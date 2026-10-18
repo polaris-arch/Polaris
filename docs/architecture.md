@@ -52,24 +52,30 @@ Polaris 存在三个不可混同的真值：
 
 ## 代理运行时
 
-`ProxyRuntime` 保留为跨领域事务 façade。它负责起停、换核、受控重启、配置世代、真实
+`ProxyRuntime` 保留为跨领域事务 façade。它负责起停、受控重启、配置世代、真实
 selector 切换事务和运行快照提交。以下独立 owner 已从根文件中分离：
 
 - `runtime/proxy/system_takeover.rs`：系统代理接管、恢复快照、marker 和残留检测。
-- `runtime/proxy/dns_race.rs`：仅节点拨号 DNS race sidecar、DoH 上游与 watchdog；普通 DNS 规则不经该 sidecar。
+- `config-engine::node_dns`：节点 DNS 上游/decoy 的纯规划与内核隔离策略生成，不持有网络任务或监听端口。
 - `runtime/proxy/selector_reconcile.rs`：latest-wins 意图、单飞 reconcile、脏位与退避唤醒。
 - `runtime/proxy/network_settle.rs`：起核、TUN flush 与恢复探测之间的 RAII 计数门。
 - `runtime/route_binding.rs`：按真正承流 endpoint/detour 根规划绑定网卡，不遍历并阻断空闲节点。
 
-DNS sidecar 锁序固定为 `sidecar → state`，世代判断与复合提交在同一临界区内。selector 不拥有
+selector 不拥有
 `switch_serial`；它只生成意图，真实 config CAS、gRPC I/O、lifecycle 复核和运行快照提交仍在 façade
 的一条事务内。
 
 ## DNS 与网卡路由
 
 DNS 服务器、DNS 服务器组、DNS 规则和默认解析行为是一等配置，不是流量路由规则的附属字段。
-普通查询交给 sing-box 原生 DNS 规则与服务器组；当前自定义 sidecar 只承担尚无原生等价接线的节点
-域名拨号竞速。
+普通查询交给 sing-box 原生 DNS 规则与服务器组。节点拨号通过 `domain_resolver` 的
+`node-bootstrap` 策略调用内核原生 evaluate/respond 竞速：Tier1 加密优先、Tier2 后备，单候选
+1500ms、A/AAAA 与两层共享 2s。候选禁缓存，最终选中正/负响应由内核现有 Client 缓存。
+App 不再拥有节点 DNS UDP 服务、动态端口、故障回退服务或候选连接路由豁免。
+系统 DNS 接管/恢复、明确的 dns-bootstrap 引导及普通 DNS Groups 保持独立。
+Tailscale 控制/DERP 保留显式 dns-bootstrap，防止启动时递归进入自身 MagicDNS；custom
+原始 JSON 的显式 resolver 不覆盖。节点 bind_interface 不代表 DNS 候选继承相同网卡。
+此策略要求通过独立验收的新核心；旧核心应明确拒绝新字段，禁止恢复本地服务作为降级。
 
 网卡决策顺序为：节点显式绑定 → 订阅策略 → 全局默认 → TUN 会话期特殊逐目的路由 → 内核自动探测。
 TUN 起核前会同时读取节点目的出口与默认出口：两者相同就不写 `bind_interface`，由 sing-box 原生
@@ -124,8 +130,9 @@ WebView 生产 CSP 的脚本源仅为 `self`，不允许 inline script 或 `unsa
 `switch_serial`、start commit/stop reset 或 helper/marker 等待边界，不属于本轮的安全重构。
 
 设置更新页同样按 owner 拆分：`SettingsUpdate` 只编排卡片与共享设置，`use-app-update` / `AppUpdateCard`
-拥有应用更新状态机和呈现，`use-core-update` / `CoreUpdateCard` 拥有内核更新状态机和呈现。下载进度订阅、
-安装期包快照和回滚确认仍由各自 hook 持有，不把异步事务重新散回页面组件。
+拥有应用更新状态机和呈现，`CoreInfoCard` 只读展示内核信息（现役版本、配套版本、补丁集标识）。
+内核随应用安装包发布，应用内不提供更新、上传或回滚内核的入口。下载进度订阅与安装期包快照仍由
+`use-app-update` 持有，不把异步事务重新散回页面组件。
 App 更新通道的前端归一化位于 `domain/app-update-channel`，宿主侧候选策略位于
 `commands/updater/app_update_policy`；两者只解释持久配置，下载、校验和安装仍由既有 App 更新 owner 单点完成。
 

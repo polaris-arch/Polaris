@@ -17,10 +17,18 @@ README 只留「怎么装、怎么用」。
 
 | 工具 | 版本 | 用途 |
 |---|---|---|
-| Rust | stable（edition 2021） | 后端 + `crates/` 下 18 个域 crate（另有 `source-probe` 是 dev-only，只进 `[dev-dependencies]`，不进任何 lib/bin 依赖图） |
+| Rust | stable（edition 2021） | 后端 + `crates/` 下的域 crate（另有 `source-probe` 是 dev-only，只进 `[dev-dependencies]`，不进任何 lib/bin 依赖图） |
 | Node.js | 24+（CI 钉 26） | 前端构建 + fetch 脚本 |
-| pnpm | 11.24.0（由 `ui/package.json` 钉扎） | 前端包管理（`ui/`） |
-| [Tauri CLI 2](https://v2.tauri.app/) | 2.x | `cargo tauri build` 打包（随 `ui/` devDep 装） |
+| pnpm | 11.24.0（由 `ui/package.json` 钉扎） | 前端包管理（`ui/`）；`tauri build` 的 `beforeBuildCommand` 直接调用 `pnpm`，须在 PATH 上 |
+| Go | 所选构建路径源码清单的 `goVersion` | 源码构建与二进制构建信息检查；桌面、移动端输入分开维护 |
+| [Tauri CLI 2](https://v2.tauri.app/) | `scripts/tauri-cli.version` 钉扎 | 全局 CLI 执行 `tauri build` 打包 |
+
+在仓库根安装全局 CLI。CLI 已从 `ui/` devDependency 退场，桌面和 Android CI 均安装同一固定版本。
+
+```bash
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
+tauri --version
+```
 
 ### 系统依赖
 
@@ -63,49 +71,59 @@ TypeScript 7 不再沿用旧的 `createSourceFile(..., ScriptTarget, ..., Script
 
 ### 资源拉取（sing-box 核 / cronet / 面板）
 
-三类资源的渠道与完整性合同不同，不能混称为「官方 release + manifest SHA」：
+当前内核开发仓为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)。仓库导航迁移不改写已冻结的构建输入：下述桌面 Release 资产与移动端 alpha.12 来源仍按各自清单核验，不得把旧资产 URL 机械替换为新仓下载地址。
 
-- `fetch-core` 从 sing-box GitHub Release 下载压缩包，以 `coreArchiveSha256` 校验；
-- `fetch-cronet` 从 Go module proxy 下载平台模块 zip，解压后以 `cronetLibrarySha256` 校验实际动态库；
-- `fetch-dashboard` 取 sing-box `gh-pages` 面板产物，**当前没有 SHA256 pin**。
-
-它们都按需拉取、不入库，且打包前必须跑：Tauri bundle `resources` 字段引用这些产物。core 与 cronet
-缺 pin 都会 fail，绝不无校验拉取原生可执行资源。
+当前桌面打包以 `src-tauri/core-manifest.json` 的 `desktopRelease` 为入口，按
+`scripts/desktop-core/release-contract.json` 消费固定的 [polaris-box](https://github.com/polaris-arch/polaris-box)
+发布资产。源码提交、tag 对象、资产索引与摘要由清单锁定；不要改用 fork 默认分支的最新提交，
+也不要把旧 `sourceBuild` 或移动端 `scripts/mobile-core/source-contract.json` 当成当前桌面选择。
+这些是构建输入约束，不代表该 App 候选已经完成原生验收或已发布。
 
 ```bash
-node scripts/fetch-core.mjs       # sing-box 四平台核（版本 = core-manifest.json 的 bundledCoreVersion，勿在此重复钉）
-node scripts/fetch-cronet.mjs     # libcronet（仅 linux/windows；mac 静态编入核心）
-node scripts/fetch-dashboard.mjs  # sing-box 面板（gh-pages 产物）
+# 本地 Linux 资源准备；其它平台为 win、mac-x64、mac-arm64
+node scripts/fetch-core.mjs --platform=linux
+node scripts/fetch-cronet.mjs --platform=linux
+node scripts/fetch-dashboard.mjs
 ```
 
-`node scripts/fetch-cronet.mjs --platform=linux` 或 `--platform=win` 可只拉当前打包腿；版本始终从
-`bundledCoreVersion` 对应 sing-box tag 的 `go.mod` 解析，Linux 与 Windows 可各自使用上游实际 require 的模块版本。
-`--check-only` 不下载库，但会校验 tag 可读、两个精确 require 均存在、以及两平台的 SHA-256 pin 完整且格式有效。
+`fetch-core` 验证固定发布输入后放入 `resources/<平台>/`。Linux / Windows 的 Cronet 动态库也必须
+符合清单摘要；macOS 使用静态输入。`fetch-dashboard` 获取 sing-box `gh-pages` 面板，当前没有 SHA256 pin。
+资源不入库；Tauri 打包配置引用的文件必须事先准备好，不能把获取资源视作运行期在线换核功能。
 
-上面三条都必须手动跑：`tauri.conf.json` **没有** `build.beforeBundleCommand`，
-`cargo tauri build` 不会替你 fetch 任何资源。
-（此前本节描述过一套 `beforeBundleCommand` 兜底，实际那个键从未存在，
-`scripts/verify-dashboard-resources.mjs` 因此是永不执行的孤儿脚本——已删除。）
+#### 发布打包与原生验收包
 
-兜底改由 `node scripts/verify-packaging.mjs confs` 提供，它在 CI 的 fetch 之后、Rust 构建之前跑
-（`.github/workflows/package.yml`），断言 conf 引用的每一条资源路径**存在且有内容**：
-空目录与 0 字节文件一律转红（存在 ≠ 有内容；fetch / 解压失败的典型形态正是留下这两种）。
-任意开发机可复现，纯静态、无构建依赖。
+`.github/workflows/desktop-core.yml` 按冻结清单选择路径：发布选择模式在四个平台验证固定资产，
+源码模式才从固定源码构建。原生输入汇总为候选专属内核包；`package.yml` 的消费形态为：
 
-升级核心时，先更新 `bundledCoreVersion` 与对应 `coreArchiveSha256`，再跑
-`node scripts/fetch-cronet.mjs --check-only`。若上游 `go.mod` 的 Cronet 依赖变化，只更新受影响平台的
-`cronetLibrarySha256`，最后以 `--force --platform=<linux 或 win>` 重拉并验证该平台库；版本不写回 manifest。
+```bash
+node scripts/fetch-core.mjs --bundle-dir=<内核包目录> --candidate="$(git rev-parse HEAD)"
+```
+
+`--bundle-dir` 与 `--candidate` 必须一起提供。当前 `desktopRelease` 路径先验证原生验收包，
+再消费固定资产；不能用本机仅下载一个平台的结果替代发布验收。取包时使用实际 workflow 返回的
+artifact 名称和候选提交，不复用其它提交的回执。当前清单存在 `desktopRelease`，不要照旧示例
+直接使用 `--producer`；源码生产路径只在无此发布选择时适用。
+
+`tauri.conf.json` 没有 `build.beforeBundleCommand`；`tauri build` 不会代替手动准备上述资源。
+CI 在 fetch 后通过 `node scripts/verify-packaging.mjs confs` 检查资源存在且非空，
+产物仍须通过后续 payload / assets 与原生验收。下载成功、摘要正确和运行验收是不同检查。
+
+维护者调整桌面内核选择时须同步审查 `desktopRelease`、发布契约及其摘要，并核对实际固定发布资产。
+移动端源码清单和历史 source-mode 输入分别维护，不能只改 `bundledCoreVersion` 或旧 `sourceBuild`
+就宣称桌面选择已更新。内核随 App 配套交付；本说明不提供用户独立上传、在线替换或回滚内核的入口。
 
 ### 打包出安装包
+
+本节的产物命名、资产表及下文三份 Android APK 描述的是当前 `main` 源码的构建与发布流程约定，供维护者准备候选包使用，不是现有公开下载清单，也不表示候选产物已经发布或通过安装验收。已公开的下载请以 [README 安装说明](../README.md#安装) 和 [v1.0.0 Release](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0) 的实际资产为准。
 
 ```bash
 # 1) 拉资产（见上）
 # 2) 前端构建 + Rust 编译 + 安装包（Tauri CLI 自动编排 beforeBuildCommand）
 #    从**仓库根**跑，并显式传本平台的 config（见下方「按平台筛内核」）
-cargo tauri build --config src-tauri/tauri.linux.conf.json          # Linux
-cargo tauri build --config src-tauri/tauri.windows.conf.json        # Windows
-cargo tauri build --config src-tauri/tauri.macos-arm64.conf.json    # macOS Apple Silicon
-cargo tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-apple-darwin  # macOS Intel
+tauri build --config src-tauri/tauri.linux.conf.json          # Linux
+tauri build --config src-tauri/tauri.windows.conf.json        # Windows
+tauri build --config src-tauri/tauri.macos-arm64.conf.json    # macOS Apple Silicon
+tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-apple-darwin  # macOS Intel
 ```
 
 产物落在**仓库根**的 `target/release/bundle/`（本仓是 cargo workspace，workspace 根在仓库根，
@@ -113,25 +131,53 @@ cargo tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-a
 
 | 平台 | 产物 | 形态 |
 |---|---|---|
-| Linux | `*.deb` / `*.AppImage` | deb 包 + AppImage（单文件免装） |
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` | **分架构单出**（不再出 universal，未签名）。⚠️ 这是 **release 资产名**，不是本地产物名 —— 见下 |
-| Windows | `*-win-setup.exe` | NSIS 安装器（WebView2 downloadBootstrapper，不内嵌 Runtime） |
-| Windows | `polaris-portable-*.zip` | 免安装绿色版（解压即用，自带 `resources/` + `portable.marker` 形态标记） |
+| Linux | `Polaris_<版本>_amd64-linux.deb` / `Polaris_<版本>_amd64-linux.AppImage` | deb 包 + AppImage（单文件免装） |
+| macOS | `Polaris_<版本>_aarch64-mac.dmg` / `Polaris_<版本>_x64-mac.dmg` | **分架构单出**（不再出 universal，未签名）。⚠️ 这是 **release 资产名**，不是本地产物名 —— 见下 |
+| Windows | `Polaris_<版本>_x64-win-setup.exe` | NSIS 安装器（WebView2 downloadBootstrapper，不内嵌 Runtime） |
+| Windows | `Polaris_<版本>_x64-win-Portable.zip` | 免安装绿色版（解压即用，自带 `resources/` + `portable.marker` 形态标记） |
 
 portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `resources/` 额外打 zip，
-本地单跑上面那条 `cargo tauri build` 不会有。
+本地单跑上面那条 `tauri build` 不会有。
 
-⚠️ **dmg 那行同理，但成因不同**：`-mac-arm64` / `-mac-x64` 这个 arch tag 不是 Tauri 产出的，
-是 `package.yml` 的 `Tag macOS dmg with arch` 步把 `<名>.dmg` 重命名成 `<名>-<tag>.dmg` 加上的
-（该步只在 CI 跑）。**本地跑 `cargo tauri build` 拿到的是 Tauri 默认名的 dmg，不带 tag。**
-这个 tag 是更新器选包契约的硬要求：`github.rs::find_suitable_update_asset` 按资产名里的
-`mac-arm64` / `mac-x64` 选包，匹配不到直接返回 `None`（已取消「任意 .dmg」回落）。
+正式发布文件名统一为 `Polaris_<版本>_<架构>-<平台>[-<形态>].<扩展名>`。
+`package.yml` 在产物校验前规范化 macOS、Linux 与 Windows 的文件名；本地单跑 `tauri build`
+仍得到 Tauri 默认文件名。版本来自 `src-tauri/tauri.conf.json`，不使用 CI 运行标签代替版本。
+桌面草稿先核六份资产；最终发布必须包含六份桌面资产、下列三份 Android APK 与 `SHA256SUMS`。
+`scripts/release-assets.mjs` 定义命名及集合，`verify-packaging.mjs assets --label release-all`
+核对完整集合、版本、体积与逐项摘要，旧名副本与额外文件均拒绝。
 
-一个 release 里 deb / AppImage / mac-arm64 dmg / mac-x64 dmg / win setup / portable zip
-**各恰好一个**（共 6 个平台交付物，另含 `SHA256SUMS`），由
-`verify-packaging.mjs assets --label release` 机器守住。
-两个 Linux 形态同样是「恰好一个」而非「至少一个」：updater 的 Linux 分支取首个命中
-（`github.rs` 的 `app_image.first()` / `deb.first()`），多一个就和 dmg / setup 一样选谁看资产顺序。
+### 移动端源码构建前置条件
+
+桌面 sidecar 下载不能替代移动端绑定组件。当前共同输入见 [source-contract.json](../scripts/mobile-core/source-contract.json) 和 [移动内核构建说明](../scripts/mobile-core/README.md)：固定 polaris-box 源码、Go 1.25.5、gomobile/gobind v0.1.13，先生成并核验组件及原始收据，再由 App 消费。
+
+- **Android 绑定组件**：API 24 AAR，Java 17（CI 固定 17.0.20+101）、NDK r30-beta3（完整来源版本 30.0.16138531-beta3）。AAR 含 ARM64、ARMv7、x86、x86_64 四种 ABI；这不扩大正式 APK 的两种 ARM ABI 范围。
+- **Android App**：Gradle 使用 JDK 21，SDK/Build Tools 当前为 36 / 36.0.0；Rust 使用 [android-rust-ndk.version](../scripts/android-rust-ndk.version) 固定的 27.3.13750724，不能与绑定组件 NDK 混用。App 最低 API 24。
+- **组件准备顺序**：共享入口为 `bash scripts/build-mobile-core.sh android`，须显式提供已有 source、Go、gomobile、gobind、SDK、NDK、JDK、work/cache 路径（完整参数见移动内核说明）。随后由 `scripts/mobile-core/consume.py materialize-android` 核验组件和收据再写入 App 输入；CI 的 `ci_android.py prepare/build` 编排此过程。仅把任意 AAR 复制为 `libbox.aar` 不满足当前来源核验。
+- **iOS / iPadOS**：源构建入口、固定 Xcode/SDK、ARM64 设备与模拟器目标及个人签名条件见 [iOS 源码构建](ios-source-build.md)。没有已发布 IPA 不影响源码构建文档的提供；编译/链接、签名、真机安装和运行验收是不同阶段。
+
+### Android 当前源码签名发布构建
+
+| ABI | 当前源码打包名（非已发布清单） |
+|---|---|
+| ARMv8 | `Polaris_<版本>_arm64-v8a-android.apk` |
+| ARMv7 | `Polaris_<版本>_armeabi-v7a-android.apk` |
+| ARMv8 + ARMv7（universal，不含 x86） | `Polaris_<版本>_universal-android.apk` |
+
+`android.yml` 在桌面草稿通过后构建三个正式签名 APK：
+
+```bash
+bash scripts/build-android-apk.sh --apk --split-per-abi --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
+bash scripts/build-android-apk.sh --apk --target aarch64 armv7 --ci --config src-tauri/tauri.android.conf.json
+```
+
+两次调用分别产出 `arm64Release` / `armRelease` 与 `universalRelease`；全部使用完整 Rust release
+构型、R8、资源裁剪、压缩 native libraries 与复制后的原生库安全剥符号。两条命令只构建
+`arm64-v8a` 和 `armeabi-v7a`；release JNI 打包再排除 x86/x86_64 库，保留各 split 自己的 ABI 集合。
+universal 包含两个 ARM ABI；debug 开发构型保留模拟器 ABI。
+三个包逐一核 manifest 版本/应用 ID、真实 ABI 集合、每份 ELF 的架构/符号/压缩方式、R8 证据、
+内核 AAR 来源原字节与正式签名证书 pin。任何签名凭据缺失即失败；风险门的未签名轻量包不能发布。
+最终清单使用从草稿回读且与 Android job 固定已验签 SHA 对拍的字节，公开紧前再核完整远端 digest。
+本轮不产出 iOS release 包。三份 APK 的实际构建、签名、体积与安装验收须由候选发布验证。
 
 #### 按平台筛内核（`--config` 不可省）
 
@@ -144,7 +190,7 @@ portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `re
   包里没有内核、bundler 照常出包，只在用户机器上 `resolve_core_binary → Err` 才暴露。显式
   `--config` 下同样的改名会得到 `failed to read configuration file` 硬失败。
   （macOS 那份原名 `tauri.macos.conf.json` 会被隐式合并，实为 arm64 专用 ⇒ 在 Intel Mac 上裸
-  `cargo tauri build` 会打进 arm64 内核；已改名为 `tauri.macos-arm64.conf.json` 消除该隐式默认。）
+  `tauri build` 会打进 arm64 内核；已改名为 `tauri.macos-arm64.conf.json` 消除该隐式默认。）
 
 这些不变量由 `node scripts/verify-packaging.mjs confs` 机器守住（CI 每次打包前跑，本机可直接复现）；
 构建后再由 `payload` / `assets` 两个模式断言产物里恰好一份本平台内核、且产物名满足更新器选包契约。
@@ -170,16 +216,38 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
 
 ## 持续集成
 
-两个 workflow 分工（`.github/workflows/`）：
+主要 workflow 分工（`.github/workflows/`）：
 
-- **`ci.yml`** — 快速门禁：三平台 `cargo fmt + clippy + build + test`，每个 PR / push 到 main 触发。
-  职责 = 「改动是否正确」。建议把三平台 `cargo-test` 设为 required checks。
-- **`package.yml`** — 发布工程：三平台 matrix 跑 fetch + `tauri build` + 产物上传。
-  触发 = tag（`v*`）/ 手动 / main 改动打包相关路径。职责 = 「能否产出可分发安装包」。
+- **`ci.yml`** — Rust 门禁，职责 = 「改动是否正确」。三个并行 job：
+  - `fmt + clippy (<os>)`：格式与 clippy（`-D warnings`）；Linux 腿另跑 rustdoc 与 Cronet 来源解析。
+  - `cross-target clippy + android face`（只在 Linux）：对 Windows / macOS / Android / iOS 四个交叉目标跑
+    clippy，检查 `vendor/` 下随仓第三方副本在这些目标上零诊断，并核对 Android 影响面登记表与交叉豁免表。
+    带 C 依赖的包在部分目标上被豁免（见 `scripts/cross-target-exempt.json`），它不能代替原生腿。
+  - `build + test (<os>)`：`cargo build` 与 `cargo test`。
+
+  触发与平台：
+  - 推送 `main` 只跑 Linux 原生测试加交叉 clippy（纯文档改动不触发）。
+  - Windows 与 macOS 原生 lint 与测试在 pull_request、手动触发、发布时跑（发布经 `package.yml` 调用，
+    三平台不绿不发布）。
+  - 含平台分支的改动合入前须手动触发三平台：`gh workflow run ci.yml --ref <分支>`；只确认一个平台时加
+    `-f os=windows-2022` 或 `-f os=macos-14`。直接推送 `main` 不会跑这两个平台，原生腿上的失败要到下一次
+    手动触发或发布时才会出现。
+
+  本机镜像是 `scripts/gate-rust.sh`（加 `--with-cross` 才跑交叉那几条），与 `ci.yml` 由
+  `scripts/gate-rust-ci-parity.test.mjs` 对拍。建议把三平台的 `fmt + clippy (<os>)`、`build + test (<os>)`
+  与 `cross-target clippy + android face` 设为 required checks。
+- **`ui.yml`** — 前端门禁：`pnpm run build`（tsc + vite build）、vitest、Playwright；PR / push 到 main 触发。
+- **`release-risk.yml`** — 发布风险门：PR / merge queue / push 到 main 均触发，在 job 内按改动路径分类，
+  只对受影响的面调用 `desktop-core.yml`、`package.yml`（不上传产物）与 `android.yml`。
+- **`desktop-core.yml`** — 只被调用：四个原生 runner 验证固定发布输入，或在源码模式下构建固定源码，再汇总候选内核包。
+- **`package.yml`** — 发布工程：Linux / Windows / macOS arm64 / macOS x64 四条腿跑 fetch + `tauri build` + 产物校验。
+  触发 = tag（`v*`）/ 手动 / 被 `release-risk.yml` 调用。职责 = 「能否产出可分发安装包」。tag 发布时建草稿 release、
+  上传桌面资产，再调用 `android.yml` 上传签名 APK，全量对账后公开。
+- **`android.yml`** — 只被调用或手动触发：构建 release-profile APK 并做产物级检查；发布调用时产出签名 APK。
 
 ## Windows 安装器与 WebView2
 
-Tauri 2 依赖 WebView2 Runtime。Windows 只发布一个 **`*-win-setup.exe`**，使用
+Tauri 2 依赖 WebView2 Runtime。Windows 只发布一个 **`Polaris_<版本>_x64-win-setup.exe`**，使用
 `tauri.conf.json` 的 `downloadBootstrapper`：普通 Win10/11 通常已预装，缺失时安装器联网获取微软
 Runtime。Polaris 不内嵌、不镜像 WebView2 Runtime，也不维护第二套 Windows 安装包。
 
@@ -192,8 +260,8 @@ Runtime。Polaris 不内嵌、不镜像 WebView2 Runtime，也不维护第二套
 
 | 运行形态 | 选包判据 | 命中 |
 |---|---|---|
-| 安装态（NSIS 装的） | `.exe` 且名含 `win` | `*-win-setup.exe` |
-| 便携（解压 zip 跑的） | `polaris-portable-` 前缀 + `.zip` | `polaris-portable-*.zip` |
+| 安装态（NSIS 装的） | `Polaris_` 前缀 + `_x64-win-setup.exe` 后缀 | `Polaris_<版本>_x64-win-setup.exe` |
+| 便携（解压 zip 跑的） | `Polaris_` 前缀 + `_x64-win-Portable.zip` 后缀 | `Polaris_<版本>_x64-win-Portable.zip` |
 
 故安装器显式带 `win`，便携版是 zip，与 `.exe` 分属不相交的命名空间，两条规则各自无歧义。
 这些「恰好一个」由 `verify-packaging.mjs assets` 在 CI 里机器守住。
@@ -204,8 +272,31 @@ Runtime。Polaris 不内嵌、不镜像 WebView2 Runtime，也不维护第二套
 `Compress-Archive` 打的纯 zip、没有 stub，该变量恒不存在。`package.yml` 打完 zip 会开包核验
 标记确实在里面，缺了就让整条腿硬失败。
 
-⚠️ **便携版的更新是「下载 + 交系统」，不是全自动**：便携用户拿到的是 zip，`update_install`
-不认识 zip 形态（只认 `.exe/.dmg/.AppImage/.deb`）⇒ 回退用系统打开该 zip，由用户自行解压覆盖。
-这是有意的诚实降级：形态正确、且绝不会有 NSIS 在背后装出第二份程序。自动解压替换需引解压依赖，未做。
+⚠️ **便携版的更新是「下载 + 手动覆盖」，不是全自动**：便携用户拿到的是 zip，没有安装程序。在更新卡上点
+「重启并安装」后，应用先给出说明（更新压缩包与程序所在文件夹两个位置），此时连接不受影响；用户再点
+「退出并打开文件夹」，应用才按下面的次序执行（`update_install` 的便携腿）：
+
+1. 断开连接并停止内核（与正常退出同一道准备门；内核未确认停止则应用保持运行并提示重试）；
+2. 用系统打开更新压缩包与程序所在文件夹（任一个打不开则不退出）；
+3. 退出应用。
+
+随后由用户把压缩包里的全部内容解压到程序所在文件夹并选择覆盖，再重新启动。内核 `sing-box.exe` 直接从
+便携目录的 `resources\win\` 运行，Windows 不允许改写正在运行的映像文件，所以停核与退出必须先于覆盖——
+这一次序由应用保证，不依赖用户记得先退出。自动解压替换未做：它需要一段在主程序退出后独立运行、逐项换入
+并能回滚的脚本，而被替换的是用户自己放置、权限与占用情况都不可预知的目录。
+⚠️ **应用管不到的情形**：用户绕开更新卡、在应用仍运行时自己把压缩包解压进程序目录，被占用的文件会被跳过，
+目录里会是新旧文件混杂。便携版不经过安装器，安装器里「先结束本安装目录内的内核」那一步在这里不存在。
+⚠️ 便携运行形态下拿到安装器（或安装态拿到便携压缩包）按形态错配处理：不执行安装，交系统打开并在更新卡上
+报错，不会在背后装出第二份程序。
 ⚠️ 用户若删掉 `portable.marker`，应用会重新把自己当成安装态、改推安装器——**没有自动手段能守住这点**，
 故该文件内写明了「勿删」。
+
+## 随包内核与提权助手
+
+桌面正式包使用本版本选定的 polaris-box 内核。Linux、Windows 的 Cronet 库与内核同包；macOS 使用静态输入。打包阶段先冻结实际 helper（Windows 还含 cleaner）字节，再生成 `core-manifest.json` 并作为 App 编译输入；最终包装必须与这份输入逐字节一致。正式版不接受用户上传内核或环境变量指定的替代内核。
+
+TUN 首次使用或选定内容身份改变时，经管理员授权事务安装本版本配套内核。助手按 CoreID 存放不可变版本，启动请求只携带 CoreID，不上传文件。兼容的较新助手可保留；安装另一版本内核不会主动停止其他用户的活跃核。旧助手仍占用受管核或无法证明空槽时，升级会延期，不能把观察快照当作停止授权。
+
+助手保留最近三个历史内容身份以及所有仍持有原生租约的版本。旧平铺核和用户目录遗留缓存只在未使用且观察完整时退役；无法确认时保留。公开发布及旧资产删除另按实际消费验收后的活跃引用迁移执行。
+
+应用自更新保留发行时冻结的 helper/core 字节。macOS 对暂存与最终应用包校验签名，不做深度重签；macOS、AppImage 在目标旁暂存候选并串行替换，失败恢复本次操作前的原文件，恢复未完成时保留准确事务目录。失败不删除已下载安装件。这些源码路径仍需原生载体验证。

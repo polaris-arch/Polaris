@@ -4,17 +4,17 @@
 
 [简体中文](README.md) · [English](README.en.md) · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · **فارسی**
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
-[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-0E98A4?style=flat-square)](#نصب)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
+[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#نصب)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
 <div dir="rtl">
 
-**Polaris** — یک کلاینت پروکسی شبکه چندسکویی بر پایه sing-box. ساخته‌شده با Tauri 2 (ترکیب Rust و React).
+**Polaris** — یک کلاینت پروکسی شبکه چندسکویی بر پایه [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). ساخته‌شده با Tauri 2 (ترکیب Rust و React).
 
 ![خانه](docs/screenshots/home.png)
 
@@ -22,17 +22,30 @@
 
 | حوزه | قابلیت‌ها |
 |---|---|
-| شیوه گرفتن ترافیک | TUN · پروکسی سیستمی · پورت محلی |
-| مسیریابی | هوشمند / سراسری / مستقیم · قوانین سفارشی · مسیریابی بر پایه برنامه · مسیریابی منطقه‌ای (شامل بازگشت به چین) |
-| پروتکل‌ها | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN |
-| شبکه خصوصی | WireGuard · Tailscale · WARP؛ OpenConnect و OpenVPN نیز پس از اعلام زیرشبکه‌های داخلی در همین دسته قرار می‌گیرند |
-| DNS | FakeIP · DoH / DoT · رقابت هم‌زمان بین حل‌کننده‌ها · راهبرد IPv6 · محافظت در برابر نشت |
-| عیب‌یابی | توپولوژی اتصال‌ها · گزارش زنده · سنجش سرعت گره‌ها · تشخیص باز بودن سرویس‌های پخش و هوش مصنوعی |
-| بهره‌برداری | مدیریت اشتراک · به‌روزرسانی برخط هسته · پشتیبان‌گیری و بازیابی پیکربندی · قفل حریم خصوصی · ماندگاری در سینی سیستم |
-| به‌روزرسانی برنامه | کانال پایدار / آزمایشی · دانلود دوبارهٔ نسخهٔ فعلی · بررسی چکیدهٔ نصب‌کننده |
-| بهینه‌سازی حافظه | آزادسازی WebView اصلی پس از ۱۰ دقیقه پنهان یا کمینه بودن رابط؛ آمار، اتصال‌ها و گزارش‌ها تنها هنگام نیاز مشترک می‌شوند |
+| شیوه گرفتن ترافیک | TUN · پروکسی سیستمی / پورت محلی (دسکتاپ) |
+| مسیریابی | هوشمند / سراسری / مستقیم · قوانین سفارشی · مسیریابی بر پایه برنامه · مسیریابی منطقه‌ای (حالت هوشمند، شامل بازگشت به چین) |
+| گره‌های پروکسی | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[1](#tor-note) |
+| اتصال‌های شبکه[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[3](#masque-note) |
+| DNS | FakeIP · DoH / DoT · رقابت حل‌کننده‌های دامنهٔ گره‌ها |
+| کنترل شبکه | کلید IPv6 · مسدودسازی DoH مرورگر · سیاست WebRTC (فقط TUN) |
+| عیب‌یابی | توپولوژی اتصال‌ها · گزارش زنده · سنجش سرعت گره‌ها همراه با پیشرفت · نمایش قوانین تطبیق‌یافته · تشخیص باز بودن سرویس‌های پخش و هوش مصنوعی |
+| بهره‌برداری | مدیریت اشتراک · پشتیبان‌گیری و بازیابی پیکربندی با تأیید · قفل حریم خصوصی · ماندگاری در سینی سیستمِ دسکتاپ |
+| به‌روزرسانی برنامه | کانال پایدار / آزمایشی · دانلود دوبارهٔ نسخهٔ فعلی · بررسی چکیدهٔ نصب‌کننده و هشدار نبود آن |
+| بهینه‌سازی حافظهٔ دسکتاپ | با فعال بودن حالت سبک خودکار، WebView اصلی پس از ۱۰ دقیقه پنهان یا کمینه ماندن پیوستهٔ پنجرهٔ اصلی آزاد می‌شود؛ آمار، اتصال‌ها و گزارش‌ها تنها هنگام نیاز مشترک می‌شوند |
 
 </div>
+
+<a id="tor-note"></a>
+
+1. Tor به فایل اجرایی در دسترس Tor و شرایط لازم برای اجرا روی سکو نیاز دارد.
+
+<a id="mesh-note"></a>
+
+2. OpenConnect، ‏OpenVPN و MASQUE از بخش شبکه خصوصی افزوده می‌شوند. مسیریابی شبکهٔ داخلی به زیرشبکه‌های داخلی پیکربندی‌شده (meshRoutes) نیز وابسته است؛ صرف دسته‌بندی ورودی این قابلیت را اثبات نمی‌کند.
+
+<a id="masque-note"></a>
+
+3. MASQUE از پیاده‌سازی خود sing-box استفاده می‌کند و از اتصال رسمی MASQUE کلادفلر، از جمله WARP از طریق MASQUE، پشتیبانی نمی‌کند. این محدودیت فقط مربوط به همین روش اتصال است.
 
 <table>
 <tr>
@@ -51,13 +64,16 @@
 
 بسته مناسب سکوی خود را از [Releases](https://github.com/polaris-arch/Polaris/releases) دانلود کنید.
 
+فرایند انتشار فعلی از نام فایل‌های تعریف‌شده در [release-assets.mjs](scripts/release-assets.mjs) استفاده می‌کند؛ `<version>` نسخه برنامه بدون پیشوند `v` است. برای macOS بسته‌های جداگانه Apple Silicon / Intel، برای Windows بسته x64 و برای Linux بسته amd64 در نظر گرفته شده است. بسته‌های Android به‌ترتیب ARM64، ‏ARMv7 و universal آمده‌اند؛ universal فقط همین دو معماری ARM را شامل می‌شود و x86 ندارد. امکان دانلود به فایل‌های واقعی انتشار انتخاب‌شده بستگی دارد. فایل‌ها را با `SHA256SUMS` در همان صفحه بررسی کنید.
+
 | سکو | فایل |
 |---|---|
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
-| Windows | `*-win-setup.exe`؛ نسخه قابل حمل: `polaris-portable-*.zip` |
-| Linux | `*.deb` / `*.AppImage` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
-بسته‌ها با گواهی پولی امضای کد امضا نمی‌شوند، بنابراین نخستین اجرا روی هر سکو نیازمند یک گام تأیید دستی است.
+بسته‌های دسکتاپ با گواهی پولی امضای کد امضا نمی‌شوند؛ اجرای نخست ممکن است به تأیید دستی نیاز داشته باشد.
 
 نصب‌کننده ویندوز، WebView2 Runtime را در خود جای نمی‌دهد؛ اگر سیستم فاقد آن باشد، به‌صورت برخط دریافت می‌شود. کاربران نسخه‌های سبک‌شده / LTSC یا نسخه قابل حمل که Runtime را ندارند، ابتدا [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) را از سایت مایکروسافت نصب کنند. Polaris نصب‌کننده آفلاین WebView2 ارائه نمی‌دهد.
 
@@ -85,14 +101,25 @@ xattr -cr /Applications/Polaris.app
 
 ## ساخت
 
-نیازمند Rust stable، Node.js 24+ (در CI اکنون Node 26) و [Tauri CLI 2](https://v2.tauri.app/).
+این بخش برای نگه‌دارندگانی است که کد منبع فعلی را می‌سازند؛ مثال برای Linux است. ساخت موفق کد منبع به معنی تأیید عملکرد بسته‌های منتشرشده نیست. وابستگی‌های سکوها، ابزارهای موبایل و قراردادهای بسته‌بندی در راهنماهای زیر آمده است.
+
+راهنمای ساخت از کد: [دسکتاپ و Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [هسته موبایل و ابزارهای با نسخه ثابت](scripts/mobile-core/README.md).
+
+برای iOS در حال حاضر IPA یا بسته جیلبریک منتشر نمی‌شود و سازگاری با جیلبریک تأیید نشده است. امضای شخصی برای دستگاه بدون جیلبریک به حساب Apple Developer Program با قابلیت Network Extension و [پروفایل‌های provisioning](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles) منطبق با مجوزهای App، ‏PacketTunnel و App Group نیاز دارد. حساب رایگان [Personal Team از NE provider پشتیبانی نمی‌کند](https://developer.apple.com/forums/thread/128767) و نصب خارج از فروشگاه به‌تنهایی این مجوزها را اعطا نمی‌کند. کامپایل یا نصب موفق جایگزین آزمون عملکرد نیست.
+
+نیازمند Rust stable، Node.js 24+ (در CI اکنون Node 26)، pnpm 11.24.0، Go و [Tauri CLI 2](https://v2.tauri.app/).
 
 </div>
 
 ```bash
-node scripts/fetch-core.mjs        # دریافت هسته sing-box (قفل‌شده با SHA256)
-node scripts/fetch-cronet.mjs      # دریافت libcronet
-cargo tauri build --config src-tauri/tauri.linux.conf.json
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
+pnpm --dir ui install --frozen-lockfile   # وابستگی‌های رابط کاربری
+# هستهٔ دسکتاپ: انتشار ثابت تعیین‌شده در desktopRelease فایل core-manifest.json
+node scripts/fetch-core.mjs --platform=linux
+# بسته‌های بررسی بومی و آماده‌سازی منابع: docs/build-and-package.en.md
+node scripts/fetch-cronet.mjs --platform=linux  # دریافت libcronet.so در کنار هسته Linux
+node scripts/fetch-dashboard.mjs   # دریافت پنل داخلی
+tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
 <div dir="rtl">
@@ -107,7 +134,7 @@ cargo tauri build --config src-tauri/tauri.linux.conf.json
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd ui && npm test
+cd ui && npx pnpm@11.24.0 test
 ```
 
 <div dir="rtl">
@@ -119,20 +146,23 @@ cd ui && npm test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   فرایند اصلی Tauri 2
-crates/      ۱۷ crate دامنه‌ای (config-engine / core-supervisor / helper / updater / …)
+crates/      crateهای دامنه‌ای (config-engine / core-supervisor / helper / updater / …)
 resources/   هسته sing-box + libcronet (در زمان ساخت دریافت می‌شوند، در مخزن نیستند)
 ```
 
 <div dir="rtl">
 
-هسته به‌صورت یک فرایند فرزند sidecar اجرا می‌شود و از طریق صفحه مدیریت gRPC کنترل می‌گردد. TUN و پروکسی سیستمی را helperهای دارای دسترسی ویژه در هر سه سکو بر عهده دارند (macOS / Windows / Linux، همگی با Rust).
+در دسکتاپ (Windows / macOS / Linux)، هسته به‌صورت یک فرایند فرزند sidecar اجرا می‌شود و از طریق صفحه مدیریت gRPC کنترل می‌گردد. کارهای نیازمند دسترسی ویژه — راه‌اندازی هسته برای TUN و تصاحب سیستم — در هر سه سکو (macOS / Windows / Linux) به helperهای نوشته‌شده با Rust سپرده می‌شود؛ مسیر پروکسی سیستمی که به helper نیاز ندارد، مستقیماً توسط crate ‏`system-integration` در سمت برنامه مدیریت می‌شود و بازگردانی تنظیمات نیز بر عهده همان است.
+
+در Android، ‏libbox در فرایند برنامه بارگذاری می‌شود و از یکپارچه‌سازی VPN موبایل استفاده می‌کند، نه مسیر دسکتاپ sidecar/helper که در بالا توضیح داده شد.
 
 ## مستندات
 
 | فایل | محتوا |
 |---|---|
+| [docs/architecture.md](docs/architecture.md) | لایه‌بندی فعلی، تراکنش‌های اجرا، DNS / مسیریابی، مرزهای دسترسی ویژه و معیار تفکیک فایل‌های بزرگ (فقط به زبان چینی) |
 | [docs/build-and-package.en.md](docs/build-and-package.en.md) | ساخت، CI، ثابت‌های بسته‌بندی، قرارداد انتخاب بسته توسط به‌روزرسان |
-| [docs/troubleshooting.fa.md](docs/troubleshooting.fa.md) | توضیح نسخه‌های بدون امضا، صفحه سفید / خرابی تصویر / کرش GPU |
+| [docs/troubleshooting.fa.md](docs/troubleshooting.fa.md) | محدودیت سازگاری MASQUE، نسخه‌های بدون امضا، صفحه سفید / خرابی تصویر / کرش GPU |
 
 تصاویر با دستور `node scripts/capture-screenshots.mjs` ساخته می‌شوند: کروم بدون رابط گرافیکی، خروجی ساخت رابط کاربری را با داده‌های نمونه تزریق‌شده رندر می‌کند — نه نصب برنامه لازم است و نه اجرای هسته.
 
@@ -140,7 +170,8 @@ resources/   هسته sing-box + libcronet (در زمان ساخت دریافت 
 
 | پروژه | نقش |
 |---|---|
-| [sing-box](https://github.com/SagerNet/sing-box) | هسته پروکسی (فرایند فرزند sidecar) |
+| [sing-box-polaris (فورک مورد استفاده)](https://github.com/polaris-arch/sing-box-polaris) | فورک هسته مورد استفاده Polaris؛ کد و نسخه ثابت و فایل‌های polaris-box بر اساس مانیفست ساخت انتخاب‌شده تعیین می‌شوند |
+| [sing-box (بالادست اصلی)](https://github.com/SagerNet/sing-box) | پروژه اصلی بالادست و پایه فنی؛ با قدردانی از توسعه‌دهندگان |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | بستر اجرای دسکتاپ |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet برای NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | پنل داخلی |

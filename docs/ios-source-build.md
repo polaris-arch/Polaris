@@ -1,10 +1,52 @@
+# iOS 源码构建（ARM64，自行签名）
+
+项目保留 iOS 源码与编译入口，不在 GitHub Releases 发布 iOS 安装包。以下步骤说明当前源码的设备 ARM64 无签名编译/链接路径，不表示签名、安装、Network Extension 授权或实际 VPN 流量已验收。
+
+在 Mac 上准备 Rust stable 与 aarch64-apple-ios、Node.js 24+（CI 26）、pnpm 11.24.0、Python 3，以及 Xcode 27.1 build 27A9275；设备与模拟器 SDK 都须 27.1。Go 1.25.5、SagerNet gomobile/gobind v0.1.13 须用明确工具路径提供。本文使用正式 Python 构建入口，不使用历史 `tauri ios build` 流程；通用 Tauri CLI 版本见 `scripts/tauri-cli.version`（当前 2.12.1），不应据此假定 UI 依赖安装会提供本地 CLI。不要运行 `gomobile init` 来替换已固定 gobind。
+
+完整主机测试与同树合入复用的执行输入采集要求 Python 3.11+ 及标准库 `tomllib`；CI 显式使用 Python 3.12 并检查实际解释器/模块。缺少该模块时普通构建仍可继续，但证据不具复用资格且不生成 execution sidecar。此要求不追溯改变下文历史构建入口。
+
+当前内核开发仓为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)；下述移动端 alpha.12 固定来源仍以现有 source-contract 为准。新仓导航不表示来源清单已经迁移，也不提供新的已发布移动组件或 IPA 下载。
+
+核心来源以 [source-contract.json](../scripts/mobile-core/source-contract.json) 为准，当前是 polaris-box v1.15.0-alpha.12 的固定 commit 577d4b9a089b71d2f0a4ca334b87264b55c10478。`--source` 指向保存对应 tag/commit/tree 的核心 checkout，不是 Polaris应用目录；不应用历史六片补丁。先准备组件所需现行工具/来源，完整约束见 [移动内核构建说明](../scripts/mobile-core/README.md)。
+
+在 Polaris 仓库根目录：
+
+```sh
+rustup target add aarch64-apple-ios
+pnpm --dir ui install --frozen-lockfile
+node scripts/fetch-dashboard.mjs
+pnpm --dir ui build
+python3 -B scripts/mobile-core/build_apple_app.py \
+  --source "$CORE_SOURCE" \
+  --go "$GO_BIN" --gomobile "$GOMOBILE_BIN" --gobind "$GOBIND_BIN" \
+  --developer "$DEVELOPER_DIR" \
+  --work "$APPLE_WORK" --cache "$APPLE_CACHE"
+```
+
+上述变量须替换/设置成真实明确路径；`DEVELOPER_DIR` 指向选定 Xcode 的 `Contents/Developer`。work/cache 为固定用户自有目录，须位于同一文件系统并满足构建器资源准入；不覆盖已有归档或挪用历史 receipt。入口会生产或重新核验共享组件，再构建并核验设备 App/PacketTunnel；无需额外先跑一次组件构建器。不传 `--signing-team` 即无签名编译/链接。
+
+共享静态组件包含设备与模拟器两个 arm64 slice，最低 iOS 15；App/PacketTunnel最低 iOS 17。默认 Apple托管工作流只要求 device-arm64；模拟器 App 构建是现有手动选项，不由共享双 slice成功自动推出。Intel simulator/macOS/tvOS 不属于本 iOS正式目标。
+
+真机安装须另行准备用户自己的 Apple开发签名身份、已注册设备和匹配的 profiles；主 App与 PacketTunnel使用同一 Team及共同App Group，并具备 Packet Tunnel entitlement。选择自己可注册的 Bundle ID，主 App与 Tauri identifier一致，扩展 ID 加 `.PacketTunnel`；修改 `src-tauri/gen/apple/project.yml` 后，在该文件所在目录运行 `xcodegen generate`，并核对两个 target。现有 `--signing-team` 只选择 Team，不能替代这些条件。实际设备授权、连接/停止、DNS/IPv4/IPv6 及后台生命周期需另验。不要提交证书、profiles 或构建产物。
+
+旧 `build-libbox-ios.sh` 与 `ios-libbox.py build`（包括 `--historical`）均已退休并拒绝生产构建。下方历史记录中的旧版本、旧命令和验收结论只属于当时，不是当前操作步骤，也不能替代当前源码、工具及产物核验。
+
+
+<details>
+<summary>历史构建记录（旧命令不可作为现行生产入口）</summary>
+
+# 历史存档：b66 基线及此前阶段原文（2026-10-15 保留）
+
+以下内容逐字保留，仅用于理解旧来源、收据和阶段限制。日期表示本次归档说明时间，不替代原证据的日期；所有旧生产命令均受上方退休说明约束。
+
 # iOS 源码编译（准备中）
 
 ## 统一 main 的源码收口边界
 
 当前 iOS 源码由 `c8f57984..1490dabf` 的 18 片独立增量移植到 `0713990a`，并按当前主线适配退出、重启和独立配置检查的入口。主 App 退出或重启保留系统 Packet Tunnel，不经过桌面四类 owner 的 drain 或签发清理证明；桌面检查准入继续生效，iOS 只跳过未提供承载的独立构造检查。
 
-本目录的 iOS Libbox manifest 仍是历史六片 / gomobile v0.1.12 / SDK 27.0 基线。当前共享主线已包含九片补丁及 sing-tun/nftables 依赖固定；后三片与依赖尚未迁移到 iOS 构建输入。因此六片 Framework 只能作为历史开发缓存，不是当前统一源码的最终核心产物。必须完成整组 Apple 来源、补丁、依赖与导出 ABI 核验后，再更新 iOS manifest 并统一重建 Framework/App。当前合流只收纳源码，不产生新的 App、Framework、签名、NE 流量或设备验收收据。
+本目录的 iOS Libbox manifest 仍是历史六片 / gomobile v0.1.12 / SDK 27.0 基线。当前共享主线为八片补丁，不对依赖模块打补丁；后两片尚未迁移到 iOS 构建输入。因此六片 Framework 只能作为历史开发缓存，不是当前统一源码的最终核心产物。必须完成整组 Apple 来源、补丁与导出 ABI 核验后，再更新 iOS manifest 并统一重建 Framework/App。当前合流只收纳源码，不产生新的 App、Framework、签名、NE 流量或设备验收收据。
 
 有限独立审查已确认旧六片 Go monitor 可通过已进入的 Swift 回调，在 reload 后触达共享 wrapper 的新 manager。主线 `default-monitor-isolation.patch` 提供 manager/state 隔离、seal/admission 与 native listener identity；Apple 尚未消费该片。Swift close 忽略 listener 的事实存在，但独立的迟到 Close(A) 破坏 B 路径尚未证明，不能靠代理对象地址或一次 generation 检查代替完整迁移。
 
@@ -36,7 +78,7 @@ Polaris 的 iOS 构建由使用者在自己的 Mac 上完成并自行签名。�
 ## 构建主 App 的前置条件
 
 - Xcode、命令行工具及 iOS SDK；历史 App 使用 Xcode 27.1 / SDK 27.1。六片 Libbox 的历史构建工具链仍固定为下节 27.0；原 App 链接已核验的六片 Framework。当前工程的 default final hook 保持拒绝，须完成 Apple 迁移后才能统一构建。首次构建可先在 Xcode 中接受许可。
-- Node.js 24+、pnpm 11.24.0、Rust、CocoaPods、Go、Python 3；项目已包含生成的 Xcode 工程。修改 `project.yml` 后需要 XcodeGen；不要重新执行 `tauri ios init` 覆盖 Packet Tunnel target。
+- Node.js 24+、pnpm 11.24.0、全局 Tauri CLI（版本见 `scripts/tauri-cli.version`）、Rust、CocoaPods、Go、Python 3；项目已包含生成的 Xcode 工程。修改 `project.yml` 后需要 XcodeGen；不要重新执行 `tauri ios init` 覆盖 Packet Tunnel target。
 - `rustup target add aarch64-apple-ios`。若构建 Apple Silicon 模拟器，再加 `aarch64-apple-ios-sim` 和与 SDK 匹配的 iOS Simulator runtime。
 - 真机安装需要 Apple Developer 付费账号、开发证书、设备注册和对应 provisioning profile。Xcode 登录账号并不自动证明本机已有有效签名身份。
 
@@ -71,7 +113,7 @@ Go 默认下载已由核心 `go.mod` / `go.sum` 锁定并校验的缺失模块�
 cd ui
 pnpm install --frozen-lockfile
 cd ../src-tauri
-../ui/node_modules/.bin/tauri ios build --debug --target aarch64 --no-sign --ci --ignore-version-mismatches
+tauri ios build --debug --target aarch64 --no-sign --ci --ignore-version-mismatches
 cd ..
 python3 scripts/verify-ios-archive.py src-tauri/gen/apple/build/arm64/Polaris.ipa
 ```
@@ -80,7 +122,7 @@ python3 scripts/verify-ios-archive.py src-tauri/gen/apple/build/arm64/Polaris.ip
 
 对已有历史 IPA，仅可显式执行 `python3 scripts/verify-ios-archive.py --historical <旧IPA路径>` 的结构核验。这个结果是 structure-only；当前没有最终 source receipt 到静态链接 IPA 的证据验证实现。
 
-Apple Silicon 模拟器可将目标换成 `--target aarch64-sim`。当前 Tauri CLI 2.11.4 将可用 Simulator runtime 与 SDK 版本比较；若使用 SDK27.1 而仅安装 27.0 runtime，普通 CLI 归档会提前失败。可启动 `tauri ios build --debug --target aarch64-sim --no-sign --ci --ignore-version-mismatches --open` 保持该 options server 活动，随后由 Xcode 对实际已安装的 27.0 目标执行无签名 build；测试记录必须绑定实际 SDK/runtime，不能据此声称 27.1/Duo runtime 已验。`--ignore-version-mismatches` 仅处理当前固定 OS 插件 JS/Rust 版本提示，不放宽源码或 Framework 哈希验证。安装实际 App 后，用 [独立 XCUITest 工程](../scripts/ios-simulator-acceptance/README.md) 检查五个页面、可触达导航、横竖屏布局和重新启动。模拟器可验收其实际支持的行为；签名和设备专属行为另外验证，UI 测试不能证明 VPN 流量或资源归属。
+Apple Silicon 模拟器可将目标换成 `--target aarch64-sim`。当前 Tauri CLI 2.11.4 将可用 Simulator runtime 与 SDK 版本比较；若使用 SDK27.1 而仅安装 27.0 runtime，普通 CLI 归档会提前失败。可启动 `tauri ios build --debug --target aarch64-sim --no-sign --ci --ignore-version-mismatches --open` 保持该 options server 活动，随后由 Xcode 对实际已安装的 27.0 目标执行无签名 build；测试记录必须绑定实际 SDK/runtime，不能据此声称 27.1/Duo runtime 已验。`--ignore-version-mismatches` 仅处理当前固定 OS 插件 JS/Rust 版本提示，不放宽源码或 Framework 哈希验证。安装实际 App 后，用独立 XCUITest 工程（只在本机保留，不入库）检查五个页面、可触达导航、横竖屏布局和重新启动。模拟器可验收其实际支持的行为；签名和设备专属行为另外验证，UI 测试不能证明 VPN 流量或资源归属。
 
 若重复模拟器构建在最后一步报 `failed to rename app ... Directory not empty`，先将 `build/arm64-sim/Polaris.app` 移到自己的备份目录，再重跑同一构建命令。修改 Swift 源文件后重新生成工程；若同步源码副本，须在同步完成后生成，避免旧 `project.pbxproj` 覆盖新源文件登记。
 
@@ -121,3 +163,5 @@ Android 正分片修复 SDK 取消不等待晚 callback、callback 直写 `Excha
 - iOS 尚无主 App 启动前的 Libbox 配置预检查。主 App 不链接 Libbox，在扩展里先 CheckConfig 再启动主核仍缺构造工作目录隔离与清理证明；冻结契约返回 CleanupUnknown，不能据此认定构造 owner 已退出或已支持 Android 同款节点预剥离。
 - iPhone Duo：Xcode27.1/SDK27.1 已具备 device type 与原生 verticalBarEdge/reservedRegions API；当前仅有26.5/27.0 runtimes，Duo要求27.1 runtime，下载当前不可用。连续单页面/草稿布局、原生四边安全区、键盘、字号和reserved-region消费已接线；外屏/内屏连续切换、半折区域避让仍未在实际Duo模拟器或真机验收。不能用近似视口夹具替代。
 - iPad 分屏仍待验证；已有普通横竖屏验收不覆盖分屏或 Duo 折叠区。
+
+</details>

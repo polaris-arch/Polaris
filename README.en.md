@@ -4,15 +4,15 @@
 
 [简体中文](README.md) · **English** · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
-[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-0E98A4?style=flat-square)](#install)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
+[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#install)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
-**Polaris** — a cross-platform network proxy client built on sing-box. Tauri 2 (Rust + React).
+**Polaris** — a cross-platform network proxy client built on [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). Tauri 2 (Rust + React).
 
 ![Home](docs/screenshots/home.png)
 
@@ -20,15 +20,28 @@
 
 | Area | Capabilities |
 |---|---|
-| Traffic capture | TUN · System proxy · Local port |
-| Routing | Smart / Global / Direct · Custom rules · Per-app routing · Region routing (incl. back-to-China) |
-| Protocols | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN |
-| Mesh | WireGuard · Tailscale · WARP; OpenConnect / OpenVPN also count once they declare internal subnets |
-| DNS | FakeIP · DoH / DoT · Resolver racing · IPv6 strategy · Leak protection |
-| Diagnostics | Connection topology · Live logs · Node speed tests · Streaming and AI unlock detection |
-| Operations | Subscription management · Online core updates · Config backup and restore · Privacy lock · Tray residency |
-| App updates | Stable / Testing channels · Re-download the current version · Installer digest verification |
-| Memory optimization | Releases the main WebView after the UI stays hidden or minimized for 10 minutes; stats, connections, and logs subscribe on demand |
+| Traffic capture | TUN · System proxy / Local port (desktop) |
+| Routing | Smart / Global / Direct · Custom rules · Per-app routing · Region routing (Smart mode, incl. back-to-China) |
+| Proxy protocols | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[1](#tor-note) |
+| Mesh connections[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[3](#masque-note) |
+| DNS | FakeIP · DoH / DoT · Node-domain resolver racing |
+| Network controls | IPv6 toggle · Browser DoH blocking · WebRTC policy (TUN only) |
+| Diagnostics | Connection topology · Live logs · Node speed tests with progress · Rule-hit display · Streaming and AI unlock detection |
+| Operations | Subscription management · Config backup and restore with confirmation · Privacy lock · Desktop tray residency |
+| App updates | Stable / Testing channels · Re-download the current version · Installer digest verification and missing-digest warnings |
+| Desktop memory optimization | With automatic lightweight mode enabled, releases the main WebView after the main window stays hidden or minimized for 10 minutes; stats, connections, and logs subscribe on demand |
+
+<a id="tor-note"></a>
+
+1. Tor requires an available Tor executable and the necessary runtime conditions on the platform.
+
+<a id="mesh-note"></a>
+
+2. OpenConnect, OpenVPN, and MASQUE are added through Mesh. Internal-network routing also depends on configured internal subnets (meshRoutes); the entry category alone does not establish that routing capability.
+
+<a id="masque-note"></a>
+
+3. MASQUE uses sing-box’s own implementation and does not support Cloudflare’s official MASQUE access, including WARP over MASQUE. This limitation applies specifically to that access method.
 
 <table>
 <tr>
@@ -45,13 +58,16 @@
 
 Download the package for your platform from [Releases](https://github.com/polaris-arch/Polaris/releases).
 
+The current release pipeline uses the filenames defined in [release-assets.mjs](scripts/release-assets.mjs); `<version>` is the app version without the `v` prefix. macOS has separate Apple Silicon / Intel packages, Windows uses x64, and Linux uses amd64. Android packages are listed as ARM64, ARMv7, and universal; universal contains only these two ARM architectures, not x86. Download availability depends on the actual assets of the selected Release. Check files against `SHA256SUMS` on the same release page.
+
 | Platform | File |
 |---|---|
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
-| Windows | `*-win-setup.exe`; portable build: `polaris-portable-*.zip` |
-| Linux | `*.deb` / `*.AppImage` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
-Packages are not signed with a paid code-signing certificate, so the first launch needs a manual approval step on each platform.
+Desktop packages are not signed with a paid code-signing certificate, so the first launch may need manual approval.
 
 The Windows installer does not bundle the WebView2 Runtime; it is fetched online when the system lacks it. On stripped-down / LTSC images or portable setups without the Runtime, install [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) from Microsoft first. Polaris does not ship an offline WebView2 installer.
 
@@ -74,12 +90,23 @@ When SmartScreen appears, choose **More info** → **Run anyway**.
 
 ## Build
 
-Requires Rust stable, Node.js 24+ (CI currently uses Node 26), and [Tauri CLI 2](https://v2.tauri.app/).
+This section is for maintainers building the current source, with Linux as the example. A successful source build does not establish runtime acceptance of published packages. See the build guides below for platform dependencies, mobile toolchains, and packaging conventions.
+
+Source-build guides: [desktop and Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [mobile core and pinned toolchains](scripts/mobile-core/README.md).
+
+iOS currently has no published IPA or jailbreak package; jailbreak compatibility is unverified. Self-signing for a non-jailbroken device requires an Apple Developer Program account with Network Extension capability and [provisioning profiles](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles) matching the App, PacketTunnel, and App Group entitlements. Free [Personal Teams do not support NE providers](https://developer.apple.com/forums/thread/128767), and sideloading alone does not grant those entitlements. Successful compilation or installation does not replace runtime verification.
+
+Requires Rust stable, Node.js 24+ (CI currently uses Node 26), pnpm 11.24.0, Go, and [Tauri CLI 2](https://v2.tauri.app/).
 
 ```bash
-node scripts/fetch-core.mjs        # fetch the sing-box core (SHA256 pinned)
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
+pnpm --dir ui install --frozen-lockfile   # frontend dependencies
+# Desktop core: consume the pinned release selected by core-manifest.json desktopRelease
+node scripts/fetch-core.mjs --platform=linux
+# Native acceptance bundles and local resource preparation: docs/build-and-package.en.md
 node scripts/fetch-cronet.mjs --platform=linux  # fetch libcronet.so beside the Linux core
-cargo tauri build --config src-tauri/tauri.linux.conf.json
+node scripts/fetch-dashboard.mjs   # fetch the built-in dashboard
+tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
 The core is not committed and must be fetched before packaging. The per-platform `--config` is not optional: omitting it produces **a package with no core**, with zero build-time errors — the failure only surfaces at runtime. Full details, CI division of labor, and the Windows installer / updater package-selection contract are in [Build and Package](docs/build-and-package.en.md).
@@ -90,7 +117,7 @@ Development gates:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd ui && npm test
+cd ui && npx pnpm@11.24.0 test
 ```
 
 ## Architecture
@@ -98,18 +125,21 @@ cd ui && npm test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   Tauri 2 main process
-crates/      17 domain crates (config-engine / core-supervisor / helper / updater / …)
+crates/      domain crates (config-engine / core-supervisor / helper / updater / …)
 resources/   sing-box core + libcronet (fetched at build time, not committed)
 ```
 
-The core runs as a sidecar child process and is managed over a gRPC control plane. TUN and system proxy are handled by privileged helpers on all three platforms (macOS / Windows / Linux, all in Rust).
+On desktop (Windows / macOS / Linux), the core runs as a sidecar child process and is managed over a gRPC control plane. Privileged work — starting the core for TUN and system takeover — is delegated to the Rust helpers on all three platforms; the System Proxy path, which needs no helper, is managed directly by the app-side `system-integration` crate, which also owns the rollback.
+
+Android loads libbox into the application process and uses mobile VPN integration rather than the desktop sidecar/helper path described above.
 
 ## Documentation
 
 | File | Contents |
 |---|---|
+| [docs/architecture.md](docs/architecture.md) | Current layering, runtime transactions, DNS / routing, privilege boundaries, and the criteria for splitting large files (Chinese only) |
 | [docs/build-and-package.en.md](docs/build-and-package.en.md) | Build, CI, packaging invariants, updater package-selection contract |
-| [docs/troubleshooting.en.md](docs/troubleshooting.en.md) | Unsigned-build notes, white screen / corrupted rendering / GPU crash triage |
+| [docs/troubleshooting.en.md](docs/troubleshooting.en.md) | MASQUE compatibility limits, unsigned-build notes, white screen / corrupted rendering / GPU crash triage |
 
 Screenshots are produced by `node scripts/capture-screenshots.mjs`: headless Chrome renders the built frontend with injected stub data — no app install and no running core required.
 
@@ -117,7 +147,8 @@ Screenshots are produced by `node scripts/capture-screenshots.mjs`: headless Chr
 
 | Project | Role |
 |---|---|
-| [sing-box](https://github.com/SagerNet/sing-box) | Proxy core (sidecar child process) |
+| [sing-box-polaris (active fork)](https://github.com/polaris-arch/sing-box-polaris) | Core fork used by Polaris; frozen source, version, and polaris-box assets follow the selected build manifest |
+| [sing-box (original upstream)](https://github.com/SagerNet/sing-box) | Original upstream project and technical foundation; acknowledged here |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Desktop runtime |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet for NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | Built-in dashboard |

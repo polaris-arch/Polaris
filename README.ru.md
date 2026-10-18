@@ -4,15 +4,15 @@
 
 [简体中文](README.md) · [English](README.en.md) · [繁體中文](README.zh-TW.md) · **Русский** · [فارسی](README.fa.md)
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
-[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-0E98A4?style=flat-square)](#установка)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
+[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#установка)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
-**Polaris** — кроссплатформенный клиент сетевого прокси на базе sing-box. Tauri 2 (Rust + React).
+**Polaris** — кроссплатформенный клиент сетевого прокси на базе [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). Tauri 2 (Rust + React).
 
 ![Главная](docs/screenshots/home.png)
 
@@ -20,15 +20,28 @@
 
 | Область | Функции |
 |---|---|
-| Перехват трафика | TUN · Системный прокси · Локальный порт |
-| Маршрутизация | Умная / Глобальная / Прямая · Свои правила · Маршрутизация по приложениям · Маршрутизация по регионам (включая возврат в Китай) |
-| Протоколы | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN |
-| Сети | WireGuard · Tailscale · WARP; OpenConnect / OpenVPN также относятся сюда, если объявлены внутренние подсети |
-| DNS | FakeIP · DoH / DoT · Гонка резолверов · Стратегия IPv6 · Защита от утечек |
-| Диагностика | Топология соединений · Логи в реальном времени · Тесты скорости узлов · Проверка доступа к стримингу и ИИ-сервисам |
-| Эксплуатация | Управление подписками · Онлайн-обновление ядра · Резервное копирование и восстановление конфигурации · Блокировка приватности · Работа в системном трее |
-| Обновление приложения | Стабильный / тестовый каналы · Повторная загрузка текущей версии · Проверка дайджеста установщика |
-| Оптимизация памяти | Освобождение основного WebView после 10 минут скрытого или свёрнутого интерфейса; статистика, соединения и логи подписываются по требованию |
+| Перехват трафика | TUN · Системный прокси / Локальный порт (ПК) |
+| Маршрутизация | Умная / Глобальная / Прямая · Свои правила · Маршрутизация по приложениям · Маршрутизация по регионам (умный режим, включая возврат в Китай) |
+| Прокси-узлы | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[1](#tor-note) |
+| Подключения Mesh[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[3](#masque-note) |
+| DNS | FakeIP · DoH / DoT · Гонка резолверов доменов узлов |
+| Управление сетью | Переключатель IPv6 · Блокировка браузерного DoH · Политика WebRTC (только TUN) |
+| Диагностика | Топология соединений · Логи в реальном времени · Тесты скорости узлов с отображением прогресса · Отображение сработавших правил · Проверка доступа к стримингу и ИИ-сервисам |
+| Эксплуатация | Управление подписками · Резервное копирование и восстановление конфигурации с подтверждением · Блокировка приватности · Работа в системном трее на ПК |
+| Обновление приложения | Стабильный / тестовый каналы · Повторная загрузка текущей версии · Проверка дайджеста установщика и предупреждение о его отсутствии |
+| Оптимизация памяти на ПК | При включённом автоматическом облегчённом режиме основной WebView освобождается после 10 минут непрерывно скрытого или свёрнутого главного окна; статистика, соединения и логи подписываются по требованию |
+
+<a id="tor-note"></a>
+
+1. Для Tor нужен доступный исполняемый файл Tor и необходимые условия выполнения на платформе.
+
+<a id="mesh-note"></a>
+
+2. OpenConnect, OpenVPN и MASQUE добавляются через Mesh. Маршрутизация во внутреннюю сеть также зависит от настроенных внутренних подсетей (meshRoutes); сама категория входа не подтверждает эту возможность.
+
+<a id="masque-note"></a>
+
+3. MASQUE использует собственную реализацию sing-box и не поддерживает подключение к официальному сервису MASQUE Cloudflare, включая WARP через MASQUE. Ограничение относится именно к этому способу подключения.
 
 <table>
 <tr>
@@ -45,13 +58,16 @@
 
 Скачайте пакет для своей платформы со страницы [Releases](https://github.com/polaris-arch/Polaris/releases).
 
+Текущий процесс выпуска использует имена файлов из [release-assets.mjs](scripts/release-assets.mjs); `<version>` — версия приложения без префикса `v`. Для macOS предусмотрены отдельные пакеты Apple Silicon / Intel, для Windows — x64, для Linux — amd64. Пакеты Android перечислены в порядке ARM64, ARMv7 и universal; universal содержит только эти две архитектуры ARM, без x86. Наличие загрузок определяется фактическими файлами выбранного релиза. Проверьте файлы по `SHA256SUMS` на странице релиза.
+
 | Платформа | Файл |
 |---|---|
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
-| Windows | `*-win-setup.exe`; портативная сборка — `polaris-portable-*.zip` |
-| Linux | `*.deb` / `*.AppImage` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
-Пакеты не подписываются платным сертификатом подписи кода, поэтому при первом запуске на каждой платформе требуется ручное разрешение.
+Настольные пакеты не подписываются платным сертификатом подписи кода; при первом запуске может потребоваться ручное разрешение.
 
 Установщик Windows не содержит встроенного WebView2 Runtime; при его отсутствии в системе он загружается из сети. Если у вас урезанная сборка / LTSC или портативная версия без Runtime, сначала установите [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) с сайта Microsoft. Polaris не поставляет офлайн-установщик WebView2.
 
@@ -74,12 +90,23 @@
 
 ## Сборка
 
-Требуются Rust stable, Node.js 24+ (в CI сейчас Node 26) и [Tauri CLI 2](https://v2.tauri.app/).
+Раздел предназначен для разработчиков, собирающих текущий исходный код; пример приведён для Linux. Успешная сборка исходного кода не подтверждает проверку работы опубликованных пакетов. Зависимости платформ, мобильные инструменты и правила упаковки описаны в руководствах ниже.
+
+Сборка из исходного кода: [настольные платформы и Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [мобильное ядро и фиксированные инструменты](scripts/mobile-core/README.md).
+
+Для iOS сейчас не публикуются IPA или пакеты для jailbreak; совместимость с jailbreak не проверена. Самостоятельная подпись для устройства без jailbreak требует аккаунта Apple Developer Program с возможностью Network Extension и [профилей provisioning](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles), соответствующих правам App, PacketTunnel и App Group. Бесплатная [Personal Team не поддерживает NE provider](https://developer.apple.com/forums/thread/128767), а установка вне магазина сама по себе не даёт этих прав. Успешная компиляция или установка не заменяет проверку работы.
+
+Требуются Rust stable, Node.js 24+ (в CI сейчас Node 26), pnpm 11.24.0, Go и [Tauri CLI 2](https://v2.tauri.app/).
 
 ```bash
-node scripts/fetch-core.mjs        # загрузка ядра sing-box (закреплено по SHA256)
-node scripts/fetch-cronet.mjs      # загрузка libcronet
-cargo tauri build --config src-tauri/tauri.linux.conf.json
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
+pnpm --dir ui install --frozen-lockfile   # зависимости фронтенда
+# Ядро для ПК: закреплённый релиз из desktopRelease в core-manifest.json
+node scripts/fetch-core.mjs --platform=linux
+# Нативные проверочные пакеты и подготовка ресурсов: docs/build-and-package.en.md
+node scripts/fetch-cronet.mjs --platform=linux  # загрузка libcronet.so рядом с ядром Linux
+node scripts/fetch-dashboard.mjs   # загрузка встроенной панели
+tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
 Ядро не хранится в репозитории и должно быть загружено перед сборкой пакета. Платформенный `--config` обязателен: без него получится **пакет без ядра**, причём во время сборки не будет ни одной ошибки — сбой проявится только во время работы. Полное описание, разделение задач в CI и контракт выбора пакета для установщика Windows и обновлятора — в [Сборка и упаковка](docs/build-and-package.en.md).
@@ -90,7 +117,7 @@ cargo tauri build --config src-tauri/tauri.linux.conf.json
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd ui && npm test
+cd ui && npx pnpm@11.24.0 test
 ```
 
 ## Архитектура
@@ -98,18 +125,21 @@ cd ui && npm test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   Главный процесс Tauri 2
-crates/      17 доменных crate (config-engine / core-supervisor / helper / updater / …)
+crates/      доменные crate (config-engine / core-supervisor / helper / updater / …)
 resources/   Ядро sing-box + libcronet (загружаются при сборке, в репозитории не хранятся)
 ```
 
-Ядро работает как дочерний процесс-sidecar и управляется через gRPC. TUN и системный прокси обслуживаются привилегированными helper-процессами на всех трёх платформах (macOS / Windows / Linux, целиком на Rust).
+На настольных платформах (Windows / macOS / Linux) ядро работает как дочерний процесс-sidecar и управляется через gRPC. Привилегированные операции — запуск ядра для TUN и системный перехват — делегируются helper-процессам на Rust на всех трёх платформах; путь System Proxy, которому helper не нужен, управляется напрямую crate `system-integration` на стороне приложения, он же отвечает за откат.
+
+На Android libbox загружается в процесс приложения и используется мобильная интеграция VPN, а не описанный выше настольный путь sidecar/helper.
 
 ## Документация
 
 | Файл | Содержание |
 |---|---|
+| [docs/architecture.md](docs/architecture.md) | Текущие слои, транзакции выполнения, DNS / маршрутизация, границы привилегий и критерии разделения больших файлов (только на китайском) |
 | [docs/build-and-package.en.md](docs/build-and-package.en.md) | Сборка, CI, инварианты упаковки, контракт выбора пакета обновлятором |
-| [docs/troubleshooting.ru.md](docs/troubleshooting.ru.md) | Замечания о неподписанных сборках, белый экран / артефакты отрисовки / сбои GPU |
+| [docs/troubleshooting.ru.md](docs/troubleshooting.ru.md) | Ограничения совместимости MASQUE, замечания о неподписанных сборках, белый экран / артефакты отрисовки / сбои GPU |
 
 Скриншоты генерируются командой `node scripts/capture-screenshots.mjs`: headless Chrome отрисовывает собранный фронтенд с подставленными тестовыми данными — устанавливать приложение и запускать ядро не нужно.
 
@@ -117,7 +147,8 @@ resources/   Ядро sing-box + libcronet (загружаются при сбо
 
 | Проект | Назначение |
 |---|---|
-| [sing-box](https://github.com/SagerNet/sing-box) | Прокси-ядро (дочерний процесс-sidecar) |
+| [sing-box-polaris (используемый форк)](https://github.com/polaris-arch/sing-box-polaris) | Форк ядра, используемый Polaris; фиксированные исходники, версия и файлы polaris-box определяются выбранным манифестом сборки |
+| [sing-box (исходный upstream)](https://github.com/SagerNet/sing-box) | Исходный проект и техническая основа; благодарность разработчикам |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Десктопная среда выполнения |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet для NaiveProxy |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | Встроенная панель |

@@ -4,15 +4,15 @@
 
 **简体中文** · [English](README.en.md) · [繁體中文](README.zh-TW.md) · [Русский](README.ru.md) · [فارسی](README.fa.md)
 
-[![release](https://img.shields.io/github/v/release/polaris-arch/Polaris?style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
-[![sing-box](https://img.shields.io/badge/sing--box-1.14-0E98A4?style=flat-square)](https://github.com/SagerNet/sing-box)
-[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-0E98A4?style=flat-square)](#安装)
+[![release](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris%2Freleases%2Flatest&query=%24.tag_name&style=flat-square&color=0E98A4&label=release)](https://github.com/polaris-arch/Polaris/releases/latest)
+[![sing-box](https://img.shields.io/badge/sing--box-1.15-0E98A4?style=flat-square)](https://github.com/polaris-arch/sing-box-polaris)
+[![platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Android-0E98A4?style=flat-square)](#安装)
 [![license](https://img.shields.io/badge/license-MIT-0E98A4?style=flat-square)](LICENSE)
-[![stars](https://img.shields.io/github/stars/polaris-arch/Polaris?style=flat-square&color=0E98A4)](https://github.com/polaris-arch/Polaris/stargazers)
+[![stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fpolaris-arch%2FPolaris&query=%24.stargazers_count&style=flat-square&color=0E98A4&label=stars)](https://github.com/polaris-arch/Polaris/stargazers)
 
 </div>
 
-**北极星** — 基于 sing-box 的跨平台网络代理客户端。Tauri 2（Rust + React）。
+**北极星** — 基于 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) 的跨平台网络代理客户端。Tauri 2（Rust + React）。
 
 ![主页](docs/screenshots/home.png)
 
@@ -20,15 +20,28 @@
 
 | 领域 | 能力 |
 |---|---|
-| 接管方式 | TUN · 系统代理 · 本地端口 |
-| 分流 | 智能 / 全局 / 直连 · 自定义规则 · 应用分流 · 地区分流（含回国） |
-| 协议 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor · OpenConnect · OpenVPN |
-| 组网 | WireGuard · Tailscale · WARP；OpenConnect / OpenVPN 声明了内网段后同样归入 |
-| DNS | FakeIP · DoH / DoT · 解析竞速 · IPv6 策略 · 泄漏防护 |
-| 诊断 | 连接拓扑 · 实时日志 · 节点测速 · 流媒体与 AI 解锁检测 |
-| 运维 | 订阅管理 · 内核在线更新 · 配置备份恢复 · 隐私锁 · 托盘驻留 |
-| 应用更新 | 正式版 / 测试版通道 · 可重新下载当前版本 · 安装包摘要校验 |
-| 内存优化 | 界面隐藏或最小化 10 分钟后自动释放主 WebView；统计、连接与日志按需订阅 |
+| 接管方式 | TUN · 系统代理 / 本地端口（桌面） |
+| 分流 | 智能 / 全局 / 直连 · 自定义规则 · 应用分流 · 地区分流（智能模式，含回国） |
+| 普通代理 | VLESS · VMess · Trojan · Hysteria 2 / 1 · TUIC · Shadowsocks · AnyTLS · Naive · Snell · SOCKS · HTTP · SSH · Tor[1](#tor-note) |
+| 组网接入[2](#mesh-note) | WireGuard · Tailscale · WARP (WireGuard) · OpenConnect · OpenVPN · MASQUE[3](#masque-note) |
+| DNS | FakeIP · DoH / DoT · 节点域名解析竞速 |
+| 网络控制 | IPv6 开关 · 浏览器 DoH 拦截 · WebRTC 策略（仅 TUN） |
+| 诊断 | 连接拓扑 · 实时日志 · 节点测速与进度 · 规则命中展示 · 流媒体与 AI 解锁检测 |
+| 运维 | 订阅管理 · 配置备份恢复与确认 · 隐私锁 · 桌面托盘驻留 |
+| 应用更新 | 正式版 / 测试版通道 · 可重新下载当前版本 · 安装包摘要校验与缺失提示 |
+| 桌面内存优化 | 启用自动轻量模式后，主窗口连续隐藏或最小化 10 分钟会释放主 WebView；统计、连接与日志按需订阅 |
+
+<a id="tor-note"></a>
+
+1. Tor 需要可用的 Tor 可执行程序；平台上的实际运行条件须另行满足。
+
+<a id="mesh-note"></a>
+
+2. 组网添加入口包含 OpenConnect、OpenVPN 和 MASQUE；内网路由能力还取决于所配置的内网网段（meshRoutes），不能仅凭入口归类判断。
+
+<a id="masque-note"></a>
+
+3. MASQUE 使用 sing-box 自有实现，不支持 Cloudflare 官方的 MASQUE 接入（包括 WARP 的 MASQUE 接入）。此限制仅针对该接入方式。
 
 <table>
 <tr>
@@ -45,13 +58,16 @@
 
 从 [Releases](https://github.com/polaris-arch/Polaris/releases) 下载对应平台安装包。
 
+当前发布流程按 [release-assets.mjs](scripts/release-assets.mjs) 使用以下文件名，`<version>` 为应用版本（不含 `v` 前缀）。macOS 按 Apple Silicon / Intel 分包，Windows 为 x64，Linux 为 amd64；Android 依次为 ARM64、ARMv7 和 universal，universal 仅含这两种 ARM 架构，不含 x86。下载时以所选 Release 的实际附件为准，并用同页 `SHA256SUMS` 核对文件。
+
 | 平台 | 文件 |
 |---|---|
-| macOS | `*-mac-arm64.dmg` / `*-mac-x64.dmg` |
-| Windows | `*-win-setup.exe`；免安装用 `polaris-portable-*.zip` |
-| Linux | `*.deb` / `*.AppImage` |
+| macOS | `Polaris_<version>_aarch64-mac.dmg` / `Polaris_<version>_x64-mac.dmg` |
+| Windows | `Polaris_<version>_x64-win-setup.exe` / `Polaris_<version>_x64-win-Portable.zip` |
+| Linux | `Polaris_<version>_amd64-linux.deb` / `Polaris_<version>_amd64-linux.AppImage` |
+| Android | `Polaris_<version>_arm64-v8a-android.apk` / `Polaris_<version>_armeabi-v7a-android.apk` / `Polaris_<version>_universal-android.apk` |
 
-安装包当前不做付费代码签名，首次启动需按平台放行。
+桌面安装包当前不做付费代码签名，首次启动需按平台放行。
 
 Windows 安装器不内嵌 WebView2 Runtime；系统缺失时会联网获取。精简版 / LTSC 或便携版用户若缺少
 Runtime，请先从微软官方下载并安装 [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
@@ -78,12 +94,23 @@ SmartScreen 提示时选择「更多信息」→「仍要运行」。
 
 ## 构建
 
-需要 Rust stable、Node.js 24+（CI 当前使用 Node 26）、[Tauri CLI 2](https://v2.tauri.app/)。
+以下供维护者构建当前源码，示例为 Linux；源码构建成功不等于已发布安装包通过运行验收。平台依赖、移动端工具链与打包约定见下方构建文档。
+
+源码构建入口：[桌面与 Android](docs/build-and-package.md) · [iOS / iPadOS](docs/ios-source-build.md) · [移动内核与固定工具链](scripts/mobile-core/README.md)。
+
+iOS 目前不提供 IPA 或越狱包，越狱兼容性未验证。非越狱设备自行签名需具备 Network Extension 能力的 Apple Developer Program 账号，以及匹配 App、PacketTunnel 和 App Group 权限的 [provisioning profiles](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)；免费 [Personal Team 不支持 NE provider](https://developer.apple.com/forums/thread/128767)，侧载本身不会授予这些权限。编译成功或安装成功均不能替代运行验收。
+
+需要 Rust stable、Node.js 24+（CI 当前使用 Node 26）、pnpm 11.24.0、Go、[Tauri CLI 2](https://v2.tauri.app/)。
 
 ```bash
-node scripts/fetch-core.mjs        # 拉 sing-box 内核（SHA256 钉扎）
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
+pnpm --dir ui install --frozen-lockfile   # 前端依赖
+# 桌面核：按当前 core-manifest.json 的 desktopRelease 消费固定发布资产
+node scripts/fetch-core.mjs --platform=linux
+# 发布打包的原生验收包与本地资源准备，见 docs/build-and-package.md
 node scripts/fetch-cronet.mjs --platform=linux  # 拉与 Linux 核同目录的 libcronet.so
-cargo tauri build --config src-tauri/tauri.linux.conf.json
+node scripts/fetch-dashboard.mjs   # 拉内置面板
+tauri build --config src-tauri/tauri.linux.conf.json
 ```
 
 内核不入库，打包前必须拉。平台 `--config` 不可省：缺了会打出**没有内核的包**，且构建期零报错，
@@ -104,12 +131,14 @@ cd ui && npx pnpm@11.24.0 test
 ```
 ui/          React + Zustand + Vite + Tailwind
 src-tauri/   Tauri 2 主进程
-crates/      17 个 domain crate（config-engine / core-supervisor / helper / updater / …）
+crates/      domain crates（config-engine / core-supervisor / helper / updater / …）
 resources/   sing-box 内核 + libcronet（构建期拉取，不入库）
 ```
 
-内核以 sidecar 子进程运行，经 gRPC 管理面通信。需要特权的 TUN 起核与系统接管委托三平台
+桌面端（Windows / macOS / Linux）内核以 sidecar 子进程运行，经 gRPC 管理面通信。需要特权的 TUN 起核与系统接管委托三平台
 Rust helper；无需 helper 的 System Proxy 路径由应用侧 `system-integration` 直接管理并负责回滚。
+
+Android 将 libbox 载入应用进程，采用移动端 VPN 集成，不使用上述桌面 sidecar/helper 路径。
 
 ## 文档
 
@@ -117,7 +146,7 @@ Rust helper；无需 helper 的 System Proxy 路径由应用侧 `system-integrat
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 当前分层、运行事务、DNS/路由、特权边界与大文件判定准则 |
 | [docs/build-and-package.md](docs/build-and-package.md) | 构建、CI、打包不变量、更新器选包契约 |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | 不签名说明、白屏 / 花屏 / GPU 崩溃排障 |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | MASQUE 兼容限制、不签名说明、白屏 / 花屏 / GPU 崩溃排障 |
 
 截图由 `node scripts/capture-screenshots.mjs` 生成：无头 Chrome 渲染前端构建产物 + 注入桩数据，
 不需要装应用或起内核。
@@ -126,7 +155,8 @@ Rust helper；无需 helper 的 System Proxy 路径由应用侧 `system-integrat
 
 | 项目 | 用途 |
 |---|---|
-| [sing-box](https://github.com/SagerNet/sing-box) | 代理内核（sidecar 子进程） |
+| [sing-box-polaris（实际使用的 fork）](https://github.com/polaris-arch/sing-box-polaris) | 实际使用的内核 fork；冻结源码、版本及 polaris-box 资产以所选构建清单为准 |
+| [sing-box（原始上游）](https://github.com/SagerNet/sing-box) | 原始上游项目与技术来源；保留致谢 |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | 桌面运行时 |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | NaiveProxy 的 libcronet |
 | [sing-box-dashboard](https://github.com/SagerNet/sing-box-dashboard) | 内置面板 |
