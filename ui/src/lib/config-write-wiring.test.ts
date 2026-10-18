@@ -95,12 +95,12 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
 const PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
   // W-a：设置页漏斗。只认对象字面量实参 —— `update(idx, next)` 那种同名的列表编辑器局部函数不是写 config。
   ['W-a', /(?<![.\w$])update\s*\(\s*\{/g],
-  // W-b：通用 config 写（版本化整份 save / 原子 patch / 实体事务 / store 包装）。
-  ['W-b', /(?:\b(?:api\.config|configApi)\s*\.\s*(?:save|patch|mutateEntities)|\b(?:saveConfig|mutateConfigEntities))\s*\(/g],
+  // W-b：config 写（版本化整份 save / 原子 patch / 实体事务 / 原子 takeover / store 包装）。
+  ['W-b', /(?:\b(?:api\.config|configApi)\s*\.\s*(?:save|patch|mutateEntities|setTakeover)|\b(?:saveConfig|mutateConfigEntities))\s*\(/g],
   // W-d：专用 IPC 写腿 —— 前端发的是「加一个节点」而不是「写 servers 键」，但落盘的是同一份 config。
   [
     'W-d',
-    /\b(?:api\.(?:server|rules|subscription|ruleResources)|(?:server|rules|subscription|ruleResources)Api)\s*\.\s*(?:add|addBulk|createStart|update|updateServers|delete|deleteBatch|reorder|switch|registerWarp|applyWarpLicense|download|redownload|cancel|resetBuiltin|setAutoUpdate|updateAll|tailscaleLogin|tailscaleLogout|tailscaleLoginCancel)\s*\(/g,
+    /\b(?:api\.(?:server|rules|subscription|ruleResources)|(?:server|rules|subscription|ruleResources)Api)\s*\.\s*(?:add|addBulk|createStart|update|updateServers|delete|deleteBatch|reorder|switch|registerWarp|applyWarpLicense|download|redownload|cancel|resetBuiltin|setAutoUpdate|updateAll|tailscaleLogin|tailscaleLogout|tailscaleLoginCancel|autoSelectEnable|autoSelectSwitchNow)\s*\(/g,
   ],
 ];
 
@@ -325,6 +325,12 @@ interface Site {
 }
 
 const SITES: readonly Site[] = [
+  ...(['switch', 'autoSelectEnable', 'autoSelectSwitchNow'] as const).map(method => ({
+    file: 'lib/auto-select-actions.ts',
+    callee: `api.server.${method}(`,
+    route: 'direct' as const,
+    why: 'W-1 saved selection intent/actual exit transaction: dedicated backend command in existing webview write queue, authoritative readback before feedback; no config patch or staged selection intent.',
+  })),
   // ── W-a：设置子页与 DNS 资源工作区共用 `useConfig().update` 漏斗 ──
   // 漏斗按键判是硬要求而非风格：`SettingsNetwork` 的 `update({ [key]: next })` 一个调用点跨
   // `mixedPort`(Class B) / `controlPort`(Class A) 两个 class，静态判必错一半。
@@ -337,7 +343,6 @@ const SITES: readonly Site[] = [
       'components/screens/settings/SettingsTun.tsx',
       'components/screens/settings/SettingsUpdate.tsx',
       'components/screens/settings/AppUpdateCard.tsx',
-      'components/screens/settings/CoreUpdateCard.tsx',
       'components/dialogs/DnsResourceDialog.tsx',
       'components/screens/rules/DnsPolicyWorkspace.tsx',
       'components/screens/rules/NetworkProfilePanel.tsx',
@@ -373,10 +378,16 @@ const SITES: readonly Site[] = [
 
   // ── W-b：通用 config 写 ──
   {
-    file: 'components/screens/home/HomeScreen.tsx',
+    file: 'hooks/use-periodic-speed-test-fields.ts',
     callee: 'saveConfig(',
     route: 'direct',
-    why: 'W-1 切节点（直连哨兵写 selectedServerId）+ W-2 系统代理接管（proxyModeType 有 OS 活态回读）；同批被 applyFakeIpTunEntry 连带纠正的 dnsConfig 是这次原子模式切换的一半，拆开暂存会让 UI 与 OS 活态分叉',
+    why: 'W-0/Class A：订阅表单里「开启全局周期测速」的就地操作，只写 periodicSpeedTestEnabled。它是原始配置的顶层键（∉ UserConfig），调度器下一拍即读到，不需要重启内核，也就没有可暂存的东西',
+  },
+  {
+    file: 'components/screens/home/HomeScreen.tsx',
+    callee: 'api.config.setTakeover(',
+    route: 'direct',
+    why: 'W-2：专用后端原子事务同时更新 proxyModeType 与 FakeIP-TUN 纠正，系统代理接管有 OS 活态回读；不能拆成暂存键。Home 已不调用 saveConfig，实际 setTakeover 写腿必须留在扫描与登记面内',
   },
   {
     file: 'components/screens/logs/LogsScreen.tsx',
@@ -453,9 +464,15 @@ const SITES: readonly Site[] = [
   },
   {
     file: 'tray/TrayMenu.tsx',
-    callee: 'api.config.patch(',
+    callee: 'saveConfig(',
     route: 'direct',
-    why: 'W-1 模式/出口与 W-2 系统代理接管：只提交本动作字段；托盘虽是独立 webview，未提交字段仍由后端锁内保留',
+    why: 'W-1 模式切换：只提交 proxyMode；托盘虽是独立 webview，未提交字段仍由后端锁内保留。接管方式另走专用 setTakeover 原子事务',
+  },
+  {
+    file: 'tray/TrayMenu.tsx',
+    callee: 'api.config.setTakeover(',
+    route: 'direct',
+    why: 'W-2：与 Home 共用后端最新配置原子事务，只传用户选择的 modeType，同时完成 FakeIP-TUN 纠正与系统代理活态回读；不得把托盘陈旧 DNS 快照拆成暂存或 patch 写回',
   },
 
   {
@@ -566,6 +583,12 @@ const SITES: readonly Site[] = [
     callee: 'api.server.tailscaleLogout(',
     route: 'direct',
     why: 'W-3：清 tailscale state 目录不可逆（BYPASS_TABLE 的 deleteTailscaleNode 同族）',
+  },
+  {
+    file: 'components/dialogs/ts-logout-confirm.ts',
+    callee: 'api.server.tailscaleLogout(',
+    route: 'direct',
+    why: 'W-3：主连接持有该节点时用户确认断开后的第二次登出，与 TsSettingsDialog / NodesScreen 的第一次登出同一动作、同样不可逆；两个调用点都已先过 splitStagedOnly 前置拦截',
   },
   {
     file: 'components/dialogs/TsLoginDialog.tsx',
@@ -966,6 +989,17 @@ const SITES: readonly Site[] = [
 const key = (s: { file: string; callee: string }) => `${s.file} | ${s.callee}`;
 
 describe('守卫自检：扫到的确实是源码（防扫空 / 过滤过头 → 断言恒真）', () => {
+  it('原子 takeover 两种 API 拼写都在写面内，读取与同名普通函数不误报', () => {
+    const writes = (source: string) => PATTERNS.flatMap(([, pattern]) =>
+      [...code(source).matchAll(pattern)].map(match => match[0].replace(/\s+/g, '')),
+    );
+    expect(writes('api.config.setTakeover(next); configApi . setTakeover(next);')).toEqual([
+      'api.config.setTakeover(', 'configApi.setTakeover(',
+    ]);
+    expect(writes('api.config.get(); configApi.getValue(key); setTakeover(next); other.setTakeover(next);')).toEqual([]);
+    expect(writes('// api.config.setTakeover(next);')).toEqual([]);
+  });
+
   it('测试文件与 api-client 定义处（barrel + ipc/api/ 目录）都被排除在扫描面外', () => {
     expect(FILES.some((p) => /\.(test|spec)\.tsx?$/.test(p))).toBe(false);
     expect(HITS.some((h) => h.file.endsWith('ipc/api-client.ts') || h.file.includes('ipc/api/'))).toBe(

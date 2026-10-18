@@ -117,7 +117,7 @@ export function ResCatalogPanel({ instanceId }: { instanceId: string }): ReactEl
         ]);
         if (!live) return;
         setBuiltin(catalog?.items ?? []);
-        setDownloadedIds(new Set((Array.isArray(list) ? list : []).map((item) => item.id)));
+        setDownloadedIds(new Set((Array.isArray(list) ? list : []).filter((item) => item.fileExists).map((item) => item.id)));
         if (cached?.items != null) setExternal(cached.items);
         setLoadErr(false);
       } catch (err) {

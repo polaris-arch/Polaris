@@ -91,8 +91,9 @@ export type { SpeedTestDonePayload };
 /**
  * 中断成因 → 标题文案键。**只换标题，不换动作集合**。
  *
- * 三种成因下用户能做的事完全相同（继续剩余 / 重新测速 / 关闭），差别只在「为什么停了、接下来该去
- * 看哪儿」：让位是「主核接管了」，另两种是「本机测速核出事了，日志页 `sing-box` 来源里有它的行」。
+ * 各种成因下用户能做的事完全相同（继续剩余 / 重新测速 / 关闭），差别只在「为什么停了、接下来该去
+ * 看哪儿」：让位是「主核接管了」，核退出与核无响应是「本机测速核出事了，日志页 `sing-box` 来源里
+ * 有它的行」，取消与被抢占是「这一轮被叫停了，核与节点都没出事」。
  * 把动作也跟着分叉只会让同一件事有两套代码路径。
  *
  * 载荷没有 `reason`（旧后端 / 兜底静默超时腿）→ 回落到通用的那句，与本字段引入前逐字一致。
@@ -101,6 +102,8 @@ const INTERRUPT_MSG_KEY: Record<SpeedTestInterruptReason, string> = {
   superseded: 'nodes.speedTestInterrupted',
   core_exited: 'nodes.speedTestCoreExited',
   core_unresponsive: 'nodes.speedTestCoreUnresponsive',
+  cancelled: 'nodes.speedTestCancelled',
+  preempted: 'nodes.speedTestPreempted',
 };
 
 /**

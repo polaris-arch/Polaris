@@ -27,14 +27,14 @@
  * @param max 上限；达到即停止追加（不报错，与「添加」按钮的 atCap 语义一致）
  * @returns 合并后的**完整**新列表
  */
-export function parseBulkEntries(draft: string, existing: string[], max?: number): string[] {
+export function parseBulkEntries(draft: string, existing: string[], max?: number, entryIdentity: (value: string) => string = (value) => value.trim().toLowerCase()): string[] {
   const next = [...existing];
   // 去重基准里剔掉空串：既有的空行不该让粘贴内容里的第一个条目被误判成重复。
-  const seen = new Set(next.map((s) => s.trim().toLowerCase()).filter(Boolean));
+  const seen = new Set(next.map(entryIdentity).filter(Boolean));
   for (const raw of draft.split(/[,\n]/)) {
     const entry = raw.trim();
     if (!entry) continue;
-    const key = entry.toLowerCase();
+    const key = entryIdentity(entry);
     if (seen.has(key)) continue;
     if (max !== undefined && next.length >= max) break;
     seen.add(key);

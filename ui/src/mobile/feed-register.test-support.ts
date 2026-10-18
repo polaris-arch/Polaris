@@ -74,8 +74,8 @@ export interface FeedEntry {
 
 /* ───────────── 写入方锚（多格共用的写在这里，改一处就够）───────────── */
 
-/** 配置镜像的唯一写入方：冷启动一次 + `event:configChanged` 广播重拉。 */
-const CONFIG_FED: Anchor = { file: 'ui/src/mobile/config-sync.ts', mustContain: 'loadConfig(true)' };
+/** 移动根持有共享 main feed；config-sync.test.tsx 验证真实导入、返回 cleanup 与首拉/广播发布。 */
+const CONFIG_FED: Anchor = { file: 'ui/src/mobile/config-sync.ts', mustContain: "return acquireConfigSync({ scope: 'main' });" };
 /** 连接态：事件三条腿 + 30s 兜底轮询都收敛到这一次重拉。 */
 const PROXY_STATUS_FED: Anchor = { file: 'ui/src/mobile/app-wiring.ts', mustContain: 'store().refreshProxyStatus()' };
 /** 🔴 W-23 的那条腿。摘掉它，`tailscaleStatuses` / `tailscaleLoginStates` 两格立刻没有写入方。 */
@@ -187,6 +187,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   { id: 'useAppStore.updateProxyMode', role: 'action', disposition: act(STORE_APP), note: '改分流模式（首页模式芯片与规则屏「切回智能」共用这一条）。' },
   { id: 'useAppStore.startProxy', role: 'action', disposition: act(STORE_APP), note: '起核。它**故意不写** `proxyStatus` —— 托盘等别的入口也能启停，只有走事件才让多处收敛。' },
   { id: 'useAppStore.stopProxy', role: 'action', disposition: act(STORE_APP), note: '停核。同起核：不写连接态，等 `onStopped` 事件把真值推回来。' },
+  { id: 'useAppStore.acceptSelectionConfig', role: 'action', disposition: act({ file: 'ui/src/store/app-store.ts', mustContain: 'acceptSelectionConfig: async (config)' }), note: 'Auto 写事务读回后发布后端落盘配置与派生镜像；既不乐观改意图，也不另发配置写。' },
   { id: 'useAppStore.switchServer', role: 'action', disposition: act(STORE_APP), note: '换出口节点（首页选择面与节点屏整行主动作共用这一条）。' },
   { id: 'useAppStore.setUnlock', role: 'action', disposition: act(STORE_APP), note: '检测成功或失败后结束进行态。' },
   { id: 'useAppStore.setUnlockProgress', role: 'action', disposition: act(STORE_APP), note: '应用级 progress 事件逐个更新服务徽章。' },
@@ -209,10 +210,14 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   { id: 'useAppStore.retainServerIds', role: 'action', disposition: act(STORE_APP), note: '配置对账时驱逐已删节点的派生缓存（长会话里这些表只增不减就是泄漏）。' },
 
   /* ── 延迟 ───────────────────────────────────────────────────────────── */
-  { id: 'useLatencyStore.latencyMap', role: 'state', disposition: fed({ file: 'ui/src/mobile/use-mobile-speed-test.ts', mustContain: 'applyLatencyResult(event.serverId, event.latency)' }), note: '窗口 coordinator 接主动带 runId 结果与 passive RTT；旧轮次不写延迟，invoke 仅补遗漏，切页仍继续。' },
-  { id: 'useLatencyStore.testedAt', role: 'state', disposition: fed({ file: 'ui/src/mobile/use-mobile-speed-test.ts', mustContain: 'applyLatencyResult(event.serverId, event.latency)' }), note: '测速时刻（陈旧判定靠它，陈旧要画成「陈旧」而不是一个数）。' },
-  { id: 'useLatencyStore.applyLatencyResult', role: 'action', disposition: act(STORE_LATENCY), note: '已接受主动 RESULT 或无 ID passive RTT 的单项延迟写入口。' },
-  { id: 'useLatencyStore.applyLatencyResults', role: 'action', disposition: act(STORE_LATENCY), note: '延迟落库腿（一次测速的结果整批写进去）。' },
+  { id: 'useLatencyStore.latencyMap', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, currentConfig.servers)' }), note: '事件与invoke仅触发共享账本读回；同配置/生命周期资格的快照才写入数字。' },
+  { id: 'useLatencyStore.testedAt', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, currentConfig.servers)' }), note: '测速时刻（陈旧判定靠它，陈旧要画成「陈旧」而不是一个数）。' },
+  { id: 'useLatencyStore.applyLatencyResult', role: 'action', disposition: act(STORE_LATENCY), note: '旧单项回包只请求账本刷新，不采信无身份数字。' },
+  { id: 'useLatencyStore.applyLatencyResults', role: 'action', disposition: act(STORE_LATENCY), note: '旧批量回执只请求账本刷新，不采信裸数值。' },
+  { id: 'useLatencyStore.projections', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, currentConfig.servers)' }), note: '同版账本的候选五态及测量标注。' },
+  { id: 'useLatencyStore.currentProjections', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, currentConfig.servers)' }), note: '当前出口保留实际测量目的，不覆盖候选路径。' },
+  { id: 'useLatencyStore.readError', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'invalidate(true)' }), note: '权威读回失败如实显示结果不可读，不冒未测或成功。' },
+  { id: 'useLatencyStore.snapshot', role: 'state', disposition: fed({ file: 'ui/src/store/use-latency-store.ts', mustContain: 'applySnapshot(result, currentConfig.servers)' }), note: '进程/版本/资格绑定的只读账本快照，不持久化。' },
   { id: 'useLatencyStore.retainServerIds', role: 'action', disposition: act(STORE_LATENCY), note: '延迟表的对账驱逐（节点删了它的延迟也要跟着走）。' },
 
   /* ── 暂存（待应用条）─────────────────────────────────────────────────── */

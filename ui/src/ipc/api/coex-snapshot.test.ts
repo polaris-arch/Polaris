@@ -1,0 +1,114 @@
+import runtimeFixture from '@/contracts/coex-runtime.rust.fixture.json';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { IPC_CHANNELS } from '@/domain/ipc-channels';
+import { CoexSnapshotDecodeError } from '@/contracts/coex-snapshot';
+import rustFixture from '@/contracts/coex-snapshot.rust.fixture.json';
+import windowsFixture from '@/contracts/coex-windows.rust.fixture.json';
+const transport = vi.hoisted(() => vi.fn());
+const eventTransport = vi.hoisted(() => vi.fn());
+vi.mock('@tauri-apps/api/event', () => ({ listen: eventTransport }));
+vi.mock('@tauri-apps/api/core', () => ({ invoke: transport }));
+const { systemApi } = await import('./system');
+const { IpcError } = await import('../ipc-client');
+const unknown = { status: 'unknown', reason: 'fixture source unavailable' };
+const snapshot = {
+  schemaVersion: 1, platform: 'darwin', objects: unknown, observation: unknown, commandCleanup: unknown,
+  context: { observationPhase: unknown, ownInterfaces: unknown, criteria: unknown, repairHistory: unknown }, classification: unknown,
+};
+describe('actual system wrapper through IPC envelope decoder', () => {
+  beforeEach(() => { transport.mockReset(); vi.stubGlobal('window', { __TAURI_INTERNALS__: {} }); });
+  afterEach(() => vi.unstubAllGlobals());
+  it.each(Object.entries(windowsFixture.snapshots))('roundtrips actual Windows %s on the same manual IPC command', async (_name, wire) => {
+    transport.mockResolvedValueOnce({ success: true, data: wire });
+    expect(await systemApi.coexReadonlySnapshot()).toEqual(wire);
+    expect(transport).toHaveBeenCalledTimes(1);
+    expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_READONLY_SNAPSHOT, {});
+  });
+  it.each(['mappedV6', 'mappedV6WireSpelling'] as const)('retains Rust-serialized %s address/nextHop/prefix and scopes through the real wrapper', async (name) => {
+    transport.mockResolvedValueOnce({ success: true, data: windowsFixture.snapshots[name] });
+    const v = await systemApi.coexReadonlySnapshot();
+    if (v.schemaVersion !== 2 || v.sources.addresses.rows.status !== 'known' || v.sources.routes6.rows.status !== 'known') throw Error('fixture');
+    const address = v.sources.addresses.rows.value[1]; const route = v.sources.routes6.rows.value[0];
+    expect(address.family).toBe('ipv6'); expect(address.address).toBe('::ffff:192.0.2.9'); expect(address.scopeId).toEqual({ status: 'known', value: 42 });
+    expect(route.family).toBe('ipv6'); expect(route.prefix).toBe(name === 'mappedV6' ? '::ffff:c000:200/120' : '::ffff:192.0.2.0/120');
+    expect(route.nextHop).toEqual({ status: 'known', value: '::ffff:192.0.2.1' }); expect(route.nextHopScopeId).toEqual({ status: 'known', value: 42 });
+    expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_READONLY_SNAPSHOT, {}); expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it('preserves one wire-budget Unknown and the other four actual Rust sources through the wrapper', async () => {
+    transport.mockResolvedValueOnce({ success: true, data: windowsFixture.snapshots.oversizedSource });
+    const v = await systemApi.coexReadonlySnapshot(); if (v.schemaVersion !== 2) throw Error('fixture');
+    expect(v.sources.addresses.rows.status).toBe('unknown');
+    expect(v.sources.addresses.error).toEqual({ status: 'known', value: 'Windows source wire byte limit exceeded' });
+    for (const key of ['adapters', 'routes4', 'routes6', 'ras'] as const) expect(v.sources[key].rows.status).toBe('known');
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it('invokes the registered no-argument command once and unwraps once', async () => {
+    transport.mockResolvedValue({ success: true, data: snapshot });
+    expect(await systemApi.coexReadonlySnapshot()).toEqual(snapshot);
+    expect(transport).toHaveBeenCalledTimes(1);
+    expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_READONLY_SNAPSHOT, {});
+  });
+  it.each(Object.entries(rustFixture.snapshots))('decodes the Rust-generated %s through the real wrapper and envelope', async (_name, wire) => {
+    transport.mockResolvedValueOnce({ success: true, data: wire });
+    expect(await systemApi.coexReadonlySnapshot()).toEqual(wire);
+    expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_READONLY_SNAPSHOT, {});
+  });
+  it('propagates denied-window envelope and permits a later explicit retry', async () => {
+    transport.mockResolvedValueOnce({ success: false, code: 'coex_window_denied', error: 'main window required' });
+    await expect(systemApi.coexReadonlySnapshot()).rejects.toBeInstanceOf(IpcError);
+    transport.mockResolvedValueOnce({ success: true, data: snapshot });
+    expect(await systemApi.coexReadonlySnapshot()).toEqual(snapshot);
+  });
+  it('propagates transport failure without manufacturing an empty snapshot', async () => {
+    const error = new Error('fixture transport unavailable'); transport.mockRejectedValueOnce(error);
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try { await expect(systemApi.coexReadonlySnapshot()).rejects.toBe(error); } finally { spy.mockRestore(); }
+  });
+  it.each([{ success: true }, { success: true, data: { ...snapshot, schemaVersion: 2 } },
+    { success: true, data: { ...snapshot, objects: [] } }, undefined])('fails closed on malformed returned data %j', async (raw) => {
+    transport.mockResolvedValueOnce(raw);
+    await expect(systemApi.coexReadonlySnapshot()).rejects.toBeInstanceOf(CoexSnapshotDecodeError);
+  });
+  it('fails closed on the non-Tauri browser fallback', async () => {
+    vi.stubGlobal('window', {});
+    await expect(systemApi.coexReadonlySnapshot()).rejects.toBeInstanceOf(CoexSnapshotDecodeError);
+    expect(transport).not.toHaveBeenCalled();
+  });
+  it('retains macOS partial-source Unknown through the registered no-argument wrapper', async () => {
+    transport.mockResolvedValueOnce({ success: true, data: rustFixture.snapshots.macosPartialSources });
+    const wire = await systemApi.coexReadonlySnapshot();
+    expect(wire.platform).toBe('darwin');
+    if (wire.objects.status !== 'known') throw Error('fixture roster unavailable');
+    expect(wire.objects.value[0].addresses.status).toBe('known');
+    expect(wire.objects.value[0].routes.status).toBe('unknown');
+    expect(wire.classification.status).toBe('unknown');
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+
+});
+
+describe('actual runtime state wrapper and existing listenReady transport', () => {
+  beforeEach(() => { transport.mockReset(); eventTransport.mockReset(); vi.stubGlobal('window', { __TAURI_INTERNALS__: {} }); });
+  afterEach(() => vi.unstubAllGlobals());
+  it.each(Object.entries(runtimeFixture.states))('decodes generated %s through real envelope exactly once', async (_name, wire) => {
+    transport.mockResolvedValueOnce({ success: true, data: wire }); expect(await systemApi.coexRuntimeGetState()).toEqual(wire);
+    expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_RUNTIME_GET_STATE, {});
+  });
+  it('manual refresh carries only expected revision and returns immediate state', async () => {
+    const wire = runtimeFixture.states.staleBusy; transport.mockResolvedValueOnce({ success: true, data: wire });
+    expect(await systemApi.coexRuntimeRefresh('7')).toEqual(wire); expect(transport).toHaveBeenCalledWith(IPC_CHANNELS.COEX_RUNTIME_REFRESH, { expectedReportRevision: '7' });
+  });
+  it('uses real listenReady acknowledgement and same strict event decoder', async () => {
+    let resolve: (off: () => void) => void = () => {}; let callback: (event: { payload: unknown }) => void = () => {};
+    eventTransport.mockImplementation((_event, cb) => { callback = cb; return new Promise<() => void>(r => { resolve = r; }); });
+    const accept = vi.fn(); const error = vi.fn(); const off = vi.fn(); let registered = false;
+    const registration = systemApi.onCoexRuntimeState(accept, error).then(value => { registered = true; return value; });
+    await Promise.resolve(); expect(registered).toBe(false); callback({ payload: runtimeFixture.states.latest }); expect(accept).toHaveBeenCalledWith(runtimeFixture.states.latest);
+    callback({ payload: { ...runtimeFixture.states.latest, reportRevision: 1 } }); expect(error).toHaveBeenCalledTimes(1); expect(accept).toHaveBeenCalledTimes(1);
+    resolve(off); (await registration)(); expect(off).toHaveBeenCalledTimes(1); expect(transport).not.toHaveBeenCalled();
+  });
+  it('rejects denied-window state and invalid returned envelope', async () => {
+    transport.mockResolvedValueOnce({ success: false, code: 'coex_window_denied', error: 'main window required' }); await expect(systemApi.coexRuntimeGetState()).rejects.toBeInstanceOf(IpcError);
+    transport.mockResolvedValueOnce({ success: true, data: { reportRevision: 1 } }); await expect(systemApi.coexRuntimeGetState()).rejects.toThrow();
+  });
+});

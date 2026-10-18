@@ -1,6 +1,9 @@
 /**
- * 「本窗口刚发起过起核」认领闸门 —— 提权门两码（`HELPER_NOT_INSTALLED` / `HELPER_GATE_ABORTED`）
- * 与 `ROOT_ORPHAN_BLOCKED`（残留 root 孤儿阻断起核）共三码的**唯一去重依据**。
+ * 「本窗口刚发起过起核」认领闸门 —— 提权门两码（`HELPER_NOT_INSTALLED` / `HELPER_GATE_ABORTED`）、
+ * `ROOT_ORPHAN_BLOCKED`（残留 root 孤儿阻断起核）、`CORE_NOT_EXECUTABLE`（随包内核文件不可执行）、
+ * `HELPER_CORE_MISMATCH`（提权助手里的内核与本应用不配套）
+ * 这一类「起核终态、后端双出口」的码的**唯一去重依据**。下文以最早纳入的三码为例；纳入的全集以
+ * `domain/proxy-error-routing.ts` 里调用 `isProxyStartClaimed()` 的分支为准。
  *
  * # 为什么需要它
  *

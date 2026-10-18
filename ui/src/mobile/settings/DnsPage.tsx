@@ -44,9 +44,12 @@ import type { DnsConfig, DnsPolicyAction, UserConfig } from '@/contracts/types';
 import type { CselGroup } from '@/components/dialogs/csel-logic';
 import {
   buildDnsActionGroups,
+  buildDnsRealQueryFallbackGroups,
   dnsActionFromChoice,
   dnsDefaultActionChoice,
   dnsDefaultFallbackChoice,
+  dnsRealQueryFallbackChoice,
+  dnsRealQueryFallbackFromChoice,
   type DnsDefaults,
 } from '@/components/dialogs/dns-action-options';
 import {
@@ -56,6 +59,7 @@ import {
 } from '@/domain/dns-connection-resolution';
 import {
   DNS_FALLBACK,
+  dnsUpstreamIdentity,
   DNS_PRESET_CUSTOM,
   domesticPresets,
   fakeIpTogglePatch,
@@ -235,8 +239,11 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
    *  · id 由 `reconcileCustomUpstreams` 生成并复用，**删掉一条时同步把 pool 里那个 id 摘掉**，
    *    否则留下一个指向不存在上游的孤儿启用项，它既不计数也不下发，而界面上看不出来。
    */
+  const [invalidCustom, setInvalidCustom] = useState<string[]>([]);
   function commitCustomUpstreams(next: string[]): void {
-    if (next.some((spec) => spec.trim() !== '' && !isPureIpDnsSpec(spec))) return;
+    const rejected = next.filter((spec) => spec.trim() !== '' && !isPureIpDnsSpec(spec));
+    setInvalidCustom(rejected);
+    if (rejected.length > 0) return;
     const current = dns.nodeResolverCustom ?? [];
     const nextCustom = reconcileCustomUpstreams(current, next, () => `doh-${crypto.randomUUID()}`);
     const nextIds = new Set(nextCustom.map((item) => item.id));
@@ -443,18 +450,7 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
             )}
           />
         )}
-        <SettingsRow
-          id="takeover-system-dns"
-          label={t('settings.advanced.takeoverSystemDns')}
-          desc={t('settings.dns.takeoverSystemDnsDesc')}
-          control={
-            <MobileSwitch
-              checked={dns.takeoverSystemDns !== false}
-              ariaLabel={t('settings.advanced.takeoverSystemDns')}
-              onChange={(v) => patchDns('takeover-system-dns', { takeoverSystemDns: v })}
-            />
-          }
-        />
+        {/* System DNS takeover changes desktop OS settings; mobile DNS is owned by its VPN service. */}
         <SettingsRow
           id="optimistic-cache"
           label={t('settings.advanced.optimisticCache')}
@@ -549,6 +545,11 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
               t('settings.dns.noQuotaTag'),
               false,
             )}
+            {(dns.nodeResolverCustom ?? []).map((upstream) => (
+              <div key={upstream.id}>
+                {raceUpstreamRow(`race-custom-${upstream.id}`, upstream.id, upstream.spec, '', true)}
+              </div>
+            ))}
             <SettingsNote id="race-upstreams-quota" title={t('settings.dns.raceStrategy')} summary={t('mobileHelp.raceUpstreams')}>{t('settings.dns.raceUpstreamsDesc')}</SettingsNote>
             {/* 自定义 DoH 上游库存。桌面是一整块 `ListEditor`，这里是它的移动端对位
                 （`MobileListEditor`，去重与草稿规则读同一份 `@/domain/list-entries`）。
@@ -556,6 +557,7 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
             <SettingsRow
               stacked
               id="race-custom-list"
+              problem={invalidCustom.length > 0 ? `${t('settings.advanced.dnsInvalid')}: ${invalidCustom.join(', ')}` : undefined}
               label={t('settings.dns.addCustomDoh')}
               desc={t('settings.dns.raceCustomHint')}
               control={
@@ -563,6 +565,8 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
                   id="race-custom-entries"
                   value={(dns.nodeResolverCustom ?? []).map((item) => item.spec)}
                   onChange={commitCustomUpstreams}
+                  onValidate={(next) => setInvalidCustom(next.filter((spec) => spec.trim() !== '' && !isPureIpDnsSpec(spec)))}
+                  entryIdentity={dnsUpstreamIdentity}
                   placeholder="https://1.1.1.1/dns-query"
                   ariaLabel={t('settings.dns.addCustomDoh')}
                   addLabel={t('settings.dns.addCustomDoh')}
@@ -728,10 +732,11 @@ function DnsDefaultsRows({
 }): ReactElement {
   const { t } = useTranslation();
   /* 同屏只许开一个面板：两个一起开是误触面（同 `forms/RuleFormPanel.tsx` 那条）。 */
-  const [sheet, setSheet] = useState<'action' | 'fallback' | null>(null);
+  const [sheet, setSheet] = useState<'action' | 'fallback' | 'realQueryFallback' | null>(null);
 
   const actionValue = dnsDefaultActionChoice(defaults);
   const fallbackValue = dnsDefaultFallbackChoice(defaults);
+  const realQueryFallbackValue = dnsRealQueryFallbackChoice(defaults);
   const resources = {
     servers: config.dnsServers ?? [],
     groups: config.dnsServerGroups ?? [],
@@ -748,6 +753,9 @@ function DnsDefaultsRows({
      是一条走不通的链。 */
   const fallbackGroups = collapsibleGroups(
     buildDnsActionGroups({ ...resources, currentValue: fallbackValue, includeHosts: false }),
+  );
+  const realQueryFallbackGroups = collapsibleGroups(
+    buildDnsRealQueryFallbackGroups({ ...resources, currentValue: realQueryFallbackValue }),
   );
   const hostsFirst = defaults.unmatchedAction?.type === 'hostsFirst';
 
@@ -767,6 +775,12 @@ function DnsDefaultsRows({
         dnsDefaults: { ...defaults, unmatchedAction },
       }),
     );
+  }
+
+  function commitRealQueryFallback(rowId: string, value: string): void {
+    const realQueryFallbackAction = dnsRealQueryFallbackFromChoice(value);
+    if (!realQueryFallbackAction) return;
+    commit(rowId, update({ dnsDefaults: { ...defaults, realQueryFallbackAction } }));
   }
 
   return (
@@ -789,6 +803,24 @@ function DnsDefaultsRows({
           />
         }
       />
+      {actionValue === 'fakeIp' && (
+        <SettingsRow
+          stacked
+          id="dns-real-query-fallback"
+          label={t('settings.dns.realQueryFallback')}
+          desc={t('settings.dns.realQueryFallbackHint')}
+          control={
+            <SelectSheetTrigger
+              label={t('settings.dns.realQueryFallback')}
+              options={[]}
+              value={realQueryFallbackValue}
+              valueLabel={labelOf(realQueryFallbackGroups, realQueryFallbackValue)}
+              open={sheet === 'realQueryFallback'}
+              onOpen={() => setSheet('realQueryFallback')}
+            />
+          }
+        />
+      )}
       {/* Hosts 优先这一档才有兜底可言（同桌面：非 hostsFirst 时整行不画，不画成禁用）。 */}
       {hostsFirst && (
         <SettingsRow
@@ -807,7 +839,20 @@ function DnsDefaultsRows({
           }
         />
       )}
-      {/* 两张面板一律渲染在行之外（`position: fixed` 的层不该嵌在行的盒里）。 */}
+      <SelectSheetPanel
+        label={t('settings.dns.realQueryFallback')}
+        groups={realQueryFallbackGroups}
+        value={realQueryFallbackValue}
+        openGroupIds={openGroupOf(realQueryFallbackGroups, realQueryFallbackValue)}
+        open={sheet === 'realQueryFallback'}
+        onClose={() => setSheet(null)}
+        onSelect={(next) => {
+          setSheet(null);
+          commitRealQueryFallback('dns-real-query-fallback', next);
+        }}
+        closeLabel={t('common.close')}
+      />
+      {/* 所有面板一律渲染在行之外（`position: fixed` 的层不该嵌在行的盒里）。 */}
       <SelectSheetPanel
         label={t('settings.dns.defaultUnmatched')}
         groups={actionGroups}

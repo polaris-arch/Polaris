@@ -1025,3 +1025,57 @@ describe('冲突弹窗的落定（resolveConflict / dismissConflict）', () => {
     expect(after.conflict).toBeNull();
   });
 });
+
+
+describe('save snapshot ownership across awaited reads/writes', () => {
+  it('new intent during a deferred read is never covered by the old conflict decision', async () => {
+    seedStaged(9443);
+    let resolveRead!: (config: UserConfig) => void;
+    getMock.mockImplementationOnce(() => new Promise((resolve) => { resolveRead = resolve; }));
+    const saving = useStagedConfigStore.getState().save();
+    await vi.waitFor(() => expect(resolveRead).toBeTypeOf('function'));
+    useStagedConfigStore.getState().stage({ id: 'setting:logLevel', kind: 'setting', label: 'level', entityPath: ['logLevel'], nextValue: 'debug' });
+    const disk = { ...DISK_SAME_ENTITY, logLevel: 'info' } as UserConfig;
+    resolveRead(disk);
+    expect(await saving).toBe(false);
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(useStagedConfigStore.getState().conflict).toBeNull();
+    expect(useStagedConfigStore.getState().baseline).toEqual(CONFIG);
+    expect(await useStagedConfigStore.getState().resolveConflict(['server:n1'])).toBe(false);
+    getMock.mockResolvedValue(disk);
+    expect(await useStagedConfigStore.getState().save()).toBe(false);
+    expect(useStagedConfigStore.getState().conflict?.map((row) => row.entryId)).toEqual(['server:n1', 'setting:logLevel']);
+  });
+  it('an unseen intent added during the write keeps its original baseline for the next conflict check', async () => {
+    seedStaged(9443);
+    const disk = { ...CONFIG, logLevel: 'info' } as UserConfig;
+    getMock.mockResolvedValue(disk);
+    let release!: () => void;
+    saveMock.mockImplementationOnce(async (config) => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { status: 'saved', version: 'committed', config: config as UserConfig };
+    });
+    const saving = useStagedConfigStore.getState().save();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    useStagedConfigStore.getState().stage({ id: 'setting:logLevel', kind: 'setting', label: 'level', entityPath: ['logLevel'], nextValue: 'debug' });
+    release();
+    expect(await saving).toBe(true);
+    expect(useStagedConfigStore.getState().entries.map((row) => row.id)).toEqual(['setting:logLevel']);
+    expect(useStagedConfigStore.getState().baseline).toEqual(CONFIG);
+    getMock.mockResolvedValue(saveMock.mock.calls[0][0] as UserConfig);
+    expect(await useStagedConfigStore.getState().save()).toBe(false);
+    expect(useStagedConfigStore.getState().conflict?.map((row) => row.entryId)).toEqual(['setting:logLevel']);
+  });
+  it('revert/reset during a pending read cannot publish the discarded snapshot', async () => {
+    seedStaged();
+    let resolveRead!: (config: UserConfig) => void;
+    getMock.mockImplementationOnce(() => new Promise((resolve) => { resolveRead = resolve; }));
+    const saving = useStagedConfigStore.getState().save();
+    await vi.waitFor(() => expect(resolveRead).toBeTypeOf('function'));
+    useStagedConfigStore.getState().reset();
+    resolveRead(CONFIG);
+    expect(await saving).toBe(false);
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(useStagedConfigStore.getState().entries).toEqual([]);
+  });
+});

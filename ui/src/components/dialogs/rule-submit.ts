@@ -10,7 +10,7 @@ import { api, IpcError } from '@/ipc';
 import { editRoute, type StagedEntry } from '@/lib/staged-config';
 import { toast } from '@/lib/error-handler';
 import { isRuleTypeDnsEffectSupported, ruleTypeNameKey, validateRule } from '@/domain/rules';
-import { invalidCondValues, splitVals, type Cond } from './rule-cond';
+import { invalidCondValues, parseConditionValues, type Cond } from './rule-cond';
 /* 🔴 两个符号都从纯 `.ts` 取。`splitDnsRecordLines` 此前 import 自 `./RuleDnsEffect`（`.tsx`），
    而本模块是移动端规则表单复用的提交腿 —— 那条边会把整份桌面 DNS 字段组件拖进移动端闭包。 */
 import { dnsActionFromChoice, splitDnsRecordLines } from './dns-action-options';
@@ -113,7 +113,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
   // 完全无法区分，而排序又直接决定命中优先级。
   const nameEmpty = !name.trim();
   setErrName(nameEmpty);
-  const filled = conds.filter((c) => splitVals(c.v).length);
+  const filled = conds.filter((c) => parseConditionValues(c.t, c.v).length);
   if (!filled.length) {
     toast.error(t('rules.invalidHead'), t('rules.errNoCond'));
     // 名称也空时两条错误一起显示（不让用户改完一个再发现另一个）。
@@ -124,7 +124,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
     onValidationError?.('basic');
     return;
   }
-  const rconds: RuleCondition[] = filled.map((c) => ({ type: c.t, values: splitVals(c.v) }));
+  const rconds: RuleCondition[] = filled.map((c) => ({ type: c.t, values: parseConditionValues(c.t, c.v) }));
   const multi = rconds.length > 1;
   if (dnsEnabled && rconds.some((condition) => !isRuleTypeDnsEffectSupported(condition.type))) {
     toast.error(t('rules.invalidHead'), t('rules.errDnsCondition'));

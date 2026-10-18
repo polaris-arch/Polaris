@@ -1,3 +1,5 @@
+import { subscriptionExpiryDate } from '@/domain/subscription-expiry';
+import type { ReactNode } from 'react';
 /**
  * 节点屏视图模型 —— **呈现层与接线层之间的唯一契约**。
  *
@@ -34,6 +36,7 @@ export type { TsExitWarning, MeshTunnelHealth, NodesListSortKey };
 /** 一行节点。字段全部由接线层按桌面同一套判据算好——呈现层不得自己再判一遍。 */
 export interface NodeRowVM {
   readonly server: ServerConfig;
+  readonly sourceLabel?: string;
   /** 当前出口。 */
   readonly isCurrent: boolean;
   /** 组网/端点协议节点（桌面 `.nd-cap exit` 那颗角标的判据）。 */
@@ -179,6 +182,7 @@ export function buildNodeMoreItems(args: {
 }
 
 export interface NodesScreenViewProps {
+  readonly autoSelectStatus?: ReactNode;
   readonly t: (key: string, vars?: Record<string, unknown>) => string;
 
   // ── block 1：分组段 ───────────────────────────────────────────────────────
@@ -474,7 +478,7 @@ export function buildSubSummary(args: {
 
   const info = sub.userInfo;
   const usageRaw = subUsage(info);
-  const expireSec = info?.expire;
+  const expiryDate = subscriptionExpiryDate(info?.expire);
   const updatedText = relativeTimeTextIso(sub.lastUpdated, t);
   return {
     name: sub.name,
@@ -492,8 +496,8 @@ export function buildSubSummary(args: {
           }
         : undefined,
     expiry:
-      typeof expireSec === 'number' && expireSec > 0
-        ? t('nodes.subExpiry', { date: new Date(expireSec * 1000).toISOString().slice(0, 10) })
+      expiryDate !== null
+        ? t('nodes.subExpiry', { date: expiryDate })
         : undefined,
     /* `relativeTimeTextIso` 解析不出来时返回空串（那是「这条时间戳读不动」，不是「刚刚」）
        ⇒ 空串同样落成缺席，绝不回落成一个看起来对的相对时间。 */

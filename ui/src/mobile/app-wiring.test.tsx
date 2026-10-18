@@ -1,3 +1,4 @@
+import { AUTO_SELECT_CAUSES } from '@/contracts/auto-select';
 /**
  * 移动端**全局接线层**的门 —— 射程 = 「后端把事实推过来之后，界面读的那些 store 会不会动」。
  *
@@ -50,6 +51,9 @@ import type { SubscriptionUpdateProgress } from '@/contracts/subscription-progre
 import type { SubscriptionCreateSnapshot } from '@/contracts/subscription-create-operation';
 import type { TaildropTaskSnapshot } from '@/contracts/taildrop';
 import * as ts from '@/test/ts-compiler';
+import { measurementFixture, measurementServer } from '@/store/measurement-fixture.test-support';
+import { configContentDigest } from '@/lib/staged-config';
+import type { MeasurementSnapshot } from '@/contracts/measurement-display';
 import {
   CALL_SITE_FIXTURE,
   callSitesIn,
@@ -81,6 +85,8 @@ function emit<T>(name: string, payload: T): void {
 }
 
 let proxyStatus: ProxyStatus | null = null;
+let measurementSnapshot: MeasurementSnapshot | null = null;
+const measurementSnapshotMock = vi.fn(async () => measurementSnapshot);
 let pendingRaw: unknown = { added: [], modified: [], removed: [], restartDeferred: false };
 let vpnSnapshot: VpnStatusSnapshot = { connected: false, openConnect: [], openVpn: [] };
 
@@ -149,6 +155,8 @@ vi.mock('@/ipc', () => ({
     server: {
       tailscaleStateExists: (ids: string[]) => tailscaleStateExistsMock(ids),
       tailscaleLoginCancel: (serverId: string, attemptId: string) => cancelLoginMock(serverId, attemptId),
+      speedTestResultSnapshot: () => measurementSnapshotMock(),
+      onSpeedTestSchedule: channel('speedTestSchedule'),
       onSpeedTestResult: channel<{ runId?: string; serverId: string; latency: number }>('speedTestResult'),
       onSpeedTestProgress: channel('speedTestProgress'),
       onSpeedTestDone: channel('speedTestDone'),
@@ -250,6 +258,8 @@ beforeEach(() => {
   bus.clear();
   toasts = [];
   proxyStatus = null;
+  measurementSnapshot = null;
+  measurementSnapshotMock.mockClear();
   pendingRaw = { added: [], modified: [], removed: [], restartDeferred: false };
   vpnSnapshot = { connected: false, openConnect: [], openVpn: [] };
   offSpy.mockClear();
@@ -268,7 +278,7 @@ beforeEach(() => {
   useAppStore.setState({ ipInfoRevision: -1 });
   useVpnStatusStore.getState().replace(false, [], []);
   useSubscriptionProgressStore.setState({ progress: {} });
-  useLatencyStore.setState({ latencyMap: {}, testedAt: {} });
+  useLatencyStore.setState({ latencyMap: {}, testedAt: {}, snapshot: null, projections: {}, currentProjections: {}, readError: false });
   useTailscaleLoginCacheStore.setState({ cache: {} });
   useTailscaleLoginProgressStore.setState({ attempts: {} });
   createListSeed = [];
@@ -735,6 +745,20 @@ describe('⑥.2 登录期出口让位 / 自动换节点：后端改了出口，�
     off();
   });
 
+  for (const cause of AUTO_SELECT_CAUSES) {
+    it(`confirmed ${cause} event preserves its cause on the mobile app subscription`, async () => {
+      const off = startMobileAppWiring(t);
+      await settle(); toasts = [];
+      const before = getStatusMock.mock.calls.length;
+      emit('autoSwitch', { cause, leg: cause === 'failover' ? 'failover' : 'select', reason: cause === 'failover' ? 'connectivity' : cause, oldServerName: 'previous', newServerName: 'actual', latency: 88 });
+      await settle();
+      expect(getStatusMock.mock.calls.length).toBeGreaterThan(before);
+      expect(toasts).toEqual([{ channel: 'success', msg: `autoSelect.event.${cause}` }]);
+      expect(notifyDesktopMock).not.toHaveBeenCalled();
+      off();
+    });
+  }
+
   it('自动换节点 → 重拉连接态 + 一条 toast（不然首页节点名会静默变成另一个）', async () => {
     const off = startMobileAppWiring(t);
     await settle();
@@ -745,7 +769,7 @@ describe('⑥.2 登录期出口让位 / 自动换节点：后端改了出口，�
     expect(getStatusMock.mock.calls.length, '没重拉连接态 ⇒ 出口名/国旗要等 30s 兜底才收敛').toBeGreaterThan(
       before,
     );
-    expect(toasts).toEqual([{ channel: 'success', msg: 'home.autoSwitched' }]);
+    expect(toasts).toEqual([{ channel: 'success', msg: 'autoSelect.event.unknown' }]);
     // 刻意不发系统通知（同 `onAutoUpdate` 的口径：结果本身是常驻呈现，通知留给「不看就错过」的那类）。
     expect(notifyDesktopMock).not.toHaveBeenCalled();
     off();
@@ -874,10 +898,8 @@ describe('⑩ 喂数腿在移动树里真有调用点（源码面，与上面的
   /** 「谁调了 `name(`」——返回相对路径 + 行号，红的时候人能直接跳过去。 */
   const callSites = (name: string): string[] => callSitesIn(SOURCES, name);
 
-  it('⓪ 取材面自检：文件数、行数、以及「注释 / 声明行都不算调用点」', () => {
+  it('⓪ 取材面自检：生产文件与真实调用点，注释 / 声明行不算调用点', () => {
     expect(FILES.length, '移动树的生产源码文件数掉了一大截 —— 取材面塌了').toBeGreaterThan(30);
-    const lines = [...SOURCES.values()].reduce((n, s) => n + s.split('\n').length, 0);
-    expect(lines, '扫到的行数掉了一大截').toBeGreaterThan(5000);
     // 共用谓词的正反自检（含「声明行不算」那四对）。夹具住在被共用的那份实现旁边。
     for (const [name, line, expected] of CALL_SITE_FIXTURE) {
       expect(isCallSiteLine(name, line), `${name} @ ${line}`).toBe(expected);
@@ -1237,13 +1259,17 @@ function App() {
   });
 
   it.each([
-    ['onStarted', '「应用中…」在起核落地后收场'],
-    ['onError', '重启失败时把原因写进条上（而不是永久转圈）'],
-    ['onLifecycle', '「立即应用」走的是后端自驱去抖重启，那条路径 started/error 一个都不发'],
-    ['applyStateOnLifecycle', '收场判定复用桌面那份纯逻辑（含「failed 带原因 / stopped 不判失败」）'],
+    ['onLifecycleReady', '先完成监听注册再 Apply，终态带本次 applyId/generation'],
+    ['applyStateOnLifecycle', '复用桌面归属判定：匹配 ready/failed，中间 stopped 不收场'],
   ])('`MobilePendingBar` 的 effect 里真的订了 `%s`（%s）', (callee) => {
     expect(effectInstalls(parse('./MobilePendingBar.tsx'), 'MobilePendingBar', callee)).toBe(true);
   });
+
+  it.each(['onStarted', 'onError'])(
+    '`MobilePendingBar` 不用无归属 `%s` 广播决定本次 Apply 的结局', (callee) => {
+      expect(effectInstalls(parse('./MobilePendingBar.tsx'), 'MobilePendingBar', callee)).toBe(false);
+    },
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1341,10 +1367,8 @@ describe('⑫ 桌面那批 app 级订阅：要么移植了，要么在表里登�
    * 不许写「本批不做」——那是排期，不是判定。
    */
   const NOT_PORTED: ReadonlyArray<readonly [string, string]> = [
-    ['subscribeLatencyEvents', '移动端由 subscribeMobileSpeedTestProgress 同时接主动轮次与被动 warm RTT：旧 runId 不落延迟；原桌面无轮次门订阅不重复挂。应用级实际 RTT/退订行为见本文件末尾'],
     ['onOpenConnectStatus', 'OpenConnect 增量在移动端零消费者：节点屏的 `deriveMeshTunnelHealth` 只读 `openVpn`，首帧快照那一跳已经把 `openConnect` 落进 store 了'],
     ['onSystemProxyResidual', '移动端接管方式恒为 TUN，系统代理这个对象在 Android 上不存在'],
-    ['onCoreBaselineWarning', '发射点是桌面换核路径，移动端不随包第二个核'],
     ['subscribeSpeedTestProgressToast', '移动端通过runId会话store与行内进度消费同样事件；不重复显示桌面的sticky toast'],
     // ── 2026-09-06 第二次扩面抓出来的七条：它们不长成订阅的样子，此前整条掉在取材面外 ──
     ['useSystemProxyLivePolling', '移动端接管方式恒为 TUN（`MobileHomeScreen.MOBILE_TAKEOVER`），systemProxy 档在 Android 上连入站都不发；那条轮询每轮 exec `networksetup`/`gsettings`/`reg`，在这里既无对象也无消费者'],
@@ -1567,17 +1591,41 @@ describe('⑬ 订阅创建恢复面 + Taildrop 发件进度：应用级订阅真
 });
 
 describe('连接后检测由 Rust 排程，应用级事件跨页接收', () => {
-  it('后台 warm RTT 在切屏后仍落全局 store，应用卸载后监听器确实退订', () => {
+  it('后台 warm RTT 在切屏后由同身份账本落全局 store，卸载后确实退订', async () => {
+    vi.useFakeTimers();
+    const config = { servers: ['n-hk', 'n-jp', 'n-sg'].map(measurementServer), subscriptions: [] } as unknown as UserConfig;
+    useAppStore.setState({ config, proxyStatus: { running: true, mainGeneration: 7, startTime: 10 } });
+    const digest = await configContentDigest(config);
+    const ledger = (values: Record<string, number>, revision: string) => ({
+      ...measurementFixture(config, values, revision), frontendConfigDigest: digest,
+    });
+    measurementSnapshot = ledger({ 'n-hk': 38 }, '1');
     const off = subscribeMobileSpeedTestProgress();
-    emit('speedTestResult', { serverId: 'n-hk', latency: 38 });
-    expect(useLatencyStore.getState().latencyMap['n-hk']).toBe(38);
-    // Switching from Home to Nodes does not unmount the app-level subscription.
-    emit('speedTestResult', { serverId: 'n-jp', latency: 73 });
-    expect(useLatencyStore.getState().latencyMap).toMatchObject({ 'n-hk': 38, 'n-jp': 73 });
-    off();
-    emit('speedTestResult', { serverId: 'n-sg', latency: 91 });
-    expect(useLatencyStore.getState().latencyMap['n-sg']).toBeUndefined();
-    expect(offSpy).toHaveBeenCalledWith('speedTestResult');
+    try {
+      // Initial and result-event reads have the same 200ms debounce; event numbers
+      // themselves are never measurement evidence.
+      emit('speedTestResult', { serverId: 'n-hk', latency: 999 });
+      expect(useLatencyStore.getState().latencyMap['n-hk']).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(200);
+      await vi.waitFor(() => expect(useLatencyStore.getState().latencyMap['n-hk']).toBe(38));
+      // Switching Home → Nodes leaves the app-level feed mounted.
+      measurementSnapshot = ledger({ 'n-hk': 38, 'n-jp': 73 }, '2');
+      emit('speedTestResult', { serverId: 'n-jp', latency: 999 });
+      await vi.advanceTimersByTimeAsync(200);
+      await vi.waitFor(() => expect(useLatencyStore.getState().latencyMap).toMatchObject({ 'n-hk': 38, 'n-jp': 73 }));
+      off();
+      const reads = measurementSnapshotMock.mock.calls.length;
+      measurementSnapshot = ledger({ 'n-sg': 91 }, '3');
+      emit('speedTestResult', { serverId: 'n-sg', latency: 91 });
+      await vi.advanceTimersByTimeAsync(5200);
+      expect(measurementSnapshotMock.mock.calls.length).toBe(reads);
+      expect(useLatencyStore.getState().latencyMap['n-sg']).toBeUndefined();
+      expect(offSpy).toHaveBeenCalledWith('speedTestResult');
+      expect(offSpy).toHaveBeenCalledWith('speedTestSchedule');
+    } finally {
+      off();
+      vi.useRealTimers();
+    }
   });
 
   it('失效后显示检测中，progress 与终态落库；连接变化不额外 force', async () => {

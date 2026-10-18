@@ -11,7 +11,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { groupServersBySubscription, defaultOpenGroupIds } from './server-grouping';
+import { groupServersBySubscription, defaultOpenGroupIds, nodeViewGroups } from './server-grouping';
 import { DIRECT_SERVER_ID } from './direct-selection';
 import type { ServerConfig, SubscriptionConfig } from '../contracts/types';
 
@@ -181,5 +181,49 @@ describe('接线：四处节点选择器共用 defaultOpenGroupIds', () => {
     for (const { rel, src } of sources) {
       expect(src, `${rel} 又长回了第一组回落`).not.toMatch(/groups\[0\]\s*\??\.\s*id/);
     }
+  });
+});
+
+describe('single-pass grouping compatibility', () => {
+  it.each([false, true])('preserves interleaved node, subscription and orphan order (empty=%s)', includeEmpty => {
+    const nodes = [
+      server('b1', { subscriptionId: 'b' }), server('orphan', { subscriptionId: 'gone' }),
+      server('a1', { subscriptionId: 'a', protocol: 'openconnect' }),
+      server('mesh-orphan', { subscriptionId: 'gone', protocol: 'openconnect' }),
+      server('b2', { subscriptionId: 'b' }), server('manual'),
+      server('mesh', { protocol: 'openconnect' }),
+    ];
+    const groups = groupServersBySubscription(nodes, [sub('b'), sub('empty'), sub('a')], includeEmpty);
+    expect(groups.map(group => [group.id, group.servers.map(node => node.id)])).toEqual([
+      ['manual', ['orphan', 'manual']], ['mesh', ['mesh-orphan', 'mesh']],
+      ['b', ['b1', 'b2']], ...(includeEmpty ? [['empty', []]] : []), ['a', ['a1']],
+    ]);
+    expect(groups.find(group => group.id === 'a')!.servers[0]).toBe(nodes[2]);
+    expect(nodes.map(node => node.id)).toEqual(['b1', 'orphan', 'a1', 'mesh-orphan', 'b2', 'manual', 'mesh']);
+  });
+
+  it('preserves duplicate subscriptions and empty-ID legacy membership without sharing arrays', () => {
+    const nodes = [server('none'), server('empty', { subscriptionId: '' }), server('a', { subscriptionId: 'a' })];
+    const groups = groupServersBySubscription(nodes, [sub('a', 'first'), sub(''), sub('a', 'last')]);
+    expect(groups.map(group => [group.name, group.servers.map(node => node.id)])).toEqual([
+      ['manual', ['none', 'empty']], ['first', ['a']], ['', ['empty']], ['last', ['a']],
+    ]);
+    expect(groups[1].servers).not.toBe(groups[3].servers);
+    groups[1].servers.pop();
+    expect(groups[3].servers).toEqual([nodes[2]]);
+  });
+});
+
+
+it('nodeViewGroups retains original all-node order, source attribution and collision-safe ID', () => {
+  const nodes = [server('b', { subscriptionId: '__all_nodes__' }), server('m'), server('e', { protocol: 'openconnect' })];
+  const groups = nodeViewGroups(nodes, [sub('__all_nodes__', 'Subscription')], { manual: 'Local', mesh: 'Endpoints' });
+  expect(groups.map(group => group.id)).toEqual(['manual', 'mesh', '__all_nodes__', '__all_nodes___']);
+  const all = groups[groups.length - 1]!;
+  expect(all.servers).toBe(nodes);
+  expect(all.sources).toEqual({
+    b: { id: '__all_nodes__', kind: 'subscription', name: 'Subscription' },
+    m: { id: 'manual', kind: 'manual', name: 'Local' },
+    e: { id: 'mesh', kind: 'mesh', name: 'Endpoints' },
   });
 });

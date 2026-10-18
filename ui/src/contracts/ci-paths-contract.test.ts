@@ -26,6 +26,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url));
 
@@ -66,6 +67,60 @@ const KNOWN_CI = ['**.md', 'docs/**', 'LICENSE', 'NOTICE'];
 const KNOWN_UI = ['**.md', 'docs/**', 'LICENSE', 'NOTICE'];
 
 describe('CI 触发面对称契约（判据面横跨两侧 ⇒ 过滤器不得 ignore 对侧树）', () => {
+  it('普通手动分支运行替换旧运行，固定审计独立分组，tag与复用调用保持保护', () => {
+    for (const workflow of ['ci.yml', 'ui.yml']) {
+      const source = read(workflow);
+      const match = source.match(/^  group: (.+)\n  cancel-in-progress: \$\{\{ (.+) \}\}$/m);
+      expect(match).not.toBeNull();
+      expect(source).toMatch(/preserve_run:\n\s+description: .+\n\s+type: boolean\n\s+default: false/);
+      const context = (event: string, ref: string, preserve: boolean, runId: number) => ({
+        github: { event_name: event, ref, workflow: 'fixture-caller', run_id: runId,
+          event: { inputs: { preserve_run: preserve ? 'true' : 'false' }, pull_request: {}, merge_group: {} } },
+        inputs: { preserve_run: preserve },
+        startsWith: (value: string, prefix: string) => value.startsWith(prefix),
+        format: (value: string, argument: number) => value.replace('{0}', String(argument)),
+      });
+      const evaluate = (event: string, ref: string, preserve = false) =>
+        runInNewContext(match![2], context(event, ref, preserve, 1));
+      expect(evaluate('workflow_dispatch', 'refs/heads/collab/test')).toBe(true);
+      expect(evaluate('workflow_dispatch', 'refs/heads/main', true)).toBe(false);
+      expect(evaluate('workflow_dispatch', 'refs/tags/v1.0.0')).toBe(false);
+      expect(evaluate('pull_request', 'refs/pull/1/merge')).toBe(true);
+      expect(evaluate('push', 'refs/heads/main')).toBe(true);
+      expect(evaluate('merge_group', 'refs/heads/gh-readonly-queue/main/pr-1')).toBe(false);
+      const group = (preserve: boolean, runId: number) => match![1].replace(
+        /\$\{\{ (.+?) \}\}/g,
+        (_text, expression: string) => String(runInNewContext(expression, context(
+          'workflow_dispatch', 'refs/heads/collab/test', preserve, runId))),
+      );
+      expect(group(false, 1)).toBe(group(false, 2));
+      expect(group(true, 1)).not.toBe(group(false, 2));
+      expect(group(true, 1)).not.toBe(group(true, 2));
+      // A reusable workflow inherits its caller's event and workflow name;
+      // github.event_name is not "workflow_call" at runtime.
+      const called = (event: string, ref: string, caller: string, runId: number) => {
+        const value = context(event, ref, false, runId);
+        value.github.workflow = caller;
+        return {
+          cancels: runInNewContext(match![2], value),
+          group: match![1].replace(/\$\{\{ (.+?) \}\}/g,
+            (_text, expression: string) => String(runInNewContext(expression, value))),
+        };
+      };
+      const tagPublish = called('push', 'refs/tags/v1.0.0', 'Package', 1);
+      expect(tagPublish.cancels).toBe(false);
+      expect(tagPublish.group).toBe(called('push', 'refs/tags/v1.0.0', 'Package', 2).group);
+      const directTag = called('workflow_dispatch', 'refs/tags/v1.0.0', 'Package', 1);
+      expect(directTag.cancels).toBe(false);
+      const ordinaryCall = called('workflow_dispatch', 'refs/heads/collab/test', 'Package', 1);
+      expect(ordinaryCall.cancels).toBe(true);
+      expect(ordinaryCall.group).toBe(called('workflow_dispatch', 'refs/heads/collab/test', 'Package', 2).group);
+      expect(ordinaryCall.group).not.toBe(group(false, 1));
+      expect(called('pull_request', 'refs/pull/1/merge', 'Release Risk', 1).cancels).toBe(true);
+      expect(called('merge_group', 'refs/heads/gh-readonly-queue/main/pr-1', 'Package', 1).cancels).toBe(false);
+    }
+  });
+
   it('ci.yml（Rust 门）：不 ignore ui/**（CI-5 正主）、不 ignore 自己的 Rust 树、不 ignore workflow 树', () => {
     const entries = pushIgnoreEntries(read('ci.yml'));
     // 哨兵先行：entries 必须逐字包含今天的已知全集（防解析器哑掉后下面全绿）。

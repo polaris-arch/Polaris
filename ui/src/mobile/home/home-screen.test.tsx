@@ -1,3 +1,15 @@
+import { measurementFixture, measurementServer } from '@/store/measurement-fixture.test-support';
+import { useLatencyStore } from '@/store/use-latency-store';
+import { useAppStore } from '@/store/app-store';
+import type { UserConfig } from '@/contracts/types';
+vi.mock('@/store/use-latency-store', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/store/use-latency-store')>();
+  return { ...actual, useLatencyStore: Object.assign((select: (state: ReturnType<typeof actual.useLatencyStore.getState>) => unknown) => select(actual.useLatencyStore.getState()), actual.useLatencyStore) };
+});
+vi.mock('@/store/app-store', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/store/app-store')>();
+  return { ...actual, useAppStore: Object.assign((select: (state: ReturnType<typeof actual.useAppStore.getState>) => unknown) => select(actual.useAppStore.getState()), actual.useAppStore) };
+});
 /**
  * 移动端「首页」屏的门。射程 = 本屏的**屏级契约**，与相邻各道门不重叠：
  * `../mobile-entry.test.ts` 守入口链路（契约 A1 的 CSS 集合 / 五个目的地 / 导航与路由同源），
@@ -25,7 +37,7 @@
  * 门会对着自己的禁令列表报红；而「让它变绿」最自然的动作就是把取材面缩窄，最后缩成恒绿。
  * 故取材面**显式排除测试文件**，并由 ⓪ 组正面断言「排除生效 + 取材面仍然是活的」。
  */
-import { afterAll, describe, it, expect } from 'vitest';
+import { afterAll, describe, it, expect, vi } from 'vitest';
 import { closeOracle, measure } from '@/styles/css-oracle.test-support';
 import { inMobileShell } from '@/styles/mount.test-support';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -306,6 +318,7 @@ const SUBJECT_VM: HomeScreenViewProps['ruleSubject'] = {
 /** 「合并进已有规则」的一行候选（可追加，非影子，规则启用中）。 */
 const appendRow = (over: Partial<RuleAppendTarget> = {}): AppendTargetVM => ({
   target: {
+    snapshot: { id: 'r1', type: 'domain', values: ['netflix.com'], action: 'proxy', enabled: true, remarks: '流媒体解锁' },
     ruleId: 'r1',
     ruleIndex: 0,
     remarks: '流媒体解锁',
@@ -322,8 +335,27 @@ const appendRow = (over: Partial<RuleAppendTarget> = {}): AppendTargetVM => ({
   shadowed: false,
 });
 
-const render = (over: Partial<HomeScreenViewProps> = {}): string =>
-  renderToStaticMarkup(<HomeScreenView {...baseProps(over)} />);
+let renderRevision = 0;
+const render = (over: Partial<HomeScreenViewProps> = {}): string => {
+  const props = baseProps(over);
+  const current = props.node.kind === 'node' ? {...measurementServer('home-fixture'),name:props.node.name} : null;
+  const servers = [...props.pickRows.map(row=>row.server),...(current?[current]:[])];
+  const config = {servers,subscriptions:[]} as unknown as UserConfig;
+  const values: Record<string,number|null> = {};
+  for(const row of props.pickRows) if(row.latencyMs !== undefined) values[row.server.id]=row.latencyMs;
+  if(current && props.node.kind==='node' && props.node.latencyMs !== undefined) values[current.id]=props.node.latencyMs;
+  const snapshot=measurementFixture(config,values,String(++renderRevision),Date.now());
+  for(const row of props.pickRows) if(row.latencyStale && snapshot.rows[row.server.id]?.candidate) snapshot.rows[row.server.id].candidate!.state='expired';
+  if(current && props.node.kind==='node') {
+    if(props.node.latencyStale && snapshot.rows[current.id]?.candidate) snapshot.rows[current.id].candidate!.state='expired';
+
+  }
+  useAppStore.setState({config,servers});
+  useLatencyStore.setState({snapshot:null,readError:false,latencyMap:{},testedAt:{},projections:{},currentProjections:{}});
+  useLatencyStore.getState().applySnapshot(snapshot,servers);
+  const qualified = current && props.node.kind==='node' ? {...props,node:{...props.node,serverId:current.id,displayedServer:current}} : props;
+  return renderToStaticMarkup(<HomeScreenView {...qualified} />);
+};
 
 /** DOM 里 `data-home-card="…"` 的出现序。 */
 const cardOrder = (html: string): string[] =>
@@ -916,7 +948,7 @@ describe('⑦ 无源不画：陈旧 / 哨兵 / 隐私 / 空态', () => {
     const html = render({
       node: { kind: 'node', name: 'HK03', protocolLabel: 'VLESS', flagSrc: null, latencyMs: 42, latencyStale: true },
     });
-    expect(html).toContain('nodes.mobileLatencyStale');
+    expect(html).toContain('measurement.expired');
     expect(html).not.toContain('42 ms');
   });
 
@@ -1287,12 +1319,15 @@ describe('⑨–⑫ 出口控制、检测与规则统计的当前呈现契约', 
       })).get('node-status-card') ?? '';
 
     const measured = stopped(85);
-    expect(measured).toContain('class="h-latency-grade mid">85 ms</span>');
+    expect(measured).toContain('data-measurement-state="success"');
+    expect(measured).toContain('85 ms');
     expect(measured).toContain('class="h-latency-reason">连接后可测当前出口</span>');
     expect(measured).toMatch(/<button[^>]*disabled=""[^>]*>mobileHome\.currentSpeedTest<\/button>/);
-    expect(stopped(null)).toContain('class="h-latency-grade dead">nodes.timeout</span>');
-    expect(stopped(85, true)).toContain('class="h-latency-grade none">nodes.mobileLatencyStale</span>');
-    expect(stopped(undefined)).toContain('class="h-latency-grade none">未检测</span>');
+    expect(stopped(null)).toContain('data-measurement-state="failed"');
+    expect(stopped(null)).toContain('measurement.failed');
+    expect(stopped(85,true)).toContain('data-measurement-state="expired"');
+    expect(stopped(85,true)).not.toContain('85 ms');
+    expect(stopped(undefined)).toContain('data-measurement-state="unmeasured"');
   });
 
   it('非空卡头提供全部入口，空态不提供失效入口；完整列表不截断聚合项', () => {
@@ -1408,7 +1443,8 @@ describe('⑬ 哨兵出口 / 空态入口 / 主机行规则面板：能力真的
     const at = WIRING_RAW.indexOf('const onPickSentinel');
     const body = WIRING_RAW.slice(at, WIRING_RAW.indexOf('const onSetRouting', at));
     expect(body).toContain("if (kind === 'block' && blockDisabledReason !== null) return");
-    expect(body).toContain('if (id === selectedServerId)');
+    expect(body).toContain('const config = useAppStore.getState().config;');
+    expect(body).toContain('if (config && config.selectionIntent === undefined && id === config.selectedServerId)');
     expect(body).toContain('switchServer(id)');
     expect(body).toContain("kind === 'direct' ? 'home.routingDirect' : 'home.routingBlock'");
     expect(body).not.toContain('update({ selectedServerId: id })');

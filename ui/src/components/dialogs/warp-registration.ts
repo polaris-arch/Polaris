@@ -1,3 +1,4 @@
+import { applyOnDemand } from './on-demand-field';
 import type { ServerConfig } from '@/contracts/types';
 import { isWarpServer, type WarpWireGuardDraft } from '@/domain/warp';
 import type { FormValues } from './field-spec';
@@ -86,6 +87,7 @@ export function buildRegisteredWarpServer(
     }, values),
   };
   applyDetour(server, detour);
+  applyOnDemand(server, values.onDemand);
   if (bindInterface) server.bindInterface = bindInterface;
   return server;
 }

@@ -33,6 +33,7 @@ vi.mock('@/ipc', () => ({
   api: {
     config: {
       get: async () => CONFIG,
+      onChangedReady: async () => () => {},
       save: async (config: UserConfig) => ({ status: 'saved', version: 'v2', config }),
       setStagedPending: async (_pending: boolean) => undefined,
     },
@@ -227,4 +228,17 @@ describe('介质与信号来源（源码守卫：行为断言够不着的两条�
   it('渲染端不监听 beforeunload / pagehide / unload 来清暂存', () => {
     expect(STORE_SRC).not.toMatch(/addEventListener\s*\(\s*['"](beforeunload|pagehide|unload)['"]/);
   });
+});
+
+
+it('a tray-only feed never consumes the main clean-exit marker or restores staged text', async () => {
+  vi.resetModules();
+  const { acquireConfigSync, refreshConfig } = await import('./app-store');
+  const { useStagedConfigStore } = await import('./staged-config-store');
+  const release = acquireConfigSync({ scope: 'tray' });
+  try {
+    await refreshConfig();
+    expect(cleanExitMock).not.toHaveBeenCalled();
+    expect(useStagedConfigStore.getState().hydrated).toBe(false);
+  } finally { release(); }
 });

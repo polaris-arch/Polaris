@@ -38,6 +38,8 @@ const AUX_RAW = read('../i18n/auxiliary.ts');
 const MENU = code(MENU_RAW);
 const LABELS = code(LABELS_RAW);
 const AUX = code(AUX_RAW);
+const HOST = code(read('../../../src-tauri/src/tray/window.rs'));
+const PLATFORM = code(read('../../../src-tauri/src/tray/platform.rs'));
 
 describe('守卫自检：扫到的确实是源码（防读空文件恒绿）', () => {
   it('三个源文件非空且是托盘/aux 的文件', () => {
@@ -282,7 +284,9 @@ describe('A6：托盘桌面通知（开关同步 + FakeIP 纠正告知）', () =
   it('切接管方式触发 FakeIP 自动启用时真的发通知（不是又一次 TODO）', () => {
     const start = MENU.indexOf('const setTakeover');
     const body = MENU.slice(start, MENU.indexOf('\n  };', start));
-    expect(body).toContain('applyFakeIpTunEntry');
+    expect(body).toContain('api.config.setTakeover(modeType)');
+    expect(body).not.toContain('dnsConfig:');
+    expect(body).not.toContain('saveConfig(patch)');
     expect(body).toMatch(/if\s*\(corrected\)/);
     expect(body).toContain('notifyDesktop(');
   });
@@ -324,5 +328,92 @@ describe('A2b：systemProxy 降级态跨窗一致（2026-07-28 复审 MED #4）'
       /if \(isSystemProxyLiveApplicable\(status\.running, cfg\.proxyModeType, status\.starting\)\)/
     );
     expect(MENU).toMatch(/setSystemProxyLive\('unknown'\)/);
+  });
+});
+
+
+describe('O07 shared config with fenced ancillary hydration', () => {
+  it('acquires tray scope and derives all config mirrors from the same raw publication', () => {
+    expect(MENU).toContain("acquireConfigSync({ scope: 'tray' })");
+    expect(MENU).toContain('useAppStore((state) => state.config)');
+    expect(MENU).toContain('config?.servers ?? []');
+    expect(MENU).toContain('config?.subscriptions ?? []');
+    expect(MENU).toContain('config?.selectedServerId ?? null');
+    expect(MENU).not.toMatch(/api\.config\.onChanged(?:Ready)?\(/);
+    const hydrate = MENU.slice(MENU.indexOf('const hydrate ='), MENU.indexOf('refreshOnShow.current ='));
+    expect(hydrate).not.toContain('api.config.get(');
+    expect(hydrate).toContain('refreshConfig(');
+    expect(hydrate).toContain('api.proxy.getStatus()');
+    expect(hydrate).toContain('api.ipInfo.peek()');
+    expect(hydrate).toMatch(/await fetchSystemProxyLive\(\);\s*if \(!current\(\)\) return;/);
+    expect(hydrate).toMatch(/await api\.ipInfo\.peek\(\);\s*if \(!current\(\)\) return;/);
+  });
+  it('focus and native show request fresh reads; unmount and hide invalidate late ancillary results', () => {
+    expect(MENU).toContain("void hydrate('fresh')");
+    expect(MENU).toContain('refreshOnShow.current()');
+    expect(MENU).toContain('trayLifecycle.current++');
+    expect(MENU).toContain('hydrateGeneration.current++');
+    expect(MENU).toContain('releaseConfig()');
+    expect(MENU).not.toContain('hydrateStagedConfig');
+  });
+  it('native click-away blur, Escape, helper hide and unmount use the same retirement boundary', () => {
+    const retire = MENU.slice(MENU.indexOf('const retireInteraction ='), MENU.indexOf('const [running,'));
+    expect(retire).toContain('interactionActive.current = false');
+    expect(retire).toContain('interactionEpoch.current++');
+    expect(retire).toContain('hydrateGeneration.current++');
+    expect(retire).toContain('controller.abort()');
+    expect(MENU).toContain("window.addEventListener('blur', retireInteraction)");
+    expect(MENU).toContain("window.removeEventListener('blur', retireInteraction)");
+    expect(MENU).toMatch(/if \(e\.key === 'Escape'\) \{\s*e\.preventDefault\(\);\s*retireInteraction\(\);/);
+    expect(MENU).toMatch(/const hide = \(\) => \{\s*retireInteraction\(\);/);
+    expect(MENU).toMatch(/mounted\.current = false;\s*trayLifecycle\.current\+\+;\s*retireInteraction\(\);/);
+    expect(MENU).toMatch(/refreshOnShow\.current = \(\) => \{\s*retireInteraction\(\);\s*interactionActive\.current = true;/);
+    expect(MENU).toContain('const onFocus = () => refreshOnShow.current()');
+    const hydrate = MENU.slice(MENU.indexOf('const hydrate ='), MENU.indexOf('refreshOnShow.current ='));
+    expect(hydrate).toContain('if (!interactionActive.current) return');
+    expect(hydrate).toContain('mounted.current && interactionActive.current');
+  });
+  it('only exact show reactivates the shared remeasure bridge; legacy and unknown reasons are geometry', () => {
+    const bridge = MENU.slice(MENU.indexOf('window.__POLARIS_TRAY_REMEASURE__ ='), MENU.indexOf('delete window.__POLARIS_TRAY_REMEASURE__'));
+    const exactShowOnly = (source: string) => /window\.__POLARIS_TRAY_REMEASURE__ = \(reason\) => \{\s*requestRemeasure\(\);\s*if \(reason === 'show'\) refreshOnShow\.current\(\);\s*\};/.test(source);
+    expect(exactShowOnly(bridge)).toBe(true);
+    expect(exactShowOnly(bridge.replace("if (reason === 'show') ", ''))).toBe(false);
+    expect(exactShowOnly(bridge.replace("reason === 'show'", "reason !== 'geometry'"))).toBe(false);
+    expect(bridge).not.toContain('interactionActive.current = true');
+  });
+  it('native show reason follows successful show only, while both screen routes reach geometry', () => {
+    const geometry = HOST.slice(HOST.indexOf('pub(super) fn notify_screen_change_remeasure('), HOST.indexOf('fn queue_overlay_build('));
+    const show = HOST.slice(HOST.indexOf('pub(super) fn show_ready_overlay('), HOST.indexOf('pub fn toggle_overlay('));
+    const showCall = `win.eval("window.__POLARIS_TRAY_REMEASURE__?.('show');")`;
+    const geometryCall = `win.eval("window.__POLARIS_TRAY_REMEASURE__?.('geometry');")`;
+    expect(geometry).toContain(geometryCall);
+    expect(geometry).not.toContain(showCall);
+    expect(geometry).not.toContain('win.show()');
+    const failure = show.match(/if let Err\(e\) = win\.show\(\) \{[\s\S]*?return;\s*\}/);
+    expect(failure).not.toBeNull();
+    expect(show.indexOf(showCall)).toBeGreaterThan((failure?.index ?? 0) + (failure?.[0].length ?? 0));
+    expect(show.indexOf('focus_overlay(win)')).toBeGreaterThan(show.indexOf(showCall));
+    expect(HOST.split(showCall)).toHaveLength(2);
+    expect(HOST.split(geometryCall)).toHaveLength(2);
+    expect(HOST.match(/__POLARIS_TRAY_REMEASURE__/g)).toHaveLength(2);
+    expect(HOST).toContain('WindowEvent::ScaleFactorChanged { .. } => notify_screen_change_remeasure(&app_handle)');
+    expect(PLATFORM).toContain('super::window::notify_screen_change_remeasure(&app)');
+    expect(PLATFORM).not.toContain('__POLARIS_TRAY_REMEASURE__');
+  });
+  it('selection feedback owns the accepted publication across await, not its invalidated old read token', () => {
+    const start = MENU.indexOf('const switchExit =');
+    const body = MENU.slice(start, MENU.indexOf('\n  const switchNode =', start));
+    const hasFence = (source: string) => /const acceptance = useAppStore\.getState\(\)\.acceptSelectionConfig\(saved\);\s*const publicationGeneration = configReadGeneration\.current\(\);\s*await acceptance;\s*if \(!current\(\) \|\| !configReadGeneration\.isCurrent\(publicationGeneration\)\) return;\s*const feedback = traySwitchFeedback/.test(source);
+    expect(hasFence(body)).toBe(true);
+    expect(hasFence(body.replace(' || !configReadGeneration.isCurrent(publicationGeneration)', ''))).toBe(false);
+    expect(hasFence(body.replace('isCurrent(publicationGeneration)', 'isCurrent(readGeneration)'))).toBe(false);
+  });
+  it('ordinary writes use the shared settlement path while selection retains its dedicated GET fence', () => {
+    expect(MENU).toContain('useAppStore.getState().saveConfig({ proxyMode: mode })');
+    expect(MENU).toContain('api.config.setTakeover(modeType)');
+    expect(MENU).toContain('saved: await api.config.get(), readGeneration');
+    expect(MENU).toContain('if (!configReadGeneration.isCurrent(readGeneration)) return');
+    expect(MENU).toContain('acceptSelectionConfig(saved)');
+    expect(MENU).not.toContain('setConfig(saved)');
   });
 });

@@ -104,13 +104,13 @@
  *  · `--warn` 当文字的落点全是 10~12.5px：`.log-WARN`(12px) `.warn-line`(11px) `.mode-warn`/
  *    `.plat-warn`/`.app-disabled-note`(11.5px) `.webrtc-note`(11px) `.pill.warn`(10.5px)
  *    `.nd-cap.lan`(10px) `.statusbar .sb-conns`(11.5px) `.pending-bar .pb-tx b`(12px)
- *    `.core-ver-banner .cvb-tx b`(12.5px) `.nd-top .nd-lat.slow`(11px) `.home-degraded` …
+ *    `.nd-top .nd-lat.slow`(11px) `.home-degraded` …
  *  · `--ok` 同样：`.pill.ok`(10.5px) `.act-direct` `.parse-ok` `.wg-preview .wpv-h`(12px)
  *    `.nd-top .nd-lat.fast`(11px) `#sb-lat.fast` `.ut-ic.ok`…
  *  · `--dn` 只有两处，都是文字：`.statusbar .rate-dn`(11.5px/600) `.conn-rate .d`(11.5px/600)。
  *  全仓**没有一处**落进 AA 的大字例外（≥18.66px bold / ≥24px）⇒ 门槛一律 **4.5**，不是 3.0。
  *  当色点/描边/进度条填充/开关轨（`.dot.*` `.lat-*` `.swt.indet` `.sub-usage .bar>i`
- *  `.connect-btn.busy` 的 22px 图标、`.pb-ic`/`.cvb-ic` 的 13px 图标）走 1.4.11 的 **3:1**，
+ *  `.connect-btn.busy` 的 22px 图标、`.pb-ic` 的 13px 图标）走 1.4.11 的 **3:1**，
  *  本段不按 4.5 判它们，但下调后逐条只会更好或仍达标（见下）。
  *
  * 取值判据（CIE L* + WCAG，底色花名册按「该 token 的文字实际落在什么面上」逐条扫出来）：
@@ -1218,7 +1218,7 @@ body:has(.pending-bar.show) #toast-stack{
  *    退回弱底不损失什么；`.btn.danger` 是**破坏性动作按钮**，弱底后与 `.btn.ghost` 同重量，
  *    「这一步不可逆」的视觉分量没了 —— 那是拿语义换达标；
  *  · 换墨保住实底与分量，且**本仓已有同一套词汇**：`.btn.flow{ color:#00141d }`（亮蓝实底配近黑墨）、
- *    `.hc-step.done .st-n`、`.core-ver-banner .cvb-ic{ color:hsl(var(--surface)) }` 都是这么写的。
+ *    `.hc-step.done .st-n`、`.app-update-banner .aub-ic{ color:hsl(var(--surface)) }` 都是这么写的。
  * 取 `--surface` 而非裸近黑：深色下它是 219 32% 10.5% ⇒ 落亮红上 **5.63**，且不是裸色值
  *    （本文件那道「覆盖层不得出现裸色值」的门盯着）。hover 的 `filter:brightness(1.08)`
  *    （components.css:396）对整块生效，实底被提亮、近黑墨几乎不动 ⇒ 复合后 **6.40**，只增不减。

@@ -63,16 +63,16 @@ const alt = sorted
     t.raw
       ? t.raw
       : t.latin
-        ? `(?<![a-z])${sep(esc(t.text as string))}(?![a-z])`
+        ? `${sep(esc(t.text as string))}(?![a-z])`
         : esc(t.text as string)
   )
   .join('|');
-const MATCHER = new RegExp(alt);
+const MATCHER = new RegExp(alt, 'g');
 
 // 命中文本（归一化后）→ code。原生 pattern 以 code 归一化建 key（cn pattern 消耗 "cn"）。
-const TOKEN2CODE = new Map<string, string>();
+const TOKEN2CODE = new Map<string, { code: string; latin: boolean }>();
 for (const t of tokens) {
-  TOKEN2CODE.set(normalize(t.raw ? t.code : (t.text as string)), t.code);
+  TOKEN2CODE.set(normalize(t.raw ? t.code : (t.text as string)), { code: t.code, latin: t.latin });
 }
 
 /**
@@ -92,6 +92,15 @@ export const getCountryCode = (name: string): string | null => {
   }
 
   // 优先级 2：合并 token regex（最早位置 + 同位置最长优先）。
-  const hit = MATCHER.exec(lower);
-  return hit ? (TOKEN2CODE.get(normalize(hit[0])) ?? null) : null;
+  MATCHER.lastIndex = 0;
+  let hit: RegExpExecArray | null;
+  while ((hit = MATCHER.exec(lower)) !== null) {
+    const token = TOKEN2CODE.get(normalize(hit[0]));
+    if (token && (!token.latin || hit.index === 0 || !/[a-z]/.test(lower[hit.index - 1]))) {
+      return token.code;
+    }
+    // A rejected inner token may overlap a later valid token; advance one character.
+    MATCHER.lastIndex = hit.index + 1;
+  }
+  return null;
 };

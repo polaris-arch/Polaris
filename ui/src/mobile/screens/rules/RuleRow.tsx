@@ -300,7 +300,9 @@ export function RuleRow(props: RuleRowProps): ReactElement {
     if (!row || !list) return;
     const rects = [...list.children].map((el) => {
       const r = el.getBoundingClientRect();
-      return { top: r.top, bottom: r.bottom };
+      // The dragged row is still transformed until React commits the state reset.
+      const offset = el === row ? dragDy ?? 0 : 0;
+      return { top: r.top - offset, bottom: r.bottom - offset };
     });
     const to = dropIndexAt(rects, index, e.clientY);
     if (to !== index) onReorder(rule, to);

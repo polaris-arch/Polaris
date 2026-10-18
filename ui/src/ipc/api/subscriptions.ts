@@ -17,6 +17,7 @@ export type BackupErrorCode =
   | 'readFailed'
   | 'invalidFormat'
   | 'invalidArgs'
+  | 'sharedDependencyConflict'
   | 'saveFailed'
   | 'meshRoutingRequiresTrustedRestore'
   | 'meshRoutingInvalidPolicy'

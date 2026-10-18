@@ -12,8 +12,10 @@
  */
 import { mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { contextOf, memoryFs, stripComments, winnerValue } from './css-cascade.test-support';
 import {
   DRAIN,
@@ -35,13 +37,15 @@ import {
   inflightMeasures,
   measure,
   oracleHygiene,
+  ownedProcessState,
   parseDevToolsEndpoint,
   productPostcssPlugins,
   resolveChromeBinary,
   spawnOwnedBrowser,
   waitForDevToolsEndpoint,
+  waitGone,
 } from './css-oracle.test-support';
-import type { SpawnedBrowser } from './css-oracle.test-support';
+import type { OracleProcessProbe, Owned, SpawnedBrowser } from './css-oracle.test-support';
 import { inMobileShell } from './mount.test-support';
 
 // 收尾走 CDP 的 `Browser.close`，让 Chrome 自己退（全程不 kill 进程）。
@@ -477,8 +481,139 @@ describe('⑧ 进程与 profile 卫生：收尾不保证就得自曝（第五轮
     const dir = mkdtempSync('/var/tmp/polaris-css-oracle-abandon-');
     expect(existsSync(dir)).toBe(true);
     // 子进程与 ws 都还没建起来 —— 正是 `launch` 在等 `DevToolsActivePort` 之前抛掉的那一档。
-    await abandon({ pid: undefined, dir, closed: false }, undefined, undefined);
+    await abandon({ pid: undefined, dir, closed: false, state: 'not-started' }, undefined, undefined);
     expect(existsSync(dir), '启动失败路径把 profile 留在了 /var/tmp').toBe(false);
+  });
+
+  describe('POL-U32：无 /proc 时用 ChildProcess/owned 状态，不把未知当退出', () => {
+    // Real ChildProcess objects with synthetic exit observations; never spawn or
+    // signal a process here. Integration cases below still use the real browser.
+    const observeChild = (child: ChildProcess, values: Partial<Pick<ChildProcess, 'pid' | 'exitCode' | 'signalCode'>>) => {
+      for (const [key, value] of Object.entries(values))
+        Object.defineProperty(child, key, { configurable: true, writable: true, value });
+    };
+    const liveChild = () => {
+      const child = new ChildProcess();
+      observeChild(child, { pid: 424242 });
+      return child;
+    };
+    const noProc = (): OracleProcessProbe => ({
+      profileProcesses: () => null,
+      pidState: vi.fn(() => { throw new Error('a retained child handle must not probe a reused PID'); }),
+    });
+    const fixture = (child?: ChildProcess): Owned => ({
+      pid: child?.pid,
+      dir: mkdtempSync(join(tmpdir(), 'polaris-css-oracle-lifecycle-')),
+      closed: false,
+      child,
+    });
+
+    it.each([false, true])('断 CDP/请退结果 %s，但 child 仍活：超时保留 profile 并报告', async (acknowledged) => {
+      const child = liveChild();
+      const owned = fixture(child);
+      const probe = noProc();
+      const requestExit = vi.fn(async () => acknowledged);
+      const disconnected = { OPEN: 1, readyState: 3, send: vi.fn(), close: vi.fn() };
+      try {
+        expect(await waitGone(owned, 0, probe)).toBe(false);
+        await abandon(owned, child, disconnected as unknown as WebSocket, { probe, requestExit, timeoutMs: 0 });
+        expect(requestExit).toHaveBeenCalledWith(owned);
+        expect(disconnected.send).not.toHaveBeenCalled();
+        expect(disconnected.close).toHaveBeenCalledOnce();
+        expect(existsSync(owned.dir)).toBe(true);
+        expect(owned.closed).toBe(false);
+        expect(() => assertNoOracleLeak(oracleHygiene([owned], probe))).toThrow(/还活着/);
+      } finally {
+        rmSync(owned.dir, { recursive: true, force: true }); // synthetic fixture only
+      }
+    });
+
+    it('未知所有权、在途 spawn、权限不明都不证明退出', async () => {
+      const cases: [Owned, OracleProcessProbe][] = [
+        [fixture(), noProc()],
+        [{ ...fixture(new ChildProcess()), state: 'starting' }, noProc()],
+        [{ ...fixture(), pid: 424242 }, { profileProcesses: () => null, pidState: () => 'unknown' }],
+      ];
+      for (const [owned, probe] of cases) {
+        try {
+          expect(ownedProcessState(owned, probe)).toBe('unknown');
+          await abandon(owned, owned.child, undefined, { probe, requestExit: async () => false, timeoutMs: 0 });
+          expect(existsSync(owned.dir)).toBe(true);
+          expect(owned.closed).toBe(false);
+          expect(() => assertNoOracleLeak(oracleHygiene([owned], probe))).toThrow(/未证退出/);
+        } finally {
+          rmSync(owned.dir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it.each(['code', 'signal', 'requested'] as const)('真实退出证据 %s 才清目录，已退 child 不探测复用 PID', async (kind) => {
+      const child = liveChild();
+      if (kind === 'code') observeChild(child, { exitCode: 0 });
+      if (kind === 'signal') observeChild(child, { signalCode: 'SIGTERM' });
+      const owned = fixture(child);
+      const probe = noProc();
+      const requestExit = vi.fn(async () => { observeChild(child, { exitCode: 0 }); return true; });
+      try {
+        await abandon(owned, child, undefined, { probe, requestExit, timeoutMs: 0 });
+        expect(existsSync(owned.dir)).toBe(false);
+        expect(owned.closed).toBe(true);
+        expect(probe.pidState).not.toHaveBeenCalled();
+        expect(requestExit).toHaveBeenCalledTimes(kind === 'requested' ? 1 : 0);
+        expect(() => assertNoOracleLeak(oracleHygiene([owned], probe))).not.toThrow();
+      } finally {
+        rmSync(owned.dir, { recursive: true, force: true });
+      }
+    });
+
+    it('明确没有创建进程或异步 spawn 失败，才可在无 /proc 平台清空 profile', async () => {
+      for (const state of ['not-started', 'failed'] as const) {
+        const owned = { ...fixture(state === 'failed' ? new ChildProcess() : undefined), state };
+        try {
+          await abandon(owned, owned.child, undefined, { probe: noProc(), timeoutMs: 0 });
+          expect(existsSync(owned.dir)).toBe(false);
+          expect(owned.closed).toBe(true);
+        } finally {
+          rmSync(owned.dir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it('Linux 根已退出但子进程未退/扫描不完整：保留，直到整棵树确证为空', async () => {
+      const child = liveChild();
+      observeChild(child, { exitCode: 0 });
+      const owned = fixture(child);
+      let tree = { pids: [424243, 424244], complete: true };
+      const probe = { ...noProc(), profileProcesses: () => tree };
+      const options = { probe, requestExit: async () => false, timeoutMs: 0 };
+      try {
+        expect(oracleHygiene([owned], probe).liveBrowsers.map((b) => b.pid)).toEqual(tree.pids);
+        await abandon(owned, child, undefined, options);
+        expect(existsSync(owned.dir)).toBe(true);
+        tree = { pids: [], complete: false };
+        expect(await waitGone(owned, 0, probe)).toBe(false);
+        await abandon(owned, child, undefined, options);
+        expect(existsSync(owned.dir)).toBe(true);
+        tree = { pids: [], complete: true };
+        await abandon(owned, child, undefined, options);
+        expect(existsSync(owned.dir)).toBe(false);
+        expect(owned.closed).toBe(true);
+      } finally {
+        rmSync(owned.dir, { recursive: true, force: true });
+      }
+    });
+
+    it('Linux 空 profile 扫描不能盖过仍在启动/运行的 child', async () => {
+      const child = liveChild();
+      const owned = fixture(child);
+      const probe = { ...noProc(), profileProcesses: () => ({ pids: [], complete: true }) };
+      try {
+        expect(await waitGone(owned, 0, probe)).toBe(false);
+        expect(ownedProcessState(owned, probe)).toBe('running');
+      } finally {
+        rmSync(owned.dir, { recursive: true, force: true });
+      }
+    });
   });
 
   it('收尾覆盖「启动在途」：不 await 的 measure + 立刻收尾 ⇒ 不留孤儿', async () => {

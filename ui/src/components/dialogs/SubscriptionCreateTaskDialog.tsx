@@ -82,6 +82,8 @@ export function SubscriptionCreateTaskDialog({ instanceId, operationId }: { inst
 
   useEffect(() => {
     if (!snapshot?.terminal) return;
+    cancelInFlight.current = false;
+    setCancelling(false);
     const attemptKey = snapshot.phase === 'succeeded'
       ? `${snapshot.revision}:${publishAttempt}`
       : `${snapshot.revision}`;
@@ -163,7 +165,7 @@ export function SubscriptionCreateTaskDialog({ instanceId, operationId }: { inst
             const next = await cancel(operationId);
             // Only the terminal cancelled frame closes this task. A non-terminal response leaves
             // the operation visible and unlocks it for a later, explicit retry.
-            if (!next.terminal) {
+            if (!next.terminal || next.phase === 'failed') {
               cancelInFlight.current = false;
               setCancelling(false);
             }

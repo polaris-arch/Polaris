@@ -1,4 +1,4 @@
-import type { PendingNodeChanges } from '@/contracts/types';
+import type { PendingNodeChanges, ProxyLifecycleEvent } from '@/contracts/types';
 import {
   proxyErrorReason,
   type ProxyErrorTranslate,
@@ -53,7 +53,7 @@ export interface ApplyOutcome {
  *
  * **`applied` 不再报「已应用」**（spec §2.5 Q8 的第三行）：C-8 —— `apply_pending` 的返回值只表达
  * **排程结果**，`applied` 仅意味着 `schedule_restart()` 已排程，重启到底成没成走的是另一条通道
- * （`event:proxyStarted` / `event:proxyError`）。此前直接报 success 的写法会在「排程了但核没起来」时
+ * （带 applyId 的 `event:proxyLifecycle`）。此前直接报 success 的写法会在「排程了但核没起来」时
  * 说谎，而那正是最需要如实说的一格。故 applied/deferred 一律进 `applying` 态、**不弹 toast**：
  * 条本身持续显示「应用中…」，而 toast 2.2s 就消失，用它表达一个还在进行中的过程只会误导。
  *
@@ -69,7 +69,7 @@ export interface ApplyOutcome {
  * 返回值出栈，而 `applyPendingChanges` 早已返回。没有这条兜底，条会永远停在「应用中…」。
  *
  * 取 12s：起核正常路径（含 TUN 建栈 + 系统代理设置）实测在数秒内；给慢盘/首次授权留一倍余量，
- * 又不至于让用户对着转圈干等太久。到点后**查状态再判**，不盲目判失败。
+ * 又不至于让用户对着转圈干等太久。到点后重读状态；没有本次归属的完成证据，仍必须保守报未确认失败。
  */
 export const APPLY_CONFIRM_TIMEOUT_MS = 12_000;
 
@@ -118,57 +118,38 @@ export function isRestartFailureCode(code: string | undefined): boolean {
 /** 条里由「这一次 apply」驱动的那部分状态（`phase` + 失败原因）。 */
 export interface ApplyState {
   phase: ApplyPhase;
+  applyId?: number;
+  mainGeneration?: number;
   /** 只在 `failed` 时有意义。 */
   reason: string | null;
 }
 
-/**
- * `event:proxyLifecycle` → 「应用中…」该怎么收场。**纯函数**，返回 `null` = 这一帧与本次 apply 无关。
- *
- * # 为什么它才是收场的权威判据（而不是「差集变空」）
- *
- * 后端起核**失败**时起核快照同样是空 ⇒ 差集同样为空。拿差集判成功会把失败报成成功，
- * 而这正是本条要堵的那种谎。本事件显式携带结局，三个 phase 各有确定去向：
- *
- * - `ready` —— 核按新配置起来了 ⇒ 成功收场（`idle`）。差集随后由后端同刻推的空差集清掉，条自然隐身。
- * - `failed` —— 这次起核没回来 ⇒ `failed` + 一句可选的本地化原因：
- *   `errorCode` 命中键 → 译文；未知/缺码 → `null`，由 `composeBarView` 落到不带
- *   `{{reason}}` 的「应用失败」，不显示后端诊断串或 "undefined"。
- * - `stopped` —— 核停了就谈不上「正在应用」⇒ 回 `idle`。**不判失败**：停核可能正是用户自己点的
- *   （或重启的停核腿刚跑完、起核还在路上），把它算成「应用失败」会红得毫无道理。
- *
- * # 为什么 `reason` 必须经 `proxyErrorReason` 而不是直接用 `event.message`
- *
- * `message` 是 Rust 侧写死的中文串，直接塞进 `home.pendingApplyFailedReason`（「应用失败：{{reason}}」）
- * 就是半句本地化、半句中文 —— 俄语/波斯语用户实测如此。载荷里的 `errorCode` 才是可跨语种的分类。
- * `errorCode` 在本通道是真可选的（`StartError.code` 为 `Option`），但 Rust `message`
- * 可能携带路径、PID、命令、stderr 或固定语言，所以不能以「缺码」为由穿透到 UI。
- * `STARTUP_FAILED` / `ROOT_ORPHAN_BLOCKED` 等已在 `contracts/proxy-error-key-coverage.test.ts` 与 Rust
- * 码集做全量对账；新码未映射时 fail-safe 为无 reason 终态。
- *
- * # 只在 `applying` 时改态
- *
- * 与既有两条事件腿同一条纪律（`PendingChangesBar` 头注）：别的时候来的起停是别人的事
- * （托盘启停、后台自愈），不该把与本次 apply 无关的结局算进来。
- *
- * # 与 12s 兜底轮询的优先级
- *
- * 本函数是**先到先决**的一方，轮询是**兜底**的一方，两者不会打脸：轮询的 timer 只在
- * `phase === 'applying'` 期间存在，本函数一旦把 phase 推离 `applying`，那条 effect 的 cleanup
- * 立刻 `clearTimeout`。反过来若事件真丢了（或那条极早期失败连本通道都没走到），12s 到点由
- * `getStatus()` 这个更权威的真值收场。两条腿问的是同一件事（核在不在跑），不存在两个答案并存。
- */
+/** Only an attributed terminal event may conclude this Apply request. */
 export function applyStateOnLifecycle(
-  current: ApplyPhase,
-  event: { phase: 'ready' | 'stopped' | 'failed'; errorCode?: string; message?: string },
+  current: ApplyState,
+  event: ProxyLifecycleEvent,
   t: ProxyErrorTranslate
 ): ApplyState | null {
-  if (current !== 'applying') return null;
-  if (event.phase === 'failed') {
-    // 未知/缺码无论 message 是否存在都落到不带诊断原因的本地化文案。
-    return { phase: 'failed', reason: proxyErrorReason(event, t) };
+  if (current.phase !== 'applying' || !Number.isSafeInteger(current.applyId) || (current.applyId ?? 0) <= 0) return null;
+  if (!Number.isSafeInteger(event.mainGeneration) || event.mainGeneration <= 0) return null;
+  if (event.mainGeneration < (current.mainGeneration ?? 0)) return null;
+  // Delivery order across lifecycle producers is not globally ordered. Even an unrelated
+  // operation advances the observed floor before ownership filtering, otherwise a delayed
+  // owned terminal frame could incorrectly complete against an already superseded core.
+  const observed = event.mainGeneration > (current.mainGeneration ?? 0)
+    ? { ...current, mainGeneration: event.mainGeneration } : current;
+  // A newer explicit user stop cancels neutrally; an old stop cannot cancel a newer Apply.
+  if (event.kind === 'stop' && event.terminal === true && event.phase === 'stopped'
+      && current.mainGeneration !== undefined && event.mainGeneration > current.mainGeneration) {
+    return { phase: 'idle', reason: null };
   }
-  return { phase: 'idle', reason: null };
+  if (event.applyId !== current.applyId || event.kind !== 'restart') {
+    return observed === current ? null : observed;
+  }
+  if (event.terminal !== true) return observed;
+  if (event.phase === 'failed') return { phase: 'failed', reason: proxyErrorReason(event, t) };
+  if (event.phase === 'ready') return { phase: 'idle', reason: null };
+  return observed === current ? null : observed;
 }
 
 // ─────────────────────── §2.4 两个正交维度的合成（不是一个状态机）───────────────────────

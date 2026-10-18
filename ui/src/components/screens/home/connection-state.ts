@@ -138,7 +138,7 @@ export interface GlobalProxyStatusInput {
 /**
  * `ProxyStatus` 是否代表“核已停止且存在终态故障”。只读结构化错误码，不解析后端 message。
  *
- * 三个排除项都是明确的非故障终态：用户取消 Helper 引导、停止授权被取消、内核更新窗口拒绝操作。
+ * 两个排除项都是明确的非故障终态：用户取消 Helper 引导、停止授权被取消。
  * 它们各有即时反馈，但不应把常驻状态永久染成“代理不可用”。其余码在 `running=false` 时才成立；
  * 运行期的接管/规则降级由更具体的状态处理。
  */
@@ -153,7 +153,6 @@ export function hasTerminalProxyError({
   return ![
     ProxyErrorCode.HELPER_GATE_ABORTED,
     ProxyErrorCode.STOP_AUTH_CANCELLED,
-    ProxyErrorCode.CORE_UPDATE_IN_PROGRESS,
   ].includes(errorCode);
 }
 

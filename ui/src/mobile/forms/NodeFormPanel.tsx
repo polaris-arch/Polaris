@@ -1,3 +1,4 @@
+import { realityUtlsError } from '@/domain/utls';
 import { MobileInfo } from '../MobileInfo';
 import { MobileSelect as MobileSelect } from '../MobileSelect';
 /**
@@ -40,7 +41,7 @@ import { MobileSelect as MobileSelect } from '../MobileSelect';
  * 等价，理由同 R1。
  */
 
-import { useMemo, useState, type ReactElement } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 /* 「展开即露出」的全仓不变量（`components/reveal.ts`，纯 `.ts`、无 CSS、不导出组件 ⇒ 契约 A1
    的两条风险一条都不成立）。本面板的 `.m-form-body` 同样是 `overflow-y:auto` 的单一滚动容器：
@@ -158,8 +159,13 @@ export function NodeFormPanel({
   /* Tailcat 客户端公钥（同桌面 D5）：纯展示态，由后端从私钥推导；私钥一改就作废，不落盘、不进日志。 */
   const [tcPublicKey, setTcPublicKey] = useState('');
   const [tcKeyBusy, setTcKeyBusy] = useState(false);
+  // Same request-generation rule as desktop NodeDialog; editing/leave invalidates stale replies.
+  const keyRevision = useRef(0);
+  useEffect(() => () => { keyRevision.current += 1; }, []);
 
   const setField = (k: string, v: FormValue): void => {
+    keyRevision.current += 1;
+    setTcKeyBusy(false);
     setDraft((d) => ({ ...d, [k]: v }));
     setDirty(true);
     /* 两条失效规则逐字同桌面 `NodeDialog.setField`：JSON 改过 ⇒ 上次探测结果对不上新文本；
@@ -169,6 +175,8 @@ export function NodeFormPanel({
   };
 
   const changeProto = (next: NodeProto): void => {
+    keyRevision.current += 1;
+    setTcKeyBusy(false);
     setProto(next);
     /* 换协议：公共字段（名/址/端口/detour）留在各自 state；协议特定字段重置为新协议默认
        （逐字同桌面 `NodeDialog.changeProto`）。 */
@@ -238,16 +246,22 @@ export function NodeFormPanel({
    */
   const runTailcatKeypair = async (): Promise<void> => {
     const current = typeof draft.privateKey === 'string' ? draft.privateKey.trim() : '';
+    const revision = ++keyRevision.current;
     setTcKeyBusy(true);
     try {
       const r = await api.server.tailcatKeypair(current || undefined);
-      if (!current) setField('privateKey', r.privateKey);
+      if (keyRevision.current !== revision || !hasInstance(instanceId)) return;
+      if (!current) {
+        setDraft((value) => ({ ...value, privateKey: r.privateKey }));
+        setDirty(true);
+      }
       setTcPublicKey(r.publicKey);
     } catch (e) {
+      if (keyRevision.current !== revision || !hasInstance(instanceId)) return;
       console.error('[mobile-node-form] tailcat keypair failed:', e instanceof IpcError ? e.code : 'unknown');
       setNotice({ tone: 'err', text: t('node.tcKeyFailed') });
     } finally {
-      if (hasInstance(instanceId)) setTcKeyBusy(false);
+      if (keyRevision.current === revision && hasInstance(instanceId)) setTcKeyBusy(false);
     }
   };
 
@@ -361,6 +375,13 @@ export function NodeFormPanel({
       // 同协议编辑 → base 起底保全非模型字段（R5）；改型/新增 → 干净 base 防旧协议残留。
       const codecBase = base !== undefined && base.protocol === proto ? { ...base, ...meta } : meta;
       const full = protoCodec[proto].toConfig(draft, codecBase);
+      const utlsError = realityUtlsError(full);
+      if (utlsError) {
+        revealGroup(nodeFieldGroup(proto, 'fp') ?? 'basic');
+        setNotice({ tone: 'err', text: t(utlsError) });
+        return;
+      }
+
       if (isMeshTunnelNodeProtocol(proto)) applyMeshInboundPolicy(full, policy);
       if (base?.subscriptionId !== undefined || bindInterface === '') delete full.bindInterface;
       else full.bindInterface = bindInterface;

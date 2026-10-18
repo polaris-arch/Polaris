@@ -11,8 +11,12 @@ vi.mock('react', async (importOriginal) => ({
   useCallback: (fn: unknown) => fn,
   useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
 }));
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', async (importOriginal) => ({
+  ...await importOriginal<typeof import('react-i18next')>(), useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock('@/ipc/api-client', () => ({ updateApi: {}, versionApi: {}, systemApi: {} }));
+
+// Initialization must settle (or fail this suite), never leak an unhandled rejection.
+await (await import('@/i18n')).i18nReady;
 
 const { UpdatePage } = await import('./UpdatePage');
 const { default: SettingsUpdate } = await import('@/components/screens/settings/SettingsUpdate');

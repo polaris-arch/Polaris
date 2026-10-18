@@ -1,3 +1,4 @@
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * NodesScreen —— 节点屏（1:1 提取自原型 polaris-prototype.html L1737-1868 #s-nodes
  * + renderMesh/meshItem L4816-4842/4806-4815 组网入口 + syncNodeToolbar L4482-4485 工具栏行为）。
@@ -19,6 +20,8 @@
  * **本屏不再自订 onSpeedTestProgress**，也不再画屏内进度行——见 `use-node-speed-test.ts` 的 `runSpeedTest` 判据。
  */
 
+import { AutoSelectStatusPanel } from '@/mobile/AutoSelectStatusPanel';
+import { useAutoSelectStatus } from '@/hooks/use-auto-select-status';
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useNodeSortStore } from '@/store/use-node-sort-store';
@@ -28,7 +31,7 @@ import { toast } from '@/lib/error-handler';
 import { api } from '@/ipc';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
 import type { MeshRouteReport } from '@/contracts/mesh-route-report';
-import { groupServersBySubscription } from '@/domain/server-grouping';
+import { nodeViewGroups } from '@/domain/server-grouping';
 import { initialNodesTab } from './initial-tab';
 import { isMeshNode, type SpeedTestCaps } from '@/domain/endpoint-routes';
 import { meshNodeRouteBadge, reportForDisplayedMeshNode } from '@/domain/mesh-route-badges';
@@ -56,6 +59,8 @@ import { useNodeSubscriptionActions } from './use-node-subscription-actions';
 import { useNodeDeletion } from './use-node-deletion';
 import { useNodeActions } from './use-node-actions';
 import { performMeshTsLogout } from './mesh-ts-logout';
+import { confirmStopThenTsLogout } from '@/components/dialogs/ts-logout-confirm';
+import { isMainCoreLogoutError } from '@/components/dialogs/ts-logout-flow';
 import type { NodesListSortKey } from './nodes-list-projection';
 import { useNodesRenderWindow } from './use-nodes-render-window';
 import { NodesHeader } from './NodesHeader';
@@ -187,8 +192,8 @@ export function NodesScreen() {
 
   // 分组（单一真值：自建 → 组网 → 各订阅）
   const groups = useMemo(
-    () => groupServersBySubscription(servers, subscriptions, true),
-    [servers, subscriptions],
+    () => nodeViewGroups(servers, subscriptions, { manual: t('nodes.tab.manual'), mesh: t('nodes.tab.mesh') }),
+    [servers, subscriptions, t],
   );
 
   const manualCount = groups.find((g) => g.isManual)?.servers.length ?? 0;
@@ -364,6 +369,7 @@ export function NodesScreen() {
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
   const proxyStartTime = useAppStore((s) => s.proxyStatus?.startTime);
   const savedConfig = useAppStore((s) => s.config);
+  const autoSelectStatus = useAutoSelectStatus(savedConfig);
   const [meshRouteState, setMeshRouteState] = useState<ReportLoadState<MeshRouteReport>>({
     report: null, loading: true, error: false,
   });
@@ -473,7 +479,12 @@ export function NodesScreen() {
         setTailscaleLoginState,
       );
       if (result.ok) toast.success(t(result.noticeKey));
-      else {
+      else if (isMainCoreLogoutError(result.error)) {
+        await confirmStopThenTsLogout(node.id, t, () => {
+          setTailscaleLoginState(node.id, false);
+          toast.success(t('nodes.meshTsLogoutOk'));
+        });
+      } else {
         console.error('[NodesScreen] tailscale logout failed:', result.error);
         toast.error(t(result.noticeKey));
       }
@@ -546,6 +557,11 @@ export function NodesScreen() {
         openDialog={openDialog}
         subscriptionActions={subscriptionActions}
       />
+
+      <SavedAutoSelectControls t={t} />
+
+      <AutoSelectStatusPanel {...autoSelectStatus} t={t}
+        servers={diskServers} subscriptions={savedConfig?.subscriptions ?? []} />
 
       <NodesToolbar
         t={t}

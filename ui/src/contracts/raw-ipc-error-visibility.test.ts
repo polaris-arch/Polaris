@@ -17,7 +17,6 @@ const IMPORT_DIALOG = source('../components/dialogs/ImportDialog.tsx');
 const RES_CATALOG = source('../components/dialogs/ResCatalogDialog.tsx');
 const NODE_DIALOG = source('../components/dialogs/NodeDialog.tsx');
 const GENERAL = source('../components/screens/settings/SettingsGeneral.tsx');
-const CORE_BANNER = source('../components/screens/settings/CoreVersionBanner.tsx');
 const CONNECTIONS = source('../components/screens/connections/ConnectionsScreen.tsx');
 const TRAY = source('../tray/TrayMenu.tsx');
 const PROXY_ERROR_TEXT = source('../domain/proxy-error-text.ts');
@@ -35,14 +34,11 @@ describe('用户可见 IPC 失败面', () => {
     expect(GENERAL).toContain("setPwErr(t('common.saveFailed'))");
   });
 
-  it('资源目录以稳定码保存持久错误，换核只显示既有短提示', () => {
+  it('资源目录以稳定码保存持久错误', () => {
     expect(RES_CATALOG).toContain("type CatalogLoadError = 'RESOURCE_CATALOG_LOAD_FAILED'");
     expect(RES_CATALOG).toContain("setLoadErr(catalogLoadFailure('initial', e))");
     expect(RES_CATALOG).toContain("setExtErr(catalogLoadFailure('external', e))");
     expect(RES_CATALOG).toContain("t('errors.operationFailed')");
-    expect(CORE_BANNER).toContain("console.error('[CoreVersionBanner] manual core replacement failed:', r.error)");
-    expect(CORE_BANNER).toContain("setReplaceErr(t('settings.core.swapFailedShort'))");
-    expect(CORE_BANNER).not.toMatch(/setReplaceErr\(e instanceof Error \? e\.message/);
   });
 
   it('连接关闭、节点 IPC 失败与托盘 notice 不透传 Error.message', () => {

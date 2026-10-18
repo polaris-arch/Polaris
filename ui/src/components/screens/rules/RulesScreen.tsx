@@ -1,3 +1,4 @@
+import { configCanonicalText } from '@/lib/staged-config';
 /**
  * RulesScreen —— 自定义规则屏（1:1 提取自原型 polaris-prototype.html L1869-1919 #s-rules）。
  *
@@ -311,7 +312,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
     [visibleRules, commitOrder],
   );
 
-  // 同 handleDrop：开关必须即时反馈，故乐观更新 store + 失败回滚（原先只写后端，开关点了不动）。
+  // 暂存路径由 replay 即时反馈；直接写路径乐观更新磁盘镜像并只回滚自己的值。
   const handleToggle = useCallback(
     async (rule: Rule) => {
       const currentEffect = plane === 'dns' ? ruleDnsEffect(rule) : ruleRouteEffect(rule);
@@ -323,12 +324,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
           [plane]: { ...currentEffect, enabled: currentEffect.enabled === false },
         },
       };
-      // 操作面（镜像自身）：同 commitOrder —— 乐观 setState 的回滚基准。
-      const prev = plane === 'dns' ? useAppStore.getState().dnsRules : useAppStore.getState().rules;
-      const optimistic = prev.map((r) => (r.id === next.id ? next : r));
-      useAppStore.setState(plane === 'dns' ? { dnsRules: optimistic } : { rules: optimistic });
-      // 当前平面规则启停无副作用，进入对应独立集合的暂存腿。
-      // 上面那次乐观 setState 照旧 —— 开关即时跳位是这条腿的可见承诺，暂存与否都不该让它弹回。
+      // Staged replay provides immediate feedback without mutating the disk mirror.
       const stageRule =
         plane === 'dns'
           ? editRoute('dnsRules', stagingEnabled) === 'staged'
@@ -343,12 +339,20 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
         });
         return; // 零 IPC 写、零磁盘写（FR-1）
       }
+      const prev = plane === 'dns' ? useAppStore.getState().dnsRules : useAppStore.getState().rules;
+      const optimistic = prev.map((r) => (r.id === next.id ? next : r));
+      useAppStore.setState(plane === 'dns' ? { dnsRules: optimistic } : { rules: optimistic });
       try {
         await api.rules.update(next, plane);
       } catch (err) {
         // 同 handleDrop：开关弹回原位是静默的。停用了以为停用了、其实规则还在生效 → 必须报。
         console.error('[RulesScreen] toggle failed:', err);
-        useAppStore.setState(plane === 'dns' ? { dnsRules: prev } : { rules: prev });
+        useAppStore.setState((state) => {
+          const current = plane === 'dns' ? state.dnsRules : state.rules;
+          const original = prev.find((r) => r.id === next.id);
+          const restored = current.map((r) => r === next && original ? original : r);
+          return plane === 'dns' ? { dnsRules: restored } : { rules: restored };
+        });
         toast.error(
           t('rules.saveFailed'),
         );
@@ -414,7 +418,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
    */
   const requestDelete = useCallback(
     (rule: Rule) => {
-      confirmTwice(`${RULE_DEL_PREFIX}${rule.id}`, () => {
+      confirmTwice(`${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`, () => {
         void (async () => {
           try {
             await deleteRule(rule);
@@ -427,7 +431,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
         })();
       });
     },
-    [confirmTwice, deleteRule, t],
+    [confirmTwice, deleteRule, t, plane],
   );
 
   const handleRegionChange = useCallback(
@@ -759,7 +763,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
                   onEdit={(r) => openDialog({ kind: 'rule', ruleId: r.id, initialPlane: plane })}
                   onDuplicate={handleDuplicate}
                   onDelete={requestDelete}
-                  deleteConfirming={armed === `${RULE_DEL_PREFIX}${rule.id}`}
+                  deleteConfirming={armed === `${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`}
                   onDragStart={(r) => setDragId(r.id)}
                   onDragOver={(_, e) => e.preventDefault()}
                   onDrop={handleDrop}

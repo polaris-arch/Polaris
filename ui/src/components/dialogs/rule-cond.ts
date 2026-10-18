@@ -13,7 +13,7 @@ import { RULE_TYPES, validateRuleValue } from '@/domain/rules';
 import { geoTagOf } from '@/domain/rule-resource-refs';
 import { ruleSetRef } from './rule-set-pick';
 
-/** 编辑草稿的单条件（`v` = 原始多值串，提交时 `splitVals`）。 */
+/** 编辑草稿的单条件（`v` = 原始多值串，提交时 `parseConditionValues`）。 */
 export interface Cond {
   t: RuleType;
   v: string;
@@ -25,6 +25,15 @@ export const splitVals = (v: string): string[] =>
     .split(/[,\n]/)
     .map((s) => s.trim())
     .filter(Boolean);
+
+/** Regex commas are syntax, so regex values use one expression per line. */
+export const parseConditionValues = (type: RuleType, value: string): string[] =>
+  type === 'domainRegex'
+    ? String(value ?? '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+    : splitVals(value);
+
+export const formatConditionValues = (type: RuleType, values: readonly string[]): string =>
+  values.join(type === 'domainRegex' ? '\n' : ', ');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 草稿编辑（类型切换 / 勾选）
@@ -252,7 +261,7 @@ export function offPoolSelectedOptions(
 export function invalidCondValues(conds: readonly Cond[]): Array<{ type: RuleType; value: string }> {
   const out: Array<{ type: RuleType; value: string }> = [];
   for (const c of conds) {
-    for (const v of splitVals(c.v)) {
+    for (const v of parseConditionValues(c.t, c.v)) {
       if (!validateRuleValue(c.t, v)) out.push({ type: c.t, value: v });
     }
   }
@@ -298,7 +307,7 @@ export function matchConditionValues(
   const isIp = looksLikeIp(raw);
   const applied: boolean[] = [];
   for (const c of conds) {
-    const toks = c.values.map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const toks = c.values.map((s) => c.type === 'domainRegex' ? s.trim() : s.trim().toLowerCase()).filter(Boolean);
     if (!toks.length) continue;
     const spec = RULE_TYPES[c.type]?.test;
     if (!spec) continue;
@@ -313,7 +322,7 @@ export function matchConditionValues(
 /** 草稿态（多值串）的「测试匹配」——拆值后交给 [`matchConditionValues`]，合成逻辑不重写第二份。 */
 export function computeTestMatch(conds: readonly Cond[], logic: 'and' | 'or', input: string): TestResult {
   return matchConditionValues(
-    conds.map((c) => ({ type: c.t, values: splitVals(c.v) })),
+    conds.map((c) => ({ type: c.t, values: parseConditionValues(c.t, c.v) })),
     logic,
     input
   );

@@ -266,6 +266,7 @@ export function computeTopologyLayout(
   // 「其它」显示名：聚合侧用 sentinel 标记（它不知 i18n）→ 此处替换为本地化文案。
   // isOthers 按 sentinel 判定而非显示名比较，杜绝真实 host 恰为本地化「其它」文案时被误染/撞 id。
   const middle = aggregate.hosts.map((h) => ({
+    key: h.name,
     name: h.name === TOPOLOGY_OTHERS_KEY ? t('home.others') : h.name,
     value: h.count,
     flows: new Map(h.flows.map((f) => [f.outbound, f.count])),
@@ -321,7 +322,7 @@ export function computeTopologyLayout(
   middle.forEach((m) => {
     const height = scaledBarHeight(m.value, midScale);
     const node: TopoNode = {
-      id: `mid-${m.name}`,
+      id: `mid-${m.key}`,
       name: m.name,
       type: 'host',
       value: m.value,
@@ -333,7 +334,7 @@ export function computeTopologyLayout(
       recent: m.recent,
     };
     nodes.push(node);
-    midNodes.set(m.name, node);
+    midNodes.set(m.key, node);
     cursor += height + NODE_GAP;
   });
 
@@ -370,7 +371,7 @@ export function computeTopologyLayout(
   let sourceCursor = sourceNode.y;
 
   middle.forEach((m) => {
-    const midNode = midNodes.get(m.name)!;
+    const midNode = midNodes.get(m.key)!;
     const heightSource = (m.value / (totalConnections || 1)) * sourceNode.height;
     links.push({
       id: linkId(sourceNode.id, midNode.id),
@@ -395,7 +396,7 @@ export function computeTopologyLayout(
 
   /* ── 缎带：域名 → 出站（两端各按本列节点高度的占比算，故三列异 scale 无碍）── */
   middle.forEach((m) => {
-    const midNode = midNodes.get(m.name)!;
+    const midNode = midNodes.get(m.key)!;
     let midCursor = midNode.y;
 
     outbounds.forEach((o) => {

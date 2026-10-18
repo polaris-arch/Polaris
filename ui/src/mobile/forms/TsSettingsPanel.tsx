@@ -1,4 +1,5 @@
-import { supportsTsAccountActions, tsLoginErrorReason, tsLoginUsesBackendReplacement } from '@/components/dialogs/ts-login-server';
+import { applyOnDemand, onDemandDraftValue } from '@/components/dialogs/on-demand-field';
+import { supportsTsAccountActions, tsAccountActionsUseNormalMain, tsLoginErrorReason } from '@/components/dialogs/ts-login-server';
 import { loginFailureReasonKey } from '@/domain/tailscale-login-progress';
 /**
  * 移动端 **Tailscale 设置表** —— 批 3。节点行上「编辑」一个 tailscale 节点落到这里
@@ -66,7 +67,7 @@ import { MeshInboundPolicyFields } from './MeshInboundPolicyFields';
 import { FormSheet } from './FormSheet';
 import { FormGroup } from './FormGroup';
 import { useMobileFormStore } from './form-store';
-import { isMainCoreLogoutError, sameRunningCore, stopOwnedCoreThenLogout } from './ts-logout-flow';
+import { isMainCoreLogoutError, sameRunningCore, stopOwnedCoreThenLogout, tsNodeHoldByRunningCore } from '@/components/dialogs/ts-logout-flow';
 import { hasTsAuthKey, hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 
@@ -86,7 +87,7 @@ export function TsSettingsPanel({
 }): ReactElement {
   const { t } = useTranslation();
   const accountActionsSupported = supportsTsAccountActions();
-  const isIOS = tsLoginUsesBackendReplacement(true);
+  const isIOS = tsAccountActionsUseNormalMain();
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
@@ -118,6 +119,7 @@ export function TsSettingsPanel({
   const stateReadRevision = useRef(0);
   const [draft, setDraft] = useState<FormValues>(() => ({
     ...initTsDraft(node),
+    onDemand: onDemandDraftValue(node),
     bindInterface: node?.bindInterface ?? '',
   }));
   const [name, setName] = useState(node?.name ?? '');
@@ -275,6 +277,7 @@ export function TsSettingsPanel({
       if (bindInterface) next.bindInterface = bindInterface;
       else delete next.bindInterface;
       applyMeshInboundPolicy(next, policy);
+      applyOnDemand(next, draft.onDemand);
       // 暂存灰度的**唯一**闸门（与桌面同一个 `editRoute`）。
       if (editRoute('servers', stagingEnabled) === 'staged') {
         stage({
@@ -322,11 +325,72 @@ export function TsSettingsPanel({
     if (!accountActionsSupported) return;
     if (node === undefined) return;
     const serverId = node.id;
+    const logoutNow = async (): Promise<void> => {
+      setBusy(true);
+      try {
+        await api.server.tailscaleLogout(serverId);
+        await completeLogout(serverId);
+      } catch (e) {
+        if (isIOS || !isMainCoreLogoutError(e)) {
+          const reason = tsLoginErrorReason(e);
+          setNotice({ tone: 'err', text: t(reason ? loginFailureReasonKey(reason) : 'nodes.meshTsLogoutFail') });
+          return;
+        }
+        // The native writer gate refused this exact node. Capture the live core before asking
+        // to stop it; a later confirmation must not stop a replacement/user-selected core.
+        const ownerStatus = await api.proxy.getStatus().catch(() => null);
+        if (!ownerStatus || !sameRunningCore(ownerStatus, ownerStatus)) {
+          setNotice({ tone: 'info', text: t('ts.logoutStopChanged') });
+          return;
+        }
+        const owner = { serverId, selectedId: useAppStore.getState().selectedServerId,
+          status: ownerStatus };
+        const stopConfirmId = open({
+          kind: 'confirm',
+          payload: {
+            title: t('ts.logoutStopTitle'),
+            message: t('ts.logoutStopMessage'),
+            confirmLabel: t('ts.logoutStopConfirm'),
+            danger: true,
+            onConfirm: async () => {
+              closeInstance(stopConfirmId);
+              if (!hasInstance(instanceId)) return;
+              setBusy(true);
+              try {
+                const result = await stopOwnedCoreThenLogout(owner, {
+                  selectedId: () => useAppStore.getState().selectedServerId,
+                  serverPresent: (id) => useAppStore.getState().servers.some((s) => s.id === id),
+                  status: () => api.proxy.getStatus(),
+                  stopExpected: (expected) => api.proxy.stopExpected(expected),
+                  logout: async (id) => { await api.server.tailscaleLogout(id); },
+                });
+                if (result.kind === 'loggedOut') await completeLogout(serverId);
+                else if (result.kind === 'changed') setNotice({ tone: 'info', text: t('ts.logoutStopChanged') });
+                else if (result.kind === 'stopFailed') setNotice({ tone: 'err', text: t('ts.logoutStopFailed') });
+                else setNotice({ tone: 'err', text: t(result.code === 'TAILSCALE_LOGOUT_MAIN_CORE'
+                  ? 'ts.reasonMainCoreInUse' : 'nodes.meshTsLogoutFail') });
+              } catch (error) {
+                // Delegate or local-state failures are not one of the helper's structured outcomes.
+                // Keep this form open and surface them instead of dropping an async confirmation rejection.
+                console.error('[mobile-ts-settings] confirmed logout failed:', error);
+                if (hasInstance(instanceId)) setNotice({ tone: 'err', text: t('nodes.meshTsLogoutFail') });
+              } finally {
+                if (hasInstance(instanceId)) setBusy(false);
+              }
+            },
+          },
+        });
+      } finally {
+        if (hasInstance(instanceId)) setBusy(false);
+      }
+    };
     const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('ts.logout'),
-        message: t('meshJoin.logout'),
+        // A stopped iOS proxy is connected first and disconnected again by this action.
+        message: t(isIOS && !useAppStore.getState().proxyStatus?.running
+          ? 'ts.logoutStartsConnectionNote' : 'meshJoin.logout'),
         confirmLabel: t('ts.logout'),
         danger: true,
         onConfirm: async () => {
@@ -344,63 +408,31 @@ export function TsSettingsPanel({
             setNotice({ tone: 'info', text: t('home.stagedOnlyBlocked') });
             return;
           }
-          setBusy(true);
-          try {
-            await api.server.tailscaleLogout(serverId);
-            await completeLogout(serverId);
-          } catch (e) {
-            if (isIOS || !isMainCoreLogoutError(e)) {
-              const reason = tsLoginErrorReason(e);
-              setNotice({ tone: 'err', text: t(reason ? loginFailureReasonKey(reason) : 'nodes.meshTsLogoutFail') });
-              return;
-            }
-            // The native writer gate refused this exact node. Capture the live core before asking
-            // to stop it; a later confirmation must not stop a replacement/user-selected core.
-            const ownerStatus = await api.proxy.getStatus().catch(() => null);
-            if (!ownerStatus || !sameRunningCore(ownerStatus, ownerStatus)) {
-              setNotice({ tone: 'info', text: t('ts.logoutStopChanged') });
-              return;
-            }
-            const owner = { serverId, selectedId: useAppStore.getState().selectedServerId,
-              status: ownerStatus };
-            const stopConfirmId = open({
+          // The mobile backend stops a proxy that holds this node and leaves it stopped.
+          // Say so before calling it unless the proxy provably does not hold the node.
+          const [proxy, snapshot] = await Promise.all([
+            api.proxy.getStatus().catch(() => null),
+            api.server.tailscaleGetStatus().catch(() => null),
+          ]);
+          const hold = tsNodeHoldByRunningCore(proxy, snapshot, serverId);
+          if (!hasInstance(instanceId)) return;
+          if (hold !== 'notHeld') {
+            const stopNoticeId = open({
               kind: 'confirm',
               payload: {
                 title: t('ts.logoutStopTitle'),
-                message: t('ts.logoutStopMessage'),
+                message: t(hold === 'held' ? 'ts.logoutStopMessage' : 'ts.logoutStopUnsureMessage'),
                 confirmLabel: t('ts.logoutStopConfirm'),
                 danger: true,
                 onConfirm: async () => {
-                  closeInstance(stopConfirmId);
-                  if (!hasInstance(instanceId)) return;
-                  setBusy(true);
-                  try {
-                    const result = await stopOwnedCoreThenLogout(owner, {
-                      selectedId: () => useAppStore.getState().selectedServerId,
-                      serverPresent: (id) => useAppStore.getState().servers.some((s) => s.id === id),
-                      status: () => api.proxy.getStatus(),
-                      stop: () => useAppStore.getState().stopProxy(),
-                      logout: async (id) => { await api.server.tailscaleLogout(id); },
-                    });
-                    if (result.kind === 'loggedOut') await completeLogout(serverId);
-                    else if (result.kind === 'changed') setNotice({ tone: 'info', text: t('ts.logoutStopChanged') });
-                    else if (result.kind === 'stopFailed') setNotice({ tone: 'err', text: t('ts.logoutStopFailed') });
-                    else setNotice({ tone: 'err', text: t(result.code === 'TAILSCALE_LOGOUT_MAIN_CORE'
-                      ? 'ts.reasonMainCoreInUse' : 'nodes.meshTsLogoutFail') });
-                  } catch (error) {
-                    // Delegate or local-state failures are not one of the helper's structured outcomes.
-                    // Keep this form open and surface them instead of dropping an async confirmation rejection.
-                    console.error('[mobile-ts-settings] confirmed logout failed:', error);
-                    if (hasInstance(instanceId)) setNotice({ tone: 'err', text: t('nodes.meshTsLogoutFail') });
-                  } finally {
-                    if (hasInstance(instanceId)) setBusy(false);
-                  }
+                  closeInstance(stopNoticeId);
+                  if (hasInstance(instanceId)) await logoutNow();
                 },
               },
             });
-          } finally {
-            if (hasInstance(instanceId)) setBusy(false);
+            return;
           }
+          await logoutNow();
         },
       },
     });

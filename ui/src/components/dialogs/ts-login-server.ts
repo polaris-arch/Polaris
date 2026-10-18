@@ -34,9 +34,24 @@ export function supportsTsAccountActions(_mobileOs?: string): boolean {
   return true;
 }
 
+function tsMobileOs(): string | undefined {
+  return typeof document === 'undefined' ? undefined : document.documentElement?.dataset?.mobileOs;
+}
+
+/** iOS starts the normal connection for account actions and reconnects after a switch. */
+export function tsAccountActionsUseNormalMain(): boolean {
+  return tsMobileOs() === 'ios';
+}
+
+/** Android's backend stops a proxy that holds the node for an account action and leaves it stopped. */
+export function tsBackendLeavesProxyStopped(): boolean {
+  return tsMobileOs() === 'android';
+}
+
+/** Mobile backends retire the old identity themselves; desktop orchestrates logout, save, login. */
 export function tsLoginUsesBackendReplacement(replaceIdentity: boolean): boolean {
-  return replaceIdentity && typeof document !== 'undefined'
-    && document.documentElement?.dataset?.mobileOs === 'ios';
+  const mobileOs = tsMobileOs();
+  return replaceIdentity && (mobileOs === 'ios' || mobileOs === 'android');
 }
 
 export type TsLoginMode = 'browser' | 'authkey';
@@ -205,7 +220,7 @@ export function planTsLoginSubmit(input: TsLoginSubmitInput): TsLoginSubmitPlan 
 }
 
 export interface TsLoginExecution {
-  /** iOS switch: the backend owns Stop/retirement/save/Start as one request. */
+  /** Mobile switch: the backend owns Stop/retirement/save (and, on iOS, Start) as one request. */
   backendReplacement?: boolean;
   /** Explicit credential actions use the same backend transaction on all platforms. */
   backendCredentials?: boolean;
@@ -220,7 +235,7 @@ export interface TsLoginExecution {
   cancel: () => Promise<void>;
 }
 
-const RETIREMENT_REASONS = ['mainCoreChanged', 'cancelled', 'nativeRetirementUnknown',
+const RETIREMENT_REASONS = ['mainCoreChanged', 'mainCoreInUse', 'staleLoginCoreAlive', 'cancelled', 'nativeRetirementUnknown',
   'profileBindingUnknown', 'stateRevisionChanged', 'candidateConfigurationChanged',
   'retainedAuthKeyUnavailable', 'retainedAuthKeyAuthorityChanged', 'credentialRevisionChanged',
   'invalidCredentialIntent', 'credentialCommitUnknown'];
@@ -234,6 +249,7 @@ export function tsLoginErrorReason(error: unknown): string | undefined {
     'IOS_FOREGROUND_REQUIRED', 'IOS_VPN_PERMISSION_DENIED', 'IOS_READY_UNKNOWN', 'IOS_START_CANCELLED',
     'readyUnknown', 'unsavedConfiguration', 'configurationPending', 'superseded', 'targetNotInMain'].includes(error.code)) return error.code;
   if (error.code === 'TAILSCALE_LOGOUT_MAIN_CORE') return 'mainCoreInUse';
+  if (error.code === 'TAILSCALE_LOGOUT_STALE_LOGIN_CORE') return 'staleLoginCoreAlive';
   return undefined;
 }
 

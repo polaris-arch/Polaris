@@ -2,9 +2,10 @@
  * 提交计划纯逻辑单测（vitest，node 环境）。
  * 守的是「登录成果孤儿化」那条 bug：新建路径必须带真实 id 落盘后再登录。
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
-import { supportsTsLoginActions, supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsLoginFailureKey, tsLoginUsesBackendCredentials } from './ts-login-server';
+import { loginFailureReasonKey } from '@/domain/tailscale-login-progress';
+import { supportsTsLoginActions, supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsAccountActionsUseNormalMain, tsBackendLeavesProxyStopped, tsLoginErrorReason, tsLoginFailureKey, tsLoginUsesBackendCredentials, tsLoginUsesBackendReplacement } from './ts-login-server';
 
 const MINTED = 'minted-id-1';
 const mint = () => MINTED;
@@ -240,5 +241,49 @@ describe('explicit retained credential routing and editable candidates', () => {
       expect(JSON.stringify(plan.server)).not.toContain('revision-A');
     }
     expect(raw.retainedAuthKey.authKey).toBe('synthetic-retained');
+  });
+});
+
+describe('account switch routing by platform', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const onPlatform = (mobileOs?: string) =>
+    vi.stubGlobal('document', { documentElement: { dataset: mobileOs ? { mobileOs } : {} } });
+
+  it.each([
+    // [platform marker, backend owns an account switch, account actions use the normal connection]
+    ['android', true, false],
+    ['ios', true, true],
+    [undefined, false, false],
+  ] as const)('%s: backend replacement=%s, normal main=%s', (mobileOs, replacement, normalMain) => {
+    onPlatform(mobileOs);
+    expect(tsLoginUsesBackendReplacement(true)).toBe(replacement);
+    expect(tsAccountActionsUseNormalMain()).toBe(normalMain);
+    // Only Android stops the holding proxy itself and leaves it stopped.
+    expect(tsBackendLeavesProxyStopped()).toBe(mobileOs === 'android');
+    // An ordinary sign-in is never a replacement, whatever the platform.
+    expect(tsLoginUsesBackendReplacement(false)).toBe(false);
+  });
+
+  it('without a document nothing is routed to the backend', () => {
+    vi.stubGlobal('document', undefined);
+    expect(tsLoginUsesBackendReplacement(true)).toBe(false);
+    expect(tsAccountActionsUseNormalMain()).toBe(false);
+  });
+
+  it('recognizes the main-core refusal from both the logout leg and the credential transaction', () => {
+    expect(tsLoginErrorReason({ code: 'TAILSCALE_LOGOUT_MAIN_CORE' })).toBe('mainCoreInUse');
+    expect(tsLoginErrorReason({ code: 'TAILSCALE_LOGIN_FAILED', message: 'mainCoreInUse' })).toBe('mainCoreInUse');
+    expect(tsLoginErrorReason({ code: 'TAILSCALE_LOGIN_FAILED', message: 'tskey-private' })).toBeUndefined();
+  });
+
+  it('a leftover login process has its own message on both the login and the logout leg', () => {
+    for (const error of [
+      { code: 'TAILSCALE_LOGIN_FAILED', message: 'staleLoginCoreAlive' },
+      { code: 'TAILSCALE_LOGOUT_STALE_LOGIN_CORE', message: 'Cannot clear Tailscale state' },
+    ]) {
+      expect(loginFailureReasonKey(tsLoginErrorReason(error))).toBe('ts.reasonStaleLoginCore');
+    }
+    // The generic logout failure stays generic.
+    expect(tsLoginErrorReason({ code: 'TAILSCALE_LOGOUT_FAILED' })).toBeUndefined();
   });
 });

@@ -12,11 +12,13 @@ import { createRoot } from 'react-dom/client';
 import { api, unlockApi } from '/src/ipc';
 import { useAppStore } from '/src/store/app-store';
 import { useMobileFormStore } from '/src/mobile/forms/form-store';
+import { useDialogStore } from '/src/components/dialogs/dialog-store';
 import { useTailscaleLoginProgressStore } from '/src/store/use-tailscale-login-progress-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
 import { TsLoginPanel } from '/src/mobile/forms/TsLoginPanel';
 import { MobileToaster } from '/src/mobile/MobileToaster';
 import { MobileFormHost } from '/src/mobile/forms/MobileFormHost';
+import { ConfirmPanel } from '/src/mobile/forms/ConfirmPanel';
 import { startMobileAppWiring } from '/src/mobile/app-wiring';
 import { i18nReady } from '/src/i18n';
 import '/src/styles/tokens.resolved.css';
@@ -29,6 +31,8 @@ import '/src/mobile/connections/connections-redesign.css';
 await i18nReady;
 const mode = new URLSearchParams(location.search).get('mode');
 if (mode?.startsWith('ios')) document.documentElement.dataset.mobileOs = 'ios';
+if (mode?.startsWith('android-switch') || mode?.startsWith('android-stop-retained')) document.documentElement.dataset.mobileOs = 'android';
+const heldDesktop = mode === 'desktop-switch-held' || mode === 'credential-settings-logout-held';
 const listeners = new Map();
 const on = name => fn => { const set = listeners.get(name) || new Set(); listeners.set(name, set); set.add(fn); return () => set.delete(fn); };
 const bus = (domain, names) => { for (const name of names) api[domain][name] = on(name); };
@@ -49,11 +53,16 @@ api.subscription.createList = async () => [];
 api.server.taildropTasks = async () => [];
 api.server.tailscaleStateExists = async () => {
   if (mode === 'state-read-fail') throw Error('state unavailable');
-  return { 'ts-1': mode === 'state-true' || mode === 'state-switch' || mode === 'ios-existing' || mode === 'ios-settings' || mode?.startsWith('ios-replace') };
+  return { 'ts-1': mode === 'state-true' || mode === 'state-switch' || mode === 'ios-existing' || mode === 'ios-settings' || mode?.startsWith('ios-replace') || mode?.startsWith('android-switch') || heldDesktop };
 };
 const test = window.__tsTest = { opens: [], cancels: [], starts: 0, saves: 0, prepares: 0, logouts: 0, releasePrepare: null, releaseStart: null, releaseSave: null, releaseProgress: null, holdProgress: false, failProgress: false, receipt: null, mode, mainStarts: 0, mainStops: 0, progressQueries: [], receipts: {}, refreshes: 0, backendSaved: null, request: null };
 api.proxy.start = async () => { test.mainStarts++; };
 api.proxy.stop = async () => { test.mainStops++; };
+if (heldDesktop) api.proxy.getStatus = async () => test.mainStops === 0 ? { running: true, starting: false, pid: 9, startTime: 5 } : { running: false };
+// A stopped proxy is positive proof that nothing holds the node: no notice in these modes.
+if (mode === 'android-switch' || mode === 'ios-settings') api.proxy.getStatus = async () => ({ running: false, starting: false });
+if (mode?.startsWith('android-switch-') || mode?.startsWith('android-stop-retained')) api.proxy.getStatus = async () => mode?.endsWith('-restarted') ? { running: false, starting: false, mainGeneration: 8 } : ({ running: true, starting: mode?.endsWith('-starting'), pid: 9, startTime: 5, mainGeneration: 7 });
+if (mode === 'android-switch-unknown') api.proxy.getStatus = async () => { throw new Error('proxy status unavailable'); };
 api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
   test.progressQueries.push([serverId,attemptId]);
   if (test.holdProgress) await new Promise(resolve => { test.releaseProgress = resolve; });
@@ -61,17 +70,29 @@ api.server.tailscaleLoginProgress = async (serverId, attemptId) => {
   if (test.receipts[attemptId]) return test.receipts[attemptId];
   return test.receipt?.serverId === serverId && test.receipt?.attemptId === attemptId ? test.receipt : null;
 };
-api.server.tailscaleGetStatus = async () => mode?.startsWith('main') && test.starts > 0
-  ? { connected: true, statuses: [{ serverId: 'ts-1', backendState: 'Running', loggedIn: true,
-      expired: false, peers: [], tailscaleIPs: [], canShareFiles: false,
-      waitingFileCount: 0, receivingFileCount: 0, unreadFileCount: 0 }] }
-  : { connected: false, statuses: [] };
+api.server.tailscaleGetStatus = async () => {
+  if (mode === 'android-switch-unknown') throw new Error('status unavailable');
+  if (mode?.startsWith('android-switch-') || mode?.startsWith('android-stop-retained')) {
+    const absent = mode?.endsWith('-empty') || mode?.endsWith('-other');
+    return { connected: true, statuses: [], mainCoreHold: mode?.endsWith('-legacy') ? undefined : {
+      mainGeneration: mode?.endsWith('-restarted') ? 9 : mode?.endsWith('-stale') ? 6 : 7,
+      serverIds: absent ? (mode?.endsWith('-other') ? ['other'] : []) : ['ts-1'] } };
+  }
+  return (mode?.startsWith('main') && test.starts > 0)
+    ? { connected: true, statuses: [{ serverId: 'ts-1', backendState: 'Running', loggedIn: true,
+        expired: false, peers: [], tailscaleIPs: [], canShareFiles: false,
+        waitingFileCount: 0, receivingFileCount: 0, unreadFileCount: 0 }] }
+    : { connected: false, statuses: [] };
+};
 api.system.openExternal = async url => { test.opens.push(url); };
 api.server.tailscaleLoginPrepare = async () => {
   test.prepares++;
   if (mode === 'prepare' || mode?.includes('retained-prepare')) await new Promise(resolve => { test.releasePrepare = resolve; });
 };
-api.server.tailscaleLogout = async () => { test.logouts++; };
+api.server.tailscaleLogout = async () => {
+  if (heldDesktop && test.mainStops === 0) throw { code: 'TAILSCALE_LOGOUT_MAIN_CORE' };
+  test.logouts++;
+};
 api.server.tailscaleLoginCancel = async (serverId, attemptId) => { test.cancels.push([serverId,attemptId]); };
 api.server.tailscaleLogin = async (node, request) => {
   test.starts++;
@@ -135,12 +156,14 @@ test.begin = id => useTailscaleLoginProgressStore.getState().begin('ts-1', id);
 test.authUrl = () => useAppStore.getState().tailscaleAuthUrls['ts-1'];
 test.initiated = () => useAppStore.getState().tailscaleLoginInitiated['ts-1'];
 test.stop = off;
+test.topConfirm = () => { const entry = (heldDesktop ? useDialogStore : useMobileFormStore).getState().stack.at(-1); return entry?.kind === 'confirm' ? entry.payload : null; };
 function Host() {
   const stack = useMobileFormStore(s => s.stack);
   if (mode?.includes('retained-prepare')) return <MobileFormHost />;
   if (mode === 'ios-settings' || mode?.includes('credential-settings')) return <MobileFormHost />;
   return stack.map(form => form.kind === 'ts-login'
-    ? <TsLoginPanel key={form.instanceId} instanceId={form.instanceId} serverId={form.serverId} replaceIdentity={mode?.startsWith('ios-replace') || mode === 'state-switch'} /> : null);
+    ? <TsLoginPanel key={form.instanceId} instanceId={form.instanceId} serverId={form.serverId} replaceIdentity={mode?.startsWith('ios-replace') || mode === 'state-switch' || mode?.startsWith('android-switch') || mode === 'desktop-switch-held'} /> : form.kind === 'confirm'
+      ? <ConfirmPanel key={form.instanceId} instanceId={form.instanceId} payload={form.payload} /> : null);
 }
 useMobileFormStore.getState().open({kind:mode === 'ios-settings' || mode?.includes('credential-settings') ? 'ts-settings' : 'ts-login', serverId:'ts-1'});
 createRoot(document.getElementById('root')).render(<main className="mobile-root"><Host /><MobileToaster /></main>);
@@ -352,6 +375,176 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile TS attempt lif
         const t = (window as any).__tsTest;
         return { logouts: t.logouts, replace: t.request.replaceIdentity, mode: t.request.mode };
       })).toEqual({ logouts: 1, replace: true, mode: loginMode });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('Android switches a browser-only node through one backend request, never a renderer logout', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=android-switch`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { logouts: t.logouts, saves: t.saves, replace: t.request.replaceIdentity, mode: t.request.mode,
+          revision: t.request.expectedCredentialRevision ?? null, noticed: !!t.topConfirm() };
+      })).toEqual({ logouts: 0, saves: 0, replace: true, mode: 'browser', revision: null, noticed: false });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['empty', 'other'])('Android switch skips the notice for a same-run %s set with no STATUS frame', async proof => {
+    for (const loginMode of ['browser', 'authkey']) {
+      const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+      try {
+        await page.goto(origin + '/__ts-login?mode=android-switch-' + proof);
+        if (loginMode === 'authkey') {
+          await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+          await page.locator('#mts-authkey').fill('synthetic-test-key');
+        }
+        await page.locator('.m-form-foot .primary').click();
+        await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+        expect(await page.evaluate(() => {
+          const t = (window as any).__tsTest;
+          return { notice: !!t.topConfirm(), starts: t.starts, logouts: t.logouts,
+            replace: t.request.replaceIdentity, mode: t.request.mode, mainStops: t.mainStops };
+        })).toEqual({ notice: false, starts: 1, logouts: 0, replace: true, mode: loginMode, mainStops: 0 });
+      } finally { await page.close(); }
+    }
+  }, 45_000);
+
+  it.each(['empty', 'other'])('Android retained-key login skips the notice for a same-run %s set', async proof => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(origin + '/__ts-login?mode=android-stop-retained-' + proof);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      await page.getByRole('button', { name: '使用已保存密钥', exact: true }).click();
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { notice: !!t.topConfirm(), reuse: t.request.reuseRetainedAuthKey,
+          replace: t.request.replaceIdentity, mainStops: t.mainStops };
+      })).toEqual({ notice: false, reuse: true, replace: false, mainStops: 0 });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.each(['stale', 'legacy', 'starting', 'restarted'])('Android %s proof asks and cancellation submits nothing', async proof => {
+    for (const retained of [false, true]) {
+      const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+      try {
+        await page.goto(origin + '/__ts-login?mode=' + (retained ? 'android-stop-retained-' : 'android-switch-') + proof);
+        if (retained) {
+          await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+          await page.getByRole('button', { name: '使用已保存密钥', exact: true }).click();
+        }
+        await page.locator('.m-form-foot .primary').click();
+        await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+        expect(await page.evaluate(() => (window as any).__tsTest.topConfirm().message.startsWith('暂时无法确认'))).toBe(true);
+        await page.getByRole('dialog', { name: retained ? '断开连接并登录？' : '断开连接并切换账号？' })
+          .getByRole('button', { name: '取消', exact: true }).click();
+        expect(await page.evaluate(() => {
+          const t = (window as any).__tsTest;
+          return { notice: !!t.topConfirm(), starts: t.starts, prepares: t.prepares, logouts: t.logouts };
+        })).toEqual({ notice: false, starts: 0, prepares: 0, logouts: 0 });
+      } finally { await page.close(); }
+    }
+  }, 45_000);
+
+  it('Android says the proxy will stay disconnected before a switch stops the proxy holding the node', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=android-switch-held`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'),
+          prepares: t.prepares, starts: t.starts, logouts: t.logouts };
+      })).toEqual({ title: '断开连接并切换账号？', keepsDisconnected: true, prepares: 0, starts: 0, logouts: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { logouts: t.logouts, mainStops: t.mainStops, replace: t.request.replaceIdentity };
+      })).toEqual({ logouts: 0, mainStops: 0, replace: true });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('Android asks before a switch even when neither status can be read, without claiming a holder', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=android-switch-unknown`);
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, unsure: t.topConfirm().message.startsWith('暂时无法确认'),
+          keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'), starts: t.starts };
+      })).toEqual({ title: '断开连接并切换账号？', unsure: true, keepsDisconnected: true, starts: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('Android asks before signing in with the stored key stops the proxy holding the node', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-login?mode=android-stop-retained`);
+      await page.getByRole('button', { name: 'Auth Key', exact: true }).click();
+      await page.getByRole('button', { name: '使用已保存密钥', exact: true }).click();
+      await page.locator('.m-form-foot .primary').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'),
+          prepares: t.prepares, starts: t.starts };
+      })).toEqual({ title: '断开连接并登录？', keepsDisconnected: true, prepares: 0, starts: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { replace: t.request.replaceIdentity, reuse: t.request.reuseRetainedAuthKey, mainStops: t.mainStops };
+      })).toEqual({ replace: false, reuse: true, mainStops: 0 });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop offers to stop the proxy that holds the node, then switches and leaves it stopped', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop?mode=desktop-switch-held`);
+      await page.locator('.entry-form-dlg .btn.flow').click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'),
+          starts: t.starts, logouts: t.logouts, mainStops: t.mainStops };
+      })).toEqual({ title: '断开连接并切换账号？', keepsDisconnected: true, starts: 0, logouts: 0, mainStops: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.starts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { logouts: t.logouts, mainStops: t.mainStops, mainStarts: t.mainStarts, replace: t.request.replaceIdentity };
+      })).toEqual({ logouts: 1, mainStops: 1, mainStarts: 0, replace: true });
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it('desktop settings logout asks before stopping the proxy that holds the node, then logs out', async () => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, locale: 'zh-CN' });
+    try {
+      await page.goto(`${origin}/__ts-desktop?mode=credential-settings-logout-held`);
+      await page.getByRole('button', { name: '退出登录', exact: true }).click();
+      await page.waitForFunction(() => !!(window as any).__tsTest.topConfirm());
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { title: t.topConfirm().title, keepsDisconnected: t.topConfirm().message.includes('代理会保持断开'),
+          logouts: t.logouts, mainStops: t.mainStops };
+      })).toEqual({ title: '断开连接并退出登录？', keepsDisconnected: true, logouts: 0, mainStops: 0 });
+      await page.evaluate(() => (window as any).__tsTest.topConfirm().onConfirm());
+      await page.waitForFunction(() => (window as any).__tsTest.logouts === 1);
+      expect(await page.evaluate(() => {
+        const t = (window as any).__tsTest;
+        return { mainStops: t.mainStops, mainStarts: t.mainStarts };
+      })).toEqual({ mainStops: 1, mainStarts: 0 });
     } finally { await page.close(); }
   }, 30_000);
 

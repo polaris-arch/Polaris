@@ -35,6 +35,7 @@ import { useAppStore } from '@/store/app-store';
 import { ListEditor } from './ListEditor';
 import {
   DNS_FALLBACK,
+  dnsUpstreamIdentity,
   DNS_PRESET_CUSTOM,
   domesticPresets,
   isIpDoh,
@@ -597,6 +598,7 @@ export default function SettingsDns({
                 className="race-custom"
                 value={draftCustomSpecs}
                 onChange={setCustomUpstreams}
+                  entryIdentity={dnsUpstreamIdentity}
                 placeholder="https://223.5.5.5/dns-query"
                 ariaLabel="DoH URL"
                 addLabel={t('settings.dns.addCustomDoh')}

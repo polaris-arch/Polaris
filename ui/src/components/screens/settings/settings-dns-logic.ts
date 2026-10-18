@@ -8,6 +8,16 @@ import type { CustomDnsUpstream, DnsConfig } from '@/contracts/types';
 
 export const MAX_DOH_RACE_UPSTREAMS = 3;
 
+/** URL authority is case insensitive; path/query are protocol data and remain exact. */
+export function dnsUpstreamIdentity(spec: string): string {
+  const value = spec.trim();
+  try {
+    const url = new URL(value);
+    url.hostname = url.hostname.toLowerCase();
+    return url.href;
+  } catch { return value.toLowerCase(); }
+}
+
 /** 启用池变更：system 属兜底层不计额度；Tier1 达上限时拒绝第 4 个。 */
 export function nextRacePool(pool: readonly string[], id: string, on: boolean): string[] {
   const set = new Set(pool);
@@ -35,17 +45,17 @@ export function reconcileCustomUpstreams(
   const used = new Set<string>();
   const seenSpecs = new Set<string>();
   // 后续仍以原值出现的条目先保留其 id；否则在列表头插入新项会“偷走”下一行的启用身份。
-  const incomingSpecs = new Set(specs.map((spec) => spec.trim()).filter(Boolean));
+  const incomingSpecs = new Set(specs.map((spec) => dnsUpstreamIdentity(spec)).filter(Boolean));
   const reserved = new Set(
-    previous.filter((item) => incomingSpecs.has(item.spec.trim())).map((item) => item.id)
+    previous.filter((item) => incomingSpecs.has(dnsUpstreamIdentity(item.spec))).map((item) => item.id)
   );
   const next: CustomDnsUpstream[] = [];
   for (let index = 0; index < specs.length; index += 1) {
     const spec = specs[index].trim();
-    const specKey = spec.toLowerCase();
+    const specKey = dnsUpstreamIdentity(spec);
     if (!spec || seenSpecs.has(specKey)) continue;
     seenSpecs.add(specKey);
-    const exact = previous.find((item) => !used.has(item.id) && item.spec.trim() === spec);
+    const exact = previous.find((item) => !used.has(item.id) && dnsUpstreamIdentity(item.spec) === specKey);
     const samePosition = previous[index];
     const samePositionAvailable = samePosition && !used.has(samePosition.id) && !reserved.has(samePosition.id);
     const remaining = previous.find((item) => !used.has(item.id) && !reserved.has(item.id));

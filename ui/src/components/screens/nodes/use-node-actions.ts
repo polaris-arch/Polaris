@@ -120,9 +120,16 @@ export function useNodeActions({
 
   const selectAll = useCallback(() => {
     const allSelected =
-      selectedIds.size === visibleServers.length && visibleServers.length > 0;
-    setSelectedIds(allSelected ? new Set() : new Set(visibleServers.map((s) => s.id)));
-  }, [visibleServers, selectedIds.size, setSelectedIds]
+      visibleServers.length > 0 && visibleServers.every((server) => selectedIds.has(server.id));
+    setSelectedIds((previous) => {
+      const next = new Set(previous);
+      for (const server of visibleServers) {
+        if (allSelected) next.delete(server.id);
+        else next.add(server.id);
+      }
+      return next;
+    });
+  }, [visibleServers, selectedIds, setSelectedIds]
   );
 
   // allSettled 而非 all：批选里混进一个无分享链接形态的协议（WG/TS/SSH/Custom），all 会整体 reject

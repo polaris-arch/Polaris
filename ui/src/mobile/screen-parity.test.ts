@@ -1040,6 +1040,14 @@ describe('⓪ 自检：四个取材面都是活的，且判据没被自己污染
         `${register.screen}：${file} 不在这一屏的 desktopDirs 里 —— 那不是「本屏的原语库」`,
       ).toBe(true);
     }
+    // Sharing the measurement implementation across desktop/mobile does not make
+    // its owned status/path copy a common-only primitive.
+    expect(screenKeysOf('ui/src/mobile/MeasurementLabel.tsx')).toEqual([
+      'measurement.nodePath', 'measurement.unavailable',
+    ]);
+    expect(HOME_PARITY.extraBlockSources).toContain('ui/src/mobile/MeasurementLabel.tsx');
+    expect(HOME_PARITY.sharedPrimitives).not.toContain('ui/src/mobile/MeasurementLabel.tsx');
+    expect(HOME_PARITY.blocks.find(entry => entry.id === 'MeasurementLabel')?.disposition.kind).toBe('ported');
     // 反向对照：一份**真的是内容**的文件必须被这条判据判成不合格（证明它不是恒真）。
     expect(
       screenKeysOf('ui/src/components/hover-cards/RuleHoverCard.tsx').length,
@@ -1405,6 +1413,24 @@ describe('④ 锚：每一条豁免都被真的打开核对（不是形状检查
 });
 
 describe('⑤ 喂数腿：移动端读的每一格 store 状态都有写入方（W-23 / W-24 住在这一面上）', () => {
+  it('共享测量 feed 是数字写入与撤回的真实调用方，不把共享内部 action 伪登记为移动直接读点', () => {
+    const source = strip(readFileSync(join(REPO, 'ui/src/store/use-latency-store.ts'), 'utf8'));
+    expect(source).toContain('applySnapshot(result, currentConfig.servers)');
+    expect(source).toContain('useLatencyStore.getState().invalidate(true)');
+    expect(source).toContain('const ticket = epoch;');
+    expect(source).toContain('ticket !== epoch');
+    expect(source).toContain('api.server.speedTestResultSnapshot()');
+    expect(source).toContain('api.server.onSpeedTestResult(schedule)');
+    expect(source).toContain('api.server.onSpeedTestSchedule(schedule)');
+    for (const id of ['useLatencyStore.applySnapshot', 'useLatencyStore.invalidate']) {
+      expect(FEED_FACE.has(id)).toBe(false);
+      expect(MOBILE_FEEDS.some(row => row.id === id)).toBe(false);
+    }
+    for (const id of ['useLatencyStore.projections', 'useLatencyStore.currentProjections', 'useLatencyStore.snapshot', 'useLatencyStore.readError']) {
+      expect(FEED_FACE.has(id)).toBe(true);
+      expect(MOBILE_FEEDS.some(row => row.id === id && row.role === 'state')).toBe(true);
+    }
+  });
   const registered = MOBILE_FEEDS.map((e) => e.id);
 
   it('移动端读点面 ≡ 喂数腿登记表', () => {

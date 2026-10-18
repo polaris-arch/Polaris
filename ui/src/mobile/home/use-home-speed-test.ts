@@ -1,3 +1,4 @@
+import { cancelMeasurementConsent } from '../MeasurementStartNotice';
 import { runMobileSpeedTest, useMobileSpeedTestStore, mobileSpeedTestBusy } from '../use-mobile-speed-test';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -22,7 +23,7 @@ export function useHomeSpeedTest(args: {
   selectedId: string | null;
   running: boolean;
   routing: string;
-}): { view: LatencyCheckVM; runCurrent: () => Promise<void> } {
+}): { view: LatencyCheckVM; runCurrent: (consentGranted?: boolean) => Promise<void> } {
   const { t } = useTranslation();
   const globalBusy = useMobileSpeedTestStore(mobileSpeedTestBusy);
   const [busyKind, setBusyKind] = useState<'current' | 'all' | null>(null);
@@ -32,7 +33,7 @@ export function useHomeSpeedTest(args: {
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; };
+    return () => { mounted.current = false; cancelMeasurementConsent(); };
   }, []);
 
   const selected = args.servers.find((s) => s.id === args.selectedId);
@@ -62,7 +63,7 @@ export function useHomeSpeedTest(args: {
     return `${state.selectedServerId ?? ''}|${getEffectiveConfig()?.proxyMode ?? 'smart'}`;
   }, []);
 
-  const runCurrent = useCallback(async (): Promise<void> => {
+  const runCurrent = useCallback(async (consentGranted = false): Promise<void> => {
     if (blocked || !selected) {
       setError(blocked);
       return;
@@ -74,7 +75,7 @@ export function useHomeSpeedTest(args: {
     setError(null);
     setFeedback(null);
     try {
-      const result = await runMobileSpeedTest([selected.id], 'current', () => currentKey() === requestKey);
+      const result = await runMobileSpeedTest([selected.id], 'current', () => currentKey() === requestKey, consentGranted);
       if (!result || currentKey() !== requestKey) return;
       const skipped = notInPoolMessage(result, t);
       if (skipped && mounted.current) setError(skipped);

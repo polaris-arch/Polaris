@@ -84,6 +84,7 @@ export type CommitWrite = (
   rowId: string,
   write: Promise<void>,
   toText?: (err: unknown) => string,
+  isCurrent?: () => boolean,
 ) => void;
 
 /**
@@ -95,13 +96,14 @@ export function createCommit(
   setErrors: (updater: (prev: WriteErrors) => WriteErrors) => void,
   t: TFunction,
 ): CommitWrite {
-  return (rowId, write, toText) => {
+  return (rowId, write, toText, isCurrent = () => true) => {
     void write.then(
-      () => setErrors((prev) => withoutWriteError(prev, rowId)),
-      (err: unknown) =>
-        setErrors((prev) =>
-          withWriteError(prev, rowId, (toText ?? ((e) => writeFailureText(t, e)))(err)),
-        ),
+      () => setErrors((prev) => isCurrent() ? withoutWriteError(prev, rowId) : prev),
+      (err: unknown) => {
+        setErrors((prev) => isCurrent()
+          ? withWriteError(prev, rowId, (toText ?? ((e) => writeFailureText(t, e)))(err)) : prev,
+        );
+      },
     );
   };
 }

@@ -27,7 +27,8 @@ export function projectVisibleServers(
     list = list.filter(
       (server) =>
         server.name.toLowerCase().includes(query) ||
-        server.address.toLowerCase().includes(query),
+        server.address.toLowerCase().includes(query) ||
+        !!activeGroup.sources?.[server.id]?.name.toLowerCase().includes(query),
     );
   }
   if (protoFilter) {

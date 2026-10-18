@@ -99,7 +99,7 @@ function resolveT(expr: string): string {
 function collectDescs(): DescHit[] {
   const out: DescHit[] = [];
   for (const f of readdirSync(SETTINGS_DIR).filter((n) =>
-    /^Settings.*\.tsx$/.test(n) || ['AppUpdateCard.tsx', 'CoreUpdateCard.tsx'].includes(n),
+    /^Settings.*\.tsx$/.test(n) || ['AppUpdateCard.tsx', 'CoreInfoCard.tsx'].includes(n),
   )) {
     const src = code(readFileSync(join(SETTINGS_DIR, f), 'utf8'));
     const re = /(?:desc|tip)=(?:"([^"]*)"|\{t\('([^']+)'(?:,\s*'([^']*)')?[\s\S]*?\}|\{([^}]*)\})/g;
@@ -303,6 +303,42 @@ interface PromiseRow {
  */
 const REGISTRY: readonly PromiseRow[] = [
   {
+    snippet: '其他选项仅覆盖生成配置，不修改节点',
+    evidence: {
+      kind: 'anchors',
+      items: [
+        { file: 'crates/config-engine/src/builder/outbounds.rs', needle: 'config.utls_policy.as_deref(),' },
+        { file: 'crates/config-engine/src/user_config/utls.rs', needle: 'let mut effective = Cow::Borrowed(server);' },
+        {
+          file: 'crates/config-engine/src/user_config/utls',
+          needle: 'fn node_intent_global_policy_protocol_matrix_keeps_stored_nodes_unchanged()',
+          withTests: true,
+        },
+      ],
+    },
+  },
+  {
+    snippet: '应用运行期间按周期测速；应用被系统暂停后，回来时自动补测',
+    evidence: {
+      kind: 'anchors',
+      items: [
+        // 总开关由调度器每拍读；关着时一轮都不发。
+        { file: 'src-tauri/src/runtime/measurement_scheduler.rs', needle: '.get("periodicSpeedTestEnabled")' },
+        // 回来后的补测评估（离开够久即作废旧结果并立即发一轮）。
+        { file: 'src-tauri/src/runtime/measurement_scheduler.rs', needle: 'fn returned(&mut self, now: Now, away_ms: u64)' },
+      ],
+    },
+  },
+  {
+    snippet: '并发过高可能把可用节点误判为超时',
+    // 说明行，不是「自动做某事」的承诺；它描述的那个设置项由测速准入处读取。
+    evidence: {
+      kind: 'anchor',
+      file: 'src-tauri/src/commands/speedtest.rs',
+      needle: '.get("speedTestConcurrency")',
+    },
+  },
+  {
     snippet: '下次打开时还原上次的窗口布局',
     evidence: { kind: 'config-key', key: 'rememberWindowSize' },
   },
@@ -487,14 +523,6 @@ const REGISTRY: readonly PromiseRow[] = [
     evidence: { kind: 'config-key', key: 'autoDownloadUpdate' },
   },
   {
-    snippet: '每天后台检查一次内核更新',
-    evidence: { kind: 'config-key', key: 'autoUpdateCore' },
-  },
-  {
-    snippet: '自动更新时跳过',
-    evidence: { kind: 'config-key', key: 'restrictCoreUpdateToCompatibleMinor' },
-  },
-  {
     snippet: 'Polaris 启动时检查并在需要时补更',
     evidence: { kind: 'config-key', key: 'autoUpdateSubscriptionOnStart' },
   },
@@ -577,7 +605,8 @@ describe('守卫自检：判据面与解析器都真的在工作（防空集合�
     expect(timerFor(10 * 60 * 1000), '10 分钟的计时常量找不到了').not.toBeNull();
     // 反向：编一个没人写过的时长，必须解析失败 —— 证明它不是「恒返回一个东西」。
     expect(timerFor(7 * 60 * 1000 + 137), '编造的时长也能解析出常量 —— 本门恒绿').toBeNull();
-  });
+    // 两次全量源码扫描，空载约 3.6s；与编译并行时超过默认的 5s。
+  }, 20_000);
 
   it('去注释真的生效（注释里引用的旧文案不该被当成在用的承诺）', () => {
     expect(code('// desc="闲置 99 分钟后自动关机"\nconst a = 1;')).not.toContain('闲置 99 分钟');

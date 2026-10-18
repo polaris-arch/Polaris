@@ -14,11 +14,81 @@
  * 断言的是关系：bottom 必须**从状态栏高度推导**、中性暗色覆盖必须**两份都在**、开关文案必须**同句式**。
  */
 import { describe, it, expect } from 'vitest';
+import { parse } from '@babel/parser';
 import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
+
+/** Parse the real handler and follow one block's applyNow result into the committed phase.
+ * Comments, unrelated result.status expressions and unused applyOutcome calls cannot satisfy it.
+ */
+type FlowNode = { type: string; [key: string]: unknown };
+const flowNode = (value: unknown): value is FlowNode =>
+  typeof value === 'object' && value !== null && 'type' in value && typeof value.type === 'string';
+function flowNodes(value: unknown): FlowNode[] {
+  if (Array.isArray(value)) return value.flatMap(flowNodes);
+  if (!flowNode(value)) return [];
+  return [value, ...Object.values(value).flatMap(flowNodes)];
+}
+const identifier = (value: unknown, name: string): boolean =>
+  flowNode(value) && value.type === 'Identifier' && value.name === name;
+const member = (value: unknown, name: string): value is FlowNode =>
+  flowNode(value) && value.type === 'MemberExpression' && value.computed === false
+  && identifier(value.property, name);
+const identifierName = (value: unknown): string | null =>
+  flowNode(value) && value.type === 'Identifier' && typeof value.name === 'string' ? value.name : null;
+function ownsApplyOutcome(source: string): boolean {
+  const ast = parse(source, { sourceType: 'module', plugins: ['typescript', 'jsx'] });
+  const handlers = flowNodes(ast).filter(node => node.type === 'VariableDeclarator' && identifier(node.id, 'onApply'));
+  if (handlers.length !== 1 || !flowNode(handlers[0].init)) return false;
+  const handler = handlers[0].init;
+  for (const attempt of flowNodes(handler).filter(node => node.type === 'TryStatement')) {
+    if (!flowNode(attempt.block) || !Array.isArray(attempt.block.body)) continue;
+    const statements = attempt.block.body.filter(flowNode);
+    const declarations = statements.filter(node => node.type === 'VariableDeclaration')
+      .flatMap(node => Array.isArray(node.declarations) ? node.declarations.filter(flowNode) : []);
+    for (const result of declarations) {
+      const resultName = identifierName(result.id);
+      if (!resultName || !flowNode(result.init) || result.init.type !== 'AwaitExpression') continue;
+      const call = result.init.argument;
+      if (!flowNode(call) || call.type !== 'CallExpression' || !member(call.callee, 'applyNow')) continue;
+      const state = call.callee.object;
+      if (!flowNode(state) || state.type !== 'CallExpression' || !member(state.callee, 'getState')
+        || !identifier(state.callee.object, 'useStagedConfigStore')) continue;
+      for (const outcome of declarations) {
+        const outcomeName = identifierName(outcome.id);
+        const init = outcome.init;
+        if (!outcomeName || !flowNode(init) || init.type !== 'CallExpression'
+          || !identifier(init.callee, 'applyOutcome') || !Array.isArray(init.arguments) || init.arguments.length !== 1
+          || !member(init.arguments[0], 'status') || !identifier(init.arguments[0].object, resultName)) continue;
+        const scoped = flowNodes(attempt.block);
+        // Both bindings must be unique and unreassigned inside this handler's try scope.
+        if ([resultName, outcomeName].some(name =>
+          scoped.filter(node => node.type === 'VariableDeclarator' && identifier(node.id, name)).length !== 1
+          || scoped.some(node => node.type === 'AssignmentExpression' && identifier(node.left, name)))) continue;
+        for (const next of declarations) {
+          const nextName = identifierName(next.id);
+          if (!nextName || !flowNode(next.init) || next.init.type !== 'ObjectExpression'
+            || !Array.isArray(next.init.properties)) continue;
+          const phase = next.init.properties.find(value => flowNode(value) && value.type === 'ObjectProperty'
+            && identifier(value.key, 'phase'));
+          if (!flowNode(phase) || !member(phase.value, 'phase') || !identifier(phase.value.object, outcomeName)) continue;
+          const ordered = declarations.indexOf(result) < declarations.indexOf(outcome)
+            && declarations.indexOf(outcome) < declarations.indexOf(next);
+          const commit = statements.some(node => node.type === 'ExpressionStatement' && flowNode(node.expression)
+            && node.expression.type === 'CallExpression' && identifier(node.expression.callee, 'setApply')
+            && Array.isArray(node.expression.arguments) && node.expression.arguments.length === 1
+            && identifier(node.expression.arguments[0], nextName));
+          if (ordered && commit) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 
 /** 去掉 CSS/JS 注释，避免注释里引用的示例代码被当成真实声明命中。 */
 const stripComments = (src: string) =>
@@ -405,7 +475,26 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
     // P4：红态判据搬进纯函数 `composeBarView`（§2.4 那张表的一列），组件只消费它。
     // 变异对照：在组件里另写一个 `applyFailed` 布尔来点红 → 与表分叉、转红。
     // 「红 ↔ toast 同源」那一半改由 `pending-bar-logic.test.ts` 的行为断言守（比正则更有牙）。
-    expect(bar, 'apply 结果没走 applyOutcome（易与表分叉）').toMatch(/applyOutcome\(r\.status\)/);
+    expect(ownsApplyOutcome(read('../components/layout/PendingChangesBar.tsx'))).toBe(true);
+    expect(ownsApplyOutcome(read('../mobile/MobilePendingBar.tsx'))).toBe(true);
+  });
+
+  it('Apply result ownership AST rejects disconnected and comment-only lookalikes on both surfaces', () => {
+    for (const path of ['../components/layout/PendingChangesBar.tsx', '../mobile/MobilePendingBar.tsx']) {
+      const source = read(path);
+      // Binding names may evolve; identity and consumption may not.
+      expect(ownsApplyOutcome(source.replaceAll('result', 'reply'))).toBe(true);
+      for (const [before, after] of [
+        ['applyOutcome(result.status)', 'applyOutcome(other.status)'],
+        ['applyOutcome(result.status)', "applyOutcome('applied')"],
+        ['phase: outcome.phase', "phase: 'idle'"],
+        ['setApply(next);', 'setApply(initial);'],
+        ['applyOutcome(result.status)', "unrelated(result.status) /* applyOutcome(result.status) */"],
+      ]) {
+        expect(source, before).toContain(before);
+        expect(ownsApplyOutcome(source.replace(before, after)), `${path}: ${after}`).toBe(false);
+      }
+    }
   });
 
   it('`#s-home > .pending-bar` override 必须留着 —— 它现在是降级横幅的唯一支撑', () => {
@@ -1750,10 +1839,9 @@ describe('浅色 --warn / --ok / --dn 的文字对比度，与深色 .btn.danger
    * 修法与逐值推导见 `index.css` 的「浅色语义色下调」段与「深色 .btn.danger 换墨色」段。
    *
    * **门槛为什么一律 4.5（查过用法才定的，不是默认值）**：这三个 token 当文字的落点全部是
-   * 10~12.5px（`.pill` 10.5 / `.nd-cap` 10 / `.warn-line` 11 / `.statusbar` 11.5 / `.log-view` 12 /
-   * `.core-ver-banner .cvb-tx b` 12.5 …），`.btn.danger` 是 12.5px/660 —— 没有一处够得上 AA 的
+   * 10~12.5px（`.pill` 10.5 / `.nd-cap` 10 / `.warn-line` 11 / `.statusbar` 11.5 / `.log-view` 12 …），`.btn.danger` 是 12.5px/660 —— 没有一处够得上 AA 的
    * 大字例外（≥18.66px bold 或 ≥24px）。它们当**色点/描边/进度条/开关轨/图标**的那些用法
-   * （`.dot.*` `.lat-*` `.swt.indet` `.sub-usage .bar>i` `.pb-ic`/`.cvb-ic` 的 13px svg、
+   * （`.dot.*` `.lat-*` `.swt.indet` `.sub-usage .bar>i` `.pb-ic` 的 13px svg、
    * `.connect-btn.busy` 的 22px svg）走 WCAG 1.4.11 的 3:1，**不在本门**。
    *
    * 花名册怎么来的（与浅色 `--err` 那道门的口径差异，别当成抄的）：

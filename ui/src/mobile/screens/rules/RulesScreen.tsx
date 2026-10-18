@@ -1,3 +1,4 @@
+import { appRuleDisabled } from '@/components/screens/app-policy/app-policy-logic';
 /**
  * 移动端「规则」屏 —— 四合一入口（IA spec §1.2 / §2.2）。
  *
@@ -58,7 +59,7 @@ import {
   profileRowStatus,
   ruleProfileBadge,
 } from '@/domain/network-profile';
-import { netenvDnsDisplayName } from '@/components/dialogs/dns-action-options';
+import { dnsRealQueryFallbackChoice, netenvDnsDisplayName } from '@/components/dialogs/dns-action-options';
 import { probeDisplayText, useResolvedProbes } from '@/components/screens/rules/network-profile-probes';
 import type { MeshRouteReport } from '@/contracts/mesh-route-report';
 import { asMeshRouteReport, meshRouteSummaryKey, MobileMeshRouteEvidence } from '../../MobileMeshRouteEvidence';
@@ -173,6 +174,7 @@ export function MobileRulesScreen(): ReactElement {
   /* 核起停会改变引擎算出来的 force-route 段集（未运行时报告是空的），故列进下面那条拉取的依赖。 */
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
   const { armed, confirmTwice } = useConfirmTwice();
+  const deleteSnapshot = useRef<{ key: string; rule: Rule } | null>(null);
 
   /**
    * 写失败的**行内**回显（键 → 已翻译的文案）。
@@ -483,9 +485,6 @@ export function MobileRulesScreen(): ReactElement {
           [plane]: { ...currentEffect, enabled: currentEffect.enabled === false },
         },
       };
-      const prev = plane === 'dns' ? useAppStore.getState().dnsRules : useAppStore.getState().rules;
-      const optimistic = prev.map((r) => (r.id === next.id ? next : r));
-      useAppStore.setState(plane === 'dns' ? { dnsRules: optimistic } : { rules: optimistic });
       const stageRule =
         plane === 'dns'
           ? editRoute('dnsRules', stagingEnabled) === 'staged'
@@ -500,12 +499,20 @@ export function MobileRulesScreen(): ReactElement {
         });
         return;
       }
+      const prev = plane === 'dns' ? useAppStore.getState().dnsRules : useAppStore.getState().rules;
+      const optimistic = prev.map((r) => (r.id === next.id ? next : r));
+      useAppStore.setState(plane === 'dns' ? { dnsRules: optimistic } : { rules: optimistic });
       try {
-        await api.rules.update(next, plane);
+        await api.rules.update(next, plane, rule);
       } catch (err) {
         // 开关弹回原位是静默的。停用了以为停用了、其实规则还在生效 → 必须报。
         console.error('[MobileRulesScreen] toggle failed:', err);
-        useAppStore.setState(plane === 'dns' ? { dnsRules: prev } : { rules: prev });
+        useAppStore.setState((state) => {
+          const current = plane === 'dns' ? state.dnsRules : state.rules;
+          const original = prev.find((r) => r.id === next.id);
+          const restored = current.map((r) => r === next && original ? original : r);
+          return plane === 'dns' ? { dnsRules: restored } : { rules: restored };
+        });
         toast.error(tr('rules.saveFailed'));
         // 只回滚不报，开关就是「弹回去了、什么都没说」——与「功能坏了」完全同形。
         reportWriteError(`rule:${rule.id}`, tr('rules.saveFailed'));
@@ -553,10 +560,13 @@ export function MobileRulesScreen(): ReactElement {
   const requestDeleteRule = useCallback(
     (plane: 'route' | 'dns', rule: Rule) => {
       clearWriteError(`rule:${rule.id}`);
-      confirmTwice(`${RULE_DEL_PREFIX}${rule.id}`, () => {
+      const confirmationKey = `${RULE_DEL_PREFIX}${plane}:${rule.id}`;
+      if (armed !== confirmationKey) deleteSnapshot.current = { key: confirmationKey, rule };
+      const expected = deleteSnapshot.current?.key === confirmationKey ? deleteSnapshot.current.rule : rule;
+      confirmTwice(confirmationKey, () => {
         void (async () => {
           try {
-            await (plane === 'dns' ? deleteDnsRule : deleteRouteRule)(rule);
+            await (plane === 'dns' ? deleteDnsRule : deleteRouteRule)(expected);
             setSheetRuleId(null);
           } catch (err) {
             console.error('[MobileRulesScreen] delete failed:', err);
@@ -567,7 +577,7 @@ export function MobileRulesScreen(): ReactElement {
         })();
       });
     },
-    [confirmTwice, deleteDnsRule, deleteRouteRule, tr, clearWriteError, reportWriteError],
+    [armed, confirmTwice, deleteDnsRule, deleteRouteRule, tr, clearWriteError, reportWriteError],
   );
 
   const handleRegionChange = useCallback(
@@ -671,6 +681,7 @@ export function MobileRulesScreen(): ReactElement {
     (preset: AppPreset): { text: string; tone: AppRowModel['policyTone']; value: string } => {
       const rule = appRuleById.get(preset.id);
       if (!rule) return { text: tr('appPolicy.followGlobal'), tone: 'follow', value: 'follow' };
+      if (appRuleDisabled(rule)) return { text: tr('rules.disabledBadge'), tone: 'follow', value: 'disabled' };
       if (rule.action === 'direct') {
         return { text: tr('appPolicy.action.direct'), tone: 'direct', value: 'direct' };
       }
@@ -1488,6 +1499,16 @@ export function MobileRulesScreen(): ReactElement {
     return tr('rules.dnsResolverInherit');
   }, [config?.dnsDefaults, dnsServerNameById, dnsGroupNameById, tr]);
 
+  const dnsRealQueryFallbackText = useMemo(() => {
+    const defaultAction = config?.dnsDefaults?.unmatchedAction;
+    const fakeIp = defaultAction ? defaultAction.type === 'fakeIp' : config?.dnsConfig?.enableFakeIp !== false;
+    if (!fakeIp) return undefined;
+    const choice = dnsRealQueryFallbackChoice(config?.dnsDefaults ?? {});
+    if (choice === 'reject') return tr('rules.dnsActionReject');
+    const serverId = choice.startsWith('server:') ? choice.slice(7) : choice;
+    return tr('rules.dnsActionServer', { name: dnsServerNameById.get(serverId) ?? serverId });
+  }, [config?.dnsDefaults, config?.dnsConfig, dnsServerNameById, tr]);
+
   /* ═══════════ 规则行绑定 ═══════════ */
 
   /* 规则行徽标的场景表取**展示面**（暂存中新建的场景也要认得，同桌面 `RulesScreen`）；
@@ -1522,7 +1543,7 @@ export function MobileRulesScreen(): ReactElement {
           meshOverlapPrevious: plane === 'route' && meshRoute.previous,
           routeInactive: plane === 'route' && modeInactive && route !== null,
           networkProfileBadge: ruleProfileBadge(rule, badgeProfiles, resolvedProbes),
-          deleteConfirming: armed === `${RULE_DEL_PREFIX}${rule.id}`,
+          deleteConfirming: armed === `${RULE_DEL_PREFIX}${plane}:${rule.id}`,
           sheetOpen: sheetRuleId === rule.id,
           onOpenSheet: (r) => setSheetRuleId(r ? r.id : null),
           onToggle: (r) => void handleToggle(plane, r),
@@ -1779,6 +1800,7 @@ export function MobileRulesScreen(): ReactElement {
           rows={dnsRows}
           defaultActionText={dnsDefaultActionText}
           defaultFallbackText={dnsDefaultFallbackText}
+          realQueryFallbackText={dnsRealQueryFallbackText}
           systemPaneAbsentReason={tr('mobileRules.dnsSystemPaneAbsent')}
           errorOf={errorOf}
         />

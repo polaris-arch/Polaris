@@ -62,6 +62,8 @@ type Classifier = {
   ANDROID_IMPACT_SCOPES: Record<string, { why: string }>;
 };
 
+const { appleRequired } = await import(pathToFileURL(join(REPO_ROOT, 'scripts/apple-ci-impact.mjs')).href);
+
 const classifier: Classifier = await import(
   pathToFileURL(join(REPO_ROOT, 'scripts/classify-ci-impact.mjs')).href
 );
@@ -131,6 +133,22 @@ function stripLineComments(source: string, kind: 'js' | 'yaml'): string {
 }
 
 describe('CI 影响分类器的完备性（fail-open 根治）', () => {
+  it('实际核身份采集入口的变更同时点亮真核门与桌面包装，不能只登记包装腿', () => {
+    expect(compact(['scripts/native-payload-input.mjs'])).toEqual({
+      kernel: true,
+      platforms: [...ALL_PACKAGE_PLATFORMS],
+      preflight: true,
+      hasPackage: true,
+    });
+  });
+  it('实际编译前安装身份入口和共享进程租约覆盖全部桌面载体', () => {
+    for (const path of ['scripts/prepare-core-identity.mjs', 'crates/helper/src/process_lease.rs']) {
+      const actual = classifyImpact([path]);
+      expect(actual.platforms).toEqual([...ALL_PACKAGE_PLATFORMS]);
+      expect(actual.hasPackage).toBe(true);
+      expect(actual.unregisteredScopes).toEqual([]);
+    }
+  });
   it('本地资源目录 symlink 按目录 scope 枚举，未知目录仍会触发登记门', () => {
     const root = mkdtempSync(join(tmpdir(), 'polaris-impact-scopes-'));
     try {
@@ -306,6 +324,7 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'package.yml': { signal: (impact) => impact.hasPackage, label: '打包腿' },
       'release-risk.yml': { signal: (impact) => impact.hasPackage, label: '打包腿' },
       'android.yml': { signal: (impact) => impact.android, label: 'Android APK 腿' },
+      'apple.yml': { signal: () => false, label: 'Apple unsigned App/PacketTunnel 腿' },
     };
 
     const invoked: Array<[string, string]> = [];
@@ -324,7 +343,7 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
         ).toBe(false);
       }
       for (const match of source.matchAll(
-        /(?:^|[\s;&|(`])(?:node|sh|bash)\s+(?:--test\s+)?(scripts\/[A-Za-z0-9._-]+)/g,
+        /(?:^|[\s;&|(`])(?:node|sh|bash)\s+(?:--test\s+)?(scripts\/[A-Za-z0-9._/-]+)/g,
       )) {
         invoked.push([match[1], workflow]);
       }
@@ -332,19 +351,25 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
 
     // 哨兵：抓取器变哑在此红（空表会让下面的 for 恒真）。
     expect([...new Set(invoked.map(([script]) => script))].sort()).toEqual([
+      'scripts/apple-ci-impact.mjs',
       'scripts/assert-pc-runtime-release.mjs',
       'scripts/assert-pc-runtime-release.test.mjs',
       'scripts/assert-r8-evidence.mjs',
       'scripts/build-android-apk.sh',
-      'scripts/build-libbox.sh',
       'scripts/classify-ci-impact.mjs',
+      'scripts/desktop-core/validation-origin.mjs',
+      'scripts/desktop-core/wire-input-handoff.mjs',
       'scripts/fetch-core.mjs',
       'scripts/fetch-cronet.mjs',
       'scripts/fetch-dashboard.mjs',
       'scripts/fetch-protoc.mjs',
       'scripts/gate-android-release-behavior.sh',
       'scripts/gate-node-test.sh',
+      'scripts/macos-nested-code.sh',
+      'scripts/native-payload-input.mjs',
       'scripts/postprocess-appimage.mjs',
+      'scripts/prepare-core-identity.mjs',
+      'scripts/release-assets.mjs',
       'scripts/verify-apk.mjs',
       'scripts/verify-packaging.mjs',
       'scripts/verify-wry-keep-rules.mjs',
@@ -356,10 +381,27 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'android.yml 一条 `run: node scripts/…` 都没抓到 —— 抓取器或该 workflow 的形状变了',
     ).toBeGreaterThan(1);
 
+    expect(invoked.filter(([, workflow]) => workflow === 'apple.yml').map(([script]) => script))
+      .toContain('scripts/fetch-protoc.mjs');
+    // Python orchestration owns the SDK → final carrier link; it is not a legacy
+    // build-libbox shell invocation and cannot disappear behind the node scanner.
+    const androidSource = stripLineComments(readFileSync(join(REPO_ROOT, '.github/workflows/android.yml'), 'utf8'), 'yaml');
+    const appleSource = stripLineComments(readFileSync(join(REPO_ROOT, '.github/workflows/apple.yml'), 'utf8'), 'yaml');
+    for (const action of ['prepare', 'build', 'verify']) {
+      expect(androidSource).toContain(`python3 scripts/mobile-core/ci_android.py ${action}`);
+    }
+    for (const action of ['prepare', 'build', 'evidence']) {
+      expect(appleSource).toContain(`python3 -B scripts/mobile-core/ci_apple.py ${action}`);
+    }
+    expect(classifyImpact(['scripts/mobile-core/ci_android.py']).android).toBe(true);
+    expect(appleRequired(['scripts/mobile-core/ci_apple.py'])).toBe(true);
+
     for (const [script, workflow] of invoked) {
       const { signal, label } = requiredLeg[workflow];
       expect(
-        signal(classifyImpact([script])),
+        workflow === 'apple.yml' || script === 'scripts/apple-ci-impact.mjs'
+          ? appleRequired([script])
+          : signal(classifyImpact([script])),
         `${workflow} 里真跑 ${script}，但改它不触发${label} —— 那条腿的一环没有合入前信号`,
       ).toBe(true);
     }

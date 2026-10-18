@@ -1,3 +1,4 @@
+import { appRuleForPick, appRuleDisabled } from './app-policy-logic';
 /**
  * AppPolicyScreen —— 应用分流屏（1:1 提取自原型 polaris-prototype.html L1922-1963 #s-apppolicy）。
  *
@@ -257,8 +258,7 @@ export function AppPolicyScreen() {
 
   /** 单一策略提交点（原型 nodeSelMenu onPick 同口径：一次调用把 action+targetServerId 一并落地）。 */
   const setAppPolicy = (appId: string, action: RuleAction, targetServerId: string | undefined) => {
-    const existing = ruleByAppId.get(appId);
-    void applyRule(appId, { action, enabled: existing?.enabled ?? true, targetServerId });
+    void applyRule(appId, appRuleForPick(appId, action, targetServerId));
   };
 
   /** 移除自定义应用（原型 apCardHtml/apRowHtml 的 RM_BTN，仅 custom 项渲染）：同时清掉该应用的
@@ -360,7 +360,8 @@ export function AppPolicyScreen() {
           </div>
         </div>
         <div className="acts">
-          <span
+          <button
+            type="button"
             className={cn('swt', enabled && 'on')}
             role="switch"
             aria-checked={enabled}
@@ -697,6 +698,7 @@ function AppCard({
       <PolicySelector
         appId={preset.id}
         action={rule?.action ?? 'proxy'}
+        disabledRule={appRuleDisabled(rule)}
         targetServerId={rule?.targetServerId}
         servers={servers}
         subscriptions={subscriptions}
@@ -757,6 +759,7 @@ function ApRow({
       <PolicySelector
         appId={preset.id}
         action={rule?.action ?? 'proxy'}
+        disabledRule={appRuleDisabled(rule)}
         targetServerId={rule?.targetServerId}
         servers={servers}
         subscriptions={subscriptions}
@@ -822,9 +825,10 @@ function CheckMark() {
  * `.ap-list` 有 overflow:hidden，position:absolute 在列表视图会被裁切，故不能用 CSS 默认的
  * absolute 锚定。
  */
-function PolicySelector({
+export function PolicySelector({
   appId,
   action,
+  disabledRule,
   targetServerId,
   servers,
   subscriptions,
@@ -832,6 +836,7 @@ function PolicySelector({
 }: {
   appId: string;
   action: RuleAction;
+  disabledRule?: boolean;
   targetServerId?: string;
   servers: ServerConfig[];
   subscriptions: SubscriptionConfig[];
@@ -842,7 +847,7 @@ function PolicySelector({
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const scheduleReveal = useRevealAfterCommit();
 
-  const anchorRef = useRef<HTMLSpanElement>(null);
+  const anchorRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
 
@@ -870,7 +875,11 @@ function PolicySelector({
       if (!anchorRef.current?.contains(target) && !menuRef.current?.contains(target)) close();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close();
+        anchorRef.current?.focus();
+      }
     };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
@@ -897,23 +906,27 @@ function PolicySelector({
   const pick = (nextAction: RuleAction, nextTarget: string | undefined) => {
     onPick(appId, nextAction, nextTarget);
     setOpen(false);
+    anchorRef.current?.focus();
   };
 
-  const view = appPolicyView(action, targetServerId, servers, t);
+  const view = disabledRule
+    ? { cls: '', dot: '', label: t('rules.disabledBadge') }
+    : appPolicyView(action, targetServerId, servers, t);
   const curKind: RuleAction | 'node' = action === 'proxy' && targetServerId ? 'node' : action;
 
   return (
     <>
-      <span
+      <button
+        type="button"
         ref={anchorRef}
         className={cn('app-pol', view.cls)}
-        role="button"
-        tabIndex={0}
+        aria-haspopup="menu"
+        aria-expanded={open}
         onClick={toggleMenu}
       >
         <span className={cn('act-dot', view.dot)} />
         <span>{view.label}</span>
-      </span>
+      </button>
       {open && (
         <div
           ref={menuRef}

@@ -224,7 +224,7 @@ describe('门 5 · 首页延迟表按选单开合条件订阅', () => {
     expect(CODE, '首页又无条件订整张延迟表了 ⇒ 每次逐节点回包都重渲整棵子树').not.toMatch(
       /useLatencyStore\(\s*\(s\)\s*=>\s*s\.latencyMap\s*\)/
     );
-    expect(CODE).toContain('useLatencyStore(latencyMapWhen(nodeMenuOpen))');
+    expect(CODE).toContain('useQualifiedLatencies(servers, nodeMenuOpen)');
   });
 
   it('关闭档返回**模块级冻结哨兵**（写成 `{}` 字面量 ⇒ 每次提交仍判不等 ⇒ 改了等于白改）', () => {

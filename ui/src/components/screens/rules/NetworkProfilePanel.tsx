@@ -189,16 +189,19 @@ function ProfileList({ config, update }: { config: NonNullable<UseConfigResult['
 
 /** 加载 / 失败态的外壳（口径同 `DnsResourceState`）。 */
 function ConfigShell({
+  instanceId,
   titleId,
   title,
   render,
 }: {
+  instanceId: string;
   titleId: string;
   title: string;
   render: (cfg: UseConfigResult & { config: NonNullable<UseConfigResult['config']> }) => React.ReactNode;
 }) {
   const { t } = useTranslation();
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((s) => s.closeInstance);
+  const close = () => closeInstance(instanceId);
   const cfg = useConfig();
   if (cfg.loading || cfg.error || !cfg.config) {
     return (
@@ -230,13 +233,15 @@ function ConfigShell({
   return <>{render({ ...cfg, config: cfg.config })}</>;
 }
 
-export function NetworkProfilesDialog() {
+export function NetworkProfilesDialog({ instanceId }: { instanceId: string }) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((s) => s.closeInstance);
+  const close = () => closeInstance(instanceId);
   const title = t('rules.networkProfile.title');
   return (
     <ConfigShell
+      instanceId={instanceId}
       titleId="network-profiles-title"
       title={title}
       render={({ config, update }) => (
@@ -293,11 +298,13 @@ function Field({
 }
 
 function ProfileForm({
+  instanceId,
   config,
   update,
   base,
   onSaved,
 }: {
+  instanceId: string;
   config: NonNullable<UseConfigResult['config']>;
   update: UseConfigResult['update'];
   base?: NetworkProfile;
@@ -305,7 +312,8 @@ function ProfileForm({
 }) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((s) => s.closeInstance);
+  const close = () => closeInstance(instanceId);
   const isEdit = base != null;
   const [id] = useState(() => base?.id ?? `np-${crypto.randomUUID()}`);
   const [name, setName] = useState(base?.name ?? '');
@@ -329,11 +337,12 @@ function ProfileForm({
     display.kind === 'pending' ? null : probeWarningKey(resolved?.find((r) => r.profileId === id));
 
   const requestClose = () => {
+    if (submitting) return;
     if (!dirty) {
       close();
       return;
     }
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('rules.discardTitle'),
@@ -341,7 +350,7 @@ function ProfileForm({
         confirmLabel: t('rules.discard'),
         danger: true,
         onConfirm: () => {
-          close();
+          closeInstance(confirmId);
           close();
         },
       },
@@ -349,6 +358,7 @@ function ProfileForm({
   };
 
   const handleSubmit = async () => {
+    if (submitting) return;
     const err = validateNetworkProfileDraft({ name, cidrs, domains });
     setError(err);
     if (err) return;
@@ -477,17 +487,21 @@ function ProfileForm({
 }
 
 export function NetworkProfileDialog({
+  instanceId,
   profileId,
   onSaved,
 }: {
+  instanceId: string;
   profileId?: string;
   onSaved?: (profileId: string) => void;
 }) {
   const { t } = useTranslation();
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((s) => s.closeInstance);
+  const close = () => closeInstance(instanceId);
   const title = t(profileId ? 'rules.networkProfile.editTitle' : 'rules.networkProfile.newTitle');
   return (
     <ConfigShell
+      instanceId={instanceId}
       titleId="network-profile-title"
       title={title}
       render={({ config, update }) => {
@@ -506,7 +520,7 @@ export function NetworkProfileDialog({
             </Modal>
           );
         }
-        return <ProfileForm config={config} update={update} base={base} onSaved={onSaved} />;
+        return <ProfileForm instanceId={instanceId} config={config} update={update} base={base} onSaved={onSaved} />;
       }}
     />
   );

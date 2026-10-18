@@ -45,6 +45,7 @@ function parseEndpoint(ep: string): { host: string; port: number } | null {
 export function parseWgQuickConf(raw: string | undefined | null): ParsedWgQuick | null {
   if (!raw || typeof raw !== 'string') return null;
   let section = '';
+  let peerSections = 0;
   const iface: Record<string, string> = {};
   const peer: Record<string, string> = {};
   for (const lineRaw of raw.split(/\r?\n/)) {
@@ -53,6 +54,7 @@ export function parseWgQuickConf(raw: string | undefined | null): ParsedWgQuick 
     const sec = /^\[(\w+)\]$/.exec(line);
     if (sec) {
       section = sec[1].toLowerCase();
+      if (section === 'peer' && ++peerSections > 1) section = 'ignored-peer';
       continue;
     }
     const eq = line.indexOf('=');

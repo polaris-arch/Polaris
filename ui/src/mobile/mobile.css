@@ -25,6 +25,8 @@ body *::-webkit-scrollbar { display: none; }
 /* ═══════════ 根：Dynamic Type 接缝 + 响应标量缺省 ═══════════ */
 
 :root {
+  /* The root already owns the stacking context: do not trap toast below body portals. */
+  container: mchrome / inline-size;
   /*
    * Dynamic Type 的**消费端**（D-10）。生产端在原生层：Android 读 `Configuration.fontScale`、
    * iOS 映射 `preferredContentSizeCategory`，把真值写成根元素的**内联** `--font-scale`
@@ -205,7 +207,7 @@ body {
 
 /* 断点：medium ≥ 37.5em、expanded ≥ 52.5em（`core.json#breakpoints`）。
  * 外壳只解析三个响应标量；多列列流（column-count / break-inside）本批不做，理由见设计文档 §6。 */
-@container mscreen (min-width: 37.5em) {
+@container mchrome (min-width: 37.5em) {
   .m-page {
     --page-inset: var(--sp-6); /* 24 */
     --section-gap: var(--sp-5); /* 20 */
@@ -218,7 +220,7 @@ body {
   }
 }
 
-@container mscreen (min-width: 52.5em) {
+@container mchrome (min-width: 52.5em) {
   .m-page {
     --page-inset: var(--sp-7); /* 32 */
     --section-gap: 18px; /* 阶梯里没有 18；expanded 的 sectionGap 比 medium 略收，见 core.json */

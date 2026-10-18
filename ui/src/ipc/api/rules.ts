@@ -11,12 +11,12 @@ export const rulesApi = {
     return invoke(IPC_CHANNELS.RULES_ADD, { rule, plane });
   },
 
-  async update(rule: Rule, plane: 'route' | 'dns'): Promise<void> {
-    return invoke(IPC_CHANNELS.RULES_UPDATE, { rule, plane });
+  async update(rule: Rule, plane: 'route' | 'dns', expectedRule?: Rule | null): Promise<void> {
+    return invoke(IPC_CHANNELS.RULES_UPDATE, { rule, plane, expectedRule, requireExpected: expectedRule !== undefined });
   },
 
-  async delete(ruleId: string, plane: 'route' | 'dns'): Promise<void> {
-    return invoke(IPC_CHANNELS.RULES_DELETE, { ruleId, plane });
+  async delete(ruleId: string, plane: 'route' | 'dns', expectedRule?: Rule | null): Promise<void> {
+    return invoke(IPC_CHANNELS.RULES_DELETE, { ruleId, plane, expectedRule, requireExpected: expectedRule !== undefined });
   },
 
   /** 按执行平面独立重排。 */

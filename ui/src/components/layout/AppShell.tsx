@@ -20,6 +20,7 @@
  * 内容区按 nav-store mainScreen 渲染对应屏幕（ScreenRouter）。
  */
 
+import { useAppStore } from '@/store/app-store';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
@@ -69,6 +70,7 @@ export interface AppShellProps {
 
 export default function AppShell({ children }: AppShellProps) {
   const { t } = useTranslation();
+  const privacyMode = useAppStore((state) => state.privacyMode);
   const [os, setOs] = useState<Platform>(() => detectPlatform());
   const scope = useNavStore((s) => s.scope);
   const mainScreen = useNavStore((s) => s.mainScreen);
@@ -241,9 +243,9 @@ export default function AppShell({ children }: AppShellProps) {
             **有弹窗打开时它会 portal 到最顶层 `<dialog>` 的子树里** —— 那是 top-layer，不进去就被
             `::backdrop` 压住且 z-index 无效（根因与双引擎实测见 `../dialogs/dialog-top-layer.ts`）。
             故本处只是「无弹窗时的宿主」，不是唯一挂载点；定位一律 fixed 相对视口，两种宿主下落点一致。 */}
-        <Toaster />
+        {!privacyMode && <Toaster />}
         {/* 隐私锁遮罩（#lock-overlay 铺满 .win，privacyMode===true 时渲染；否则 return null 零成本）。
-            挂在最后 → DOM 序在 chrome 之上；z-index:100 盖住 shell/侧栏/状态栏/toast。 */}
+            原生 top-layer 锁挂在最后；普通 Modal 暂停入层，toast 锁定期间不挂载。 */}
         <LockOverlay />
       </div>
     </div>

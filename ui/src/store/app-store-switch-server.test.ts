@@ -19,7 +19,7 @@ const configGetMock = vi.fn(async () => authoritativeConfig('__direct__'));
 vi.mock('../ipc', () => ({
   api: {
     server: { switch: (id: string) => switchMock(id) },
-    config: { get: () => configGetMock(), save: vi.fn(), setStagedPending: vi.fn() },
+    config: { onChangedReady: async () => () => {}, get: () => configGetMock(), save: vi.fn(), setStagedPending: vi.fn() },
     proxy: { getStatus: vi.fn() },
   },
 }));
@@ -173,4 +173,62 @@ it.each(['ios', 'android'])('only %s decides whether switch waits for hydration'
     hydration.mockRestore();
     vi.unstubAllGlobals();
   }
+});
+
+it('a late manual readback keeps the newer whole config and yields no feedback receipt', async () => {
+  seed('n-old');
+  let release!: () => void;
+  configGetMock.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve(authoritativeConfig('n-a')); }));
+  const switching = useAppStore.getState().switchServer('n-a');
+  await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+  seed('n-b');
+  release();
+  expect(await switching).toBeNull();
+  expect(useAppStore.getState().config?.selectedServerId).toBe('n-b');
+  expect(useAppStore.getState().selectedServerId).toBe('n-b');
+});
+
+it('a newer config during iOS hydration also supersedes the old manual feedback receipt', async () => {
+  let release!: () => void;
+  const hydration = vi.spyOn(stagedConfig, 'hydrateStagedConfig').mockImplementation((_config, isCurrent) => new Promise(resolve => {
+    release = () => { expect(isCurrent?.()).toBe(false); resolve(); };
+  }));
+  vi.stubGlobal('document', { documentElement: { dataset: { mobileOs: 'ios' } } });
+  try {
+    const switching = useAppStore.getState().switchServer('n-a');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    seed('n-b');
+    release();
+    expect(await switching).toBeNull();
+    expect(useAppStore.getState().config?.selectedServerId).toBe('n-b');
+  } finally { hydration.mockRestore(); vi.unstubAllGlobals(); }
+});
+
+it('a superseded failed manual readback is silent while an active failure still propagates', async () => {
+  seed('n-old');
+  let reject!: () => void;
+  configGetMock.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = () => fail(Error('old read failed')); }));
+  const switching = useAppStore.getState().switchServer('n-a');
+  await vi.waitFor(() => expect(reject).toBeTypeOf('function'));
+  seed('n-b');
+  reject();
+  expect(await switching).toBeNull();
+  expect(useAppStore.getState().config?.selectedServerId).toBe('n-b');
+  configGetMock.mockRejectedValueOnce(Error('active read failed'));
+  await expect(useAppStore.getState().switchServer('n-c')).rejects.toThrow('active read failed');
+});
+
+
+it('a newer shared fresh read supersedes a dedicated manual read without consuming its receipt', async () => {
+  seed('n-old');
+  let release!: () => void;
+  configGetMock.mockImplementationOnce(() => new Promise(resolve => { release = () => resolve(authoritativeConfig('n-old-response')); }));
+  const switching = useAppStore.getState().switchServer('n-a');
+  await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+  configGetMock.mockResolvedValueOnce(authoritativeConfig('n-shared'));
+  await useAppStore.getState().loadConfig(true);
+  release();
+  expect(await switching).toBeNull();
+  expect(useAppStore.getState().selectedServerId).toBe('n-shared');
+  expect(useAppStore.getState().config?.selectedServerId).toBe('n-shared');
 });

@@ -12,7 +12,8 @@ import {
   partitionNodeDeleteRoutes,
   type NodeDeleteRoutePolicy,
 } from './node-delete-fallback';
-import { selectedVisibleIds } from './nodes-logic';
+import { useAppStore, getEffectiveConfig } from '@/store/app-store';
+import { selectedDeletableIds } from './nodes-logic';
 
 /**
  * 批量删除按钮的原地二次确认 key（与单节点删除的 `node-del:<id>` 区分）。
@@ -209,9 +210,12 @@ export function useNodeDeletion({
     /* 目标集**先与可见集求交**：勾选集不随 tab 切换 / 筛选收窄而收缩，直接消费它会删掉用户此刻
        看不见的节点（判据全文见 `selectedVisibleIds`）。求交后为空 = 没有任何一个勾中项在当前
        视野里，此时连确认都不该武装（武装了也只会执行一次空删）。 */
-    const ids = new Set(selectedVisibleIds(visibleServers, selectedIds));
-    if (ids.size === 0) return;
+    const requested = new Set(selectedDeletableIds(visibleServers, selectedIds, diskServers));
+    if (requested.size === 0) return;
     confirmTwice(BATCH_DEL_KEY, () => {
+      const latest = useAppStore.getState().servers;
+      const ids = new Set(selectedDeletableIds(getEffectiveConfig()?.servers ?? latest, requested, latest));
+      if (ids.size === 0) return;
       void (async () => {
         const split = splitStagedOnly(
           'server.deleteBatch',

@@ -28,6 +28,7 @@ export const IPC_CHANNELS = {
   CONFIG_GET: 'config_get',
   CONFIG_SAVE: 'config_save',
   CONFIG_PATCH: 'config_patch',
+  CONFIG_SET_TAKEOVER: 'config_set_takeover',
   CONFIG_MUTATE_ENTITIES: 'config_mutate_entities',
   CONFIG_CLASSIFY_STAGED: 'config_classify_staged',
   CONFIG_SET_STAGED_PENDING: 'config_set_staged_pending',
@@ -67,6 +68,11 @@ export const IPC_CHANNELS = {
   SERVER_DELETE: 'server_delete',
   SERVER_DELETE_BATCH: 'server_delete_batch',
   SERVER_SPEED_TEST: 'server_speed_test',
+  SPEED_TEST_SCHEDULE_STATUS: 'speed_test_schedule_status', // 周期测速的计划状态（只读）
+  SPEED_TEST_RESULT_SNAPSHOT: 'speed_test_result_snapshot', // Existing ledger, read-only UI projection.
+  AUTO_SELECT_ENABLE: 'auto_select_enable', // 把选择意图置为「自动选择（该订阅）」；清掉只需点任一节点
+  AUTO_SELECT_SWITCH_NOW: 'auto_select_switch_now', // 自动意图下按共享裁决请求换点（允许重启内核）
+  AUTO_SELECT_STATUS: 'auto_select_status', // 选择状态（只读）
   WARP_REGISTER: 'warp_register', // Cloudflare WARP 设备注册 → 生成 WireGuard 草稿
   WARP_APPLY_LICENSE: 'warp_apply_license', // 对已注册 WARP 节点原地应用 WARP+ license（升级免重建）
   TAILSCALE_LOGIN: 'tailscale_login', // 按需瞬态登录核：拉起登录专用 sing-box 取交互登录 URL（Phase 2）
@@ -212,6 +218,7 @@ export const IPC_CHANNELS = {
 
   // 更新管理
   UPDATE_CHECK: 'update_check',
+  UPDATE_CLEAR_PORTABLE_HANDOFF: 'update_clear_portable_handoff',
   UPDATE_DOWNLOAD: 'update_download',
   // 回读最后一帧 update:progress。更新卡的状态在组件本地，只订阅事件的话组件重挂载后就对在途/已完成的
   // 下载一无所知（下完了的那一帧永不再来）⇒ 挂载时补一次回读。
@@ -222,16 +229,8 @@ export const IPC_CHANNELS = {
   // App 更新弹窗（独立 mini 更新窗）：主进程 → 弹窗推状态载荷；弹窗 → 主进程回传按钮/关闭动作。
   UPDATE_POPUP_ACTION: 'update_popup_action',
 
-  // 核心管理
-  CORE_UPDATE_CHECK: 'core_update_check',
-  CORE_UPDATE_RUN: 'core_update_run',
+  // 内核只读信息
   CORE_GET_VERSION_INFO: 'core_get_version_info',
-  CORE_ROLLBACK: 'core_rollback',
-  CORE_REPLACE_MANUAL: 'core_replace_manual',
-  CORE_UPDATE_GET_AUTO_STATUS: 'core_update_get_auto_status', // 内核自动更新状态（lastCheckAt/staged/跨带提示）
-  CORE_UPDATE_APPLY_STAGED: 'core_update_apply_staged', // 用户点「立即应用」：停代理→换核→重启（唯一允许主动断流）
-  CORE_UPDATE_ACK_VERSION_CHANGE: 'core_update_ack_version_change', // banner 展示版本变更通知后 ack 清除 pendingChangeNotice（show→ack，弹一次非每启）
-  CORE_RESET_FACTORY: 'core_reset_factory', // B6：把内核恢复为随 App 出厂的版本
   APP_UNINSTALL_ALL: 'app_uninstall_all', // B6：完全卸载 Polaris（提权 helper / 受保护目录内核 / 用户配置 / 应用本体）
 
   // Shell 操作
@@ -267,8 +266,8 @@ export const IPC_CHANNELS = {
   // **与上面两条的分工**：那两条的发射点在后端**命令层**，后端自驱的核起停（去抖重启 /
   // 「立即应用」/ drain 排空 / 崩溃自愈）一个都不发 —— 这正是「点了立即应用，核真重启了、
   // 条上仍显示立即应用」的成因。本通道由 `runtime/proxy.rs` 在**真状态跃迁点**发，
-  // 覆盖全部路径。上面两条**保留不动**（后端两个 scheduler 仍听它们：订阅补更会真联网、
-  // 换核会排队，收口过去等于每次内部重启都多跑一遍）。
+  // 覆盖全部路径。上面两条**保留不动**（后端的订阅调度器仍听它们：订阅补更会真联网，
+  // 收口过去等于每次内部重启都多跑一遍）。
   EVENT_PROXY_LIFECYCLE: 'event:proxyLifecycle',
   // 无载荷：payload 恒为 {}，本文件三个订阅方（App.tsx / TrayMenu.tsx / use-config.ts）全部丢弃，
   // 详见后端 commands/config.rs::broadcast_config_changed_with 与其调用点守卫。
@@ -304,11 +303,9 @@ export const IPC_CHANNELS = {
   EVENT_TRAY_OPEN_SCREEN: 'event:trayOpenScreen',
   EVENT_ENTER_PRIVACY_MODE: 'event:enterPrivacyMode',
   EVENT_EXIT_PRIVACY_MODE: 'event:exitPrivacyMode', // 退出隐私模式（解锁/idle 计时复位）
-  EVENT_CORE_VERSION_CHANGED: 'event:coreVersionChanged',
-  EVENT_CORE_AUTO_UPDATE_STATUS: 'event:coreAutoUpdateStatus', // 内核自动更新状态变更（staged 待生效 / 跨带提示）
-  EVENT_CORE_BASELINE_WARNING: 'event:coreBaselineWarning', // 非官方核 ≤ 随包基线：启动 reconcile 发兼容风险提醒
   EVENT_HELPER_UPGRADEABLE: 'event:helperUpgradeable', // 提权 helper proto < 期望（如属主根治 v6）：启动后发，渲染端 toast 引导升级
   EVENT_AUTO_NODE_SWITCHED: 'event:autoNodeSwitched', // 自动换节点成功通知
+  EVENT_AUTO_SELECT_STATUS: 'event:autoSelectStatus', // 选择状态变化，载荷与状态命令的返回同形
   EVENT_PROXY_PENDING_CHANGES: 'event:proxyPendingChanges', // R2 待应用差集 PUSH：switch_mode 末尾推 {added, modified, removed}（与 pull 同构）；待应用操作条数据源
   EVENT_PROXY_INVALID_NODES: 'proxy:invalid-nodes', // 启动 gate 剔除的非法节点（空数组=清陈旧标灰）
   EVENT_NETWORK_PROFILE_MATCH_CHANGED: 'event:networkProfileMatchChanged', // 网络场景命中态变更（无载荷，收到即重拉 NETWORK_PROFILE_RESOLVED_SOURCES）
@@ -327,6 +324,8 @@ export const IPC_CHANNELS = {
   // ——invoke 返回值只有发起方那个 JS 堆拿得到，这正是「断开后进度 toast 还要等十几秒才转中断」的根因。
   // `pending` = 本轮没拿到值的节点 id，中断态 toast 的「继续」按它续测。详见 contracts/speed-test.ts。
   EVENT_SPEED_TEST_DONE: 'event:speedTestDone',
+  // 周期测速的计划状态：状态或其原因变化、以及每轮收尾时发一次，载荷与状态命令的返回同形。
+  EVENT_SPEED_TEST_SCHEDULE: 'event:speedTestSchedule',
   EVENT_TAILSCALE_AUTH_URL: 'event:tailscaleAuthUrl', // Tailscale 节点需交互登录：核日志抓出的登录 URL（瞬态核路径）
   EVENT_TAILSCALE_LOGIN_PROGRESS: 'event:tailscaleLoginProgress',
   EVENT_TAILSCALE_STATUS: 'event:tailscaleStatus', // sing-box 1.14 管理 API 推送的 Tailscale 节点真实态（backendState/loggedIn/authURL/IP/过期）
@@ -336,6 +335,10 @@ export const IPC_CHANNELS = {
   EVENT_MESH_LOGIN_FALLBACK: 'event:meshLoginFallback', // 缺陷1 登录期出口让位：选中 TS 出口未就绪→默认路由让位直连(engaged=true)/就绪后切回(engaged=false)，渲染端据此提示（payload={engaged,serverName?}）
   EVENT_SYSTEM_PROXY_RESIDUAL: 'event:systemProxyResidual', // TUN 启动后检测到无 marker 的系统代理残留（非 Polaris 设的）→ 一次性提示
   SYSTEM_LIST_NETWORK_INTERFACES: 'system_list_network_interfaces',
+  COEX_RUNTIME_GET_STATE: 'coex_runtime_get_state',
+  COEX_RUNTIME_REFRESH: 'coex_runtime_refresh',
+  EVENT_COEX_RUNTIME_STATE: 'event:coexRuntimeState',
+  COEX_READONLY_SNAPSHOT: 'coex_readonly_snapshot',
 
   // 界面语言不再经此反向同步：改走 config.language 单一真值源（主进程直接读 config，见 config-engine）。
 

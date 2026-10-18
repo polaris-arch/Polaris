@@ -1,3 +1,8 @@
+import { cancelMeasurementConsent } from '../MeasurementStartNotice';
+import { useQualifiedLatencies } from '../use-qualified-latencies';
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
+import { AutoSelectStatusPanel } from '../AutoSelectStatusPanel';
+import { useAutoSelectStatus } from '@/hooks/use-auto-select-status';
 import { runMobileSpeedTest, useMobileSpeedTestStore, mobileSpeedTestBusy } from '../use-mobile-speed-test';
 /**
  * 移动端「节点」屏的**接线层**：读 store、发 IPC、把结果整形成 `view-model.ts` 的 props。
@@ -67,7 +72,7 @@ import { useSubscriptionProgressStore } from '@/store/use-subscription-progress-
 import { api } from '@/ipc';
 import { toast } from '@/lib/error-handler';
 import { withProxyStartClaim } from '@/lib/proxy-start-claim';
-import { groupServersBySubscription } from '@/domain/server-grouping';
+import { nodeViewGroups } from '@/domain/server-grouping';
 import {
   speedTestableIds,
   manualSpeedTestCaps,
@@ -132,28 +137,40 @@ import type {
    `protocol-label-parity.test.ts`。 */
 
 export function MobileNodesScreen(): ReactElement {
+  useEffect(() => () => cancelMeasurementConsent(), []);
   const { t } = useTranslation();
   const config = useEffectiveConfig();
+  const savedConfig = useAppStore((s) => s.config);
+  const autoSelectStatus = useAutoSelectStatus(savedConfig);
   const servers = useEffectiveServers();
   const diskServers = useAppStore((s) => s.servers);
   const selectedServerId = useAppStore((s) => s.selectedServerId);
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
   const startProxy = useAppStore((s) => s.startProxy);
   const invalidNodes = useAppStore((s) => s.invalidNodes);
-  const latencyMap = useLatencyStore((s) => s.latencyMap);
+  const latencyMap = useQualifiedLatencies(servers);
   const testedAt = useLatencyStore((s) => s.testedAt);
   const subscriptionProgress = useSubscriptionProgressStore((s) => s.progress);
 
   const subscriptions = useMemo(() => config?.subscriptions ?? [], [config?.subscriptions]);
   const groups = useMemo(
-    () => groupServersBySubscription(servers, subscriptions, true),
-    [servers, subscriptions],
+    () => nodeViewGroups(servers, subscriptions, { manual: t('nodes.tab.manual'), mesh: t('nodes.tab.mesh') }),
+    [servers, subscriptions, t],
   );
 
   const [tab, setTab] = useState<string | null>(null);
   /* 冷启动落点与桌面同一条判据（`initialNodesTab`），不另猜一个。`groups` 还没水合时它返回
      `null` —— 那时定位没有信息量，落成空串即「一个都不选中」，等 groups 到齐再自然命中。 */
-  const activeTab = tab ?? initialNodesTab(groups, selectedServerId) ?? '';
+  const activeTab = tab !== null && groups.some((group) => group.id === tab)
+    ? tab
+    : tab !== null
+      ? groups[0]?.id ?? ''
+      : initialNodesTab(groups, selectedServerId) ?? '';
+  useEffect(() => {
+    if (tab !== null && groups.length > 0 && !groups.some((group) => group.id === tab)) {
+      setTab(groups[0].id);
+    }
+  }, [groups, tab]);
   const activeGroup = groups.find((g) => g.id === activeTab);
   const activeSub = subscriptions.find((s) => s.id === activeTab);
 
@@ -261,10 +278,13 @@ export function MobileNodesScreen(): ReactElement {
   /** 切出口共用 store 写腿；只有后端收据为 applied 才报告已生效。 */
   const onUseAsExit = useCallback(
     (row: NodeRowVM) => {
-      if (row.server.id === selectedServerId) return;
+      // Read disk state at click time; staged edits cannot decide whether Auto exits.
+      const config = useAppStore.getState().config;
+      if (config && config.selectionIntent === undefined && row.server.id === config.selectedServerId) return;
       void runWrite(
         async () => {
           const receipt = await switchServer(row.server.id);
+          if (!receipt) return;
           const feedback = mobileSwitchReceiptFeedback(receipt, row.server.name, t);
           if (feedback?.tone === 'success') {
             setNotice(undefined);
@@ -275,7 +295,7 @@ export function MobileNodesScreen(): ReactElement {
         (err) => serverSwitchErrorText(err instanceof IpcError ? err.code : undefined, t),
       );
     },
-    [runWrite, switchServer, selectedServerId, t],
+    [runWrite, switchServer, t],
   );
 
   /** 一轮测速。射程由调用方按复用的谓词算好；本函数只管发、落库、报结局。 */
@@ -470,9 +490,16 @@ export function MobileNodesScreen(): ReactElement {
   }, []);
 
   const selectAll = useCallback(() => {
-    const all = selectedIds.size === visibleServers.length && visibleServers.length > 0;
-    setSelectedIds(all ? new Set() : new Set(visibleServers.map((x) => x.id)));
-  }, [visibleServers, selectedIds.size]);
+    const all = visibleServers.length > 0 && visibleServers.every((server) => selectedIds.has(server.id));
+    setSelectedIds((previous) => {
+      const next = new Set(previous);
+      for (const server of visibleServers) {
+        if (all) next.delete(server.id);
+        else next.add(server.id);
+      }
+      return next;
+    });
+  }, [visibleServers, selectedIds]);
 
   /* 「全部测速」的射程是**全部**节点，不是当前分组里可见的那批 —— 拿可见数去禁用它，
      会在「当前 tab 恰好一个可测节点都没有」时把一个本来有目标的动作锁死。 */
@@ -523,7 +550,7 @@ export function MobileNodesScreen(): ReactElement {
         const progress = subscriptionProgress[g.id];
         return {
           id: g.id,
-          label: g.isManual ? t('nodes.tab.manual') : g.isMesh === true ? t('nodes.tab.mesh') : g.name,
+          label: g.isAll ? t('nodes.tab.all') : g.isManual ? t('nodes.tab.manual') : g.isMesh === true ? t('nodes.tab.mesh') : g.name,
           count: g.servers.length,
           failureDetail:
             progress?.phase === 'failed' ? subscriptionErrorDetail(progress, t) : undefined,
@@ -535,12 +562,14 @@ export function MobileNodesScreen(): ReactElement {
   const rows = useMemo<NodeRowVM[]>(
     () =>
       visibleServers.map((server) => {
-        const mesh = activeGroup?.isMesh === true || isMeshNode(server);
+        const source = activeGroup?.sources?.[server.id];
+        const mesh = activeGroup?.isMesh === true || source?.kind === 'mesh' || isMeshNode(server);
         const meshRouteContextMismatch = mesh && meshRoute.report?.snapshot.configSource === 'running' &&
           (!meshReportMatchesScreen || stagedOnly.has(server.id));
         const reason = speedTestBlockReason(server, speedTestCaps, stagedOnly.has(server.id));
         return {
           server,
+          sourceLabel: source ? source.kind === 'subscription' ? source.name : t(`nodes.tab.${source.kind}`) : undefined,
           isCurrent: server.id === selectedServerId,
           isExit: mesh,
           lanOnly: mesh && !meshAllowsInternet(server),
@@ -737,6 +766,8 @@ export function MobileNodesScreen(): ReactElement {
   return (
     <NodesScreenView
       t={t}
+      autoSelectStatus={<><SavedAutoSelectControls t={t} /><AutoSelectStatusPanel {...autoSelectStatus} t={t}
+        servers={savedConfig?.servers ?? []} subscriptions={savedConfig?.subscriptions ?? []} /></>}
       groups={groupTabs}
       activeTab={activeTab}
       onSelectTab={(id) => {
@@ -785,7 +816,7 @@ export function MobileNodesScreen(): ReactElement {
         setBatchMode(true);
         setSelectedIds(new Set());
       }}
-      selectedIds={selectedIds}
+      selectedIds={new Set(visibleServers.filter((server) => selectedIds.has(server.id)).map((server) => server.id))}
       onToggleSelect={toggleSelect}
       onSelectAll={selectAll}
       onBatchCopyLinks={() =>

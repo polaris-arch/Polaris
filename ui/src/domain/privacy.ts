@@ -39,9 +39,22 @@ export function shouldRedactLogs(privacyMode: boolean, redactPref: boolean): boo
 
 // ── 客户端兜底脱敏 ──
 const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
-// IPv6：要求 ≥3 段冒号分隔（{3,7} 组「seg:」），故 HH:MM:SS 时间戳（仅 2 冒号）不误伤；
-// 压缩形（::1）罕见于代理日志，为规避时间戳误报而不覆盖，属可接受取舍。
-const IPV6 = /\b(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}\b/g;
+// Broad candidate extraction, followed by IPv6 structure validation (no lookbehind).
+const IPV6 = /[0-9a-fA-F]*:[0-9a-fA-F:.]*(?:%[a-zA-Z0-9_.~-]+)?/g;
+function isIpv6Token(token: string): boolean {
+  let address = token.split('%')[0];
+  if (address.includes('.')) {
+    const colon = address.lastIndexOf(':');
+    const tail = address.slice(colon + 1).split('.');
+    if (tail.length !== 4 || tail.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return false;
+    address = address.slice(0, colon + 1) + '0:0';
+  }
+  const halves = address.split('::');
+  if (halves.length > 2) return false;
+  const groups = halves.flatMap((half) => half ? half.split(':') : []);
+  if (groups.some((group) => !/^[0-9a-fA-F]{1,4}$/.test(group))) return false;
+  return halves.length === 2 ? groups.length < 8 : groups.length === 8;
+}
 // 域名：≥1 段 + 纯字母 TLD（≥2）。TLD 限纯字母 → 版本号（1.14.0-alpha.43 / v0.1.1）末段非纯字母，不误伤。
 const DOMAIN = /\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b/g;
 const MASK = '•••'; // •••
@@ -52,5 +65,20 @@ const MASK = '•••'; // •••
  * 先 IPv4/IPv6 再域名：IP 被掩成 ••• 后不含点，域名正则不会二次命中。
  */
 export function redactSensitive(text: string): string {
-  return text.replace(IPV4, MASK).replace(IPV6, MASK).replace(DOMAIN, MASK);
+  // IPv6 first: otherwise the IPv4 suffix of a mapped address would be masked separately.
+  return text.replace(IPV6, (candidate) => {
+    const address = candidate.replace(/\.+$/, '');
+    if (isIpv6Token(address)) return MASK + candidate.slice(address.length);
+    // A log label can contribute a delimiter colon (or trailing hex letters) to the
+    // maximal candidate: peer:2001:db8::1 / key:::ffff:192.0.2.1. Do not let that
+    // invalid prefix hide a valid address inside it. Only colon-delimited suffixes
+    // are retried, still using the full IPv6 validator, so HH:MM:SS stays visible.
+    for (let colon = address.indexOf(':'); colon >= 0; colon = address.indexOf(':', colon + 1)) {
+      const start = colon + 1;
+      if (isIpv6Token(address.slice(start))) {
+        return address.slice(0, start) + MASK + candidate.slice(address.length);
+      }
+    }
+    return candidate;
+  }).replace(IPV4, MASK).replace(DOMAIN, MASK);
 }

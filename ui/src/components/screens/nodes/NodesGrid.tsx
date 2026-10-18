@@ -82,7 +82,8 @@ export function NodesGrid({
         </div>
       ) : (
         renderedServers.map((server) => {
-          const isMesh = activeGroup?.isMesh || isMeshNode(server);
+          const source = activeGroup?.sources?.[server.id];
+          const isMesh = activeGroup?.isMesh || source?.kind === 'mesh' || isMeshNode(server);
           const lanOnly = isMesh && !meshAllowsInternet(server);
           const blockReason = speedTestBlockReason(server, speedTestCaps, stagedOnly.has(server.id));
           const meshRouteBadge = meshRouteBadges.get(server.id);
@@ -90,6 +91,7 @@ export function NodesGrid({
             <NodeCard
               key={server.id}
               server={server}
+              sourceLabel={source ? source.kind === 'subscription' ? source.name : t(`nodes.tab.${source.kind}`) : undefined}
               isCurrent={server.id === selectedServerId}
               isExit={isMesh}
               lanOnly={lanOnly}

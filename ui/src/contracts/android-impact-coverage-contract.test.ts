@@ -491,6 +491,16 @@ describe('Android 影响面的完备性（APK 腿的触发面 fail-open 根治�
         HOW_TO_FIX,
     ).toEqual([]);
 
+    const geoSeedHostTests = 'src-tauri/src/runtime/geo_seed/tests/resolve_tests.rs';
+    expect(androidRegistrationOf(geoSeedHostTests)).toEqual({
+      key: geoSeedHostTests, table: 'NO_ANDROID_IMPACT_SCOPES',
+    });
+    expect(NO_ANDROID_IMPACT_SCOPES[geoSeedHostTests]).toContain('cargo test --workspace');
+    expect(NO_ANDROID_IMPACT_SCOPES[geoSeedHostTests]).toContain('APK 构建不运行这些测试');
+    // Registering this host-only test cannot suppress the actual Android assets.
+    expect(classifyImpact(['src-tauri/gen/android/app/src/main/java/com/polaris2/app/vpn/BundledRules.kt']).android).toBe(true);
+    expect(classifyImpact(['resources/data/geosite-cn.srs']).android).toBe(true);
+
     // 正面断言：面里的每一条都真的解析到了一条登记（上面那条只说「没有漏网」，
     // 面若为空它同样成立）。
     for (const path of androidCfgFace) {

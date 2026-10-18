@@ -85,6 +85,8 @@ export interface ApplyNowResult {
   saved: boolean;
   /** 排程结果；`null` = IPC 失败。`saved:false` 时恒 `null`（没调过）。 */
   status: ApplyStatus | null;
+  /** Backend force_restart_seq identity; absent receipts cannot prove completion. */
+  applyId?: number;
 }
 
 /** 取持久存储；不可用（隐私模式 / node / webview 未提供）返 null。介质选型理由见文件头。 */
@@ -298,6 +300,8 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
   resolveConflict: async (keepEntryIds) => {
     const { enabled, entries, baseline, conflict, conflictBaseline } = get();
     if (!enabled) return true;
+    // A stale/dismissed dialog cannot authorize a new save or rebase.
+    if (conflict === null || conflictBaseline === null) return false;
     const keep = new Set(keepEntryIds);
     // 裁决只作用于**进了冲突集的那些条目**。没冲突的条目与这次弹窗无关，一条都不能动 ——
     // 按 `keepEntryIds` 直接过滤全表会把「同一批里没冲突的编辑」一起丢掉（用户没被问过、
@@ -326,7 +330,7 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
   applyNow: async () => {
     if (!(await get().save())) return { saved: false, status: null };
     const r = await api.proxy.applyPendingChanges().catch(() => null);
-    return { saved: true, status: r?.status ?? null };
+    return { saved: true, status: r?.status ?? null, ...(r?.applyId == null ? {} : { applyId: r.applyId }) };
   },
 
   hydrate: (config) => {
@@ -367,7 +371,7 @@ type GetState = () => StagedConfigState;
 
 /**
  * 「保存」的本体（Q8-b 四步）。`save` 与 `resolveConflict` 共用 —— 两条腿只差
- * `conflictResolved`（后者刚被用户裁决过，不该再问第二遍）。
+ * 裁决后 baseline 已更新到用户看过的那份磁盘；若磁盘再次变化，仍需重新询问。
  *
  * 抽成模块级函数而不是 store 里的第三个 action：它不是外部可调用的能力，
  * 摆进 `StagedConfigState` 只会多一个能被误用的入口。
@@ -414,6 +418,11 @@ async function performSaveLocked(
     set({ saveStatus: 'saveFailed' });
     return false;
   }
+  // Edits made while this read was in flight need their own full conflict check.
+  if (get().entries !== entries || get().baseline !== baseline) {
+    set({ saveStatus: 'idle' });
+    return false;
+  }
   const diskVersion = configBaseVersion(disk);
   /** 合并结果 = 把 staged 重放到磁盘现值上。落盘、弹窗里的「用我的」、成功后的新 baseline 同一个值。 */
   const merged = replay(disk, entries);
@@ -449,6 +458,10 @@ async function performSaveLocked(
     // 后端不在提交点盲清这个 bit（它不知道在途期间是否又有下一批）；成功回包后由
     // `persist(outcome.config, remaining)` 按实际剩余条目收账。回包丢失只会保守地多拦一次，不会误启动。
     await flushStagedPendingSync();
+    if (get().entries !== entries || get().baseline !== baseline) {
+      set({ saveStatus: 'idle' });
+      return false;
+    }
     outcome = await api.config.save(merged, true, diskVersion);
   } catch (err) {
     console.error('[staged-config] save failed:', err);
@@ -463,18 +476,19 @@ async function performSaveLocked(
   }
   // 成功 ⇒ 本次捕获且期间未变化的意图已经**是**磁盘现值，留着只会让计数虚高。
   // 保存 IPC 在途期间仍可继续编辑；新 id 或同 id 新版本不属于本次提交，绝不能被旧回包清掉。
-  // 锚点同步刷到落盘后的新版本：不刷的话，下一批 staged 会拿一份陈旧 baseline 去比对，
-  // 把「用户自己刚保存的那次改动」认成「磁盘侧变了」→ 第二次保存平白弹一次冲突窗。
   const remaining = remainingEntriesAfterCommit(entries, get().entries);
+  // New/revised intents have not approved changes found on disk by this save.
+  // Keep their original comparison base; the next save rechecks them conservatively.
+  const remainingBaseline = remaining.length > 0 ? get().baseline : outcome.config;
   set({
     entries: remaining,
     saveStatus: 'idle',
     conflict: null,
     conflictBaseline: null,
     baseVersion: outcome.version,
-    baseline: outcome.config,
+    baseline: remainingBaseline,
   });
-  persist(outcome.config, remaining);
+  persist(remainingBaseline, remaining);
   return true;
 }
 
@@ -511,7 +525,7 @@ function consumeCleanExitFlag(): Promise<void> {
  * 放在这里而不是让 app-store 直接 `getState().hydrate(...)`：调用点只该知道「有份新 config 到了」，
  * 不该知道暂存层的开关与恢复语义（现在还多了一条「恢复前要先问后端上次怎么退的」）。
  */
-export function hydrateStagedConfig(config: UserConfig): Promise<void> {
+export function hydrateStagedConfig(config: UserConfig, isCurrent: () => boolean = () => true): Promise<void> {
   // 判据取 **store 的 `enabled`** 而非编译期常量：`stage`/`revert`/`reset`/`editRoute` 判的都是前者，
   // 两处不同源会造出一个「半开」态 —— 谁在运行期把 `enabled` 置 true（文档明说该字段就是为了让单测
   // 两侧都跑到），hydrate 却因常量为 false 永不执行 ⇒ `baseVersion` 恒 null ⇒ `persist()` 走
@@ -522,9 +536,11 @@ export function hydrateStagedConfig(config: UserConfig): Promise<void> {
   // 已 hydrate 过 ⇒ 同步快路径。这条腿只跟盘刷 `baseVersion`/`baseline`，**不读存储**，
   // 与「上次怎么退的」无关；配置变更事件走的全是这条，不该为它多绕一个微任务。
   if (store.hydrated) {
-    store.hydrate(config);
+    if (isCurrent()) store.hydrate(config);
     return Promise.resolve();
   }
   // 首次恢复**必须**排在标记消费之后：反过来的话条目已经进内存，事后再清存储也追不回来。
-  return consumeCleanExitFlag().then(() => useStagedConfigStore.getState().hydrate(config));
+  return consumeCleanExitFlag().then(() => {
+    if (isCurrent()) useStagedConfigStore.getState().hydrate(config);
+  });
 }

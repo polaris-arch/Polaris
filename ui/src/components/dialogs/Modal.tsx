@@ -23,6 +23,7 @@
 import {
   createContext,
   useEffect,
+  useLayoutEffect,
   useRef,
   type CSSProperties,
   type ReactNode,
@@ -30,6 +31,7 @@ import {
 } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useDialogTopLayerStore } from './dialog-top-layer';
+import { useAppStore } from '@/store/app-store';
 
 /** Modal 向子树（Csel）暴露的协作上下文。 */
 export interface ModalContextValue {
@@ -101,6 +103,8 @@ export function Modal({
 }: ModalProps) {
   const { t } = useTranslation();
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const privacyMode = useAppStore((state) => state.privacyMode);
+  const resumeFocus = useRef<HTMLElement | null>(null);
   const cselCloseRef = useRef<(() => void) | null>(null);
   // pointerdown 是否落在 backdrop（dialog 元素本身）—— 防拖选出界误关。
   const downOnBackdropRef = useRef(false);
@@ -108,32 +112,45 @@ export function Modal({
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const dialog = dialogRef.current;
-    if (!dialog) return;
+    if (!dialog || privacyMode) return;
     // 记录打开前焦点（StrictMode 双跑：cleanup 已把焦点还原到 trigger，故重跑时再次捕获仍是 trigger）。
     const prevFocus = document.activeElement as HTMLElement | null;
     if (!dialog.open) dialog.showModal();
-    focusFirst(dialog);
+    if (resumeFocus.current && dialog.contains(resumeFocus.current)) resumeFocus.current.focus();
+    else focusFirst(dialog);
     // 登记进 top-layer 元素栈 —— toast 要挂到「最顶层弹窗」的子树里才不会被 ::backdrop 压住
     // （理由与实测见 ./dialog-top-layer.ts 模块头）。**必须在 showModal 之后**：登记的语义是
     // 「这个元素现在在 top-layer 里」，提前登记会让 toast 挂到一个还没提层的节点上。
     const { register, unregister } = useDialogTopLayerStore.getState();
     register(dialog);
     return () => {
+      if (dialog.contains(document.activeElement)) resumeFocus.current = document.activeElement as HTMLElement;
       unregister(dialog);
       if (dialog.open) dialog.close();
       // 还原焦点（保底；多数实现原生会还原，spec 未强制）。
-      if (prevFocus && document.contains(prevFocus)) prevFocus.focus();
+      if (!useAppStore.getState().privacyMode && prevFocus && document.contains(prevFocus)) prevFocus.focus();
     };
-  }, []);
+  }, [privacyMode]);
+
+  // Lock teardown runs in the same layout phase. Restore top-dialog focus afterward,
+  // when the lock no longer makes this subtree inert.
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    const layers = useDialogTopLayerStore.getState().els;
+    if (privacyMode || !dialog?.open || layers[layers.length - 1] !== dialog) return;
+    if (resumeFocus.current && dialog.contains(resumeFocus.current)) resumeFocus.current.focus();
+    else focusFirst(dialog);
+  }, [privacyMode]);
 
   return (
     <ModalContext.Provider value={{ cselCloseRef }}>
       <dialog
         ref={dialogRef}
         className={className ? `dlg ${className}` : 'dlg'}
-        style={style}
+        style={privacyMode ? { ...style, display: 'none' } : style}
+        aria-hidden={privacyMode || undefined}
         aria-labelledby={titleId}
         // ESC：原生派 cancel 到最顶层 dialog。csel 开 → 只关菜单；否则请求关弹窗。
         onCancel={(e) => {

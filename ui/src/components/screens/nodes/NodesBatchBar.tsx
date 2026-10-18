@@ -1,7 +1,8 @@
 import type { TFunction } from 'i18next';
 import type { ServerConfig } from '@/contracts/types';
+import { useAppStore } from '@/store/app-store';
 import { cn } from '@/lib/utils';
-import { canMoveToGroup } from './nodes-logic';
+import { canMoveToGroup, selectedDeletableIds, selectedVisibleIds } from './nodes-logic';
 import { BATCH_DEL_KEY, type useNodeDeletion } from './use-node-deletion';
 
 interface Props {
@@ -32,6 +33,9 @@ export function NodesBatchBar({
   nodeDeletion,
   exitBatch,
 }: Props) {
+  const saved = useAppStore(state => state.servers);
+  const selectedCount = selectedVisibleIds(visibleServers, selectedIds).length;
+  const deletable = selectedDeletableIds(visibleServers, selectedIds, saved).length;
   return (
     <div className="batch-bar" id="nodes-batch">
       <button
@@ -39,12 +43,12 @@ export function NodesBatchBar({
         id="batch-all"
         className="nd-check on"
         role="checkbox"
-        aria-checked={selectedIds.size === visibleServers.length && visibleServers.length > 0}
+        aria-checked={visibleServers.length > 0 && visibleServers.every((server) => selectedIds.has(server.id))}
         onClick={selectAll}
         style={{ position: 'static' }}
         aria-label={t('nodes.selectAll')}
       >
-        {selectedIds.size === visibleServers.length && visibleServers.length > 0 && (
+        {visibleServers.length > 0 && visibleServers.every((server) => selectedIds.has(server.id)) && (
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.4}>
             <path d="M5 12l5 5 9-11" />
           </svg>
@@ -52,7 +56,7 @@ export function NodesBatchBar({
       </button>
       <b>
         {t('nodes.selectedPrefix')}
-        <span className="mono">{selectedIds.size}</span>
+        <span className="mono">{selectedCount}</span>
         {t('nodes.selectedSuffix')}
       </b>
       <div className="sp" />
@@ -61,7 +65,7 @@ export function NodesBatchBar({
         id="batch-test"
         className="btn ghost sm"
         onClick={testSelected}
-        disabled={testing || selectedIds.size === 0}
+        disabled={testing || selectedCount === 0}
       >
         {t('nodes.testGroup')}
       </button>
@@ -90,7 +94,7 @@ export function NodesBatchBar({
         type="button"
         className="btn ghost sm"
         onClick={copyLinksBatch}
-        disabled={selectedIds.size === 0}
+        disabled={selectedCount === 0}
       >
         {t('nodes.batchCopyLinks')}
       </button>
@@ -102,7 +106,7 @@ export function NodesBatchBar({
           className={cn('btn ghost sm', confirmArmed === BATCH_DEL_KEY && 'confirming')}
           style={{ color: 'hsl(var(--err))' }}
           onClick={nodeDeletion.deleteBatch}
-          disabled={selectedIds.size === 0}
+          disabled={deletable === 0}
         >
           {confirmArmed === BATCH_DEL_KEY
             ? t('nodes.batchDeleteConfirmAgain')

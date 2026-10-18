@@ -55,7 +55,6 @@ export type UpdateErrWire =
   | 'digestFieldInvalid'
   | 'cacheDirFailed'
   | 'downloadFailed'
-  | 'backendUnavailable'
   | 'downloadTaskFailed'
   | 'sizeMismatch'
   | 'digestHexInvalid'
@@ -74,23 +73,17 @@ export type PopupAction =
   | 'manualDownload'
   | 'close';
 
-/** 内核构建来源（= Rust `CoreBuildKind`，serde 小写）。§C6 的判定产物。 */
-export type CoreBuildKind = 'official' | 'fork' | 'unknown';
-
-/** 版本变更通知（= Rust `PendingChangeNotice`）。show→ack 一次性。 */
-export interface PendingChangeNotice {
-  previousVersion: string;
-  currentVersion: string;
-}
-
 /** `core_get_version_info` 的返回。 */
 export interface CoreVersionInfo {
-  currentVersion: string;
+  /**
+   * 对安装包里的内核文件执行 `version` 读到的版本；读不到时为空串（不回落到清单声明的版本）。
+   * 它不是「正在运行的内核」的版本：经提权助手运行时执行的是助手目录里的副本。
+   */
+  packagedVersion: string;
+  /** 本应用版本随包清单声明的内核版本。 */
   bundledVersion: string;
-  build: CoreBuildKind;
-  hasBackup: boolean;
-  backupVersion: string | null;
-  pendingChangeNotice: PendingChangeNotice | null;
+  /** 桌面补丁集标识；移动端（Android、iOS）恒为 `null`。 */
+  patchSet: string | null;
 }
 
 /** `version_get_info` 的返回。 */

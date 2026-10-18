@@ -10,7 +10,7 @@
  * 由 `buildWgServer` 组装。R1：`key` 绑 serverId（见导出包装）+ useState 同步初始化。
  */
 
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveServers } from '@/store/app-store';
@@ -82,10 +82,11 @@ function previewFromDraft(d: WgDraft): WgPreview {
   };
 }
 
-function WgForm({ base }: { base?: ServerConfig }) {
+function WgForm({ instanceId, base }: { instanceId: string; base?: ServerConfig }) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((state) => state.closeInstance);
+  const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const loadConfig = useAppStore((s) => s.loadConfig);
   // 展示面：组网单例槽判据必须含暂存节点，否则暂存了一个 WARP/TS 还能再建第二个。
   const servers = useEffectiveServers();
@@ -144,7 +145,7 @@ function WgForm({ base }: { base?: ServerConfig }) {
       close();
       return;
     }
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('wg.discardTitle'),
@@ -152,7 +153,7 @@ function WgForm({ base }: { base?: ServerConfig }) {
         confirmLabel: t('wg.discard'),
         danger: true,
         onConfirm: () => {
-          close();
+          closeInstance(confirmId);
           close();
         },
       },
@@ -359,12 +360,12 @@ function WgForm({ base }: { base?: ServerConfig }) {
   );
 }
 
-export function WgDialog({ serverId }: { serverId?: string }) {
+export function WgDialog({ instanceId, serverId }: { instanceId: string; serverId?: string }) {
   // 展示面：编辑基准（读盘的话暂存过的节点再打开会显示改前的旧值）。
   const servers = useEffectiveServers();
   const base = serverId ? servers.find((s) => s.id === serverId) : undefined;
   // R1：key 绑 serverId —— 切换编辑目标 = 重挂 = 同步重新初始化。
-  return <WgForm key={serverId ?? 'new'} base={base} />;
+  return <WgForm key={serverId ?? 'new'} instanceId={instanceId} base={base} />;
 }
 
 export default WgDialog;

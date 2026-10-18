@@ -305,3 +305,15 @@ describe('启发式覆盖只做提示', () => {
     }
   });
 });
+
+
+it('append refuses a stale picker snapshot after concurrent condition, metadata or deletion changes', () => {
+  const original = rule({ id: 'r' });
+  const subject = domain('new.example.com');
+  const target = ruleAppendTargets([original], subject)[0];
+  expect(appendSubjectToRule(original, target, subject)).not.toBeNull();
+  expect(appendSubjectToRule({ ...original, remarks: 'concurrently edited' }, target, subject)).toBeNull();
+  expect(appendSubjectToRule({ ...original, values: ['other.example'] }, target, subject)).toBeNull();
+  expect(appendSubjectToRule({ ...original, id: 'replacement' }, target, subject)).toBeNull();
+  expect(appendSubjectToRule(original, ruleAppendTargets([original], subject)[0], subject)).not.toBeNull();
+});

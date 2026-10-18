@@ -1,3 +1,5 @@
+import { acquireConfigSync } from '@/store/app-store';
+import { autoNodeSwitchFeedback } from '@/lib/auto-node-switch-feedback';
 /**
  * Polaris App 根组件。
  *
@@ -56,15 +58,8 @@ import {
 import { openTrackedSubscriptionCreateRecovery } from './store/subscription-create-recovery';
 
 /**
- * #17 内核基线警告的「每会话一次」闸门。**必须是模块级单例**——挂在组件内（useRef/state）会随
- * App 重挂（轻量模式返回 / window 重建）复位，等于没去重。同 上游的模块级
- * `let coreBaselineWarnedThisSession = false`。
- */
-const coreBaselineWarnGate = createOnceGate();
-
-/**
- * 「提权助手可升级」提示的每会话一次闸门。**必须是模块级单例**（同 `coreBaselineWarnGate` 的理由：
- * 挂在组件内的 `useRef`/`state` 会随 App 重挂 —— 轻量模式返回 / window 重建 —— 复位，等于没去重）。
+ * 「提权助手可升级」提示的每会话一次闸门。**必须是模块级单例**：挂在组件内的 `useRef`/`state`
+ * 会随 App 重挂 —— 轻量模式返回 / window 重建 —— 复位，等于没去重。
  *
  * 本腿尤其需要它：触发源有**两个**（后端事件 + 挂载回读），二者必然重叠，没有闸门就是同一件事
  * 弹两条 toast。
@@ -164,7 +159,7 @@ export function handleHelperUpgradeable(
 
 export default function App() {
   const { t, i18n } = useTranslation();
-  const loadConfig = useAppStore((s) => s.loadConfig);
+
   const refreshProxyStatus = useAppStore((s) => s.refreshProxyStatus);
   const servers = useAppStore((s) => s.servers);
   const config = useAppStore((s) => s.config);
@@ -263,11 +258,12 @@ export default function App() {
 
   // 首帧水合：config + 连接态各拉一次（事件只推增量，初值得自己取）。
   useEffect(() => {
-    void loadConfig();
+    const releaseConfig = acquireConfigSync({ scope: 'main' });
     void refreshProxyStatus();
     // R2 挂载首拉待应用差集（上游 4 触发点之「挂载」）：window 重建后 store 为空时水合操作条。
     pullPendingChanges();
-  }, [loadConfig, refreshProxyStatus]);
+    return releaseConfig;
+  }, [refreshProxyStatus]);
 
   // 隐私态首帧水合：`config_get_privacy_mode` 读的是 Rust 进程内 PRIVACY_MODE atomic（跨 renderer
   // reload 存活）。**必须自取初值**——若锁定期间 renderer 白屏 reload / 从托盘锁定后首次开主窗，
@@ -473,22 +469,6 @@ export default function App() {
     return off;
   }, []);
 
-  // 配置变更：任何写盘路径（config_save / config_set_value，见 commands/config.rs 的
-  // broadcast_config_changed）都会广播 → 重拉 config。这是「写后端 → UI 刷新」的兜底总线：
-  // 弹窗提交后各自 loadConfig(true) 是快路径，此处保证漏掉的、以及别的窗口写的，也能收敛。
-  //
-  // **必须 force**：非 force 会被在飞的 loadConfig 单飞合并——写 1 的回声启动 get；写 2 在其在飞期间
-  // 落盘，其回声被合并进写 1 那次 get；若该 get 携带的是写 2 之前的快照，store 就停在旧值，而写 2 的
-  // 回声已被消费掉、不会再有刷新 → 与磁盘持久分叉（表现：开关点了弹回、拖拽回跳一拍）。
-  // force 自带代际失效（invalidateLoadConfig），旧在飞载的回填会被丢弃。代价只是每次广播一次 get。
-  // 回调必须零参（不得读 payload——事件已无载荷）：Rust 侧 `commands/config.rs` 的
-  // `config_changed_payload_tests` 把本文件 include_str! 进测试判据锁住这条形态，改成读参数的
-  // 形态会让 `cargo test -p polaris` 转红。
-  useEffect(() => {
-    const off = api.config.onChanged(() => void loadConfig(true));
-    return off;
-  }, [loadConfig]);
-
   // 代理错误：分腿的**全部判定**在 `domain/proxy-error-routing.ts`（2026-09-06 从本文件整段迁出，
   // 迁出理由与「Android 上哪几条不可达」见该文件头注）—— 移动入口 `mobile/app-wiring.ts` 读的是
   // 同一份，这里只负责把事件接过去。逐码的处置理由也一并住在那边，本处不再复写一遍。
@@ -655,16 +635,12 @@ export default function App() {
     };
   }, []);
 
-  // 自动换节点（C3）：节点故障自动切换成功后后端 emit `event:autoNodeSwitched`（payload 含 newServerName/latency）。
-  // **emit 发射点由并行 proxy 批接线**（events.rs 已定义常量，发射随该批落地）——故此订阅非死通道，与 A3/A4 同型
-  // （契约先行、后端随批合璧，wave gate 验前后端合璧）。后端在本事件之前先发通用 configChanged
-  // signal，选中节点由上面的统一配置订阅重拉；这里仅①刷连接态 ②toast 告知已切到哪个节点，避免
-  // 同一事务连续发两次强制 config.get。Polaris toast 为单串（无 description）→ 只用
-  // home.autoSwitched（含 name/latency），舍 上游的补充 autoSwitchedDesc。
+  // Both confirmed failover and automatic selection use this event. ConfigChanged loads the
+  // saved exit separately; this listener refreshes connection state and reports the actual cause.
   useEffect(() => {
     const off = api.proxy.onAutoNodeSwitched((data) => {
       void refreshProxyStatus();
-      toast.success(t('home.autoSwitched', { name: data.newServerName, latency: data.latency }));
+      toast.success(autoNodeSwitchFeedback(data, t));
     });
     return off;
   }, [t, refreshProxyStatus]);
@@ -677,21 +653,6 @@ export default function App() {
     const off = api.proxy.onSystemProxyResidual(({ proxy }) =>
       toast.warning(t('proxy.systemProxyResidualDesc', { proxy }))
     );
-    return off;
-  }, [t]);
-
-  // #17 非官方核 ≤ 随包基线 → 兼容风险警告（对齐 上游 use-native-events.ts::handleCoreBaselineWarning）。
-  // **每会话一次**：启动期发射，若不去重则轻量模式返回/window 重建重挂 App 时会重复唠叨（同上方
-  // systemProxyResidual 的每会话一次模式）。去重闸门用模块级单例 `coreBaselineWarnGate`（见文件顶部），
-  // 等价于 上游的 `let coreBaselineWarnedThisSession`，但工厂形态可被单测锁死「第 2 次返 false」。
-  // 发射端由并行后端批补上（启动期检测非官方核 ≤ 随包基线时发，payload {current, bundled, kind}）。
-  // Polaris 的 toast.warning 是单串签名（无 sonner 的 options 对象）→ 标题与详情合成一条，
-  // 直接用带 {{current}}/{{bundled}} 插值的 coreBaselineWarnDesc（同 systemProxyResidualDesc 的用法）。
-  useEffect(() => {
-    const off = api.proxy.onCoreBaselineWarning(({ current, bundled }) => {
-      if (!coreBaselineWarnGate()) return;
-      toast.warning(t('settings.advanced.coreBaselineWarnDesc', { current, bundled }));
-    });
     return off;
   }, [t]);
 

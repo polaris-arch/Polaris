@@ -10,8 +10,10 @@ export function helperActionErrorText(
   switch (code) {
     case 'cancelled': return t('helper.actionError.cancelled');
     case 'authorizationUnavailable': return t('helper.actionError.authorizationUnavailable');
+    case 'partialCleanup': return t('helper.actionError.partialCleanup');
     case 'proxyRunning': return t('helper.actionError.proxyRunning');
     case 'unsupported': return t('helper.actionError.unsupported');
+    case 'bundleMismatch': return t('helper.actionError.bundleMismatch');
     case 'missingAsset': return t('helper.actionError.missingAsset');
     case 'notReady': return t('helper.actionError.notReady');
     default: return t('helper.actionError.failed');
@@ -30,6 +32,7 @@ export function backupErrorText(
     case 'readFailed': return t('backupImport.error.readFailed');
     case 'invalidFormat': return t('backupImport.error.invalidFormat');
     case 'invalidArgs': return t('backupImport.error.invalidArgs');
+    case 'sharedDependencyConflict': return t('backupImport.error.sharedDependencyConflict');
     case 'saveFailed': return t('backupImport.error.saveFailed');
     case 'meshRoutingRequiresTrustedRestore': return t('backupImport.error.meshRoutingRequiresTrustedRestore');
     case 'meshRoutingInvalidPolicy': return t('backupImport.error.meshRoutingInvalidPolicy');

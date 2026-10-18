@@ -181,7 +181,7 @@ export const CONNECTIONS_PARITY: ScreenParityRegister = {
         kind: 'ported',
         mobile: {
           file: 'ui/src/mobile/connections/MobileConnectionsScreen.tsx',
-          mustContain: "await api.rules.update(next, 'route');",
+          mustContain: "await api.rules.update(next, 'route', base);",
         },
       },
       note: '右键面板里的「合并进已有规则」。选择器（桌面 `RulePickDialog`）在移动端是一张底部面板，判据整层复用 `dialogs/rule-append.ts`（`ruleAppendTargets` / `sortAppendTargets` / `analyzeRuleCoverage` / `isShadowedTarget` / `appendSubjectToRule`）。锚取的是那条真的 IPC 追加调用，不是选择器的标题 —— 面板在、腿没了正是本仓栽过的形态。',
