@@ -45,7 +45,9 @@ const DNS_NAME: &str = "warm.mesh.polaris.invalid";
 static PORT_HANDOFF: Mutex<()> = Mutex::new(());
 
 fn port_handoff() -> std::sync::MutexGuard<'static, ()> {
-    PORT_HANDOFF.lock().unwrap_or_else(|error| error.into_inner())
+    PORT_HANDOFF
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
 }
 fn bind_tcp(address: impl std::net::ToSocketAddrs) -> std::io::Result<TcpListener> {
     let _guard = port_handoff();
@@ -712,7 +714,9 @@ fn run(core: &Path, config: &Path, temp: &TempDir, reservations: impl Sized) -> 
     // child's completed Start receipt, or after killing/reaping a failed child.
     // Unwrap outside the lock so ordinary startup failure does not poison it.
     handoff(reservations, || {
-        let child = command.spawn().map_err(|error| format!("spawn core: {error}"))?;
+        let child = command
+            .spawn()
+            .map_err(|error| format!("spawn core: {error}"))?;
         finish_startup(Running { child, log }, Duration::from_secs(10))
     })
     .unwrap_or_else(|error| panic!("mesh core startup failed: {error}"))
@@ -730,7 +734,9 @@ fn finish_startup(mut running: Running, timeout: Duration) -> Result<Running, St
             .try_wait()
             .map_err(|error| format!("inspect child startup: {error}; stderr={log}"))?;
         if let Some(status) = exited {
-            return Err(format!("core exited before startup: {status}; stderr={log}"));
+            return Err(format!(
+                "core exited before startup: {status}; stderr={log}"
+            ));
         }
         if log.lines().any(|line| line.contains("sing-box started (")) {
             return Ok(running);

@@ -491,7 +491,9 @@ def evidence(*, publish_env=False, slot=None):
                     require(total <= EVIDENCE_CONTENT_BYTES, 'selected original evidence exceeds 4GiB budget')
                     info = zipfile.ZipInfo(name)
                     info.create_system = 3
-                    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    # Preserve the link itself: macOS framework links may be 0755.
+                    # Synthesizing 0777 disagrees with the exact transport inventory.
+                    info.external_attr = (stat.S_IFLNK | stat.S_IMODE(path.lstat().st_mode)) << 16
                     package.writestr(info, raw_link)
                     rows[name] = {'originalPath': str(path), 'link': link}
                     continue

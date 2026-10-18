@@ -1005,6 +1005,52 @@ class AppleEntryTests(unittest.TestCase):
                 self.assertFalse(index['completeUnsignedChain'])
                 self.assertEqual(index['files'][member]['sha256'], __import__('hashlib').sha256(raw).hexdigest())
 
+    def test_original_framework_link_modes_match_transport_without_following_targets(self):
+        import stat
+        from contextlib import nullcontext
+        from apple_handoff import selected_row
+        for link_mode in (0o755, 0o777):
+            with self.subTest(link_mode=oct(link_mode)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                framework = root / 'component/Libbox.xcframework/ios-arm64/Libbox.framework'
+                version = framework / 'Versions/A'; version.mkdir(parents=True)
+                version.chmod(0o750)
+                target = version / 'Libbox'; target.write_bytes(b'original framework binary')
+                target.chmod(0o640)
+                link = framework / 'Libbox'; link.symlink_to('Versions/A/Libbox')
+                directory_link = framework / 'Current'; directory_link.symlink_to('Versions/A')
+                real_lstat = Path.lstat
+
+                def source_lstat(path):
+                    observed = real_lstat(path)
+                    if path in (link, directory_link):
+                        # Linux links cannot be chmod'ed; model actual Darwin lstat
+                        # while retaining real links, targets, and archive I/O.
+                        fields = list(observed); fields[0] = stat.S_IFLNK | link_mode
+                        return os.stat_result(fields)
+                    return observed
+
+                with mock.patch.object(Path, 'lstat', source_lstat), \
+                        mock.patch.object(ci_apple, 'location', return_value=root), \
+                        mock.patch.object(ci_apple, 'lease', side_effect=lambda *args, **kwargs: nullcontext()), \
+                        mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}, clear=True), \
+                        mock.patch('builtins.print'):
+                    transported = {path: selected_row(path, root) for path in (link, directory_link, target, version)}
+                    ci_apple.evidence()
+                with zipfile.ZipFile(root / 'apple-original-evidence.zip') as archive:
+                    for path in (link, directory_link):
+                        name = path.relative_to(root).as_posix()
+                        info = archive.getinfo(name)
+                        self.assertEqual(info.create_system, 3)
+                        self.assertEqual(info.external_attr >> 16, stat.S_IFLNK | transported[path]['mode'])
+                        self.assertEqual(archive.read(name), os.readlink(path).encode())
+                    info = archive.getinfo(target.relative_to(root).as_posix())
+                    self.assertEqual(info.external_attr >> 16, stat.S_IFREG | transported[target]['mode'])
+                    self.assertEqual(archive.read(info), target.read_bytes())
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+                self.assertEqual(stat.S_IMODE(version.stat().st_mode), transported[version]['mode'])
+                self.assertEqual(transported[version]['mode'], 0o750)
+
     def test_unreadable_component_receipt_does_not_block_original_evidence_packaging(self):
         from contextlib import contextmanager
         @contextmanager
