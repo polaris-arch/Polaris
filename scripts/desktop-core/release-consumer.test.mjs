@@ -555,7 +555,7 @@ for (const ref of ['refs/heads/collab/s5-android-signal-20261010', 'refs/heads/c
   const workflow = readFileSync(join(repo, '.github/workflows/package.yml'), 'utf8');
   const body = workflow.match(/      - name: Resolve platform matrix[\s\S]*?        run: \|\n([\s\S]*?)          # 全量矩阵/)[1];
   const bash = body.split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n');
-  const setupEnv = { ...process.env, ...env, POLARIS_NO_KERNEL_RUN: '0', CORE_CANDIDATE: candidate,
+  const setupEnv = { ...process.env, ...env, SYSTEM_CANDIDATE: '', POLARIS_NO_KERNEL_RUN: '0', CORE_CANDIDATE: candidate,
     EXPECTED_CANDIDATE: candidate, PLATFORMS_JSON: '["linux","windows"]',
     CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-900-1`, CORE_RUN_ID: '900', CORE_RUN_ATTEMPT: '1',
     VALIDATION_KERNEL: 'true', VALIDATION_UPLOAD: 'true', VALIDATION_LIGHT: 'false', VALIDATION_SKIP_QUALITY: 'true' };
@@ -1437,5 +1437,74 @@ test('NA02 unchanged bytes reject setuid/setgid/sticky on final core, sidecar an
       assert.deepEqual(readFileSync(path), before);
       assert.throws(() => verifyPackagedRelease(f.root, f.manifest, 'linux', join(carrier, 'sing-box'), f.run), /permissions/);
     });
+  }
+});
+
+// Execute the existing source-proof call site with an injected child process.
+// No archive, native core, network, or full release fixture is executed here.
+function sourceProofCallFixture() {
+  const source = readFileSync(new URL('./release-consumer.mjs', import.meta.url), 'utf8');
+  const entry = source.indexOf('export function verifyPackagedRelease(');
+  const start = source.indexOf('  if (isUpstreamRelease(contract)) {', entry);
+  const end = source.indexOf('\n  return receipt;', start);
+  assert.ok(entry >= 0 && start > entry && end > start);
+  const timeout = Number(source.match(/const LOCAL_ARCHIVE_TIMEOUT_MS = ([0-9_]+);/)[1].replaceAll('_', ''));
+  assert.equal(timeout, 120_000);
+  const invoke = new Function('isUpstreamRelease', 'run', 'contract', 'row', 'snapshot', 'core', 'key',
+    'join', 'dirname', 'fileURLToPath', 'moduleURL', 'LOCAL_ARCHIVE_TIMEOUT_MS', 'performance',
+    source.slice(start, end).replaceAll('import.meta.url', 'moduleURL'));
+  const contract = { sourceArchive: { name: 'inert-source.tar.gz', bytes: 7, sha256: 'a'.repeat(64) },
+    sourceCommit: 'b'.repeat(40), sourceTree: 'c'.repeat(40),
+    legalFiles: [{ path: 'licenses/LICENSE', content: 'never_log_source_proof_input' }], sourcePolicy: { fixture: true } };
+  const row = { sourceIdentity: { fixture: true }, buildGraph: { localReplacements: [{ fixture: true }] } };
+  const snapshot = { sourceGitlinks: [{ path: 'inert', sha: 'd'.repeat(40) }] };
+  return { contract, row, snapshot, run(key, child, upstream = true) {
+    const ticks = [1000, 121499];
+    return invoke(() => upstream, child, contract, row, snapshot, join('inert', key, 'sing-box'), key,
+      join, dirname, fileURLToPath, new URL('./release-consumer.mjs', import.meta.url).href, timeout,
+      { now: () => ticks.shift() });
+  } };
+}
+
+test('source archive reproof preserves complete inputs and its existing 120-second budget', () => {
+  const f = sourceProofCallFixture();
+  for (const key of Object.keys(RELEASE_TARGETS)) {
+    let calls = 0;
+    f.run(key, (command, args, options) => {
+      calls++;
+      assert.equal(command, PYTHON);
+      assert.deepEqual(args, ['-B', fileURLToPath(new URL('./release-archive.py', import.meta.url)),
+        join('inert', key, 'core-release/source', f.contract.sourceArchive.name)]);
+      assert.deepEqual(options, { input: JSON.stringify({ sourceArchive: f.contract.sourceArchive,
+        sourceCommit: f.contract.sourceCommit, sourceTree: f.contract.sourceTree,
+        sourceGitlinks: f.snapshot.sourceGitlinks, legalFiles: f.contract.legalFiles,
+        sourceIdentity: f.row.sourceIdentity, buildReplacements: f.row.buildGraph.localReplacements,
+        sourcePolicy: f.contract.sourcePolicy }), encoding: 'utf8', maxBuffer: 1024 * 1024,
+        timeout: 120_000, killSignal: 'SIGKILL' });
+      return '';
+    });
+    assert.equal(calls, 1);
+  }
+  f.run('linux', () => assert.fail('Historical release must not enter upstream proof'), false);
+});
+
+test('source archive reproof failures identify platform, archive, stage and elapsed time without retries', () => {
+  const f = sourceProofCallFixture();
+  for (const key of Object.keys(RELEASE_TARGETS)) {
+    for (const failure of [Object.assign(new Error('spawnSync python3 ETIMEDOUT'), { code: 'ETIMEDOUT', status: null, signal: 'SIGKILL' }),
+      Object.assign(new Error('source tree differs'), { status: 7, signal: null }),
+      Object.assign(new Error('spawnSync python3 ENOBUFS'), { code: 'ENOBUFS' }), new Error('source proof rejected')]) {
+      let calls = 0;
+      assert.throws(() => f.run(key, () => { calls++; throw failure; }), error => {
+        assert.equal(error.cause, failure);
+        for (const field of [`platform=${key}`, 'archive=inert-source.tar.gz', 'stage=source-archive-reproof',
+          'elapsedMs=120499', 'timeoutMs=120000', `code=${failure.code ?? 'unknown'}`,
+          `status=${failure.status ?? 'unknown'}`, `signal=${failure.signal ?? 'unknown'}`, failure.message])
+          assert.ok(error.message.includes(field), field);
+        assert.doesNotMatch(error.message, /never_log_source_proof_input/);
+        return true;
+      });
+      assert.equal(calls, 1);
+    }
   }
 });

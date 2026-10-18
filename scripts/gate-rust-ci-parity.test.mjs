@@ -124,7 +124,8 @@ const GATES = [
 function loadStripped() {
   const ciRaw = readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8');
   const shRaw = readFileSync(join(ROOT, 'scripts/gate-rust.sh'), 'utf8');
-  return { ci: stripComments(ciRaw), sh: stripComments(shRaw) };
+  const controlledRaw = readFileSync(join(ROOT, 'scripts/run-native-dns-controlled-tests.mjs'), 'utf8');
+  return { ci: stripComments(ciRaw), sh: stripComments(shRaw), controlled: controlledRaw };
 }
 
 /** ci.yml 里那条 Android 影响面完备性步骤的名字（本文件多处引用，抠成常量免得写歪一处不自知）。 */
@@ -161,7 +162,7 @@ const MIRRORED_BUT_NOT_VERBATIM = [
   CANDIDATE_RUNTIME_STEP,
 ];
 
-function assertCandidateOnlySteps(ci) {
+function assertCandidateOnlySteps(ci, controlled) {
   const build = extractCiStepBlock(ci, CANDIDATE_BUILD_STEP);
   const runtime = extractCiStepBlock(ci, CANDIDATE_RUNTIME_STEP);
   for (const block of [build, runtime]) {
@@ -179,28 +180,37 @@ function assertCandidateOnlySteps(ci) {
   assert.ok(build.includes('export POLARIS_BUILD_ID="$CORE_CANDIDATE"'));
   assert.ok(build.indexOf('export POLARIS_BUILD_ID=') < build.indexOf('cargo build --locked'));
   assert.ok(build.indexOf('cargo build --locked') < build.indexOf('node scripts/prepare-core-identity.mjs'));
-  assert.deepEqual(commands(runtime), [
-    'cargo test --locked -p polaris --lib "$test" -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee "$log"',
-  ]);
+  assert.deepEqual(commands(runtime), []);
+  assert.ok(runtime.includes('node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"'));
   assert.match(runtime, /node --test scripts\/native-dns-ci-routing\.test\.mjs/);
-  assert.match(runtime, /test result: ok\. 1 passed; 0 failed; 0 ignored;/);
+  assert.match(runtime, /scripts\/run-native-dns-controlled-tests\.test\.mjs/);
+  assert.ok(controlled.includes("args: ['test', '--locked', '-p', 'polaris', '--lib', '--no-run', '--message-format=json']"));
+  assert.equal((controlled.match(/'--no-run'/g) ?? []).length, 1);
+  assert.ok(controlled.includes("args: [name, '--exact', '--ignored', '--nocapture', '--test-threads=1']"));
+  assert.match(controlled, /summaries\.length === 1/);
+  assert.match(controlled, /test result: ok\. 1 passed; 0 failed; 0 ignored;/);
   assert.match(runtime, /!cancelled\(\)/);
   assert.match(runtime, /steps\.workspace_build\.outcome == 'success'/);
 }
 
 test('the two candidate-only Cargo steps retain exact commands, admitted scope and failure checks', () => {
-  assertCandidateOnlySteps(loadStripped().ci);
+  const { ci, controlled } = loadStripped();
+  assertCandidateOnlySteps(ci, controlled);
 });
-for (const [name, before, after] of [
-  ['candidate admission removed', "needs.cheap_format.outputs.native_dns_candidate != ''", 'true'],
-  ['helper build selector weakened', 'cargo build --locked -p polaris-helper --bin polaris-helper', 'cargo build -p polaris-helper'],
-  ['cleaner selector changed', 'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner', 'cargo build --locked -p polaris-helper --bin polaris-helper'],
-  ['ignored tests broadened', '--lib "$test" -- --exact --ignored', '--lib -- --ignored'],
-  ['zero-test evidence accepted', 'test result: ok. 1 passed; 0 failed; 0 ignored;', 'test result: ok.'],
+for (const [name, source, before, after] of [
+  ['candidate admission removed', 'ci', "needs.cheap_format.outputs.native_dns_candidate != ''", 'true'],
+  ['helper build selector weakened', 'ci', 'cargo build --locked -p polaris-helper --bin polaris-helper', 'cargo build -p polaris-helper'],
+  ['cleaner selector changed', 'ci', 'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner', 'cargo build --locked -p polaris-helper --bin polaris-helper'],
+  ['controlled runner disconnected', 'ci', 'node scripts/run-native-dns-controlled-tests.mjs', 'node scripts/other.mjs'],
+  ['controlled build selector weakened', 'controlled', "'--lib', '--no-run'", "'--no-run'"],
+  ['ignored tests broadened', 'controlled', "name, '--exact', '--ignored'", "name, '--ignored'"],
+  ['zero-test evidence accepted', 'controlled', 'test result: ok. 1 passed; 0 failed; 0 ignored;', 'test result: ok.'],
+  ['duplicated verdict accepted', 'controlled', 'summaries.length === 1', 'summaries.length >= 1'],
 ]) test(`candidate-only Cargo registration rejects ${name}`, () => {
-  const { ci } = loadStripped();
-  assert.ok(ci.includes(before));
-  assert.throws(() => assertCandidateOnlySteps(ci.replaceAll(before, after)), { name: 'AssertionError' });
+  const fixture = loadStripped();
+  assert.ok(fixture[source].includes(before));
+  fixture[source] = fixture[source].replaceAll(before, after);
+  assert.throws(() => assertCandidateOnlySteps(fixture.ci, fixture.controlled), { name: 'AssertionError' });
 });
 
 /**
@@ -385,7 +395,10 @@ test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字�
       if (sub === 'install') return false;
       return true;
     });
-    if (isGate) cargoSteps.push(m[1]);
+    // The controlled step delegates its single Cargo build to this exact runner;
+    // assertCandidateOnlySteps above pins both the call and the runner's selectors.
+    const delegatedGate = body.includes('node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"');
+    if (isGate || delegatedGate) cargoSteps.push(m[1]);
   }
   assert.ok(cargoSteps.length > 0, '一个跑 cargo 的步骤都没抠到 —— 取材面是空的，本断言恒真');
 

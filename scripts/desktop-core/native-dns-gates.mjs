@@ -74,6 +74,8 @@ export function formalGateContext(root, env = process.env, run = execFileSync) {
     kernelSourceCommit: contract.sourceCommit, kernelSourceTree: contract.sourceTree,
     releaseId: contract.releaseId, tag: contract.tag, tagObject: contract.tagObject };
 }
+// All four carriers are inputs to host gates. --platform selects the native
+// run/finalize plan, not a subset of this before/after payload proof.
 export function verifyFormalGatePayloads(root, env = process.env) {
   const context = formalGateContext(root, env);
   const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json')));
@@ -248,7 +250,7 @@ export function summaryFor(key, env, plan, results = [], failure = null) {
 async function main() {
   const [mode, platformArg, ...extra] = process.argv.slice(2);
   requireGate(['run', 'finalize', 'verify-formal'].includes(mode) && platformArg?.startsWith('--platform=') && extra.length === 0,
-    'Usage: native-dns-gates.mjs run|finalize|verify-formal --platform=linux|win|mac-x64|mac-arm64');
+    'Usage: native-dns-gates.mjs run|finalize|verify-formal --platform=linux|win|mac-x64|mac-arm64 (verify-formal checks all four payloads; --platform selects run/finalize host gates)');
   const key = platformArg.slice('--platform='.length), root = process.cwd(), target = TARGETS[key];
   requireGate(target, `Unsupported native platform: ${key}`);
   if (mode === 'verify-formal') { console.log(JSON.stringify(verifyFormalGatePayloads(root))); return; }

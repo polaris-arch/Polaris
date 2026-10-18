@@ -943,12 +943,22 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
     demand(((lstatSync(original).mode | lstatSync(final).mode) & 0o7000) === 0
       && (lstatSync(original).mode & 0o7777) === (lstatSync(final).mode & 0o7777), 'Final release notice permissions differ');
   }
-  if (isUpstreamRelease(contract)) run(process.platform === 'win32' ? 'python' : 'python3',
-    ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), join(dirname(core), 'core-release/source', contract.sourceArchive.name)],
-    { input: JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
-      sourceTree: contract.sourceTree, sourceGitlinks: snapshot.sourceGitlinks, legalFiles: contract.legalFiles, sourceIdentity: row.sourceIdentity,
-      buildReplacements: row.buildGraph.localReplacements, ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }),
-      encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: LOCAL_ARCHIVE_TIMEOUT_MS, killSignal: 'SIGKILL' });
+  if (isUpstreamRelease(contract)) {
+    const started = performance.now();
+    try {
+      run(process.platform === 'win32' ? 'python' : 'python3',
+        ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), join(dirname(core), 'core-release/source', contract.sourceArchive.name)],
+        { input: JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
+          sourceTree: contract.sourceTree, sourceGitlinks: snapshot.sourceGitlinks, legalFiles: contract.legalFiles, sourceIdentity: row.sourceIdentity,
+          buildReplacements: row.buildGraph.localReplacements, ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }),
+          encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: LOCAL_ARCHIVE_TIMEOUT_MS, killSignal: 'SIGKILL' });
+    } catch (error) {
+      // Identify the exact local proof that failed without logging its input,
+      // changing the verification budget, retrying, or accepting older evidence.
+      const elapsedMs = Math.round(performance.now() - started);
+      throw new Error(`Release proof failed (platform=${key}; archive=${contract.sourceArchive.name}; stage=source-archive-reproof; elapsedMs=${elapsedMs}; timeoutMs=${LOCAL_ARCHIVE_TIMEOUT_MS}; code=${error?.code ?? 'unknown'}; status=${error?.status ?? 'unknown'}; signal=${error?.signal ?? 'unknown'}): ${error?.message ?? error}`, { cause: error });
+    }
+  }
   return receipt;
 }
 

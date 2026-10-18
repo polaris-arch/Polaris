@@ -31,7 +31,10 @@ test('only this invocation’s exact package/library test artifact is selectable
 });
 
 test('Cargo library paths retain native outputs, sysroot and inherited lookup without outside build-script paths', () => {
-  const root = process.cwd(), target = join(root, 'target');
+  // Exercise each environment-key/delimiter policy with synthetic rooted paths.
+  // A Windows cwd contains a drive colon, which cannot be split as a POSIX list.
+  // Real host paths (including Windows drive letters) are checked separately below.
+  const target = join('/', 'controlled-fixture', 'target');
   const lib = join(target, 'debug/build/native/out'), exe = join(target, 'debug/deps/test');
   const messages = [{ reason: 'build-script-executed', linked_paths: [`native=${lib}`, 'native=/outside'] }];
   for (const [platform, key, sep] of [['linux', 'LD_LIBRARY_PATH', ':'], ['darwin', 'DYLD_FALLBACK_LIBRARY_PATH', ':'], ['win32', 'PATH', ';']]) {
@@ -40,6 +43,20 @@ test('Cargo library paths retain native outputs, sysroot and inherited lookup wi
     assert.ok(paths.includes(lib)); assert.ok(paths.includes('/rust/sysroot')); assert.ok(paths.includes('/existing'));
     assert.ok(!paths.includes('/outside')); assert.equal(env.FROZEN, 'yes');
   }
+});
+
+test('the actual host preserves its native Cargo paths and inherited search entries', () => {
+  const target = join(process.cwd(), 'target');
+  const lib = join(target, 'debug/build/native/out'), exe = join(target, 'debug/deps/test');
+  const sysroot = join(process.cwd(), 'toolchain/lib');
+  const inherited = join(process.cwd(), 'existing libraries');
+  const key = process.platform === 'win32' ? 'PATH' : process.platform === 'darwin' ? 'DYLD_FALLBACK_LIBRARY_PATH' : 'LD_LIBRARY_PATH';
+  const oldKey = process.platform === 'win32' ? 'Path' : key;
+  const env = runtimeEnvironment([{ reason: 'build-script-executed', linked_paths: [`native=${lib}`] }],
+    target, exe, sysroot, { [oldKey]: inherited });
+  const paths = env[key].split(process.platform === 'win32' ? ';' : ':');
+  for (const expected of [lib, sysroot, inherited]) assert.ok(paths.includes(expected));
+  if (oldKey !== key) assert.equal(Object.hasOwn(env, oldKey), false);
 });
 
 test('exact one-test verdict rejects zero, ignored, failed, duplicated and interrupted results', () => {

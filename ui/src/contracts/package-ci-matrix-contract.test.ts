@@ -264,18 +264,23 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
 
     // The cheap formatter is a required predecessor, never a best-effort probe.
     // It runs for every normal gate event, including non-Linux dispatches.
-    // Only the explicit manual launcher diagnosis selects a separate non-acceptance job.
+    // Only launcher diagnosis without a SYSTEM request selects a separate job.
+    // A conflicting SYSTEM request must reach admission and fail, never skip it.
     const requireCheapFormat = (block: string) => {
       expect(block).not.toMatch(/^ {4}(?:needs|continue-on-error):/m);
       const conditions = [...block.matchAll(/^ {4}if: \$\{\{ (.*) \}\}$/gm)];
       expect(block.match(/^ {4}if:/gm) ?? []).toHaveLength(1);
       expect(conditions).toHaveLength(1);
-      expect(conditions[0][1]).toBe("github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true");
+      expect(conditions[0][1]).toBe("github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != ''");
       for (const event of ['pull_request', 'push', 'merge_group', 'workflow_call', 'workflow_dispatch']) {
         for (const selected of [undefined, false, true]) {
-          expect(runInNewContext(conditions[0][1], {
-            github: { event_name: event }, inputs: { windows_launcher_diagnostics: selected },
-          })).toBe(event !== 'workflow_dispatch' || selected !== true);
+          for (const candidate of [undefined, '', 'a'.repeat(40), 'malformed']) {
+            expect(runInNewContext(conditions[0][1], {
+              github: { event_name: event }, inputs: {
+                windows_launcher_diagnostics: selected, windows_system_candidate: candidate,
+              },
+            })).toBe(event !== 'workflow_dispatch' || selected !== true || !!candidate);
+          }
         }
       }
       expect(block).not.toMatch(/^ {8}(?:if|continue-on-error):/m);
@@ -380,14 +385,20 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       const source = workflow(name);
       const direct = workflowConcurrency(source, name);
       const called = workflowConcurrency(source, 'Package');
-      expect(direct.cancels).toBe(true);
-      expect(called.cancels).toBe(true);
+      expect(direct.cancels).toBe(false);
+      expect(called.cancels).toBe(false);
       expect(direct.group).not.toBe(called.group);
-      expect(called.group).toBe(workflowConcurrency(source, 'Package', undefined, undefined, false, 2).group);
+      expect(called.group).not.toBe(workflowConcurrency(source, 'Package', undefined, undefined, false, 2).group);
       const fixed = workflowConcurrency(source, 'Package', undefined, undefined, true, 1);
       expect(fixed.cancels).toBe(false);
-      expect(fixed.group).not.toBe(called.group);
+      expect(fixed.group).toBe(called.group);
       expect(fixed.group).not.toBe(workflowConcurrency(source, 'Package', undefined, undefined, true, 2).group);
+      for (const event of ['push', 'pull_request']) {
+        const automatic = workflowConcurrency(source, 'Package', event);
+        expect(automatic.cancels).toBe(true);
+        expect(automatic.group).toBe(workflowConcurrency(source, 'Package', event, undefined, false, 2).group);
+        expect(automatic.group).not.toBe(workflowConcurrency(source, name, event).group);
+      }
     }
   });
 
@@ -478,6 +489,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(resolve).toContain('CORE_CANDIDATE: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}');
     expect(resolve).toContain('CORE_RUN_ID: ${{ github.run_id }}');
     expect(resolve).toContain('CORE_RUN_ATTEMPT: ${{ github.run_attempt }}');
+    expect(resolve).toContain("SYSTEM_CANDIDATE: ${{ inputs.windows_system_candidate || '' }}");
     expect(resolve).toContain("POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}");
     const runAt = resolve.indexOf('\n        run: |\n');
     const matrixAt = resolve.indexOf('\n          all=', runAt);
@@ -491,7 +503,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       CORE_CANDIDATE: candidate, EXPECTED_CANDIDATE: candidate,
       CORE_RUN_ID: '12', CORE_RUN_ATTEMPT: '3',
       CORE_BUNDLE_ARTIFACT: `desktop-core-bundle-${candidate}-12-3`,
-      POLARIS_NATIVE_PAYLOAD_VALIDATION: '0',
+      POLARIS_NATIVE_PAYLOAD_VALIDATION: '0', SYSTEM_CANDIDATE: '',
     };
     const cases: [string, Record<string, string>, number][] = [
       ['exact reuse', {}, 0], ['standalone producer', { CORE_BUNDLE_ARTIFACT: '' }, 0],
@@ -502,6 +514,28 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     ];
     for (const [name, changed, status] of cases) {
       const result = spawnSync('bash', ['-c', script], { env: { ...process.env, ...base, ...changed }, encoding: 'utf8' });
+      expect(result.status, `${name}: ${result.stderr}`).toBe(status);
+    }
+    const system = {
+      ...base, SYSTEM_CANDIDATE: candidate, GITHUB_SHA: candidate,
+      GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
+      GITHUB_REF: 'refs/heads/ci/governance', PLATFORM: 'all', PLATFORMS_JSON: '',
+      VALIDATION_SKIP_QUALITY: 'false',
+    };
+    const systemCases: [string, Record<string, string>, number][] = [
+      ['SYSTEM exact candidate', {}, 0], ['SYSTEM main', { GITHUB_REF: 'refs/heads/main' }, 0],
+      ['SYSTEM wrong SHA', { SYSTEM_CANDIDATE: 'b'.repeat(40) }, 1],
+      ['SYSTEM malformed SHA', { SYSTEM_CANDIDATE: 'not-a-commit' }, 1],
+      ['SYSTEM push', { GITHUB_EVENT_NAME: 'push' }, 1],
+      ['SYSTEM other repository', { GITHUB_REPOSITORY: 'other/repo' }, 1],
+      ['SYSTEM other branch', { GITHUB_REF: 'refs/heads/other' }, 1],
+      ['SYSTEM tag', { GITHUB_REF: 'refs/tags/v1.0.0' }, 1],
+      ['SYSTEM narrowed platform', { PLATFORM: 'windows' }, 1],
+      ['SYSTEM custom matrix', { PLATFORMS_JSON: '["windows"]' }, 1],
+      ['SYSTEM skipped quality gates', { VALIDATION_SKIP_QUALITY: 'true' }, 1],
+    ];
+    for (const [name, changed, status] of systemCases) {
+      const result = spawnSync('bash', ['-c', script], { env: { ...process.env, ...system, ...changed }, encoding: 'utf8' });
       expect(result.status, `${name}: ${result.stderr}`).toBe(status);
     }
     const ref = 'refs/heads/collab/fk02-native-payload-validation-20261010';
@@ -657,9 +691,9 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       caller = 'Package', ref = 'refs/heads/collab/contract', preserve = false, runId = 1,
       event = 'workflow_dispatch') => workflowConcurrency(packageSource, caller, event, ref, preserve, runId, selection);
     const tip = packageGroup();
-    expect(tip.group).toBe('package-Package-refs/heads/collab/contract-all');
-    expect(tip.cancels).toBe(true);
-    expect(tip.group).toBe(packageGroup({}, 'Package', undefined, false, 2).group);
+    expect(tip.group).toBe('package-Package-refs/heads/collab/contract-all-fixed-1');
+    expect(tip.cancels).toBe(false);
+    expect(tip.group).not.toBe(packageGroup({}, 'Package', undefined, false, 2).group);
     expect(tip.group).not.toBe(packageGroup({}, 'Release Risk').group);
     expect(tip.group).not.toBe(packageGroup({}, 'Package', 'refs/heads/collab/other').group);
     expect(packageGroup({ platform: 'linux' }).group).not.toBe(packageGroup({ platform: 'windows' }).group);
@@ -670,7 +704,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       .toBe('package-Release Risk-7-all');
     const fixed = packageGroup({}, 'Package', undefined, true);
     expect(fixed.cancels).toBe(false);
-    expect(fixed.group).not.toBe(tip.group);
+    expect(fixed.group).toBe(tip.group);
     expect(fixed.group).not.toBe(packageGroup({}, 'Package', undefined, true, 2).group);
     const inherited = packageGroup({ eventPreserveRun: true }, 'Release Risk');
     expect(inherited.cancels).toBe(false);

@@ -261,7 +261,7 @@ esac
   });
 
   it('并发组：同一 PR / 分支上新提交取消旧运行，merge queue 不取消，且被取消的腿里没有写 release 的任务', () => {
-    // 普通 tip 可替代；固定审计与 merge queue 独立、tag 不取消。求实际表达式语义。
+    // 自动 tip 可替代；手动、固定审计与 merge queue 独立、tag 不取消。求实际表达式语义。
     const match = risk.match(
       /^concurrency:\n  group: (.+)\n  cancel-in-progress: \$\{\{ (.+) \}\}\n/m,
     );
@@ -282,7 +282,7 @@ esac
         String(runInNewContext(expression, context(eventName, ref, preserve, runId))));
     expect(cancels('pull_request', 'refs/pull/7/merge')).toBe(true);
     expect(cancels('push', 'refs/heads/main')).toBe(true);
-    expect(cancels('workflow_dispatch', 'refs/heads/ci/shorten-pipelines')).toBe(true);
+    expect(cancels('workflow_dispatch', 'refs/heads/ci/shorten-pipelines')).toBe(false);
     // 队列里的每一组都必须跑完才能出结论。
     expect(cancels('merge_group', 'refs/heads/gh-readonly-queue/main/pr-7')).toBe(false);
     expect(cancels('workflow_dispatch', 'refs/heads/collab/audit', true)).toBe(false);
@@ -291,7 +291,9 @@ esac
     expect(group('push', 'refs/heads/main')).toBe(group('push', 'refs/heads/main', false, 2));
     expect(group('workflow_dispatch', 'refs/heads/collab/audit', true)).not.toBe(
       group('workflow_dispatch', 'refs/heads/collab/audit', true, 2));
-    expect(group('workflow_dispatch', 'refs/heads/collab/audit', true)).not.toBe(
+    expect(group('workflow_dispatch', 'refs/heads/collab/audit')).not.toBe(
+      group('workflow_dispatch', 'refs/heads/collab/audit', false, 2));
+    expect(group('workflow_dispatch', 'refs/heads/collab/audit', true)).toBe(
       group('workflow_dispatch', 'refs/heads/collab/audit'));
     expect(group('merge_group', 'refs/heads/queue')).not.toBe(group('merge_group', 'refs/heads/queue', false, 2));
     expect(group('push', 'refs/tags/v1.0.0')).not.toBe(group('push', 'refs/tags/v2.0.0'));
