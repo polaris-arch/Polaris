@@ -480,26 +480,30 @@ def carrier_summary(root, slot):
                 'original summary bytes changed during export')
 
 
-def aggregate(folder, output, *, scope):
+def validate_aggregate(folder, *, scope, expected_context, expected_producer, expected_app, expected_source_contract):
+    """Pure historical-or-current evidence check; never rewrites producer identity.
+
+    The current-run entry below supplies current identities. A separate merge
+    verifier must prove eligibility before supplying historical expectations.
+    """
     require(isinstance(scope, str) and scope in SCOPES, 'explicit aggregate scope required')
     slots = required_slots(scope)
     folder = Path(folder)
     require({p.name for p in folder.iterdir()} == {'component', *slots},
             'aggregate requires exactly component and declared carrier slots')
     rows = {}
-    from consume import app_identity
-    current_app = app_identity()
+    current_app = expected_app
     compiler_identity = None
     transport = read_receipt(folder / 'component' / 'component-transport.json')
     manifest_path = folder / 'component' / 'component-handoff.json'
     require(transport.get('schema') == 'polaris-apple-handoff-transport-v1' and
-            transport['context'] == context() and file_pin(manifest_path) == transport['manifest'] and
+            transport['context'] == expected_context and file_pin(manifest_path) == transport['manifest'] and
             transport['fingerprint'] == receipt_digest({k: v for k, v in transport.items() if k != 'fingerprint'}),
             'aggregate component run differs')
     manifest = read_receipt(manifest_path)
     scoped = validate_scope_record(manifest, 'component-handoff', scope)
-    require(manifest['App'] == producer_code() and manifest['sourceContract'] == load() and
-            manifest['context'] == context() and manifest['producerJob'] == 'component' and
+    require(manifest['App'] == expected_producer and manifest['sourceContract'] == expected_source_contract and
+            manifest['context'] == expected_context and manifest['producerJob'] == 'component' and
             manifest['fingerprint'] == receipt_digest({k: v for k, v in manifest.items() if k != 'fingerprint'}),
             'aggregate original component/source differs')
     for slot in slots:
@@ -507,7 +511,7 @@ def aggregate(folder, output, *, scope):
         require(validate_scope_record(row, 'carrier-handoff', scope) == scoped,
                 'aggregate mixed legacy/scoped wrappers')
         require(row['slot'] == slot and
-                row['context'] == context() and row['componentTransport'] == transport and
+                row['context'] == expected_context and row['componentTransport'] == transport and
                 row.get('devicePassed') is False and row.get('signatureTrustValidated') is False and
                 row.get('publicationEligible') is False and
                 row['fingerprint'] == receipt_digest({k: v for k, v in row.items() if k != 'fingerprint'}),
@@ -532,7 +536,7 @@ def aggregate(folder, output, *, scope):
         require(receipt.get('schema') == 'polaris-mobile-apple-carrier-v1' and
                 receipt['fingerprint'] == receipt_digest({k: v for k, v in receipt.items() if k != 'fingerprint'}) and
                 receipt['App'] == current_app and
-                receipt['producerCandidate'] == context()['candidate'] and
+                receipt['producerCandidate'] == expected_context['candidate'] and
                 receipt['componentFingerprint'] == manifest['componentFingerprint'] and
                 receipt['selectedTarget'] == {'device-arm64': 'ios-arm64', 'sim-arm64': 'ios-arm64-simulator'}[slot] and
                 receipt.get('AppCarrierValidated') is True and receipt.get('AppAccepted') is False and
@@ -540,11 +544,20 @@ def aggregate(folder, output, *, scope):
                 'aggregate actual carrier identity/scope differs')
         rows[slot] = row
     require({p.name for p in folder.iterdir()} == {'component', *slots}, 'aggregate contains extra slot')
-    facts = {'schema': 'polaris-apple-unsigned-chain-v3' if scoped else 'polaris-apple-unsigned-chain-v2', 'context': context(), 'App': producer_code(),
+    facts = {'schema': 'polaris-apple-unsigned-chain-v3' if scoped else 'polaris-apple-unsigned-chain-v2', 'context': expected_context, 'App': expected_producer,
              'componentTransport': transport, 'carriers': rows, 'completeSlots': list(slots),
              'devicePassed': False, 'signatureTrustValidated': False, 'publicationEligible': False}
     if scoped:
         facts.update(scope_fields(scope), validatedSlots=list(slots),
                      notRequestedSlots=[slot for slot in SLOTS if slot not in slots])
     facts['fingerprint'] = receipt_digest(facts)
+    return facts
+
+
+def aggregate(folder, output, *, scope):
+    require(isinstance(scope, str) and scope in SCOPES, 'explicit aggregate scope required')
+    from consume import app_identity
+    facts = validate_aggregate(folder, scope=scope, expected_context=context(),
+                               expected_producer=producer_code(), expected_app=app_identity(),
+                               expected_source_contract=load())
     write_json(output, facts)

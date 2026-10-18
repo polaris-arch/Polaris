@@ -8,7 +8,9 @@ from fork_input import require
 from artifacts import file_pin, module, tree_inventory, read_pinned
 
 
-def source_table(files):
+def source_table(files, *, reader=None):
+    """Build origin facts from local originals or a bounded archive reader."""
+    reader = read_pinned if reader is None else reader
     require(0 < len(files) <= 65536, 'native source file count budget')
     helper = module('origin_buildinfo', 'scripts/libbox-patches/android-source.py')
     carrier = module('origin_container', 'scripts/apple-carrier.py')
@@ -25,7 +27,7 @@ def source_table(files):
             append(pin['sha256'], {'kind': pin['kind'], 'path': path, 'sha256': pin['sha256']})
         else:
             require(pin['kind'] == 'external-static-archive', 'unknown native origin kind')
-            raw, actual_pin = read_pinned(path)
+            raw, actual_pin = reader(path)
             require(actual_pin == {key: pin[key] for key in ('bytes', 'sha256')},
                     'static origin changed during inspection')
             parsed = carrier.container(raw, helper)

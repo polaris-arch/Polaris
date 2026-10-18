@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { runInNewContext } from 'node:vm';
@@ -18,7 +20,7 @@ function aggregateEnvironment() {
     DESKTOP_CORE_REQUIRED: 'false', DESKTOP_CORE_RESULT: 'skipped',
     PREFLIGHT_REQUIRED: 'false', PREFLIGHT_RESULT: 'skipped', PACKAGE_REQUIRED: 'false',
     PACKAGE_RESULT: 'skipped', ANDROID_REQUIRED: 'false', ANDROID_RESULT: 'skipped',
-    APPLE_DEFERRED: 'false' };
+    APPLE_DEFERRED: 'false', APPLE_EVIDENCE_MODE: 'rebuilt' };
 }
 
 test('real Apple and shared producer/application edits select the final App leg', () => {
@@ -26,6 +28,7 @@ test('real Apple and shared producer/application edits select the final App leg'
     'crates/tauri-plugin-polaris-ios/ios/Sources/MeasurementDeviceState.swift',
     'scripts/mobile-core/ci_apple.py', 'scripts/mobile-core/apple_rust.py',
     'scripts/mobile-core/apple-cache.py', 'scripts/mobile-core/test_apple_entry.py',
+    'scripts/mobile-core/apple_merge_reuse.py', 'scripts/mobile-core/test_apple_merge_reuse.py',
     'src-tauri/capabilities/default.json', 'src-tauri/capabilities/tray.json',
     'scripts/fetch-protoc.mjs', 'scripts/lib/extract-zip.mjs',
     'ui/src/App.tsx', 'Cargo.lock', 'src-tauri/tauri.ios.conf.json', '.github/workflows/apple.yml']) {
@@ -62,7 +65,7 @@ test('Apple workflow keeps one admitted host, mandatory device and optional isol
   assert.doesNotMatch(workflow, /\n  carrier:\n/);
   assert.equal((workflow.match(/ci_apple.py build/g) || []).length, 1);
   assert.equal((workflow.match(/ci_apple.py carrier --slot/g) || []).length, 2);
-  assert.match(workflow, /unsigned-chain:\n\s+needs: component\n\s+if: always\(\)/);
+  assert.match(workflow, /unsigned-chain:\n\s+needs: \[resolve, component\]\n\s+if: always\(\)/);
   const blocks = workflow.split(/^ {6}- /m).slice(1);
   for (const [slot, short] of [['device-arm64', 'device'], ['sim-arm64', 'sim']]) {
     const id = slot.replaceAll('-', '_');
@@ -120,6 +123,7 @@ test('shared failure builds no carriers; optional simulator requires safe device
   const success = Object.fromEntries(ids.map(id => [id, { conclusion: 'success' }]));
   const evaluate = (text, steps, includeSimulator, cancelled = false) => runInNewContext(text, {
     steps, inputs: { include_simulator: includeSimulator }, cancelled: () => cancelled,
+    env: { POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: includeSimulator ? 'false' : 'true' },
   });
   const selectedCount = (steps, includeSimulator) => {
     const ready = evaluate(shared, steps, includeSimulator);
@@ -214,4 +218,287 @@ test('deferred Apple never passes the full aggregate and never conceals non-Appl
   const full = invoke({ APPLE_DEFERRED: 'false', APPLE_RESULT: 'success' });
   assert.equal(full.status, 0);
   assert.doesNotMatch(full.stdout, /NOT_VALIDATED/);
+});
+
+
+function appleWorkflow() {
+  return readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
+}
+
+function workflowStep(workflow, name) {
+  const step = workflow.split(/^ {6}- /m).find(block => block.includes(`name: ${name}\n`));
+  assert.ok(step, `missing workflow step: ${name}`);
+  return step;
+}
+
+function shellBody(step) {
+  const marker = '        run: |\n';
+  assert.ok(step.includes(marker), 'missing shell block');
+  return step.slice(step.indexOf(marker) + marker.length)
+    .split('\n').map(line => line.slice(10)).join('\n');
+}
+
+function shellFixture(body, env) {
+  const directory = mkdtempSync(join(tmpdir(), 'apple-workflow-'));
+  const output = join(directory, 'output');
+  const summary = join(directory, 'summary');
+  try {
+    writeFileSync(output, '');
+    writeFileSync(summary, '');
+    const result = spawnSync('bash', ['-c', body], { encoding: 'utf8',
+      env: { ...process.env, ...env, GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary } });
+    return { ...result, stdout: result.stdout + readFileSync(output, 'utf8') + readFileSync(summary, 'utf8') };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function expression(text) {
+  const match = text.match(/\$\{\{ (.+) \}\}/);
+  assert.ok(match, 'missing workflow expression');
+  return match[1];
+}
+
+test('Apple merge reuse requires explicit main-push opt-in and narrow read-only permissions', () => {
+  const workflow = appleWorkflow();
+  const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
+  const call = workflow.slice(workflow.indexOf('  workflow_call:'), workflow.indexOf('  workflow_dispatch:'));
+  const dispatch = workflow.slice(workflow.indexOf('  workflow_dispatch:'), workflow.indexOf('\npermissions:'));
+  assert.match(call, /allow_merge_reuse:\n\s+description:[^\n]+\n\s+type: boolean\n\s+default: false/);
+  assert.doesNotMatch(dispatch, /allow_merge_reuse/);
+  assert.match(call, /value: \$\{\{ jobs.unsigned-chain.outputs.evidence_mode \}\}/);
+  const resolver = workflow.slice(workflow.indexOf('\n  resolve:\n'), workflow.indexOf('\n  component:\n'));
+  const component = workflow.slice(workflow.indexOf('\n  component:\n'), workflow.indexOf('\n  unsigned-chain:\n'));
+  const final = workflow.slice(workflow.indexOf('\n  unsigned-chain:\n'));
+  const caller = risk.slice(risk.indexOf('\n  apple:\n'), risk.indexOf('\n  gate:\n'));
+  for (const job of [resolver, final, caller]) assert.match(job, /permissions:\n\s+contents: read\n\s+actions: read/);
+  assert.doesNotMatch(component, /actions: read|GITHUB_TOKEN:/);
+  assert.match(workflow, /\npermissions:\n  contents: read\n\nenv:/);
+  assert.equal((workflow.match(/GITHUB_TOKEN:/g) || []).length, 2);
+  assert.equal((workflow.match(/ref: \$\{\{ inputs.candidate \|\| github.sha \}\}/g) || []).length, 3);
+  assert.doesNotMatch(workflow, /contents: write|actions: write|secrets:|publish_release|codesign --sign|security import/);
+  assert.doesNotMatch(caller, /contents: write|secrets:|upload_artifacts|publish_release/);
+  const permission = expression(resolver.split('\n').find(line => line.includes('POLARIS_APPLE_ALLOW_MERGE_REUSE:')));
+  const callerPermission = expression(caller.split('\n').find(line => line.includes('allow_merge_reuse:')));
+  for (const event of ['push', 'pull_request', 'merge_group', 'workflow_dispatch', 'workflow_call', 'schedule']) {
+    for (const ref of ['refs/heads/main', 'refs/heads/topic', 'refs/tags/v1.2.3', 'refs/pull/5/merge', '']) {
+      for (const allow of [true, false]) {
+        for (const simulator of [true, false]) {
+          const actual = runInNewContext(permission, { github: { event_name: event, ref },
+            inputs: { allow_merge_reuse: allow, include_simulator: simulator } });
+          assert.equal(actual, allow && !simulator && event === 'push' && ref === 'refs/heads/main' ? 'true' : 'false');
+        }
+      }
+      for (const native of ['true', 'false']) {
+        assert.equal(runInNewContext(callerPermission, { github: { event_name: event, ref },
+          needs: { classify: { outputs: { native_validation: native } } } }),
+        event === 'push' && ref === 'refs/heads/main' && native !== 'true');
+      }
+    }
+  }
+});
+
+test('resolver failures and partial uploads select a full component build without skipped-green', () => {
+  const workflow = appleWorkflow();
+  const resolver = workflow.slice(workflow.indexOf('\n  resolve:\n'), workflow.indexOf('\n  component:\n'));
+  const component = workflow.slice(workflow.indexOf('\n  component:\n'), workflow.indexOf('\n  unsigned-chain:\n'));
+  assert.match(component, /needs: resolve\n\s+if: \$\{\{ !cancelled\(\)/);
+  const componentIf = expression(component.split('\n').find(line => line.trim().startsWith('if:')));
+  const outputIf = expression(resolver.split('\n').find(line => line.trim().startsWith('reused:')));
+  const statuses = ['success', 'failure', 'cancelled', 'skipped', ''];
+  for (const resolverOutcome of statuses) {
+    for (const receiptOutcome of statuses) {
+      for (const reused of ['true', 'false', '', 'unknown']) {
+        const actual = runInNewContext(outputIf, { steps: {
+          resolve: { outcome: resolverOutcome, conclusion: 'success', outputs: { reused } },
+          receipt: { outcome: receiptOutcome, conclusion: 'success' },
+        } });
+        assert.equal(actual, resolverOutcome === 'success' && receiptOutcome === 'success' && reused === 'true' ? 'true' : 'false');
+      }
+    }
+  }
+  for (const result of statuses) {
+    for (const reused of ['true', 'false', '', 'unknown']) {
+      for (const cancelled of [false, true]) {
+        assert.equal(runInNewContext(componentIf, { cancelled: () => cancelled,
+          needs: { resolve: { result, outputs: { reused } } } }),
+        !cancelled && !(result === 'success' && reused === 'true'));
+      }
+    }
+  }
+  assert.match(resolver, /id: resolve\n\s+continue-on-error: true/);
+  assert.match(resolver, /id: receipt\n\s+if: \$\{\{ steps.resolve.outcome == 'success' && steps.resolve.outputs.reused == 'true' \}\}\n\s+continue-on-error: true/);
+  assert.equal((workflow.match(/continue-on-error: true/g) || []).length, 2);
+  assert.match(resolver, /receipt_sha256: \$\{\{ steps.resolve.outputs.receipt_sha256 \}\}/);
+  const verification = workflowStep(workflow, 'Verify same-tree evidence receipt against the current candidate and context');
+  assert.match(verification, /RECEIPT_SHA256: \$\{\{ needs.resolve.outputs.receipt_sha256 \}\}/);
+  assert.equal(expression(verification.split('\n').find(line => line.includes('POLARIS_APPLE_ALLOW_MERGE_REUSE:'))),
+    expression(resolver.split('\n').find(line => line.includes('POLARIS_APPLE_ALLOW_MERGE_REUSE:'))));
+  assert.match(verification, /check-result --receipt "\$RUNNER_TEMP\/apple-merge-reuse\/apple-merge-reuse.json" --expected-sha "\$RECEIPT_SHA256"/);
+});
+
+test('only Release Risk device-only PR snapshots bracket real work and seal uploaded originals after the chain', () => {
+  const workflow = appleWorkflow();
+  const blocks = workflow.split(/^ {6}- /m).slice(1);
+  const commandIndex = command => blocks.findIndex(block => block.includes(command));
+  const frontend = commandIndex('ci_apple.py build');
+  assert.equal(commandIndex('snapshot --phase frontend-before'), frontend - 1);
+  assert.equal(commandIndex('snapshot --phase frontend-after'), frontend + 1);
+  const carrier = commandIndex('ci_apple.py carrier --slot "device-arm64"');
+  assert.equal(commandIndex('snapshot --phase carrier-before --slot device-arm64'), carrier - 1);
+  assert.equal(commandIndex('snapshot --phase carrier-after --slot device-arm64'), carrier + 1);
+  assert.equal(commandIndex('ci_apple.py evidence --slot "device-arm64"'), carrier + 2);
+  assert.ok(commandIndex('snapshot --phase frontend-after') < commandIndex('ci_apple.py evidence\n'));
+  const snapshots = blocks.filter(block => block.includes('apple_merge_reuse.py snapshot'));
+  assert.equal(snapshots.length, 4);
+  for (const snapshot of snapshots) assert.match(snapshot, /if: \$\{\{ env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true'/);
+  assert.match(blocks[carrier], /env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT != 'true' \|\| steps.carrier_before.conclusion == 'success'/);
+  const chain = blocks.findIndex(block => block.includes('id: chain\n'));
+  const seal = blocks.findIndex(block => block.includes('id: execution_contract\n'));
+  const upload = blocks.findIndex(block => block.includes('id: execution_contract_upload\n'));
+  assert.ok(chain >= 0 && seal === chain + 1 && upload === seal + 1);
+  assert.match(blocks[seal], /env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true' && !cancelled\(\) && steps.aggregate.conclusion == 'success' && steps.chain.conclusion == 'success'/);
+  assert.match(blocks[seal], /seal --summaries "\$RUNNER_TEMP\/apple-chain" --chain "\$RUNNER_TEMP\/apple-chain.json" --output "\$RUNNER_TEMP\/apple-execution-contract.json"/);
+  assert.match(blocks[upload], /env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true' && !cancelled\(\) && steps.execution_contract.conclusion == 'success'/);
+  assert.match(blocks[upload], /name: apple-execution-contract-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/);
+  for (const block of [blocks[chain], blocks[upload]]) assert.match(block, /if-no-files-found: error/);
+  assert.match(blocks[chain], /always\(\) && !\(needs.resolve.result == 'success' && needs.resolve.outputs.reused == 'true'\)/);
+  const requirement = expression(workflow.split('\n').find(line => line.startsWith('  POLARIS_APPLE_PRODUCE_REUSE_CONTRACT:')));
+  const riskRef = 'owner/repo/.github/workflows/release-risk.yml@refs/pull/7/merge';
+  const appleRef = 'owner/repo/.github/workflows/apple.yml@refs/heads/main';
+  const finalScript = shellBody(workflowStep(workflow, 'Require verified reuse or the complete current-attempt build chain'));
+  const readySteps = Object.fromEntries([...workflow.matchAll(/id: ([\w_]+)\n/g)]
+    .map(match => [match[1], { conclusion: 'success', outputs: { eligible: 'true' } }]));
+  for (const [label, event, ref, simulator, expected] of [
+    ['Release Risk PR producer', 'pull_request', riskRef, false, 'true'],
+    ['standalone dispatch', 'workflow_dispatch', appleRef, false, 'false'],
+    ['Release Risk dispatch', 'workflow_dispatch', riskRef, false, 'false'],
+    ['main fallback', 'push', riskRef.replace('refs/pull/7/merge', 'refs/heads/main'), false, 'false'],
+    ['merge group', 'merge_group', riskRef, false, 'false'],
+    ['simulator PR', 'pull_request', riskRef, true, 'false'],
+    ['standalone simulator', 'workflow_dispatch', appleRef, true, 'false'],
+    ['other caller PR', 'pull_request', appleRef, false, 'false'],
+    ['unknown caller PR', 'pull_request', '', false, 'false'],
+    ['similarly named caller', 'pull_request', riskRef.replace('release-risk.yml@', 'release-risk.yml.bak@'), false, 'false'],
+    ['pull request target', 'pull_request_target', riskRef, false, 'false'],
+  ]) {
+    const flag = runInNewContext(requirement, { github: { event_name: event, workflow_ref: ref },
+      inputs: { include_simulator: simulator }, contains: (haystack, needle) => haystack.includes(needle) });
+    assert.equal(flag, expected, label);
+    const context = { env: { POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: flag },
+      inputs: { include_simulator: simulator }, cancelled: () => false, steps: readySteps };
+    for (const block of [...snapshots, blocks[seal], blocks[upload]]) {
+      const condition = expression(block.split('\n').find(line => line.trim().startsWith('if:')));
+      assert.equal(runInNewContext(condition, context), expected === 'true', label);
+    }
+    const carrierCondition = expression(blocks[carrier].split('\n').find(line => line.trim().startsWith('if:')));
+    assert.equal(runInNewContext(carrierCondition, { ...context, steps: {
+      ...readySteps, carrier_before: { conclusion: 'skipped' },
+    } }), expected !== 'true', label);
+    const gateEnvironment = { POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: flag,
+      POLARIS_APPLE_SCOPE: simulator ? 'device-and-simulator' : 'device-only',
+      RESOLVE_RESULT: label === 'main fallback' ? 'failure' : 'success', REUSED: 'false',
+      COMPONENT_RESULT: 'success', REUSE_VERIFIED: 'skipped', AGGREGATE_RESULT: 'success', CHAIN_RESULT: 'success',
+      CONTRACT_RESULT: expected === 'true' ? 'success' : 'skipped',
+      CONTRACT_ELIGIBLE: expected === 'true' ? 'true' : '',
+      CONTRACT_UPLOAD_RESULT: expected === 'true' ? 'success' : 'skipped' };
+    assert.equal(shellFixture(finalScript, gateEnvironment).status, 0, label);
+    if (expected === 'true') {
+      assert.equal(shellFixture(finalScript, { ...gateEnvironment,
+        CONTRACT_RESULT: 'skipped', CONTRACT_UPLOAD_RESULT: 'skipped' }).status, 1, label);
+    }
+  }
+});
+
+test('actual unsigned-chain result shell accepts only verified reuse or a complete full build', () => {
+  const workflow = appleWorkflow();
+  const step = workflowStep(workflow, 'Require verified reuse or the complete current-attempt build chain');
+  assert.match(step, /id: result\n\s+if: always\(\)/);
+  const script = shellBody(step);
+  const rebuilt = { RESOLVE_RESULT: 'success', REUSED: 'false', COMPONENT_RESULT: 'success',
+    REUSE_VERIFIED: 'skipped', AGGREGATE_RESULT: 'success', CHAIN_RESULT: 'success',
+    CONTRACT_RESULT: 'success', CONTRACT_ELIGIBLE: 'true', CONTRACT_UPLOAD_RESULT: 'success', POLARIS_APPLE_SCOPE: 'device-only',
+    POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: 'true' };
+  const reused = { ...rebuilt, REUSED: 'true', COMPONENT_RESULT: 'skipped', REUSE_VERIFIED: 'success',
+    AGGREGATE_RESULT: 'skipped', CHAIN_RESULT: 'skipped', CONTRACT_RESULT: 'skipped', CONTRACT_UPLOAD_RESULT: 'skipped',
+    POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: 'false' };
+  const ordinary = { ...rebuilt, POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: 'false',
+    CONTRACT_RESULT: 'skipped', CONTRACT_UPLOAD_RESULT: 'skipped' };
+  const simulator = { ...ordinary, POLARIS_APPLE_SCOPE: 'device-and-simulator' };
+  const ineligible = { ...rebuilt, CONTRACT_ELIGIBLE: 'false', CONTRACT_UPLOAD_RESULT: 'skipped' };
+  const invoke = shellFixture;
+  const check = body => {
+    for (const [mode, env] of [['rebuilt', rebuilt], ['reused', reused], ['rebuilt', ordinary], ['rebuilt', simulator], ['rebuilt', ineligible]]) {
+      const result = invoke(body, env);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.match(result.stdout, new RegExp(`evidence_mode=${mode}`));
+      for (const key of ['COMPONENT_RESULT', 'REUSE_VERIFIED', 'AGGREGATE_RESULT', 'CHAIN_RESULT', 'CONTRACT_RESULT', 'CONTRACT_UPLOAD_RESULT']) {
+        for (const status of ['success', 'failure', 'cancelled', 'skipped', '', 'unknown'].filter(value => value !== env[key])) {
+          const invalid = invoke(body, { ...env, [key]: status });
+          assert.equal(invalid.status, 1, `${mode} ${key}=${status}: ${invalid.stdout}${invalid.stderr}`);
+          assert.doesNotMatch(invalid.stdout, /evidence_mode=/);
+        }
+      }
+    }
+    for (const result of ['failure', 'cancelled', 'skipped', '']) {
+      assert.equal(invoke(body, { ...reused, RESOLVE_RESULT: result }).status, 1);
+      assert.equal(invoke(body, { ...rebuilt, RESOLVE_RESULT: result }).status, 0);
+      assert.equal(invoke(body, { ...rebuilt, RESOLVE_RESULT: result, REUSED: 'true' }).status, 0);
+    }
+    for (const reusedValue of ['false', '', 'unknown']) {
+      assert.equal(invoke(body, { ...reused, REUSED: reusedValue }).status, 1);
+    }
+    for (const scope of ['device-and-simulator', '', 'unknown']) {
+      assert.equal(invoke(body, { ...reused, POLARIS_APPLE_SCOPE: scope }).status, 1);
+    }
+    for (const eligibility of ['', 'unknown', 'false']) {
+      assert.equal(invoke(body, { ...rebuilt, CONTRACT_ELIGIBLE: eligibility }).status, 1);
+    }
+    for (const eligibility of ['', 'unknown', 'true']) {
+      assert.equal(invoke(body, { ...ineligible, CONTRACT_ELIGIBLE: eligibility }).status, 1);
+    }
+    assert.equal(invoke(body, { ...rebuilt, POLARIS_APPLE_SCOPE: 'unknown' }).status, 1);
+    assert.equal(invoke(body, { ...rebuilt, POLARIS_APPLE_SCOPE: 'device-and-simulator' }).status, 1);
+    assert.equal(invoke(body, { ...reused, POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: 'true' }).status, 1);
+    assert.equal(invoke(body, { ...ordinary, POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: 'true' }).status, 1);
+    assert.equal(invoke(body, { ...rebuilt, POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: 'false' }).status, 1);
+    for (const requirement of ['', 'unknown']) {
+      assert.equal(invoke(body, { ...ordinary, POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: requirement }).status, 1);
+    }
+    assert.equal(invoke(body, { ...reused, COMPONENT_RESULT: 'success' }).status, 1);
+  };
+  check(script);
+  for (const mutation of [script.replace('[ "$REUSE_VERIFIED" = success ]', 'true'),
+    script.replace('[ "$COMPONENT_RESULT" = skipped ]', 'true'),
+    script.replace('[ "$CONTRACT_UPLOAD_RESULT" = success ]', 'true')]) {
+    assert.notEqual(mutation, script);
+    assert.throws(() => check(mutation));
+  }
+});
+
+test('Release Risk reports rebuilt versus reused Apple evidence and rejects missing or incompatible modes', () => {
+  const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
+  assert.match(risk, /APPLE_EVIDENCE_MODE: \$\{\{ needs.apple.outputs.evidence_mode \}\}/);
+  const script = aggregateScript();
+  const invoke = overrides => shellFixture(script, {
+    ...aggregateEnvironment(), APPLE_REQUIRED: 'true', APPLE_RESULT: 'success',
+    APPLE_INCLUDE_SIMULATOR: 'false', ...overrides,
+  });
+  const rebuilt = invoke({ APPLE_EVIDENCE_MODE: 'rebuilt' });
+  assert.equal(rebuilt.status, 0);
+  assert.match(rebuilt.stdout, /compile\/link rebuilt and passed in this run/);
+  assert.doesNotMatch(rebuilt.stdout, /reused verified/);
+  const reused = invoke({ APPLE_EVIDENCE_MODE: 'reused' });
+  assert.equal(reused.status, 0);
+  assert.match(reused.stdout, /reused verified same-tree PR/);
+  assert.match(reused.stdout, /no new compilation in this run/);
+  assert.doesNotMatch(reused.stdout, /rebuilt and passed/);
+  for (const mode of ['', 'unknown', 'success', 'false']) {
+    const result = invoke({ APPLE_EVIDENCE_MODE: mode });
+    assert.equal(result.status, 1);
+    assert.doesNotMatch(result.stdout, /发布风险门通过：/);
+  }
+  assert.equal(invoke({ APPLE_EVIDENCE_MODE: 'reused', APPLE_INCLUDE_SIMULATOR: 'true' }).status, 1);
+  assert.equal(invoke({ APPLE_EVIDENCE_MODE: 'rebuilt', APPLE_INCLUDE_SIMULATOR: 'true' }).status, 0);
+  assert.equal(invoke({ APPLE_REQUIRED: 'false', APPLE_RESULT: 'skipped', APPLE_EVIDENCE_MODE: '' }).status, 0);
 });

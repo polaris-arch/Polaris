@@ -404,3 +404,131 @@ negative tests. New formal source controls live in `test_inputs.py` and
 compiled native output, dispatched CI, signed/installed Apps or published mobile
 assets. Contract artifact pins/producer receipt remain null, and
 AppAccepted/devicePassed/publicationEligible remain false until actual results.
+
+## Exact-tree main merge evidence reuse
+
+`apple_merge_reuse.py` is an opt-in read-only evidence path for the Release Risk
+workflow's ordinary `push` to `refs/heads/main`. It admits only a same-repository
+PR that GitHub confirms was merged at that exact two-parent commit. The merge,
+PR head, and actual executed reusable-workflow commit must have identical Git
+trees. Source checkout, caller/reusable workflow files, source contract and
+producer/consumer/verifier code inventories remain byte-bound. A direct push,
+squash/rebase merge, fork PR, arbitrary PR claim, tag, simulator request, manual
+dispatch, merge group, incomplete listing or unavailable API selects a full
+build. Human review and merge authorization remain in the existing workflow;
+no GitHub APPROVED decision or new branch-protection setting is required or
+asserted by a machine receipt. Existing authorized main writers and GitHub's
+run/artifact integrity are the trust boundary: main write access already permits
+changing this verifier.
+
+Every eligible Release Risk device-only PR still runs the complete native
+pipeline. Four execution snapshots, before/after frontend+component and
+before/after the carrier, bind actual Node/pnpm, Go/gomobile/gobind, Cargo/rustc,
+Xcode/xcrun/Swift/clang and protoc identities, exact SDK versions/settings,
+selected build environment overrides and source/workflow hashes. Before and
+after observations must agree. Existing Rust receipts additionally bind the
+locked release staticlib command, target, Cargo.lock, iOS configuration, actual
+compiler binaries, link inputs and produced archive. The resulting
+`apple-execution-contract-<run>-<attempt>` artifact is created only after the
+same-run strict unsigned-chain aggregate and all six original artifact uploads
+have succeeded and the effective Cargo inputs are supported. Its small sidecar binds their provider IDs/digests, exact
+internal bytes/inventories and the original source/run/attempt. Standalone,
+manual, main-fallback, merge-group and simulator full builds retain their normal
+aggregate gate without this PR-only eligibility check.
+
+On a later exact-tree merge, the current main verifier obtains the completed
+successful original PR run and exact attempt from GitHub, verifies the real
+workflow execution SHA and same-PR ref/branch, and requires both original Apple
+jobs to have succeeded. It downloads all seven exact-attempt artifacts through
+read-only provider APIs. Provider SHA-256 and size, bounded archive inventories,
+internal file/receipt hashes, tool/SDK/source/input contracts, Rust archive,
+linked archive and IPA bytes must match. Artifact names only select candidates;
+cache hits, filenames, job skipping or successful statuses alone cannot admit
+reuse. Only the Apple reusable caller and its resolver/sealer jobs receive the necessary
+`actions: read`; workflow defaults and native component permissions remain
+`contents: read`. No write scope, new credential or repository setting is added.
+API routes are allowlisted to this repository and exact run/attempt/artifact IDs;
+cross-repository identities are rejected. Storage redirects, receipts, logs and
+artifacts receive no GitHub token. Archives are inspected,
+never installed or executed, and their original absolute paths are treated as
+data only.
+
+The new `apple-merge-reuse-<run>-<attempt>` receipt refers to a single original
+full producer and its artifact IDs/digests. It never edits old producer candidate,
+run, attempt, path or receipt bytes; it never embeds an accumulating provenance
+history or uses another reuse receipt as a producer. The final job validates
+that exact same-run receipt and requires the native job to be skipped only in
+this verified branch. A resolver miss/error or receipt-upload failure runs the
+normal build. A later receipt-check failure makes the gate red; it cannot pass
+as a skipped build. The required Release Risk check name and acceptance of the
+Apple job's successful result remain unchanged.
+
+Old evidence without these snapshots and execution sidecar is intentionally
+ineligible, including PR14 run `39073373973` attempt `2`. It is not backfilled.
+The first PR introducing this code must run a full native build; offline
+fixtures do not replace that integration check. Reuse proves that historical
+execution evidence applies to the same source and workflow contract, not that
+moving `stable` tools were freshly resolved at merge time. A changed workflow,
+source tree, contract or internal/external hash requires a new build.
+
+Scope stays unsigned device-arm64 App plus PacketTunnel compile/link. The shared
+component still has two arm64 slices, which does not imply a simulator carrier
+was run. `devicePassed`, `signatureTrustValidated` and `publicationEligible`
+remain false. Signing, device execution and publication requirements are
+unchanged. `test_apple_merge_reuse.py` exercises complete fixture packages and
+mutates identities, scopes, contracts, actual byte pins, archives, API routes,
+redirect credentials and missing evidence; `apple-ci-impact.test.mjs` exercises
+the full/reuse/fallback workflow result combinations. The existing strict
+same-run consumer/import and aggregate controls remain in the test gate.
+
+
+Revision closure and Cargo admission:
+
+- The verifier joins each native receipt pin to both the transported payload and
+  its retained original. Bind logs, every compiler object and external archive,
+  generated-source and framework inventories, local replacement source snapshots,
+  and overlapping retained files must agree in path, bytes, mode and type.
+  Static member/origin tables are recomputed from bounded archive bytes using the
+  existing parser. Original absolute paths are never opened on the verifier host.
+- Execution snapshot v2 binds the Cargo environment before/after each producer
+  phase. The actual Cargo hook also records its effective environment after the
+  source-owned compiler/output/native-flag assignments. Values are length/hash
+  pairs, never raw environment text. Registry tokens/credential providers and
+  HTTP transport settings are omitted, including their hashes; no credential
+  file is read. Wrapper/compiler/linker/runner selectors, alternate lockfiles,
+  ambient compiler flags and unsupported external configuration cannot qualify.
+- Cargo's working-directory/ancestor and Cargo-home configuration locations are
+  checked. Only regular, tracked repository/root-or-src-tauri Cargo configs are
+  admitted and byte-pinned. Includes, external sources, environment injection and
+  unretained tool/flag inputs are refused. The initial flag policy supports the
+  existing tracked static-CRT and debug-strip flags; changing this admission
+  policy needs a reviewed source change. Legacy `config` and `config.toml` are
+  both checked conservatively, including when Cargo would shadow one.
+- `CARGO_BUILD_JOBS` and jobserver/Make FD handles only schedule existing build
+  work and are not semantic pins; the existing native budget still governs them.
+  Temporary paths are not added to the Cargo namespace. No environment variable
+  is cleared or changed for qualification. Main verifies the original Mac
+  execution contract; it does not compare it with the resolver's Linux home,
+  temporary directory, run ID or jobserver descriptors.
+- Unsupported Cargo inputs produce an explicit non-eligibility observation and
+  the ordinary full build continues unchanged. The successful aggregate/chain
+  remains mandatory. Sealing exports `eligible=false` and creates no execution
+  sidecar, so a later main merge rebuilds. A supported contract must upload
+  successfully. Missing/corrupt evidence, unexpected statuses or altered
+  receipt/hash bindings are not silently converted to producer success.
+
+Cargo input/configuration rules are audited against the primary references:
+https://doc.rust-lang.org/cargo/reference/environment-variables.html and
+https://doc.rust-lang.org/cargo/reference/config.html . The bounded, deliberately
+conservative admission policy above is this repository's policy, not a claim
+that every possible Cargo configuration is reusable.
+
+
+Qualification never short-circuits integrity checks. The sealer collects valid
+unavailable observations, validates every remaining snapshot and all comparable
+phase/tool/SDK/environment bindings, then verifies all native/Rust/IPA/link
+originals. It next compares the current chain and all five local summary files
+with the uploaded bytes and checks the provider workflow binding. Only after
+those checks may it return `eligible=false` without a sidecar. Malformed later
+snapshots, missing/changed originals or changed current aggregate inputs remain
+hard failures even when some or all execution observations are unavailable.

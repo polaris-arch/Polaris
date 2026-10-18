@@ -427,8 +427,10 @@ jobs:
     if: needs.classify.outputs.apple == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.defer_apple)
     permissions:
       contents: read
+      actions: read # Only Apple resolver/sealer jobs consume Actions metadata and original artifacts.
     uses: ./.github/workflows/apple.yml
     with:
+      allow_merge_reuse: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify.outputs.native_validation != 'true' }}
       preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       candidate: ${{ needs.classify.outputs.candidate }}
       include_simulator: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator }}
@@ -453,6 +455,7 @@ jobs:
       ANDROID_RESULT: ${{ needs.android.result }}
       APPLE_REQUIRED: ${{ needs.classify.outputs.apple }}
       APPLE_RESULT: ${{ needs.apple.result }}
+      APPLE_EVIDENCE_MODE: ${{ needs.apple.outputs.evidence_mode }}
       APPLE_DEFERRED: ${{ github.event_name == 'workflow_dispatch' && inputs.defer_apple && 'true' || 'false' }}
       APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}
       UNREGISTERED: ${{ needs.classify.outputs.unregistered }}
@@ -509,7 +512,15 @@ jobs:
             exit 1
           fi
           if [ "$APPLE_REQUIRED" = true ]; then
-            printf '%s\n' 'Apple device-arm64: unsigned App + PacketTunnel compile/link passed.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            case "${APPLE_EVIDENCE_MODE:-}" in
+              reused)
+                [ "${APPLE_INCLUDE_SIMULATOR:-false}" = false ] || {
+                  echo '::error::Simulator validation cannot reuse device-only Apple evidence'; exit 1; }
+                printf '%s\n' 'Apple device-arm64: reused verified same-tree PR unsigned App + PacketTunnel compile/link evidence; no new compilation in this run.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}" ;;
+              rebuilt)
+                printf '%s\n' 'Apple device-arm64: unsigned App + PacketTunnel compile/link rebuilt and passed in this run.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}" ;;
+              *) echo '::error::Apple success lacks a verified evidence mode'; exit 1 ;;
+            esac
             if [ "${APPLE_INCLUDE_SIMULATOR:-false}" = true ]; then
               printf '%s\n' 'Apple sim-arm64: unsigned App + PacketTunnel compile/link passed (requested).' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
             else

@@ -155,7 +155,13 @@ def build_reserved():
     # archive. Source declarations or local/private names cannot satisfy it.
     command = [str(tool_paths['cargo']), 'rustc', '--locked', '--release', '--lib', '--package', 'polaris',
                '--target', triple, '--features', 'tauri/custom-protocol', '--crate-type', 'staticlib']
+    execution_inputs = None
+    if os.environ.get('POLARIS_APPLE_PRODUCE_REUSE_CONTRACT') == 'true':
+        from apple_merge_reuse import cargo_execution_inputs, observe_cargo_execution_inputs
+        execution_inputs = observe_cargo_execution_inputs(env)
     run(command, cwd=ROOT / 'src-tauri', env=env, log=root / ('original-rust-' + triple + '.log'), capture='none')
+    if execution_inputs is not None and 'unavailable' not in execution_inputs:
+        require(cargo_execution_inputs(env) == execution_inputs, 'actual Cargo input changed during compilation')
     archive = target / triple / 'release/libpolaris_lib.a'
     require(not archive.is_symlink() and archive.read_bytes().startswith(b'!<arch>\n'), 'actual Rust static archive required')
     bridges = verify_swift_bridges(verify_start_app(
@@ -185,6 +191,8 @@ def build_reserved():
                'originalWireArchive': {'path': str(library), **file_pin(library)},
                'wireSelection': selection, 'wireArchive': {'path': str(wire), **file_pin(wire)},
                'archive': pin, 'linkedArchive': str(dest), 'devicePassed': False}
+    if execution_inputs is not None:
+        receipt['executionInputs'] = execution_inputs
     receipt['fingerprint'] = sha(canonical(receipt))
     require(file_pin(wire) == {'bytes': len(thin), 'sha256': sha(thin)} and
             file_pin(library) == selected['binary'], 'wire input changed during Rust compile')
