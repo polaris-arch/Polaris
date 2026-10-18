@@ -18,7 +18,7 @@ pub(super) fn probe_stages(port: u16, origin: Instant) -> (Result<(), String>, V
     let mut socket = None;
     let mut timeout_error = None;
     let result = (|| {
-        let connected = TcpStream::connect_timeout(&local(port), Duration::from_millis(600));
+        let connected = connect_tcp_timeout(&local(port), Duration::from_millis(600));
         stages.push(stage(
             "connect",
             origin,
@@ -268,7 +268,7 @@ fn healthy_listener_echo_and_worker_receipts_are_observable() {
 #[test]
 fn accepted_connection_waits_for_payload_sent_after_accept_receipt() {
     let listener = Listener::tcp_on(false);
-    let mut stream = TcpStream::connect(local(listener.port)).unwrap();
+    let mut stream = connect_tcp(local(listener.port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_millis(600)))
         .unwrap();
@@ -313,7 +313,7 @@ fn accepted_connection_waits_for_payload_sent_after_accept_receipt() {
 }
 
 fn response_fixture(response: Option<u8>) -> (u16, Arc<AtomicBool>, JoinHandle<()>) {
-    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let socket = bind_tcp("127.0.0.1:0").unwrap();
     socket.set_nonblocking(true).unwrap();
     let port = socket.local_addr().unwrap().port();
     let stop = Arc::new(AtomicBool::new(false));
@@ -386,7 +386,7 @@ fn early_eof_and_wrong_echo_keep_the_probe_failure_stage() {
 #[test]
 fn listener_read_failure_and_finished_worker_are_visible() {
     let listener = Listener::tcp_on(false);
-    let stream = TcpStream::connect(local(listener.port)).unwrap();
+    let stream = connect_tcp(local(listener.port)).unwrap();
     stream.shutdown(std::net::Shutdown::Write).unwrap();
     assert!(eventually(|| listener
         .diagnostics

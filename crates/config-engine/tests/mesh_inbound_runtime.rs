@@ -38,15 +38,219 @@ const B_PRIVATE: &str = "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A=";
 const B_PUBLIC: &str = "WGmv9FBUlzLLqu1eXfmzCm2jHLDldCutWtShp2jxpns=";
 const DNS_NAME: &str = "warm.mesh.polaris.invalid";
 
-fn free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+// All socket allocation in this test binary shares the startup handoff lock.
+// Hold it only for allocation/connect setup or release -> child startup, never
+// for probe I/O, peer handshakes, or server_assigned. Other processes remain outside
+// this coordination: the core accepts port numbers, not inherited sockets.
+static PORT_HANDOFF: Mutex<()> = Mutex::new(());
+
+fn port_handoff() -> std::sync::MutexGuard<'static, ()> {
+    PORT_HANDOFF.lock().unwrap_or_else(|error| error.into_inner())
 }
+fn bind_tcp(address: impl std::net::ToSocketAddrs) -> std::io::Result<TcpListener> {
+    let _guard = port_handoff();
+    TcpListener::bind(address)
+}
+fn bind_udp(address: impl std::net::ToSocketAddrs) -> std::io::Result<UdpSocket> {
+    let _guard = port_handoff();
+    UdpSocket::bind(address)
+}
+fn connect_tcp(address: SocketAddr) -> std::io::Result<TcpStream> {
+    connect_tcp_timeout(&address, Duration::from_millis(600))
+}
+fn connect_tcp_timeout(address: &SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
+    let _guard = port_handoff();
+    TcpStream::connect_timeout(address, timeout)
+}
+fn handoff<T>(reservations: impl Sized, start: impl FnOnce() -> T) -> T {
+    let _guard = port_handoff();
+    drop(reservations);
+    start()
+}
+
+#[test]
+fn port_handoff_blocks_competing_allocation_until_child_owns_sockets() {
+    // Negative control: releasing a reservation without handoff coordination
+    // permits an explicitly scheduled competing allocator to steal it.
+    let reservation = bind_tcp("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    let stolen = handoff(reservation, || {
+        // Bypass the allocation gate deliberately. Holding the gate keeps real
+        // parallel fixtures out of this deterministic negative control.
+        thread::spawn(move || TcpListener::bind(address).unwrap())
+            .join()
+            .unwrap()
+    });
+    assert_eq!(stolen.local_addr().unwrap(), address);
+    drop(stolen);
+
+    let tcp = bind_tcp("127.0.0.1:0").unwrap();
+    let udp = bind_udp("127.0.0.1:0").unwrap();
+    let tcp_address = tcp.local_addr().unwrap();
+    let udp_address = udp.local_addr().unwrap();
+    let ((owned_tcp, owned_udp), competitor) = handoff((tcp, udp), || {
+        let (attempted, observed) = std::sync::mpsc::channel();
+        let competitor = thread::spawn(move || {
+            // Schedule the competitor inside the actual post-drop gap, not
+            // while an un-released reservation still protects the socket.
+            assert!(matches!(
+                PORT_HANDOFF.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            attempted.send(()).unwrap();
+            let tcp_error = bind_tcp(tcp_address).unwrap_err().kind();
+            let udp_error = bind_udp(udp_address).unwrap_err().kind();
+            (tcp_error, udp_error)
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Model the child process, which intentionally does not use our mutex.
+        let owned_tcp = TcpListener::bind(tcp_address).unwrap();
+        let owned_udp = UdpSocket::bind(udp_address).unwrap();
+        ((owned_tcp, owned_udp), competitor)
+    });
+    let errors = competitor.join().unwrap();
+    assert_eq!(
+        errors,
+        (std::io::ErrorKind::AddrInUse, std::io::ErrorKind::AddrInUse)
+    );
+    drop((owned_tcp, owned_udp));
+}
+
+// Spawn this test executable to exercise real child exit and timeout cleanup
+// without a bundled core, shell, network, or platform-specific command.
+#[test]
+fn startup_receipt_child_fixture() {
+    match std::env::var("POLARIS_MESH_STARTUP_TEST").as_deref() {
+        Ok("ready") => {
+            eprintln!("INFO[0000] sing-box started (0.01s)");
+            thread::sleep(Duration::from_secs(30));
+        }
+        Ok("timeout") => thread::sleep(Duration::from_secs(30)),
+        _ => {}
+    }
+}
+
+#[test]
+fn startup_handoff_releases_lock_on_ready_exit_timeout_and_spawn_error() {
+    for mode in ["ready", "exit", "timeout"] {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("startup.stderr");
+        let result = handoff((), || {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "startup_receipt_child_fixture", "--nocapture"])
+                .env("POLARIS_MESH_STARTUP_TEST", mode)
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(&log).unwrap())
+                .spawn()
+                .unwrap();
+            finish_startup(Running { child, log }, Duration::from_secs(2))
+        });
+        assert_eq!(result.is_ok(), mode == "ready");
+        if let Err(error) = &result {
+            assert!(error.contains(if mode == "exit" {
+                "core exited"
+            } else {
+                "deadline exceeded"
+            }));
+        }
+        drop(result); // successful fixture is also killed/reaped
+        assert!(!PORT_HANDOFF.is_poisoned());
+        // Acquire rather than try_lock: other parallel tests may be allocating.
+        drop(port_handoff());
+    }
+    let missing = tempfile::tempdir().unwrap().path().join("missing-core");
+    let result = handoff((), || std::process::Command::new(missing).spawn());
+    assert!(result.is_err());
+    assert!(!PORT_HANDOFF.is_poisoned());
+    drop(port_handoff());
+}
+
+// Match the direct inbounds' IPv4 loopback bind. Keep sockets alive through
+// config validation; a bare port number is not a reservation across parallel
+// fixtures (in particular while MASQUE waits for A before starting B).
+#[derive(Default)]
+struct InboundPortReservations {
+    tcp: Vec<TcpListener>,
+    udp: Vec<UdpSocket>,
+}
+impl InboundPortReservations {
+    fn tcp(&mut self) -> u16 {
+        let socket = bind_tcp("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        self.tcp.push(socket);
+        port
+    }
+    fn udp(&mut self) -> u16 {
+        let socket = bind_udp("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        self.udp.push(socket);
+        port
+    }
+}
+
+#[test]
+fn inbound_port_reservations_isolate_fixtures_and_keep_waiting_peer_bound() {
+    let mut a = InboundPortReservations::default();
+    let mut b = InboundPortReservations::default();
+    let a_tcp = a.tcp();
+    let a_udp = a.udp();
+    let b_tcp = [b.tcp(), b.tcp()];
+    let b_udp = [b.udp(), b.udp()];
+    assert_ne!(b_tcp[0], b_tcp[1]);
+    assert_ne!(b_udp[0], b_udp[1]);
+    for port in b_tcp {
+        assert_ne!(a_tcp, port);
+        assert_eq!(
+            bind_tcp(local(port)).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+    for port in b_udp {
+        assert_ne!(a_udp, port);
+        assert_eq!(
+            bind_udp(local(port)).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+    // Simulate A's handoff while B waits for its session address. A concurrent
+    // fixture may allocate listeners, but cannot take B's pending inbounds.
+    drop(a);
+    let other = thread::spawn(move || {
+        let tcp = Listener::tcp_on(false);
+        let udp = Listener::udp(false);
+        assert!(!b_tcp.contains(&tcp.port));
+        assert!(!b_udp.contains(&udp.port));
+    });
+    other.join().unwrap();
+    for port in b_tcp {
+        assert_eq!(
+            bind_tcp(local(port)).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+    for port in b_udp {
+        assert_eq!(
+            bind_udp(local(port)).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+    // Isolate release/rebind from other parallel fixtures as well. Raw binds
+    // model the receiving child while the handoff gate is already held.
+    let (_tcp, _udp) = handoff(b, || {
+        let tcp: Vec<_> = b_tcp
+            .into_iter()
+            .map(|port| TcpListener::bind(local(port)).unwrap())
+            .collect();
+        let udp: Vec<_> = b_udp
+            .into_iter()
+            .map(|port| UdpSocket::bind(local(port)).unwrap())
+            .collect();
+        (tcp, udp)
+    });
+}
+
 fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
+    bind_udp("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -60,7 +264,7 @@ fn reserve_wireguard_port(excluded: &[u16]) -> UdpSocket {
     // reservations during selection so a port cannot be selected repeatedly.
     let mut rejected = Vec::new();
     for _ in 0..64 {
-        let socket = UdpSocket::bind("[::]:0").expect("reserve WireGuard wildcard port");
+        let socket = bind_udp("[::]:0").expect("reserve WireGuard wildcard port");
         if !excluded.contains(&socket.local_addr().unwrap().port()) {
             return socket;
         }
@@ -71,8 +275,8 @@ fn reserve_wireguard_port(excluded: &[u16]) -> UdpSocket {
 
 #[test]
 fn wireguard_port_reservations_exclude_live_listeners_and_keep_peers_distinct() {
-    let ipv6 = UdpSocket::bind("[::1]:0").unwrap();
-    let ipv4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let ipv6 = bind_udp("[::1]:0").unwrap();
+    let ipv4 = bind_udp("127.0.0.1:0").unwrap();
     let excluded = [
         ipv6.local_addr().unwrap().port(),
         ipv4.local_addr().unwrap().port(),
@@ -88,13 +292,13 @@ fn wireguard_port_reservations_exclude_live_listeners_and_keep_peers_distinct() 
     // SO_EXCLUSIVEADDRUSE lease over every address.
     #[cfg(windows)]
     {
-        let a_loopback = UdpSocket::bind(("::1", a_port)).unwrap();
-        let b_loopback = UdpSocket::bind(("::1", b_port)).unwrap();
+        let a_loopback = bind_udp(("::1", a_port)).unwrap();
+        let b_loopback = bind_udp(("::1", b_port)).unwrap();
         assert_eq!(a_loopback.local_addr().unwrap().port(), a_port);
         assert_eq!(b_loopback.local_addr().unwrap().port(), b_port);
     }
     for port in [a_port, b_port] {
-        let error = UdpSocket::bind(("::", port)).unwrap_err();
+        let error = bind_udp(("::", port)).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
     }
 }
@@ -127,7 +331,7 @@ struct Listener {
 }
 impl Listener {
     fn tcp_on(ipv6: bool) -> Self {
-        let socket = TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).unwrap();
+        let socket = bind_tcp(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).unwrap();
         socket.set_nonblocking(true).unwrap();
         let address = socket.local_addr().unwrap();
         let port = address.port();
@@ -193,7 +397,7 @@ impl Listener {
         Self::udp_on(dns, false)
     }
     fn udp_on(dns: bool, ipv6: bool) -> Self {
-        let socket = UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).unwrap();
+        let socket = bind_udp(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" }).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
@@ -492,21 +696,53 @@ impl Drop for Running {
         let _ = self.child.wait();
     }
 }
-fn run(core: &Path, config: &Path, temp: &TempDir) -> Running {
+fn run(core: &Path, config: &Path, temp: &TempDir, reservations: impl Sized) -> Running {
     let (ok, diag) = check(core, config);
     assert!(ok, "mesh config rejected by bundled core: {diag}");
     let log = temp.path().join("core.stderr");
     let mut command = command_for_core(core);
     command.arg("--disable-color");
-    let child = with_run(command)
+    let mut command = with_run(command);
+    command
         .arg("-c")
         .arg(config)
         .stdout(Stdio::null())
-        .stderr(std::fs::File::create(&log).unwrap())
-        .spawn()
-        .unwrap();
-    Running { child, log }
+        .stderr(std::fs::File::create(&log).unwrap());
+    // Validate and prepare before taking the lock. Release it only after the
+    // child's completed Start receipt, or after killing/reaping a failed child.
+    // Unwrap outside the lock so ordinary startup failure does not poison it.
+    handoff(reservations, || {
+        let child = command.spawn().map_err(|error| format!("spawn core: {error}"))?;
+        finish_startup(Running { child, log }, Duration::from_secs(10))
+    })
+    .unwrap_or_else(|error| panic!("mesh core startup failed: {error}"))
 }
+// In the bundled core (577d4b9), Box.Start emits this only after all Start,
+// PostStart and Started stages succeeded. Direct listeners bind synchronously;
+// MASQUE's client.Start launches its session goroutine without waiting for an
+// address. This is service startup readiness, not tunnel/peer readiness.
+fn finish_startup(mut running: Running, timeout: Duration) -> Result<Running, String> {
+    let until = Instant::now() + timeout;
+    loop {
+        let log = running.log();
+        let exited = running
+            .child
+            .try_wait()
+            .map_err(|error| format!("inspect child startup: {error}; stderr={log}"))?;
+        if let Some(status) = exited {
+            return Err(format!("core exited before startup: {status}; stderr={log}"));
+        }
+        if log.lines().any(|line| line.contains("sing-box started (")) {
+            return Ok(running);
+        }
+        if Instant::now() >= until {
+            return Err(format!("core startup deadline exceeded; stderr={log}"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // On every error, Running::drop kills and waits before handoff unlocks.
+}
+
 fn tcp_probe(port: u16) -> Result<(), String> {
     diagnostics::probe_stages(port, Instant::now()).0
 }
@@ -528,7 +764,7 @@ fn eventually_tcp(port: u16) -> Result<(), String> {
     }
 }
 fn udp(port: u16, packet: &[u8]) -> Option<Vec<u8>> {
-    let socket = UdpSocket::bind("127.0.0.1:0").ok()?;
+    let socket = bind_udp("127.0.0.1:0").ok()?;
     socket
         .set_read_timeout(Some(Duration::from_millis(600)))
         .ok()?;
@@ -574,66 +810,6 @@ fn wireguard_family(core: &Path, ipv6: bool) {
     let b_tcp = Listener::tcp_on(ipv6);
     let b_udp = Listener::udp_on(false, ipv6);
     let upstream = Listener::udp(true);
-    let a_out_tcp = free_tcp_port();
-    let a_out_udp = free_udp_port();
-    let a_warm_dns = free_udp_port();
-    let b_in_tcp = free_tcp_port();
-    let b_in_denied_tcp = free_tcp_port();
-    let b_in_udp = free_udp_port();
-    let b_in_dns = free_udp_port();
-    let a_probes = [
-        Probe {
-            tag: "a-to-b-tcp",
-            listen: a_out_tcp,
-            target: b_ip,
-            port: b_tcp.port,
-            udp: false,
-        },
-        Probe {
-            tag: "a-to-b-udp",
-            listen: a_out_udp,
-            target: b_ip,
-            port: b_udp.port,
-            udp: true,
-        },
-        Probe {
-            tag: "warm-dns",
-            listen: a_warm_dns,
-            target: "127.0.0.1",
-            port: a_warm_dns,
-            udp: true,
-        },
-    ];
-    let b_probes = [
-        Probe {
-            tag: "b-to-a-tcp",
-            listen: b_in_tcp,
-            target: a_ip,
-            port: a_tcp.port,
-            udp: false,
-        },
-        Probe {
-            tag: "b-to-a-denied",
-            listen: b_in_denied_tcp,
-            target: a_ip,
-            port: a_denied_tcp.port,
-            udp: false,
-        },
-        Probe {
-            tag: "b-to-a-udp",
-            listen: b_in_udp,
-            target: a_ip,
-            port: a_udp.port,
-            udp: true,
-        },
-        Probe {
-            tag: "b-to-a-dns",
-            listen: b_in_dns,
-            target: a_ip,
-            port: 53,
-            udp: true,
-        },
-    ];
     let listeners = [
         ("a_tcp", &a_tcp),
         ("a_denied_tcp", &a_denied_tcp),
@@ -645,6 +821,70 @@ fn wireguard_family(core: &Path, ipv6: bool) {
     for (label, policy, should_allow) in
         policy_cases(peer_cidr, wrong_source, wide_target, a_tcp.port, a_udp.port)
     {
+        // Fresh leases each policy: prior cores are killed and reaped on drop,
+        // and their released ports must not be assumed free for the next run.
+        let mut a_ports = InboundPortReservations::default();
+        let mut b_ports = InboundPortReservations::default();
+        let a_out_tcp = a_ports.tcp();
+        let a_out_udp = a_ports.udp();
+        let a_warm_dns = a_ports.udp();
+        let b_in_tcp = b_ports.tcp();
+        let b_in_denied_tcp = b_ports.tcp();
+        let b_in_udp = b_ports.udp();
+        let b_in_dns = b_ports.udp();
+        let a_probes = [
+            Probe {
+                tag: "a-to-b-tcp",
+                listen: a_out_tcp,
+                target: b_ip,
+                port: b_tcp.port,
+                udp: false,
+            },
+            Probe {
+                tag: "a-to-b-udp",
+                listen: a_out_udp,
+                target: b_ip,
+                port: b_udp.port,
+                udp: true,
+            },
+            Probe {
+                tag: "warm-dns",
+                listen: a_warm_dns,
+                target: "127.0.0.1",
+                port: a_warm_dns,
+                udp: true,
+            },
+        ];
+        let b_probes = [
+            Probe {
+                tag: "b-to-a-tcp",
+                listen: b_in_tcp,
+                target: a_ip,
+                port: a_tcp.port,
+                udp: false,
+            },
+            Probe {
+                tag: "b-to-a-denied",
+                listen: b_in_denied_tcp,
+                target: a_ip,
+                port: a_denied_tcp.port,
+                udp: false,
+            },
+            Probe {
+                tag: "b-to-a-udp",
+                listen: b_in_udp,
+                target: a_ip,
+                port: a_udp.port,
+                udp: true,
+            },
+            Probe {
+                tag: "b-to-a-dns",
+                listen: b_in_dns,
+                target: a_ip,
+                port: 53,
+                udp: true,
+            },
+        ];
         // Allocate after all live echo/DNS listeners. Their IPv6 ports must not
         // be reused by the wildcard WireGuard endpoints (original CI collision).
         // Each policy gets fresh leases; kernel execution itself is never retried.
@@ -674,8 +914,7 @@ fn wireguard_family(core: &Path, ipv6: bool) {
             None,
         );
         let b_path = write_config(&b_temp, &b);
-        drop(b_lease);
-        let mut b_core = run(core, &b_path, &b_temp);
+        let mut b_core = run(core, &b_path, &b_temp, (b_ports, b_lease));
         let a = runtime_config(
             wg_config(true, ipv6, b_wg, policy),
             &a_temp,
@@ -684,8 +923,7 @@ fn wireguard_family(core: &Path, ipv6: bool) {
             Some(upstream.port),
         );
         let a_path = write_config(&a_temp, &a);
-        drop(a_lease);
-        let mut a_core = run(core, &a_path, &a_temp);
+        let mut a_core = run(core, &a_path, &a_temp, (a_ports, a_lease));
         // 正向 A→B 先成功，证明两核隧道及回包通，且 B 学到了 A 的 peer 地址。
         let (forward_tcp, listener_observations) = diagnostics::observe_forward_tcp_with_logs(
             a_out_tcp,
@@ -1013,82 +1251,87 @@ fn masque_family(core: &Path, ipv6: bool) {
     let b_tcp = Listener::tcp_on(ipv6);
     let b_udp = Listener::udp_on(false, ipv6);
     let upstream = Listener::udp(true);
-    let a_out_tcp = free_tcp_port();
-    let a_out_udp = free_udp_port();
-    let a_warm_dns = free_udp_port();
-    let b_in_tcp = free_tcp_port();
-    let b_in_denied_tcp = free_tcp_port();
-    let b_in_udp = free_udp_port();
-    let b_in_dns = free_udp_port();
-    let a_probes = [
-        Probe {
-            tag: "a-to-b-tcp",
-            listen: a_out_tcp,
-            target: b_ip,
-            port: b_tcp.port,
-            udp: false,
-        },
-        Probe {
-            tag: "a-to-b-udp",
-            listen: a_out_udp,
-            target: b_ip,
-            port: b_udp.port,
-            udp: true,
-        },
-        Probe {
-            tag: "warm-dns",
-            listen: a_warm_dns,
-            target: "127.0.0.1",
-            port: a_warm_dns,
-            udp: true,
-        },
-    ];
-    let b_probes = [
-        Probe {
-            tag: "b-to-a-tcp",
-            listen: b_in_tcp,
-            target: a_ip,
-            port: a_tcp.port,
-            udp: false,
-        },
-        Probe {
-            tag: "b-to-a-denied",
-            listen: b_in_denied_tcp,
-            target: a_ip,
-            port: a_denied_tcp.port,
-            udp: false,
-        },
-        Probe {
-            tag: "b-to-a-udp",
-            listen: b_in_udp,
-            target: a_ip,
-            port: a_udp.port,
-            udp: true,
-        },
-        Probe {
-            tag: "b-to-a-dns",
-            listen: b_in_dns,
-            target: a_ip,
-            port: 53,
-            udp: true,
-        },
-    ];
     for (label, policy, should_allow) in
         policy_cases(source, wrong_source, wide_target, a_tcp.port, a_udp.port)
     {
+        // Fresh leases each policy: prior cores are killed and reaped on drop,
+        // and their released ports must not be assumed free for the next run.
+        let mut a_ports = InboundPortReservations::default();
+        let mut b_ports = InboundPortReservations::default();
+        let a_out_tcp = a_ports.tcp();
+        let a_out_udp = a_ports.udp();
+        let a_warm_dns = a_ports.udp();
+        let b_in_tcp = b_ports.tcp();
+        let b_in_denied_tcp = b_ports.tcp();
+        let b_in_udp = b_ports.udp();
+        let b_in_dns = b_ports.udp();
+        let a_probes = [
+            Probe {
+                tag: "a-to-b-tcp",
+                listen: a_out_tcp,
+                target: b_ip,
+                port: b_tcp.port,
+                udp: false,
+            },
+            Probe {
+                tag: "a-to-b-udp",
+                listen: a_out_udp,
+                target: b_ip,
+                port: b_udp.port,
+                udp: true,
+            },
+            Probe {
+                tag: "warm-dns",
+                listen: a_warm_dns,
+                target: "127.0.0.1",
+                port: a_warm_dns,
+                udp: true,
+            },
+        ];
+        let b_probes = [
+            Probe {
+                tag: "b-to-a-tcp",
+                listen: b_in_tcp,
+                target: a_ip,
+                port: a_tcp.port,
+                udp: false,
+            },
+            Probe {
+                tag: "b-to-a-denied",
+                listen: b_in_denied_tcp,
+                target: a_ip,
+                port: a_denied_tcp.port,
+                udp: false,
+            },
+            Probe {
+                tag: "b-to-a-udp",
+                listen: b_in_udp,
+                target: a_ip,
+                port: a_udp.port,
+                udp: true,
+            },
+            Probe {
+                tag: "b-to-a-dns",
+                listen: b_in_dns,
+                target: a_ip,
+                port: 53,
+                udp: true,
+            },
+        ];
         let has_policy = policy.is_some();
         // 每轮独立 server 地址池。固定顺序仅用于此夹具，必须观测当轮实际分配；
         // MASQUE 没有按设备身份持久租约，不能从这里推导重连地址稳定。
         let server_temp = tempfile::tempdir().unwrap();
         let a_temp = tempfile::tempdir().unwrap();
         let b_temp = tempfile::tempdir().unwrap();
-        let server_port = free_udp_port();
+        let mut server_ports = InboundPortReservations::default();
+        let server_port = server_ports.udp();
         let mut server = masque_server_config(server_port, ipv6);
         if ipv6 {
             server["log"]["level"] = json!("debug");
         }
         let server_path = write_config(&server_temp, &server);
-        let mut server_core = run(core, &server_path, &server_temp);
+        let mut server_core = run(core, &server_path, &server_temp, server_ports);
         let mut a = runtime_config(
             masque_client_config(true, ipv6, server_port, policy),
             &a_temp,
@@ -1102,7 +1345,7 @@ fn masque_family(core: &Path, ipv6: bool) {
         assert_eq!(a["endpoints"][0]["version"], 3);
         assert_eq!(a["endpoints"][0]["disable_version_fallback"], true);
         let a_path = write_config(&a_temp, &a);
-        let mut a_core = run(core, &a_path, &a_temp);
+        let mut a_core = run(core, &a_path, &a_temp, a_ports);
         assert!(
             eventually(|| server_assigned(&server_core.log(), "mesh-a", a_ip)),
             "{family}/{label}: A was not assigned the expected in-session address: {} / {}",
@@ -1122,7 +1365,7 @@ fn masque_family(core: &Path, ipv6: bool) {
         assert_eq!(b["endpoints"][0]["version"], 3);
         assert_eq!(b["endpoints"][0]["disable_version_fallback"], true);
         let b_path = write_config(&b_temp, &b);
-        let mut b_core = run(core, &b_path, &b_temp);
+        let mut b_core = run(core, &b_path, &b_temp, b_ports);
         assert!(
             eventually(|| server_assigned(&server_core.log(), "mesh-b", b_ip)),
             "{family}/{label}: B was not assigned the expected in-session address: {} / {}",

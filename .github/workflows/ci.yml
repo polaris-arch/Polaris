@@ -895,10 +895,8 @@ jobs:
         id: windows_directory_go
         shell: pwsh
         run: |
-          $mod = Get-Content -LiteralPath .windows-directory-kernel/go.mod -Raw
-          $pins = [regex]::Matches($mod, '(?m)^toolchain go([0-9]+[.][0-9]+[.][0-9]+)\s*$')
-          if ($pins.Count -ne 1) { throw 'Expected one exact kernel source toolchain pin' }
-          "version=$($pins[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
+          python scripts/windows-directory/resolve-toolchain.py --kernel-root .windows-directory-kernel --mode '${{ steps.windows_directory_source.outputs.mode }}' --source '${{ steps.windows_directory_source.outputs.source }}' --github-output $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'Exact kernel compiler policy resolution failed' }
       - name: Setup exact kernel Go toolchain
         id: windows_directory_go_setup
         if: >-
@@ -1121,9 +1119,8 @@ jobs:
         id: kernel_go
         shell: pwsh
         run: |
-          $pins = [regex]::Matches((Get-Content -LiteralPath .windows-directory-kernel/go.mod -Raw), '(?m)^toolchain go([0-9]+[.][0-9]+[.][0-9]+)\s*$')
-          if ($pins.Count -ne 1) { throw 'Expected one exact source toolchain pin' }
-          "version=$($pins[0].Groups[1].Value)" >> $env:GITHUB_OUTPUT
+          python scripts/windows-directory/resolve-toolchain.py --kernel-root .windows-directory-kernel --mode candidate --source '${{ steps.candidate.outputs.source }}' --github-output $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'Exact diagnostic compiler policy resolution failed' }
       - name: Setup exact diagnostic Go toolchain
         uses: actions/setup-go@v5
         with:

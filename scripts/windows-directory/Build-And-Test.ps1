@@ -65,8 +65,12 @@ Push-Location $kernelRoot
 try {
     $actualGo = & go env GOVERSION
     if ($LASTEXITCODE -ne 0) { throw 'Go compiler identity unavailable' }
-    $expectedGo = [regex]::Match((Get-Content go.mod -Raw),'(?m)^toolchain (go[0-9.]+)\s*$').Groups[1].Value
-    if (-not $expectedGo -or $actualGo -cne $expectedGo) { throw 'Go compiler differs from exact source toolchain' }
+    $toolchainJson = & python (Join-Path $PSScriptRoot 'resolve-toolchain.py') --kernel-root $kernelRoot --mode $mode --source $source --actual-go $actualGo
+    if ($LASTEXITCODE -ne 0) { throw 'Exact source/compiler policy verification failed' }
+    $toolchain = $toolchainJson | ConvertFrom-Json -AsHashtable
+    $expectedGo = $toolchain.selectedCompiler
+    if ($actualGo -cne $expectedGo) { throw 'Go compiler differs from exact selected compiler' }
+    $toolchainJson | Set-Content -LiteralPath (Join-Path $outputRoot 'toolchain-evidence.json') -Encoding utf8NoBOM
     & go test -c -buildvcs=true -mod=readonly -trimpath -tags $tags -ldflags $ldflags -o $kernelExe ./protocol/tailscale
     if ($LASTEXITCODE -ne 0) { throw 'Native kernel test producer build failed' }
     & go test -c -buildvcs=true -mod=readonly -trimpath -tags $tags -ldflags $ldflags -o $activationExe .

@@ -16,5 +16,5 @@ test('formal mobile input/output/cache/recovery source controls run without nati
   });
   assert.equal(result.status, 0, `${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
   const count = result.stderr.match(/Ran (\d+) tests/);
-  assert.ok(count && Number(count[1]) >= 294, 'all existing mobile controls plus the 32 merge-reuse controls must execute');
+  assert.ok(count && Number(count[1]) >= 296, 'all existing mobile controls plus the 34 merge-reuse controls must execute');
 });

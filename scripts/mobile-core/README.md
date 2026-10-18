@@ -545,3 +545,11 @@ with the uploaded bytes and checks the provider workflow binding. Only after
 those checks may it return `eligible=false` without a sidecar. Malformed later
 snapshots, missing/changed originals or changed current aggregate inputs remain
 hard failures even when some or all execution observations are unavailable.
+
+
+Carrier execution snapshots enter the existing producer `private_dir` boundary
+before writing either supported or unavailable observations. A fresh carrier slot
+is created with mode 0700 and the current owner; a preexisting wrong-mode/owner
+or redirected slot is rejected, never chmod-repaired. The same slot is admitted
+again by the actual carrier entry. Generic resolver/sealer output parents retain
+their existing semantics; no global directory-permission relaxation is applied.

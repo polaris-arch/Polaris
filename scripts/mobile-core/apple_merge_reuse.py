@@ -297,11 +297,15 @@ def validate_cargo_configuration(pins):
 
 def snapshot(phase, slot=None):
     from ci_apple import location, selected_apple_tools
+    from producer import private_dir
     require(phase in PHASES and os.environ.get('POLARIS_APPLE_SCOPE') == 'device-only',
             'only declared device-only snapshots supported')
     require((phase.startswith('carrier-') and slot == 'device-arm64') or
             (phase.startswith('frontend-') and slot is None), 'snapshot slot differs')
     root = location()
+    # A before-snapshot is the first writer in the carrier work slot. Admit
+    # it through the producer boundary, never generic receipt-parent mkdir.
+    target = private_dir(root / slot) if slot else root
     selected_apple_tools(load())
     prepared = read_receipt(root / 'tools.json')
     paths = {name: prepared['paths'][name] for name in ('go', 'gomobile', 'gobind')}
@@ -332,7 +336,6 @@ def snapshot(phase, slot=None):
         row = signed({'schema': UNAVAILABLE_SCHEMA, 'context': current_context(), 'phase': phase,
                       'slot': slot, 'workflowSha': sha40(os.environ.get('GITHUB_WORKFLOW_SHA')),
                       'source': source_summary(source_bindings()), 'reason': UNAVAILABLE_REASON, **FALSE_CLAIMS})
-        target = root / slot if slot else root
         write_new(target / ('execution-' + phase + '.json'), row)
         print('Cargo inputs cannot qualify for reuse; continuing the full native build.', flush=True)
         return
@@ -341,7 +344,6 @@ def snapshot(phase, slot=None):
                   'source': source_summary(source_bindings()), 'tools': facts, 'sdk': sdk,
                   **inputs, **FALSE_CLAIMS})
     validate_snapshot(row, phase, current_context(), source_summary(source_bindings()), load())
-    target = root / slot if slot else root
     write_new(target / ('execution-' + phase + '.json'), row)
 
 

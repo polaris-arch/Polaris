@@ -1044,10 +1044,10 @@ class AppleMergeReuseControls(unittest.TestCase):
     def test_snapshot_collects_actual_binary_and_sdk_bytes_before_and_after(self):
         self.collect_snapshot_fixture()
 
-    def collect_snapshot_fixture(self, *, unavailable=False):
-        root = Path(self.temp.name) / 'snapshot-root'
-        root.mkdir()
-        (root / 'device-arm64').mkdir()
+    def collect_snapshot_fixture(self, *, unavailable=False, before_each=None, after_each=None):
+        root = (Path(self.temp.name) / 'snapshot-root').resolve()
+        root.mkdir(mode=0o700)
+        self.assertFalse((root / 'device-arm64').exists())
         binaries = root / 'tools'
         binaries.mkdir()
         for name in self.fx.tools:
@@ -1075,7 +1075,9 @@ class AppleMergeReuseControls(unittest.TestCase):
                 mock.patch.object(reuse, 'current_context', return_value=self.fx.ctx), \
                 mock.patch.object(reuse, 'source_bindings', return_value=self.fx.source):
             for phase in reuse.PHASES:
+                if before_each: before_each(root, phase)
                 reuse.snapshot(phase, 'device-arm64' if phase.startswith('carrier-') else None)
+                if after_each: after_each(root, phase)
         for phase in reuse.PHASES:
             path = root / ('device-arm64' if phase.startswith('carrier-') else '') / ('execution-' + phase + '.json')
             row = reuse.safe_json(path.read_bytes())
@@ -1090,6 +1092,114 @@ class AppleMergeReuseControls(unittest.TestCase):
             self.assertEqual(row['tools']['go']['sha256'], file_pin(binaries / 'go')['sha256'])
             self.assertEqual(row['sdk']['iphoneos']['settings'], file_pin(root / 'iphoneos/SDKSettings.json'))
             self.assertEqual('protoc' in row['tools'], phase.startswith('carrier-'))
+        return root
+
+    def test_snapshot_creates_private_slot_before_real_carrier_admission(self):
+        import ci_apple
+        from producer import private_dir
+        for unavailable in (False, True):
+            for mask in (0o000, 0o002, 0o022, 0o077):
+                for existing in (False, True):
+                    with self.subTest(unavailable=unavailable, umask=oct(mask), existing=existing):
+                        case = AppleMergeReuseControls('test_snapshot_collects_actual_binary_and_sdk_bytes_before_and_after')
+                        case.setUp(); previous = os.umask(mask); reached = []
+                        def before(root, phase):
+                            if phase == 'carrier-before' and existing:
+                                private_dir(root / 'device-arm64')
+                                (root / 'device-arm64/retained-input').write_bytes(b'unchanged')
+                        def after(root, phase):
+                            if phase != 'carrier-before': return
+                            slot = root / 'device-arm64'; info = slot.stat()
+                            self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
+                            self.assertEqual(info.st_uid, os.getuid())
+                            self.assertEqual(private_dir(slot), slot)
+                            snapshot = (slot / 'execution-carrier-before.json').read_bytes()
+                            (root / 'component-handoff.json').write_bytes(b'fixture presence')
+                            imported = {'completed': True, 'context': case.fx.ctx}
+                            with (root / 'fixture-native-progress.log').open('w') as progress, \
+                                    mock.patch.object(ci_apple.sys, 'stdout', progress), \
+                                    mock.patch.object(ci_apple, 'read_receipt', side_effect=lambda path:
+                                    imported if Path(path).name == 'import-observation.json' else {'paths': {}}), \
+                                    mock.patch('apple_handoff.context', return_value=case.fx.ctx), \
+                                    mock.patch('apple_handoff.carrier_summary') as summary, \
+                                    mock.patch.object(ci_apple, 'phase_timing', return_value=contextlib.nullcontext()), \
+                                    mock.patch.object(ci_apple, 'run') as launch:
+                                # Actual carrier() and private_dir; only native launch/summary are mocked.
+                                ci_apple.carrier('device-arm64')
+                            launch.assert_called_once(); summary.assert_called_once_with(root, 'device-arm64')
+                            args = launch.call_args.args[0]
+                            self.assertEqual(args[args.index('--work') + 1], slot)
+                            self.assertEqual(slot.stat().st_ino, info.st_ino)
+                            self.assertEqual(stat.S_IMODE(slot.stat().st_mode), 0o700)
+                            self.assertEqual((slot / 'execution-carrier-before.json').read_bytes(), snapshot)
+                            reached.append(True)
+                        try:
+                            parser = mock.patch.dict(reuse.sys.modules, {'tomllib': None}) if unavailable else contextlib.nullcontext()
+                            with parser:
+                                root = case.collect_snapshot_fixture(unavailable=unavailable, before_each=before, after_each=after)
+                            self.assertEqual(reached, [True])
+                            self.assertEqual(stat.S_IMODE((root / 'device-arm64').stat().st_mode), 0o700)
+                            if existing: self.assertEqual((root / 'device-arm64/retained-input').read_bytes(), b'unchanged')
+                        finally:
+                            os.umask(previous); case.doCleanups()
+
+    def test_snapshot_refuses_unsafe_existing_slot_without_repair_or_overwrite(self):
+        kinds = ('mode-755', 'mode-775', 'file', 'symlink', 'dangling', 'parent-symlink',
+                 'wrong-owner', 'existing-receipt', 'mode-changed-after')
+        for unavailable in (False, True):
+            for kind in kinds:
+                with self.subTest(unavailable=unavailable, kind=kind):
+                    case = AppleMergeReuseControls('test_snapshot_collects_actual_binary_and_sdk_bytes_before_and_after')
+                    case.setUp(); observed = {}; ownership = None
+                    def before(root, phase):
+                        nonlocal ownership
+                        slot = root / 'device-arm64'
+                        if phase == 'carrier-before':
+                            if kind.startswith('mode-'):
+                                mode = {'mode-755': 0o755, 'mode-775': 0o775, 'mode-changed-after': 0o700}[kind]
+                                slot.mkdir(mode=0o700); slot.chmod(mode); observed['mode'] = mode
+                            elif kind == 'file': slot.write_bytes(b'retained file')
+                            elif kind in ('symlink', 'dangling'):
+                                target = root / 'redirected-slot'
+                                if kind == 'symlink': target.mkdir(mode=0o700)
+                                slot.symlink_to(target); observed['target'] = target
+                            elif kind == 'parent-symlink':
+                                real = root.with_name('original-snapshot-root'); root.rename(real); root.symlink_to(real)
+                                observed['target'] = real / 'device-arm64'
+                            elif kind == 'wrong-owner':
+                                slot.mkdir(mode=0o700)
+                                ownership = mock.patch('producer.os.getuid', return_value=os.getuid() + 1)
+                                ownership.start()
+                            elif kind == 'existing-receipt':
+                                slot.mkdir(mode=0o700); (slot / 'execution-carrier-before.json').write_bytes(b'original receipt')
+                        elif phase == 'carrier-after' and kind == 'mode-changed-after':
+                            observed['before'] = (slot / 'execution-carrier-before.json').read_bytes()
+                            slot.chmod(0o755); observed['mode'] = 0o755
+                    try:
+                        parser = mock.patch.dict(reuse.sys.modules, {'tomllib': None}) if unavailable else contextlib.nullcontext()
+                        with parser, self.assertRaises((RuntimeError, OSError)):
+                            case.collect_snapshot_fixture(unavailable=unavailable, before_each=before)
+                        root = Path(case.temp.name) / 'snapshot-root'; slot = root / 'device-arm64'
+                        if kind.startswith('mode-'):
+                            self.assertEqual(stat.S_IMODE(slot.stat().st_mode), observed['mode'])
+                        if kind == 'file': self.assertEqual(slot.read_bytes(), b'retained file')
+                        elif kind == 'existing-receipt':
+                            self.assertEqual((slot / 'execution-carrier-before.json').read_bytes(), b'original receipt')
+                        elif kind == 'mode-changed-after':
+                            self.assertEqual((slot / 'execution-carrier-before.json').read_bytes(), observed['before'])
+                        else: self.assertFalse((slot / 'execution-carrier-before.json').exists())
+                        self.assertFalse((slot / 'execution-carrier-after.json').exists())
+                        if 'target' in observed:
+                            self.assertFalse((observed['target'] / 'execution-carrier-before.json').exists())
+                    finally:
+                        if ownership: ownership.stop()
+                        case.doCleanups()
+        # Scope rejection precedes location, directory admission, or receipt writes.
+        with mock.patch('ci_apple.location') as location, mock.patch.object(reuse, 'write_new') as write:
+            for phase, slot in [('unknown', None), ('carrier-before', 'sim-arm64'), ('frontend-before', 'device-arm64')]:
+                with mock.patch.dict(os.environ, {'POLARIS_APPLE_SCOPE': 'device-only'}), self.assertRaises(RuntimeError):
+                    reuse.snapshot(phase, slot)
+            location.assert_not_called(); write.assert_not_called()
 
     def test_full_producer_seal_requires_active_aggregate_and_uploaded_chain_bytes(self):
         jobs = self.fx.routes['/actions/runs/100/attempts/2/jobs?per_page=100']['jobs']

@@ -198,8 +198,9 @@ test('candidate checkout and App/helper identity follow PR head instead of a def
       assert.match(read[0], /ConvertFrom-Json -AsHashtable\)\.platforms\.win/);
     }
     assert.match(ci, /go-version: \$\{\{ steps\.windows_directory_go\.outputs\.version \}\}/);
-    assert.match(ci, /\$pins\.Count -ne 1/);
-    assert.match(ci, /version=\$\(\$pins\[0\]\.Groups\[1\]\.Value\)/);
+    assert.match(ci, /python scripts\/windows-directory\/resolve-toolchain\.py/);
+    assert.match(ci, /--github-output \$env:GITHUB_OUTPUT/);
+    assert.match(producer, /resolve-toolchain\.py.*--actual-go \$actualGo/);
     assert.doesNotMatch(ci, /go-version-file: \.windows-directory-kernel\/go\.mod/);
     assert.match(producer, /\$actualGo -cne \$expectedGo/);
   }
