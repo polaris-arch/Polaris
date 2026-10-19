@@ -377,7 +377,11 @@ test('resolver failures and partial uploads select a full component build withou
   }
   assert.match(resolver, /id: resolve\n\s+continue-on-error: true/);
   assert.match(resolver, /id: receipt\n\s+if: \$\{\{ steps.resolve.outcome == 'success' && steps.resolve.outputs.reused == 'true' \}\}\n\s+continue-on-error: true/);
-  assert.equal((workflow.match(/continue-on-error: true/g) || []).length, 2);
+  assert.equal((workflow.match(/continue-on-error: true/g) || []).length, 4);
+  for (const name of ['Restore exact trusted-main complete Go component package',
+    'Save exact trusted-main component package']) {
+    assert.match(workflowStep(workflow, name), /continue-on-error: true/);
+  }
   assert.match(resolver, /receipt_sha256: \$\{\{ steps.resolve.outputs.receipt_sha256 \}\}/);
   const verification = workflowStep(workflow, 'Verify same-tree evidence receipt against the current candidate and context');
   assert.match(verification, /RECEIPT_SHA256: \$\{\{ needs.resolve.outputs.receipt_sha256 \}\}/);
@@ -673,7 +677,7 @@ test('actual Git/CLI leaf exception, full override and legacy invocation stay co
 // Frozen fixtures model the reviewed owner versions. Current owner edits are
 // allowed and simply disable optimization, including in the real CLI test below.
 const mobileOwners = [
-  ['scripts/mobile-core/producer.py', '100644', '38c4e3e7804feb181cc17319a45298d4d853a92a'],
+  ['scripts/mobile-core/producer.py', '100644', '56074f0294450f26ba6ef3934df52fa81d6b4105'],
   ['scripts/mobile-source-unit.test.mjs', '100644', '8cc09d5f633f4f3c2eb6a4246f79644773b5681e'],
   ['scripts/gate-node-test.sh', '100755', '52e873e5cc95361c6723318d398caeb4db442664'],
   ['.github/workflows/release-risk.yml', '100644', '8424964ac3edd11cfe182b852dabae405b7b70ad'],

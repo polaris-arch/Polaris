@@ -83,3 +83,42 @@ test('complete packaging gate rejects old names, stale versions, extra files, mi
     assert.equal(run().status, 1);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+const packageWorkflow = readFileSync(new URL('../.github/workflows/package.yml', import.meta.url), 'utf8');
+const releaseJobs = packageWorkflow.slice(packageWorkflow.indexOf('\n  release_desktop:'));
+
+test('both release consumers select only the four current-tag desktop transports', () => {
+  const selectors = [...releaseJobs.matchAll(/^          pattern: (.+)$/gm)].map((match) => match[1]);
+  assert.deepEqual(selectors, Array(2).fill('polaris-{linux,windows,macos-arm64,macos-x64}-${{ github.ref_name }}'));
+  assert.equal((releaseJobs.match(/merge-multiple: true/g) || []).length, 2);
+  // No cross-run/repository override: download-artifact defaults to the current run.
+  assert.doesNotMatch(releaseJobs, /^          (?:run-id|repository|github-token):/m);
+  for (const job of ['release_desktop', 'release']) {
+    const body = packageWorkflow.split(`\n  ${job}:`)[1].split(/\n  [a-z_]+:/)[0];
+    assert.ok(body.indexOf('assetNames(tag.slice(1), "release")') < body.indexOf('uses: actions/download-artifact@v8'));
+    assert.match(body, /verify-packaging\.mjs"? assets --label release/);
+  }
+});
+
+test('actual pre-download tag guard rejects glob expansion and non-release identities', () => {
+  const guards = [...releaseJobs.matchAll(/^          (node --input-type=module -e '.+assetNames\(tag.slice\(1\), "release"\);')$/gm)].map((match) => match[1]);
+  assert.equal(guards.length, 2);
+  assert.equal(guards[0], guards[1]);
+  for (const tag of ['v1.0.0', 'v1.0.0-rc.1', 'main', '1.0.0', 'v1.0.0*', 'v1.0.0-[ab]', 'v1.0.0-{a,b}', 'v1.0.0-@(a)', 'v../1.0.0']) {
+    const result = spawnSync('bash', ['-c', guards[0]], {
+      encoding: 'utf8', env: { ...process.env, GITHUB_REF_NAME: tag },
+    });
+    assert.equal(result.status, ['v1.0.0', 'v1.0.0-rc.1'].includes(tag) ? 0 : 1, tag);
+  }
+});
+
+test('transport retention, light-build isolation and evidence retention are unchanged', () => {
+  const upload = packageWorkflow.split('      - name: Upload artifacts\n')[1].split('\n  # ══')[0];
+  assert.match(upload, /if: env\.POLARIS_UPLOAD_ARTIFACTS == '1'/);
+  assert.match(upload, /retention-days: 7/);
+  assert.doesNotMatch(packageWorkflow, /actions: write|deleteArtifact|delete-artifact/);
+  const android = readFileSync(new URL('../.github/workflows/android.yml', import.meta.url), 'utf8');
+  assert.equal((android.match(/retention-days: 90/g) || []).length, 6);
+  assert.match(android, /name: android-release-mapping/);
+  assert.match(android, /name: formal-mobile-input-\$\{\{ github\.job \}\}/);
+});

@@ -7,6 +7,7 @@ import json
 import struct
 import io
 import zipfile
+from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
@@ -1359,6 +1360,214 @@ class AppleEntryTests(unittest.TestCase):
         unknown = bytearray(foundation); struct.pack_into('<I', unknown, 0, 0x7ffffffe)
         with self.assertRaisesRegex(RuntimeError, 'unsupported load command'):
             parser.macho(fixtures.mach_object('ios-arm64', load_commands=[bytes(unknown)]), helper)
+
+
+class AppleCacheIdentityTests(unittest.TestCase):
+    @staticmethod
+    def pin(value):
+        raw = value.encode()
+        return {'bytes': len(raw), 'sha256': apple_cache.sha(raw)}
+
+    def inputs(self):
+        return {'tools': {'xcode': 'Xcode 27.1\nBuild version selected',
+            'App': {'candidate': 'a' * 40,
+                    'files': {name: self.pin(name) for name in apple_cache.PRODUCER_FILES}}},
+            'rustc': 'rustc 1.98.0\ncommit-hash: actual-rustc', 'cargo': 'cargo 1.98.0 (actual-cargo)',
+            'tool_pins': {name: self.pin(name + ' executable') for name in ('cargo', 'rustc')},
+            'config': {name: self.pin(name) for name in ('Cargo.lock', 'Cargo.toml',
+                'src-tauri/Cargo.toml', 'crates/new-dependency/Cargo.toml',
+                '.cargo/config.toml', 'src-tauri/.cargo/config', 'rust-toolchain.toml',
+                '.github/workflows/apple.yml', 'src-tauri/tauri.conf.json', 'src-tauri/tauri.ios.conf.json')},
+            'environment': {}}
+
+    def test_only_reviewed_android_only_files_are_omitted_without_editing_provenance(self):
+        inputs = self.inputs(); baseline = apple_cache.cache_identities(**inputs)
+        self.assertEqual(apple_cache.APPLE_RUST_UNRELATED_CODE, frozenset({
+            'scripts/mobile-core/android_sdk.py', 'scripts/libbox-patches/prepare-ndk-linux.py',
+            'scripts/libbox-patches/ndk-linux-archive.json'}))
+        for name in apple_cache.APPLE_RUST_UNRELATED_CODE:
+            with self.subTest(name=name):
+                changed = deepcopy(inputs)
+                changed['tools']['App']['files'][name] = self.pin('changed Android-only bytes')
+                original = deepcopy(changed['tools']['App'])
+                self.assertEqual(apple_cache.cache_identities(**changed), baseline)
+                self.assertEqual(changed['tools']['App'], original)
+        projected = apple_cache.apple_rust_build_code(inputs['tools']['App'])
+        self.assertEqual(set(projected['files']), set(apple_cache.PRODUCER_FILES) -
+                         apple_cache.APPLE_RUST_UNRELATED_CODE)
+        self.assertEqual(projected['policy'], apple_cache.APPLE_RUST_BUILD_CODE_POLICY)
+        name = 'scripts/mobile-core/apple_rust.py'
+        projected['files'][name]['bytes'] += 1
+        self.assertEqual(inputs['tools']['App']['files'][name], self.pin(name))
+
+    def test_shared_apple_helpers_and_unknown_producer_files_still_invalidate_dependencies(self):
+        inputs = self.inputs(); dependency, registry = apple_cache.cache_identities(**inputs)
+        # In particular ci_android.prepare_source and android-source's Mach-O
+        # parser are shared Apple inputs despite their misleading basenames.
+        names = (set(apple_cache.PRODUCER_FILES) - apple_cache.APPLE_RUST_UNRELATED_CODE) | {
+            'scripts/mobile-core/future-producer.py'}
+        for name in names:
+            with self.subTest(name=name):
+                changed = deepcopy(inputs)
+                changed['tools']['App']['files'][name] = self.pin('changed producer')
+                new_dependency, new_registry = apple_cache.cache_identities(**changed)
+                self.assertNotEqual(new_dependency, dependency)
+                self.assertEqual(new_registry, registry)
+
+    def test_projection_rejects_incomplete_inventory_bad_pins_and_unknown_policy(self):
+        original = self.inputs()['tools']['App']
+        missing = deepcopy(original); del missing['files']['scripts/mobile-core/android_sdk.py']
+        bad = [None, {}, {'files': []}, missing]
+        for pin in ({'bytes': 0, 'sha256': 'a' * 64}, {'bytes': True, 'sha256': 'a' * 64},
+                    {'bytes': 3, 'sha256': 'A' * 64}, {'bytes': 3, 'sha256': 'x'},
+                    {'bytes': 3, 'sha256': 'a' * 64, 'ignored': True}):
+            identity = deepcopy(original)
+            identity['files']['scripts/mobile-core/android_sdk.py'] = pin
+            bad.append(identity)
+        unknown = deepcopy(original); unknown['files']['future.py'] = {'bytes': 1, 'sha256': 'bad'}
+        bad.append(unknown)
+        for identity in bad:
+            with self.subTest(identity=identity), self.assertRaises(RuntimeError):
+                apple_cache.apple_rust_build_code(identity)
+        with self.assertRaisesRegex(RuntimeError, 'unknown Apple Rust build code policy'):
+            apple_cache.apple_rust_build_code(original, policy='unreviewed')
+
+    def test_lock_manifest_and_source_configuration_changes_invalidate_both_layers(self):
+        inputs = self.inputs(); baseline = apple_cache.cache_identities(**inputs)
+        names = [name for name in inputs['config'] if apple_cache.cargo_source_config(name)]
+        self.assertEqual(set(names), {'Cargo.lock', 'Cargo.toml', 'src-tauri/Cargo.toml',
+            'crates/new-dependency/Cargo.toml', '.cargo/config.toml', 'src-tauri/.cargo/config'})
+        for name in [*names, 'crates/future/.cargo/config.toml']:
+            with self.subTest(name=name):
+                changed = deepcopy(inputs); changed['config'][name] = self.pin('new source/lock/config')
+                actual = apple_cache.cache_identities(**changed)
+                self.assertTrue(all(left != right for left, right in zip(actual, baseline)))
+        for name in ('Cargo.lock', 'src-tauri/Cargo.toml'):
+            changed = deepcopy(inputs); del changed['config'][name]
+            with self.subTest(missing=name), self.assertRaisesRegex(RuntimeError, 'lock/config inputs missing'):
+                apple_cache.cache_identities(**changed)
+
+    def test_workflow_ios_and_toolchain_configuration_stay_in_compiled_identity(self):
+        inputs = self.inputs(); dependency, registry = apple_cache.cache_identities(**inputs)
+        for name in ('.github/workflows/apple.yml', 'src-tauri/tauri.conf.json',
+                     'src-tauri/tauri.ios.conf.json', 'rust-toolchain.toml'):
+            with self.subTest(name=name):
+                changed = deepcopy(inputs); changed['config'][name] = self.pin('changed build configuration')
+                new_dependency, new_registry = apple_cache.cache_identities(**changed)
+                self.assertNotEqual(new_dependency, dependency)
+                self.assertEqual(new_registry, registry)
+
+    def test_actual_cargo_tools_invalidate_both_and_rust_or_xcode_only_compiled_layer(self):
+        inputs = self.inputs(); dependency, registry = apple_cache.cache_identities(**inputs)
+        for field in ('cargo-version', 'cargo-bytes', 'rustc-version', 'rustc-bytes', 'xcode'):
+            with self.subTest(field=field):
+                changed = deepcopy(inputs)
+                if field.endswith('-bytes'):
+                    changed['tool_pins'][field.split('-')[0]] = self.pin('different actual executable')
+                elif field == 'xcode':
+                    changed['tools']['xcode'] = 'different selected Xcode/SDK build'
+                else:
+                    changed[field.split('-')[0]] = 'different actual version'
+                new_dependency, new_registry = apple_cache.cache_identities(**changed)
+                self.assertNotEqual(new_dependency, dependency)
+                if field.startswith('cargo-'):
+                    self.assertNotEqual(new_registry, registry)
+                else:
+                    self.assertEqual(new_registry, registry)
+
+    def test_rust_native_profile_and_target_flags_remain_dependency_only_inputs(self):
+        inputs = self.inputs(); dependency, registry = apple_cache.cache_identities(**inputs)
+        for name in ('RUSTFLAGS', 'RUSTDOCFLAGS', 'CARGO_ENCODED_RUSTFLAGS',
+                     'CARGO_PROFILE_RELEASE_LTO', 'CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS',
+                     'CFLAGS', 'CFLAGS_aarch64_apple_ios', 'CXXFLAGS_aarch64_apple_darwin',
+                     'OBJC_INCLUDE_PATH_aarch64_apple_ios'):
+            with self.subTest(name=name):
+                changed = deepcopy(inputs); changed['environment'][name] = 'changed flag or SDK path'
+                new_dependency, new_registry = apple_cache.cache_identities(**changed)
+                self.assertNotEqual(new_dependency, dependency)
+                self.assertEqual(new_registry, registry)
+
+    def test_registry_source_overrides_invalidate_both_without_hashing_credentials(self):
+        inputs = self.inputs(); baseline = apple_cache.cache_identities(**inputs)
+        for name in ('CARGO_REGISTRY_DEFAULT', 'CARGO_REGISTRY_INDEX',
+                     'CARGO_REGISTRIES_PRIVATE_INDEX', 'CARGO_REGISTRIES_CRATES_IO_PROTOCOL'):
+            with self.subTest(name=name):
+                changed = deepcopy(inputs); changed['environment'][name] = 'changed source setting'
+                actual = apple_cache.cache_identities(**changed)
+                self.assertTrue(all(left != right for left, right in zip(actual, baseline)))
+        changed = deepcopy(inputs)
+        changed['environment'] = {'CARGO_REGISTRY_TOKEN': 'fixture-token',
+            'CARGO_REGISTRIES_PRIVATE_TOKEN': 'fixture-private-token',
+            'CARGO_REGISTRIES_PRIVATE_CREDENTIAL_PROVIDER': 'fixture-provider'}
+        self.assertEqual(apple_cache.registry_source_overrides(changed['environment']), {})
+        self.assertEqual(apple_cache.cache_identities(**changed), baseline)
+
+    def test_candidate_run_scope_and_private_target_path_are_not_download_or_object_inputs(self):
+        inputs = self.inputs(); baseline = apple_cache.cache_identities(**inputs)
+        changed = deepcopy(inputs); changed['tools']['App']['candidate'] = 'b' * 40
+        changed['environment'] = {'POLARIS_APPLE_SCOPE': 'device-and-simulator',
+            'GITHUB_RUN_ID': '999', 'GITHUB_RUN_ATTEMPT': '3', 'CARGO_TARGET_DIR': '/other/run/cache'}
+        self.assertEqual(apple_cache.cache_identities(**changed), baseline)
+        # Compiled transport still binds scope/slot independently of lookup inputs.
+        first = {'identity': baseline[0], 'scope': scope_fields('device-only')}
+        second = {'identity': baseline[0], 'scope': scope_fields('device-and-simulator')}
+        self.assertNotEqual(apple_cache.manifest(first, 'device-arm64'),
+                            apple_cache.manifest(second, 'device-arm64'))
+
+    def test_prepare_emits_separate_keys_and_ignores_unrelated_tracked_test_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve(); source = base / 'checkout'; source.mkdir()
+            root = base / 'run'; root.mkdir(); home = base / 'home'; (home / '.cargo').mkdir(parents=True)
+            inputs = self.inputs(); tools = inputs['tools']; tools['rustc'] = inputs['rustc']
+            for name in inputs['config']:
+                path = source / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(name)
+            paths = {}
+            for name in ('cargo', 'rustc'):
+                paths[name] = base / name; paths[name].write_text(name + ' actual executable')
+            tracked = [*inputs['config'], 'scripts/mobile-core/test_apple_entry.py',
+                       'scripts/mobile-core/android_sdk.py', 'ui/test-fixture.ts']
+            def run(command, **kwargs):
+                key = tuple(command)
+                values = {('git', 'check-ignore', '--', apple_cache.STAGE.as_posix()): apple_cache.STAGE.as_posix(),
+                    ('git', 'ls-files', '-z'): '\0'.join(tracked) + '\0', ('rustc', '-vV'): inputs['rustc'],
+                    ('cargo', '-V'): inputs['cargo']}
+                values.update({('rustup', 'which', name): str(path) for name, path in paths.items()})
+                self.assertIn(key, values, 'cache preparation must not compile or fetch')
+                return values[key]
+            env = {'RUNNER_TEMP': str(base), 'GITHUB_OUTPUT': str(base / 'outputs')}
+            original = deepcopy(tools)
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(apple_cache, 'ROOT', source), \
+                    mock.patch.object(apple_cache, 'location', return_value=root), \
+                    mock.patch.object(apple_cache.Path, 'home', return_value=home), \
+                    mock.patch.object(apple_cache, 'read_receipt', return_value=tools), \
+                    mock.patch.object(apple_cache, 'run', side_effect=run), \
+                    mock.patch.object(apple_cache, 'context', return_value={'candidate': 'a' * 40}), \
+                    mock.patch.object(apple_cache, 'check_space', return_value=40 * 1024 ** 3), \
+                    mock.patch.object(apple_cache, 'note') as note:
+                apple_cache.prepare()
+            emitted = dict(line.split('=', 1) for line in (base / 'outputs').read_text().splitlines())
+            self.assertEqual(set(emitted), {'identity', 'registry_identity'})
+            self.assertNotEqual(emitted['identity'], emitted['registry_identity'])
+            owner = json.loads((source / apple_cache.STAGE / 'owner.json').read_text())
+            self.assertEqual(owner['identity'], emitted['identity'])
+            self.assertEqual(owner['registryIdentity'], emitted['registry_identity'])
+            self.assertEqual(note.call_args.kwargs['registryIdentity'], emitted['registry_identity'])
+            self.assertEqual(tools, original)
+
+    def test_workflow_uses_exact_independent_versioned_keys_without_restore_prefixes(self):
+        workflow = (apple_cache.ROOT / '.github/workflows/apple.yml').read_text()
+        registry = 'key: apple-registry-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache.outputs.registry_identity }}'
+        self.assertEqual(workflow.count(registry), 1)
+        for target in ('aarch64-apple-ios', 'aarch64-apple-ios-sim'):
+            key = 'key: apple-rust-deps-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.POLARIS_APPLE_SCOPE }}-' + \
+                  target + '-release-${{ steps.rust_cache.outputs.identity }}'
+            self.assertEqual(workflow.count(key), 1)
+        for name in ('rust_registry_restore', 'rust_device_restore', 'rust_sim_restore'):
+            step = workflow.split('id: ' + name + '\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertNotIn('restore-keys:', step)
+        self.assertNotIn('apple-rust-deps-v1-', workflow)
+        self.assertNotIn('apple-registry-v1-', workflow)
 
 
 class AppleDependencyCacheTests(unittest.TestCase):

@@ -1,5 +1,7 @@
 # Native DNS candidate validation and remaining gaps
 
+This document records the scoped fe182 candidate workflow and its evidence boundaries. Its temporary branch, source and base IDs are historical candidate identities, not the current formal desktop selection. For the selected release contract, see [Native DNS consumption](native-dns-consumption-plan.md); for current build instructions, see [Build and Package](build-and-package.en.md). Historical observations below do not certify a later App candidate.
+
 The existing manual `ci.yml` entry calls the local reusable `Native DNS Candidate`
 workflow from the same commit to validate temporary desktop inputs on
 `collab/native-node-dns-20261018`. This works before the new workflow is present

@@ -56,7 +56,7 @@
 
 ## Install
 
-Download the package for your platform from [Releases](https://github.com/polaris-arch/Polaris/releases).
+Once a release is published, download the package for your platform from [Releases](https://github.com/polaris-arch/Polaris/releases). Source or CI validation does not establish public download availability.
 
 The current release pipeline uses the filenames defined in [release-assets.mjs](scripts/release-assets.mjs); `<version>` is the app version without the `v` prefix. macOS has separate Apple Silicon / Intel packages, Windows uses x64, and Linux uses amd64. Android packages are listed as ARM64, ARMv7, and universal; universal contains only these two ARM architectures, not x86. Download availability depends on the actual assets of the selected Release. Check files against `SHA256SUMS` on the same release page.
 
@@ -90,7 +90,7 @@ When SmartScreen appears, choose **More info** → **Run anyway**.
 
 ## Build
 
-This section is for maintainers building the current source, with Linux as the example. A successful source build does not establish runtime acceptance of published packages. See the build guides below for platform dependencies, mobile toolchains, and packaging conventions.
+This section is for maintainers building the current source. A successful source build does not establish runtime acceptance of published packages. See the build guides below for platform dependencies, mobile toolchains, and packaging conventions.
 
 Source-build guides: [desktop and Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [mobile core and pinned toolchains](scripts/mobile-core/README.md).
 
@@ -98,16 +98,7 @@ iOS currently has no published IPA or jailbreak package; jailbreak compatibility
 
 Requires Rust stable, Node.js 24+ (CI currently uses Node 26), pnpm 11.24.0, Go, and [Tauri CLI 2](https://v2.tauri.app/).
 
-```bash
-npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
-pnpm --dir ui install --frozen-lockfile   # frontend dependencies
-# Desktop core: consume the pinned release selected by core-manifest.json desktopRelease
-node scripts/fetch-core.mjs --platform=linux
-# Native acceptance bundles and local resource preparation: docs/build-and-package.en.md
-node scripts/fetch-cronet.mjs --platform=linux  # fetch libcronet.so beside the Linux core
-node scripts/fetch-dashboard.mjs   # fetch the built-in dashboard
-tauri build --config src-tauri/tauri.linux.conf.json
-```
+Follow the [complete desktop build steps](docs/build-and-package.en.md#producing-installers): prepare the toolchain and protoc/PATH, pinned core, helper (plus cleaner on Windows), and installation identity before compiling the App. Fetching the core and running `tauri build` alone is not a complete usable installer recipe.
 
 The core is not committed and must be fetched before packaging. The per-platform `--config` is not optional: omitting it produces **a package with no core**, with zero build-time errors — the failure only surfaces at runtime. Full details, CI division of labor, and the Windows installer / updater package-selection contract are in [Build and Package](docs/build-and-package.en.md).
 
@@ -147,7 +138,7 @@ Screenshots are produced by `node scripts/capture-screenshots.mjs`: headless Chr
 
 | Project | Role |
 |---|---|
-| [sing-box-polaris (active fork)](https://github.com/polaris-arch/sing-box-polaris) | Core fork used by Polaris; frozen source, version, and polaris-box assets follow the selected build manifest |
+| [sing-box-polaris (active fork)](https://github.com/polaris-arch/sing-box-polaris) | Core fork used by Polaris; frozen source, version, and sing-box-polaris assets follow the selected build manifest |
 | [sing-box (original upstream)](https://github.com/SagerNet/sing-box) | Original upstream project and technical foundation; acknowledged here |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Desktop runtime |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet for NaiveProxy |

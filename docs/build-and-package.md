@@ -21,6 +21,7 @@ README 只留「怎么装、怎么用」。
 | Node.js | 24+（CI 钉 26） | 前端构建 + fetch 脚本 |
 | pnpm | 11.24.0（由 `ui/package.json` 钉扎） | 前端包管理（`ui/`）；`tauri build` 的 `beforeBuildCommand` 直接调用 `pnpm`，须在 PATH 上 |
 | Go | 所选构建路径源码清单的 `goVersion` | 源码构建与二进制构建信息检查；桌面、移动端输入分开维护 |
+| Python | 3（完整移动主机测试需 3.11+，CI 使用 3.12） | 桌面固定源码归档核验及移动构建器；Windows 命令名为 `python`，其它平台为 `python3` |
 | [Tauri CLI 2](https://v2.tauri.app/) | `scripts/tauri-cli.version` 钉扎 | 全局 CLI 执行 `tauri build` 打包 |
 
 在仓库根安装全局 CLI。CLI 已从 `ui/` devDependency 退场，桌面和 Android CI 均安装同一固定版本。
@@ -41,7 +42,9 @@ sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
 ```
 
 **macOS**：13.0+（Ventura，BTM「允许后台」三级探测需要），Xcode Command Line Tools。
-Windows：MSVC build tools（Visual Studio Build Tools 2022 + Windows 10/11 SDK）。
+Windows：MSVC build tools（Visual Studio Build Tools 2022 + Windows 10/11 SDK），并准备 CMake 与 NASM（CI 固定 NASM 3.02，来源与摘要见 `.github/workflows/ci.yml`）。
+
+原生 Rust 构建还需要 `protoc`（`crates/singbox-grpc/build.rs`）。运行 `node scripts/fetch-protoc.mjs` 获取脚本固定版本与摘要的工具；本地执行只打印 `bin` 目录，不会自动修改当前 shell 的 PATH。把打印出的目录加入 PATH，再用 `protoc --version` 核对（当前 `libprotoc 35.1`）。此步骤应在 `cargo` / `tauri` 构建前完成。
 
 ### Rust workspace（开发门禁）
 
@@ -71,10 +74,10 @@ TypeScript 7 不再沿用旧的 `createSourceFile(..., ScriptTarget, ..., Script
 
 ### 资源拉取（sing-box 核 / cronet / 面板）
 
-当前内核开发仓为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)。仓库导航迁移不改写已冻结的构建输入：下述桌面 Release 资产与移动端 alpha.12 来源仍按各自清单核验，不得把旧资产 URL 机械替换为新仓下载地址。
+当前桌面与移动端输入均选择 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) 的固定 alpha.12 来源。桌面发布资产与移动端源码分别由下述契约锁定；仓库名、源码提交、tag 对象和摘要须一起核验，不能机械改写旧资产 URL 或复用历史收据。
 
 当前桌面打包以 `src-tauri/core-manifest.json` 的 `desktopRelease` 为入口，按
-`scripts/desktop-core/release-contract.json` 消费固定的 [polaris-box](https://github.com/polaris-arch/polaris-box)
+`scripts/desktop-core/release-contract.json` 消费固定的 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)
 发布资产。源码提交、tag 对象、资产索引与摘要由清单锁定；不要改用 fork 默认分支的最新提交，
 也不要把旧 `sourceBuild` 或移动端 `scripts/mobile-core/source-contract.json` 当成当前桌面选择。
 这些是构建输入约束，不代表该 App 候选已经完成原生验收或已发布。
@@ -114,17 +117,59 @@ CI 在 fetch 后通过 `node scripts/verify-packaging.mjs confs` 检查资源存
 
 ### 打包出安装包
 
-本节的产物命名、资产表及下文三份 Android APK 描述的是当前 `main` 源码的构建与发布流程约定，供维护者准备候选包使用，不是现有公开下载清单，也不表示候选产物已经发布或通过安装验收。已公开的下载请以 [README 安装说明](../README.md#安装) 和 [v1.0.0 Release](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0) 的实际资产为准。
+本节的产物命名、资产表及下文三份 Android APK 描述的是当前 `main` 源码的构建与发布流程约定，供维护者准备候选包使用，不是现有公开下载清单，也不表示候选产物已经发布或通过安装验收。正式包发布后，下载请以 [README 安装说明](../README.md#安装) 和 [Releases](https://github.com/polaris-arch/Polaris/releases) 的实际资产为准。
+
+以下为单平台本地完整准备顺序，须在对应操作系统、干净且已提交的源码 checkout 根目录执行，并先满足上文工具链与系统依赖。`platform` 只选当前目标，macOS 可显式选择 Intel 目标；Windows 使用已具备 MSVC 环境的 Git Bash。这是源码构建，不是正式发布命令。
 
 ```bash
-# 1) 拉资产（见上）
-# 2) 前端构建 + Rust 编译 + 安装包（Tauri CLI 自动编排 beforeBuildCommand）
-#    从**仓库根**跑，并显式传本平台的 config（见下方「按平台筛内核」）
-tauri build --config src-tauri/tauri.linux.conf.json          # Linux
-tauri build --config src-tauri/tauri.windows.conf.json        # Windows
-tauri build --config src-tauri/tauri.macos-arm64.conf.json    # macOS Apple Silicon
-tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-apple-darwin  # macOS Intel
+# Bash; on Windows use Git Bash with the MSVC build environment available.
+set -euo pipefail
+platform=linux  # linux | win | mac-arm64 | mac-x64
+case "$platform" in
+  linux) target=x86_64-unknown-linux-gnu; conf=linux; helper=polaris-helper ;;
+  win) target=x86_64-pc-windows-msvc; conf=windows; helper=polaris-helper.exe ;;
+  mac-arm64) target=aarch64-apple-darwin; conf=macos-arm64; helper=polaris-helper ;;
+  mac-x64) target=x86_64-apple-darwin; conf=macos-x64; helper=polaris-helper ;;
+  *) echo "Unsupported platform" >&2; exit 1 ;;
+esac
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
+pnpm --dir ui install --frozen-lockfile
+# protoc must already be on PATH as described under system dependencies.
+protoc --version
+export POLARIS_BUILD_ID="$(git rev-parse HEAD)"
+node scripts/fetch-core.mjs --platform="$platform"
+case "$platform" in
+  linux|win) node scripts/fetch-cronet.mjs --platform="$platform" ;;
+esac
+node scripts/fetch-dashboard.mjs
+args=(--target "$target")
+out="target/$target/release"
+case "$platform" in
+  linux|win)
+    test "$(rustc -vV | sed -n 's/^host: //p')" = "$target"
+    args=(); out=target/release ;;
+  mac-*) rustup target add "$target" ;;
+esac
+cargo build --release -p polaris-helper --bin polaris-helper "${args[@]}"
+mkdir -p "resources/$platform"
+cp "$out/$helper" "resources/$platform/$helper"
+case "$platform" in
+  mac-*)
+    if ! codesign --verify --strict "resources/$platform/$helper"; then
+      codesign --force --sign - --timestamp=none "resources/$platform/$helper"
+    fi
+    codesign --verify --strict "resources/$platform/$helper" ;;
+  win)
+    cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner
+    cp "$out/polaris-cleaner.exe" resources/win/polaris-cleaner.exe ;;
+esac
+node scripts/prepare-core-identity.mjs --platform="$platform"
+export POLARIS_CORE_IDENTITY_FILE="$PWD/resources/$platform/core-manifest.json"
+tauri build --config "src-tauri/tauri.$conf.conf.json" "${args[@]}"
+node scripts/prepare-core-identity.mjs --platform="$platform" --mode=verify
 ```
+
+helper、Windows cleaner 和 App 必须共享同一 `POLARIS_BUILD_ID`。macOS 的 helper 先做 ad-hoc 密封，再生成安装身份；这不是 Developer ID 签名或公证。`prepare-core-identity.mjs` 冻结实际随包字节，App 编译消费同一清单；后续改动 helper/内核字节必须重新准备并重编 App，不能只替换文件。缺少身份输入时分析构建可能产生不可用占位，不应把编译通过当作可安装运行的完整包。正式发布还需同一候选的原生验收包、payload/assets/inventory、签名与完整发布 DAG；本地步骤不替代这些门禁。`verify-packaging.mjs confs` 会检查四个平台的资源目录，需要全部四套资源准备齐全；它不是此单平台构建步骤的一部分。
 
 产物落在**仓库根**的 `target/release/bundle/`（本仓是 cargo workspace，workspace 根在仓库根，
 故**不是** `src-tauri/target/`）；传了 `--target <triple>` 时再下沉一层：`target/<triple>/release/bundle/`。
@@ -148,7 +193,7 @@ portable 由 `package.yml` 在 Windows 腿从 `target/release/polaris.exe` + `re
 
 ### 移动端源码构建前置条件
 
-桌面 sidecar 下载不能替代移动端绑定组件。当前共同输入见 [source-contract.json](../scripts/mobile-core/source-contract.json) 和 [移动内核构建说明](../scripts/mobile-core/README.md)：固定 polaris-box 源码、Go 1.25.5、gomobile/gobind v0.1.13，先生成并核验组件及原始收据，再由 App 消费。
+桌面 sidecar 下载不能替代移动端绑定组件。当前共同输入见 [source-contract.json](../scripts/mobile-core/source-contract.json) 和 [移动内核构建说明](../scripts/mobile-core/README.md)：固定 sing-box-polaris 源码、Go 1.27.2、gomobile/gobind v0.1.13，先生成并核验组件及原始收据，再由 App 消费。
 
 - **Android 绑定组件**：API 24 AAR，Java 17（CI 固定 17.0.20+101）、NDK r30-beta3（完整来源版本 30.0.16138531-beta3）。AAR 含 ARM64、ARMv7、x86、x86_64 四种 ABI；这不扩大正式 APK 的两种 ARM ABI 范围。
 - **Android App**：Gradle 使用 JDK 21，SDK/Build Tools 当前为 36 / 36.0.0；Rust 使用 [android-rust-ndk.version](../scripts/android-rust-ndk.version) 固定的 27.3.13750724，不能与绑定组件 NDK 混用。App 最低 API 24。
@@ -192,7 +237,7 @@ universal 包含两个 ARM ABI；debug 开发构型保留模拟器 ABI。
   （macOS 那份原名 `tauri.macos.conf.json` 会被隐式合并，实为 arm64 专用 ⇒ 在 Intel Mac 上裸
   `tauri build` 会打进 arm64 内核；已改名为 `tauri.macos-arm64.conf.json` 消除该隐式默认。）
 
-这些不变量由 `node scripts/verify-packaging.mjs confs` 机器守住（CI 每次打包前跑，本机可直接复现）；
+这些不变量由 `node scripts/verify-packaging.mjs confs` 机器守住（CI 每次打包前跑；本机须先准备全部四个平台资源再复现）；
 构建后再由 `payload` / `assets` 两个模式断言产物里恰好一份本平台内核、且产物名满足更新器选包契约。
 
 上面这些问的都是「**该在**的东西在不在」。反方向由第四个模式 `inventory` 守 ——
@@ -238,12 +283,13 @@ Windows 腿因 NSIS 无 bundle 侧副本，退化为 cargo staging 清点并在�
   与 `cross-target clippy + android face` 设为 required checks。
 - **`ui.yml`** — 前端门禁：`pnpm run build`（tsc + vite build）、vitest、Playwright；PR / push 到 main 触发。
 - **`release-risk.yml`** — 发布风险门：PR / merge queue / push 到 main 均触发，在 job 内按改动路径分类，
-  只对受影响的面调用 `desktop-core.yml`、`package.yml`（不上传产物）与 `android.yml`。
+  只对受影响的面调用 `desktop-core.yml`、`package.yml`、`android.yml` 与 `apple.yml`。常规桌面与 Android 风险腿使用轻量构型，安装包 / APK 不上传、不可分发。独立的 `native_payload` 原生验收路径使用完整构型，可上传候选桌面包与证据，但不是公开 Release，也不自动证明安装或设备验收；应按具体 job 的构型与实际附件判断。
 - **`desktop-core.yml`** — 只被调用：四个原生 runner 验证固定发布输入，或在源码模式下构建固定源码，再汇总候选内核包。
 - **`package.yml`** — 发布工程：Linux / Windows / macOS arm64 / macOS x64 四条腿跑 fetch + `tauri build` + 产物校验。
-  触发 = tag（`v*`）/ 手动 / 被 `release-risk.yml` 调用。职责 = 「能否产出可分发安装包」。tag 发布时建草稿 release、
+  触发 = tag（`v*`）/ 手动 / 被 `release-risk.yml` 调用。发行构型用于构建可分发安装包；风险门轻量构型只验证打包链。tag 发布时建草稿 release、
   上传桌面资产，再调用 `android.yml` 上传签名 APK，全量对账后公开。
-- **`android.yml`** — 只被调用或手动触发：构建 release-profile APK 并做产物级检查；发布调用时产出签名 APK。
+- **`android.yml`** — 只被调用或手动触发：构建 release-profile APK 并做产物级检查；发布调用时产出三份正式签名 APK。
+- **`apple.yml`** — 由风险门选择或手动触发：默认核验设备 ARM64 App / PacketTunnel 的无签名编译与链接，模拟器 App 为显式选项；不发布 IPA，不证明设备安装、NE 授权或 VPN 运行。完整组件与证据约束见 [移动内核说明](../scripts/mobile-core/README.md)。
 
 ## Windows 安装器与 WebView2
 
@@ -293,7 +339,7 @@ Runtime。Polaris 不内嵌、不镜像 WebView2 Runtime，也不维护第二套
 
 ## 随包内核与提权助手
 
-桌面正式包使用本版本选定的 polaris-box 内核。Linux、Windows 的 Cronet 库与内核同包；macOS 使用静态输入。打包阶段先冻结实际 helper（Windows 还含 cleaner）字节，再生成 `core-manifest.json` 并作为 App 编译输入；最终包装必须与这份输入逐字节一致。正式版不接受用户上传内核或环境变量指定的替代内核。
+桌面正式包使用本版本选定的 sing-box-polaris 内核。Linux、Windows 的 Cronet 库与内核同包；macOS 使用静态输入。打包阶段先冻结实际 helper（Windows 还含 cleaner）字节，再生成 `core-manifest.json` 并作为 App 编译输入；最终包装必须与这份输入逐字节一致。正式版不接受用户上传内核或环境变量指定的替代内核。
 
 TUN 首次使用或选定内容身份改变时，经管理员授权事务安装本版本配套内核。助手按 CoreID 存放不可变版本，启动请求只携带 CoreID，不上传文件。兼容的较新助手可保留；安装另一版本内核不会主动停止其他用户的活跃核。旧助手仍占用受管核或无法证明空槽时，升级会延期，不能把观察快照当作停止授权。
 

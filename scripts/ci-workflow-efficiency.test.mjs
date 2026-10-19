@@ -567,3 +567,52 @@ test('one complete manual Package campaign forwards exact SYSTEM selection and r
     { GITHUB_REF: 'refs/tags/v1.0.0' }]) assert.notEqual(run(extra), 0, JSON.stringify(extra));
   assert.equal(run({ SYSTEM_CANDIDATE: '', PLATFORM: 'windows', VALIDATION_SKIP_QUALITY: 'true' }), 0);
 });
+
+test('Apple complete Go cache is confined to exact ordinary main consumers and saves', () => {
+  const source = yaml('apple');
+  const expression = source.match(/^  POLARIS_APPLE_COMPONENT_CACHE_ALLOWED: \$\{\{ (.+) \}\}$/m)?.[1];
+  assert.ok(expression);
+  const context = { event_name: 'push', ref: 'refs/heads/main', sha: 'a'.repeat(40),
+    repository: 'polaris-arch/Polaris',
+    workflow_ref: 'polaris-arch/Polaris/.github/workflows/release-risk.yml@refs/heads/main' };
+  const eligible = (github = {}, inputs = {}) => runInNewContext(expression, {
+    github: { ...context, ...github }, inputs,
+    format: (pattern, value) => pattern.replace('{0}', value),
+  });
+  assert.equal(eligible(), 'true');
+  assert.equal(eligible({}, { candidate: context.sha }), 'true');
+  assert.equal(eligible({ repository: 'foreign/Polaris',
+    workflow_ref: 'foreign/Polaris/.github/workflows/release-risk.yml@refs/heads/main' }), 'false');
+  assert.equal(eligible({}, { candidate: 'b'.repeat(40) }), 'false');
+  for (const event_name of ['pull_request', 'pull_request_target', 'workflow_dispatch', 'merge_group', 'workflow_run'])
+    assert.equal(eligible({ event_name }), 'false');
+  for (const ref of ['refs/pull/1/merge', 'refs/heads/topic', 'refs/tags/v1'])
+    assert.equal(eligible({ ref }), 'false');
+  for (const workflow_ref of ['polaris-arch/Polaris/.github/workflows/apple.yml@refs/heads/main',
+    'foreign/Polaris/.github/workflows/release-risk.yml@refs/heads/main',
+    'polaris-arch/Polaris/.github/workflows/release-risk.yml@refs/heads/topic'])
+    assert.equal(eligible({ workflow_ref }), 'false');
+  const steps = source.split(/(?=^      - (?:name:|uses:))/m);
+  const restore = steps.find(row => row.includes('id: go_component_restore'));
+  const save = steps.find(row => row.includes('- name: Save exact trusted-main component package'));
+  const key = 'key: apple-go-component-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_component_cache.outputs.identity }}';
+  for (const row of [restore, save]) {
+    assert.ok(row);
+    assert.ok(row.includes("env.POLARIS_APPLE_COMPONENT_CACHE_ALLOWED == 'true'"));
+    assert.ok(row.includes(key));
+    assert.ok(row.includes('path: target/apple-go-component-cache'));
+    assert.doesNotMatch(row, /restore-keys:|lookup-only:|fail-on-cache-miss:/);
+  }
+  const exportStep = steps.find(row => row.includes('id: go_component_export'));
+  assert.ok(exportStep.includes("steps.local_component.conclusion == 'success'"));
+  for (const row of [restore, exportStep])
+    assert.ok(row.includes("steps.go_component_cache.outputs.eligible == 'true'"));
+  assert.ok(exportStep.includes("steps.go_component_restore.outputs.cache-hit != 'true'"));
+  assert.ok(save.includes("steps.go_component_export.conclusion == 'success'"));
+  assert.ok(save.includes("steps.go_component_export.outputs.exported == 'true'"));
+  assert.ok(source.indexOf('ci_apple.py component-cache-key') < source.indexOf('id: shared_component'));
+  assert.ok(source.indexOf('ci_apple.py component-cache-export') > source.indexOf('ci_apple.py import-local'));
+  const build = steps.find(row => row.includes('id: shared_component'));
+  assert.doesNotMatch(build, /cache-hit|continue-on-error/);
+  assert.ok(build.includes('ci_apple.py build'));
+});

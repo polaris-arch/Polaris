@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Explicit PRB00/VAL01 producer and App+PacketTunnel link entry; no publish/device action."""
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -17,8 +18,8 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 from fork_input import ROOT, load, require
 import producer
-from producer import lease, private_dir, run as native_run, progress_write
-from artifacts import receipt_digest, file_pin
+from producer import lease, slot_locks, private_dir, run as native_run, progress_write
+from artifacts import receipt_digest, file_pin, read_receipt
 
 APPLE_PHASES = frozenset(('component-build-or-revalidate', 'component-import-verification', 'component-link-input',
                          'rust-target-build', 'host-swift-controls',
@@ -159,12 +160,16 @@ def main():
                     log=root / 'original-component-runner.log', capture='none')
     link = root / 'apple-link-input.json'
     # A retained link context cannot be overwritten as a new App identity.
+    # Reused originals retain their own native-cache lease. Rust and App
+    # work keep the current cache/target accounting unchanged.
+    component_cache = Path(read_receipt(component_work / 'component-receipt.json')['nativeInputs']['cache'])
     if not link.exists():
         timed_phase('component-link-input', run, [sys_python(), ROOT / 'scripts/mobile-core/consume.py', 'apple-link',
             '--component', component_work / 'Libbox.xcframework', '--receipt', component_work / 'component-receipt.json',
-            '--work', private_dir(root / 'link-work'), '--cache', cache, '--output', link],
+            '--work', private_dir(root / 'link-work'), '--cache', component_cache, '--output', link],
             log=root / 'original-link-input.log', capture='none')
-    with lease(root, cache, value):
+    with lease(root, cache, value), \
+            (slot_locks(component_work, component_cache) if component_cache != cache else contextlib.nullcontext()):
         env = dict(os.environ, DEVELOPER_DIR=str(args.developer.resolve(strict=True)),
                    POLARIS_LIBBOX_GENERATION_ROOT=str(component_work), POLARIS_MOBILE_LINK_INPUT=str(link),
                    POLARIS_MOBILE_LINK_INPUT_SHA256=file_pin(link)['sha256'],
@@ -247,7 +252,6 @@ def main():
         final_receipt['fingerprint'] = receipt_digest(final_receipt)
         rust_receipts = list(root.glob('rust-*.json'))
         require(len(rust_receipts) == 1, 'one actual Rust target receipt required')
-        from artifacts import read_receipt
         rust = read_receipt(rust_receipts[0])
         require(rust['App'] == final_receipt['App'] and rust['devicePassed'] is False and
                 rust['fingerprint'] == receipt_digest({k: v for k, v in rust.items() if k != 'fingerprint'}),

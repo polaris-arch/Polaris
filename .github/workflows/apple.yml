@@ -1,6 +1,6 @@
 name: Apple unsigned App and PacketTunnel
 
-# One admitted host produces the two-slice component once. Device App and
+# One admitted host builds or revalidates the two-slice component. Device App and
 # PacketTunnel are required; the simulator carrier is an explicit manual opt-in.
 # Keep exact tools, originals/exports, and strict declared-scope aggregation.
 on:
@@ -44,6 +44,10 @@ env:
   # Only successful Release Risk PR builds become future same-tree reuse sources.
   # Standalone/manual/main fallback/merge-group builds retain their original gate.
   POLARIS_APPLE_PRODUCE_REUSE_CONTRACT: ${{ github.event_name == 'pull_request' && contains(github.workflow_ref, '/.github/workflows/release-risk.yml@') && !inputs.include_simulator && 'true' || 'false' }}
+  # Cache trust is the repository's trusted-main execution/cache-write boundary.
+  # PR/manual/tag runs neither restore nor save this complete-component cache.
+  # Historical run IDs are provenance labels only; no live old-run API is needed.
+  POLARIS_APPLE_COMPONENT_CACHE_ALLOWED: ${{ github.repository == 'polaris-arch/Polaris' && github.event_name == 'push' && github.ref == 'refs/heads/main' && (inputs.candidate || github.sha) == github.sha && github.workflow_ref == format('{0}/.github/workflows/release-risk.yml@refs/heads/main', github.repository) && 'true' || 'false' }}
 
 concurrency:
   group: apple-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}-${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && github.run_id || 'tip' }}
@@ -151,10 +155,24 @@ jobs:
           restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
       - name: Locked frontend dependencies
         run: pnpm --dir ui install --frozen-lockfile
+      - name: Recompute complete Go component source and actual tool inputs
+        id: go_component_cache
+        if: ${{ env.POLARIS_APPLE_COMPONENT_CACHE_ALLOWED == 'true' }}
+        run: python3 -B scripts/mobile-core/ci_apple.py component-cache-key
+      - name: Restore exact trusted-main complete Go component package
+        id: go_component_restore
+        if: ${{ env.POLARIS_APPLE_COMPONENT_CACHE_ALLOWED == 'true' && steps.go_component_cache.conclusion == 'success' && steps.go_component_cache.outputs.eligible == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        with:
+          path: target/apple-go-component-cache
+          key: apple-go-component-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_component_cache.outputs.identity }}
+      # A missing or invalid package is a fresh bind, never a skipped component.
+      # Restored data is admitted before it can install any original-path bytes.
       - name: Snapshot complete frontend execution inputs before the build
         if: ${{ env.POLARIS_APPLE_PRODUCE_REUSE_CONTRACT == 'true' }}
         run: python3 -B scripts/mobile-core/apple_merge_reuse.py snapshot --phase frontend-before
-      - name: Frontend resources and two-slice arm64 component produced once
+      - name: Frontend resources and admitted two-slice arm64 component
         id: shared_component
         run: python3 -B scripts/mobile-core/ci_apple.py build
       - name: Snapshot complete frontend execution inputs after the build
@@ -194,6 +212,17 @@ jobs:
         id: local_component
         if: ${{ !cancelled() && steps.shared_component.conclusion == 'success' }}
         run: python3 -B scripts/mobile-core/ci_apple.py import-local
+      - name: Retain complete verified Go originals for an equivalent main consumer
+        id: go_component_export
+        if: ${{ !cancelled() && env.POLARIS_APPLE_COMPONENT_CACHE_ALLOWED == 'true' && steps.local_component.conclusion == 'success' && steps.go_component_cache.outputs.eligible == 'true' && steps.go_component_restore.outputs.cache-hit != 'true' }}
+        run: python3 -B scripts/mobile-core/ci_apple.py component-cache-export
+      - name: Save exact trusted-main component package
+        if: ${{ !cancelled() && env.POLARIS_APPLE_COMPONENT_CACHE_ALLOWED == 'true' && steps.go_component_export.conclusion == 'success' && steps.go_component_export.outputs.exported == 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: target/apple-go-component-cache
+          key: apple-go-component-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_component_cache.outputs.identity }}
       - name: Pinned protobuf compiler
         id: protoc
         if: ${{ !cancelled() && steps.local_component.conclusion == 'success' }}
@@ -211,14 +240,14 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: apple-registry-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache.outputs.identity }}
+          key: apple-registry-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust_cache.outputs.registry_identity }}
       - name: Restore device-arm64 release dependencies at their stable transport path
         id: rust_device_restore
         uses: actions/cache/restore@v5
         if: ${{ !cancelled() && steps.rust_cache.conclusion == 'success' }}
         with:
           path: target/apple-ci-cache/device-arm64
-          key: apple-rust-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.POLARIS_APPLE_SCOPE }}-aarch64-apple-ios-release-${{ steps.rust_cache.outputs.identity }}
+          key: apple-rust-deps-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.POLARIS_APPLE_SCOPE }}-aarch64-apple-ios-release-${{ steps.rust_cache.outputs.identity }}
       - name: Move restored device dependencies into the actual Cargo target directory
         id: rust_device_ready
         if: ${{ !cancelled() && steps.rust_device_restore.conclusion == 'success' }}
@@ -306,7 +335,7 @@ jobs:
         if: ${{ inputs.include_simulator && !cancelled() && steps.retire_device_arm64.conclusion == 'success' }}
         with:
           path: target/apple-ci-cache/sim-arm64
-          key: apple-rust-deps-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.POLARIS_APPLE_SCOPE }}-aarch64-apple-ios-sim-release-${{ steps.rust_cache.outputs.identity }}
+          key: apple-rust-deps-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.POLARIS_APPLE_SCOPE }}-aarch64-apple-ios-sim-release-${{ steps.rust_cache.outputs.identity }}
       - name: Move restored simulator dependencies into the actual Cargo target directory
         id: rust_sim_ready
         if: ${{ inputs.include_simulator && !cancelled() && steps.rust_sim_restore.conclusion == 'success' }}

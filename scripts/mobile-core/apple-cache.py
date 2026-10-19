@@ -18,7 +18,7 @@ from artifacts import file_pin, read_receipt
 from apple_handoff import context, required_slots, scope_fields, transport_pin
 from ci_apple import location
 from fork_input import ROOT, canonical, require, sha
-from producer import private_dir, run, slot_locks, write_json
+from producer import PRODUCER_FILES, private_dir, run, slot_locks, write_json
 
 STAGE = Path('target/apple-ci-cache')
 TARGETS = {'device-arm64': 'aarch64-apple-ios', 'sim-arm64': 'aarch64-apple-ios-sim'}
@@ -30,6 +30,66 @@ SAMPLE_LIMIT, SAMPLE_PATH_BYTES = 64, 1024
 # Actual Cargo.toml package=polaris and lib=polaris_lib. Keep all their compiled
 # outputs in the original target, including the hashed static archive in deps.
 APP_ENTRY = re.compile(r'^(?:lib)?polaris(?:_lib)?(?:-[0-9a-f]{16}(?:\.|$)|\.)')
+APPLE_RUST_BUILD_CODE_POLICY = 'polaris-apple-rust-build-code-v1'
+APPLE_RUST_UNRELATED_CODE = frozenset({
+    'scripts/mobile-core/android_sdk.py',
+    'scripts/libbox-patches/prepare-ndk-linux.py',
+    'scripts/libbox-patches/ndk-linux-archive.json',
+})
+
+
+def apple_rust_build_code(identity, policy=APPLE_RUST_BUILD_CODE_POLICY):
+    """Reviewed lookup projection only; never replace full producer provenance."""
+    require(policy == APPLE_RUST_BUILD_CODE_POLICY, 'unknown Apple Rust build code policy')
+    files = identity.get('files') if isinstance(identity, dict) else None
+    require(isinstance(files, dict) and set(PRODUCER_FILES) <= set(files),
+            'complete original producer code inventory required')
+    for name, pin in files.items():
+        require(isinstance(name, str) and isinstance(pin, dict) and set(pin) == {'bytes', 'sha256'} and
+                type(pin['bytes']) is int and pin['bytes'] > 0 and isinstance(pin['sha256'], str) and
+                re.fullmatch('[0-9a-f]{64}', pin['sha256']), 'producer code file pin differs')
+    # android_sdk has imports/function definitions only; its calls and the NDK
+    # installer/archive belong to the Android branch. ci_android.prepare_source
+    # and android-source's native parsers ARE used by Apple and stay relevant.
+    # Unknown future producer entries stay relevant by default.
+    return {'policy': policy, 'files': {name: dict(pin) for name, pin in files.items()
+                                      if name not in APPLE_RUST_UNRELATED_CODE}}
+
+
+def cargo_source_config(name):
+    # Keep whole manifests/configs, including unknown future source directives.
+    # This deliberately also invalidates on unrelated manifest/config edits.
+    return (Path(name).name in ('Cargo.toml', 'Cargo.lock') or
+            name.endswith(('/.cargo/config', '/.cargo/config.toml')) or
+            name in ('.cargo/config', '.cargo/config.toml'))
+
+
+def registry_source_overrides(environment):
+    # Registry credentials are transport authority, never identity inputs.
+    return {key: value for key, value in environment.items() if
+            key in ('CARGO_REGISTRY_DEFAULT', 'CARGO_REGISTRY_INDEX', 'CARGO_REGISTRY_PROTOCOL') or
+            (key.startswith('CARGO_REGISTRIES_') and key.endswith(('_INDEX', '_PROTOCOL')))}
+
+
+def cache_identities(tools, rustc, cargo, tool_pins, config, environment):
+    require('Cargo.lock' in config and 'src-tauri/Cargo.toml' in config, 'cache lock/config inputs missing')
+    sources = registry_source_overrides(environment)
+    overrides = {key: value for key, value in environment.items() if key.startswith((
+        'CARGO_PROFILE_', 'CARGO_TARGET_', 'RUSTFLAGS', 'RUSTDOCFLAGS', 'CARGO_ENCODED_RUSTFLAGS',
+        'CFLAGS', 'CXXFLAGS', 'OBJC_INCLUDE_PATH')) and key != 'CARGO_TARGET_DIR'}
+    dependency = sha(canonical({'policy': 'polaris-apple-rust-dependencies-v2',
+        'rustc': rustc, 'cargo': cargo, 'tools': tool_pins, 'xcode': tools['xcode'],
+        'producerCode': apple_rust_build_code(tools['App']), 'config': config,
+        'profile': 'release', 'features': ['tauri/custom-protocol'], 'crateType': 'staticlib',
+        'deploymentTarget': '17.0', 'overrides': overrides, 'sourceOverrides': sources}))
+    # Downloads have no compiler output. Retain exact Cargo format/tool bytes,
+    # lock/manifests and source configuration; omit App scope, producer code,
+    # workflow, Xcode, Rust/native flags and compiled-dependency transport policy.
+    registry = sha(canonical({'policy': 'polaris-apple-registry-downloads-v2',
+        'cargo': cargo, 'cargoTool': tool_pins['cargo'],
+        'config': {name: pin for name, pin in config.items() if cargo_source_config(name)},
+        'sourceOverrides': sources}))
+    return dependency, registry
 
 
 class ExternalCacheAlias(RuntimeError):
@@ -137,22 +197,20 @@ def prepare():
             name.endswith(('/.cargo/config', '/.cargo/config.toml')) or
             name in ('.cargo/config', '.cargo/config.toml', '.github/workflows/apple.yml',
                      'src-tauri/tauri.conf.json', 'src-tauri/tauri.ios.conf.json'))}
-        require('Cargo.lock' in config and 'src-tauri/Cargo.toml' in config, 'cache lock/config inputs missing')
         tool_pins = {name: file_pin(run(['rustup', 'which', name]).strip()) for name in ('cargo', 'rustc')}
-        overrides = {k: v for k, v in os.environ.items() if k.startswith((
-            'CARGO_PROFILE_', 'CARGO_TARGET_', 'RUSTFLAGS', 'RUSTDOCFLAGS', 'CARGO_ENCODED_RUSTFLAGS',
-            'CFLAGS', 'CXXFLAGS', 'OBJC_INCLUDE_PATH')) and k != 'CARGO_TARGET_DIR'}
-        identity = sha(canonical({'rustc': rustc, 'cargo': run(['cargo', '-V']), 'tools': tool_pins,
-            'xcode': tools['xcode'], 'producerFiles': tools['App']['files'], 'config': config,
-            'profile': 'release', 'features': ['tauri/custom-protocol'], 'crateType': 'staticlib',
-            'deploymentTarget': '17.0', 'overrides': overrides}))
+        # Keep the full workflow in compiled identity: arbitrary future shell
+        # steps can affect Cargo after prepare. There is no safe YAML omission
+        # policy here. Android-only file edits still avoid unrelated cold misses.
+        identity, registry_identity = cache_identities(
+            tools, rustc, run(['cargo', '-V']), tool_pins, config, os.environ)
         home = Path(os.environ.get('CARGO_HOME', str(Path.home() / '.cargo'))).resolve(strict=True)
         require(home == Path.home() / '.cargo', 'registry cache path differs from actual Cargo home')
         write_json(stage / 'owner.json', {'context': context(), 'scope': scope_fields(),
-            'actualCargoTargetDir': str(root / 'cache/rust-target'), 'identity': identity})
+            'actualCargoTargetDir': str(root / 'cache/rust-target'), 'identity': identity,
+            'registryIdentity': registry_identity})
         with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
-            output.write('identity=' + identity + '\n')
-        note(root, 'prepare', identity=identity, freeBytes=free,
+            output.write('identity=' + identity + '\nregistry_identity=' + registry_identity + '\n')
+        note(root, 'prepare', identity=identity, registryIdentity=registry_identity, freeBytes=free,
              registryPaths=['~/.cargo/registry/index', '~/.cargo/registry/cache', '~/.cargo/git/db'])
 
 

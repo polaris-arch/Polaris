@@ -44,7 +44,7 @@ export const MOBILE_UNIT_TEST_FILES = Object.freeze([
 // Bind the small set of producer/discovery/naming owners, not the source tree.
 // Owner updates disable this optimization until its boundary is reviewed again.
 const MOBILE_UNIT_TEST_OWNERS = Object.freeze([
-  ['scripts/mobile-core/producer.py', '100644', '38c4e3e7804feb181cc17319a45298d4d853a92a'],
+  ['scripts/mobile-core/producer.py', '100644', '56074f0294450f26ba6ef3934df52fa81d6b4105'],
   ['scripts/mobile-source-unit.test.mjs', '100644', '8cc09d5f633f4f3c2eb6a4246f79644773b5681e'],
   ['scripts/gate-node-test.sh', '100755', '52e873e5cc95361c6723318d398caeb4db442664'],
   ['.github/workflows/release-risk.yml', '100644', '8424964ac3edd11cfe182b852dabae405b7b70ad'],

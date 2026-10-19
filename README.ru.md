@@ -56,7 +56,7 @@
 
 ## Установка
 
-Скачайте пакет для своей платформы со страницы [Releases](https://github.com/polaris-arch/Polaris/releases).
+После публикации релиза установочные пакеты будут доступны в [Releases](https://github.com/polaris-arch/Polaris/releases). Успешная проверка исходников или CI сама по себе не означает наличия публичных пакетов.
 
 Текущий процесс выпуска использует имена файлов из [release-assets.mjs](scripts/release-assets.mjs); `<version>` — версия приложения без префикса `v`. Для macOS предусмотрены отдельные пакеты Apple Silicon / Intel, для Windows — x64, для Linux — amd64. Пакеты Android перечислены в порядке ARM64, ARMv7 и universal; universal содержит только эти две архитектуры ARM, без x86. Наличие загрузок определяется фактическими файлами выбранного релиза. Проверьте файлы по `SHA256SUMS` на странице релиза.
 
@@ -90,7 +90,7 @@
 
 ## Сборка
 
-Раздел предназначен для разработчиков, собирающих текущий исходный код; пример приведён для Linux. Успешная сборка исходного кода не подтверждает проверку работы опубликованных пакетов. Зависимости платформ, мобильные инструменты и правила упаковки описаны в руководствах ниже.
+Раздел предназначен для разработчиков, собирающих текущий исходный код. Успешная сборка исходного кода не подтверждает проверку работы опубликованных пакетов. Зависимости платформ, мобильные инструменты и правила упаковки описаны в руководствах ниже.
 
 Сборка из исходного кода: [настольные платформы и Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [мобильное ядро и фиксированные инструменты](scripts/mobile-core/README.md).
 
@@ -98,16 +98,7 @@
 
 Требуются Rust stable, Node.js 24+ (в CI сейчас Node 26), pnpm 11.24.0, Go и [Tauri CLI 2](https://v2.tauri.app/).
 
-```bash
-npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
-pnpm --dir ui install --frozen-lockfile   # зависимости фронтенда
-# Ядро для ПК: закреплённый релиз из desktopRelease в core-manifest.json
-node scripts/fetch-core.mjs --platform=linux
-# Нативные проверочные пакеты и подготовка ресурсов: docs/build-and-package.en.md
-node scripts/fetch-cronet.mjs --platform=linux  # загрузка libcronet.so рядом с ядром Linux
-node scripts/fetch-dashboard.mjs   # загрузка встроенной панели
-tauri build --config src-tauri/tauri.linux.conf.json
-```
+Следуйте [полной инструкции сборки](docs/build-and-package.en.md#producing-installers): подготовьте инструменты и protoc/PATH, фиксированное ядро, helper (также cleaner в Windows) и манифест идентичности установки, затем собирайте приложение. Одной загрузки ядра и запуска `tauri build` недостаточно для полноценного установочного пакета.
 
 Ядро не хранится в репозитории и должно быть загружено перед сборкой пакета. Платформенный `--config` обязателен: без него получится **пакет без ядра**, причём во время сборки не будет ни одной ошибки — сбой проявится только во время работы. Полное описание, разделение задач в CI и контракт выбора пакета для установщика Windows и обновлятора — в [Сборка и упаковка](docs/build-and-package.en.md).
 
@@ -147,7 +138,7 @@ resources/   Ядро sing-box + libcronet (загружаются при сбо
 
 | Проект | Назначение |
 |---|---|
-| [sing-box-polaris (используемый форк)](https://github.com/polaris-arch/sing-box-polaris) | Форк ядра, используемый Polaris; фиксированные исходники, версия и файлы polaris-box определяются выбранным манифестом сборки |
+| [sing-box-polaris (используемый форк)](https://github.com/polaris-arch/sing-box-polaris) | Форк ядра, используемый Polaris; фиксированные исходники, версия и файлы sing-box-polaris определяются выбранным манифестом сборки |
 | [sing-box (исходный upstream)](https://github.com/SagerNet/sing-box) | Исходный проект и техническая основа; благодарность разработчикам |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | Десктопная среда выполнения |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet для NaiveProxy |
