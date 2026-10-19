@@ -1134,14 +1134,20 @@ async fn action_producer_cannot_rebase_after_stop_or_cancellation() {
         .register_normal_start(
             serde_json::json!(false),
             true,
-            Some((captured, Arc::clone(&attempt)))
+            Some((captured, Arc::clone(&attempt))),
+            None,
         )
         .is_err());
     assert_eq!(runtime.core_generation(), stopped);
     assert!(runtime.normal_start.lock().unwrap().as_ref().is_none());
     attempt.cancel();
     assert!(runtime
-        .register_normal_start(serde_json::json!(false), true, Some((stopped, attempt)))
+        .register_normal_start(
+            serde_json::json!(false),
+            true,
+            Some((stopped, attempt)),
+            None
+        )
         .is_err());
     assert_eq!(runtime.core_generation(), stopped);
     assert!(runtime.normal_start.lock().unwrap().as_ref().is_none());
@@ -1159,6 +1165,7 @@ async fn cancellation_after_queue_before_dispatch_cannot_birth_a_producer() {
             serde_json::json!(false),
             true,
             Some((captured, Arc::clone(&attempt))),
+            None,
         )
         .unwrap();
     attempt.cancel();

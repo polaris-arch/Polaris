@@ -639,7 +639,7 @@ fn main_detour_identity_follows_physical_root_but_temp_identity_follows_its_actu
     let mut config=UserConfig {servers:serde_json::from_value(json!([
         {"id":"a","name":"A","protocol":"socks","address":"a.test","port":1080,"detour":"b","subscriptionId":"sub"},
         {"id":"b","name":"B","protocol":"socks","address":"b.test","port":1080,"bindInterface":"Root-A"}])).unwrap(),
-        subscriptions:vec![SubscriptionInterfacePolicy{id:"sub".to_owned(),proxy_bind_interface:Some("Child-A".to_owned())}],
+        subscriptions:vec![SubscriptionInterfacePolicy{id:"sub".to_owned(),proxy_bind_interface:Some("Child-A".to_owned()),speed_test_interval_minutes:None}],
         network_interfaces:Some(NetworkInterfaceDefaults{direct:None,proxy:Some("Global-A".to_owned())}),..Default::default()};
     let read = |config: &UserConfig| {
         node_fingerprints::measurement_connections_json(&serde_json::to_value(config).unwrap())

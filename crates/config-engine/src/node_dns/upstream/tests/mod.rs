@@ -302,9 +302,11 @@ fn plan_consumes_custom_pool_entry_end_to_end() {
 
 #[test]
 fn explicit_unsupported_selection_fails_generation_validation_without_hydration_changes() {
-    let mut dns = DnsConfig::default();
-    dns.node_resolver_custom = Some(vec![custom("tls", "tls://1.1.1.1")]);
-    dns.node_resolver_pool = Some(ids(&["tls"]));
+    let mut dns = DnsConfig {
+        node_resolver_custom: Some(vec![custom("tls", "tls://1.1.1.1")]),
+        node_resolver_pool: Some(ids(&["tls"])),
+        ..Default::default()
+    };
     assert!(validate_selected_upstreams(Some(&dns))
         .unwrap_err()
         .starts_with("NODE_RESOLVER_UNSUPPORTED:"));

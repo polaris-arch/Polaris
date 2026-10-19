@@ -712,7 +712,7 @@ else:
   const run = (command,args,options) => {
     if(command==='git')return args[0]==='rev-parse'?'c'.repeat(40):'';
     if(command==='go'){const row=payloads.get(digest(readFileSync(args.at(-1))));assert(row);return args[0]==='version'?row.rawBuildInfo:row.buildID;}
-    if(args[1]?.endsWith('release-archive.py') && options.input && JSON.parse(options.input).sourceArchive){sourceChecks.push(JSON.parse(options.input));return '{}';}
+    if(args[1]?.endsWith('release-archive.py') && options.input && JSON.parse(options.input).sourceArchive){assert.equal(args.at(-1),'--source-legal-pins');sourceChecks.push(JSON.parse(options.input));return '{}';}
     return execFileSync(command,args,options);
   };
   const receipts=await consumeRelease(root,manifest,undefined,{read,run,host:'linux'});
@@ -728,6 +728,7 @@ else:
   }
   assert.equal(Object.keys(receipts).length,4);assert.equal(sourceChecks.length,5);
   assert(sourceChecks.every(c=>c.sourceTree===contract.sourceTree&&c.sourceGitlinks.length===0));
+  for (const check of sourceChecks) assert.deepEqual(check.legalFiles, contract.legalFiles.map(({path,bytes,sha256})=>({path,bytes,sha256})));
   assert.equal(calls.filter(url=>url.includes('/actions/')).length,0);
   assert.equal(calls.filter(url=>url.includes('/git/trees/')).length,2);
   const publicURL = api+`/releases/${contract.releaseId}`, publicBytes = transport.get(publicURL);

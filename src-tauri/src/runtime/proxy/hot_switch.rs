@@ -3109,39 +3109,6 @@ impl ProxyRuntime {
         Ok(intents)
     }
 
-    /// 单条 rule-sel 的校正 PUT。快照里查不到该规则的 selector（生成时被剔除）或查不到目标节点的 tag
-    /// （目标被 gate 剔除 / 已删除）→ 跳过，**不是 FATAL**：该 selector 的 default 仍是有效成员。
-    ///
-    /// 返回 `Some((selector_tag, member_tag))` ⟺ **确实 PUT 过**（不论成败）；跳过的两条腿返 `None`，
-    /// 它们没有可对账的意图。
-    async fn reassert_one_rule_selector_locked(
-        &self,
-        snapshot: &SwitchSnapshot,
-        rule_key: &str,
-        target_server_id: &str,
-        my_gen: u64,
-        intent_generation: u64,
-        switch_guard: &AsyncMutexGuard<'_, ()>,
-    ) -> Result<Option<(String, String)>, ()> {
-        if !self.selector_operation_is_current(my_gen, intent_generation) {
-            return Err(());
-        }
-        let Some(entry) = snapshot.rule_target.get(rule_key) else {
-            return Ok(None);
-        };
-        let Some(member_tag) = snapshot.id_to_tag.get(target_server_id) else {
-            return Ok(None);
-        };
-        let _ = self
-            .hot_switch_selector_locked(switch_guard, &entry.selector_tag, member_tag)
-            .await;
-        if !self.selector_operation_is_current(my_gen, intent_generation) {
-            self.selector_reconcile.mark_required();
-            return Err(());
-        }
-        Ok(Some((entry.selector_tag.clone(), member_tag.clone())))
-    }
-
     /// **H3 阶段 3：运行期出口自证** —— 把「实际生效出口 ≠ 选中节点」这条轴变成可观测的。
     ///
     /// # 为什么非有这一步不可

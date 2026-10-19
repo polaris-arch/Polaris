@@ -737,7 +737,7 @@ fn validate_restore_scope_with_prior(
                     .iter()
                     .find(|service| service.service_id == original.service_id)
             })
-            .is_some_and(|prior| matches_owned(prior));
+            .is_some_and(&matches_owned);
         if !matches_owned(owned) && !matches_prior {
             return Err(SystemIntegrationError::proxy(
                 "macOS 新建 Proxies protocol 含未归属字段，保留 marker 并拒绝删除",

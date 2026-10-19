@@ -1448,6 +1448,7 @@ impl HelperRuntime {
     /// （`cleanup_stale_cores`，此时本会话尚无受管核）。运行期停核走 `stop_core`。
     ///
     /// **真机门**：真杀 root 进程需 mac/win 真机 + 已装就绪 helper。
+    #[cfg(not(unix))]
     pub fn cleanup_cores(&self) -> Result<(), String> {
         self.register_core_mutation()?;
         let client = self.build_client()?;

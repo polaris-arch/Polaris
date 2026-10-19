@@ -1,8 +1,8 @@
 //! 进程监管 owner：受管核的杀停（直起 / helper 两腿）、启动期 stale-core 清扫与 root 孤儿提权清扫、
 //! 起核后的内核二进制自证，以及 pid 层的观测原语（实跑 exe 路径 / 信号 / 探活 / 进程身份令牌）。
 //!
-//! [`pid_alive`] / [`send_signal`] 被 `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs` /
-//! `win_console.rs`），façade 必须 `pub(crate) use` 再导出（§B.3）。
+//! [`pid_alive`] / [`send_signal`] 被 `proxy` 外部消费（`speedtest.rs` / `tailscale_login_core.rs`），
+//! façade 必须 `pub(crate) use` 再导出（§B.3）。
 
 #[allow(dead_code)] // The managed exact supervisor remains dormant.
 pub(in crate::runtime::proxy) mod direct_custody;
@@ -1729,6 +1729,7 @@ pub(super) fn attestation_disposition(
 ///
 /// Windows 上没有 `sudo` 也没有 `kill`：要在管理员终端里用系统自带的 `taskkill`，每个 pid 各带
 /// 一个 `/PID`。
+#[cfg(any(not(unix), test))]
 pub(super) fn manual_orphan_kill_hint(platform: Platform, pids: &[u32]) -> String {
     let join = |prefix: &str| {
         pids.iter()

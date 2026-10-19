@@ -800,7 +800,7 @@
       "src-tauri/src/runtime/proxy.rs": "bfdbcc2aaae7e9cadb9137c7112e3b8565f67eca9dbebf90a8fdf228e1e15da6",
       "src-tauri/src/runtime/proxy/lifecycle.rs": "987c29b3a1f978fff55a0ba827cf380008f01921c3915ecd5060859455287ab1",
       "src-tauri/src/runtime/proxy/startup.rs": "7f782a4b295b5ce2f75d0df86100db8961a53e71cf77f6f318ff1ff752b93264",
-      "src-tauri/src/runtime/proxy/hot_switch.rs": "661bbb24f6e42b981ee5d2b8a40f951254be8735407314bfd906a1116595d9e0",
+      "src-tauri/src/runtime/proxy/hot_switch.rs": "cdbbc34b57cb03dd317439980b92b00924af5b8d69544def01bd86695160cc5d",
       "src-tauri/src/runtime/proxy/recovery.rs": "4f9a9b11d902db65d472efdeea2a530114f6b95cee03fe661c5401cc8a61d659",
       "src-tauri/src/runtime/proxy/network_monitor.rs": "a69d5d92271f42172a63ff4739ec0d79615d3d538cc628cf0b38af7d16df1e71",
       "src-tauri/src/commands/coexistence_snapshot.rs": "8415766265c51972da7aac5cc38fd17811703c64dd2fe9f8e439955752455a4b"

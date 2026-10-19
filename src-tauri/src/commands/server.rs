@@ -17,6 +17,7 @@
 //! 节点 CRUD 经 config 的 load/save（servers 数组原地改 + 原子写）+ 广播 event:configChanged。
 //! DIRECT_SERVER_ID 哨兵 + 删选中节点的兜底出口逻辑对齐 Polaris（D4/F-1）。
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -31,9 +32,13 @@ use polaris_mesh::warp_http::RegisterOptions;
 
 use crate::commands::config::{broadcast_config_changed, emit_config_changed_signal};
 use crate::response::{ok_void, ApiResponse};
+#[cfg(test)]
 use crate::runtime::auto_select::{self, Cause, Decision, Gate, Leg, SwitchRecord};
 use crate::runtime::config::{ConfigManager, Decision as ConfigDecision};
-use crate::runtime::proxy::{code, ProxyRuntime, SwitchOutcome};
+#[cfg(test)]
+use crate::runtime::proxy::ProxyRuntime;
+use crate::runtime::proxy::{code, SwitchOutcome};
+#[cfg(test)]
 use crate::runtime::subscription_scheduler::now_ms;
 use crate::runtime::tailscale_login_core::StartLoginOutcome;
 use crate::runtime::unlock::{selected_exit_changed, BroadcastSink};
@@ -502,9 +507,8 @@ impl std::fmt::Display for ServerSwitchError {
 /// 把出口选到 `server_id`：校验目标 → 改 `selectedServerId` → 取得 selector 所有权。在调用方的
 /// 配置写事务里对 `cfg` 就地操作；返回 `Err` 时调用方须放弃这次写（`cfg` 可能已被改了一半）。
 ///
-/// 显式选择的三个入口共用它：用户点节点（[`server_switch_core`]，随后清选择意图）、用户点某订阅
-/// 的「自动选择」时的首次落点、「立即切换」（后两个保留自动意图，见 [`auto_select_enable_core`] /
-/// [`auto_select_switch_now_core`]）。返回（出口是否真变, selector 意图代次）。
+/// 用户点节点经 [`server_switch_core`] 调用，随后清选择意图。测试侧保留旧显式自动落点
+/// 的事务不变量；生产自动选择只走原生 URLTest。返回（出口是否真变, selector 意图代次）。
 fn select_in_place(
     cfg: &mut Value,
     server_id: &str,
@@ -729,9 +733,12 @@ pub fn server_identity_repair(
     }
 }
 
-// ════════════════ 自动选择：设置意图、立即切换、读状态 ════════════════
+// Legacy placement fixtures exercise saved-intent and receipt invariants only.
+// Production commands below exclusively use native URLTest groups; these helpers
+// must not become a second App-side winner or a fallback for older kernels.
 
 /// 设置意图与立即切换被拒的原因。`code` 是给界面判别的稳定码，文案由界面按码给。
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutoSelectError {
     /// 源码里的总开关关着。
@@ -749,6 +756,7 @@ pub(crate) enum AutoSelectError {
     Switch(ServerSwitchError),
 }
 
+#[cfg(test)]
 impl AutoSelectError {
     pub(crate) const fn code(&self) -> &'static str {
         match self {
@@ -767,8 +775,10 @@ impl AutoSelectError {
 }
 
 /// 落点已落盘、而运行侧没有换成时的稳定码。
+#[cfg(test)]
 const CODE_AUTO_SELECT_SWITCH_FAILED: &str = "AUTO_SELECT_SWITCH_FAILED";
 
+#[cfg(test)]
 impl std::fmt::Display for AutoSelectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -784,6 +794,7 @@ impl std::fmt::Display for AutoSelectError {
 }
 
 /// 自动选择的显式路径在写事务里落下的一次出口变更。
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Placement {
     pub(crate) from: Option<String>,
@@ -794,6 +805,7 @@ pub(crate) struct Placement {
     pub(crate) intent_generation: u64,
 }
 
+#[cfg(test)]
 fn closed_error(closed: Option<Gate>) -> Result<(), AutoSelectError> {
     match closed {
         Some(Gate::PlatformNotOpen) => Err(AutoSelectError::PlatformNotOpen),
@@ -802,6 +814,7 @@ fn closed_error(closed: Option<Gate>) -> Result<(), AutoSelectError> {
     }
 }
 
+#[cfg(test)]
 fn selected_of(cfg: &Value) -> Option<String> {
     cfg.get("selectedServerId")
         .and_then(Value::as_str)
@@ -818,6 +831,7 @@ fn selected_of(cfg: &Value) -> Option<String> {
 ///
 /// `closed`：自动选择在这里不可用的原因。`decide(cfg, 订阅)`：显式路径的裁决，与后台择优是
 /// 同一个函数。落点过不了选择校验（如绑定的网卡不可用）时不落点、只写意图。
+#[cfg(test)]
 pub(crate) fn auto_select_enable_core(
     config: &ConfigManager,
     subscription_id: &str,
@@ -892,6 +906,7 @@ pub(crate) fn auto_select_enable_core(
 /// 重启）：由用户显式发起，走与手动点节点同级的路径。目标是裁决给的 —— 当前出口不在订阅内、
 /// 当前出口测速失败或没有新鲜结果，或当前出口已连续几轮被明显胜过。裁决没有给出落点时拒绝且
 /// 不动出口：它从不把出口换到一个并不更好的节点上。
+#[cfg(test)]
 pub(crate) fn auto_select_switch_now_core(
     config: &ConfigManager,
     closed: Option<Gate>,
@@ -941,18 +956,8 @@ pub(crate) fn auto_select_switch_now_core(
     ))
 }
 
-/// 设置意图与立即切换的回执。命令返回成功即表示写入已落盘：`intent_applied` 为真时意图此刻是
-/// 自动选择。落点另列：它的运行侧可能没换成（`placement.status` 为 `failed`，带稳定码），那时
-/// 意图仍然已生效，出口留给后台或下一次显式操作。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AutoSelectReceipt {
-    intent_applied: bool,
-    placement: Option<AutoSelectPlacement>,
-    status: auto_select::Status,
-}
-
 /// 一次落点的结果。
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AutoSelectPlacement {
@@ -968,6 +973,7 @@ pub(crate) struct AutoSelectPlacement {
     error: Option<String>,
 }
 
+#[cfg(test)]
 fn node_name(cfg: &Value, id: &str) -> Option<String> {
     cfg.get("servers")
         .and_then(Value::as_array)?
@@ -977,20 +983,9 @@ fn node_name(cfg: &Value, id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 显式路径落点之后的运行侧一半：等受限的运行态投影（可能重启），并把这次换点记进选择状态。
-/// 运行侧没换成时不报错返回：出口与意图都已落盘，结果如实写在落点里。
-async fn finish_placement(
-    app: &AppHandle,
-    state: &State<'_, AppRuntime>,
-    saved: &Value,
-    placement: Placement,
-) -> AutoSelectPlacement {
-    emit_config_changed_signal(app);
-    finish_placement_core(&state.proxy, saved, placement).await
-}
-
 /// Keep the runtime receipt and bookkeeping together, independently of the IPC shell.
 /// Saving a selection alone must not consume dwell or better-switch rate limits.
+#[cfg(test)]
 pub(crate) async fn finish_placement_core(
     proxy: &Arc<ProxyRuntime>,
     saved: &Value,

@@ -130,6 +130,52 @@ class SourceArchiveTests(unittest.TestCase):
             changed = json.loads(raw); changed['sourceTree'] = '0' * 40
             self.assertNotEqual(check(json.dumps(changed, ensure_ascii=False).encode('utf-8')).returncode, 0)
 
+    def test_explicit_legal_pins_cli_keeps_archive_inventory_and_source_proofs(self):
+        data, pin, tree, source, linked = self.fixture()
+        content = 'synthetic license\n'
+        legal = {'path': 'licenses/LICENSE', 'bytes': len(content.encode()),
+                 'sha256': hashlib.sha256(content.encode()).hexdigest()}
+        request = {'sourceArchive': pin, 'sourceCommit': COMMIT, 'sourceTree': tree,
+                   'sourceGitlinks': [{'path': 'client', 'sha': GITLINK}], 'sourceIdentity': source,
+                   'buildReplacements': linked, 'legalFiles': [legal]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'source.tar.gz'; path.write_bytes(data)
+            def check(payload=request, flag=True):
+                return subprocess.run([sys.executable, '-B', str(Path(archive.__file__)), str(path),
+                                       *(['--source-legal-pins'] if flag else [])],
+                    input=json.dumps(payload).encode(), capture_output=True, timeout=10)
+            good = check()
+            self.assertEqual(good.returncode, 0, good.stderr)
+            self.assertIn(b'stage=stdin-start', good.stderr)
+            self.assertIn(b'stage=complete', good.stderr)
+            self.assertNotIn(content.encode(), good.stderr)
+            # No optional-content fallback or request-controlled opt-in.
+            self.assertNotEqual(check(flag=False).returncode, 0)
+            self.assertNotEqual(check({**request, 'legal_pins': True}, flag=False).returncode, 0)
+            for files in [None, [], [legal, legal],
+                          [{**legal, 'content': content}],
+                          [{k: v for k, v in legal.items() if k != 'sha256'}],
+                          [{**legal, 'bytes': True}], [{**legal, 'bytes': -1}],
+                          [{**legal, 'bytes': 2 * 1024 * 1024 + 1}],
+                          [{**legal, 'bytes': legal['bytes'] + 1}],
+                          [{**legal, 'sha256': 'malformed'}], [{**legal, 'sha256': '0' * 64}],
+                          [{**legal, 'path': 'licenses/../LICENSE'}],
+                          [legal, {**legal, 'path': 'licenses/extra'}],
+                          [{**legal, 'path': 'licenses/missing'}]]:
+                with self.subTest(files=files):
+                    self.assertNotEqual(check({**request, 'legalFiles': files}).returncode, 0)
+            for field, value in [('sourceTree', '0' * 40), ('sourceGitlinks', []),
+                                 ('sourceIdentity', {**source, 'goModSha256': '0' * 64}),
+                                 ('buildReplacements', [{**linked[0], 'replacement': {
+                                     **linked[0]['replacement'], 'h1': 'h1:Yg='}}])]:
+                with self.subTest(field=field):
+                    self.assertNotEqual(check({**request, field: value}).returncode, 0)
+            # The old entry still requires and verifies the complete content.
+            full = {**request, 'legalFiles': [{**legal, 'content': content}]}
+            self.assertEqual(check(full, flag=False).returncode, 0)
+            self.assertNotEqual(check({**full, 'legalFiles': [{**legal, 'content': 'changed'}]},
+                                      flag=False).returncode, 0)
+
     def test_replace_tab_and_specific_version_precedence_follow_go_mod(self):
         for mod in [
             b'module fixture\nreplace\texample.invalid/old => example.invalid/new v1.0.0\n',

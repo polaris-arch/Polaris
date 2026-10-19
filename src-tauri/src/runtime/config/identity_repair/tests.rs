@@ -144,7 +144,7 @@ fn ordinary_writers_cannot_create_duplicate_identity() {
     // A snapshot can remove ambiguity, but still cannot guess the original credential owner.
     assert!(manager.save_full(&raw).is_err());
     let directory = TestDir::new("identity-repair-new-");
-    let clean = ConfigManager::new(directory);
+    let clean = ConfigManager::new(directory.to_path_buf());
     clean.current().unwrap();
     raw["servers"][1]["id"] = json!("same");
     assert!(clean

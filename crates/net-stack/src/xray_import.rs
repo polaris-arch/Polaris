@@ -151,7 +151,6 @@ fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>, network:
                     }
                     other => str_ne(other).map(|h| vec![h]),
                 },
-                ..Default::default()
             }));
         }
         "httpupgrade" => {

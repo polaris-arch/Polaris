@@ -1065,45 +1065,87 @@ mod lifetime_wait {
     }
 }
 
-/// 被拒之后交不交系统：只有「Windows 便携形态拿到安装程序」不交 —— 系统对 `.exe` 的打开就是
-/// 运行它，会在别处装出第二份程序。
-///
-/// **变异探针**：让 `hands_to_system` 恒真 ⇒ 首条转红；恒假 ⇒ 后四条转红。
+/// Every incompatible installation form is rejected; no rejected asset gets an OS handoff.
+/// Keep the former portable-EXE case and the other formerly handed-off forms as regressions.
 #[test]
-fn a_portable_install_never_hands_an_installer_to_the_system() {
-    let mismatch = |installer: &str, os: &str, form| InstallReject::FormMismatch {
-        installer: installer.to_owned(),
-        os: os.to_owned(),
-        form,
-    };
-    assert!(!mismatch("Polaris_1.2.3_x64-setup.exe", "windows", RunForm::Loose).hands_to_system());
-    // 这一格就是 `decide_install_plan` 对便携形态 + 安装程序给出的那个拒绝。
-    let rejected = decide_install_plan(
-        "windows",
-        RunForm::Loose,
-        Path::new(r"C:\Cache\updates\Polaris_1.2.3_x64-setup.exe"),
-        Path::new(r"D:\Polaris\polaris.exe"),
-        None,
-        Some(Path::new(r"D:\Polaris\polaris.exe")),
-    )
-    .expect_err("便携形态拿到安装程序是错配");
-    assert!(!rejected.hands_to_system(), "{rejected:?}");
-
-    for handed in [
-        // 安装态拿到便携压缩包：打开只是让系统的压缩包查看器接手。
-        mismatch(
-            "Polaris_1.2.3_x64-win-Portable.zip",
+fn incompatible_installers_are_rejected_for_every_form() {
+    for (os, form, installer) in [
+        ("windows", RunForm::Loose, "Polaris_1.2.3_x64-setup.exe"),
+        (
             "windows",
             RunForm::Installed,
+            "Polaris_1.2.3_x64-win-Portable.zip",
         ),
-        // AppImage 运行拿到 `.deb`：交给系统的包管理器界面，由用户决定（不自动提权安装）。
-        mismatch("polaris_1.2.3_amd64.deb", "linux", RunForm::Loose),
-        mismatch("Polaris-1.2.3.AppImage", "linux", RunForm::Installed),
-        InstallReject::UnknownAsset {
-            file_name: "notes.txt".to_owned(),
-        },
+        ("linux", RunForm::Loose, "polaris_1.2.3_amd64.deb"),
+        ("linux", RunForm::Installed, "Polaris-1.2.3.AppImage"),
     ] {
-        assert!(handed.hands_to_system(), "{handed:?}");
+        let rejected = decide_install_plan(
+            os,
+            form,
+            Path::new(installer),
+            Path::new("/app/polaris"),
+            Some(Path::new("/app/Polaris.AppImage")),
+            Some(Path::new("/app/polaris.exe")),
+        )
+        .expect_err("incompatible assets must never produce an install plan");
+        assert!(
+            matches!(rejected, InstallReject::FormMismatch { .. }),
+            "{rejected:?}"
+        );
+    }
+    assert!(matches!(
+        decide_install_plan(
+            "linux",
+            RunForm::Installed,
+            Path::new("notes.txt"),
+            Path::new("/app/polaris"),
+            None,
+            None
+        ),
+        Err(InstallReject::UnknownAsset { .. })
+    ));
+}
+
+fn rejects_without_handoff(body: &str) -> bool {
+    let Some((_, after_reject)) = body.split_once("Err(_reject) => {") else {
+        return false;
+    };
+    let Some((rejected, _)) = after_reject.split_once("update_install::install_advisory(&plan)")
+    else {
+        return false;
+    };
+    rejected.contains("return Ok(ApiResponse::err(")
+        && ![
+            ".open(",
+            ".spawn(",
+            "hands_to_system",
+            "spawn_detached_script(",
+        ]
+        .iter()
+        .any(|handoff| rejected.contains(handoff))
+}
+
+#[test]
+fn rejected_assets_cannot_fall_back_to_system_execution() {
+    let source = crate::test_support::crate_source("commands/updater/app_update.rs");
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(&source, "pub async fn update_install(");
+    assert!(rejects_without_handoff(&body));
+    // Negative controls use the same predicate: removing the rejection or inserting a handoff fails.
+    assert!(!rejects_without_handoff(
+        &body.replace("return Ok(ApiResponse::err(", "Ok(ApiResponse::err(")
+    ));
+    for handoff in [
+        "shell.open(&installer);",
+        "command.spawn();",
+        "reject.hands_to_system();",
+        "spawn_detached_script(&plan);",
+    ] {
+        let mutated = body.replace(
+            "Err(_reject) => {",
+            &format!("Err(_reject) => {{ {handoff}"),
+        );
+        assert!(!rejects_without_handoff(&mutated), "{handoff}");
     }
 }
 

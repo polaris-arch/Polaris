@@ -9,6 +9,7 @@ import stat
 import shlex
 import sys
 import tarfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -237,13 +238,15 @@ def extract_wire_transport(path, destination, record):
         (destination / name).chmod(0o600)
 
 
-def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_identity, build_replacements, reviewed_source=None, legal_files=None):
+def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_identity, build_replacements, reviewed_source=None, legal_files=None, *, legal_pins=False, progress=None):
     """Hash the full Git tree from source tar bytes without extracting anything.
 
     This independently links the downloaded source archive to the public commit
     tree. Tar metadata is never trusted as a commit assertion. Symlink targets
     are hashed as Git blob bytes and are never followed.
     """
+    mark = progress or (lambda stage: None)
+    mark('source-start')
     require(re.fullmatch(r'[a-f0-9]{40}', commit) and re.fullmatch(r'[a-f0-9]{40}', expected_tree),
             'invalid source object identity')
     if reviewed_source is not None:
@@ -256,9 +259,11 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
             and source.stat().st_size == record['bytes'], 'source archive size differs')
     data = source.read_bytes()
     require(hashlib.sha256(data).hexdigest() == record['sha256'], 'source archive SHA differs')
+    mark('archive-hash-verified')
     with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
         expanded = compressed.read(1024 ** 3 + 1)
     require(len(expanded) <= 1024 ** 3, 'source tar expanded size limit')
+    mark('archive-expanded')
     if 'transport' in record:
         require(record['transport'] == 'github-commit-archive-v1'
                 and record.get('name') == 'sing-box-polaris-' + commit + '.tar.gz'
@@ -268,18 +273,31 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
         require(isinstance(legal_files, list) and 0 < len(legal_files) <= 1024, 'commit source legal inventory missing')
     else:
         prefix = 'sing-box-polaris-source-' + commit
+    if legal_pins:
+        require(isinstance(legal_files, list) and 0 < len(legal_files) <= 1024, 'source legal pins inventory missing')
     expected_legal, observed_legal = {}, {}
     if legal_files is not None:
         for legal in legal_files:
+            if legal_pins:
+                require(isinstance(legal, dict) and set(legal) == {'path', 'bytes', 'sha256'}
+                        and type(legal['bytes']) is int and 0 <= legal['bytes'] <= 2 * 1024 * 1024
+                        and isinstance(legal['sha256'], str) and re.fullmatch(r'[a-f0-9]{64}', legal['sha256']),
+                        'source legal pins identity differs')
             name = legal['path']
             require(isinstance(name, str) and name.startswith('licenses/') and all(
                 re.fullmatch(r'[A-Za-z0-9_+.-]+', p) and p not in ['.', '..'] for p in name.split('/')),
                 'source legal path differs')
             source_name = 'LICENSE' if name == 'licenses/LICENSE' else 'release/' + name
-            require(source_name not in expected_legal and isinstance(legal['content'], str)
-                    and len(legal['content'].encode()) == legal['bytes']
-                    and hashlib.sha256(legal['content'].encode()).hexdigest() == legal['sha256'], 'source legal identity differs')
+            require(source_name not in expected_legal, 'source legal identity differs')
+            # Only the explicit trusted CLI path omits content. Its Node caller
+            # has already checked contract content against these pins; actual
+            # tar legal files must still match the entire inventory below.
+            if not legal_pins:
+                require(isinstance(legal['content'], str)
+                        and len(legal['content'].encode()) == legal['bytes']
+                        and hashlib.sha256(legal['content'].encode()).hexdigest() == legal['sha256'], 'source legal identity differs')
             expected_legal[source_name] = (legal['bytes'], legal['sha256'])
+    mark('legal-inventory-verified')
     entries, seen, source_files = {}, set(), {}
     def object_hash(kind, content):
         return hashlib.sha1(kind.encode() + b' ' + str(len(content)).encode() + b'\0' + content).digest()
@@ -327,6 +345,7 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
                             'reviewed source proof exceeds bound')
                 source_files[relative] = content
     require(observed_legal == expected_legal, 'source legal bytes/inventory differ')
+    mark('archive-members-verified')
     # Git archive records gitlinks as empty directories, never submodule
     # contents. Only separately fetched public Git tree objects may fill them.
     require(isinstance(gitlinks, list) and len(gitlinks) <= 1024, 'source gitlink inventory invalid')
@@ -354,6 +373,7 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
         return object_hash('tree', b''.join(value for _, value in sorted(rows)))
     observed = tree_hash(entries).hex()
     require(observed == expected_tree, 'downloaded source archive Git tree differs')
+    mark('tree-verified')
     for name, field in [('go.mod', 'goModSha256'), ('go.sum', 'goSumSha256')]:
         require(name in source_files and hashlib.sha256(source_files[name]).hexdigest() == source_identity[field],
                 'downloaded source module bytes differ')
@@ -370,6 +390,7 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
     if reviewed_source is not None:
         meta_tree = entries['third_party']['metacubex-utls']
         verify_source_policy_files(reviewed_source, {**source_identity, 'sourceCommit': commit, 'sourceTree': expected_tree}, source_files, tree_hash(meta_tree).hex())
+    mark('source-policy-verified')
     local_source = source_identity['replacements']
     require(len({item['module'] for item in local_source}) == len(local_source),
             'duplicate source replacement module')
@@ -422,13 +443,26 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
             require(len(new) == 2 and new[1] == target['version']
                     and f"{new[0]} {new[1]} {target['h1']}" in sums,
                     'linked remote replacement version/checksum differs from source')
+    mark('complete')
     return observed
 
 
 if __name__ == '__main__':
     # Node sends UTF-8 JSON bytes. Never decode through the Windows console
     # code page or surrogateescape; malformed UTF-8 must remain an error.
-    request = json.loads(sys.stdin.buffer.read().decode('utf-8', errors='strict'))
+    legal_pins = len(sys.argv) == 3 and sys.argv[2] == '--source-legal-pins'
+    started = time.monotonic()
+    def progress(stage):
+        # Fixed stage names and elapsed time only; never emit request contents.
+        if legal_pins:
+            print(f'SOURCE_ARCHIVE_PROOF stage={stage} elapsed_ms={int((time.monotonic() - started) * 1000)}',
+                  file=sys.stderr, flush=True)
+    progress('stdin-start')
+    raw_request = sys.stdin.buffer.read()
+    progress('stdin-read')
+    request = json.loads(raw_request.decode('utf-8', errors='strict'))
+    progress('request-decoded')
+    require(not legal_pins or isinstance(request, dict) and 'sourceArchive' in request, 'source legal pins require source archive')
     require(isinstance(request, dict) and 'profile' not in request, 'unexpected archive profile field')
     # Only trusted command-line call sites select this distinct transport
     # domain. Archive JSON cannot opt into a larger profile or validation-only.
@@ -441,8 +475,8 @@ if __name__ == '__main__':
         require(set(request) == {'archive', 'root'}, 'unexpected wire extraction fields')
         extract(sys.argv[1], sys.argv[2], request['archive'], request['root'], wire_handoff=True)
     elif 'sourceArchive' in request:
-        require(len(sys.argv) == 2 and not sys.argv[1].startswith('--'), 'unexpected source archive arguments')
-        verify_source_archive(sys.argv[1], request['sourceArchive'], request['sourceCommit'], request['sourceTree'], request['sourceGitlinks'], request['sourceIdentity'], request['buildReplacements'], request.get('sourcePolicy'), request.get('legalFiles'))
+        require((len(sys.argv) == 2 or legal_pins) and not sys.argv[1].startswith('--'), 'unexpected source archive arguments')
+        verify_source_archive(sys.argv[1], request['sourceArchive'], request['sourceCommit'], request['sourceTree'], request['sourceGitlinks'], request['sourceIdentity'], request['buildReplacements'], request.get('sourcePolicy'), request.get('legalFiles'), legal_pins=legal_pins, progress=progress)
     elif 'wireTransport' in request:
         require(len(sys.argv) == 3 and not sys.argv[1].startswith('--'), 'unexpected wire ZIP arguments')
         extract_wire_transport(sys.argv[1], sys.argv[2], request['wireTransport'])

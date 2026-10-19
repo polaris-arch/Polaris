@@ -118,4 +118,4 @@ pub mod mac_migration_observer;
 pub mod protected_install_path;
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
-pub mod mac_migration_guard;
+pub(crate) mod mac_migration_guard;

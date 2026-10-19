@@ -445,16 +445,42 @@ enum EndpointClosure {
 }
 
 #[cfg(target_os = "macos")]
-fn endpoint_probe(path: &Path) -> io::Result<EndpointClosure> {
-    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr};
-    use std::os::fd::AsRawFd;
-    let before = endpoint_identity(path)?;
+fn new_endpoint_probe_socket() -> io::Result<std::os::fd::OwnedFd> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+    use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
     let fd = socket(
         AddressFamily::Unix,
         SockType::Stream,
-        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        SockFlag::empty(),
         None,
     )?;
+    // macOS has no atomic socket CLOEXEC/NONBLOCK flags. This private probe is
+    // only called by synchronous administrative CLI dispatch, before daemon
+    // threads start; no spawn/exec occurs between creation and these checks.
+    // OwnedFd closes on every error. Never connect until both flags read back.
+    let descriptor_flags = FdFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFD)?);
+    fcntl(
+        &fd,
+        FcntlArg::F_SETFD(descriptor_flags | FdFlag::FD_CLOEXEC),
+    )?;
+    let status_flags = OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL)?);
+    fcntl(&fd, FcntlArg::F_SETFL(status_flags | OFlag::O_NONBLOCK))?;
+    if !FdFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFD)?).contains(FdFlag::FD_CLOEXEC)
+        || !OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL)?).contains(OFlag::O_NONBLOCK)
+    {
+        return Err(rejected(
+            "endpoint probe descriptor flags were not retained",
+        ));
+    }
+    Ok(fd)
+}
+
+#[cfg(target_os = "macos")]
+fn endpoint_probe(path: &Path) -> io::Result<EndpointClosure> {
+    use nix::sys::socket::{connect, UnixAddr};
+    use std::os::fd::AsRawFd;
+    let before = endpoint_identity(path)?;
+    let fd = new_endpoint_probe_socket()?;
     let address = UnixAddr::new(path)?;
     match connect(fd.as_raw_fd(), &address) {
         Err(nix::errno::Errno::ENOENT | nix::errno::Errno::ECONNREFUSED) => {}
@@ -1697,7 +1723,8 @@ fn uninstall_preflight_unchanged(journal: &Journal) -> io::Result<()> {
 
 /// Administrative arguments are consumed on every platform; never fall through
 /// into daemon serving mode when a migration verb is unsupported or malformed.
-pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
+/// Administrative CLI only: call before starting threads or concurrent spawn/exec.
+pub(crate) fn run(args: &[String]) -> Option<std::process::ExitCode> {
     let verb = args.first()?.as_str();
     if !matches!(
         verb,

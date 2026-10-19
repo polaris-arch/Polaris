@@ -1294,6 +1294,7 @@ fn proxy_status_serializes_camel_case_contract() {
     let s = ProxyStatus {
         running: true,
         main_generation: 7,
+        actual_server_id: Some("measured-node".into()),
         owned_stop_context: None,
         pid: 42,
         start_time: Some(1_700_000_000_000),
@@ -1311,6 +1312,7 @@ fn proxy_status_serializes_camel_case_contract() {
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(v["running"], true);
     assert_eq!(v["mainGeneration"], 7);
+    assert_eq!(v["actualServerId"], "measured-node");
     assert_eq!(v["pid"], 42);
     assert_eq!(v["mixedPort"], 7890);
     assert_eq!(v["clashApiPort"], 19090);

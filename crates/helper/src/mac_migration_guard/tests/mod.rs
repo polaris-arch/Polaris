@@ -302,3 +302,18 @@ fn preflight_cleanup_requires_exact_absence_not_unknown_or_existing_marker() {
     std::os::unix::fs::symlink(directory.path().join("absent"), &link).unwrap();
     assert!(require_metadata_absent(fs::symlink_metadata(link)).is_err());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn endpoint_probe_socket_retains_nonblocking_and_close_on_exec() {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+    let fd = new_endpoint_probe_socket().unwrap();
+    assert!(
+        FdFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFD).unwrap())
+            .contains(FdFlag::FD_CLOEXEC)
+    );
+    assert!(
+        OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL).unwrap())
+            .contains(OFlag::O_NONBLOCK)
+    );
+}

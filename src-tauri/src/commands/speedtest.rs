@@ -134,6 +134,7 @@ fn has_no_real_exit(active: &str) -> bool {
 /// 原在 `crates/speedtest`（照 Electron 三路径形态 1:1 建的纯逻辑层）。该 crate 的其余抽象与 Tauri 侧
 /// 实际形态不匹配（详见本文件 `resolve_speed_test_url` 上方说明），全 crate 仅本常量被消费 → crate 已删，
 /// 常量就近落在唯一消费者这里。
+#[cfg(test)]
 const DEFAULT_SPEED_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 
 /// **第一阶段（冷建链）预算**：CONNECT + TLS 握手 + **第一次 GET**。

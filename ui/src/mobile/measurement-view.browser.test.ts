@@ -30,7 +30,7 @@ if(mode==='desktop')await import('/src/styles/index.css');
 else {await import('/src/styles/tokens.resolved.css');await import('/src/mobile/mobile.css');await import('/src/mobile/redesign.css');}
 const servers=['a','b','c'].map((id,index)=>({id,name:index<2?'同名节点':'自建节点',protocol:'socks',address:'fixture.invalid',port:1,...(index<2?{subscriptionId:index===0?'one':'two'}:{})}));
 const config={selectedServerId:'a',proxyMode:'smart',servers,subscriptions:[{id:'one',name:'Alpha',url:'https://fixture.invalid'},{id:'two',name:'Beta',url:'https://fixture.invalid'},{id:'empty',name:'Empty',url:'https://fixture.invalid'}]};
-let status={running:mode!=='ios',mainGeneration:7,startTime:10};
+let status={running:mode!=='ios',actualServerId:mode==='ios'?null:'a',mainGeneration:7,startTime:10};
 const f=window.__measurement={mounted:false,calls:0,networkCalls:0, reads:0, kind:'success',
  state(){return {selected:useAppStore.getState().selectedServerId,latencies:useLatencyStore.getState().latencyMap};},
  publish(kind){f.kind=kind;const snap=measurementFixture(config,{a:40,b:null},String(++f.reads),Date.now());
@@ -39,6 +39,7 @@ const f=window.__measurement={mounted:false,calls:0,networkCalls:0, reads:0, kin
   if(kind==='notIncluded')snap.rows.a.notIncluded='notInPool';
   if(kind==='disconnected'){snap.rows.a.candidate.disconnected=true;snap.rows.a.candidate.identity.instance={kind:'temp'};snap.rows.a.candidate.identity.context='disconnected';}
   useLatencyStore.getState().applySnapshot(snap,config.servers);},
+ actual(serverId){status={...status,actualServerId:serverId};useAppStore.setState({proxyStatus:status});},
  editSelected(){useStagedConfigStore.setState({entries:[{id:'server:a',kind:'server',label:'edit',entityPath:['servers','a'],nextValue:{...servers[0],address:'new.invalid'}}]});},
  language:null,
  unmount(){app.unmount();dispose();},
@@ -58,7 +59,7 @@ api.server.speedTestResultSnapshot=async()=>{const snap=measurementFixture(confi
  if(f.kind==='notIncluded')snap.rows.a.notIncluded='notInPool';
  if(f.kind==='disconnected'){snap.rows.a.candidate.disconnected=true;snap.rows.a.candidate.identity.instance={kind:'temp'};snap.rows.a.candidate.identity.context='disconnected';}
  return snap;};
-api.server.speedTest=async()=>{f.calls++;status={...status,running:true};useAppStore.setState({proxyStatus:status});return {runId:'1',results:{a:40},outcome:'completed',notInPool:[],tsNotReady:[]};};
+api.server.speedTest=async()=>{f.calls++;status={...status,running:true,actualServerId:'a'};useAppStore.setState({proxyStatus:status});return {runId:'1',results:{a:40},outcome:'completed',notInPool:[],tsNotReady:[]};};
 unlockApi.manualCheck=async()=>{f.networkCalls++;throw Error('fixture stops after the authorized invocation');};
 useStagedConfigStore.setState({enabled:false,hydrated:true,entries:[]});
 useAppStore.setState({config,servers,selectedServerId:'a',proxyStatus:status,invalidNodes:[]});
@@ -211,6 +212,11 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
     const page=await browser.newPage({viewport:{width:390,height:844}});
     try {
       await openFixture(page, 'home', 'effective-node-edit');
+      await expect.poll(()=>page.locator('.h-latency-value [data-measurement-state="success"]').count()).toBe(1);
+      // Missing runtime confirmation must not borrow the saved node's result.
+      await page.evaluate(()=>(window as any).__measurement.actual(null));
+      await expect.poll(()=>page.locator('.h-latency-value [data-measurement-state="success"]').count()).toBe(0);
+      await page.evaluate(()=>(window as any).__measurement.actual('a'));
       await expect.poll(()=>page.locator('.h-latency-value [data-measurement-state="success"]').count()).toBe(1);
       await page.evaluate(()=>(window as any).__measurement.editSelected());
       await expect.poll(()=>page.locator('.h-latency-value [data-measurement-state="unmeasured"]').count()).toBe(1);

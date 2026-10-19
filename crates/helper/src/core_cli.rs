@@ -230,6 +230,8 @@ fn privileged() -> io::Result<bool> {
 }
 
 /// Return None for daemon argv. Administrative argv never falls through to daemon mode.
+/// Invoke from the single-threaded executable entry before daemon/runtime startup;
+/// macOS migration probes require no concurrent spawn/exec during fd setup.
 pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
     #[cfg(target_os = "macos")]
     if let Some(result) = crate::mac_migration_guard::run(args) {
