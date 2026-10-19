@@ -40,7 +40,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appleRequired } from './apple-ci-impact.mjs';
+import { appleRequired, mobileUnitTestsOnlyForReleaseRisk } from './apple-ci-impact.mjs';
 
 export const ALL_PACKAGE_PLATFORMS = Object.freeze([
   'linux',
@@ -515,6 +515,15 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'scripts/apple-ci-impact.mjs': {
+    why: 'Shared Release Risk Python-test proof now controls Android selection; changing its rules requires the real APK leg.',
+  },
+  'scripts/apple-ci-impact.test.mjs': {
+    why: 'Negative controls for the shared mobile routing proof; rule tests retain both mobile build legs.',
+  },
+  'scripts/classify-ci-impact.mjs': {
+    why: 'Release Risk Android selection and its conservative fallback are owned by this classifier.',
+  },
   'src-tauri/src/runtime/tls_fingerprints.rs': {
     why: 'The shared capability parser now explicitly compiles from_native for Android/iOS and host tests. '
       + 'Its loaded-container identity and schema handling enter the Android Rust cdylib and must be compiled in the APK leg. '
@@ -1321,6 +1330,15 @@ export function classifyImpact(rawPaths, { forceFull = false } = {}) {
   };
 }
 
+// Only the direct Release Risk main push can omit mobile builds. Keep the
+// path-only API, --full, native CI, PR/manual and other callers conservative.
+export function classifyReleaseRiskImpact(paths, env, event, run = execFileSync) {
+  const result = classifyImpact(paths);
+  if (result.android && mobileUnitTestsOnlyForReleaseRisk(paths, env, event, run))
+    result.android = false;
+  return result;
+}
+
 function stdinPaths() {
   const input = readFileSync(0);
   if (input.length === 0) return [];
@@ -1404,7 +1422,14 @@ function main() {
     return;
   }
   const forceFull = process.argv.includes('--full');
-  const result = classifyImpact(forceFull ? [] : stdinPaths(), { forceFull });
+  const paths = forceFull ? [] : stdinPaths().filter(Boolean);
+  let result = classifyImpact(paths, { forceFull });
+  if (!forceFull && result.android) {
+    try {
+      result = classifyReleaseRiskImpact(paths, process.env,
+        JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')));
+    } catch { /* Missing/invalid context retains the conservative path result. */ }
+  }
   // 自曝：未登记 scope 已经按内核门 + 四平台处理，但「为什么这次全量」必须能在日志里读出来。
   for (const scope of result.unregisteredScopes) {
     process.stderr.write(

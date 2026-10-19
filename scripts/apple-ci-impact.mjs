@@ -14,10 +14,81 @@ export function appleRequired(paths, full = false) {
         'scripts/mobile-core/', 'scripts/libbox-patches/'].some((prefix) => path.startsWith(prefix))
       || /^src-tauri\/(?:Cargo\.toml|build\.rs|tauri(?:\.ios)?\.conf\.json)$/.test(path)
       || ['.github/workflows/apple.yml', '.github/workflows/release-risk.yml',
-        'scripts/apple-ci-impact.mjs', 'scripts/apple-ci-impact.test.mjs',
+        'scripts/apple-ci-impact.mjs', 'scripts/apple-ci-impact.test.mjs', 'scripts/classify-ci-impact.mjs',
         'scripts/apple-carrier.py', 'scripts/fetch-dashboard.mjs', 'scripts/fetch-protoc.mjs',
         'scripts/lib/extract-zip.mjs', 'scripts/gate-node-test.sh'].includes(path);
   });
+}
+
+// Exact reviewed unittest leaves, not a test_*.py wildcard or a CI-script exemption.
+// These files are outside producer.PRODUCER_FILES. The existing Node gate executes
+// unittest discovery before classification; native CI (including naming) stays full.
+// Production code must not import these leaves. A new dependency requires review
+// of this routing contract, just as for the audited Rust test leaf below.
+export const MOBILE_UNIT_TEST_FILES = Object.freeze([
+  'scripts/mobile-core/test_apple_admission.py',
+  'scripts/mobile-core/test_apple_entry.py',
+  'scripts/mobile-core/test_apple_handoff.py',
+  'scripts/mobile-core/test_apple_merge_reuse.py',
+  'scripts/mobile-core/test_apple_progress.py',
+  'scripts/mobile-core/test_apple_read_reuse.py',
+  'scripts/mobile-core/test_apple_tls_fingerprint.py',
+  'scripts/mobile-core/test_delivery_boundaries.py',
+  'scripts/mobile-core/test_inputs.py',
+  'scripts/mobile-core/test_native_inputs.py',
+  'scripts/mobile-core/test_outputs.py',
+  'scripts/mobile-core/test_producer.py',
+  'scripts/mobile-core/test_source_checkout.py',
+  'scripts/mobile-core/test_source_policy.py',
+]);
+// Bind the small set of producer/discovery/naming owners, not the source tree.
+// Owner updates disable this optimization until its boundary is reviewed again.
+const MOBILE_UNIT_TEST_OWNERS = Object.freeze([
+  ['scripts/mobile-core/producer.py', '100644', '38c4e3e7804feb181cc17319a45298d4d853a92a'],
+  ['scripts/mobile-source-unit.test.mjs', '100644', '8cc09d5f633f4f3c2eb6a4246f79644773b5681e'],
+  ['scripts/gate-node-test.sh', '100755', '52e873e5cc95361c6723318d398caeb4db442664'],
+  ['.github/workflows/release-risk.yml', '100644', '8424964ac3edd11cfe182b852dabae405b7b70ad'],
+  ['.github/workflows/ci.yml', '100644', '9407e92d0fbc36897b7915e45511ade217bc39fa'],
+  ['src-tauri/tests/test_source_anchors.rs', '100644', '18667d599e46b5fb5cc354642a4bd86528419524'],
+]);
+
+export function mobileUnitTestsOnlyForReleaseRisk(paths, env, event, run = execFileSync) {
+  if (!paths.length || new Set(paths).size !== paths.length
+      || paths.some(path => !MOBILE_UNIT_TEST_FILES.includes(path))) return false;
+  if (env.GITHUB_EVENT_NAME !== 'push' || env.GITHUB_REF !== 'refs/heads/main'
+      || env.GITHUB_WORKFLOW !== 'Release Risk'
+      || env.GITHUB_WORKFLOW_REF !== `${env.GITHUB_REPOSITORY}/.github/workflows/release-risk.yml@refs/heads/main`)
+    return false;
+  if (!event || event.forced !== false || event.created !== false || event.deleted !== false) return false;
+  const sha = /^[0-9a-f]{40}$/;
+  if (!sha.test(event.before) || !sha.test(event.after) || /^0+$/.test(event.before)
+      || event.after !== env.GITHUB_SHA || event.before === event.after) return false;
+  try {
+    const options = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
+    if (run('git', ['rev-parse', 'HEAD'], options).trim() !== event.after) return false;
+    run('git', ['cat-file', '-e', `${event.before}^{commit}`], options);
+    run('git', ['merge-base', '--is-ancestor', event.before, event.after], options);
+    const diff = run('git', ['diff', '--raw', '--abbrev=40', '--no-renames', '-z', event.before, event.after, '--'], options);
+    if (!diff || !diff.endsWith('\0')) return false;
+    const fields = diff.slice(0, -1).split('\0');
+    if (fields.length !== paths.length * 2) return false;
+    const remaining = new Set(paths);
+    for (let i = 0; i < fields.length; i += 2) {
+      const row = /^:100644 100644 ([0-9a-f]{40}) ([0-9a-f]{40}) M$/.exec(fields[i]);
+      if (!row || row[1] === row[2] || [row[1], row[2]].some(oid => /^0+$/.test(oid))
+          || !remaining.delete(fields[i + 1])) return false;
+    }
+    if (remaining.size) return false;
+    for (const ref of [event.before, event.after]) {
+      for (const [path, mode, blob] of MOBILE_UNIT_TEST_OWNERS) {
+        if (run('git', ['ls-tree', '-z', ref, '--', path], options) !== `${mode} blob ${blob}\t${path}\0`)
+          return false;
+      }
+    }
+    return true;
+  } catch {
+    return false; // Unknown history, modes, owners or oversized output retain builds.
+  }
 }
 
 // Reviewed single-leaf contract, not a general Rust test-path rule. The owner
@@ -31,6 +102,7 @@ const LINUX_TEST_BOUNDARY = '#[cfg(all(target_os = "linux", target_arch = "x86_6
 
 export function appleRequiredForReleaseRisk(paths, env, event, run = execFileSync) {
   const required = appleRequired(paths);
+  if (required && mobileUnitTestsOnlyForReleaseRisk(paths, env, event, run)) return false;
   if (!required || paths.length !== 1 || paths[0] !== APPLE_TEST_LEAF) return required;
   if (env.GITHUB_EVENT_NAME !== 'push' || env.GITHUB_REF !== 'refs/heads/main'
       || env.GITHUB_WORKFLOW !== 'Release Risk'
@@ -73,7 +145,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     try {
       required = appleRequiredForReleaseRisk(paths, process.env,
         JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')));
-      if (!required) process.stderr.write('Apple build not selected: audited Linux test-leaf content only; native Rust tests remain required. No Apple compilation/test pass is claimed.\n');
+      if (!required) process.stderr.write('Apple build not selected: audited test-only content; source controls and native Rust tests remain required. No Apple compilation/test pass is claimed.\n');
     } catch { /* Keep the existing conservative path decision. */ }
   }
   console.log(required);
