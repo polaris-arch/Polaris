@@ -65,14 +65,18 @@ export function downloadWireArtifact(root, destination, candidate, context, name
       encoding: 'utf8', timeout: 300000, maxBuffer: 1024 * 1024 });
   } finally { rmSync(temporary, { recursive: true, force: true }); }
 }
-function inventory(resources, host = process.platform, declared = [], strict = true) {
+function inventory(resources, host = process.platform, declared = [], strict = true, directories) {
   regularPath(resources, true);
   if (strict) same(readdirSync(resources).sort(), DIRECTORIES, 'Wire handoff directory inventory differs');
   else demand(DIRECTORIES.every((name) => present(join(resources, name))), 'Missing wire inputs');
   const files = [];
   function walk(path, relative) {
     const st = lstatSync(path); demand(!st.isSymbolicLink(), 'Linked wire handoff input');
-    if (st.isDirectory()) { for (const name of readdirSync(path).sort()) walk(join(path, name), relative ? `${relative}/${name}` : name); return; }
+    if (st.isDirectory()) {
+      directories?.push(relative);
+      for (const name of readdirSync(path).sort()) walk(join(path, name), relative ? `${relative}/${name}` : name);
+      return;
+    }
     const transport = declared.find((file) => file.name === relative);
     // NTFS exposes only writable/read-only through Node's POSIX mode facade.
     // Pinned transport bytes include each original safe POSIX mode; preserve
@@ -228,16 +232,31 @@ export function importCoreWireHandoff(root, manifest, bundle, candidate, artifac
 // core executable bits inside a tar, and reuse the strict pinned extractor.
 export function packCoreWireHandoff(bundle, destination) {
   regularPath(bundle, true); demand(basename(bundle) === HANDOFF_ROOT && !present(destination), 'Fresh named wire archive required');
-  const proof = join(bundle, 'handoff.json'); regularPath(proof); const parsed = JSON.parse(readFileSync(proof));
-  same(inventory(join(bundle, 'resources')), parsed.files, 'Wire archive input differs');
+  same(readdirSync(bundle).sort(), ['handoff.json', 'resources'], 'Unexpected wire handoff payload');
+  const proof = join(bundle, 'handoff.json'); regularPath(proof);
+  const proofBytes = readFileSync(proof), parsed = JSON.parse(proofBytes);
+  const directories = [];
+  same(inventory(join(bundle, 'resources'), process.platform, [], true, directories), parsed.files, 'Wire archive input differs');
+  const members = { [`${HANDOFF_ROOT}/handoff.json`]: digest(proofBytes),
+    ...Object.fromEntries(parsed.files.map((f) => [`${HANDOFF_ROOT}/resources/${f.name}`, f.sha256])) };
+  const memberModes = { [`${HANDOFF_ROOT}/handoff.json`]: 0o600,
+    ...Object.fromEntries(parsed.files.map((f) => [`${HANDOFF_ROOT}/resources/${f.name}`, f.mode])) };
+  const memberBytes = { [`${HANDOFF_ROOT}/handoff.json`]: proofBytes.length,
+    ...Object.fromEntries(parsed.files.map((f) => [`${HANDOFF_ROOT}/resources/${f.name}`, f.bytes])) };
+  // Same fixed four-platform/receipt domain as consumption. Include the real
+  // directories and already-observed file sizes, so entry and payload byte
+  // overflow fail before tar creation/upload, not in every downstream import.
+  execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B',
+    join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), '--check-wire-handoff'],
+  { input: JSON.stringify({ root: HANDOFF_ROOT, archive: { members, memberModes }, memberBytes,
+    directories: [HANDOFF_ROOT, `${HANDOFF_ROOT}/resources`, ...directories.map((n) => `${HANDOFF_ROOT}/resources/${n}`)] }),
+    encoding: 'utf8', maxBuffer: 1024 * 1024 });
   mkdirSync(destination, { mode: 0o700 });
   try {
     const name = 'core-wire-inputs.tar.gz', path = join(destination, name);
     execFileSync('tar', ['-czf', path, '-C', dirname(bundle), HANDOFF_ROOT]);
-    const raw = readFileSync(path), members = { [`${HANDOFF_ROOT}/handoff.json`]: digest(readFileSync(proof)),
-      ...Object.fromEntries(parsed.files.map((f) => [`${HANDOFF_ROOT}/resources/${f.name}`, f.sha256])) };
-    const memberModes = { [`${HANDOFF_ROOT}/handoff.json`]: 0o600,
-      ...Object.fromEntries(parsed.files.map((f) => [`${HANDOFF_ROOT}/resources/${f.name}`, f.mode])) };
+    const raw = readFileSync(path);
+    demand(raw.length > 0 && raw.length <= 512 * 1024 * 1024, 'Wire archive size limit');
     const pin = { root: HANDOFF_ROOT, archive: { name, bytes: raw.length, sha256: digest(raw), members, memberModes } };
     writeFileSync(join(destination, 'archive.json'), JSON.stringify(pin, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
     return pin;
@@ -246,10 +265,12 @@ export function packCoreWireHandoff(bundle, destination) {
 export function unpackCoreWireHandoff(artifact, destination) {
   regularPath(artifact, true); same(readdirSync(artifact).sort(), ['archive.json', 'core-wire-inputs.tar.gz'], 'Wire transport inventory differs');
   const metadata = join(artifact, 'archive.json'); regularPath(metadata); const pin = JSON.parse(readFileSync(metadata));
+  same(Object.keys(pin).sort(), ['archive', 'root'], 'Unexpected wire archive fields');
+  same(Object.keys(pin.archive ?? {}).sort(), ['bytes', 'memberModes', 'members', 'name', 'sha256'], 'Unexpected wire archive record fields');
   demand(pin.root === HANDOFF_ROOT && pin.archive?.name === 'core-wire-inputs.tar.gz', 'Wire archive identity differs');
   const archive = join(artifact, pin.archive.name); regularPath(archive);
-  execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), archive, destination],
-    { input: JSON.stringify(pin), encoding: 'utf8', maxBuffer: 1024 * 1024 });
+  execFileSync(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), archive, destination, '--wire-handoff'],
+    { input: JSON.stringify({ archive: pin.archive, root: HANDOFF_ROOT }), encoding: 'utf8', maxBuffer: 1024 * 1024 });
   const payload = join(destination, HANDOFF_ROOT);
   const proof = JSON.parse(readFileSync(join(payload, 'handoff.json'), 'utf8'));
   same(pin.archive.memberModes, { [`${HANDOFF_ROOT}/handoff.json`]: 0o600,

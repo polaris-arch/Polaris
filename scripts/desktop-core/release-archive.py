@@ -18,24 +18,117 @@ def require(ok, message):
         raise ValueError(message)
 
 
-def extract(path, destination, record, root, target=None):
+WIRE_ROOT = 'core-wire-inputs'
+WIRE_PLATFORMS = ('linux', 'win', 'mac-x64', 'mac-arm64')
+
+
+def archive_name(name, directory, root):
+    require(isinstance(name, str), 'unsafe archive path')
+    name = name.removesuffix('/') if directory else name
+    parts = name.split('/')
+    require(parts[0] == root and all(re.fullmatch(r'[A-Za-z0-9_+.-]+', p)
+            and p not in ['.', '..'] and not p.endswith('.')
+            and p.split('.')[0].upper() not in ['CON', 'PRN', 'AUX', 'NUL',
+                *['COM' + str(i) for i in range(1, 10)], *['LPT' + str(i) for i in range(1, 10)]]
+            for p in parts), 'unsafe archive path')
+    return name
+
+
+def wire_group(name, directory):
+    if directory and name in (WIRE_ROOT, WIRE_ROOT + '/resources', WIRE_ROOT + '/resources/.release-receipts'):
+        return 'control'
+    if not directory and name == WIRE_ROOT + '/handoff.json':
+        return 'control'
+    parts = name.split('/')
+    require(len(parts) >= 3 and parts[:2] == [WIRE_ROOT, 'resources'], 'wire archive group differs')
+    if parts[2] in WIRE_PLATFORMS and (directory or len(parts) > 3):
+        return parts[2]
+    require(not directory and len(parts) == 4 and parts[2] == '.release-receipts', 'wire archive group differs')
+    return 'control'
+
+
+def wire_inventory(record, root, directories=None, member_bytes=None):
+    """Fixed four-platform handoff domain; never a caller-supplied larger cap.
+
+    Both producer planning and consumption use this pure check. Count required
+    parent directories too, so omitting tar directory headers cannot evade the
+    per-platform entry budget or create an unbounded extraction tree.
+    """
+    require(root == WIRE_ROOT, 'wire archive root differs')
+    require(set(record) <= {'name', 'bytes', 'sha256', 'members', 'memberModes'}, 'unexpected wire archive fields')
+    expected = record['members']
+    require(isinstance(expected, dict) and 0 < len(expected) <= 7 + len(WIRE_PLATFORMS) * 1024,
+            'wire member inventory limit')
+    modes = record.get('memberModes')
+    require(isinstance(modes, dict) and set(modes) == set(expected), 'member permissions differ')
+    if member_bytes is not None:
+        require(isinstance(member_bytes, dict) and set(member_bytes) == set(expected), 'wire member sizes differ')
+        require(all(type(size) is int and 0 <= size <= 200 * 1024 * 1024
+                    for size in member_bytes.values()), 'unexpected/oversized member')
+        require(sum(member_bytes.values()) <= 1024 ** 3, 'expanded size limit')
+    controls, parents = set(), set()
+    counts = dict.fromkeys(WIRE_PLATFORMS, 0)
+    for name, sha256 in expected.items():
+        archive_name(name, False, root)
+        require(isinstance(sha256, str) and re.fullmatch(r'[a-f0-9]{64}', sha256), 'wire member hash differs')
+        require(type(modes[name]) is int and 0 <= modes[name] <= 0o777 and not modes[name] & 0o022,
+                'unsafe member permissions')
+        group = wire_group(name, False)
+        if group == 'control':
+            controls.add(name)
+            require(modes[name] == 0o600, 'wire control permissions differ')
+        else:
+            counts[group] += 1
+        parts = name.split('/')
+        parents.update('/'.join(parts[:i]) for i in range(1, len(parts)))
+    receipts = root + '/resources/.release-receipts/'
+    fixed = {root + '/handoff.json', receipts + 'public-readback.json',
+             *(receipts + key + '.json' for key in WIRE_PLATFORMS)}
+    indices = {receipts + 'polaris-box-assets.json', receipts + 'polaris-upstream-native-assets.json'}
+    require(fixed <= controls and len(controls) == 7 and len(controls & indices) == 1
+            and controls <= fixed | indices, 'wire control inventory differs')
+    require(all(0 < count <= 1024 for count in counts.values()), 'wire platform member inventory limit')
+    require(not parents & set(expected), 'file/directory collision')
+    aliases = {}
+    for name in set(expected) | parents:
+        require(aliases.setdefault(name.lower(), name) == name, 'directory case alias')
+    if directories is not None:
+        require(isinstance(directories, list) and all(isinstance(name, str) for name in directories)
+                and len(directories) == len(set(directories)) and set(directories) == parents,
+                'wire directory inventory differs')
+    entries = dict.fromkeys((*WIRE_PLATFORMS, 'control'), 0)
+    for names, directory in ((parents, True), (expected, False)):
+        for name in names:
+            group = wire_group(name, directory)
+            entries[group] += 1
+            require(entries[group] <= (10 if group == 'control' else 2048), 'wire group entry limit')
+    return 10 + len(WIRE_PLATFORMS) * 2048
+
+
+def extract(path, destination, record, root, target=None, *, wire_handoff=False):
     require(0 < record['bytes'] <= 512 * 1024 * 1024 and Path(path).stat().st_size == record['bytes'],
             'archive bytes differ')
     data = Path(path).read_bytes()
     require(len(data) == record['bytes'] and hashlib.sha256(data).hexdigest() == record['sha256'],
             'archive bytes differ')
     expected = record['members']
-    require(0 < len(expected) <= 1024, 'member inventory limit')
+    if wire_handoff:
+        require(target is None and path.endswith('.tar.gz'), 'wire archive format differs')
+        entry_limit = wire_inventory(record, root)
+    else:
+        require(0 < len(expected) <= 1024, 'member inventory limit')
+        entry_limit = 2048
+    if 'memberModes' in record:
+        require(set(record['memberModes']) == set(expected), 'member permissions differ')
     seen, aliases, members = set(), set(), {}
+    groups = dict.fromkeys((*WIRE_PLATFORMS, 'control'), 0)
 
     def member(name, directory, mode, size, read):
-        name = name.removesuffix('/') if directory else name
-        parts = name.split('/')
-        require(parts[0] == root and all(re.fullmatch(r'[A-Za-z0-9_+.-]+', p)
-                and p not in ['.', '..'] and not p.endswith('.')
-                and p.split('.')[0].upper() not in ['CON', 'PRN', 'AUX', 'NUL',
-                    *['COM' + str(i) for i in range(1, 10)], *['LPT' + str(i) for i in range(1, 10)]]
-                for p in parts), 'unsafe archive path')
+        name = archive_name(name, directory, root)
+        if wire_handoff:
+            group = wire_group(name, directory)
+            groups[group] += 1
+            require(groups[group] <= (10 if group == 'control' else 2048), 'wire group entry limit')
         require(name not in seen and name.lower() not in aliases, 'duplicate archive path')
         seen.add(name)
         aliases.add(name.lower())
@@ -49,14 +142,13 @@ def extract(path, destination, record, root, target=None):
         require(len(content) == size and hashlib.sha256(content).hexdigest() == expected[name],
                 'member bytes differ')
         if 'memberModes' in record:
-            require(set(record['memberModes']) == set(expected)
-                    and record['memberModes'][name] == mode & 0o777,
+            require(record['memberModes'][name] == mode & 0o777,
                     'member permissions differ')
         members[name] = (content, mode & 0o777)
 
     if path.endswith('.zip'):
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            require(len(archive.infolist()) <= 2048, 'entry limit')
+            require(len(archive.infolist()) <= entry_limit, 'entry limit')
             for info in archive.infolist():
                 require('\x00' not in info.orig_filename, 'raw NUL ZIP member name')
                 mode = info.external_attr >> 16
@@ -87,7 +179,7 @@ def extract(path, destination, record, root, target=None):
             count = 0
             for info in archive:
                 count += 1
-                require(count <= 2048 and (info.isfile() or info.isdir()), 'link/special/entry limit')
+                require(count <= entry_limit and (info.isfile() or info.isdir()), 'link/special/entry limit')
                 if info.isdir():
                     member(info.name, True, info.mode, info.size, None)
                 else:
@@ -337,9 +429,23 @@ if __name__ == '__main__':
     # Node sends UTF-8 JSON bytes. Never decode through the Windows console
     # code page or surrogateescape; malformed UTF-8 must remain an error.
     request = json.loads(sys.stdin.buffer.read().decode('utf-8', errors='strict'))
-    if 'sourceArchive' in request:
+    require(isinstance(request, dict) and 'profile' not in request, 'unexpected archive profile field')
+    # Only trusted command-line call sites select this distinct transport
+    # domain. Archive JSON cannot opt into a larger profile or validation-only.
+    if len(sys.argv) == 2 and sys.argv[1] == '--check-wire-handoff':
+        require(set(request) == {'archive', 'root', 'directories', 'memberBytes'}, 'unexpected wire check fields')
+        require(isinstance(request['memberBytes'], dict), 'wire member sizes differ')
+        wire_inventory(request['archive'], request['root'], request['directories'], request['memberBytes'])
+    elif len(sys.argv) == 4:
+        require(sys.argv[3] == '--wire-handoff', 'unknown archive profile')
+        require(set(request) == {'archive', 'root'}, 'unexpected wire extraction fields')
+        extract(sys.argv[1], sys.argv[2], request['archive'], request['root'], wire_handoff=True)
+    elif 'sourceArchive' in request:
+        require(len(sys.argv) == 2 and not sys.argv[1].startswith('--'), 'unexpected source archive arguments')
         verify_source_archive(sys.argv[1], request['sourceArchive'], request['sourceCommit'], request['sourceTree'], request['sourceGitlinks'], request['sourceIdentity'], request['buildReplacements'], request.get('sourcePolicy'), request.get('legalFiles'))
     elif 'wireTransport' in request:
+        require(len(sys.argv) == 3 and not sys.argv[1].startswith('--'), 'unexpected wire ZIP arguments')
         extract_wire_transport(sys.argv[1], sys.argv[2], request['wireTransport'])
     else:
+        require(len(sys.argv) == 3 and not sys.argv[1].startswith('--'), 'unexpected native archive arguments')
         extract(sys.argv[1], sys.argv[2], request['archive'], request['root'], request.get('target'))
