@@ -1,16 +1,20 @@
 // Deliberately synthetic contract fixtures. Never publication or smoke evidence.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { dirname } from 'node:path';
+import { cronetFixture } from '../lib/cronet-payload.test.mjs';
+import { verifyNativeReleaseGate } from './release-native-gates.mjs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { nativeReleaseGoVersion } from '../native-payload-input.mjs';
 import { digest, desktopSourceGoVersion, upstreamSourceGoVersion } from './source-graph.mjs';
-import { RELEASE_TARGETS, validateReleaseContract, releasePayloadMembers, publicBytes, verifyReleaseCore, releaseSingTunDependency, validateReleaseNotice, releaseInstallationContract, UPSTREAM_INSTALLATION_DOMAIN } from './release-consumer.mjs';
+import { ADAPTER_FILES, consumeRelease, verifyPackagedRelease, portableCanonical, RELEASE_TARGETS, validateReleaseContract, releasePayloadMembers, publicBytes, verifyReleaseCore, releaseSingTunDependency, validateReleaseNotice, releaseInstallationContract, UPSTREAM_INSTALLATION_DOMAIN } from './release-consumer.mjs';
 import { selectedCoreManifest } from '../lib/core-identity.mjs';
 import { managedFormalSelection } from './managed-mesh-core.mjs';
-import { validateUpstreamIndex, upstreamMetadata, upstreamPayloadPins, contractPublicAssets, readUpstreamPublicEvidence, validateUpstreamReadback } from './upstream-release.mjs';
+import { validateUpstreamIndex, upstreamMetadata, upstreamPayloadPins, contractPublicAssets, readUpstreamPublicEvidence, validateUpstreamReadback, readUpstreamSourceEvidence, validatePublishedUpstreamReadback } from './upstream-release.mjs';
 // Frozen G4 source coordinates, with synthetic payloads only. These tests do
 // not assert that a release exists or that any native artifact has passed.
 const hash = 'a'.repeat(64), commit = '55300c55560bcc604fd9675c5526b5713db81cc1',
@@ -602,4 +606,152 @@ test('automatic commit archive permits only its exact anonymous codeload redirec
     await assert.rejects(publicBytes(url, 2, true, { ...options, fetch: async () => new Response(null, { status: 302, headers: { location: wrong } }) }), /Unapproved release redirect/);
   }
   await assert.rejects(publicBytes(url, 2, true, { ...options, fetch: async () => new Response(null, { status: 302, headers: { location: destination } }) }), /Unapproved release redirect/);
+});
+
+
+test('published source observation needs no Actions and cannot claim fresh producer success', async () => {
+  const { contract } = fixture(), responses = evidenceFixture(contract), calls = [];
+  const request = async path => { calls.push(path); assert(!path.startsWith('/actions/')); return structuredClone(responses.get(path)); };
+  const observed = await readUpstreamSourceEvidence(contract, request);
+  validatePublishedUpstreamReadback(observed, contract);
+  assert.deepEqual(calls, [`/git/trees/${tree}?recursive=1`]);
+  assert.equal(Object.hasOwn(observed, 'producerReadback'), false);
+  assert.throws(() => validateUpstreamReadback(observed, contract), /producer readback/);
+  assert.throws(() => validatePublishedUpstreamReadback({ ...observed, producerReadback: {} }, contract), /live producer/);
+  for (const sourceGitlinks of [undefined, null, [{ path: '../escape', sha: 'e'.repeat(40) }],
+    [{ path: 'x', sha: 'bad' }], [...observed.sourceGitlinks, ...observed.sourceGitlinks]])
+    assert.throws(() => validatePublishedUpstreamReadback({ sourceGitlinks }, contract));
+  for (const mutate of [r => { r.sha = '0'.repeat(40); }, r => { r.truncated = true; },
+    r => { r.tree = null; }, r => { r.tree[0].mode = '100644'; }]) {
+    const response = structuredClone(responses.get(`/git/trees/${tree}?recursive=1`)); mutate(response);
+    await assert.rejects(readUpstreamSourceEvidence(contract, async () => response));
+  }
+  for (const unavailable of ['/actions/runs/1/attempts/1', '/actions/workflows/10', '/actions/jobs/1'])
+    await assert.rejects(readUpstreamPublicEvidence(contract, async path => {
+      if (path === unavailable) throw new Error('Actions unavailable');
+      return structuredClone(responses.get(path));
+    }), /Actions unavailable/);
+});
+
+// Integration uses inert binary headers and real archive extraction/hash checks.
+// Go inspection and source-tree subprocess are mocked; full source validation is
+// independently exercised by test-source-archive.py. No native execution occurs.
+test('published consume, packaged verification and native gate work with every Actions URL denied', async t => {
+  const { contract } = fixture(), root = mkdtempSync(join(tmpdir(), 'published-no-actions-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const transport = new Map(), calls = [], sourceChecks = [];
+  const encode = value => Buffer.from(JSON.stringify(value));
+  const put = (path, bytes) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, bytes); };
+  const sourceBytes = Buffer.from('inert source: subprocess proof is mocked');
+  Object.assign(contract.sourceArchive, { bytes: sourceBytes.length, sha256: digest(sourceBytes) });
+  transport.set(contract.sourceArchive.url, sourceBytes);
+  const payloads = new Map();
+  for (const [key, row] of Object.entries(contract.platforms)) {
+    const target = RELEASE_TARGETS[key], core = Buffer.alloc(256);
+    if (key === 'mac-arm64') row.signatureObservation = { state: 'signed', cdHash: '4'.repeat(40), trustValidated: false };
+    if (key === 'linux') { core.set([127,69,76,70,2,1]); core.writeUInt16LE(62,18); }
+    else if (key === 'win') { core.write('MZ'); core.writeUInt32LE(128,60); core.write('PE\0\0',128); core.writeUInt16LE(0x8664,132); }
+    else { core.writeUInt32LE(0xfeedfacf); core.writeUInt32LE(key === 'mac-x64' ? 0x1000007 : 0x100000c,4); }
+    core.write(key,200);
+    const files = { [target.core]: core, LICENSE: Buffer.from('LICENSE') };
+    if (target.sidecar) files[target.sidecar] = cronetFixture(key);
+    for (const value of [row.core, ...(row.sidecar ? [row.sidecar] : [])])
+      Object.assign(value, { bytes: files[value.member].length, sha256: digest(files[value.member]) });
+    Object.assign(row.finalPackageCronetSmoke, { coreSha256: row.core.sha256, librarySha256: row.sidecar?.sha256 ?? null });
+    row.buildGraph.settings = { GOOS: target.os, GOARCH: target.arch, CGO_ENABLED: target.cgo, '-trimpath': 'true', '-tags': row.tags };
+    row.rawBuildInfo = `fixture: ${row.goVersion}\n\tpath\tgithub.com/sagernet/sing-box/cmd/sing-box\n\tmod\tgithub.com/sagernet/sing-box\t(devel)\n`
+      + row.buildGraph.normalModules.map(m => `\tdep\t${m.module}\t${m.version}\t${m.h1}\n`).join('')
+      + row.buildGraph.localReplacements.map(m => `\tdep\t${m.module}\t${m.version}\t${m.h1}\n\t=>\t${m.replacement.module}\t${m.replacement.version}\t${m.replacement.h1}\n`).join('')
+      + Object.entries(row.buildGraph.settings).map(([k,v]) => `\tbuild\t${k}=${v}\n`).join('');
+    const members = Object.fromEntries(Object.entries(files).map(([name,b]) => [`${row.archive.root}/${name}`, b.toString('base64')]));
+    const archive = join(root, row.archive.name);
+    execFileSync('python3', ['-c', `import base64,io,json,sys,tarfile,zipfile
+members=json.load(sys.stdin)
+if sys.argv[1].endswith('.zip'):
+ with zipfile.ZipFile(sys.argv[1],'w') as z:
+  for n,v in members.items():
+   i=zipfile.ZipInfo(n);i.external_attr=0o100755<<16;z.writestr(i,base64.b64decode(v))
+else:
+ with tarfile.open(sys.argv[1],'w:gz') as z:
+  for n,v in members.items():
+   b=base64.b64decode(v);i=tarfile.TarInfo(n);i.size=len(b);i.mode=0o755;z.addfile(i,io.BytesIO(b))`, archive], { input: JSON.stringify(members) });
+    const bytes = readFileSync(archive);
+    Object.assign(row.archive, { bytes: bytes.length, sha256: digest(bytes), members: Object.fromEntries(Object.entries(files).map(([name,b]) => [`${row.archive.root}/${name}`,digest(b)])) });
+    Object.assign(row.releaseAsset, { bytes: bytes.length, sha256: digest(bytes) });
+    transport.set(row.releaseAsset.url, bytes); payloads.set(row.core.sha256,row);
+  }
+  const { schema, providerContract, releaseId, assetIndex, platforms, sourceArchive, ...base } = contract;
+  const index = encode({ schema: 'polaris-upstream-native-assets-v1', ...base,
+    sourceArchive: { name: sourceArchive.name, bytes: sourceArchive.bytes, sha256: sourceArchive.sha256 },
+    platforms: Object.values(platforms).map(({releaseAsset,...row})=>row) });
+  Object.assign(contract.assetIndex,{ bytes:index.length,sha256:digest(index) });
+  // Match the active transport: reviewed index in App, fixed-commit source archive.
+  contract.materialTransport = 'committed-index-github-source-v1';
+  contract.producerSourceArchive = { name: sourceArchive.name, bytes: sourceArchive.bytes, sha256: sourceArchive.sha256 };
+  contract.assetIndex = { name: contract.assetIndex.name, bytes: index.length, sha256: digest(index), path: 'scripts/desktop-core/release-asset-index.json' };
+  contract.sourceArchive = { transport: 'github-commit-archive-v1', name: `sing-box-polaris-${contract.sourceCommit}.tar.gz`,
+    bytes: sourceBytes.length, sha256: digest(sourceBytes), url: `https://github.com/${contract.repository}/archive/${contract.sourceCommit}.tar.gz` };
+  transport.set(contract.sourceArchive.url, sourceBytes);
+  put(join(root,contract.assetIndex.path),index);
+  const raw = encode(contract), manifest = { desktopRelease: { schema: 'polaris-app-release-selection-v1', contractPath:'scripts/desktop-core/release-contract.json', contractSha256:digest(raw),
+    ...Object.fromEntries(['version','tag','tagObject','sourceCommit','sourceTree','releaseId'].map(k=>[k,contract[k]])),
+    librarySha256:{linux:contract.platforms.linux.sidecar.sha256,win:contract.platforms.win.sidecar.sha256} } };
+  const repo = join(dirname(fileURLToPath(import.meta.url)),'../..');
+  for (const name of ADAPTER_FILES) { mkdirSync(dirname(join(root,name)),{recursive:true});copyFileSync(join(repo,name),join(root,name)); }
+  put(join(root,manifest.desktopRelease.contractPath),raw);
+  const api = `https://api.github.com/repos/${contract.repository}`;
+  transport.set(api,encode({id:contract.repositoryId,full_name:contract.repository,private:false}));
+  transport.set(api+`/releases/${contract.releaseId}`,encode({id:contract.releaseId,tag_name:contract.tag,draft:false,immutable:false,
+    html_url:`https://github.com/${contract.repository}/releases/tag/${contract.tag}`,
+    assets:contractPublicAssets(contract).map(a=>({id:a.assetId,name:a.name,size:a.bytes,state:'uploaded',browser_download_url:a.url,digest:`sha256:${a.sha256}`}))}));
+  transport.set(api+`/git/ref/tags/${contract.tag}`,encode({ref:`refs/tags/${contract.tag}`,object:{type:'tag',sha:contract.tagObject}}));
+  transport.set(api+`/git/tags/${contract.tagObject}`,encode({sha:contract.tagObject,tag:contract.tag,object:{type:'commit',sha:contract.sourceCommit}}));
+  transport.set(api+`/git/commits/${contract.sourceCommit}`,encode({sha:contract.sourceCommit,tree:{sha:contract.sourceTree}}));
+  transport.set(api+`/git/trees/${contract.sourceTree}?recursive=1`,encode({sha:contract.sourceTree,truncated:false,tree:[]}));
+  const read = async url => { calls.push(url); assert(!url.includes('/actions/'),'Actions forbidden');assert(transport.has(url),url);return transport.get(url); };
+  const run = (command,args,options) => {
+    if(command==='git')return args[0]==='rev-parse'?'c'.repeat(40):'';
+    if(command==='go'){const row=payloads.get(digest(readFileSync(args.at(-1))));assert(row);return args[0]==='version'?row.rawBuildInfo:row.buildID;}
+    if(args[1]?.endsWith('release-archive.py') && options.input && JSON.parse(options.input).sourceArchive){sourceChecks.push(JSON.parse(options.input));return '{}';}
+    return execFileSync(command,args,options);
+  };
+  const receipts=await consumeRelease(root,manifest,undefined,{read,run,host:'linux'});
+  for(const [key,row] of Object.entries(contract.platforms)){
+    const receipt=verifyPackagedRelease(root,manifest,key,join(root,'resources',key,row.core.member),run,'linux');
+    assert.equal(Object.hasOwn(receipt.publicReadback,'producerReadback'),false);
+    const context={repository:'polaris-arch/Polaris',runId:'123',attempt:'1'};
+    const facts={schema:'polaris-app-native-release-gate-v1',candidate:receipt.adapter.facts.candidate,context,contractSha256:manifest.desktopRelease.contractSha256,
+      platform:key,host:{linux:'linux',win:'win32','mac-x64':'darwin','mac-arm64':'darwin'}[key],arch:key==='mac-arm64'?'arm64':'x64',receipt,
+      readback:JSON.parse(readFileSync(join(root,'resources/.release-receipts/public-readback.json'))),indexSha256:contract.assetIndex.sha256,
+      inspection:'download-extract-buildinfo-buildid-cronet-native-signature',actualAppAcceptance:'pending load, gvisor/mixed, feature and final carrier'};
+    verifyNativeReleaseGate({...facts,fingerprint:digest(portableCanonical(facts))},contract,manifest.desktopRelease,receipt.adapter,context,key);
+  }
+  assert.equal(Object.keys(receipts).length,4);assert.equal(sourceChecks.length,5);
+  assert(sourceChecks.every(c=>c.sourceTree===contract.sourceTree&&c.sourceGitlinks.length===0));
+  assert.equal(calls.filter(url=>url.includes('/actions/')).length,0);
+  assert.equal(calls.filter(url=>url.includes('/git/trees/')).length,2);
+  const publicURL = api+`/releases/${contract.releaseId}`, publicBytes = transport.get(publicURL);
+  for (const mutate of [r=>{r.id++;},r=>{r.draft=true;},r=>{r.tag_name+='changed';},
+    r=>{r.assets[0].id++;},r=>{r.assets[0].digest='sha256:'+'0'.repeat(64);},
+    r=>{r.assets[0].size++;},r=>{r.assets[0].browser_download_url+='?changed';}]) {
+    const changed=JSON.parse(publicBytes);mutate(changed);transport.set(publicURL,encode(changed));
+    await assert.rejects(consumeRelease(root,manifest,['linux'],{read,run}));
+    transport.set(publicURL,publicBytes);
+  }
+  for (const url of [contract.sourceArchive.url,contract.platforms.linux.releaseAsset.url]) {
+    const original=transport.get(url);transport.set(url,Buffer.alloc(original.length));
+    await assert.rejects(consumeRelease(root,manifest,['linux'],{read,run}));transport.set(url,original);
+  }
+  const treeURL=api+`/git/trees/${contract.sourceTree}?recursive=1`, treeBytes=transport.get(treeURL);
+  transport.set(treeURL,encode({sha:contract.sourceTree,truncated:true,tree:[]}));
+  await assert.rejects(consumeRelease(root,manifest,['linux'],{read,run}));transport.set(treeURL,treeBytes);
+  put(join(root,contract.assetIndex.path),Buffer.alloc(index.length));
+  await assert.rejects(consumeRelease(root,manifest,['linux'],{read,run}));put(join(root,contract.assetIndex.path),index);
+  let reads=0;
+  await assert.rejects(consumeRelease(root,manifest,['linux'],{run,read:async url=>{
+    if(url===publicURL && ++reads===2){const r=JSON.parse(publicBytes);r.assets[0].digest=null;return encode(r);}
+    return read(url);
+  }}),/identity changed/);
+  // Failed acquisitions never replace the already installed, verified payload.
+  verifyPackagedRelease(root,manifest,'linux',join(root,'resources/linux/sing-box'),run,'linux');
 });

@@ -267,6 +267,17 @@ export function validateUpstreamReadback(snapshot, contract) {
   for (const [key, expected] of Object.entries(producer.nativeJobs)) same(readback.jobs[key], {
     id: expected.id, name: expected.name, runId: producer.runId, runAttempt: producer.runAttempt,
     sourceCommit: contract.sourceCommit, status: 'completed', conclusion: 'success' }, 'Saved native job identity differs');
+  validateUpstreamSourceReadback(snapshot, contract);
+}
+// Published consumption trusts the reviewed contract/index in this App commit.
+// It revalidates public source and bytes, not the producer's historical Actions
+// status. Never label these observations as a fresh producer-success readback.
+export function validatePublishedUpstreamReadback(snapshot, contract) {
+  if (!isUpstreamRelease(contract)) return;
+  demand(!Object.hasOwn(snapshot, 'producerReadback'), 'Published readback must not claim live producer verification');
+  validateUpstreamSourceReadback(snapshot, contract);
+}
+function validateUpstreamSourceReadback(snapshot, contract) {
   demand(Array.isArray(snapshot.sourceGitlinks) && snapshot.sourceGitlinks.length <= 1024
     && snapshot.sourceGitlinks.every((entry) => typeof entry.path === 'string' && entry.path.length > 0
       && entry.path.split('/').every((part) => part && !['.', '..'].includes(part) && !part.includes('\0')) && hex(entry.sha, 40))
@@ -295,12 +306,20 @@ export async function readUpstreamPublicEvidence(contract, request) {
       jobs[key] = { id: job.id, name: job.name, runId: job.run_id, runAttempt: job.run_attempt,
         sourceCommit: job.head_sha, status: job.status, conclusion: job.conclusion };
     }
+    const source = await readUpstreamSourceEvidence(contract, request);
+    return { producerReadback: { runId: run.id, runAttempt: run.run_attempt, sourceCommit: run.head_sha,
+      workflow: workflow.path, workflowId: workflow.id, status: run.status, conclusion: run.conclusion, jobs }, ...source };
+}
+
+// Used by both published consumption and the strict candidate/publication path.
+export async function readUpstreamSourceEvidence(contract, request) {
     const tree = await request(`/git/trees/${contract.sourceTree}?recursive=1`);
     demand(tree.sha === contract.sourceTree && tree.truncated === false && Array.isArray(tree.tree), 'Complete public source tree unavailable');
     const sourceGitlinks = tree.tree.filter((entry) => entry.mode === '160000' || entry.type === 'commit')
       .map((entry) => { demand(entry.mode === '160000' && entry.type === 'commit' && hex(entry.sha, 40)
         && typeof entry.path === 'string' && entry.path.split('/').every((part) => part && !['.', '..'].includes(part)),
       'Public source gitlink differs'); return { path: entry.path, sha: entry.sha }; }).sort((a,b) => a.path.localeCompare(b.path));
-    return { producerReadback: { runId: run.id, runAttempt: run.run_attempt, sourceCommit: run.head_sha,
-      workflow: workflow.path, workflowId: workflow.id, status: run.status, conclusion: run.conclusion, jobs }, sourceGitlinks };
+    const evidence = { sourceGitlinks };
+    validateUpstreamSourceReadback(evidence, contract);
+    return evidence;
 }

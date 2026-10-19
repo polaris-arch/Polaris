@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Frozen formal Xcode Cargo hook; no CLI options server, signing or device action."""
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 
 sys.dont_write_bytecode = True
@@ -22,6 +24,46 @@ SWIFT_BRIDGES = ('_init_plugin_dialog', '_init_plugin_notification', '_init_plug
                  '_register_plugin', '_run_plugin_command')
 SWIFT_EXPORT_POLICY = ('vendor/swift-rs/src-rs/build.rs', 'vendor/swift-rs/src-rs/ios_exports.rs',
                        'crates/tauri-plugin-polaris-ios/ios/Sources/VpnPlugin.swift')
+CARGO_TIMING_BYTES = 4 * 1024 ** 2
+
+
+@contextlib.contextmanager
+def cargo_timing_report(target, root, triple):
+    """Retain one bounded diagnostic, never an acceptance receipt or a rerun."""
+    report = target / 'cargo-timings/cargo-timing.html'
+    try:
+        previous = report.lstat().st_mtime_ns
+    except FileNotFoundError:
+        previous = None
+    except OSError:
+        previous = False  # Unknown starting state cannot identify a new report.
+    try:
+        yield
+    finally:
+        try:
+            require(previous is not False and report.resolve(strict=True) == report,
+                    'Cargo timing diagnostic redirected or starting state unknown')
+            fd = os.open(report, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as stream:
+                before = os.fstat(stream.fileno())
+                require(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= CARGO_TIMING_BYTES and
+                        before.st_mtime_ns != previous, 'fresh bounded Cargo timing diagnostic required')
+                raw = stream.read(CARGO_TIMING_BYTES + 1)
+                after = os.fstat(stream.fileno())
+            require(len(raw) == before.st_size and
+                    (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns),
+                    'Cargo timing diagnostic changed during read')
+            output = root / ('diagnostic-cargo-timing-' + triple + '.html')
+            partial = output.with_suffix('.html.part')
+            with partial.open('xb') as stream:
+                require(stream.write(raw) == len(raw), 'incomplete Cargo timing diagnostic copy')
+            os.link(partial, output)  # Exclusive publication; preserve earlier diagnostics.
+            partial.unlink()
+        except (OSError, RuntimeError):
+            # Missing/oversized reports and diagnostic I/O must not mask Cargo's
+            # original failure or become an additional carrier acceptance gate.
+            with contextlib.suppress(OSError):
+                print('Cargo timing diagnostic unavailable; not carrier acceptance', file=sys.stderr, flush=True)
 
 
 def target_for(platform, arches, configuration):
@@ -153,13 +195,14 @@ def build_reserved():
     env['RUSTC'] = str(tool_paths['rustc'])
     # The final Xcode link needs global native Swift bridge definitions in this
     # archive. Source declarations or local/private names cannot satisfy it.
-    command = [str(tool_paths['cargo']), 'rustc', '--locked', '--release', '--lib', '--package', 'polaris',
+    command = [str(tool_paths['cargo']), 'rustc', '--locked', '--release', '--timings', '--lib', '--package', 'polaris',
                '--target', triple, '--features', 'tauri/custom-protocol', '--crate-type', 'staticlib']
     execution_inputs = None
     if os.environ.get('POLARIS_APPLE_PRODUCE_REUSE_CONTRACT') == 'true':
         from apple_merge_reuse import cargo_execution_inputs, observe_cargo_execution_inputs
         execution_inputs = observe_cargo_execution_inputs(env)
-    run(command, cwd=ROOT / 'src-tauri', env=env, log=root / ('original-rust-' + triple + '.log'), capture='none')
+    with cargo_timing_report(target, root, triple):
+        run(command, cwd=ROOT / 'src-tauri', env=env, log=root / ('original-rust-' + triple + '.log'), capture='none')
     if execution_inputs is not None and 'unavailable' not in execution_inputs:
         require(cargo_execution_inputs(env) == execution_inputs, 'actual Cargo input changed during compilation')
     archive = target / triple / 'release/libpolaris_lib.a'

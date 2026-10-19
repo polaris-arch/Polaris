@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 // Orthogonal to desktop package/Android selection: shared source and final
 // iOS link changes require the real unsigned App+PacketTunnel build.
@@ -19,6 +20,61 @@ export function appleRequired(paths, full = false) {
   });
 }
 
+// Reviewed single-leaf contract, not a general Rust test-path rule. The owner
+// blob binds its actual #[cfg(test)] module declaration. Code review must keep
+// production include!/build.rs inputs independent of this test leaf; any new
+// such dependency must update this routing contract. A changed owner falls back.
+export const APPLE_TEST_LEAF = 'src-tauri/src/runtime/proxy/mesh_apply/candidate/check/tests/mod.rs';
+const TEST_OWNER = 'src-tauri/src/runtime/proxy/mesh_apply/candidate/check.rs';
+const TEST_OWNER_BLOB = '5c38100fa91a246ed00606832af675b4684c14ea';
+const LINUX_TEST_BOUNDARY = '#[cfg(all(target_os = "linux", target_arch = "x86_64"))]\nmod linux_tests {\n';
+
+export function appleRequiredForReleaseRisk(paths, env, event, run = execFileSync) {
+  const required = appleRequired(paths);
+  if (!required || paths.length !== 1 || paths[0] !== APPLE_TEST_LEAF) return required;
+  if (env.GITHUB_EVENT_NAME !== 'push' || env.GITHUB_REF !== 'refs/heads/main'
+      || env.GITHUB_WORKFLOW !== 'Release Risk'
+      || env.GITHUB_WORKFLOW_REF !== `${env.GITHUB_REPOSITORY}/.github/workflows/release-risk.yml@refs/heads/main`)
+    return required;
+  if (!event || event.forced !== false || event.created !== false || event.deleted !== false)
+    return required;
+  const sha = /^[0-9a-f]{40}$/;
+  if (!sha.test(event.before) || !sha.test(event.after) || /^0+$/.test(event.before)
+      || event.after !== env.GITHUB_SHA || event.before === event.after) return required;
+  try {
+    const options = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
+    if (run('git', ['rev-parse', 'HEAD'], options).trim() !== event.after) return required;
+    run('git', ['cat-file', '-e', `${event.before}^{commit}`], options);
+    run('git', ['merge-base', '--is-ancestor', event.before, event.after], options);
+    const diff = run('git', ['diff', '--raw', '--abbrev=40', '--no-renames', '-z', event.before, event.after, '--'], options);
+    // This registered leaf already has mode 100755. Only identical regular-file
+    // modes and a single existing M are admitted, never A/D/R/T/chmod or mixed edits.
+    const fields = diff.split('\0');
+    const row = /^:100755 100755 ([0-9a-f]{40}) ([0-9a-f]{40}) M$/.exec(fields[0]);
+    if (fields.length !== 3 || fields[1] !== APPLE_TEST_LEAF || fields[2] !== '' || !row
+        || row[1] === row[2] || [row[1], row[2]].some(oid => /^0+$/.test(oid))) return required;
+    for (const [ref, blob] of [[event.before, row[1]], [event.after, row[2]]]) {
+      if (run('git', ['ls-tree', '-z', ref, '--', TEST_OWNER], options)
+          !== `100755 blob ${TEST_OWNER_BLOB}\t${TEST_OWNER}\0`)
+        return required;
+      const content = run('git', ['cat-file', 'blob', blob], options);
+      if (!content.startsWith(LINUX_TEST_BOUNDARY)) return required;
+    }
+    return false; // Linux native tests still run; this is not an Apple test pass.
+  } catch {
+    return required; // Missing/shallow history, failed commands or oversized input.
+  }
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  console.log(appleRequired(readFileSync(0, 'utf8').split('\0').filter(Boolean), process.argv.includes('--full')));
+  const paths = readFileSync(0, 'utf8').split('\0').filter(Boolean);
+  let required = appleRequired(paths, process.argv.includes('--full'));
+  if (required && !process.argv.includes('--full') && process.argv.includes('--release-risk')) {
+    try {
+      required = appleRequiredForReleaseRisk(paths, process.env,
+        JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')));
+      if (!required) process.stderr.write('Apple build not selected: audited Linux test-leaf content only; native Rust tests remain required. No Apple compilation/test pass is claimed.\n');
+    } catch { /* Keep the existing conservative path decision. */ }
+  }
+  console.log(required);
 }

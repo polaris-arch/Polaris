@@ -155,7 +155,7 @@ class Fixture:
             'rustc': versions['rustc'] + '\n', 'linkInputSha256': link_pin['sha256'], 'devicePassed': False,
             'sdkVersion': '27.1', 'cargoLock': file_pin(reuse.ROOT / 'Cargo.lock'),
             'iosConfig': file_pin(reuse.ROOT / 'src-tauri/tauri.ios.conf.json'),
-            'command': ['/tools/cargo', 'rustc', '--locked', '--release', '--lib', '--package', 'polaris',
+            'command': ['/tools/cargo', 'rustc', '--locked', '--release', '--timings', '--lib', '--package', 'polaris',
                         '--target', 'aarch64-apple-ios', '--features', 'tauri/custom-protocol', '--crate-type', 'staticlib'],
             'archive': reuse.pin_bytes(b'rustarchive'),
             'executionInputs': {'overrides': {'RUSTC': reuse.pin_bytes(b'/tools/rustc'),
@@ -253,13 +253,15 @@ class Fixture:
         self.routes['/actions/runs/100/artifacts?per_page=100'] = {'total_count': len(self.artifacts),
                                                                 'artifacts': list(self.artifacts.values())}
 
-    def replace_rust_execution(self, execution):
+    def replace_rust_execution(self, execution, *, command=None):
         rust = reuse.safe_json(self.carrier_files['device-arm64/rust-aarch64-apple-ios.json'])
         rust.pop('fingerprint')
         if execution is None:
             rust.pop('executionInputs')
         else:
             rust['executionInputs'] = execution
+        if command is not None:
+            rust['command'] = command
         rust = reuse.signed(rust)
         carrier = reuse.safe_json(self.carrier_files['device-arm64/app-carrier.json'])
         carrier.pop('fingerprint'); carrier['rustInput'].update(reuse.pin_bytes(raw_json(rust)))
@@ -336,6 +338,21 @@ class AppleMergeReuseControls(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.fx = Fixture(self.temp.name)
+
+    def test_cargo_timing_command_remains_exact_not_an_extra_flags_allowance(self):
+        for kind in ('missing-timings', 'duplicate-timings', 'verbose'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as folder:
+                fx = Fixture(folder)
+                rust = reuse.safe_json(fx.carrier_files['device-arm64/rust-aarch64-apple-ios.json'])
+                command = rust['command'][:]
+                if kind == 'missing-timings':
+                    command.remove('--timings')
+                else:
+                    command.append('--timings' if kind == 'duplicate-timings' else '-vv')
+                fx.replace_rust_execution(rust['executionInputs'], command=command)
+                with tempfile.TemporaryDirectory() as work, \
+                        self.assertRaisesRegex(RuntimeError, 'Rust command contract differs'):
+                    reuse.read_evidence(fx.api, fx.artifacts, fx.ctx, fx.source, work)
 
     @both_merge_forms
     def test_positive_retains_all_original_bytes_and_reference_only_receipt(self):

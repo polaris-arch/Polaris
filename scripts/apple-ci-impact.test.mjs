@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { runInNewContext } from 'node:vm';
-import { appleRequired } from './apple-ci-impact.mjs';
+import { APPLE_TEST_LEAF, appleRequired, appleRequiredForReleaseRisk } from './apple-ci-impact.mjs';
 
 function aggregateScript() {
   const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
@@ -548,4 +549,122 @@ test('Release Risk reports rebuilt versus reused Apple evidence and rejects miss
   assert.equal(invoke({ APPLE_EVIDENCE_MODE: 'reused', APPLE_INCLUDE_SIMULATOR: 'true' }).status, 1);
   assert.equal(invoke({ APPLE_EVIDENCE_MODE: 'rebuilt', APPLE_INCLUDE_SIMULATOR: 'true' }).status, 0);
   assert.equal(invoke({ APPLE_REQUIRED: 'false', APPLE_RESULT: 'skipped', APPLE_EVIDENCE_MODE: '' }).status, 0);
+});
+
+
+const reviewedOwner = 'src-tauri/src/runtime/proxy/mesh_apply/candidate/check.rs';
+const ownerBlob = '5c38100fa91a246ed00606832af675b4684c14ea';
+const linuxBoundary = '#[cfg(all(target_os = "linux", target_arch = "x86_64"))]\nmod linux_tests {\n';
+function leafContext() {
+  const before = 'a'.repeat(40), after = 'b'.repeat(40);
+  return { env: { GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/main',
+    GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_WORKFLOW: 'Release Risk',
+    GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/release-risk.yml@refs/heads/main',
+    GITHUB_SHA: after }, event: { before, after, forced: false, created: false, deleted: false } };
+}
+function leafGit(context, overrides = {}) {
+  return (command, args) => {
+    assert.equal(command, 'git');
+    if (args[0] === 'rev-parse' && args[1] === 'HEAD') return overrides.head ?? context.event.after;
+    if (args[0] === 'cat-file' && args[1] === '-e') {
+      if (overrides.missingBase) throw new Error('missing base');
+      return '';
+    }
+    if (args[0] === 'merge-base') {
+      if (overrides.nonAncestor) throw new Error('not ancestor');
+      return '';
+    }
+    if (args[0] === 'diff') return overrides.diff ?? `:100755 100755 ${'c'.repeat(40)} ${'d'.repeat(40)} M\0${APPLE_TEST_LEAF}\0`;
+    if (args[0] === 'ls-tree') return `${overrides.ownerMode ?? '100755'} blob ${overrides.owner ?? ownerBlob}\t${reviewedOwner}\0`;
+    if (args[0] === 'cat-file' && args[1] === 'blob') return overrides.content ?? linuxBoundary + '}\n';
+    throw new Error('unexpected git call: ' + args.join(' '));
+  };
+}
+
+test('one audited existing Linux test leaf can omit Apple, never native Rust', async () => {
+  const context = leafContext();
+  assert.equal(appleRequired([APPLE_TEST_LEAF]), true); // Legacy path-only API stays conservative.
+  assert.equal(appleRequiredForReleaseRisk([APPLE_TEST_LEAF], context.env, context.event, leafGit(context)), false);
+  const { classifyNativeImpact } = await import('./classify-ci-impact.mjs');
+  assert.equal(classifyNativeImpact(leafGit(context)('git', ['diff'])).nativeRequired, true);
+  const owner = readFileSync(new URL('../' + reviewedOwner, import.meta.url));
+  // Ordinary owner edits merely disable the runtime exemption; no exact-blob
+  // assertion blocks unrelated production development.
+  assert.match(owner.toString(), /#\[cfg\(test\)\]\nmod tests;/);
+  assert.ok(readFileSync(new URL('../' + APPLE_TEST_LEAF, import.meta.url), 'utf8').startsWith(linuxBoundary));
+  // Reviewed source-input contract: build.rs must not acquire this test leaf as
+  // an input. A future production include/build dependency needs routing review.
+  const build = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
+  assert.doesNotMatch(build, /candidate\/check\/tests|check\/tests\/mod\.rs/);
+  const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
+  assert.match(risk, /git diff --name-only -z "\$base" "\$head" \| node scripts\/apple-ci-impact\.mjs --release-risk/);
+});
+
+test('test-leaf routing rejects unsafe or unregistered diff and source boundaries', () => {
+  const c = leafContext(), valid = leafGit(c)('git', ['diff']);
+  const check = overrides => appleRequiredForReleaseRisk([APPLE_TEST_LEAF], c.env, c.event, leafGit(c, overrides));
+  for (const diff of ['', valid.slice(0, -1), valid + valid,
+    valid.replace(' M\0', ' A\0'), valid.replace(' M\0', ' D\0'), valid.replace(' M\0', ' R100\0'),
+    valid.replace(' M\0', ' C100\0'), valid.replace(' M\0', ' T\0'),
+    valid.replace(':100755 100755', ':100644 100755'), valid.replace(':100755 100755', ':100755 100644'),
+    valid.replace(':100755 100755', ':120000 120000'), valid.replace(':100755 100755', ':160000 160000'),
+    valid.replace('c'.repeat(40), '0'.repeat(40)), valid.replace('d'.repeat(40), 'c'.repeat(40)),
+    valid.replace(APPLE_TEST_LEAF, 'src-tauri/src/lib.rs'), valid.replace(APPLE_TEST_LEAF, '../' + APPLE_TEST_LEAF),
+    valid + `:100644 100644 ${'c'.repeat(40)} ${'d'.repeat(40)} M\0src-tauri/build.rs\0`]) {
+    assert.equal(check({ diff }), true, JSON.stringify(diff));
+  }
+  for (const overrides of [{ owner: 'e'.repeat(40) }, { ownerMode: '120000' }, { content: '// cfg removed\n' },
+    { content: linuxBoundary.replace('linux', 'macos') }, { missingBase: true }, { nonAncestor: true },
+    { head: 'e'.repeat(40) }]) assert.equal(check(overrides), true);
+  for (const extra of [reviewedOwner, 'src-tauri/build.rs', 'src-tauri/src/lib.rs', 'Cargo.toml',
+    '.github/workflows/apple.yml', 'src-tauri/src/another/tests/mod.rs']) {
+    assert.equal(appleRequiredForReleaseRisk([APPLE_TEST_LEAF, extra], c.env, c.event, leafGit(c)), true);
+  }
+});
+
+test('only reliable direct ordinary main push can use the leaf contract', () => {
+  const c = leafContext();
+  for (const env of [{ GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_EVENT_NAME: 'merge_group' },
+    { GITHUB_EVENT_NAME: 'workflow_dispatch' }, { GITHUB_REF: 'refs/heads/topic' },
+    { GITHUB_WORKFLOW: 'CI' }, { GITHUB_WORKFLOW_REF: '' }, { GITHUB_SHA: 'e'.repeat(40) },
+    { GITHUB_WORKFLOW_REF: c.env.GITHUB_WORKFLOW_REF.replace('release-risk.yml@', 'apple.yml@') }]) {
+    assert.equal(appleRequiredForReleaseRisk([APPLE_TEST_LEAF], { ...c.env, ...env }, c.event, leafGit(c)), true);
+  }
+  for (const event of [null, {}, { ...c.event, forced: true }, { ...c.event, created: true },
+    { ...c.event, deleted: true }, { ...c.event, forced: undefined },
+    { ...c.event, before: '0'.repeat(40) }, { ...c.event, before: c.event.after },
+    { ...c.event, after: 'unknown' }]) {
+    assert.equal(appleRequiredForReleaseRisk([APPLE_TEST_LEAF], c.env, event, leafGit(c)), true);
+  }
+});
+
+test('actual Git/CLI leaf exception, full override and legacy invocation stay compatible', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'apple-leaf-route-'));
+  const script = fileURLToPath(new URL('./apple-ci-impact.mjs', import.meta.url));
+  const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+  try {
+    git('init', '-q'); git('config', 'user.name', 'fixture'); git('config', 'user.email', 'fixture@example.invalid');
+    mkdirSync(dirname(join(dir, APPLE_TEST_LEAF)), { recursive: true });
+    writeFileSync(join(dir, reviewedOwner), readFileSync(new URL('../' + reviewedOwner, import.meta.url)));
+    chmodSync(join(dir, reviewedOwner), 0o755);
+    writeFileSync(join(dir, APPLE_TEST_LEAF), linuxBoundary + '}\n'); chmodSync(join(dir, APPLE_TEST_LEAF), 0o755);
+    git('add', '.'); git('commit', '-qm', 'fixture base');
+    const before = git('rev-parse', 'HEAD');
+    writeFileSync(join(dir, APPLE_TEST_LEAF), linuxBoundary + '    // test fixture only\n}\n');
+    git('add', '.'); git('commit', '-qm', 'fixture edit');
+    const after = git('rev-parse', 'HEAD'), c = leafContext();
+    const ownerCurrent = git('rev-parse', `${after}:${reviewedOwner}`) === ownerBlob;
+    const eventPath = join(dir, 'event.json');
+    writeFileSync(eventPath, JSON.stringify({ ...c.event, before, after }));
+    const invoke = (args, env = {}) => spawnSync(process.execPath, [script, ...args], { cwd: dir,
+      input: APPLE_TEST_LEAF + '\0', encoding: 'utf8',
+      env: { ...process.env, ...c.env, GITHUB_SHA: after, GITHUB_EVENT_PATH: eventPath, ...env } });
+    for (const [args, expected] of [[[], 'true'], [['--release-risk'], ownerCurrent ? 'false' : 'true'],
+      [['--release-risk', '--full'], 'true'], [['--full'], 'true']]) {
+      const result = invoke(args); assert.equal(result.status, 0, result.stderr); assert.equal(result.stdout.trim(), expected);
+    }
+    assert.equal(invoke(['--release-risk'], { GITHUB_EVENT_PATH: join(dir, 'missing') }).stdout.trim(), 'true');
+    writeFileSync(eventPath, '{broken');
+    assert.equal(invoke(['--release-risk']).stdout.trim(), 'true');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

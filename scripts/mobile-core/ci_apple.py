@@ -416,6 +416,7 @@ def evidence(*, publish_env=False, slot=None):
                     receipt_errors['native-input:' + str(len(receipt_errors))] = 'original input missing in failed partial work'
             if 'generatorOutputRoot' in origins:
                 paths.update(path for path in Path(origins['generatorOutputRoot']).rglob('*') if path.is_file())
+        timing_paths = []
         for current_slot in required_slots():
             if scoped_slot and current_slot != scoped_slot:
                 continue
@@ -435,6 +436,7 @@ def evidence(*, publish_env=False, slot=None):
             from apple_rust import target_for
             target = target_for('iphoneos' if current_slot == 'device-arm64' else 'iphonesimulator',
                                 'arm64', 'release')
+            timing_paths.append(work / ('diagnostic-cargo-timing-' + target + '.html'))
             archive = root / 'cache/rust-target' / target / 'release/libpolaris_lib.a'
             if archive.is_file():
                 paths.add(archive)
@@ -523,6 +525,44 @@ def evidence(*, publish_env=False, slot=None):
             # reads at most this index bound; never emit an unretirable index.
             require(sum(len(raw) for raw in receipt_chunks(index, pretty=True)) <= EVIDENCE_INDEX_BYTES,
                     'original evidence index exceeds bound')
+            # Mandatory originals and their index have already passed unchanged.
+            # Optional diagnostics use only remaining budgets; never enter paths
+            # or receipt_errors, and never read again during ZIP serialization.
+            from apple_rust import CARGO_TIMING_BYTES
+            for timing in timing_paths:
+                try:
+                    name = timing.relative_to(root).as_posix()
+                    require(len(rows) < EVIDENCE_ENTRIES and len(name.encode('utf-8')) <= EVIDENCE_PATH_BYTES and
+                            timing.resolve(strict=True) == timing, 'no safe diagnostic entry budget')
+                    fd = os.open(timing, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(fd, 'rb') as stream:
+                        before = os.fstat(stream.fileno())
+                        require(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= CARGO_TIMING_BYTES,
+                                'bounded diagnostic required')
+                        raw = stream.read(CARGO_TIMING_BYTES + 1)
+                        after = os.fstat(stream.fileno())
+                    require(len(raw) == before.st_size and
+                            (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns) and
+                            total + len(raw) <= EVIDENCE_CONTENT_BYTES, 'no stable diagnostic content budget')
+                    proposed = {**index, 'files': {**rows, name: {'originalPath': str(timing),
+                                'bytes': len(raw), 'sha256': sha(raw), 'diagnosticOnly': True}}}
+                    index_bytes = sum(len(chunk) for chunk in receipt_chunks(proposed, pretty=True))
+                    require(index_bytes <= EVIDENCE_INDEX_BYTES and
+                            (total + len(raw) + index_bytes) * 9 // 8 +
+                            (len(rows) + 2) * (2 * EVIDENCE_PATH_BYTES + 1024) + 1024 <= EVIDENCE_ZIP_BYTES,
+                            'no diagnostic index or ZIP budget')
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFREG | stat.S_IMODE(before.st_mode)) << 16
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                except (OSError, RuntimeError, ValueError):
+                    with contextlib.suppress(OSError):
+                        print('Cargo timing diagnostic omitted; mandatory originals unchanged', flush=True)
+                    continue
+                # Actual output-device/ZIP I/O failure keeps its existing strict
+                # meaning; only optional source reads and validation are skipped.
+                package.writestr(info, raw)
+                index, rows, total = proposed, proposed['files'], total + len(raw)
             with package.open('EVIDENCE-INDEX.json', 'w', force_zip64=True) as member:
                 for raw in receipt_chunks(index, pretty=True):
                     member.write(raw)
