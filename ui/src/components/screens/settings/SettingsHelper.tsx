@@ -14,7 +14,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { helperApi } from '@/ipc/api-client';
+import { helperApi, type HelperActionErrorCode } from '@/ipc/api-client';
+import { useNavStore } from '@/store/nav-store';
 import { toast } from '@/lib/error-handler';
 import type { HelperStatus } from '@/contracts/types/runtime';
 import { Phead, SetBlock, SetRow, Pill, Dot, Button, Spinner } from './Primitives';
@@ -61,6 +62,7 @@ export default function SettingsHelper() {
   const [status, setStatus] = useState<HelperStatus | null>(null);
   const [state, setState] = useState<HelperState>('checking');
   const [busy, setBusy] = useState(false);
+  const [installFailure, setInstallFailure] = useState<HelperActionErrorCode | null>(null);
   const cleanupPending = useRef(false);
   const { armed, confirmTwice } = useConfirmTwice();
   const confirmingUninstall = armed === UNINSTALL_KEY;
@@ -102,6 +104,7 @@ export default function SettingsHelper() {
   /** 安装/升级/修复共用（三态按钮都指向它）。 */
   async function install() {
     setBusy(true);
+    setInstallFailure(null);
     try {
       const r = await helperApi.install();
       if (r.success) cleanupPending.current = false;
@@ -110,10 +113,12 @@ export default function SettingsHelper() {
       // W10：Rust 侧把所有失败（用户取消/脚本失败/二进制缺失）都装进 success:false 的 ok 应答——
       // 不在这里读出来，任何失败都是零反馈的「点击安装无反应」。信封不 reject，catch 永远等不到它。
       if (!r.success) {
+        setInstallFailure(r.errorCode ?? 'failed');
         toast.error(t('helper.installFail'), helperActionErrorText(r.errorCode, t));
       }
     } catch (err) {
       console.error('[SettingsHelper] install failed:', err);
+      setInstallFailure('failed');
       reportFailure(t('helper.installFail'));
     } finally {
       setBusy(false);
@@ -218,6 +223,16 @@ export default function SettingsHelper() {
         </div>
 
         <div className="hc-body">
+          {installFailure && (
+            <div role="alert" data-testid="helper-install-failure" className="helper-state">
+              <b>{t('helper.installFail')}</b>
+              <p>{helperActionErrorText(installFailure, t)}</p>
+              <p>{t('helper.failureNextStep')}</p>
+              <Button variant="ghost" size="sm" onClick={() => useNavStore.getState().navigate('logs')}>
+                {t('helper.viewLogsAction')}
+              </Button>
+            </div>
+          )}
           {status?.selectedCore && (
             <dl className="card-sub" data-testid="helper-selected-core" style={{ overflowWrap: 'anywhere' }}>
               <dt>{t('helper.selectedCoreVersion')}</dt><dd>{status.selectedCore.version}</dd>

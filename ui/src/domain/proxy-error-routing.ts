@@ -1,3 +1,4 @@
+import { needsHelperRecovery, revealHelperRecovery } from '@/domain/helper-recovery';
 /**
  * `event:proxyError` 的**分腿路由** —— 桌面与移动**共用同一张处置表**。
  *
@@ -250,6 +251,7 @@ export function handleProxyErrorEvent(
     void refreshProxyStatus();
     if (isProxyStartClaimed()) return;
     toast.error(proxyErrorText(data, t));
+    if (needsHelperRecovery(data.errorCode)) void revealHelperRecovery();
     void notifyDesktop(
       t(`notify.${contentErrorKey}.title`),
       t(`notify.${contentErrorKey}.body`)

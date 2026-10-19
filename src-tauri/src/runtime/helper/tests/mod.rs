@@ -882,6 +882,21 @@ fn helper_action_error_codes_serialize_as_frontend_contract() {
         (HelperActionErrorCode::MissingAsset, "missingAsset"),
         (HelperActionErrorCode::BundleMismatch, "bundleMismatch"),
         (HelperActionErrorCode::NotReady, "notReady"),
+        (
+            HelperActionErrorCode::InvalidInstallation,
+            "invalidInstallation",
+        ),
+        (HelperActionErrorCode::TokenWriteFailed, "tokenWriteFailed"),
+        (
+            HelperActionErrorCode::ScriptWriteFailed,
+            "scriptWriteFailed",
+        ),
+        (
+            HelperActionErrorCode::AuthorizationLaunchFailed,
+            "authorizationLaunchFailed",
+        ),
+        (HelperActionErrorCode::InstallerFailed, "installerFailed"),
+        (HelperActionErrorCode::UpgradeDeferred, "upgradeDeferred"),
         (HelperActionErrorCode::Failed, "failed"),
     ];
     for (code, wire) in cases {
@@ -1302,4 +1317,81 @@ fn installer_uid_matches_the_native_nonroot_app_user() {
         observed, 0,
         "Mac App/admin-CLI regression must run as the actual nonroot runner"
     );
+}
+
+#[test]
+fn helper_install_errors_preserve_preparation_stage_without_guessing_cause() {
+    use std::io::{Error, ErrorKind};
+    let cases = [
+        (
+            ManagerError::InvalidInstallation("private"),
+            HelperActionErrorCode::InvalidInstallation,
+        ),
+        (
+            ManagerError::HelperBinaryMissing(PathBuf::from("private")),
+            HelperActionErrorCode::MissingAsset,
+        ),
+        (
+            ManagerError::TokenWrite(Error::from(ErrorKind::PermissionDenied)),
+            HelperActionErrorCode::TokenWriteFailed,
+        ),
+        (
+            ManagerError::ScriptWrite(Error::from(ErrorKind::StorageFull)),
+            HelperActionErrorCode::ScriptWriteFailed,
+        ),
+        (
+            ManagerError::Escalation(ClientError::Io(Error::from(ErrorKind::NotFound))),
+            HelperActionErrorCode::AuthorizationLaunchFailed,
+        ),
+        (
+            ManagerError::UnsupportedPlatform(Platform::Ios),
+            HelperActionErrorCode::Unsupported,
+        ),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(manager_install_failure_code(&error), expected);
+    }
+    for platform in [Platform::Mac, Platform::Win, Platform::Linux] {
+        assert_eq!(
+            install_command_failure_code(platform, 1, ""),
+            HelperActionErrorCode::InstallerFailed
+        );
+    }
+    assert_eq!(
+        install_command_failure_code(Platform::Linux, 127, ""),
+        HelperActionErrorCode::AuthorizationUnavailable
+    );
+    assert_eq!(
+        install_command_failure_code(Platform::Mac, 127, ""),
+        HelperActionErrorCode::InstallerFailed
+    );
+}
+
+#[test]
+fn helper_upgrade_deferral_recognizes_the_observed_macos_marker_not_exit_code_or_prose() {
+    let actual = "0:174: execution error: helper administration: helper busy, unknown or legacy upgrade admission unsupported\nHELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY (75)";
+    assert_eq!(
+        install_command_failure_code(Platform::Mac, 1, actual),
+        HelperActionErrorCode::UpgradeDeferred
+    );
+    assert_eq!(
+        install_command_failure_code(
+            Platform::Linux,
+            75,
+            "HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY"
+        ),
+        HelperActionErrorCode::UpgradeDeferred
+    );
+    for diagnostic in [
+        "",
+        "helper busy",
+        "helper busy, unknown or legacy upgrade admission unsupported",
+        "path/HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY",
+        "HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY (1)",
+    ] {
+        assert_eq!(
+            install_command_failure_code(Platform::Mac, 75, diagnostic),
+            HelperActionErrorCode::InstallerFailed
+        );
+    }
 }

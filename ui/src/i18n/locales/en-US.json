@@ -46,6 +46,12 @@
       "unsupported": "This platform does not support the privileged helper",
       "missingAsset": "The helper files bundled with this app are unavailable",
       "notReady": "The helper was installed but is not ready yet",
+      "invalidInstallation": "The installation identity parameters are invalid. Reinstall Polaris from a verified package and check the logs.",
+      "tokenWriteFailed": "Helper authentication data could not be saved. Check available disk space and access to the app’s data folder; see the logs for details.",
+      "scriptWriteFailed": "The Helper installation script could not be saved. Check available disk space and access to the app’s data folder; see the logs for details.",
+      "authorizationLaunchFailed": "The administrator authorization process could not be started. Check the installation log before trying again.",
+      "upgradeDeferred": "The existing helper did not approve a safe upgrade. It may be busy or lack upgrade support. Disconnect its managed connections and check again; if it remains blocked, check the logs to determine whether a confirmed legacy migration is needed.",
+      "installerFailed": "The Helper installation command failed. Check the installation log for the cause before trying again.",
       "failed": "The helper action could not be completed",
       "bundleMismatch": "The bundled core does not match this app’s content identity. Reinstall Polaris."
     },
@@ -59,6 +65,8 @@
       "invalid": "Verification failed",
       "unavailable": "Unavailable"
     },
+    "failureNextStep": "Check the Helper installation entries in Logs for the failure details. Recheck does not reinstall the helper.",
+    "viewLogsAction": "View logs",
     "installSelectedCoreAction": "Install selected core"
   },
   "proxy": {
@@ -3210,9 +3218,10 @@
       "rateLimit": "Waiting for the switch rate window to free up",
       "cooldown": "Waiting for the switch cooldown to end"
     },
-    "choose": "Automatically select within a subscription",
-    "choice": "Auto · {{subscription}}",
-    "choiceHelp": "The automatic intent and actual exit are shown separately. Picking any node returns to manual selection.",
+    "choose": "Automatic node selection",
+    "choice": "Subscription: {{subscription}}",
+    "choiceSelected": "Selected · Subscription: {{subscription}}",
+    "choiceHelp": "Choose a subscription to select nodes automatically within it. Check the connection status for the actual exit; choosing any node switches to manual selection.",
     "switchNow": "Evaluate switching now",
     "keepManual": "Keep current exit in manual mode",
     "intentSaved": "Automatic intent saved; the actual exit awaits backend evaluation.",

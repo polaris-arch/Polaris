@@ -27,7 +27,7 @@ export function AutoSelectControls({ config, accept, t, query = '', getCurrentCo
         return <div key={sub.id}><button type="button" data-auto-select-subscription={sub.id} data-exit-write="auto-select-enable"
           aria-pressed={selected} disabled={busy || empty || selected} aria-description={empty ? t('autoSelect.error.AUTO_SELECT_SUBSCRIPTION_EMPTY') : undefined}
           style={{ minHeight: '2.75rem', paddingInline: '0.75rem' }} onClick={() => run({ kind: 'enable', subscriptionId: sub.id })}>
-          {t('autoSelect.choice', { subscription: sub.name })}
+          {t(selected ? 'autoSelect.choiceSelected' : 'autoSelect.choice', { subscription: sub.name })}
         </button>{empty && <p data-auto-select-empty={sub.id}>{t('autoSelect.error.AUTO_SELECT_SUBSCRIPTION_EMPTY')}</p>}</div>;
       })}
       {auto && <button type="button" data-exit-write="auto-select-now" disabled={busy}

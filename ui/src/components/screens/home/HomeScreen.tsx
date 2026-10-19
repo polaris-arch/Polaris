@@ -1,3 +1,4 @@
+import { needsHelperRecovery, revealHelperRecovery } from '@/domain/helper-recovery';
 import { proxyErrorText } from '@/domain/proxy-error-text';
 import { useQualifiedLatencies } from '@/mobile/use-qualified-latencies';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
@@ -613,10 +614,12 @@ export function HomeScreen() {
           code === ProxyErrorCode.HELPER_CORE_ABSENT ||
           code === ProxyErrorCode.HELPER_CORE_INVALID) {
         toast.error(proxyErrorText({ errorCode: code }, key => t(key)));
+        if (needsHelperRecovery(code)) void revealHelperRecovery();
         return;
       }
       if (code === ProxyErrorCode.HELPER_CORE_MISMATCH) {
         toast.error(t('errors.helperCoreMismatch'));
+        void revealHelperRecovery();
         return;
       }
       toast.error(

@@ -13,6 +13,11 @@ beforeEach(() => {
 });
 
 describe('applyTrayScreenIntent', () => {
+  it('helper recovery opens the existing Helper subpage', () => {
+    expect(applyTrayScreenIntent('settings-helper')).toBe(true);
+    expect(useNavStore.getState()).toMatchObject({ scope: 'settings', settingsScreen: 'helper' });
+  });
+
   it("'settings' → 进设置 scope", () => {
     expect(applyTrayScreenIntent('settings')).toBe(true);
     expect(useNavStore.getState().scope).toBe('settings');

@@ -39,3 +39,7 @@ describe('structured action error text', () => {
 it('maps shared dependency conflicts to actionable localized backup copy', () => {
   expect(backupErrorText('sharedDependencyConflict', t)).toBe('translated:backupImport.error.sharedDependencyConflict');
 });
+
+it.each(["invalidInstallation", "tokenWriteFailed", "scriptWriteFailed", "authorizationLaunchFailed", "installerFailed", "upgradeDeferred"])('preserves Helper installation stage %s', code => {
+  expect(helperActionErrorText(code as Parameters<typeof helperActionErrorText>[0], t)).toBe(`translated:helper.actionError.${code}`);
+});

@@ -47,7 +47,6 @@ const CORE_MANIFEST_JSON: &str = include_str!("../../core-manifest.json");
 struct CoreManifest {
     #[serde(rename = "bundledCoreVersion")]
     bundled_core_version: String,
-    #[cfg(test)]
     #[serde(rename = "windowsBuild")]
     windows_build: Option<WindowsBuild>,
     #[serde(rename = "sourceBuild")]
@@ -57,10 +56,12 @@ struct CoreManifest {
     extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Deserialize)]
 struct WindowsBuild {
-    version: String,
+    // Production admission needs this block's presence and validated shape;
+    // only legacy compatibility fixtures read its version value.
+    #[serde(rename = "version")]
+    _version: String,
 }
 
 /// Selected bundled build identity, shared with default HTTP UA. No process probe.
@@ -320,9 +321,10 @@ fn bundled_core_version_with_ios(
         return Ok(version.to_owned());
     }
     Ok(if windows {
-        manifest
-            .windows_build
-            .map_or(manifest.bundled_core_version, |build| build.version)
+        manifest.windows_build.map_or(
+            manifest.bundled_core_version,
+            |WindowsBuild { _version: version }| version,
+        )
     } else {
         manifest.bundled_core_version
     })

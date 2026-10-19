@@ -1,3 +1,4 @@
+import { needsHelperRecovery, revealHelperRecovery } from '@/domain/helper-recovery';
 import { MeasurementLabel } from '@/mobile/MeasurementLabel';
 import { useAppStore, acquireConfigSync, refreshConfig } from '@/store/app-store';
 import { autoSelectT } from './auto-select-labels';
@@ -494,7 +495,12 @@ export default function TrayMenu() {
    */
   const noticeActionFailure = (actionLabel: string, err: unknown) => {
     console.error('[TrayMenu] action failed:', actionLabel, err);
-    if (!mounted.current) return;
+    if (!mounted.current || !interactionActive.current) return;
+    // The main renderer may be destroyed in lightweight mode. Do not rely on its
+    // proxy:error subscriber or an OS notification to expose the repair action.
+    if (needsHelperRecovery((err as { code?: unknown } | null)?.code)) {
+      void revealHelperRecovery();
+    }
     setNotice(t('tray.actionFailed', { action: actionLabel, detail: t('tray.actionFailedDetail') }));
   };
 
@@ -515,6 +521,8 @@ export default function TrayMenu() {
   });
 
   const toggleConnect = async () => {
+    const life = trayLifecycle.current, operation = interactionEpoch.current;
+    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
     const { action } = connBtn;
     if (action === 'none' || connBtn.disabled) return;
     // **取消腿**：启动中点击 = 打断在飞的那一轮（走 stop 通道），**绝不**再发一次 start。
@@ -534,7 +542,7 @@ export default function TrayMenu() {
       // 或接着切个节点。原型只有「选节点」那一条关（`:4237`）。
     } catch (err) {
       /* 失败：保持浮层打开；主窗开着时错误仍经 proxy:error 呈现，托盘态（主窗关闭）由 notice 行兜底（W14） */
-      noticeActionFailure(action === 'start' ? t('tray.connect') : t('tray.disconnect'), err);
+      if (current()) noticeActionFailure(action === 'start' ? t('tray.connect') : t('tray.disconnect'), err);
     } finally {
       setPending(null);
     }

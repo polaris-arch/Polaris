@@ -515,6 +515,11 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/core_version.rs': {
+    why: 'Android default HTTP UA and bundled-version displays embed the mobile producer contract through this module. '
+      + 'Its Android cfg branch and include_str input enter the APK Rust cdylib; changes retain Android compilation/linking and packaging. '
+      + 'aarch64-linux-android cargo check covers production types, while host tests cover parsing and unknown fallbacks; neither proves on-device HTTP behavior.',
+  },
   'scripts/apple-ci-impact.mjs': {
     why: 'Shared Release Risk Python-test proof now controls Android selection; changing its rules requires the real APK leg.',
   },
@@ -830,6 +835,10 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/core_version/tests/mod.rs':
+    'Host cfg(test) regressions cover the embedded mobile version contract, malformed input, and desktop admission/unknown mapping. '
+    + 'ci.yml host cargo test --workspace executes these tests; Android cargo check -p polaris and APK builds do not compile test targets. '
+    + 'The not(Android/iOS) test predicate only selects a desktop admission assertion; this file is not an APK input and does not establish Android device behavior.',
   'src-tauri/src/runtime/tailscale_directory.rs':
     'G4 directory identity/terminal-epoch predicates are shared Rust bookkeeping; iOS alone admits native directory retirement. '
     + 'Android target cargo check covers the Unix lease type surface, while host tests cover directory identity controls. '
@@ -870,8 +879,8 @@ export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
     + 'ci.yml 的 aarch64-linux-android cargo check 覆盖 Android debug cfg 类型；check-android-bridge.mjs A17 '
     + '核对命令、实例发现与注入接线。APK release 构建不执行 debug 注入，也不能证明实际 8 秒让位或重启恢复。',
   'src-tauri/src/runtime/updater.rs':
-    'Frozen desktop sourceBuild selects the compiled desktop baseline and patch-set id only; the Android branch keeps bundledCoreVersion unchanged; Android and iOS report no desktop patch set. '
-    + 'cargo check --target aarch64-linux-android -p polaris type-checks that branch, while host updater/tests exercises explicit Android '
+    'Bundled-version display now delegates to runtime/core_version.rs; Android and iOS still report no desktop patch set. '
+    + 'cargo check --target aarch64-linux-android -p polaris type-checks production parsing and admission, while host updater/tests exercises legacy '
     + 'baseline compatibility and incomplete-source negatives. No JNI, APK resource, Android updater flow or on-device cleanup is verified by this change.',
   'scripts/fetch-core.mjs':
     'Desktop source producers and four-artifact consumption are invoked by package/release-risk, not android.yml. '

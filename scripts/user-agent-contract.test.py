@@ -20,6 +20,16 @@ class UserAgentContract(unittest.TestCase):
         self.assertNotIn('core-manifest.json', source)
         self.assertIn('"unknown".to_owned()', source)
 
+    def test_windows_overlay_contract_remains_in_production(self):
+        source = read('src-tauri/src/runtime/updater.rs')
+        manifest = source.split('struct CoreManifest {', 1)[1].split('\n}', 1)[0]
+        self.assertNotIn('#[cfg(test)]', manifest)
+        self.assertIn('windows_build: Option<WindowsBuild>', manifest)
+        self.assertIn('#[derive(Debug, Clone, Deserialize)]\nstruct WindowsBuild', source)
+        self.assertNotIn('#[cfg(test)]\n#[derive(Debug, Clone, Deserialize)]\nstruct WindowsBuild', source)
+        self.assertIn('manifest.windows_build.is_some()', source)
+        self.assertIn('#[serde(rename = "version")]\n    _version: String', source)
+
     def test_mobile_matches_linked_constant(self):
         source = read('src-tauri/src/runtime/core_version.rs')
         self.assertIn('scripts/mobile-core/source-contract.json', source)

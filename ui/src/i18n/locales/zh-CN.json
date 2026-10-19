@@ -46,6 +46,12 @@
       "unsupported": "此平台不支持提权 helper",
       "missingAsset": "应用内置的 helper 文件不可用",
       "notReady": "helper 已安装，但暂未就绪",
+      "invalidInstallation": "安装身份参数无效。请使用已核验的安装包重新安装 Polaris，并查看日志。",
+      "tokenWriteFailed": "无法保存 Helper 认证数据。请检查磁盘剩余空间和应用数据目录的访问权限，具体原因见日志。",
+      "scriptWriteFailed": "无法写入 Helper 安装脚本。请检查磁盘剩余空间和应用数据目录的访问权限，具体原因见日志。",
+      "authorizationLaunchFailed": "无法启动管理员授权进程。请先查看安装日志，再决定是否重试。",
+      "upgradeDeferred": "现有助手未批准安全升级，可能仍在使用中或不支持升级协议。请断开它管理的连接后重新检测；若仍被阻止，请查看日志，确认是否需要旧版迁移。",
+      "installerFailed": "Helper 安装命令执行失败。请先查看安装日志中的具体原因，再决定是否重试。",
       "failed": "helper 操作未能完成",
       "bundleMismatch": "随包内核与本应用的内容身份不符，请重新安装 Polaris。"
     },
@@ -59,6 +65,8 @@
       "invalid": "核验失败",
       "unavailable": "不可用"
     },
+    "failureNextStep": "请查看日志中的 Helper 安装记录以确认失败原因。重新检测不会再次安装 Helper。",
+    "viewLogsAction": "查看日志",
     "installSelectedCoreAction": "安装本版本配套内核"
   },
   "proxy": {
@@ -3210,9 +3218,10 @@
       "rateLimit": "须等待换点限频窗口释放",
       "cooldown": "须等待换点冷却结束"
     },
-    "choose": "自动选择订阅",
-    "choice": "自动 · {{subscription}}",
-    "choiceHelp": "自动意图与实际出口分开显示；点击任一节点会回到手动选择。",
+    "choose": "自动选节点",
+    "choice": "订阅：{{subscription}}",
+    "choiceSelected": "已选 · 订阅：{{subscription}}",
+    "choiceHelp": "选择一个订阅，在其中自动选节点。实际出口以连接状态为准；点击任一节点改为手动选择。",
     "switchNow": "立即评估切换",
     "keepManual": "保留当前出口，改为手动",
     "intentSaved": "自动选择意图已保存；实际出口等待后端评估。",

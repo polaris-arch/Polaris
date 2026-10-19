@@ -19,6 +19,12 @@ export type HelperActionErrorCode =
   | 'bundleMismatch'
   | 'missingAsset'
   | 'notReady'
+  | 'invalidInstallation'
+  | 'tokenWriteFailed'
+  | 'scriptWriteFailed'
+  | 'authorizationLaunchFailed'
+  | 'installerFailed'
+  | 'upgradeDeferred'
   | 'failed';
 
 export interface HelperActionResult {

@@ -31,7 +31,8 @@ use polaris_helper_client::PipeConnector;
 use polaris_helper_client::UnixConnector;
 use polaris_helper_client::{
     read_token, EscalationOutcome, HelperClient, HelperManager, HelperStatus, InstallParams,
-    InstallPaths, StdExecutor, StdSysOps, SysOps, READY_POLL_ATTEMPTS, READY_POLL_DELAY,
+    InstallPaths, ManagerError, StdExecutor, StdSysOps, SysOps, READY_POLL_ATTEMPTS,
+    READY_POLL_DELAY,
 };
 use polaris_helper_proto::{
     FlushDns, HelperBirthTarget, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns,
@@ -178,6 +179,12 @@ pub enum HelperActionErrorCode {
     MissingAsset,
     BundleMismatch,
     NotReady,
+    InvalidInstallation,
+    TokenWriteFailed,
+    ScriptWriteFailed,
+    AuthorizationLaunchFailed,
+    InstallerFailed,
+    UpgradeDeferred,
     Failed,
 }
 
@@ -188,6 +195,43 @@ const fn escalation_failure_code(platform: Platform, code: i32) -> HelperActionE
         HelperActionErrorCode::AuthorizationUnavailable
     } else {
         HelperActionErrorCode::Failed
+    }
+}
+
+/// Preserve the typed preparation stage without exposing paths, tokens, or OS error text.
+fn manager_install_failure_code(error: &ManagerError) -> HelperActionErrorCode {
+    match error {
+        ManagerError::InvalidInstallation(_) => HelperActionErrorCode::InvalidInstallation,
+        ManagerError::HelperBinaryMissing(_) => HelperActionErrorCode::MissingAsset,
+        ManagerError::TokenWrite(_) => HelperActionErrorCode::TokenWriteFailed,
+        ManagerError::ScriptWrite(_) => HelperActionErrorCode::ScriptWriteFailed,
+        ManagerError::Escalation(_) => HelperActionErrorCode::AuthorizationLaunchFailed,
+        ManagerError::UnsupportedPlatform(_) => HelperActionErrorCode::Unsupported,
+    }
+}
+
+/// A nonzero authorization/install command exit does not identify an inner failure cause.
+fn install_command_failure_code(
+    platform: Platform,
+    code: i32,
+    stderr: &str,
+) -> HelperActionErrorCode {
+    // osascript wraps the script's exit 75 as exit 1. Recognize only the exact
+    // installer marker (optionally its AppleScript exit suffix), never prose,
+    // a bare exit code, or a guessed old-helper version. This is presentation
+    // only: it grants no admission and does not retry or stop a service.
+    if stderr.lines().any(|line| {
+        matches!(
+            line.trim(),
+            "HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY"
+                | "HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY (75)"
+        )
+    }) {
+        HelperActionErrorCode::UpgradeDeferred
+    } else if matches!(platform, Platform::Linux) && code == 127 {
+        HelperActionErrorCode::AuthorizationUnavailable
+    } else {
+        HelperActionErrorCode::InstallerFailed
     }
 }
 
@@ -894,6 +938,7 @@ impl HelperRuntime {
             }
         };
         if let Err(error) = self.register_core_mutation() {
+            log::warn!("helper install mutation preflight failed: {error}");
             return self.action_failed(HelperActionErrorCode::Failed, error);
         }
         let manager = self.manager();
@@ -935,14 +980,14 @@ impl HelperRuntime {
             Ok(EscalationOutcome::Failed { stderr, code }) => {
                 log::warn!("helper install command failed (exit {code}): {stderr}");
                 self.action_failed(
-                    escalation_failure_code(self.platform, code),
+                    install_command_failure_code(self.platform, code, &stderr),
                     "helper installer exited unsuccessfully",
                 )
             }
             Err(e) => {
                 log::warn!("helper install failed: {e}");
                 self.action_failed(
-                    HelperActionErrorCode::Failed,
+                    manager_install_failure_code(&e),
                     "helper install operation failed",
                 )
             }

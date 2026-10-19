@@ -15,6 +15,12 @@ export function helperActionErrorText(
     case 'unsupported': return t('helper.actionError.unsupported');
     case 'bundleMismatch': return t('helper.actionError.bundleMismatch');
     case 'missingAsset': return t('helper.actionError.missingAsset');
+    case 'invalidInstallation': return t('helper.actionError.invalidInstallation');
+    case 'tokenWriteFailed': return t('helper.actionError.tokenWriteFailed');
+    case 'scriptWriteFailed': return t('helper.actionError.scriptWriteFailed');
+    case 'authorizationLaunchFailed': return t('helper.actionError.authorizationLaunchFailed');
+    case 'upgradeDeferred': return t('helper.actionError.upgradeDeferred');
+    case 'installerFailed': return t('helper.actionError.installerFailed');
     case 'notReady': return t('helper.actionError.notReady');
     default: return t('helper.actionError.failed');
   }

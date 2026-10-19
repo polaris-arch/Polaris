@@ -46,6 +46,12 @@
       "unsupported": "此平台不支援提權 helper",
       "missingAsset": "應用程式內建的 helper 檔案無法使用",
       "notReady": "helper 已安裝，但暫未就緒",
+      "invalidInstallation": "安裝身分參數無效。請使用已驗證的安裝套件重新安裝 Polaris，並查看日誌。",
+      "tokenWriteFailed": "無法儲存 Helper 驗證資料。請檢查磁碟剩餘空間及應用程式資料目錄的存取權限，詳細原因見日誌。",
+      "scriptWriteFailed": "無法寫入 Helper 安裝指令碼。請檢查磁碟剩餘空間及應用程式資料目錄的存取權限，詳細原因見日誌。",
+      "authorizationLaunchFailed": "無法啟動管理員授權程序。請先查看安裝日誌，再決定是否重試。",
+      "upgradeDeferred": "現有助手未批准安全升級，可能仍在使用中或不支援升級協定。請中斷它管理的連線後重新偵測；若仍被阻止，請查看日誌，確認是否需要舊版遷移。",
+      "installerFailed": "Helper 安裝命令執行失敗。請先查看安裝日誌中的詳細原因，再決定是否重試。",
       "failed": "helper 操作未能完成",
       "bundleMismatch": "隨附核心與本應用程式的內容身分不符，請重新安裝 Polaris。"
     },
@@ -59,6 +65,8 @@
       "invalid": "驗證失敗",
       "unavailable": "無法使用"
     },
+    "failureNextStep": "請查看日誌中的 Helper 安裝記錄以確認失敗原因。重新偵測不會再次安裝 Helper。",
+    "viewLogsAction": "查看日誌",
     "installSelectedCoreAction": "安裝本版本配套核心"
   },
   "proxy": {
@@ -3210,9 +3218,10 @@
       "rateLimit": "須等待切換頻率限制視窗釋出",
       "cooldown": "須等待切換冷卻結束"
     },
-    "choose": "自動選擇訂閱",
-    "choice": "自動 · {{subscription}}",
-    "choiceHelp": "自動意圖與實際出口分開顯示；點擊任一節點會回到手動選擇。",
+    "choose": "自動選節點",
+    "choice": "訂閱：{{subscription}}",
+    "choiceSelected": "已選 · 訂閱：{{subscription}}",
+    "choiceHelp": "選擇一個訂閱，在其中自動選節點。實際出口以連線狀態為準；點選任一節點改為手動選擇。",
     "switchNow": "立即評估切換",
     "keepManual": "保留目前出口，改為手動",
     "intentSaved": "自動選擇意圖已儲存；實際出口等待後端評估。",
