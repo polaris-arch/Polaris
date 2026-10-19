@@ -305,8 +305,15 @@ fn explicit_unsupported_selection_fails_generation_validation_without_hydration_
     let mut dns = DnsConfig::default();
     dns.node_resolver_custom = Some(vec![custom("tls", "tls://1.1.1.1")]);
     dns.node_resolver_pool = Some(ids(&["tls"]));
-    assert!(validate_selected_upstreams(Some(&dns)).unwrap_err().starts_with("NODE_RESOLVER_UNSUPPORTED:"));
-    assert!(resolve_upstreams(dns.node_resolver_pool.as_ref().unwrap(), dns.node_resolver_custom.as_ref().unwrap()).tier1.is_empty());
+    assert!(validate_selected_upstreams(Some(&dns))
+        .unwrap_err()
+        .starts_with("NODE_RESOLVER_UNSUPPORTED:"));
+    assert!(resolve_upstreams(
+        dns.node_resolver_pool.as_ref().unwrap(),
+        dns.node_resolver_custom.as_ref().unwrap()
+    )
+    .tier1
+    .is_empty());
     dns.node_resolver_pool = Some(ids(&["ali"]));
     assert!(validate_selected_upstreams(Some(&dns)).is_ok()); // Legacy unselected entry remains editable.
     dns.node_resolver_pool = Some(ids(&["tls"]));

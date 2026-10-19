@@ -2209,7 +2209,11 @@ impl CommandRunner for StatefulLinuxRunner {
                     8 => current.mode = value,
                     _ => unreachable!(),
                 }
-                if self.fail_after_set_calls.borrow().contains(&self.set_calls.get()) {
+                if self
+                    .fail_after_set_calls
+                    .borrow()
+                    .contains(&self.set_calls.get())
+                {
                     return Err("injected failure after ordered write".into());
                 }
                 if self.panic_first_set_after_mutation.replace(false) {
@@ -2517,8 +2521,13 @@ impl WindowsProxyRegistryWriter for ExactWindowsWriter {
     ) -> Result<(), WindowsProxyWriterError> {
         self.restores
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.fail_next_restore_before_mutation.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            return Err(WindowsProxyWriterError::other("injected restore failure before mutation"));
+        if self
+            .fail_next_restore_before_mutation
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(WindowsProxyWriterError::other(
+                "injected restore failure before mutation",
+            ));
         }
         *self
             .current
@@ -2530,8 +2539,13 @@ impl WindowsProxyRegistryWriter for ExactWindowsWriter {
     fn notify_settings_changed(&self) -> Result<(), WindowsProxyWriterError> {
         self.notifications
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.fail_next_notification.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            return Err(WindowsProxyWriterError::other("injected notification failure"));
+        if self
+            .fail_next_notification
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(WindowsProxyWriterError::other(
+                "injected notification failure",
+            ));
         }
         Ok(())
     }
@@ -4568,7 +4582,6 @@ fn points_to_us_unit() {
     assert!(!points_to_us(Some(&off), "127.0.0.1:8080"));
 }
 
-
 #[test]
 fn partial_apply_restore_failure_retries_from_persisted_actual_start() {
     for replacement in [false, true] {
@@ -4589,7 +4602,13 @@ fn partial_apply_restore_failure_retries_from_persisted_actual_start() {
         runner.fail_next_set_before_mutation.set(true);
         let observed = runner.current.clone();
         let marker = mem_marker();
-        seed_current_marker(&marker, &original, &apply_base, &applied, ProxyMarkerPhase::Applying);
+        seed_current_marker(
+            &marker,
+            &original,
+            &apply_base,
+            &applied,
+            ProxyMarkerPhase::Applying,
+        );
         let ops = SystemProxyOpsImpl::with_platform(runner, Platform::Linux).with_noop_sleeper();
         let mut controller = SystemProxyController::new(ops, marker);
         assert!(controller.recover_from_marker().is_err());
@@ -4612,14 +4631,28 @@ fn absent_mac_protocol_with_pac_added_before_capture_must_not_be_removed() {
     live.mac_services[0].configuration_plist = Some(
         r#"<plist version="1.0"><dict><key>ProxyAutoConfigURLString</key><string>https://pac.example/proxy.pac</string></dict></plist>"#.into(),
     );
-    for phase in [ProxyMarkerPhase::Owned, ProxyMarkerPhase::Applying, ProxyMarkerPhase::Restoring] {
+    for phase in [
+        ProxyMarkerPhase::Owned,
+        ProxyMarkerPhase::Applying,
+        ProxyMarkerPhase::Restoring,
+    ] {
         let marker = mem_marker();
         seed_current_marker(&marker, &original, &original, &applied, phase);
         let mut controller = SystemProxyController::new(exact_ops(live.clone()), marker);
         assert!(controller.recover_from_marker().is_err());
-        assert!(!controller.ops.calls.borrow().contains(&"restore_transaction"));
-        assert_eq!(controller.ops.transaction_status.borrow().as_ref(), Some(&live));
-        assert!(matches!(controller.marker.read_checked(), ProxyMarkerRead::CurrentValidated(_)));
+        assert!(!controller
+            .ops
+            .calls
+            .borrow()
+            .contains(&"restore_transaction"));
+        assert_eq!(
+            controller.ops.transaction_status.borrow().as_ref(),
+            Some(&live)
+        );
+        assert!(matches!(
+            controller.marker.read_checked(),
+            ProxyMarkerRead::CurrentValidated(_)
+        ));
     }
 }
 
@@ -4629,16 +4662,26 @@ fn existing_mac_protocol_still_allows_touched_only_restore_with_foreign_pac() {
     let applied = original.clone();
     let mut live = applied.clone();
     live.mac_services[0].configuration_plist = Some(
-        r#"<plist version="1.0"><dict><key>ProxyAutoConfigEnable</key><true/></dict></plist>"#.into(),
+        r#"<plist version="1.0"><dict><key>ProxyAutoConfigEnable</key><true/></dict></plist>"#
+            .into(),
     );
     let marker = mem_marker();
-    seed_current_marker(&marker, &original, &original, &applied, ProxyMarkerPhase::Owned);
+    seed_current_marker(
+        &marker,
+        &original,
+        &original,
+        &applied,
+        ProxyMarkerPhase::Owned,
+    );
     let mut controller = SystemProxyController::new(exact_ops(live), marker);
     controller.disable().unwrap();
-    assert!(controller.ops.calls.borrow().contains(&"restore_transaction"));
+    assert!(controller
+        .ops
+        .calls
+        .borrow()
+        .contains(&"restore_transaction"));
     // Native restore_exact_members writes touched keys only; this mock checks admission.
 }
-
 
 #[test]
 fn windows_partial_apply_restore_retry_keeps_actual_start() {
@@ -4653,21 +4696,41 @@ fn windows_partial_apply_restore_retry_keeps_actual_start() {
         WindowsRegistryDwordValue::PresentValue(1),
     );
     let mut partial = original.windows_registry.clone().unwrap();
-    partial.proxy_server = applied.windows_registry.as_ref().unwrap().proxy_server.clone();
+    partial.proxy_server = applied
+        .windows_registry
+        .as_ref()
+        .unwrap()
+        .proxy_server
+        .clone();
     let writer = std::sync::Arc::new(ExactWindowsWriter::new(partial.clone()));
-    writer.fail_next_restore_before_mutation.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer
+        .fail_next_restore_before_mutation
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let marker = mem_marker();
-    seed_current_marker(&marker, &original, &original, &applied, ProxyMarkerPhase::Applying);
+    seed_current_marker(
+        &marker,
+        &original,
+        &original,
+        &applied,
+        ProxyMarkerPhase::Applying,
+    );
     let ops = SystemProxyOpsImpl::with_platform(MockRunner::default(), Platform::Win)
-        .with_windows_registry_writer(writer.clone(), true).with_noop_sleeper();
+        .with_windows_registry_writer(writer.clone(), true)
+        .with_noop_sleeper();
     let mut controller = SystemProxyController::new(ops, marker);
     assert!(controller.disable().is_err());
     let ProxyMarkerRead::CurrentValidated(saved) = controller.marker.read_checked() else {
         panic!("failed restore must retain marker");
     };
-    assert_eq!(saved.exact_restore_base.unwrap().windows_registry, Some(partial));
+    assert_eq!(
+        saved.exact_restore_base.unwrap().windows_registry,
+        Some(partial)
+    );
     controller.disable().unwrap();
-    assert_eq!(writer.capture().unwrap(), original.windows_registry.unwrap());
+    assert_eq!(
+        writer.capture().unwrap(),
+        original.windows_registry.unwrap()
+    );
     assert_eq!(controller.marker.read_checked(), ProxyMarkerRead::Missing);
 }
 
@@ -4684,13 +4747,27 @@ fn persisted_partial_restore_anchor_does_not_authorize_foreign_changes() {
         WindowsRegistryDwordValue::PresentValue(1),
     );
     let mut partial = original.windows_registry.clone().unwrap();
-    partial.proxy_server = applied.windows_registry.as_ref().unwrap().proxy_server.clone();
+    partial.proxy_server = applied
+        .windows_registry
+        .as_ref()
+        .unwrap()
+        .proxy_server
+        .clone();
     let writer = std::sync::Arc::new(ExactWindowsWriter::new(partial));
-    writer.fail_next_restore_before_mutation.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer
+        .fail_next_restore_before_mutation
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let marker = mem_marker();
-    seed_current_marker(&marker, &original, &original, &applied, ProxyMarkerPhase::Applying);
+    seed_current_marker(
+        &marker,
+        &original,
+        &original,
+        &applied,
+        ProxyMarkerPhase::Applying,
+    );
     let ops = SystemProxyOpsImpl::with_platform(MockRunner::default(), Platform::Win)
-        .with_windows_registry_writer(writer.clone(), true).with_noop_sleeper();
+        .with_windows_registry_writer(writer.clone(), true)
+        .with_noop_sleeper();
     let mut controller = SystemProxyController::new(ops, marker);
     assert!(controller.disable().is_err());
     writer.current.lock().unwrap().proxy_override =
@@ -4699,43 +4776,87 @@ fn persisted_partial_restore_anchor_does_not_authorize_foreign_changes() {
     let restores = writer.restores.load(std::sync::atomic::Ordering::Relaxed);
     assert!(controller.disable().is_err());
     assert_eq!(writer.capture().unwrap(), foreign);
-    assert_eq!(writer.restores.load(std::sync::atomic::Ordering::Relaxed), restores);
-    assert!(matches!(controller.marker.read_checked(), ProxyMarkerRead::CurrentValidated(_)));
+    assert_eq!(
+        writer.restores.load(std::sync::atomic::Ordering::Relaxed),
+        restores
+    );
+    assert!(matches!(
+        controller.marker.read_checked(),
+        ProxyMarkerRead::CurrentValidated(_)
+    ));
 }
 
 #[test]
 fn mac_service_scope_changes_retain_authority_for_still_owned_services() {
-    let original = exact_mac_snapshot(vec![exact_mac_service("a", false), exact_mac_service("b", false)]);
-    let applied = exact_mac_snapshot(vec![exact_mac_service("a", true), exact_mac_service("b", true)]);
+    let original = exact_mac_snapshot(vec![
+        exact_mac_service("a", false),
+        exact_mac_service("b", false),
+    ]);
+    let applied = exact_mac_snapshot(vec![
+        exact_mac_service("a", true),
+        exact_mac_service("b", true),
+    ]);
     let mut added = applied.clone();
-    added.mac_services.push(exact_mac_service("new-foreign-service", true));
+    added
+        .mac_services
+        .push(exact_mac_service("new-foreign-service", true));
     let mut removed = applied.clone();
     removed.mac_services.pop();
     for live in [added, removed] {
-        for phase in [ProxyMarkerPhase::Applying, ProxyMarkerPhase::Owned, ProxyMarkerPhase::Restoring] {
+        for phase in [
+            ProxyMarkerPhase::Applying,
+            ProxyMarkerPhase::Owned,
+            ProxyMarkerPhase::Restoring,
+        ] {
             let marker = mem_marker();
             let saved = seed_current_marker(&marker, &original, &original, &applied, phase);
             let mut controller = SystemProxyController::new(exact_ops(live.clone()), marker);
             let error = controller.disable().unwrap_err();
             assert!(error.to_string().contains("scope_changed"));
-            assert!(!controller.ops.calls.borrow().contains(&"restore_transaction"));
-            assert_eq!(controller.ops.transaction_status.borrow().as_ref(), Some(&live));
-            assert_eq!(controller.marker.read_checked(), ProxyMarkerRead::CurrentValidated(saved));
+            assert!(!controller
+                .ops
+                .calls
+                .borrow()
+                .contains(&"restore_transaction"));
+            assert_eq!(
+                controller.ops.transaction_status.borrow().as_ref(),
+                Some(&live)
+            );
+            assert_eq!(
+                controller.marker.read_checked(),
+                ProxyMarkerRead::CurrentValidated(saved)
+            );
         }
     }
 }
 
 #[test]
 fn mac_service_scope_order_is_not_a_scope_change() {
-    let original = exact_mac_snapshot(vec![exact_mac_service("a", false), exact_mac_service("b", false)]);
-    let applied = exact_mac_snapshot(vec![exact_mac_service("a", true), exact_mac_service("b", true)]);
+    let original = exact_mac_snapshot(vec![
+        exact_mac_service("a", false),
+        exact_mac_service("b", false),
+    ]);
+    let applied = exact_mac_snapshot(vec![
+        exact_mac_service("a", true),
+        exact_mac_service("b", true),
+    ]);
     let mut reordered = applied.clone();
     reordered.mac_services.reverse();
     let marker = mem_marker();
-    seed_current_marker(&marker, &original, &original, &applied, ProxyMarkerPhase::Owned);
+    seed_current_marker(
+        &marker,
+        &original,
+        &original,
+        &applied,
+        ProxyMarkerPhase::Owned,
+    );
     let mut controller = SystemProxyController::new(exact_ops(reordered), marker);
     controller.disable().unwrap();
-    assert!(controller.ops.calls.borrow().contains(&"restore_transaction"));
+    assert!(controller
+        .ops
+        .calls
+        .borrow()
+        .contains(&"restore_transaction"));
     assert_eq!(controller.marker.read_checked(), ProxyMarkerRead::Missing);
 }
 
@@ -4743,10 +4864,20 @@ fn mac_service_scope_order_is_not_a_scope_change() {
 fn immediate_partial_rollback_is_journaled_without_claiming_foreign_state() {
     for replacement in [false, true] {
         for foreign in [false, true] {
-            let original = linux_transaction_snapshot(exact_linux_snapshot("proxy.corp:3128").linux_gsettings.unwrap());
+            let original = linux_transaction_snapshot(
+                exact_linux_snapshot("proxy.corp:3128")
+                    .linux_gsettings
+                    .unwrap(),
+            );
             let apply_base = if replacement {
-                linux_transaction_snapshot(exact_linux_snapshot("127.0.0.1:7000").linux_gsettings.unwrap())
-            } else { original.clone() };
+                linux_transaction_snapshot(
+                    exact_linux_snapshot("127.0.0.1:7000")
+                        .linux_gsettings
+                        .unwrap(),
+                )
+            } else {
+                original.clone()
+            };
             let runner = StatefulLinuxRunner::new(apply_base.linux_gsettings.clone().unwrap());
             // Apply stops after four writes; immediate rollback stops after its first write.
             *runner.fail_after_set_calls.borrow_mut() = vec![4, 5];
@@ -4755,9 +4886,16 @@ fn immediate_partial_rollback_is_journaled_without_claiming_foreign_state() {
             let fail_before_write = runner.fail_next_set_before_mutation.clone();
             let marker = mem_marker();
             if replacement {
-                seed_current_marker(&marker, &original, &original, &apply_base, ProxyMarkerPhase::Owned);
+                seed_current_marker(
+                    &marker,
+                    &original,
+                    &original,
+                    &apply_base,
+                    ProxyMarkerPhase::Owned,
+                );
             }
-            let ops = SystemProxyOpsImpl::with_platform(runner, Platform::Linux).with_noop_sleeper();
+            let ops =
+                SystemProxyOpsImpl::with_platform(runner, Platform::Linux).with_noop_sleeper();
             let mut controller = SystemProxyController::new(ops, marker);
             assert!(controller.enable(&req()).is_err());
             let ProxyMarkerRead::CurrentValidated(saved) = controller.marker.read_checked() else {
@@ -4765,7 +4903,10 @@ fn immediate_partial_rollback_is_journaled_without_claiming_foreign_state() {
             };
             assert_eq!(saved.phase, ProxyMarkerPhase::Applying);
             assert!(saved.exact_restore_base.is_some());
-            assert_ne!(*observed.borrow(), apply_base.linux_gsettings.clone().unwrap());
+            assert_ne!(
+                *observed.borrow(),
+                apply_base.linux_gsettings.clone().unwrap()
+            );
             if foreign {
                 observed.borrow_mut().ignore_hosts = "['foreign.example']".into();
                 let before = observed.borrow().clone();
@@ -4773,7 +4914,10 @@ fn immediate_partial_rollback_is_journaled_without_claiming_foreign_state() {
                 assert!(controller.disable().is_err());
                 assert_eq!(*observed.borrow(), before);
                 assert_eq!(writes.get(), writes_before);
-                assert_eq!(controller.marker.read_checked(), ProxyMarkerRead::CurrentValidated(saved));
+                assert_eq!(
+                    controller.marker.read_checked(),
+                    ProxyMarkerRead::CurrentValidated(saved)
+                );
             } else {
                 fail_before_write.set(true);
                 assert!(controller.disable().is_err());
@@ -4791,7 +4935,11 @@ fn immediate_partial_rollback_is_journaled_without_claiming_foreign_state() {
 
 #[test]
 fn immediate_rollback_anchor_persist_failure_prevents_restore_writes() {
-    let original = linux_transaction_snapshot(exact_linux_snapshot("proxy.corp:3128").linux_gsettings.unwrap());
+    let original = linux_transaction_snapshot(
+        exact_linux_snapshot("proxy.corp:3128")
+            .linux_gsettings
+            .unwrap(),
+    );
     let runner = StatefulLinuxRunner::new(original.linux_gsettings.clone().unwrap());
     *runner.fail_after_set_calls.borrow_mut() = vec![4];
     let writes = runner.set_calls.clone();
@@ -4799,7 +4947,11 @@ fn immediate_rollback_anchor_persist_failure_prevents_restore_writes() {
     let ops = SystemProxyOpsImpl::with_platform(runner, Platform::Linux).with_noop_sleeper();
     let mut controller = SystemProxyController::new(ops, marker);
     assert!(controller.enable(&req()).is_err());
-    assert_eq!(writes.get(), 4, "failed anchor persistence must precede rollback writes");
+    assert_eq!(
+        writes.get(),
+        4,
+        "failed anchor persistence must precede rollback writes"
+    );
     let ProxyMarkerRead::CurrentValidated(saved) = controller.marker.read_checked() else {
         panic!("Applying marker must survive failed anchor persistence");
     };
@@ -4818,12 +4970,24 @@ fn replacement_cannot_launder_pac_into_absent_protocol_ownership() {
         r#"<plist version="1.0"><dict><key>ProxyAutoConfigURLString</key><string>https://pac.example/proxy.pac</string></dict></plist>"#.into(),
     );
     let marker = mem_marker();
-    let saved = seed_current_marker(&marker, &original, &original, &applied, ProxyMarkerPhase::Owned);
+    let saved = seed_current_marker(
+        &marker,
+        &original,
+        &original,
+        &applied,
+        ProxyMarkerPhase::Owned,
+    );
     let mut controller = SystemProxyController::new(exact_ops(live.clone()), marker);
     assert!(controller.enable(&req()).is_err());
     assert!(!controller.ops.calls.borrow().contains(&"apply_transaction"));
-    assert_eq!(controller.ops.transaction_status.borrow().as_ref(), Some(&live));
-    assert_eq!(controller.marker.read_checked(), ProxyMarkerRead::CurrentValidated(saved));
+    assert_eq!(
+        controller.ops.transaction_status.borrow().as_ref(),
+        Some(&live)
+    );
+    assert_eq!(
+        controller.marker.read_checked(),
+        ProxyMarkerRead::CurrentValidated(saved)
+    );
 }
 
 #[test]
@@ -4832,21 +4996,44 @@ fn plan_one_marker_is_readable_and_anchor_commit_upgrades_before_any_write() {
     let applied = exact_linux_snapshot("127.0.0.1:8080");
     let fs = FailNthWriteFs::new(usize::MAX);
     let marker = ProxyMarker::new(fs.clone(), "/marker.json");
-    let saved = seed_current_marker(&marker, &original, &original, &applied, ProxyMarkerPhase::Applying);
-    let mut root: serde_json::Value = serde_json::from_str(fs.inner.file.borrow().as_deref().unwrap()).unwrap();
+    let saved = seed_current_marker(
+        &marker,
+        &original,
+        &original,
+        &applied,
+        ProxyMarkerPhase::Applying,
+    );
+    let mut root: serde_json::Value =
+        serde_json::from_str(fs.inner.file.borrow().as_deref().unwrap()).unwrap();
     root["systemProxyTxnV2"]["plan_version"] = serde_json::json!(1);
     *fs.inner.file.borrow_mut() = Some(serde_json::to_string(&root).unwrap());
-    assert!(matches!(marker.read_checked(), ProxyMarkerRead::CurrentValidated(ref old) if old.plan_version == 1));
-    assert_eq!(marker.begin_apply_rollback(saved.txn_id.as_deref().unwrap(), &applied),
-        crate::proxy::ProxyMarkerMutationOutcome::Updated);
+    assert!(
+        matches!(marker.read_checked(), ProxyMarkerRead::CurrentValidated(ref old) if old.plan_version == 1)
+    );
+    assert_eq!(
+        marker.begin_apply_rollback(saved.txn_id.as_deref().unwrap(), &applied),
+        crate::proxy::ProxyMarkerMutationOutcome::Updated
+    );
     let ProxyMarkerRead::CurrentValidated(upgraded) = marker.read_checked() else {
         panic!("upgraded marker must validate");
     };
-    assert_eq!(upgraded.plan_version, crate::proxy::PROXY_TRANSACTION_PLAN_VERSION);
-    assert_ne!(upgraded.plan_version, 1, "old plan-one readers must refuse anchored transactions");
+    assert_eq!(
+        upgraded.plan_version,
+        crate::proxy::PROXY_TRANSACTION_PLAN_VERSION
+    );
+    assert_ne!(
+        upgraded.plan_version, 1,
+        "old plan-one readers must refuse anchored transactions"
+    );
     assert_eq!(upgraded.exact_restore_base, Some(applied));
-    assert_eq!(marker.update_current_phase(saved.txn_id.as_deref().unwrap(),
-        ProxyMarkerPhase::Applying, ProxyMarkerPhase::Owned), crate::proxy::ProxyMarkerMutationOutcome::Mismatch);
+    assert_eq!(
+        marker.update_current_phase(
+            saved.txn_id.as_deref().unwrap(),
+            ProxyMarkerPhase::Applying,
+            ProxyMarkerPhase::Owned
+        ),
+        crate::proxy::ProxyMarkerMutationOutcome::Mismatch
+    );
 }
 
 #[test]
@@ -4858,19 +5045,43 @@ fn completed_immediate_rollback_retains_marker_until_notification_succeeds() {
         WindowsRegistryDwordValue::PresentValue(1),
     );
     let marker = mem_marker();
-    let saved = seed_current_marker(&marker, &original, &original, &applied, ProxyMarkerPhase::Applying);
-    assert_eq!(marker.begin_apply_rollback(saved.txn_id.as_deref().unwrap(), &applied),
-        crate::proxy::ProxyMarkerMutationOutcome::Updated);
-    let writer = std::sync::Arc::new(ExactWindowsWriter::new(original.windows_registry.clone().unwrap()));
-    writer.fail_next_notification.store(true, std::sync::atomic::Ordering::Relaxed);
+    let saved = seed_current_marker(
+        &marker,
+        &original,
+        &original,
+        &applied,
+        ProxyMarkerPhase::Applying,
+    );
+    assert_eq!(
+        marker.begin_apply_rollback(saved.txn_id.as_deref().unwrap(), &applied),
+        crate::proxy::ProxyMarkerMutationOutcome::Updated
+    );
+    let writer = std::sync::Arc::new(ExactWindowsWriter::new(
+        original.windows_registry.clone().unwrap(),
+    ));
+    writer
+        .fail_next_notification
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let ops = SystemProxyOpsImpl::with_platform(MockRunner::default(), Platform::Win)
-        .with_windows_registry_writer(writer.clone(), true).with_noop_sleeper();
+        .with_windows_registry_writer(writer.clone(), true)
+        .with_noop_sleeper();
     let mut controller = SystemProxyController::new(ops, marker);
     assert!(controller.disable().is_err());
-    assert!(matches!(controller.marker.read_checked(), ProxyMarkerRead::CurrentValidated(_)));
+    assert!(matches!(
+        controller.marker.read_checked(),
+        ProxyMarkerRead::CurrentValidated(_)
+    ));
     controller.disable().unwrap();
-    assert_eq!(writer.notifications.load(std::sync::atomic::Ordering::Relaxed), 2);
-    assert_eq!(writer.restores.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(
+        writer
+            .notifications
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert_eq!(
+        writer.restores.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
     assert_eq!(controller.marker.read_checked(), ProxyMarkerRead::Missing);
 }
 
@@ -4879,27 +5090,45 @@ fn replacement_mac_snapshot(port: u16) -> ProxyTransactionSnapshot {
     service.configuration_plist = Some(format!(
         r#"<plist version="1.0"><dict><key>HTTPPort</key><integer>{port}</integer></dict></plist>"#,
     ));
-    service.touched.as_mut().unwrap().http_port = crate::proxy::MacProxyPropertyValue::PropertyListXml(
-        format!(r#"<plist version="1.0"><integer>{port}</integer></plist>"#),
-    );
+    service.touched.as_mut().unwrap().http_port =
+        crate::proxy::MacProxyPropertyValue::PropertyListXml(format!(
+            r#"<plist version="1.0"><integer>{port}</integer></plist>"#
+        ));
     exact_mac_snapshot(vec![service])
 }
 
 fn seed_failed_mac_replacement(
     completed_rollback: bool,
-) -> (ProxyMarker<crate::proxy::proxy_tests_helpers::MemFs>, ProxyTransactionSnapshot, ProxyTransactionSnapshot) {
+) -> (
+    ProxyMarker<crate::proxy::proxy_tests_helpers::MemFs>,
+    ProxyTransactionSnapshot,
+    ProxyTransactionSnapshot,
+) {
     let original = exact_mac_snapshot(vec![exact_mac_service("a", false)]);
     let prior = replacement_mac_snapshot(8080);
     let applied = replacement_mac_snapshot(8081);
     let marker = mem_marker();
-    let owned = seed_current_marker(&marker, &original, &original, &prior, ProxyMarkerPhase::Owned);
+    let owned = seed_current_marker(
+        &marker,
+        &original,
+        &original,
+        &prior,
+        ProxyMarkerPhase::Owned,
+    );
     let crate::proxy::ProxyMarkerReplaceOutcome::Replaced(replacement) = marker.replace_if_current(
-        owned.txn_id.as_deref().unwrap(), "127.0.0.1:8081", &prior, &applied,
-    ) else { panic!("replacement must persist prior Owned provenance"); };
+        owned.txn_id.as_deref().unwrap(),
+        "127.0.0.1:8081",
+        &prior,
+        &applied,
+    ) else {
+        panic!("replacement must persist prior Owned provenance");
+    };
     assert_eq!(replacement.exact_prior_applied, Some(prior.clone()));
     if completed_rollback {
-        assert_eq!(marker.begin_apply_rollback(replacement.txn_id.as_deref().unwrap(), &applied),
-            crate::proxy::ProxyMarkerMutationOutcome::Updated);
+        assert_eq!(
+            marker.begin_apply_rollback(replacement.txn_id.as_deref().unwrap(), &applied),
+            crate::proxy::ProxyMarkerMutationOutcome::Updated
+        );
     }
     // Native no-write failure leaves A. Successful immediate rollback B->A also leaves A.
     (marker, original, prior)
@@ -4913,8 +5142,14 @@ fn mac_failed_replacement_restores_prior_owned_protocol_across_retry() {
         ops.restore_fails = true;
         let mut controller = SystemProxyController::new(ops, marker);
         assert!(controller.disable().is_err());
-        assert!(controller.ops.calls.borrow().contains(&"restore_transaction"),
-            "prior-owned A must pass admission even when candidate applied is B");
+        assert!(
+            controller
+                .ops
+                .calls
+                .borrow()
+                .contains(&"restore_transaction"),
+            "prior-owned A must pass admission even when candidate applied is B"
+        );
         let ProxyMarkerRead::CurrentValidated(saved) = controller.marker.read_checked() else {
             panic!("failed final restore must preserve prior provenance");
         };
@@ -4924,7 +5159,10 @@ fn mac_failed_replacement_restores_prior_owned_protocol_across_retry() {
         // Recreate the controller so the retry must load persisted authority, not local memory.
         let mut restarted = SystemProxyController::new(exact_ops(prior), controller.marker);
         restarted.recover_from_marker().unwrap();
-        assert_eq!(restarted.ops.transaction_status.borrow().as_ref(), Some(&original));
+        assert_eq!(
+            restarted.ops.transaction_status.borrow().as_ref(),
+            Some(&original)
+        );
         assert_eq!(restarted.marker.read_checked(), ProxyMarkerRead::Missing);
     }
 }
@@ -4945,10 +5183,18 @@ fn mac_failed_replacement_never_claims_new_pac_before_or_during_retry() {
             foreign.mac_services[0].configuration_plist = Some(
                 r#"<plist version="1.0"><dict><key>HTTPPort</key><integer>8080</integer><key>ProxyAutoConfigURLString</key><string>https://foreign.example/pac</string></dict></plist>"#.into(),
             );
-            let mut restarted = SystemProxyController::new(exact_ops(foreign.clone()), controller.marker);
+            let mut restarted =
+                SystemProxyController::new(exact_ops(foreign.clone()), controller.marker);
             assert!(restarted.recover_from_marker().is_err());
-            assert!(!restarted.ops.calls.borrow().contains(&"restore_transaction"));
-            assert_eq!(restarted.ops.transaction_status.borrow().as_ref(), Some(&foreign));
+            assert!(!restarted
+                .ops
+                .calls
+                .borrow()
+                .contains(&"restore_transaction"));
+            assert_eq!(
+                restarted.ops.transaction_status.borrow().as_ref(),
+                Some(&foreign)
+            );
             assert_eq!(restarted.marker.read_checked(), before);
         }
     }
@@ -4961,16 +5207,35 @@ fn old_plan_one_replacement_does_not_invent_prior_applied_provenance() {
     let applied = replacement_mac_snapshot(8081);
     let fs = FailNthWriteFs::new(usize::MAX);
     let marker = ProxyMarker::new(fs.clone(), "/marker.json");
-    let owned = seed_current_marker(&marker, &original, &original, &prior, ProxyMarkerPhase::Owned);
-    let mut root: serde_json::Value = serde_json::from_str(fs.inner.file.borrow().as_deref().unwrap()).unwrap();
+    let owned = seed_current_marker(
+        &marker,
+        &original,
+        &original,
+        &prior,
+        ProxyMarkerPhase::Owned,
+    );
+    let mut root: serde_json::Value =
+        serde_json::from_str(fs.inner.file.borrow().as_deref().unwrap()).unwrap();
     root["systemProxyTxnV2"]["plan_version"] = serde_json::json!(1);
     *fs.inner.file.borrow_mut() = Some(serde_json::to_string(&root).unwrap());
     let crate::proxy::ProxyMarkerReplaceOutcome::Replaced(replacement) = marker.replace_if_current(
-        owned.txn_id.as_deref().unwrap(), "127.0.0.1:8081", &prior, &applied,
-    ) else { panic!("compatible replacement may persist without fabricated prior authority"); };
+        owned.txn_id.as_deref().unwrap(),
+        "127.0.0.1:8081",
+        &prior,
+        &applied,
+    ) else {
+        panic!("compatible replacement may persist without fabricated prior authority");
+    };
     assert_eq!(replacement.exact_prior_applied, None);
     let mut controller = SystemProxyController::new(exact_ops(prior), marker);
     assert!(controller.disable().is_err());
-    assert!(!controller.ops.calls.borrow().contains(&"restore_transaction"));
-    assert!(matches!(controller.marker.read_checked(), ProxyMarkerRead::CurrentValidated(_)));
+    assert!(!controller
+        .ops
+        .calls
+        .borrow()
+        .contains(&"restore_transaction"));
+    assert!(matches!(
+        controller.marker.read_checked(),
+        ProxyMarkerRead::CurrentValidated(_)
+    ));
 }

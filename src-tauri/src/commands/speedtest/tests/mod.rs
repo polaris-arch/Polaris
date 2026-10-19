@@ -1983,17 +1983,32 @@ fn the_default_speed_test_endpoint_resolves_to_a_tunnel_target() {
 /// Invalid explicit endpoints stay visible and fail admission; no fake node failure/default request.
 #[test]
 fn user_speed_test_url_rejects_explicit_invalid_without_substitution() {
-    for good in ["http://example.com/check", "https://example.com:8443/check?t=1"] {
+    for good in [
+        "http://example.com/check",
+        "https://example.com:8443/check?t=1",
+    ] {
         let config = json!({"speedTestUrl":good});
         assert!(validate_speed_test_url(&config).is_ok());
         assert_eq!(resolve_speed_test_url(&config), good);
     }
-    for bad in ["http://", "https://example.com:99999", "socks5://1.2.3.4:1080", "garbage"] {
+    for bad in [
+        "http://",
+        "https://example.com:99999",
+        "socks5://1.2.3.4:1080",
+        "garbage",
+    ] {
         let config = json!({"speedTestUrl":bad});
-        assert_eq!(validate_speed_test_url(&config), Err("SPEED_TEST_URL_INVALID"));
+        assert_eq!(
+            validate_speed_test_url(&config),
+            Err("SPEED_TEST_URL_INVALID")
+        );
         assert_eq!(resolve_speed_test_url(&config), bad);
     }
-    for config in [json!({}), json!({"speedTestUrl":""}), json!({"speedTestUrl":"  "})] {
+    for config in [
+        json!({}),
+        json!({"speedTestUrl":""}),
+        json!({"speedTestUrl":"  "}),
+    ] {
         assert!(validate_speed_test_url(&config).is_ok());
         assert_eq!(resolve_speed_test_url(&config), DEFAULT_SPEED_TEST_URL);
     }

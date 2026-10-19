@@ -249,7 +249,7 @@ pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
         eprintln!("migration administration requires macOS");
         return Some(std::process::ExitCode::FAILURE);
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if matches!(
         args.first().map(String::as_str),
         Some("sync-install-path" | "validate-install-path")
@@ -280,7 +280,7 @@ pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
             }
         });
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if matches!(
         args.first().map(String::as_str),
         Some("snapshot-user" | "restore-user")

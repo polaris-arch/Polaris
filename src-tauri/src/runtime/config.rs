@@ -1351,7 +1351,7 @@ impl ConfigManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut raw = self.raw_disk_for_mesh_under_write_lock()?;
-        let previous_config=raw.clone();
+        let previous_config = raw.clone();
         let policy: MeshRoutePolicy = serde_json::from_value(raw[mesh_guard::POLICY_KEY].clone())
             .map_err(StoreError::from_parse)?;
         let previous: MeshRouteState = serde_json::from_value(raw[mesh_guard::STATE_KEY].clone())

@@ -1218,8 +1218,13 @@ async fn update_builtin_with_mode(
         &builtin_runtime_dir(state),
         |resource, staged, operation| {
             persist_builtin_geo_updated(
-                app, state, &b.tag, &resource.downloaded_at, broadcast,
-                (staged, &builtin_runtime_dir(state).join(&plan.file_name)), operation,
+                app,
+                state,
+                &b.tag,
+                &resource.downloaded_at,
+                broadcast,
+                (staged, &builtin_runtime_dir(state).join(&plan.file_name)),
+                operation,
             )
         },
     )
@@ -1394,13 +1399,18 @@ struct BuiltinUpdateGate {
 
 impl BuiltinUpdateGate {
     fn generation(&self) -> std::sync::Arc<()> {
-        self.generation.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     // Called only under the configuration writer fence in production.
     fn retire(&self) {
-        *self.generation.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            std::sync::Arc::new(());
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(());
     }
 }
 

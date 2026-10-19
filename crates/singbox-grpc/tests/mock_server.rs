@@ -1818,19 +1818,17 @@ async fn connection_events_at_decodes_a_first_frame_beyond_the_default_limit() {
 
     // Replay the same large reset after a forced disconnect. Every open must
     // install the shared limit, including the second (reconnected) client.
-    *state.connection_script.lock().unwrap() = Some(vec![
-        Ok(first),
-        Err(Status::unavailable("force reconnect")),
-    ]);
+    *state.connection_script.lock().unwrap() =
+        Some(vec![Ok(first), Err(Status::unavailable("force reconnect"))]);
     let before = state.connection_calls.load(Ordering::Relaxed);
-    let mut reconnecting = client.subscribe_connections(
-        1,
-        ReconnectConfig::with_backoff(Duration::from_millis(20)),
-    );
+    let mut reconnecting =
+        client.subscribe_connections(1, ReconnectConfig::with_backoff(Duration::from_millis(20)));
     use tokio_stream::StreamExt;
     for _ in 0..2 {
         let reset = tokio::time::timeout(Duration::from_secs(5), reconnecting.next())
-            .await.expect("bounded large reset must arrive").expect("reset frame");
+            .await
+            .expect("bounded large reset must arrive")
+            .expect("reset frame");
         assert!(reset.reset);
         assert_eq!(reset.events.len(), 6000);
     }
@@ -1863,20 +1861,32 @@ async fn rule_set_status_preserves_auth_and_requested_tags() {
 
 #[tokio::test]
 async fn malformed_secret_is_rejected_at_client_admission_without_echoing_it() {
-    for secret in ["private-prefix\nprivate-suffix", "private-prefix\rprivate-suffix", "private-prefix\0private-suffix"] {
+    for secret in [
+        "private-prefix\nprivate-suffix",
+        "private-prefix\rprivate-suffix",
+        "private-prefix\0private-suffix",
+    ] {
         let result = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", 1), secret).await;
         let error = match result {
             Ok(_) => panic!("malformed metadata was admitted"),
             Err(error) => error,
         };
-        assert!(matches!(&error, polaris_singbox_grpc::ClientError::Status(status)
-            if status.code() == tonic::Code::InvalidArgument));
+        assert!(
+            matches!(&error, polaris_singbox_grpc::ClientError::Status(status)
+            if status.code() == tonic::Code::InvalidArgument)
+        );
         let diagnostic = format!("{error:?} {error}");
         assert!(!diagnostic.contains("private-prefix"));
         assert!(!diagnostic.contains("private-suffix"));
     }
-    assert!(SingBoxApiClient::connect(Endpoint::new("127.0.0.1", 1), "").await.is_ok());
-    assert!(SingBoxApiClient::connect(Endpoint::new("127.0.0.1", 1), SECRET).await.is_ok());
+    assert!(SingBoxApiClient::connect(Endpoint::new("127.0.0.1", 1), "")
+        .await
+        .is_ok());
+    assert!(
+        SingBoxApiClient::connect(Endpoint::new("127.0.0.1", 1), SECRET)
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -1890,16 +1900,24 @@ async fn connection_events_still_reject_frames_above_the_shared_bound() {
         reset: true,
     })]);
     let mut once = events_at(addr, SECRET).await.unwrap();
-    assert!(tokio::time::timeout(Duration::from_secs(5), once.message()).await.unwrap().is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(5), once.message())
+        .await
+        .unwrap()
+        .is_err());
 
-    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET).await.unwrap();
-    let mut reconnecting = client.subscribe_connections(
-        1, ReconnectConfig::with_backoff(NO_RECONNECT),
-    );
+    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
+        .await
+        .unwrap();
+    let mut reconnecting =
+        client.subscribe_connections(1, ReconnectConfig::with_backoff(NO_RECONNECT));
     use tokio_stream::StreamExt;
     // Decode errors are intentionally hidden by the reconnecting interface;
     // the oversized reset must never be delivered to its consumer.
-    assert!(tokio::time::timeout(Duration::from_secs(2), reconnecting.next()).await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), reconnecting.next())
+            .await
+            .is_err()
+    );
     assert!(state.connection_calls.load(Ordering::Relaxed) >= 2);
 }
 
@@ -1907,13 +1925,18 @@ async fn connection_events_still_reject_frames_above_the_shared_bound() {
 async fn status_reset_marks_first_frame_of_each_transport_subscription() {
     let (addr, _state, _server) = spawn_server(SECRET, 2).await;
     let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), SECRET)
-        .await.unwrap();
-    let mut stream = client.subscribe_status(5000,
-        ReconnectConfig::with_backoff(Duration::from_millis(1)));
+        .await
+        .unwrap();
+    let mut stream = client.subscribe_status(
+        5000,
+        ReconnectConfig::with_backoff(Duration::from_millis(1)),
+    );
     // The mock closes every two frames, without changing core identity or port.
     for expected_reset in [true, false, true, false, true] {
         let (_, reset) = tokio::time::timeout(Duration::from_secs(5), stream.recv_with_reset())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(reset, expected_reset);
     }
 }

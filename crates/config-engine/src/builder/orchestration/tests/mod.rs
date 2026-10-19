@@ -267,9 +267,22 @@ fn native_measurement_settings_are_structural_only_with_native_groups() {
     let mut next = old.clone();
     next.auto_select_enabled = true;
     next.speed_test_url = Some("https://example.test/check".into());
-    assert_eq!(config_generation_norm(&old, None), config_generation_norm(&next, None));
-    next.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Global });
-    assert_ne!(config_generation_norm(&old, None), config_generation_norm(&next, None));
-    let mut changed_url = next.clone(); changed_url.speed_test_url = Some("https://other.test/check".into());
-    assert_ne!(config_generation_norm(&next, None), config_generation_norm(&changed_url, None));
+    assert_eq!(
+        config_generation_norm(&old, None),
+        config_generation_norm(&next, None)
+    );
+    next.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
+    assert_ne!(
+        config_generation_norm(&old, None),
+        config_generation_norm(&next, None)
+    );
+    let mut changed_url = next.clone();
+    changed_url.speed_test_url = Some("https://other.test/check".into());
+    assert_ne!(
+        config_generation_norm(&next, None),
+        config_generation_norm(&changed_url, None)
+    );
 }

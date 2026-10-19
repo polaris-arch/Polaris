@@ -31,7 +31,10 @@ pub fn validate_dns_dependencies(config: &UserConfig) -> Result<(), String> {
     for server in config.dns_servers.iter().filter(|server| server.enabled) {
         if let DnsServerOutbound::Node { node_id } = &server.outbound {
             if !node_ids.contains(node_id.as_str()) {
-                return Err(format!("DNS 解析器「{}」引用的出口节点「{node_id}」不存在", server.id));
+                return Err(format!(
+                    "DNS 解析器「{}」引用的出口节点「{node_id}」不存在",
+                    server.id
+                ));
             }
         }
     }
@@ -41,42 +44,69 @@ pub fn validate_dns_dependencies(config: &UserConfig) -> Result<(), String> {
         let mut current = server.id.as_str();
         while !complete.contains(current) {
             if !path.insert(current) {
-                return Err(format!("DNS 解析器「{}」的 Bootstrap 依赖存在循环（{current}）", server.id));
+                return Err(format!(
+                    "DNS 解析器「{}」的 Bootstrap 依赖存在循环（{current}）",
+                    server.id
+                ));
             }
             let resource = servers[current];
-            if resource.id == BUILTIN_BOOTSTRAP_DNS_ID
-                && !is_valid_bootstrap_dns_resource(resource)
+            if resource.id == BUILTIN_BOOTSTRAP_DNS_ID && !is_valid_bootstrap_dns_resource(resource)
             {
                 return Err("DNS builtin-bootstrap 必须使用系统解析或直连 IP 端点".into());
             }
             if matches!(resource.kind, DnsServerKind::Local | DnsServerKind::Hosts) {
                 break;
             }
-            let endpoint = resource.endpoint.as_ref().filter(|endpoint| !endpoint.host.trim().is_empty())
+            let endpoint = resource
+                .endpoint
+                .as_ref()
+                .filter(|endpoint| !endpoint.host.trim().is_empty())
                 .ok_or_else(|| format!("DNS 解析器「{}」缺少端点", resource.id))?;
             if endpoint.port == Some(0) {
                 return Err(format!("DNS 解析器「{}」端口不能为 0", resource.id));
             }
-            if endpoint.host.trim().trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_ok() {
+            if endpoint
+                .host
+                .trim()
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok()
+            {
                 break;
             }
-            let bootstrap = resource.bootstrap_server_id.as_deref().filter(|id| !id.is_empty())
+            let bootstrap = resource
+                .bootstrap_server_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
                 .ok_or_else(|| format!("DNS 解析器「{}」缺少 Bootstrap", resource.id))?;
             require_server(&format!("解析器「{}」Bootstrap", resource.id), bootstrap)?;
             if bootstrap == BUILTIN_NETENV_DHCP_ID {
-                return Err(format!("DNS 解析器「{}」不能以动态 DHCP 作为 Bootstrap", resource.id));
+                return Err(format!(
+                    "DNS 解析器「{}」不能以动态 DHCP 作为 Bootstrap",
+                    resource.id
+                ));
             }
             if servers[bootstrap].kind == DnsServerKind::Hosts {
-                return Err(format!("DNS 解析器「{}」的 Bootstrap「{bootstrap}」不能是 Hosts", resource.id));
+                return Err(format!(
+                    "DNS 解析器「{}」的 Bootstrap「{bootstrap}」不能是 Hosts",
+                    resource.id
+                ));
             }
             current = bootstrap;
         }
         complete.extend(path);
     }
 
-    let groups: BTreeMap<&str, &DnsServerGroup> = config.dns_server_groups.iter()
-        .map(|group| (group.id.as_str(), group)).collect();
-    for group in config.dns_server_groups.iter().filter(|group| group.enabled) {
+    let groups: BTreeMap<&str, &DnsServerGroup> = config
+        .dns_server_groups
+        .iter()
+        .map(|group| (group.id.as_str(), group))
+        .collect();
+    for group in config
+        .dns_server_groups
+        .iter()
+        .filter(|group| group.enabled)
+    {
         let owner = format!("组「{}」", group.id);
         if group.members.is_empty() {
             return Err(format!("DNS {owner} 没有成员"));
@@ -95,16 +125,27 @@ pub fn validate_dns_dependencies(config: &UserConfig) -> Result<(), String> {
             match action {
                 DnsPolicyAction::Server { server_id } => return require_server(owner, server_id),
                 DnsPolicyAction::Group { group_id } => {
-                    return if groups.get(group_id.as_str()).is_some_and(|group| group.enabled) {
+                    return if groups
+                        .get(group_id.as_str())
+                        .is_some_and(|group| group.enabled)
+                    {
                         Ok(())
                     } else {
                         Err(format!("DNS {owner} 引用的组「{group_id}」不存在或已禁用"))
                     };
                 }
-                DnsPolicyAction::HostsFirst { hosts_server_id, fallback } => {
+                DnsPolicyAction::HostsFirst {
+                    hosts_server_id,
+                    fallback,
+                } => {
                     require_server(owner, hosts_server_id)?;
-                    if servers.get(hosts_server_id.as_str()).is_none_or(|server| server.kind != DnsServerKind::Hosts) {
-                        return Err(format!("DNS {owner} 的 Hosts 资源「{hosts_server_id}」类型无效"));
+                    if servers
+                        .get(hosts_server_id.as_str())
+                        .is_none_or(|server| server.kind != DnsServerKind::Hosts)
+                    {
+                        return Err(format!(
+                            "DNS {owner} 的 Hosts 资源「{hosts_server_id}」类型无效"
+                        ));
                     }
                     action = fallback;
                 }
@@ -113,18 +154,28 @@ pub fn validate_dns_dependencies(config: &UserConfig) -> Result<(), String> {
         }
     };
     if let Some(defaults) = &config.dns_defaults {
-        for (name, id) in [("默认直连", &defaults.direct_server_id), ("默认代理", &defaults.proxy_server_id)] {
+        for (name, id) in [
+            ("默认直连", &defaults.direct_server_id),
+            ("默认代理", &defaults.proxy_server_id),
+        ] {
             if !id.is_empty() {
                 require_server(name, id)?;
             }
         }
-        for (name, action) in [("默认策略", &defaults.unmatched_action), ("真实查询回退", &defaults.real_query_fallback_action)] {
+        for (name, action) in [
+            ("默认策略", &defaults.unmatched_action),
+            ("真实查询回退", &defaults.real_query_fallback_action),
+        ] {
             if let Some(action) = action {
                 validate_action(name, action)?;
             }
         }
     }
-    for rule in config.effective_dns_rules().iter().filter(|rule| rule.enabled) {
+    for rule in config
+        .effective_dns_rules()
+        .iter()
+        .filter(|rule| rule.enabled)
+    {
         if let Some(action) = rule.dns_effect().and_then(|effect| effect.action) {
             validate_action(&format!("规则「{}」", rule.id), &action)?;
         }

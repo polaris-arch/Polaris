@@ -1048,7 +1048,10 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
         restore_base: &ProxyTransactionSnapshot,
     ) -> ProxyMarkerMutationOutcome {
         self.record_restore_start(
-            txn_id, ProxyMarkerPhase::Applying, ProxyMarkerPhase::Applying, restore_base,
+            txn_id,
+            ProxyMarkerPhase::Applying,
+            ProxyMarkerPhase::Applying,
+            restore_base,
         )
     }
 
@@ -1068,18 +1071,24 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
         };
         if current.txn_id.as_deref() != Some(txn_id)
             || current.phase != expected
-            || !matches!(expected, ProxyMarkerPhase::Applying | ProxyMarkerPhase::Owned)
+            || !matches!(
+                expected,
+                ProxyMarkerPhase::Applying | ProxyMarkerPhase::Owned
+            )
             || !valid_transaction_snapshot(restore_base)
-            || !current.exact_original.as_ref().is_some_and(|original| {
-                valid_transaction_snapshot_pair(original, restore_base)
-            })
+            || !current
+                .exact_original
+                .as_ref()
+                .is_some_and(|original| valid_transaction_snapshot_pair(original, restore_base))
         {
             return ProxyMarkerMutationOutcome::Mismatch;
         }
         current.exact_restore_base = Some(restore_base.clone());
         current.plan_version = PROXY_TRANSACTION_PLAN_VERSION;
         current.phase = next;
-        if self.write_json_unlocked(&ProxyMarkerEnvelope { system_proxy_txn_v2: &current }) {
+        if self.write_json_unlocked(&ProxyMarkerEnvelope {
+            system_proxy_txn_v2: &current,
+        }) {
             ProxyMarkerMutationOutcome::Updated
         } else {
             ProxyMarkerMutationOutcome::PersistFailed
@@ -1190,9 +1199,15 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
             return ProxyMarkerRead::Invalid("marker root is not an object".into());
         };
         let Some(enveloped) = root.get(PROXY_TRANSACTION_ENVELOPE_KEY) else {
-            if ["exact_original", "exact_apply_base", "exact_applied", "exact_restore_base", "exact_prior_applied"]
-                .iter()
-                .any(|key| root.contains_key(*key))
+            if [
+                "exact_original",
+                "exact_apply_base",
+                "exact_applied",
+                "exact_restore_base",
+                "exact_prior_applied",
+            ]
+            .iter()
+            .any(|key| root.contains_key(*key))
             {
                 return ProxyMarkerRead::Invalid(
                     "top-level exact fields are not a current marker envelope".into(),
@@ -1284,7 +1299,8 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
             if data.plan_version != PROXY_TRANSACTION_PLAN_VERSION
                 || !valid_transaction_snapshot(prior)
                 || !valid_transaction_snapshot_pair(
-                    data.exact_apply_base.as_ref().expect("checked"), prior,
+                    data.exact_apply_base.as_ref().expect("checked"),
+                    prior,
                 )
             {
                 return ProxyMarkerRead::Invalid("invalid prior applied authority".into());
@@ -1292,10 +1308,16 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
         }
         if let Some(restore_base) = &data.exact_restore_base {
             if data.plan_version != PROXY_TRANSACTION_PLAN_VERSION
-                || !matches!(data.phase, ProxyMarkerPhase::Applying | ProxyMarkerPhase::Restoring | ProxyMarkerPhase::RestoredPendingClear)
+                || !matches!(
+                    data.phase,
+                    ProxyMarkerPhase::Applying
+                        | ProxyMarkerPhase::Restoring
+                        | ProxyMarkerPhase::RestoredPendingClear
+                )
                 || !valid_transaction_snapshot(restore_base)
                 || !valid_transaction_snapshot_pair(
-                    data.exact_original.as_ref().expect("checked"), restore_base,
+                    data.exact_original.as_ref().expect("checked"),
+                    restore_base,
                 )
             {
                 return ProxyMarkerRead::Invalid("invalid exact restore anchor".into());

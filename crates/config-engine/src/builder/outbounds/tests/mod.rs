@@ -1659,7 +1659,10 @@ fn shadow_tls_wrapper_inherits_resolved_detour_and_existing_rejection_rules() {
             ..Default::default()
         };
         if matches!(case, "missing" | "cycle") {
-            assert!(build_outbounds(&config, &mut deps_default()).is_err(), "{case}");
+            assert!(
+                build_outbounds(&config, &mut deps_default()).is_err(),
+                "{case}"
+            );
             continue;
         }
         let result = build_outbounds(&config, &mut deps_default()).unwrap();
@@ -1931,30 +1934,77 @@ fn detour_graph_preserves_valid_shared_multihop_chains() {
         ..Default::default()
     };
     let result = build_outbounds(&config, &mut deps_default()).unwrap();
-    for (tag, detour) in [("Child", "Middle"), ("Middle", "Root"), ("Sibling", "Middle")] {
-        let outbound = result.outbounds.iter().find(|outbound| outbound.tag == tag).unwrap();
+    for (tag, detour) in [
+        ("Child", "Middle"),
+        ("Middle", "Root"),
+        ("Sibling", "Middle"),
+    ] {
+        let outbound = result
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == tag)
+            .unwrap();
         assert_eq!(outbound.detour.as_deref(), Some(detour));
     }
 }
 
 #[test]
 fn independent_auto_wrappers_retain_rule_and_default_targets() {
-    use crate::user_config::auto_select::*;
     use crate::user_config::app_config::SubscriptionInterfacePolicy;
+    use crate::user_config::auto_select::*;
     let mut config = UserConfig::default();
     config.auto_select_enabled = true;
-    config.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Global });
-    config.subscriptions = vec![SubscriptionInterfacePolicy { id: "s".into(), proxy_bind_interface: None, speed_test_interval_minutes: Some(5) }];
-    config.servers = vec![ServerConfig { id: "a".into(), name: "A".into(), subscription_id: Some("s".into()), ..Default::default() }, ServerConfig { id: "b".into(), name: "B".into(), ..Default::default() }];
-    config.app_rules = vec![crate::user_config::AppRule { app_id: "browser".into(), action: RuleAction::Proxy, enabled: true, target_server_id: None, target_auto_select: Some(AutoSelectTarget::Subscription { subscription_id: "s".into() }) }];
+    config.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
+    config.subscriptions = vec![SubscriptionInterfacePolicy {
+        id: "s".into(),
+        proxy_bind_interface: None,
+        speed_test_interval_minutes: Some(5),
+    }];
+    config.servers = vec![
+        ServerConfig {
+            id: "a".into(),
+            name: "A".into(),
+            subscription_id: Some("s".into()),
+            ..Default::default()
+        },
+        ServerConfig {
+            id: "b".into(),
+            name: "B".into(),
+            ..Default::default()
+        },
+    ];
+    config.app_rules = vec![crate::user_config::AppRule {
+        app_id: "browser".into(),
+        action: RuleAction::Proxy,
+        enabled: true,
+        target_server_id: None,
+        target_auto_select: Some(AutoSelectTarget::Subscription {
+            subscription_id: "s".into(),
+        }),
+    }];
     let mut outbounds = vec![];
     let tags = BTreeMap::from([("a".into(), "A".into()), ("b".into(), "B".into())]);
-    let wrappers = generate_auto_groups(&config, &tags, &["A".into(), "B".into()], &mut outbounds).unwrap();
+    let wrappers =
+        generate_auto_groups(&config, &tags, &["A".into(), "B".into()], &mut outbounds).unwrap();
     assert_eq!(wrappers.len(), 2);
-    let global = outbounds.iter().find(|o| o.tag == urltest_tag(&AutoSelectTarget::Global)).unwrap();
+    let global = outbounds
+        .iter()
+        .find(|o| o.tag == urltest_tag(&AutoSelectTarget::Global))
+        .unwrap();
     assert_eq!(global.outbounds.as_ref().unwrap().len(), 2);
     assert_eq!(global.extra.get("interval"), Some(&serde_json::json!("5m")));
-    let scoped = outbounds.iter().find(|o| o.tag == urltest_tag(&AutoSelectTarget::Subscription { subscription_id: "s".into() })).unwrap();
+    let scoped = outbounds
+        .iter()
+        .find(|o| {
+            o.tag
+                == urltest_tag(&AutoSelectTarget::Subscription {
+                    subscription_id: "s".into(),
+                })
+        })
+        .unwrap();
     assert_eq!(scoped.outbounds, Some(vec!["A".into()]));
     assert_eq!(global.extra.get("url"), scoped.extra.get("url"));
 }
@@ -1963,11 +2013,20 @@ fn independent_auto_wrappers_retain_rule_and_default_targets() {
 fn disabled_auto_requires_its_own_valid_pin() {
     use crate::user_config::auto_select::*;
     let mut config = UserConfig::default();
-    config.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Manual });
-    config.servers = vec![ServerConfig { id: "a".into(), ..Default::default() }];
+    config.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Manual,
+    });
+    config.servers = vec![ServerConfig {
+        id: "a".into(),
+        ..Default::default()
+    }];
     let tags = BTreeMap::from([("a".into(), "A".into())]);
     assert!(generate_auto_groups(&config, &tags, &["A".into()], &mut vec![]).is_err());
-    config.auto_select_pins.push(AutoSelectPin { target: AutoSelectTarget::Manual, server_id: "a".into() });
+    config.auto_select_pins.push(AutoSelectPin {
+        target: AutoSelectTarget::Manual,
+        server_id: "a".into(),
+    });
     let mut outbounds = vec![];
     generate_auto_groups(&config, &tags, &["A".into()], &mut outbounds).unwrap();
     assert_eq!(outbounds.len(), 1);
@@ -1979,7 +2038,10 @@ fn disabled_auto_requires_its_own_valid_pin() {
 #[test]
 fn generated_tag_collision_guard_includes_endpoints() {
     let outbounds = vec![Outbound::shell("direct", "same")];
-    let endpoints = vec![Endpoint { tag: "same".into(), ..Default::default() }];
+    let endpoints = vec![Endpoint {
+        tag: "same".into(),
+        ..Default::default()
+    }];
     assert!(reject_duplicate_generated_tags(&outbounds, &endpoints).is_err());
 }
 
@@ -1994,8 +2056,14 @@ fn global_fragment_skips_native_tls_but_preserves_native_engine() {
                 serde_json::json!({"id":"s", "name":"n", "protocol":"trojan", "address":"a.com", "port":443,
                     "password":"pw", "tlsSettings":{"engine":engine}})
             }).unwrap();
-            let config = UserConfig { servers: vec![node], selected_server_id: Some("s".into()), tls_fragment: Some(true), ..Default::default() };
-            let mut deps = deps_default(); deps.platform = platform.into();
+            let config = UserConfig {
+                servers: vec![node],
+                selected_server_id: Some("s".into()),
+                tls_fragment: Some(true),
+                ..Default::default()
+            };
+            let mut deps = deps_default();
+            deps.platform = platform.into();
             let result = build_outbounds(&config, &mut deps).unwrap();
             let node = result.outbounds.iter().find(|o| o.tag == "n").unwrap();
             let json = serde_json::to_value(node).unwrap();
@@ -2010,17 +2078,35 @@ fn helper_and_probe_tags_cannot_be_captured_by_node_display_names() {
     for enabled in [false, true] {
         let mut inner = ss_server("inner", "real-inner");
         if enabled {
-            inner.shadow_tls_settings = Some(ShadowTlsSettings { password: "pw".into(), sni: "s.example".into(), ..Default::default() });
+            inner.shadow_tls_settings = Some(ShadowTlsSettings {
+                password: "pw".into(),
+                sni: "s.example".into(),
+                ..Default::default()
+            });
         }
-        let config = UserConfig { servers: vec![inner, ss_server("other", "stls-out-inner"), ss_server("probe", "probe-selector-0")], selected_server_id: Some("other".into()), ..Default::default() };
+        let config = UserConfig {
+            servers: vec![
+                inner,
+                ss_server("other", "stls-out-inner"),
+                ss_server("probe", "probe-selector-0"),
+            ],
+            selected_server_id: Some("other".into()),
+            ..Default::default()
+        };
         let mut deps = deps_default();
-        if enabled { deps.probe_pool_ports = vec![12345]; }
+        if enabled {
+            deps.probe_pool_ports = vec![12345];
+        }
         let result = build_outbounds(&config, &mut deps).unwrap();
         let tags: BTreeSet<_> = result.outbounds.iter().map(|o| o.tag.as_str()).collect();
         assert_eq!(tags.len(), result.outbounds.len());
         assert!(tags.contains("node-stls-out-inner"));
         assert!(tags.contains("node-probe-selector-0"));
-        let selector = result.outbounds.iter().find(|o| o.tag == "proxy-selector").unwrap();
+        let selector = result
+            .outbounds
+            .iter()
+            .find(|o| o.tag == "proxy-selector")
+            .unwrap();
         assert_eq!(selector.default.as_deref(), Some("node-stls-out-inner"));
         assert_eq!(tags.contains("stls-out-inner"), enabled);
         assert_eq!(tags.contains("probe-selector-0"), enabled);

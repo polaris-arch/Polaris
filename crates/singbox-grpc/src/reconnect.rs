@@ -69,13 +69,16 @@ trait Reconnect<T>: Send + Sync + 'static {
 
 /// 注入 Bearer metadata（h2c per-call auth，对齐 Polaris authMetadata）。secret 空则免认证。
 /// 非法 metadata 字节必须失败关闭，不能 panic，也不能省略认证头后继续连接。
-pub(crate) fn auth_request<R>(secret: &Option<String>, req: R) -> Result<tonic::Request<R>, String> {
+pub(crate) fn auth_request<R>(
+    secret: &Option<String>,
+    req: R,
+) -> Result<tonic::Request<R>, String> {
     let mut req = tonic::Request::new(req);
     if let Some(s) = secret {
         let val = format!("Bearer {s}");
-        let metadata = val.parse().map_err(|_| {
-            "管理 API secret 不能编码为 authorization metadata".to_owned()
-        })?;
+        let metadata = val
+            .parse()
+            .map_err(|_| "管理 API secret 不能编码为 authorization metadata".to_owned())?;
         req.metadata_mut().insert("authorization", metadata);
     }
     Ok(req)
@@ -294,22 +297,39 @@ impl Reconnect<daemon::Log> for LogReconnect {
 /// Group choices and native HTTP histories use the already available core stream.
 struct GroupsReconnect;
 impl Reconnect<daemon::Groups> for GroupsReconnect {
-    fn open(&self, target: String, secret: Option<String>, _interval_ns: i64)
-        -> Pin<Box<dyn Future<Output = Result<Streaming<daemon::Groups>, String>> + Send>> {
+    fn open(
+        &self,
+        target: String,
+        secret: Option<String>,
+        _interval_ns: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<Streaming<daemon::Groups>, String>> + Send>> {
         Box::pin(async move {
-            let channel = h2c::connect_h2c(&target).await.map_err(|e| format!("h2c connect: {e}"))?;
+            let channel = h2c::connect_h2c(&target)
+                .await
+                .map_err(|e| format!("h2c connect: {e}"))?;
             let mut client = StartedServiceClient::new(channel);
-            client.subscribe_groups(auth_request(&secret, daemon::Empty {})?).await
-                .map(|response| response.into_inner()).map_err(|e| format!("SubscribeGroups: {e}"))
+            client
+                .subscribe_groups(auth_request(&secret, daemon::Empty {})?)
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|e| format!("SubscribeGroups: {e}"))
         })
     }
 }
 
-pub(crate) fn subscribe_groups(target: String, secret: Option<String>, cfg: ReconnectConfig)
-    -> ReconnectingStream<daemon::Groups> {
+pub(crate) fn subscribe_groups(
+    target: String,
+    secret: Option<String>,
+    cfg: ReconnectConfig,
+) -> ReconnectingStream<daemon::Groups> {
     ReconnectingStream {
-        target, secret, interval_ns: 0, cfg,
-        connector: Box::new(GroupsReconnect), state: State::Initial, subscription_reset: false,
+        target,
+        secret,
+        interval_ns: 0,
+        cfg,
+        connector: Box::new(GroupsReconnect),
+        state: State::Initial,
+        subscription_reset: false,
     }
 }
 

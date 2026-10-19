@@ -2415,7 +2415,8 @@ fn bundled_core_accepts_every_admitted_utls_profile_and_rejects_unknown() {
             &DomainResolver::Tag("dns-bootstrap".into()),
             arch,
             platform,
-        ).expect("valid test outbound");
+        )
+        .expect("valid test outbound");
         let config = json!({"log":{"disabled":true},
             "dns":{"servers":[{"type":"local","tag":"dns-bootstrap"}]},
             "outbounds":[outbound]});

@@ -498,7 +498,7 @@ impl ProxyRuntime {
         if let Some(cfg) = self.emitted_exit_route_config() {
             let ipv6 = cfg.enable_ipv6.unwrap_or(false);
             self.mesh.exit_route_reassert(&cfg, ipv6).await;
-        } else if self.gate.generation()==my_gen {
+        } else if self.gate.generation() == my_gen {
             self.mesh.exit_route_clear().await;
         }
         // ③ 之前：`running=true` 语义的重探不得在核已停/已换之后落地（会覆盖停核腿的 refresh(false)）。

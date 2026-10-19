@@ -35,9 +35,9 @@ mod debug_pc_echo;
 #[allow(dead_code)]
 mod android_drain;
 mod auto_switch;
-pub(crate) mod native_auto;
 mod connection_flush;
 mod core_binary;
+pub(crate) mod native_auto;
 mod tls_capabilities;
 // `pub(crate)`：`pipe_to_log` 是全 app 唯一一份子进程排空实现，瞬态登录核
 // （`runtime::tailscale_login_core`）与测速临时核（`runtime::speedtest`）都用它。
@@ -1841,7 +1841,9 @@ impl ProxyRuntime {
             android_main_token: Mutex::new(None),
             pid: Arc::new(Mutex::new(None)),
             core_via_helper: Arc::new(AtomicBool::new(false)),
-            core_version_probe: Arc::new(crate::runtime::core_version_probe::CoreVersionProbe::default()),
+            core_version_probe: Arc::new(
+                crate::runtime::core_version_probe::CoreVersionProbe::default(),
+            ),
             pending_force_restart: RwLock::new(None),
             force_restart_seq: AtomicU64::new(1),
             current_config: RwLock::new(None),

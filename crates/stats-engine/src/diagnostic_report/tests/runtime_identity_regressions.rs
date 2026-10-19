@@ -20,13 +20,37 @@ fn pending_node_edits_cannot_disclose_running_hosts_or_auth_headers() {
         singbox_log_tail: "dial 203.0.113.25 old-endpoint.example old-host.example".into(),
         ..Default::default()
     });
-    for private in ["new-node.example", "old-node.example", "old-cover.example", "old-host.example",
-        "203.0.113.25", "old-endpoint.example", "Old private node", "synthetic-uuid", "synthetic-auth",
-        "synthetic-proxy-auth", "synthetic-cookie", "synthetic-set-cookie"] {
-        assert!(!report.contains(private), "private sentinel survived redaction");
+    for private in [
+        "new-node.example",
+        "old-node.example",
+        "old-cover.example",
+        "old-host.example",
+        "203.0.113.25",
+        "old-endpoint.example",
+        "Old private node",
+        "synthetic-uuid",
+        "synthetic-auth",
+        "synthetic-proxy-auth",
+        "synthetic-cookie",
+        "synthetic-set-cookie",
+    ] {
+        assert!(
+            !report.contains(private),
+            "private sentinel survived redaction"
+        );
     }
-    for technical in ["technical-dns.example", "technical-rule.example", "keep-label", "/masque", "vless", "masque-client"] {
-        assert!(report.contains(technical), "technical diagnostic field was lost");
+    for technical in [
+        "technical-dns.example",
+        "technical-rule.example",
+        "keep-label",
+        "/masque",
+        "vless",
+        "masque-client",
+    ] {
+        assert!(
+            report.contains(technical),
+            "technical diagnostic field was lost"
+        );
     }
 }
 
@@ -38,7 +62,10 @@ fn deleted_disk_node_and_empty_disk_config_still_redact_running_ipv6() {
         singbox_log_tail: "dial [2001:db8::42]:443".into(),
         ..Default::default()
     });
-    assert!(!report.contains("2001:db8::42"), "private sentinel survived redaction");
+    assert!(
+        !report.contains("2001:db8::42"),
+        "private sentinel survived redaction"
+    );
     assert_eq!(report.matches("<ip-1>").count(), 2);
 }
 
@@ -53,7 +80,10 @@ fn structured_standard_auth_headers_are_case_and_separator_independent() {
         ..Default::default()
     });
     for secret in ["synthetic-a", "synthetic-b", "synthetic-c", "synthetic-d"] {
-        assert!(!report.contains(secret), "private sentinel survived redaction");
+        assert!(
+            !report.contains(secret),
+            "private sentinel survived redaction"
+        );
     }
     assert!(report.contains("application/json"));
 }

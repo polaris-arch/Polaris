@@ -71,6 +71,7 @@ import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { join, dirname, resolve, basename, relative } from 'path';
 import { fileURLToPath } from 'url';
+import { macOpenGuideViolations } from './lib/macos-open-guide.mjs';
 import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
 import { verifyCronetPayload } from './lib/cronet-payload.mjs';
 import { nsisCoreSweepViolations } from './lib/nsis-core-sweep.mjs';
@@ -1656,8 +1657,8 @@ function checkWindowsHookPrivilegeBoundary(source) {
  *
  * 这份引导是**用户在拿不到任何其它帮助时**唯一能看到的东西：他双击 app 报「已损坏」，
  * 此时他既没进过 README、也没进过应用（进不去）。而它的三个组成部分分别住在三个文件里：
- * 内容在 `packaging/`、注入与文件名在 `package.yml`、同一条命令的另一份在 `README.md`。
- * 任意一处改了名字或命令，症状都不是报错，而是「用户照着做但没用」。
+ * 内容在 `packaging/`、注入与文件名在 `package.yml`、同一份安全指引在五语 README。
+ * 逐语核对安全指引，并逐字节核对最终 DMG；不能恢复清除隔离属性的旧命令。
  *
  * 本条在 **Linux 的 confs 腿**跑（打包前、1x 计费），不必等 mac 腿。mac 腿另有一条
  * 「把 dmg 挂回来看文件在不在」的开箱验 —— 两者管的是不同的东西：这里管**说得对不对**，
@@ -1672,26 +1673,15 @@ function checkMacOpenGuide() {
   }
   const guide = readFileSync(guidePath, 'utf8');
   const pkg = readFileSync(join(ROOT, '.github', 'workflows', 'package.yml'), 'utf8');
-  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
 
-  // 唯一真值取 README（它是既有的、用户可见的那一份），引导必须照抄同一条命令。
-  // 两处给不同命令 = 用户照着 dmg 里那份做完发现还是打不开，而 README 里写着另一条。
-  const CMD = 'xattr -cr /Applications/Polaris.app';
-  if (!readme.includes(CMD)) {
-    fail(`README.md 里的 quarantine 命令不再是 \`${CMD}\` —— 真值变了，引导要跟着改（本门也要跟着改）`);
+  // The reviewed five-language guide is canonical. Check every translation and
+  // README, then require byte-for-byte equality inside the final mounted DMG.
+  const readmes = Object.fromEntries(['README.md', 'README.en.md', 'README.zh-TW.md', 'README.ru.md', 'README.fa.md']
+    .map((name) => [name, readFileSync(join(ROOT, name), 'utf8')]));
+  for (const reason of macOpenGuideViolations(guide, readmes)) fail(reason);
+  if (!pkg.includes('if ! cmp -s packaging/macos-dmg-open-guide.txt "$mnt/$guide_name"; then')) {
+    fail('package.yml must compare the complete mounted guide with the validated source');
   }
-  if (!guide.includes(CMD)) {
-    fail(`引导里的命令与 README 不一致，应含 \`${CMD}\``);
-  }
-  // 开箱验也必须核对同一条命令；若仍搜旧命令/旧参数，DMG 明明正确却会在最后一步假红。
-  if (!pkg.includes(`grep -Fc '${CMD}'`)) {
-    fail(`package.yml 的 DMG 开箱验没有按完整新命令计数：应包含 \`grep -Fc '${CMD}'\``);
-  }
-  // 中英双语：dmg 是发给所有用户的，只有中文等于对一半用户没写。
-  if (!/Applications folder/i.test(guide)) {
-    fail('引导缺英文段 —— dmg 面向全部用户，单语等于对另一半人没写');
-  }
-
   // 文件名：注入与开箱验两步各写一份，且必须使用产品约定的简短英文名。
   const names = [...pkg.matchAll(/guide_name="([^"]+)"/g)].map((m) => m[1]);
   if (names.length !== 2) {

@@ -141,7 +141,9 @@ pub(super) fn sanitized_body_read_error(error: BodyReadError) -> String {
     }
 }
 
-pub(super) fn build_direct_pinned_client(target: &GuardedTarget) -> Result<reqwest::Client, String> {
+pub(super) fn build_direct_pinned_client(
+    target: &GuardedTarget,
+) -> Result<reqwest::Client, String> {
     install_ring_provider();
     let addrs: Vec<std::net::SocketAddr> = target
         .addresses

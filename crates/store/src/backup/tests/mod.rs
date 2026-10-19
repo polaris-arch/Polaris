@@ -1482,7 +1482,10 @@ fn the_selection_intent_follows_the_selected_server_through_backup() {
         "subscriptions": [{ "id": "sx", "name": "x", "url": "https://x.example/x" }],
     });
     let replaced = merge_categories(&source, &foreign, &[C::Subscriptions]).config;
-    assert_eq!(replaced["selectionIntent"],source["selectionIntent"],"empty scope remains explicit pending repair");
+    assert_eq!(
+        replaced["selectionIntent"], source["selectionIntent"],
+        "empty scope remains explicit pending repair"
+    );
     assert_eq!(replaced["selectedServerId"], Value::Null);
     // 对照：只导入通用设置，订阅还在，意图保留。
     let general = merge_categories(
@@ -1703,11 +1706,16 @@ fn sparse_old_dns_backup_restores_protected_builtin_for_compatibility_fallback()
 
 #[test]
 fn verified_auto_pins_do_not_cross_backup_general_settings() {
-    let pin=json!([{"target":{"scope":"global"},"serverId":"a"}]);
-    let source=json!({"autoSelectEnabled":true,"autoSelectPins":pin,"logLevel":"info"});
-    let exported=pick_categories(&source,&[C::GeneralSettings]);
+    let pin = json!([{"target":{"scope":"global"},"serverId":"a"}]);
+    let source = json!({"autoSelectEnabled":true,"autoSelectPins":pin,"logLevel":"info"});
+    let exported = pick_categories(&source, &[C::GeneralSettings]);
     assert!(exported.get("autoSelectPins").is_none());
-    assert_eq!(exported["autoSelectEnabled"],true);
-    let merged=merge_categories(&json!({"autoSelectPins":[]}),&source,&[C::GeneralSettings]).config;
-    assert_eq!(merged["autoSelectPins"],json!([]));
+    assert_eq!(exported["autoSelectEnabled"], true);
+    let merged = merge_categories(
+        &json!({"autoSelectPins":[]}),
+        &source,
+        &[C::GeneralSettings],
+    )
+    .config;
+    assert_eq!(merged["autoSelectPins"], json!([]));
 }

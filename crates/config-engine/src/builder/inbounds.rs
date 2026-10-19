@@ -525,7 +525,9 @@ fn build_tun_inbound(
             all_server_ids.insert(sid.to_owned());
         }
         if !crate::user_config::auto_select::referenced_targets(config).is_empty() {
-            all_server_ids.extend(crate::builder::endpoint_routes::active_physical_root_ids(config));
+            all_server_ids.extend(crate::builder::endpoint_routes::active_physical_root_ids(
+                config,
+            ));
         }
         for r in &effective_app_rules_proxy(config) {
             if let Some(tid) = &r.target_server_id {

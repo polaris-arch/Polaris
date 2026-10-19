@@ -19,7 +19,7 @@ fn registration_requires_one_complete_native_config_token_record() {
     assert!(parse_identity("sS-1-5-21-1-2-3-01000").is_none());
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn registration_transaction_restores_exact_bytes_and_absence() {
     use std::os::unix::fs::PermissionsExt;
@@ -53,7 +53,7 @@ fn registration_transaction_restores_exact_bytes_and_absence() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn registration_snapshot_rejects_linked_or_nonprivate_records() {
     use std::os::unix::fs::{symlink, PermissionsExt};

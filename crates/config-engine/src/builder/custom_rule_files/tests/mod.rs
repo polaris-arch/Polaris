@@ -214,14 +214,20 @@ fn uses_fake_ip_default_true() {
 #[test]
 fn file_base_illegal_id_sha1() {
     // sha1("a/b") = 3ec69c85a4ff...；前 12 位十六进制。
-    assert_eq!(custom_rule_file_base("a/b"), "custom-rule-~3ec69c85a4ff96830024afeef2d4e512181c8f7b");
+    assert_eq!(
+        custom_rule_file_base("a/b"),
+        "custom-rule-~3ec69c85a4ff96830024afeef2d4e512181c8f7b"
+    );
     // sha1("has space") = e42b2b98cbee...
     assert_eq!(
         custom_rule_file_base("has space"),
         "custom-rule-~e42b2b98cbee79b7a787bd5df7bda64a289063ed"
     );
     // 空 id 也走 hash（`.+` 不匹配空）：sha1("") = da39a3ee5e6b...
-    assert_eq!(custom_rule_file_base(""), "custom-rule-~da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    assert_eq!(
+        custom_rule_file_base(""),
+        "custom-rule-~da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    );
 }
 
 #[test]
@@ -348,7 +354,8 @@ fn derived_names_cannot_alias_literal_rule_ids() {
     assert_ne!(custom_rule_file_base("a/b"), custom_rule_file_base(literal));
     let mut a = rule_single(RuleType::Domain, &["a.example"]);
     let mut b = rule_single(RuleType::Domain, &["b.example"]);
-    a.id = "a/b".into(); b.id = literal.into();
+    a.id = "a/b".into();
+    b.id = literal.into();
     let files = build_custom_rule_files(&user_config(ProxyMode::Smart, vec![a, b], Some(false)));
     let a_name = format!("{}.json", custom_rule_file_base("a/b"));
     let b_name = format!("{}.json", custom_rule_file_base(literal));

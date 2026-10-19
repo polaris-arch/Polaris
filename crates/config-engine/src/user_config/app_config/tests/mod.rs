@@ -19,7 +19,10 @@ fn fully_populated() -> UserConfig {
         }],
         selected_server_id: Some(String::new()),
         auto_select_enabled: true,
-        selection_intent: Some(super::super::auto_select::SelectionIntent { mode: "auto".into(), target: super::super::auto_select::AutoSelectTarget::Global }),
+        selection_intent: Some(super::super::auto_select::SelectionIntent {
+            mode: "auto".into(),
+            target: super::super::auto_select::AutoSelectTarget::Global,
+        }),
         auto_select_pins: Vec::new(),
         speed_test_url: Some("https://example.test/".into()),
         proxy_mode: default_proxy_mode(),

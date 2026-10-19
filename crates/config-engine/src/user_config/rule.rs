@@ -50,7 +50,11 @@ pub struct RuleRouteEffect {
     pub action: RuleAction,
     #[serde(rename = "targetServerId", skip_serializing_if = "Option::is_none")]
     pub target_server_id: Option<String>,
-    #[serde(rename = "targetAutoSelect", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "targetAutoSelect",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub target_auto_select: Option<super::auto_select::AutoSelectTarget>,
     /// v1-v3 兼容字段；schema v4 起连接解析由 `dnsDefaults.connectionResolution` 全局拥有。
     #[serde(
@@ -203,7 +207,11 @@ pub struct Rule {
     /// 目标代理服务器 ID（仅 action=proxy 时有效）。
     #[serde(rename = "targetServerId", skip_serializing_if = "Option::is_none")]
     pub target_server_id: Option<String>,
-    #[serde(rename = "targetAutoSelect", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "targetAutoSelect",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub target_auto_select: Option<super::auto_select::AutoSelectTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remarks: Option<String>,
@@ -248,9 +256,15 @@ impl Rule {
     }
 
     pub fn route_target_auto_select(&self) -> Option<&super::auto_select::AutoSelectTarget> {
-        if self.route_action() != Some(RuleAction::Proxy) { return None; }
+        if self.route_action() != Some(RuleAction::Proxy) {
+            return None;
+        }
         match &self.effects {
-            Some(effects) => effects.route.as_ref().filter(|r| r.enabled && !r.resolution_only).and_then(|r| r.target_auto_select.as_ref()),
+            Some(effects) => effects
+                .route
+                .as_ref()
+                .filter(|r| r.enabled && !r.resolution_only)
+                .and_then(|r| r.target_auto_select.as_ref()),
             None => self.target_auto_select.as_ref(),
         }
     }
@@ -310,7 +324,11 @@ pub struct AppRule {
     pub enabled: bool,
     #[serde(rename = "targetServerId", skip_serializing_if = "Option::is_none")]
     pub target_server_id: Option<String>,
-    #[serde(rename = "targetAutoSelect", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "targetAutoSelect",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub target_auto_select: Option<super::auto_select::AutoSelectTarget>,
 }
 

@@ -139,7 +139,10 @@ const V6_FULL: u128 = !0u128;
 
 /// IPv6 字面量（含 :: 压缩）→ u128。非法 → None。上游 `ipv6ToBigInt`。
 fn ipv6_to_u128(addr: &str) -> Option<u128> {
-    addr.trim().parse::<std::net::Ipv6Addr>().ok().map(u128::from)
+    addr.trim()
+        .parse::<std::net::Ipv6Addr>()
+        .ok()
+        .map(u128::from)
 }
 
 /// IPv6 CIDR → (网络地址, 前缀)。上游 `parseIpv6Cidr`。

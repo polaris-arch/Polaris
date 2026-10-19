@@ -935,17 +935,37 @@ fn engaged_route_union_does_not_reapply_an_empty_engagement_context() {
 
 #[test]
 fn native_auto_roots_include_candidates_and_detours_but_off_uses_only_pin() {
-    use crate::user_config::auto_select::{AutoSelectTarget, AutoSelectPin, SelectionIntent};
-    let server = |id: &str| ServerConfig { id: id.into(), name: id.into(), protocol: Protocol::Vless, address: "example.com".into(), port: 443, ..Default::default() };
+    use crate::user_config::auto_select::{AutoSelectPin, AutoSelectTarget, SelectionIntent};
+    let server = |id: &str| ServerConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Vless,
+        address: "example.com".into(),
+        port: 443,
+        ..Default::default()
+    };
     let mut config = UserConfig::default();
-    let mut child = server("child"); child.detour = Some("root".into());
+    let mut child = server("child");
+    child.detour = Some("root".into());
     config.servers = vec![child, server("root"), server("other")];
     config.selected_server_id = Some("stale".into());
-    config.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Global });
+    config.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
     config.auto_select_enabled = true;
-    assert_eq!(active_physical_root_ids(&config), BTreeSet::from(["root".into(), "other".into()]));
+    assert_eq!(
+        active_physical_root_ids(&config),
+        BTreeSet::from(["root".into(), "other".into()])
+    );
     config.auto_select_enabled = false;
-    config.auto_select_pins = vec![AutoSelectPin { target: AutoSelectTarget::Global, server_id: "child".into() }];
-    assert_eq!(active_physical_root_ids(&config), BTreeSet::from(["root".into()]));
+    config.auto_select_pins = vec![AutoSelectPin {
+        target: AutoSelectTarget::Global,
+        server_id: "child".into(),
+    }];
+    assert_eq!(
+        active_physical_root_ids(&config),
+        BTreeSet::from(["root".into()])
+    );
     assert!(!referenced_server_ids(&config).contains("stale"));
 }

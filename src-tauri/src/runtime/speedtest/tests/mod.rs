@@ -5218,6 +5218,10 @@ fn temporary_probe_rejects_invalid_pin_even_when_insecure() {
         "address": "example.invalid", "port": 443, "password": "test-only",
         "tlsSettings": {"enabled": true, "allowInsecure": true,
                         "certificateSha256": "invalid-pin"}
-    })).unwrap();
-    assert_eq!(build_temp_node(&server, "pin-probe", &env(), None).err(), Some("TLS_PIN_INVALID"));
+    }))
+    .unwrap();
+    assert_eq!(
+        build_temp_node(&server, "pin-probe", &env(), None).err(),
+        Some("TLS_PIN_INVALID")
+    );
 }

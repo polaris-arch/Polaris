@@ -245,8 +245,10 @@ pub fn finalize_config(value: &mut Value) -> Result<(), StoreError> {
             .or_insert_with(|| Value::from(7890u16));
         // tunConfig 缺 → validate 会判 Err（必填）；这里不补（保持 Polaris 行为：缺 tunConfig throw）。
         // bool 必填默认
-        obj.entry("autoSelectEnabled").or_insert_with(|| Value::Bool(false));
-        obj.entry("autoSelectPins").or_insert_with(|| Value::Array(vec![]));
+        obj.entry("autoSelectEnabled")
+            .or_insert_with(|| Value::Bool(false));
+        obj.entry("autoSelectPins")
+            .or_insert_with(|| Value::Array(vec![]));
         obj.entry("autoStart").or_insert_with(|| Value::Bool(false));
         obj.entry("autoConnect")
             .or_insert_with(|| Value::Bool(false));

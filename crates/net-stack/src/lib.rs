@@ -17,8 +17,8 @@
 
 #![forbid(unsafe_code)]
 
-mod import_fields;
 pub mod clash_parser;
+mod import_fields;
 pub mod safe_redirect;
 pub mod share_link;
 pub mod singbox_import;

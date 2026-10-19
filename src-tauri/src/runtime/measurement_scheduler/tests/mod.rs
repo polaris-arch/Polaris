@@ -2037,7 +2037,10 @@ fn an_effective_auto_intent_puts_its_subscription_in_the_plan() {
             .collect();
         plan_subscriptions(config, &intent)
     };
-    let on = Switches { master: true, better_leg: true };
+    let on = Switches {
+        master: true,
+        better_leg: true,
+    };
     let with_intent = planned(&config, on, Platform::Linux);
     assert_eq!(with_intent, plan(&[("a", 30, &["n1"])]));
     assert_eq!(planned(&config, on, Platform::Ios), with_intent);
@@ -2551,26 +2554,30 @@ fn s5_android_scheduler_native_readings_are_bar_only_and_other_platforms_ignore_
 
 #[test]
 fn native_ownership_yields_only_referenced_candidates() {
-    let mut config=serde_json::to_value(polaris_config_engine::user_config::UserConfig::default()).unwrap();
-    config["autoSelectEnabled"]=json!(true);
-    config["subscriptions"]=json!([{"id":"one","periodicSpeedTest":true},{"id":"two","periodicSpeedTest":true}]);
-    config["servers"]=json!([
+    let mut config =
+        serde_json::to_value(polaris_config_engine::user_config::UserConfig::default()).unwrap();
+    config["autoSelectEnabled"] = json!(true);
+    config["subscriptions"] =
+        json!([{"id":"one","periodicSpeedTest":true},{"id":"two","periodicSpeedTest":true}]);
+    config["servers"] = json!([
         {"id":"a","name":"A","protocol":"http","subscriptionId":"one"},
         {"id":"b","name":"B","protocol":"http","subscriptionId":"two"}
     ]);
-    let platform=Platform::current();
-    assert_eq!(effective_plan(&config,platform).len(),2);
-    config["selectionIntent"]=json!({"mode":"auto","scope":"subscription","subscriptionId":"two"});
-    let plan=effective_plan(&config,platform);
-    assert_eq!(plan.len(),1);assert_eq!(plan["one"].members,ids(&["a"]));
-    config["autoSelectEnabled"]=json!(false);
-    assert_eq!(effective_plan(&config,platform).len(),2);
+    let platform = Platform::current();
+    assert_eq!(effective_plan(&config, platform).len(), 2);
+    config["selectionIntent"] =
+        json!({"mode":"auto","scope":"subscription","subscriptionId":"two"});
+    let plan = effective_plan(&config, platform);
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan["one"].members, ids(&["a"]));
+    config["autoSelectEnabled"] = json!(false);
+    assert_eq!(effective_plan(&config, platform).len(), 2);
 }
 
 #[test]
 fn freshness_index_preserves_first_plan_membership() {
-    let plans=plan(&[("a",5,&["same","first"]),("b",30,&["same","second"])]);
-    let indexed=freshness_period_index(&plans);
-    assert_eq!(indexed["same"],5*MINUTE);
-    assert_eq!(indexed["second"],30*MINUTE);
+    let plans = plan(&[("a", 5, &["same", "first"]), ("b", 30, &["same", "second"])]);
+    let indexed = freshness_period_index(&plans);
+    assert_eq!(indexed["same"], 5 * MINUTE);
+    assert_eq!(indexed["second"], 30 * MINUTE);
 }

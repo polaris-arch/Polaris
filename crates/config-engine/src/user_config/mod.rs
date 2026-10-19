@@ -4,8 +4,8 @@
 //! 字段 Optionality 与 TS 侧一致；serde rename 对齐 Polaris JSON 键名（对拍约束）。
 
 pub mod app_config;
-pub mod auto_select;
 pub mod app_rules_preset;
+pub mod auto_select;
 pub mod builtin_geo_rulesets;
 pub mod cidr;
 pub mod collections;

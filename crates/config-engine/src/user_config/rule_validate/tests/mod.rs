@@ -80,7 +80,7 @@ fn validate_rule_value_accept_reject_per_type() {
     // bounded actual-core admission, including lookahead and backreferences.
     assert!(validate_rule_value("domainRegex", r"\Q(a)\2\E"));
     assert!(validate_rule_value("domainRegex", &"a".repeat(1025))); // admission bounds are changed-pattern only
-    // processPath Windows 路径
+                                                                    // processPath Windows 路径
     assert!(validate_rule_value(
         "processPath",
         r"C:\Program Files\app.exe"

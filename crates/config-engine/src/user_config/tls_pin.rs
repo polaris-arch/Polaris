@@ -89,9 +89,16 @@ fn encode_std_base64(bytes: &[u8]) -> String {
 /// Explicit malformed constraints fail closed, including mixed valid/invalid lists.
 /// Empty editor fields mean unset; invalid nonempty input never becomes no pins.
 pub fn cert_pins_for_kernel(raw: Option<&str>) -> Result<Option<Vec<String>>, &'static str> {
-    let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) else { return Ok(None); };
-    let pins = raw.split(',')
-        .map(|item| decode_pin(item).map(|d| encode_std_base64(&d)).ok_or("TLS_PIN_INVALID"))
+    let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let pins = raw
+        .split(',')
+        .map(|item| {
+            decode_pin(item)
+                .map(|d| encode_std_base64(&d))
+                .ok_or("TLS_PIN_INVALID")
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(pins))
 }
@@ -102,7 +109,9 @@ pub fn preserve_cert_pins(raw: &str) -> Option<String> {
     (!raw.trim().is_empty()).then(|| raw.trim().to_owned())
 }
 
-pub fn validate_server_cert_pins(server: &crate::user_config::server_config::ServerConfig) -> Result<(), &'static str> {
+pub fn validate_server_cert_pins(
+    server: &crate::user_config::server_config::ServerConfig,
+) -> Result<(), &'static str> {
     if pin_is_emitted(server) {
         if let Some(tls) = &server.tls_settings {
             cert_pins_for_kernel(tls.certificate_sha256.as_deref())?;
@@ -134,13 +143,26 @@ pub fn modeled_cert_pins_are_emitted(
     use crate::user_config::server_config::Protocol;
     match protocol {
         Protocol::MasqueClient => true,
-        Protocol::Naive | Protocol::Tor | Protocol::Tailcat | Protocol::Ssh
-        | Protocol::Custom | Protocol::Wireguard | Protocol::Tailscale
-        | Protocol::Openconnect | Protocol::OpenvpnClient => false,
-        Protocol::Vless | Protocol::Trojan | Protocol::Hysteria2 | Protocol::Shadowsocks
-        | Protocol::Anytls | Protocol::Tuic | Protocol::Vmess | Protocol::Snell
-        | Protocol::Socks | Protocol::Http | Protocol::Hysteria =>
-            !security.is_some_and(|security| security.is_reality()),
+        Protocol::Naive
+        | Protocol::Tor
+        | Protocol::Tailcat
+        | Protocol::Ssh
+        | Protocol::Custom
+        | Protocol::Wireguard
+        | Protocol::Tailscale
+        | Protocol::Openconnect
+        | Protocol::OpenvpnClient => false,
+        Protocol::Vless
+        | Protocol::Trojan
+        | Protocol::Hysteria2
+        | Protocol::Shadowsocks
+        | Protocol::Anytls
+        | Protocol::Tuic
+        | Protocol::Vmess
+        | Protocol::Snell
+        | Protocol::Socks
+        | Protocol::Http
+        | Protocol::Hysteria => !security.is_some_and(|security| security.is_reality()),
     }
 }
 

@@ -703,9 +703,9 @@ pub async fn update_check(
         ) {
             Ok(AppUpdateCheck::Available(info)) => {
                 let info_v = serde_json::to_value(&info).unwrap_or(Value::Null);
-            if let Err(error) = state.updater().custody.select(info_v.clone()) {
-                return Ok(ApiResponse::err(error));
-            }
+                if let Err(error) = state.updater().custody.select(info_v.clone()) {
+                    return Ok(ApiResponse::err(error));
+                }
                 Ok(ApiResponse::ok(json!({
                     "hasUpdate": false,
                     "isCurrentVersion": true,
@@ -1340,7 +1340,12 @@ pub async fn update_download(
     // Keep progress projection compatible; all executable fields below come from the backend.
     let update_info = match state.updater().custody.admit(&update_info) {
         Ok(trusted) => trusted,
-        Err(error) => return Ok(fail(UpdateErr::with_detail(UpdateErrCode::RecheckFailed, &error))),
+        Err(error) => {
+            return Ok(fail(UpdateErr::with_detail(
+                UpdateErrCode::RecheckFailed,
+                &error,
+            )))
+        }
     };
 
     let Some(url) = update_info
@@ -1419,9 +1424,14 @@ pub async fn update_download(
     if reuse_probe {
         let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
         if let Err(error) = state.updater().custody.record(
-            &dest, expected_sha.as_deref().unwrap_or_default(), bytes,
+            &dest,
+            expected_sha.as_deref().unwrap_or_default(),
+            bytes,
         ) {
-            return Ok(fail(UpdateErr::with_detail(UpdateErrCode::RecheckFailed, &error)));
+            return Ok(fail(UpdateErr::with_detail(
+                UpdateErrCode::RecheckFailed,
+                &error,
+            )));
         }
         log::info!(
             "更新包已在本地且 sha256 复核通过，复用不重复下载: {}",
@@ -1555,8 +1565,16 @@ pub async fn update_download(
         LandingOutcome::Landed => {
             // tmp 这个 inode 现在叫 dest 了 —— 先解除守卫，再广播成功。
             partial.disarm();
-            if let Err(error) = state.updater().custody.record(&dest, &streamed.sha256_hex, streamed.bytes) {
-                return Ok(fail(UpdateErr::with_detail(UpdateErrCode::RecheckFailed, &error)));
+            if let Err(error) =
+                state
+                    .updater()
+                    .custody
+                    .record(&dest, &streamed.sha256_hex, streamed.bytes)
+            {
+                return Ok(fail(UpdateErr::with_detail(
+                    UpdateErrCode::RecheckFailed,
+                    &error,
+                )));
             }
             // 「下载完成 / 校验完成 / 落位完成」三点分离后，`downloaded` **只在这一支**发：
             // 早一步发就是广播一个 dest 尚不存在的假成功态，设置页会给出一个点不开的安装入口。
@@ -1637,7 +1655,9 @@ pub async fn update_install(
 
     // Read-only restoration of a portable reminder. A persisted path is display data,
     // never authority: no existence check, copy, write, delete, or OS open in this branch.
-    if confirmed == Some(false) && os == "windows" && portable.is_some()
+    if confirmed == Some(false)
+        && os == "windows"
+        && portable.is_some()
         && state.updater().custody.admits_install(&installer).is_err()
     {
         return Ok(ApiResponse::ok(json!({
@@ -1650,7 +1670,10 @@ pub async fn update_install(
         return Ok(ApiResponse::err_with_code(error, "updateTrustRequired"));
     }
     if !installer.is_file() {
-        return Ok(ApiResponse::err_with_code("Update package is missing; check and download again", "updateTrustRequired"));
+        return Ok(ApiResponse::err_with_code(
+            "Update package is missing; check and download again",
+            "updateTrustRequired",
+        ));
     }
 
     let mut plan = match update_install::decide_install_plan(
@@ -1664,7 +1687,9 @@ pub async fn update_install(
         Ok(p) => p,
         Err(_reject) => {
             // Unsupported assets must never be opened as a fallback executable.
-            return Ok(ApiResponse::err("Update package does not match this platform or installation form"));
+            return Ok(ApiResponse::err(
+                "Update package does not match this platform or installation form",
+            ));
         }
     };
 
@@ -1681,7 +1706,12 @@ pub async fn update_install(
     let stage = match tokio::task::spawn_blocking(move || updater.custody.stage(&source)).await {
         Ok(Ok(stage)) => stage,
         Ok(Err(error)) => return Ok(ApiResponse::err_with_code(error, "updateTrustRequired")),
-        Err(_) => return Ok(ApiResponse::err_with_code("Update validation task failed; download again", "updateTrustRequired")),
+        Err(_) => {
+            return Ok(ApiResponse::err_with_code(
+                "Update validation task failed; download again",
+                "updateTrustRequired",
+            ))
+        }
     };
     let installer = stage.path().to_path_buf();
     let file_path = installer.to_string_lossy().into_owned();
@@ -1758,7 +1788,7 @@ pub async fn update_install(
                         stage.hand_off();
                         ApiResponse::ok(json!({ "ok": true, "awaitingManualInstall": true,
                             "reason": format!("安装目录需要管理员权限，请从已打开的 DMG 手动安装: {error}") }))
-                    },
+                    }
                     Err(open_error) => ApiResponse::err(format!(
                         "无法准备自动安装（{error}），打开 DMG 也失败: {open_error}"
                     )),

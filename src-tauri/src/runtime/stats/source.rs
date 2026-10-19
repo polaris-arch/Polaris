@@ -195,8 +195,14 @@ pub(super) struct StatusFrame {
 }
 
 impl StatusFrame {
-    pub(super) fn apply(self, meter: &mut polaris_stats_engine::StatsAggregator, received_at_ms: u64) {
-        if self.reset { meter.reset(); }
+    pub(super) fn apply(
+        self,
+        meter: &mut polaris_stats_engine::StatsAggregator,
+        received_at_ms: u64,
+    ) {
+        if self.reset {
+            meter.reset();
+        }
         meter.on_status(&self.status, self.observed_at_ms.unwrap_or(received_at_ms));
     }
 }

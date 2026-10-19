@@ -1743,7 +1743,10 @@ fn shadow_share_imports_preserve_absence_and_explicit_fingerprints() {
 
 #[test]
 fn invalid_shared_pin_is_rejected_even_when_insecure_is_requested() {
-    assert!(parse_err("trojan://pw@a.example:443?security=tls&allowInsecure=1&pcs=bad").contains("TLS_PIN_INVALID"));
+    assert!(
+        parse_err("trojan://pw@a.example:443?security=tls&allowInsecure=1&pcs=bad")
+            .contains("TLS_PIN_INVALID")
+    );
 }
 
 mod import_parity;

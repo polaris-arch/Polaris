@@ -33,7 +33,11 @@ pub struct SubscriptionInterfacePolicy {
     pub id: String,
     #[serde(rename = "proxyBindInterface", skip_serializing_if = "Option::is_none")]
     pub proxy_bind_interface: Option<String>,
-    #[serde(rename = "speedTestIntervalMinutes", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "speedTestIntervalMinutes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub speed_test_interval_minutes: Option<u64>,
 }
 
@@ -52,9 +56,18 @@ pub struct UserConfig {
     pub servers: Vec<ServerConfig>,
     #[serde(rename = "autoSelectEnabled", default)]
     pub auto_select_enabled: bool,
-    #[serde(rename = "speedTestUrl", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "speedTestUrl",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub speed_test_url: Option<String>,
-    #[serde(rename = "selectionIntent", default, deserialize_with = "super::auto_select::deserialize_intent", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "selectionIntent",
+        default,
+        deserialize_with = "super::auto_select::deserialize_intent",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub selection_intent: Option<super::auto_select::SelectionIntent>,
     #[serde(rename = "autoSelectPins", default)]
     pub auto_select_pins: Vec<super::auto_select::AutoSelectPin>,
@@ -289,7 +302,15 @@ impl Default for UserConfig {
 impl UserConfig {
     /// A default Auto reference supersedes the last saved concrete/sentinel selection.
     pub fn effective_selected_server_id(&self) -> Option<&str> {
-        if self.selection_intent.as_ref().is_some_and(|i| i.mode == "auto") { None } else { self.selected_server_id.as_deref() }
+        if self
+            .selection_intent
+            .as_ref()
+            .is_some_and(|i| i.mode == "auto")
+        {
+            None
+        } else {
+            self.selected_server_id.as_deref()
+        }
     }
 
     /// 一等流量规则；存量配置未迁移时兼容读取 policyRules/customRules。

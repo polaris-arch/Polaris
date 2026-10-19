@@ -53,11 +53,23 @@ async fn held_old_checker_cannot_repopulate_stopped_or_new_node_badges() {
 struct FifoSink(tokio::sync::mpsc::UnboundedSender<UnlockEvent>);
 impl UnlockEventSink for FifoSink {
     fn progress(&self, service_id: &str, result: &UnlockResult) {
-        self.0.send(UnlockEvent::Progress(UnlockProgress { service_id: service_id.into(), result: result.clone() })).unwrap();
+        self.0
+            .send(UnlockEvent::Progress(UnlockProgress {
+                service_id: service_id.into(),
+                result: result.clone(),
+            }))
+            .unwrap();
     }
-    fn updated(&self, snapshot: &UnlockSnapshot) { self.0.send(UnlockEvent::Updated(snapshot.clone())).unwrap(); }
+    fn updated(&self, snapshot: &UnlockSnapshot) {
+        self.0.send(UnlockEvent::Updated(snapshot.clone())).unwrap();
+    }
     fn invalidated(&self, running: bool, exit_blocked: bool) {
-        self.0.send(UnlockEvent::Invalidated(InvalidatedPayload { running, exit_blocked })).unwrap();
+        self.0
+            .send(UnlockEvent::Invalidated(InvalidatedPayload {
+                running,
+                exit_blocked,
+            }))
+            .unwrap();
     }
 }
 
@@ -72,12 +84,21 @@ fn held_event_delivery_orders_terminal_then_clear_and_rejects_old_blocked_result
     // Receiver deliberately held: start/invalidation is queued behind the earlier terminal.
     runtime.invalidate(&sink, true, false);
     assert!(!runtime.publish_terminal(&sink, old_epoch, &old));
-    assert!(matches!(receiver.try_recv().unwrap(), UnlockEvent::Updated(_)));
-    assert!(matches!(receiver.try_recv().unwrap(), UnlockEvent::Invalidated(InvalidatedPayload { running: true, .. })));
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        UnlockEvent::Updated(_)
+    ));
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        UnlockEvent::Invalidated(InvalidatedPayload { running: true, .. })
+    ));
     assert!(receiver.try_recv().is_err());
     let current = runtime.epoch();
     assert!(runtime.publish_terminal(&sink, current, &old));
-    assert!(matches!(receiver.try_recv().unwrap(), UnlockEvent::Updated(_)));
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        UnlockEvent::Updated(_)
+    ));
 }
 
 #[test]
@@ -99,7 +120,9 @@ async fn queued_transport_keeps_capture_epoch_and_never_probes_new_session() {
         let captured_epoch = runtime.epoch();
         let calls = std::sync::Arc::new(AtomicU64::new(0));
         let observed = calls.clone();
-        let http = all_ok_mock().hook(move || { observed.fetch_add(1, Ordering::SeqCst); });
+        let http = all_ok_mock().hook(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
         let holder = runtime.run_lock.lock().await;
         let queued = runtime.run_at_epoch(&http, &sink, true, || 1_000, captured_epoch);
         tokio::pin!(queued);
@@ -125,7 +148,9 @@ async fn stale_capture_is_rejected_even_before_lock_contention() {
     let epoch = runtime.epoch();
     runtime.invalidate(&sink, true, false);
     let http = all_ok_mock().hook(|| panic!("old transport must never be probed"));
-    let result = runtime.run_at_epoch(&http, &sink, true, || 1_000, epoch).await;
+    let result = runtime
+        .run_at_epoch(&http, &sink, true, || 1_000, epoch)
+        .await;
     assert_eq!(result, UnlockSnapshot::default());
     assert!(sink.updated().is_empty());
 }

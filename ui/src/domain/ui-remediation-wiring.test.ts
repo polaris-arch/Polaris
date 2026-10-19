@@ -12,8 +12,8 @@ describe('UI remediation boundary wiring', () => {
       .toBe('errors.nodeResolverUnsupported');
   });
   it('both rule surfaces share bounded asynchronous preview with revision ownership', () => {
-    expect(read('components/dialogs/RuleTestFold.tsx')).toContain('computeTestMatchAsync(query.conds, query.logic, query.test)');
-    expect(read('components/dialogs/RuleTestFold.tsx')).toContain('reply?.query === query');
+    expect(read('hooks/use-rule-test.ts')).toContain('computeTestMatchAsync(query.conds, query.logic, query.test)');
+    expect(read('hooks/use-rule-test.ts')).toContain('reply?.query === query');
     expect(read('components/dialogs/RuleDialog.tsx')).toContain('useRuleTestFold(conds, logic, test)');
     expect(read('mobile/forms/RuleFormPanel.tsx')).toContain('useRuleTestFold(conds, logic, test)');
   });
@@ -54,4 +54,29 @@ it('both settings surfaces derive warnings from the adopted visible draft', () =
   expect(desktop).toContain('adoptSpeedTestUrlDraft(cur, prev.speedUrl, snap.speedUrl)');
   expect(mobile).toContain('adoptSpeedTestUrlDraft(cur, previous, next)');
   expect(mobile).toContain('const previous = seeded.current');
+});
+
+it('shared mobile form logic stays outside desktop hosts without hiding it from the audit surface', () => {
+  expect(read('mobile/forms/RuleFormPanel.tsx')).toContain("from '@/hooks/use-rule-test'");
+  for (const path of ['mobile/forms/VpnAuthPanel.tsx', 'components/dialogs/VpnAuthDialog.tsx']) {
+    expect(read(path)).toContain("from '@/shared/vpn/VpnAuthForm'");
+  }
+  const shared = read('shared/vpn/VpnAuthForm.tsx');
+  expect(shared).toContain('return renderFrame(');
+  expect(shared).not.toMatch(/from ['"][^'"]*(?:Modal|FormSheet|components\/screens)/);
+  expect(shared).not.toMatch(/import ['"][^'"]+\.css/);
+  expect(read('mobile/nodes/nodes-screen.test.tsx')).toContain("join(SRC, 'shared/vpn/VpnAuthForm.tsx')");
+});
+
+it('form union extraction includes readonly discriminants and does not invent absent kinds', () => {
+  const kinds = (source: string) => [...source.matchAll(/\|\s*\{\s*(?:readonly\s+)?kind:\s*'([a-z-]+)'/g)].map(match => match[1]);
+  expect(kinds("| { kind: 'vpn-auth' } | { readonly kind: 'identity-repair' }")).toEqual(['vpn-auth', 'identity-repair']);
+  expect(kinds("| { kind: 'vpn-auth' }")).not.toContain('identity-repair');
+});
+
+it('claimed startup errors retain localized resolver and speed URL recovery hints', () => {
+  const home = read('components/screens/home/HomeScreen.tsx');
+  expect(home).toContain('code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID');
+  expect(home).toContain('toast.error(proxyErrorText({ errorCode: code }, key => t(key)))');
+  expect(proxyErrorReason({ errorCode: 'SPEED_TEST_URL_INVALID', message: 'private endpoint' }, key => key)).toBe('errors.speedTestUrlInvalid');
 });

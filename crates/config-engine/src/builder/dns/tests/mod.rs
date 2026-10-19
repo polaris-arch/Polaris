@@ -1219,32 +1219,75 @@ mod real_query_fallback;
 #[test]
 fn reused_groups_have_unique_evaluate_occurrences_and_matching_responses() {
     let mut config = base_config();
-    config.dns_config = Some(UserDnsConfig { enable_fake_ip: Some(false), ..Default::default() });
+    config.dns_config = Some(UserDnsConfig {
+        enable_fake_ip: Some(false),
+        ..Default::default()
+    });
     config.dns_server_groups = vec![DnsServerGroup {
-        id: "same".into(), name: "same".into(), enabled: true,
+        id: "same".into(),
+        name: "same".into(),
+        enabled: true,
         mode: DnsServerGroupMode::Race,
-        members: vec!["builtin-domestic".into(), "builtin-remote".into()], fallback_server_id: None,
+        members: vec!["builtin-domestic".into(), "builtin-remote".into()],
+        fallback_server_id: None,
     }];
-    let action = DnsPolicyAction::Group { group_id: "same".into() };
-    let mut first = dns_effect_rule("one", RuleType::Domain, &["a.example"], RuleDnsResolver::Direct, RuleDnsAnswerMode::Real);
+    let action = DnsPolicyAction::Group {
+        group_id: "same".into(),
+    };
+    let mut first = dns_effect_rule(
+        "one",
+        RuleType::Domain,
+        &["a.example"],
+        RuleDnsResolver::Direct,
+        RuleDnsAnswerMode::Real,
+    );
     first.effects.as_mut().unwrap().dns.as_mut().unwrap().action = Some(action.clone());
     first.combine_mode = Some(CombineMode::Or);
     first.conditions = Some(vec![
-        RuleCondition { type_field: RuleType::Domain, values: vec!["a.example".into()] },
-        RuleCondition { type_field: RuleType::DomainSuffix, values: vec!["b.example".into()] },
+        RuleCondition {
+            type_field: RuleType::Domain,
+            values: vec!["a.example".into()],
+        },
+        RuleCondition {
+            type_field: RuleType::DomainSuffix,
+            values: vec!["b.example".into()],
+        },
     ]);
-    let mut second = first.clone(); second.id = "two".into();
+    let mut second = first.clone();
+    second.id = "two".into();
     config.policy_rules = Some(vec![first, second]);
     config.dns_defaults = Some(DnsPolicyDefaults {
-        direct_server_id: "builtin-domestic".into(), proxy_server_id: "builtin-remote".into(),
-        unmatched_action: Some(action), connection_resolution: Default::default(), real_query_fallback_action: None,
+        direct_server_id: "builtin-domestic".into(),
+        proxy_server_id: "builtin-remote".into(),
+        unmatched_action: Some(action),
+        connection_resolution: Default::default(),
+        real_query_fallback_action: None,
     });
     let built = build_dns_config(&config, &BTreeMap::new(), &deps_false());
     let rules = built.rules.unwrap();
-    let evaluations: Vec<_> = rules.iter().filter(|r| r.action.as_deref() == Some("evaluate")).collect();
-    assert_eq!(evaluations.len(), 10, "two OR rules plus unmatched fallback retain all occurrences");
-    let tags: BTreeSet<_> = evaluations.iter().map(|r| r.tag.as_deref().unwrap()).collect();
+    let evaluations: Vec<_> = rules
+        .iter()
+        .filter(|r| r.action.as_deref() == Some("evaluate"))
+        .collect();
+    assert_eq!(
+        evaluations.len(),
+        10,
+        "two OR rules plus unmatched fallback retain all occurrences"
+    );
+    let tags: BTreeSet<_> = evaluations
+        .iter()
+        .map(|r| r.tag.as_deref().unwrap())
+        .collect();
     assert_eq!(tags.len(), evaluations.len());
-    let responses: Vec<_> = rules.iter().filter_map(|r| r.match_response.as_ref().and_then(serde_json::Value::as_str)).collect();
-    for tag in tags { assert_eq!(responses.iter().filter(|r| **r == tag).count(), 1); }
+    let responses: Vec<_> = rules
+        .iter()
+        .filter_map(|r| {
+            r.match_response
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    for tag in tags {
+        assert_eq!(responses.iter().filter(|r| **r == tag).count(), 1);
+    }
 }

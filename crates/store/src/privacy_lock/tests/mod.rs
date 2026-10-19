@@ -179,13 +179,18 @@ fn credential_write_stages_before_replacing_the_record() {
     let hash = hash_password("pw", &SALT_A).unwrap();
     write(&fs, path, &hash).unwrap();
     let operations = fs.operations();
-    let (from, to) = operations.iter().find_map(|op| match op {
-        crate::FsOp::Rename(from, to) => Some((from, to)),
-        _ => None,
-    }).expect("credential must be published by rename");
+    let (from, to) = operations
+        .iter()
+        .find_map(|op| match op {
+            crate::FsOp::Rename(from, to) => Some((from, to)),
+            _ => None,
+        })
+        .expect("credential must be published by rename");
     assert_ne!(from, path);
     assert_eq!(to, path);
-    assert!(!operations.iter().any(|op| matches!(op, crate::FsOp::Write(target, _) if target == path)));
+    assert!(!operations
+        .iter()
+        .any(|op| matches!(op, crate::FsOp::Write(target, _) if target == path)));
 }
 
 #[test]

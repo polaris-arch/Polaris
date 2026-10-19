@@ -793,12 +793,7 @@ const SITES: readonly Site[] = [
     route: 'direct',
     why: 'W-1 switchServer（BYPASS_TABLE 明列）：首页出口框 / 状态栏节点名 / willRestartOnSelect 都实时回显它',
   },
-  {
-    file: 'tray/TrayMenu.tsx',
-    callee: 'api.server.switch(',
-    route: 'direct',
-    why: 'W-1 switchServer；且托盘是独立 webview，够不着主窗的暂存 store',
-  },
+
 
   // ── W-d：customRules 族 ──
   // 提交逻辑（含这两个 IPC 调用）2026-08-30 随 5C 拆分外提到 rule-submit.ts（RuleDialog 只剩一个
@@ -1180,7 +1175,12 @@ describe('T3：每一处 staged 调用点都必须在暂存闸门辖区内（按
     for (const f of stagedFiles) {
       const src = SOURCE.get(f)!;
       for (const g of src.matchAll(/editRoute\(([^)]*)\)/g)) {
-        expect(g[1], `${f} 的闸门实参形态不对（开关必须是 stagingEnabled）`).toMatch(
+        const args = f === 'components/dialogs/rule-submit.ts' ? g[1].replace(/\bstagingNow\b/, 'stagingEnabled') : g[1];
+        if (f === 'components/dialogs/rule-submit.ts') {
+          expect(src).toContain('const stagingNow = patterns.length ? getStagingActive() : stagingEnabled');
+          expect(src.indexOf('const stagingNow = patterns.length ? getStagingActive() : stagingEnabled')).toBeGreaterThan(src.indexOf('await api.rules.validateRegex'));
+        }
+        expect(args, `${f} 的闸门实参形态不对（开关必须来自当前暂存策略）`).toMatch(
           /^\s*(?:'[A-Za-z][A-Za-z0-9.]*'|[A-Za-z_$][\w$]*)\s*,\s*stagingEnabled\s*(?:,\s*'[A-Za-z]+'\s*)?$/
         );
       }
@@ -1209,7 +1209,6 @@ describe('T3：每一处 staged 调用点都必须在暂存闸门辖区内（按
    * 或少一个（新文件悄悄不持有）都转红 —— 白名单不许变成僵尸。
    */
   const STAGE_INJECTED_FILES = [
-    'components/dialogs/rule-submit.ts',
     'components/screens/nodes/use-node-actions.ts',
     'components/screens/nodes/use-node-deletion.ts',
   ] as const;

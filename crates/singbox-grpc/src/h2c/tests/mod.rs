@@ -139,7 +139,11 @@ async fn time_spent_dialing_counts_against_the_unary_deadline() {
 
 #[tokio::test]
 async fn connector_preserves_host_and_port_for_ipv4_dns_and_ipv6() {
-    for (uri, expected) in [("http://127.0.0.1:1234", "127.0.0.1"), ("http://localhost:1234", "localhost"), ("http://[::1]:1234", "::1")] {
+    for (uri, expected) in [
+        ("http://127.0.0.1:1234", "127.0.0.1"),
+        ("http://localhost:1234", "localhost"),
+        ("http://[::1]:1234", "::1"),
+    ] {
         let expected = expected.to_string();
         let dial: Dialer = Arc::new(move |host, port| {
             assert_eq!(host, expected);

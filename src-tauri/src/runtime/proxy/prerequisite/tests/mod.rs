@@ -1379,10 +1379,17 @@ fn diagnostic_custom_keys_require_exact_committed_emission_and_generation() {
     let emitted = serde_json::json!({"outbounds": [{"tenantCredential": "synthetic-only"}]});
     let unique = Arc::get_mut(&mut core).unwrap();
     unique.emission_digest = digest(&emitted).unwrap();
-    unique.diagnostic_secret_keys.insert("tenantcredential".into());
+    unique
+        .diagnostic_secret_keys
+        .insert("tenantcredential".into());
     *runtime.ready_main.write().unwrap() = Some(Arc::clone(&core));
-    assert!(runtime.diagnostic_runtime_secret_keys(&emitted).unwrap().contains("tenantcredential"));
-    assert!(runtime.diagnostic_runtime_secret_keys(&serde_json::json!({})).is_none());
+    assert!(runtime
+        .diagnostic_runtime_secret_keys(&emitted)
+        .unwrap()
+        .contains("tenantcredential"));
+    assert!(runtime
+        .diagnostic_runtime_secret_keys(&serde_json::json!({}))
+        .is_none());
     core.committed.store(false, Ordering::SeqCst);
     assert!(runtime.diagnostic_runtime_secret_keys(&emitted).is_none());
     core.committed.store(true, Ordering::SeqCst);

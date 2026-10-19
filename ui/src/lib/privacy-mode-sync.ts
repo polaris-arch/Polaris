@@ -31,7 +31,7 @@ export function startPrivacyModeSync(port: PrivacyModePort, apply: (locked: bool
       const before = revision;
       try {
         const locked = await port.getPrivacyMode();
-        if (typeof locked !== 'boolean') throw new Error('privacy snapshot unavailable');
+        if (typeof locked !== 'boolean') throw new Error('PRIVACY_SNAPSHOT_UNAVAILABLE');
         if (active() && before === revision) apply(locked);
       } catch (error) {
         if (!active()) return;

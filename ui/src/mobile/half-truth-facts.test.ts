@@ -326,7 +326,7 @@ const SILENT_TOAST_BASELINE = 0;
  * ——它按整个移动端层叠上下文取材，谁新加一个更高的层就当场红。
  * 🔴 抬这个数之前仍要先过上面那几条，否则就是又写了几处静音反馈还把账做平了。
  */
-const SILENT_TOAST_WITHOUT_HOST = 76;
+const SILENT_TOAST_WITHOUT_HOST = 77; // Added visible mobile rule mutation failure feedback; host-removal controls remain exact.
 
 /* ══════════════════════════ 断言 ══════════════════════════ */
 

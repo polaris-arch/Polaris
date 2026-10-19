@@ -417,8 +417,11 @@ fn auto_references_remain_explicit_when_empty_or_in_need_of_repair() {
         Value::Null,
     ] {
         let result = cleaned(bad.clone());
-        if bad.get("mode").and_then(Value::as_str)==Some("auto") {
-            assert_eq!(result["selectionIntent"],bad,"explicit Auto intent stays pending repair");
+        if bad.get("mode").and_then(Value::as_str) == Some("auto") {
+            assert_eq!(
+                result["selectionIntent"], bad,
+                "explicit Auto intent stays pending repair"
+            );
         } else {
             assert!(result.get("selectionIntent").is_none(), "{bad} 应被移除");
             assert_eq!(crate::selection_intent_subscription(&result), None);
@@ -449,7 +452,7 @@ fn auto_references_remain_explicit_when_empty_or_in_need_of_repair() {
     // 没有订阅表时本版本认识的意图是悬空的；没有意图键时什么都不做。
     let no_subscriptions =
         sanitize_config(&json!({ "selectionIntent": valid }).to_string()).unwrap();
-    assert_eq!(no_subscriptions["selectionIntent"],valid);
+    assert_eq!(no_subscriptions["selectionIntent"], valid);
     assert!(sanitize_config("{}")
         .unwrap()
         .get("selectionIntent")

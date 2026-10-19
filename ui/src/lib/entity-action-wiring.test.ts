@@ -449,6 +449,13 @@ const SITES: readonly ActionSite[] = [
     why: '克隆腿：staged 分流后不可达（editRoute 命中即 stage 一条新 id 的条目并跳过）；克隆恒建新实体，剥掉了源节点的 id',
   },
   {
+    file: 'components/dialogs/rule-submit.ts',
+    callee: 'api.rules.validateRegex',
+    count: 1,
+    route: 'no-staged-only-id',
+    why: '不传实体 id；只读有界正则准入只收 pattern 字符串，不接收磁盘或暂存实体 id',
+  },
+  {
     // 提交逻辑（含这两个调用点）2026-08-30 随 5C 拆分外提到 rule-submit.ts，登记跟着落点走。
     file: 'components/dialogs/rule-submit.ts',
     callee: 'api.rules.add',

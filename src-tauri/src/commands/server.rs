@@ -239,7 +239,11 @@ fn server_update_core(config: &ConfigManager, server: Value) -> Result<Value, St
             let found = cfg
                 .get_mut("servers")
                 .and_then(Value::as_array_mut)
-                .and_then(|servers| servers.iter_mut().find(|node| node["id"].as_str() == Some(&id)));
+                .and_then(|servers| {
+                    servers
+                        .iter_mut()
+                        .find(|node| node["id"].as_str() == Some(&id))
+                });
             let Some(existing) = found else {
                 return ConfigDecision::Skip(Err(format!("服务器不存在: {id}")));
             };
@@ -1048,54 +1052,86 @@ pub struct NativeAutoReceipt {
     status: crate::runtime::proxy::native_auto::NativeAutoStatus,
 }
 
-fn native_response(result: Result<crate::runtime::proxy::native_auto::NativeAutoStatus,String>, intent_applied: bool) -> ApiResponse<NativeAutoReceipt> {
+fn native_response(
+    result: Result<crate::runtime::proxy::native_auto::NativeAutoStatus, String>,
+    intent_applied: bool,
+) -> ApiResponse<NativeAutoReceipt> {
     match result {
-        Ok(status) => ApiResponse::ok(NativeAutoReceipt { intent_applied, status }),
+        Ok(status) => ApiResponse::ok(NativeAutoReceipt {
+            intent_applied,
+            status,
+        }),
         Err(error) => {
-            let code = if error.starts_with("AUTO_SELECT_") { error.clone() } else { "AUTO_SELECT_SWITCH_FAILED".into() };
-            ApiResponse::err_with_code(error,code)
+            let code = if error.starts_with("AUTO_SELECT_") {
+                error.clone()
+            } else {
+                "AUTO_SELECT_SWITCH_FAILED".into()
+            };
+            ApiResponse::err_with_code(error, code)
         }
     }
 }
 
 #[tauri::command]
-pub async fn auto_select_set_enabled(app: AppHandle, state: State<'_, AppRuntime>, enabled: bool) -> ApiResponse<NativeAutoReceipt> {
-    let result=state.proxy().native_auto_set_enabled(enabled).await;
+pub async fn auto_select_set_enabled(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    enabled: bool,
+) -> ApiResponse<NativeAutoReceipt> {
+    let result = state.proxy().native_auto_set_enabled(enabled).await;
     emit_config_changed_signal(&app);
-    native_response(result,true)
+    native_response(result, true)
 }
 
 #[tauri::command]
-pub async fn auto_select_disable(app: AppHandle, state: State<'_, AppRuntime>) -> ApiResponse<NativeAutoReceipt> {
-    let result=state.proxy().native_auto_set_enabled(false).await;
+pub async fn auto_select_disable(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+) -> ApiResponse<NativeAutoReceipt> {
+    let result = state.proxy().native_auto_set_enabled(false).await;
     emit_config_changed_signal(&app);
-    native_response(result,true)
+    native_response(result, true)
 }
 
 /// Select only the default reference. Rules keep their independent references.
 #[tauri::command]
-pub async fn auto_select_enable(app: AppHandle, state: State<'_, AppRuntime>, subscription_id: Option<String>, scope: Option<String>) -> ApiResponse<NativeAutoReceipt> {
+pub async fn auto_select_enable(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    subscription_id: Option<String>,
+    scope: Option<String>,
+) -> ApiResponse<NativeAutoReceipt> {
     use polaris_config_engine::user_config::auto_select::AutoSelectTarget;
-    let scope=scope.as_deref().unwrap_or(if subscription_id.is_some() { "subscription" } else { "global" });
-    let mut value=json!({"scope":scope});
-    if let Some(id)=subscription_id { value["subscriptionId"]=json!(id); }
-    let target=match serde_json::from_value::<AutoSelectTarget>(value) {
-        Ok(target) if target.valid()=>target,
-        _=>return ApiResponse::err_with_code("无效的自动选择范围","AUTO_SELECT_INVALID_SCOPE"),
+    let scope = scope.as_deref().unwrap_or(if subscription_id.is_some() {
+        "subscription"
+    } else {
+        "global"
+    });
+    let mut value = json!({"scope":scope});
+    if let Some(id) = subscription_id {
+        value["subscriptionId"] = json!(id);
+    }
+    let target = match serde_json::from_value::<AutoSelectTarget>(value) {
+        Ok(target) if target.valid() => target,
+        _ => return ApiResponse::err_with_code("无效的自动选择范围", "AUTO_SELECT_INVALID_SCOPE"),
     };
-    let result=state.proxy().native_auto_select_default(target).await;
+    let result = state.proxy().native_auto_select_default(target).await;
     emit_config_changed_signal(&app);
-    native_response(result,true)
+    native_response(result, true)
 }
 
 /// Compatibility command: request a native measurement round, not an App-side winner.
 #[tauri::command]
-pub async fn auto_select_switch_now(state: State<'_, AppRuntime>) -> ApiResponse<NativeAutoReceipt> {
-    native_response(state.proxy().native_auto_retest().await,false)
+pub async fn auto_select_switch_now(
+    state: State<'_, AppRuntime>,
+) -> ApiResponse<NativeAutoReceipt> {
+    native_response(state.proxy().native_auto_retest().await, false)
 }
 
 #[tauri::command]
-pub async fn auto_select_status(state: State<'_, AppRuntime>) -> ApiResponse<crate::runtime::proxy::native_auto::NativeAutoStatus> {
+pub async fn auto_select_status(
+    state: State<'_, AppRuntime>,
+) -> ApiResponse<crate::runtime::proxy::native_auto::NativeAutoStatus> {
     ApiResponse::ok(state.proxy().native_auto_status().await)
 }
 

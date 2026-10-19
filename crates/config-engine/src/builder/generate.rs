@@ -331,7 +331,8 @@ fn generate_base_config(
 ) -> Result<GenerateOutcome, String> {
     crate::user_config::dns_policy::validate_dns_dependencies(config)?;
     crate::node_dns::upstream::validate_selected_upstreams(config.dns_config.as_ref())?;
-    crate::user_config::auto_select::validate_test_url(config.speed_test_url.as_deref()).map_err(str::to_owned)?;
+    crate::user_config::auto_select::validate_test_url(config.speed_test_url.as_deref())
+        .map_err(str::to_owned)?;
     let cfg = config.clone();
 
     // ── 2. selectedServer 校验（L3475-3487）─────────────────────────────────────
@@ -469,28 +470,44 @@ fn generate_base_config(
     // The configuration graph can be valid while platform gates remove a node used
     // by a DNS transport. Validate actual emitted dependencies before any missing
     // policy action can disappear into the domestic default.
-    let dns_tags: std::collections::BTreeSet<&str> =
-        dns.servers.iter().map(|server| server.tag.as_str()).collect();
+    let dns_tags: std::collections::BTreeSet<&str> = dns
+        .servers
+        .iter()
+        .map(|server| server.tag.as_str())
+        .collect();
     let outbound_tags: std::collections::BTreeSet<&str> = outbounds_result
         .outbounds
         .iter()
         .map(|outbound| outbound.tag.as_str())
-        .chain(pending_endpoints.iter().map(|endpoint| endpoint.tag.as_str()))
+        .chain(
+            pending_endpoints
+                .iter()
+                .map(|endpoint| endpoint.tag.as_str()),
+        )
         .collect();
     for resource in cfg.dns_servers.iter().filter(|resource| resource.enabled) {
         if !dns_tags.contains(crate::user_config::dns_server_tag(&resource.id).as_str()) {
-            return Err(format!("DNS 解析器「{}」无法生成，请检查端点和出口依赖", resource.id));
+            return Err(format!(
+                "DNS 解析器「{}」无法生成，请检查端点和出口依赖",
+                resource.id
+            ));
         }
     }
     for server in &dns.servers {
         if let Some(resolver) = &server.domain_resolver {
             if !dns_tags.contains(resolver.as_str()) {
-                return Err(format!("DNS 解析器「{}」引用的 Bootstrap「{resolver}」未生成", server.tag));
+                return Err(format!(
+                    "DNS 解析器「{}」引用的 Bootstrap「{resolver}」未生成",
+                    server.tag
+                ));
             }
         }
         if let Some(detour) = &server.detour {
             if !outbound_tags.contains(detour.as_str()) {
-                return Err(format!("DNS 解析器「{}」引用的出口「{detour}」不可用", server.tag));
+                return Err(format!(
+                    "DNS 解析器「{}」引用的出口「{detour}」不可用",
+                    server.tag
+                ));
             }
         }
     }

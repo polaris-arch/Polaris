@@ -1,9 +1,9 @@
 //! Ephemeral release admission and byte custody for executable updates.
 //! Renderer values and persisted paths never constitute installation authority.
+use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use serde_json::Value;
 
 const RECHECK: &str = "Update selection expired or changed; check for updates again";
 const REDOWNLOAD: &str = "Update package is untrusted or changed; check and download again";
@@ -33,7 +33,14 @@ impl UpdateCustody {
         let selected = self.selected.lock().map_err(|_| RECHECK.to_string())?;
         let selected = selected.as_ref().ok_or(RECHECK)?;
         // Progress replays intentionally omit title/releaseNotes. Neither is executable identity.
-        for key in ["version", "downloadUrl", "fileName", "fileSize", "sha256", "isPrerelease"] {
+        for key in [
+            "version",
+            "downloadUrl",
+            "fileName",
+            "fileSize",
+            "sha256",
+            "isPrerelease",
+        ] {
             if selected.get(key) != requested.get(key) {
                 return Err(RECHECK.into());
             }
@@ -44,16 +51,26 @@ impl UpdateCustody {
         if !polaris_updater::verify::is_valid_sha256_hex(hash) {
             return Err(RECHECK.into());
         }
-        let name = selected.get("fileName").and_then(Value::as_str).ok_or(RECHECK)?;
+        let name = selected
+            .get("fileName")
+            .and_then(Value::as_str)
+            .ok_or(RECHECK)?;
         if name.is_empty() || name.contains(['/', '\\']) || name == "." || name == ".." {
             return Err(RECHECK.into());
         }
-        let url = reqwest::Url::parse(selected.get("downloadUrl").and_then(Value::as_str).ok_or(RECHECK)?)
-            .map_err(|_| RECHECK.to_string())?;
+        let url = reqwest::Url::parse(
+            selected
+                .get("downloadUrl")
+                .and_then(Value::as_str)
+                .ok_or(RECHECK)?,
+        )
+        .map_err(|_| RECHECK.to_string())?;
         let (owner, repo) = polaris_updater::APP_UPDATE_REPO;
         let asset_prefix = format!("/{owner}/{repo}/releases/download/");
-        if url.scheme() != "https" || url.host_str() != Some("github.com")
-            || !url.username().is_empty() || url.password().is_some()
+        if url.scheme() != "https"
+            || url.host_str() != Some("github.com")
+            || !url.username().is_empty()
+            || url.password().is_some()
             || !url.path().starts_with(&asset_prefix)
         {
             return Err(RECHECK.into());
@@ -66,14 +83,21 @@ impl UpdateCustody {
             return Err(REDOWNLOAD.into());
         }
         *self.downloaded.lock().map_err(|_| REDOWNLOAD.to_string())? = Some(Receipt {
-            path: path.to_path_buf(), hash: hash.to_owned(), bytes,
+            path: path.to_path_buf(),
+            hash: hash.to_owned(),
+            bytes,
         });
         Ok(())
     }
 
     fn receipt(&self, path: &Path) -> Result<Receipt, String> {
-        self.downloaded.lock().map_err(|_| REDOWNLOAD.to_string())?
-            .as_ref().filter(|receipt| receipt.path == path).cloned().ok_or_else(|| REDOWNLOAD.into())
+        self.downloaded
+            .lock()
+            .map_err(|_| REDOWNLOAD.to_string())?
+            .as_ref()
+            .filter(|receipt| receipt.path == path)
+            .cloned()
+            .ok_or_else(|| REDOWNLOAD.into())
     }
 
     /// Cheap authority check before any advisory or system open. Full byte validation is below.
@@ -109,24 +133,36 @@ impl UpdateCustody {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder.create(&dir).map_err(|_| "Cannot create private update stage".to_string())?;
-        let stage = InstallStage { file: dir.join(path.file_name().ok_or(REDOWNLOAD)?), dir: Some(dir) };
+        builder
+            .create(&dir)
+            .map_err(|_| "Cannot create private update stage".to_string())?;
+        let stage = InstallStage {
+            file: dir.join(path.file_name().ok_or(REDOWNLOAD)?),
+            dir: Some(dir),
+        };
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+            options
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
         }
-        let mut output = options.open(&stage.file).map_err(|_| REDOWNLOAD.to_string())?;
+        let mut output = options
+            .open(&stage.file)
+            .map_err(|_| REDOWNLOAD.to_string())?;
         let copied = std::io::copy(&mut input.take(receipt.bytes + 1), &mut output)
             .map_err(|_| REDOWNLOAD.to_string())?;
         output.sync_all().map_err(|_| REDOWNLOAD.to_string())?;
         drop(output);
         let actual = polaris_updater::verify::sha256_reader_hex(
             std::fs::File::open(&stage.file).map_err(|_| REDOWNLOAD.to_string())?,
-        ).map_err(|_| REDOWNLOAD.to_string())?;
-        if copied != receipt.bytes || polaris_updater::verify::verify_hex_digest(&actual, &receipt.hash).is_err() {
+        )
+        .map_err(|_| REDOWNLOAD.to_string())?;
+        if copied != receipt.bytes
+            || polaris_updater::verify::verify_hex_digest(&actual, &receipt.hash).is_err()
+        {
             return Err(REDOWNLOAD.into());
         }
         Ok(stage)
@@ -138,9 +174,13 @@ pub(crate) struct InstallStage {
     dir: Option<PathBuf>,
 }
 impl InstallStage {
-    pub(crate) fn path(&self) -> &Path { &self.file }
+    pub(crate) fn path(&self) -> &Path {
+        &self.file
+    }
     /// Only after successful OS/script handoff: the consumer outlives this command.
-    pub(crate) fn hand_off(mut self) { self.dir = None; }
+    pub(crate) fn hand_off(mut self) {
+        self.dir = None;
+    }
 }
 impl Drop for InstallStage {
     fn drop(&mut self) {

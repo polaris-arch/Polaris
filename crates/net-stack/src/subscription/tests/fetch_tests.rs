@@ -546,7 +546,9 @@ async fn malformed_url_diagnostics_never_echo_unparsed_credentials() {
     ] {
         assert_eq!(redact_url(input), "<invalid-url>");
         let client = MockFetch::new();
-        let error = fetch(&client, &MockLookup::public(), input).await.unwrap_err();
+        let error = fetch(&client, &MockLookup::public(), input)
+            .await
+            .unwrap_err();
         assert!(!error.message.contains("fixture-"));
         assert!(client.seen.lock().unwrap().is_empty());
     }

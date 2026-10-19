@@ -288,7 +288,9 @@ fn push_ring(ts_ms: u128, level: Level, target: &str, message: String) {
         return;
     }
     if let Ok(mut r) = ring().lock() {
-        let Ok(seq) = LOG_SEQ.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| seq.checked_add(1)) else {
+        let Ok(seq) = LOG_SEQ.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+            seq.checked_add(1)
+        }) else {
             return; // Never wrap an old record ID back into the current stream.
         };
         bounded_push(
@@ -347,7 +349,9 @@ pub fn clear() -> Result<u64, &'static str> {
     // Producers allocate their sequence and insert while holding this same lock.
     // Thus every subsequent insertion has seq >= this exact retained boundary.
     let next = LOG_SEQ.load(Ordering::Relaxed);
-    if next > 9_007_199_254_740_991 { return Err("log sequence exceeds UI precision"); }
+    if next > 9_007_199_254_740_991 {
+        return Err("log sequence exceeds UI precision");
+    }
     r.clear();
     Ok(next)
 }

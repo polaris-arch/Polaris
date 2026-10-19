@@ -88,14 +88,17 @@ fn first<'a>(parent: Option<&'a Value>, key: &str) -> Option<&'a Value> {
 
 /// Only absence defaults to TCP; explicit malformed/unsupported declarations fail closed.
 fn stream_network(ss: Option<&Value>) -> Result<&'static str, &'static str> {
-    let Some(ss) = ss else { return Ok("tcp"); };
+    let Some(ss) = ss else {
+        return Ok("tcp");
+    };
     if !ss.is_object() {
         return Err("Invalid Xray streamSettings: expected an object");
     }
     match ss.get("network") {
         None => Ok("tcp"),
-        Some(Value::String(raw)) => normalize_transport(raw)
-            .ok_or("不支持的传输层类型: Xray network"),
+        Some(Value::String(raw)) => {
+            normalize_transport(raw).ok_or("不支持的传输层类型: Xray network")
+        }
         Some(_) => Err("Invalid Xray network: expected a supported transport string"),
     }
 }
@@ -103,7 +106,9 @@ fn stream_network(ss: Option<&Value>) -> Result<&'static str, &'static str> {
 /// xray `streamSettings` → `ServerConfig`; network was validated at the import boundary.
 fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>, network: &str) {
     server.network = Some(network.to_string());
-    let Some(ss) = ss else { return; };
+    let Some(ss) = ss else {
+        return;
+    };
 
     match network {
         "ws" => {
@@ -190,7 +195,8 @@ fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>, network:
                 // Xray `tlsSettings.pinnedPeerCertSha256`：逗号分隔 hex（可带 `:`），整张证书 DER 的 SHA-256
                 // （XTLS/Xray-core infra/conf/transport_security.go @60e2a0c :314、:364-379）⇒ `certificateSha256`。
                 // 语义差同 share_link 的 `pcs`：Xray 也接受命中链上 CA，sing-box 只比叶子。
-                certificate_sha256: tls.and_then(|t| t.get("pinnedPeerCertSha256"))
+                certificate_sha256: tls
+                    .and_then(|t| t.get("pinnedPeerCertSha256"))
                     .map(|v| str_val(Some(v)).unwrap_or_else(|| "invalid-pin-shape".into()))
                     .and_then(|p| preserve_cert_pins(&p)),
                 ..Default::default()
@@ -426,7 +432,10 @@ pub fn parse_xray_outbounds(
             "http" | "h2" => stream.and_then(|s| s.get("httpSettings")),
             _ => None,
         };
-        if !crate::import_fields::headers_supported(settings.and_then(|s| s.get("headers")), network != "ws") {
+        if !crate::import_fields::headers_supported(
+            settings.and_then(|s| s.get("headers")),
+            network != "ws",
+        ) {
             r.failed += 1;
             r.warnings.push("Unrepresentable transport headers".into());
             continue;

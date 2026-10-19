@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { VpnAuthForm } from '@/components/vpn/VpnAuthForm';
+import { VpnAuthForm } from '@/shared/vpn/VpnAuthForm';
 import { FormSheet } from './FormSheet';
 import { useMobileFormStore } from './form-store';
 

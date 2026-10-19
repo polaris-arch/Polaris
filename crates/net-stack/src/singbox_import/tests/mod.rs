@@ -327,7 +327,8 @@ fn round_trip_hysteria2_anti_censorship_fields() {
         &DomainResolver::Tag("dns-bootstrap".to_string()),
         "x64",
         "linux",
-    ).expect("valid test outbound");
+    )
+    .expect("valid test outbound");
     let wrapped = json!({ "outbounds": [serde_json::to_value(&ob).unwrap()] });
     let out = parse(wrapped);
 
@@ -580,13 +581,16 @@ fn round_trip_custom_wrapped_node_survives_generation() {
         ] }));
     assert_eq!(out.servers.len(), 2);
 
-    let hy = serde_json::to_value(build_proxy_outbound(
-        &out.servers[0],
-        "proxy-1",
-        &DomainResolver::Tag("dns-bootstrap".to_string()),
-        "x64",
-        "linux",
-    ).expect("valid test outbound"))
+    let hy = serde_json::to_value(
+        build_proxy_outbound(
+            &out.servers[0],
+            "proxy-1",
+            &DomainResolver::Tag("dns-bootstrap".to_string()),
+            "x64",
+            "linux",
+        )
+        .expect("valid test outbound"),
+    )
     .unwrap();
     assert_eq!(
         hy.get("type").unwrap(),
@@ -604,13 +608,16 @@ fn round_trip_custom_wrapped_node_survives_generation() {
     assert_eq!(hy.get("server").unwrap(), "hy1.example.com");
     assert_eq!(hy.get("server_port").unwrap(), 8443);
 
-    let tor = serde_json::to_value(build_proxy_outbound(
-        &out.servers[1],
-        "proxy-2",
-        &DomainResolver::Tag("dns-bootstrap".to_string()),
-        "x64",
-        "linux",
-    ).expect("valid test outbound"))
+    let tor = serde_json::to_value(
+        build_proxy_outbound(
+            &out.servers[1],
+            "proxy-2",
+            &DomainResolver::Tag("dns-bootstrap".to_string()),
+            "x64",
+            "linux",
+        )
+        .expect("valid test outbound"),
+    )
     .unwrap();
     assert_eq!(tor.get("type").unwrap(), "tor");
     assert_eq!(tor.get("executable_path").unwrap(), "/usr/bin/tor");
@@ -798,7 +805,11 @@ fn wireguard_endpoint_without_catch_all_is_mesh_only() {
     let wg = s.wireguard_settings.as_ref().unwrap();
     assert_eq!(wg.allow_internet, Some(false), "无 catch-all → 仅组网");
     assert_eq!(wg.allowed_ips, vec!["10.0.0.0/24"]);
-    assert_eq!(wg.persistent_keepalive, Some(0), "源缺省关闭保活，不能继承本机 25 秒默认");
+    assert_eq!(
+        wg.persistent_keepalive,
+        Some(0),
+        "源缺省关闭保活，不能继承本机 25 秒默认"
+    );
     assert_eq!(wg.mtu, None);
     assert!(wg.reserved.is_empty());
     assert_eq!(wg.pre_shared_key, None);
@@ -1098,7 +1109,10 @@ fn tls_cert_pins_imported_and_round_trip_through_the_builder() {
     assert_eq!(tls.certificate_public_key_sha256.as_deref(), Some(B64));
 
     let resolver = DomainResolver::Tag("dns-bootstrap".to_string());
-    let ob = serde_json::to_value(build_proxy_outbound(s, "p", &resolver, "x64", "linux").expect("valid test outbound")).unwrap();
+    let ob = serde_json::to_value(
+        build_proxy_outbound(s, "p", &resolver, "x64", "linux").expect("valid test outbound"),
+    )
+    .unwrap();
     assert_eq!(ob["tls"]["certificate_sha256"], json!([B64, B64_2]));
     assert_eq!(ob["tls"]["certificate_public_key_sha256"], json!([B64]));
 }
@@ -1184,7 +1198,10 @@ fn masque_client_local_mapping_strips_what_generation_would_drop() {
     assert_eq!(m.password.as_deref(), Some("p"));
     assert_eq!(m.on_demand, Some(true));
     assert_eq!(m.bind_interface.as_deref(), Some("eth9"));
-    assert_eq!(m.detour, None, "此成功样例未声明代理链；独立用例覆盖保留及拒绝");
+    assert_eq!(
+        m.detour, None,
+        "此成功样例未声明代理链；独立用例覆盖保留及拒绝"
+    );
     assert_eq!(m.security, Some(SecurityMode::Tls));
     let tls = m.tls_settings.as_ref().unwrap();
     assert_eq!(tls.server_name.as_deref(), Some("sni.example.com"));
@@ -2078,13 +2095,16 @@ fn utls_enabled_intent_survives_import_save_share_and_generation() {
             let saved: ServerConfig =
                 serde_json::from_value(serde_json::to_value(node).unwrap()).unwrap();
             let effective = effective_server(&saved, Some("follow")).unwrap();
-            let built = serde_json::to_value(build_proxy_outbound(
-                effective.as_ref(),
-                "p",
-                &DomainResolver::Tag("dns-bootstrap".into()),
-                "x64",
-                "linux",
-            ).expect("valid test outbound"))
+            let built = serde_json::to_value(
+                build_proxy_outbound(
+                    effective.as_ref(),
+                    "p",
+                    &DomainResolver::Tag("dns-bootstrap".into()),
+                    "x64",
+                    "linux",
+                )
+                .expect("valid test outbound"),
+            )
             .unwrap();
             assert_eq!(built["tls"]["enabled"], true);
             match expected {
@@ -2102,13 +2122,16 @@ fn utls_enabled_intent_survives_import_save_share_and_generation() {
                 crate::share_link::parse_share_url(&link, &mut || "round".into(), &mut |_| {})
                     .unwrap();
             let effective = effective_server(&round, Some("follow")).unwrap();
-            let shared = serde_json::to_value(build_proxy_outbound(
-                effective.as_ref(),
-                "p",
-                &DomainResolver::Tag("dns-bootstrap".into()),
-                "x64",
-                "linux",
-            ).expect("valid test outbound"))
+            let shared = serde_json::to_value(
+                build_proxy_outbound(
+                    effective.as_ref(),
+                    "p",
+                    &DomainResolver::Tag("dns-bootstrap".into()),
+                    "x64",
+                    "linux",
+                )
+                .expect("valid test outbound"),
+            )
             .unwrap();
             match expected {
                 Some("") => assert_eq!(shared["tls"]["utls"]["fingerprint"], "chrome"),
@@ -2134,13 +2157,16 @@ fn imported_native_tls_engine_keeps_disabled_utls_under_global_overrides() {
         Some("apple")
     );
     let effective = effective_server_for_platform(node, None, "darwin").unwrap();
-    let built = serde_json::to_value(build_proxy_outbound(
-        effective.as_ref(),
-        "p",
-        &DomainResolver::Tag("dns-bootstrap".into()),
-        "x64",
-        "darwin",
-    ).expect("valid test outbound"))
+    let built = serde_json::to_value(
+        build_proxy_outbound(
+            effective.as_ref(),
+            "p",
+            &DomainResolver::Tag("dns-bootstrap".into()),
+            "x64",
+            "darwin",
+        )
+        .expect("valid test outbound"),
+    )
     .unwrap();
     assert_eq!(built["tls"]["engine"], "apple");
     assert!(built["tls"].get("utls").is_none());
@@ -2179,13 +2205,16 @@ fn imported_reality_uses_chrome_only_when_utls_is_absent() {
         match expected {
             Some(profile) => {
                 let effective = effective_server(&node, Some("follow")).unwrap();
-                let output = serde_json::to_value(build_proxy_outbound(
-                    &effective,
-                    "node",
-                    &DomainResolver::Tag("dns-bootstrap".into()),
-                    "x64",
-                    "linux",
-                ).expect("valid test outbound"))
+                let output = serde_json::to_value(
+                    build_proxy_outbound(
+                        &effective,
+                        "node",
+                        &DomainResolver::Tag("dns-bootstrap".into()),
+                        "x64",
+                        "linux",
+                    )
+                    .expect("valid test outbound"),
+                )
                 .unwrap();
                 assert_eq!(output["tls"]["utls"]["fingerprint"], profile);
                 if profile == "chrome" {
@@ -2203,9 +2232,16 @@ fn imported_reality_uses_chrome_only_when_utls_is_absent() {
 
 #[test]
 fn malformed_pins_fail_import_instead_of_becoming_insecure_unpinned_nodes() {
-    for pin in [json!("bad"), json!(["bad"]), json!([false]), json!({"bad":true})] {
-        let parsed = parse(json!({"outbounds":[{"type":"trojan", "tag":"n", "server":"a.example", "server_port":443,
-            "password":"pw", "tls":{"enabled":true, "insecure":true, "certificate_sha256":pin}}]}));
+    for pin in [
+        json!("bad"),
+        json!(["bad"]),
+        json!([false]),
+        json!({"bad":true}),
+    ] {
+        let parsed = parse(
+            json!({"outbounds":[{"type":"trojan", "tag":"n", "server":"a.example", "server_port":443,
+            "password":"pw", "tls":{"enabled":true, "insecure":true, "certificate_sha256":pin}}]}),
+        );
         assert!(parsed.servers.is_empty());
         assert_eq!(parsed.failed, 1);
     }

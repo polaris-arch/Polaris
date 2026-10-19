@@ -875,7 +875,9 @@ pub async fn diagnostic_export(
         Err(_) => json!({ "error": "(核未启动过，无运行期 sing-box 配置)" }),
     };
 
-    let running_secret_keys = state.proxy().diagnostic_runtime_secret_keys(&singbox_config);
+    let running_secret_keys = state
+        .proxy()
+        .diagnostic_runtime_secret_keys(&singbox_config);
     let unverified_runtime = running_secret_keys.is_none();
     let running_secret_keys = running_secret_keys.unwrap_or_default();
 

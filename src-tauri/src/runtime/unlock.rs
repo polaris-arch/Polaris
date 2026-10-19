@@ -228,13 +228,23 @@ pub trait UnlockEventSink {
 
     /// Already admitted under `with_current_commit` and the detector epoch fence.
     /// Bound sinks must enqueue directly without reacquiring producer/action locks.
-    fn progress_committed(&self, _fence: &UnlockPublicationFence, service_id: &str, result: &UnlockResult) {
+    fn progress_committed(
+        &self,
+        _fence: &UnlockPublicationFence,
+        service_id: &str,
+        result: &UnlockResult,
+    ) {
         self.progress(service_id, result);
     }
     fn updated_committed(&self, _fence: &UnlockPublicationFence, snapshot: &UnlockSnapshot) {
         self.updated(snapshot);
     }
-    fn invalidated_committed(&self, _fence: &UnlockPublicationFence, running: bool, exit_blocked: bool) {
+    fn invalidated_committed(
+        &self,
+        _fence: &UnlockPublicationFence,
+        running: bool,
+        exit_blocked: bool,
+    ) {
         self.invalidated(running, exit_blocked);
     }
 
@@ -282,7 +292,8 @@ impl<'a> BroadcastSink<'a> {
     #[must_use]
     pub fn new(handle: &'a AppHandle) -> Self {
         use tauri::Manager;
-        let sender = handle.try_state::<crate::runtime::AppRuntime>()
+        let sender = handle
+            .try_state::<crate::runtime::AppRuntime>()
             .and_then(|runtime| runtime.unlock.event_sender(handle));
         Self { handle, sender }
     }
@@ -292,14 +303,17 @@ impl BroadcastSink<'_> {
     fn enqueue(&self, event: UnlockEvent) {
         // All unlock event kinds share one FIFO. Never invoke Tauri emit under producer locks:
         // emit can synchronously invoke Rust listeners. No per-event spawn/reordering.
-        if let Some(sender) = &self.sender { let _ = sender.send(event); }
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(event);
+        }
     }
 }
 
 impl UnlockEventSink for BroadcastSink<'_> {
     fn progress(&self, service_id: &str, result: &UnlockResult) {
         self.enqueue(UnlockEvent::Progress(UnlockProgress {
-            service_id: service_id.to_string(), result: result.clone(),
+            service_id: service_id.to_string(),
+            result: result.clone(),
         }));
     }
 
@@ -308,7 +322,10 @@ impl UnlockEventSink for BroadcastSink<'_> {
     }
 
     fn invalidated(&self, running: bool, exit_blocked: bool) {
-        self.enqueue(UnlockEvent::Invalidated(InvalidatedPayload { running, exit_blocked }));
+        self.enqueue(UnlockEvent::Invalidated(InvalidatedPayload {
+            running,
+            exit_blocked,
+        }));
     }
 
     /// 生产实现：取得受管 runtime 的去抖 task 槽，先取消上一只 timer，再等
@@ -454,18 +471,29 @@ impl Drop for UnlockRuntime {
 }
 
 impl UnlockRuntime {
-    fn event_sender(&self, app: &AppHandle) -> Option<tokio::sync::mpsc::UnboundedSender<UnlockEvent>> {
+    fn event_sender(
+        &self,
+        app: &AppHandle,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<UnlockEvent>> {
         let mut queue = self.event_queue.lock().ok()?;
-        if queue.closed { return None; }
+        if queue.closed {
+            return None;
+        }
         if queue.sender.is_none() {
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
             let app = app.clone();
             let task = tauri::async_runtime::spawn(async move {
                 while let Some(event) = receiver.recv().await {
                     match event {
-                        UnlockEvent::Progress(payload) => broadcast(&app, EVENT_UNLOCK_PROGRESS, payload),
-                        UnlockEvent::Updated(payload) => broadcast(&app, EVENT_UNLOCK_UPDATED, payload),
-                        UnlockEvent::Invalidated(payload) => broadcast(&app, EVENT_UNLOCK_INVALIDATED, payload),
+                        UnlockEvent::Progress(payload) => {
+                            broadcast(&app, EVENT_UNLOCK_PROGRESS, payload)
+                        }
+                        UnlockEvent::Updated(payload) => {
+                            broadcast(&app, EVENT_UNLOCK_UPDATED, payload)
+                        }
+                        UnlockEvent::Invalidated(payload) => {
+                            broadcast(&app, EVENT_UNLOCK_INVALIDATED, payload)
+                        }
                     }
                 }
             });
@@ -481,12 +509,19 @@ impl UnlockRuntime {
         if let Ok(mut queue) = self.event_queue.lock() {
             queue.closed = true;
             queue.sender.take();
-            if let Some(task) = queue.task.take() { task.abort(); }
+            if let Some(task) = queue.task.take() {
+                task.abort();
+            }
         }
     }
 
     /// Command-level blocked results use the same epoch admission and ordered sink as detector results.
-    pub(crate) fn publish_terminal<S: UnlockEventSink>(&self, sink: &S, epoch: u64, snapshot: &UnlockSnapshot) -> bool {
+    pub(crate) fn publish_terminal<S: UnlockEventSink>(
+        &self,
+        sink: &S,
+        epoch: u64,
+        snapshot: &UnlockSnapshot,
+    ) -> bool {
         self.commit_epoch(sink, epoch, |fence| sink.updated_committed(fence, snapshot))
     }
 
@@ -753,24 +788,40 @@ impl UnlockRuntime {
         H: UnlockHttp + ?Sized,
         S: UnlockEventSink,
     {
-        self.run_at_epoch_with_budget(http, sink, force, now, budget_ms, self.epoch()).await
+        self.run_at_epoch_with_budget(http, sink, force, now, budget_ms, self.epoch())
+            .await
     }
 
     /// Bind a transport captured by the caller to its original runtime epoch.
     /// Never adopt a newer epoch after waiting for the single-flight lock.
     pub async fn run_at_epoch<H, S>(
-        &self, http: &H, sink: &S, force: bool, now: impl Fn() -> u64, epoch: u64,
+        &self,
+        http: &H,
+        sink: &S,
+        force: bool,
+        now: impl Fn() -> u64,
+        epoch: u64,
     ) -> UnlockSnapshot
-    where H: UnlockHttp + ?Sized, S: UnlockEventSink,
+    where
+        H: UnlockHttp + ?Sized,
+        S: UnlockEventSink,
     {
-        self.run_at_epoch_with_budget(http, sink, force, now, TOTAL_DETECTION_BUDGET_MS, epoch).await
+        self.run_at_epoch_with_budget(http, sink, force, now, TOTAL_DETECTION_BUDGET_MS, epoch)
+            .await
     }
 
     async fn run_at_epoch_with_budget<H, S>(
-        &self, http: &H, sink: &S, force: bool, now: impl Fn() -> u64,
-        budget_ms: u64, epoch0: u64,
+        &self,
+        http: &H,
+        sink: &S,
+        force: bool,
+        now: impl Fn() -> u64,
+        budget_ms: u64,
+        epoch0: u64,
     ) -> UnlockSnapshot
-    where H: UnlockHttp + ?Sized, S: UnlockEventSink,
+    where
+        H: UnlockHttp + ?Sized,
+        S: UnlockEventSink,
     {
         // Admission identity precedes the wait and covers every existing commit fence.
         let _run_guard = self.run_lock.lock().await;
@@ -781,7 +832,9 @@ impl UnlockRuntime {
         // ── TTL 快路：非 force 且缓存未过期 → 直接返回（零网络），并广播 UPDATED 让新监听者点亮 ──
         if !force {
             if let Some(cached) = self.peek(now()) {
-                return if self.commit_epoch(sink, epoch0, |fence| sink.updated_committed(fence, &cached)) {
+                return if self
+                    .commit_epoch(sink, epoch0, |fence| sink.updated_committed(fence, &cached))
+                {
                     cached
                 } else {
                     UnlockSnapshot::default()
@@ -794,7 +847,9 @@ impl UnlockRuntime {
         if !force {
             if let Some(last) = self.last_snapshot() {
                 if last.not_ready == Some(true) {
-                    return if self.commit_epoch(sink, epoch0, |fence| sink.updated_committed(fence, &last)) {
+                    return if self
+                        .commit_epoch(sink, epoch0, |fence| sink.updated_committed(fence, &last))
+                    {
                         last
                     } else {
                         UnlockSnapshot::default()
@@ -912,7 +967,11 @@ impl UnlockRuntime {
                 // 灰点翻回 checking（视觉诚实：补测中，非终态）。
                 for id in &timeout_ids {
                     self.commit_epoch(sink, epoch0, |fence| {
-                        sink.progress_committed(fence, id.as_str(), &UnlockResult::new(UnlockStatus::Checking));
+                        sink.progress_committed(
+                            fence,
+                            id.as_str(),
+                            &UnlockResult::new(UnlockStatus::Checking),
+                        );
                     });
                 }
                 tokio::time::sleep(backoff).await;

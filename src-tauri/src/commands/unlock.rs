@@ -105,13 +105,27 @@ impl<G: ManualBindingGuard, S: UnlockEventSink> UnlockEventSink for BoundUnlockS
     }
     // `with_current_commit` already holds the producer/action locks. Checking again here
     // would reenter those non-reentrant locks; the detector also holds its epoch fence.
-    fn progress_committed(&self, _fence: &crate::runtime::unlock::UnlockPublicationFence, service_id: &str, result: &polaris_unlock::UnlockResult) {
+    fn progress_committed(
+        &self,
+        _fence: &crate::runtime::unlock::UnlockPublicationFence,
+        service_id: &str,
+        result: &polaris_unlock::UnlockResult,
+    ) {
         self.sink.progress(service_id, result);
     }
-    fn updated_committed(&self, _fence: &crate::runtime::unlock::UnlockPublicationFence, snapshot: &UnlockSnapshot) {
+    fn updated_committed(
+        &self,
+        _fence: &crate::runtime::unlock::UnlockPublicationFence,
+        snapshot: &UnlockSnapshot,
+    ) {
         self.sink.updated(snapshot);
     }
-    fn invalidated_committed(&self, _fence: &crate::runtime::unlock::UnlockPublicationFence, running: bool, exit_blocked: bool) {
+    fn invalidated_committed(
+        &self,
+        _fence: &crate::runtime::unlock::UnlockPublicationFence,
+        running: bool,
+        exit_blocked: bool,
+    ) {
         self.sink.invalidated(running, exit_blocked);
     }
     // A manual bracket loss cannot enqueue an unbound follow-up through the ordinary self-run path.
@@ -287,12 +301,16 @@ pub async fn run_unlock_cycle(app: AppHandle, force: bool) -> Result<UnlockSnaps
                 let snapshot = UnlockSnapshot::blocked(reason);
                 if state.unlock.publish_terminal(&sink, epoch, &snapshot) {
                     Ok(snapshot)
-                } else { Err("superseded".to_string()) }
+                } else {
+                    Err("superseded".to_string())
+                }
             });
             (state.unlock.clone(), local_proxy, terminal, epoch)
         })
     };
-    if let Some(terminal) = terminal { return terminal; }
+    if let Some(terminal) = terminal {
+        return terminal;
+    }
     let proxy_port = local_proxy.as_ref().map_or(0, |proxy| proxy.port);
 
     // ── 出口 pin：经本机 http 代理入站建客户端（桌面 mixed 口走当前分流出口；Android probe-proxy-in 走 proxy-selector）──

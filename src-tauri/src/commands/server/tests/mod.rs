@@ -783,7 +783,10 @@ fn enabling_auto_is_refused_with_a_stable_code_and_writes_nothing() {
     // iOS 已开放意图；拒绝路径仍由上面的注入闸覆盖，前台准入由调度器负责。
     assert_eq!(
         auto_select::closed(
-            auto_select::Switches { master:true, better_leg:true },
+            auto_select::Switches {
+                master: true,
+                better_leg: true
+            },
             polaris_helper_proto::Platform::Ios
         ),
         None
@@ -918,7 +921,11 @@ fn malformed_bulk_import_is_atomic_and_scalar_safe() {
     seed_switch_nodes(&mgr);
     let before = mgr.load_full().unwrap();
     let disk_before = std::fs::read(mgr.path()).unwrap();
-    for invalid in [json!(7), json!(null), json!({"name":"bad","protocol":"trojan"})] {
+    for invalid in [
+        json!(7),
+        json!(null),
+        json!({"name":"bad","protocol":"trojan"}),
+    ] {
         assert!(server_add_bulk_core(&mgr, vec![before["servers"][0].clone(), invalid]).is_err());
         assert_eq!(mgr.load_full().unwrap(), before);
         assert_eq!(std::fs::read(mgr.path()).unwrap(), disk_before);

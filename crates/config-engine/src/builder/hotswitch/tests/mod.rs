@@ -1234,25 +1234,37 @@ fn sel_only_forces_subnets_is_insensitive_to_observed_addresses() {
 
 #[test]
 fn rule_auto_reference_switch_reuses_existing_wrapper_members() {
-    use crate::user_config::auto_select::{AutoSelectTarget, SelectionIntent, wrapper_tag};
+    use crate::user_config::auto_select::{wrapper_tag, AutoSelectTarget, SelectionIntent};
     let (mut deps, _) = setup_rule_deps();
     let mut old = base_config();
     old.auto_select_enabled = true;
-    old.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Global });
+    old.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
     let mut anchor = ext_rule("anchor", None);
     anchor.target_auto_select = Some(AutoSelectTarget::Manual);
     old.custom_rules = vec![ext_rule("r1", Some(NODE_A)), anchor];
     let mut next = old.clone();
     next.custom_rules[0].target_server_id = None;
     next.custom_rules[0].target_auto_select = Some(AutoSelectTarget::Manual);
-    assert_eq!(config_generation_norm(&old, None), config_generation_norm(&next, None));
+    assert_eq!(
+        config_generation_norm(&old, None),
+        config_generation_norm(&next, None)
+    );
     let plan = plan_hot_switch(&old, &next, &deps);
     assert_eq!(plan.kind, HotSwitchKind::Rules);
-    assert_eq!(plan.puts[0].member_tag, wrapper_tag(&AutoSelectTarget::Manual));
+    assert_eq!(
+        plan.puts[0].member_tag,
+        wrapper_tag(&AutoSelectTarget::Manual)
+    );
     assert_eq!(plan.puts[0].old_member_tag.as_deref(), Some("tagA"));
     let mut global = next.clone();
     global.custom_rules[0].target_auto_select = Some(AutoSelectTarget::Global);
-    assert_eq!(plan_hot_switch(&next, &global, &deps).puts[0].member_tag, wrapper_tag(&AutoSelectTarget::Global));
+    assert_eq!(
+        plan_hot_switch(&next, &global, &deps).puts[0].member_tag,
+        wrapper_tag(&AutoSelectTarget::Global)
+    );
     // Missing runtime selector evidence must not become a successful no-op.
     deps.current_rule_target_map = Some(BTreeMap::new());
     assert!(plan_hot_switch(&old, &next, &deps).must_restart);
@@ -1270,6 +1282,12 @@ fn newly_referenced_auto_group_remains_a_structural_change() {
     let mut next = old.clone();
     next.custom_rules[0].target_server_id = None;
     next.custom_rules[0].target_auto_select = Some(AutoSelectTarget::Global);
-    assert_ne!(config_generation_norm(&old, None), config_generation_norm(&next, None));
-    assert_eq!(plan_hot_switch(&old, &next, &deps).kind, HotSwitchKind::None);
+    assert_ne!(
+        config_generation_norm(&old, None),
+        config_generation_norm(&next, None)
+    );
+    assert_eq!(
+        plan_hot_switch(&old, &next, &deps).kind,
+        HotSwitchKind::None
+    );
 }

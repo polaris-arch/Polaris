@@ -195,7 +195,10 @@ pub fn plan_hot_switch(old: &UserConfig, new: &UserConfig, deps: &HotSwitchDeps)
 
     // 全局节点变化（含切到/切出 direct 哨兵：memberTag=direct，direct 恒是 proxy-selector 成员→可热切不重启）。
     // Polaris: old.selectedServerId !== newConfig.selectedServerId && newConfig.selectedServerId
-    if new.selection_intent.is_none() && old.selected_server_id != new.selected_server_id && new.selected_server_id.is_some() {
+    if new.selection_intent.is_none()
+        && old.selected_server_id != new.selected_server_id
+        && new.selected_server_id.is_some()
+    {
         let new_id = new.selected_server_id.as_deref().unwrap();
         let to_direct = is_direct_selection(Some(new_id));
         // 目标节点必须已存在于运行中的 selector（= 启动时 old.servers），否则 PUT 指向不存在的成员；
@@ -336,16 +339,26 @@ fn plan_rule_hot_switch(
 ) -> RuleHotSwitchResult {
     let auto_rule_choices = |config: &UserConfig| {
         let mut choices = BTreeMap::new();
-        for rule in config.effective_traffic_rules().iter().filter(|r| r.enabled) {
-            if let Some(target) = rule.route_target_auto_select() { choices.insert(format!("custom:{}", rule.id), target.clone()); }
+        for rule in config
+            .effective_traffic_rules()
+            .iter()
+            .filter(|r| r.enabled)
+        {
+            if let Some(target) = rule.route_target_auto_select() {
+                choices.insert(format!("custom:{}", rule.id), target.clone());
+            }
         }
         for rule in config.app_rules.iter().filter(|r| r.enabled) {
-            if let Some(target) = &rule.target_auto_select { choices.insert(format!("app:{}", rule.app_id), target.clone()); }
+            if let Some(target) = &rule.target_auto_select {
+                choices.insert(format!("app:{}", rule.app_id), target.clone());
+            }
         }
         choices
     };
     let map = match &deps.current_rule_target_map {
-        None if auto_rule_choices(old) != auto_rule_choices(new) => return RuleHotSwitchResult::CannotHotSwitch,
+        None if auto_rule_choices(old) != auto_rule_choices(new) => {
+            return RuleHotSwitchResult::CannotHotSwitch
+        }
         None => return RuleHotSwitchResult::Puts(Vec::new()), // 启动时无 rule-sel → 无规则热切换
         Some(m) => m,
     };
@@ -375,12 +388,20 @@ fn plan_rule_hot_switch(
         };
         // 新目标有→解析节点 tag；无（节点切回默认/跟全局）→ proxy-selector（rule-sel 嵌套 default）。
         let member_tag: Option<String> = if let Some(target) = new_auto {
-            if !existing_auto.contains(target) || crate::user_config::auto_select::eligible_members(new, target).iter().any(|id| is_server_dirty(id, new, deps)) { return false; }
+            if !existing_auto.contains(target)
+                || crate::user_config::auto_select::eligible_members(new, target)
+                    .iter()
+                    .any(|id| is_server_dirty(id, new, deps))
+            {
+                return false;
+            }
             Some(crate::user_config::auto_select::wrapper_tag(target))
-        } else { match new_target {
-            Some(t) => id_to_tag.get(t).cloned(),
-            None => Some(PROXY_SELECTOR_TAG.to_string()),
-        } };
+        } else {
+            match new_target {
+                Some(t) => id_to_tag.get(t).cloned(),
+                None => Some(PROXY_SELECTOR_TAG.to_string()),
+            }
+        };
         let member_tag = match member_tag {
             Some(t) => t,
             None => return false, // 新目标节点不在 selector → 退回重启
@@ -396,13 +417,15 @@ fn plan_rule_hot_switch(
         // 必须从 oldTarget 现算，禁用 currentRuleTargetMap.memberTag（那是生成时 default，首次规则热切后即陈旧）。
         let old_member_tag: String = if let Some(target) = old_auto {
             crate::user_config::auto_select::wrapper_tag(target)
-        } else { match old_target {
-            Some(t) => id_to_tag
-                .get(t)
-                .cloned()
-                .unwrap_or_else(|| PROXY_SELECTOR_TAG.to_string()),
-            None => PROXY_SELECTOR_TAG.to_string(),
-        } };
+        } else {
+            match old_target {
+                Some(t) => id_to_tag
+                    .get(t)
+                    .cloned()
+                    .unwrap_or_else(|| PROXY_SELECTOR_TAG.to_string()),
+                None => PROXY_SELECTOR_TAG.to_string(),
+            }
+        };
         puts.push(HotSwitchPut {
             selector_tag: entry.selector_tag.clone(),
             member_tag, // 上游 `memberTag || 'proxy-selector'`（此处已非空，等价）

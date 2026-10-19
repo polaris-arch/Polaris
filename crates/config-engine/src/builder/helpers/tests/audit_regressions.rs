@@ -33,9 +33,13 @@ fn node_and_app_names_cannot_capture_custom_selectors() {
 #[test]
 fn generated_helper_names_are_reserved_before_display_names() {
     let map = build_id_to_tag_map(&[
-        Node("a", "stls-out-X"), Node("b", "probe-selector-0"),
-        Node("c", "node-stls-out-X"), Node("d", "node-probe-selector-0"),
+        Node("a", "stls-out-X"),
+        Node("b", "probe-selector-0"),
+        Node("c", "node-stls-out-X"),
+        Node("d", "node-probe-selector-0"),
     ]);
-    assert!(map.values().all(|tag| !tag.starts_with("stls-out-") && !tag.starts_with("probe-selector-")));
+    assert!(map
+        .values()
+        .all(|tag| !tag.starts_with("stls-out-") && !tag.starts_with("probe-selector-")));
     assert_eq!(map.values().collect::<BTreeSet<_>>().len(), 4);
 }

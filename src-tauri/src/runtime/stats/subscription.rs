@@ -154,7 +154,10 @@ impl ConnectionStreamLifecycle {
     }
 
     pub(super) fn consume_detail_baseline(&self, epoch: u64) -> Option<bool> {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.current_epoch != epoch {
             return None;
         }

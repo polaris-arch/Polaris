@@ -1089,15 +1089,23 @@ fn unknown_autostart_blocks_all_destructive_steps() {
     assert_eq!(helper.calls.load(Ordering::SeqCst), 0);
 }
 
-
 #[test]
 fn inspection_errors_fail_closed_and_halt_later_removal_steps() {
-    for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::Other,
-        std::io::ErrorKind::NotFound] {
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::Other,
+        std::io::ErrorKind::NotFound,
+    ] {
         // Absolute, named-parent fixture; no real permission manipulation/deletes.
-        let path = std::env::temp_dir().join("rcp-inspection").join(CONFIG_DIR_LEAF);
-        let result = validate_removable_with(&path, &|leaf| leaf == CONFIG_DIR_LEAF,
-            TargetKind::Dir, &|_| Err(std::io::Error::new(kind, "injected inspection error")));
+        let path = std::env::temp_dir()
+            .join("rcp-inspection")
+            .join(CONFIG_DIR_LEAF);
+        let result = validate_removable_with(
+            &path,
+            &|leaf| leaf == CONFIG_DIR_LEAF,
+            TargetKind::Dir,
+            &|_| Err(std::io::Error::new(kind, "injected inspection error")),
+        );
         let mut ops = RecordingOps::all_ok();
         ops.config = match result {
             Err(PathReject::Missing) => StepOutcome::skipped("absent"),
@@ -1114,9 +1122,20 @@ fn inspection_errors_fail_closed_and_halt_later_removal_steps() {
         } else {
             assert!(!ops.calls().contains(&UninstallStep::CacheDir));
             assert!(!ops.calls().contains(&UninstallStep::AppBundle));
-            for step in [UninstallStep::CacheDir, UninstallStep::Preferences, UninstallStep::AppBundle] {
-                assert!(matches!(&report.steps.iter().find(|entry| entry.step == step).unwrap().outcome,
-                    StepOutcome::NotAttempted { .. }));
+            for step in [
+                UninstallStep::CacheDir,
+                UninstallStep::Preferences,
+                UninstallStep::AppBundle,
+            ] {
+                assert!(matches!(
+                    &report
+                        .steps
+                        .iter()
+                        .find(|entry| entry.step == step)
+                        .unwrap()
+                        .outcome,
+                    StepOutcome::NotAttempted { .. }
+                ));
             }
         }
     }

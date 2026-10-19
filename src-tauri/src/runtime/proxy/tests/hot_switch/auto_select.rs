@@ -1,18 +1,18 @@
 //! Native Auto ownership tests plus retained generic failover/heartbeat receipts.
 //! Retired App-ranking policy stays covered by runtime::auto_select pure tests;
 //! production tests below exercise native group state through the existing PUT harness.
+use super::*;
+use crate::commands::server::{finish_placement_core, server_switch_core, Placement};
+use crate::runtime::auto_select::{Cause, Leg, SwitchRecord};
+use crate::runtime::auto_switch::HEARTBEAT_INTERVAL_MS;
+use crate::runtime::proxy::auto_switch::{run_heartbeat, HeartbeatLegs};
+use polaris_config_engine::user_config::auto_select::{self as native, AutoSelectTarget};
+use polaris_singbox_grpc::daemon::{Group, GroupItem};
 use std::ops::ControlFlow;
 use std::time::Duration;
-use super::*;
-use crate::commands::server::{finish_placement_core,server_switch_core,Placement};
-use crate::runtime::auto_select::{Cause,SwitchRecord,Leg};
-use crate::runtime::auto_switch::HEARTBEAT_INTERVAL_MS;
-use crate::runtime::proxy::auto_switch::{run_heartbeat,HeartbeatLegs};
-use polaris_config_engine::user_config::auto_select::{self as native,AutoSelectTarget};
-use polaris_singbox_grpc::daemon::{Group,GroupItem};
-const MINUTE:u64=60_000;
-const MONO:u64=7*60*MINUTE;
-const WALL:u64=1_700_000_000_000;
+const MINUTE: u64 = 60_000;
+const MONO: u64 = 7 * 60 * MINUTE;
+const WALL: u64 = 1_700_000_000_000;
 
 fn auto_config(selected: &str, intent: Option<&str>) -> Value {
     let mut cfg = two_node_config(7890, selected);
@@ -279,20 +279,33 @@ fn the_production_heartbeat_runs_this_loop() {
     }
 }
 
-
 // Explicit barriers are coordinator inputs, independent of the retired ranker.
-fn failover_fixture() -> (Arc<ProxyRuntime>,TestDir,Value,Vec<crate::runtime::auto_switch::RuntimeCandidate>,BTreeSet<String>) {
-    let (rt,dir)=test_runtime();
-    let cfg=running(&rt,&auto_config("node-a",None));
-    rt.auto_select_note_failover(Some(30*MINUTE),failover_record("node-c","node-a"),MONO);
-    let barred=BTreeSet::from(["node-c".to_owned()]);
-    let snapshot=rt.switch_snapshot.read().unwrap().clone().unwrap();
-    let scope=BTreeSet::from(["node-b".to_owned(),"node-c".to_owned()]);
-    let mut plan=crate::runtime::auto_switch::plan_runtime_candidates(&cfg,Some("node-a"),&snapshot.id_to_tag,&snapshot.measurement_fingerprints,
-        &crate::runtime::node_fingerprints::measurement_table_json(&cfg),&BTreeSet::new(),&BTreeSet::new(),Some(&scope));
-    assert!(rt.retain_hot_switchable_candidates(rt.core_generation(),&cfg,&mut plan));
-    assert_eq!(plan.candidates.len(),2);
-    (rt,dir,cfg,plan.candidates,barred)
+fn failover_fixture() -> (
+    Arc<ProxyRuntime>,
+    TestDir,
+    Value,
+    Vec<crate::runtime::auto_switch::RuntimeCandidate>,
+    BTreeSet<String>,
+) {
+    let (rt, dir) = test_runtime();
+    let cfg = running(&rt, &auto_config("node-a", None));
+    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+    let barred = BTreeSet::from(["node-c".to_owned()]);
+    let snapshot = rt.switch_snapshot.read().unwrap().clone().unwrap();
+    let scope = BTreeSet::from(["node-b".to_owned(), "node-c".to_owned()]);
+    let mut plan = crate::runtime::auto_switch::plan_runtime_candidates(
+        &cfg,
+        Some("node-a"),
+        &snapshot.id_to_tag,
+        &snapshot.measurement_fingerprints,
+        &crate::runtime::node_fingerprints::measurement_table_json(&cfg),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        Some(&scope),
+    );
+    assert!(rt.retain_hot_switchable_candidates(rt.core_generation(), &cfg, &mut plan));
+    assert_eq!(plan.candidates.len(), 2);
+    (rt, dir, cfg, plan.candidates, barred)
 }
 
 fn failover_batch(
@@ -835,139 +848,270 @@ async fn failover_fallback_empty_candidates_or_missing_failure_receipts_do_not_p
     }
 }
 
-fn native_fixture(default:Option<AutoSelectTarget>, rule_scope:bool) -> (Arc<ProxyRuntime>,TestDir,Arc<TestPutSink>,Value) {
-    let (rt,dir)=test_runtime();
-    let mut config=auto_config("node-a",None);
-    config["autoSelectEnabled"]=serde_json::json!(true);
-    if let Some(target)=default { config["selectionIntent"]=polaris_store::auto_select::intent(&target); }
-    if rule_scope { config["appRules"]=serde_json::json!([{"appId":"independent","enabled":true,"action":"proxy","targetAutoSelect":{"scope":"subscription","subscriptionId":"sub"}}]); }
-    let config=running(&rt,&config);
-    let typed:UserConfig=serde_json::from_value(config.clone()).unwrap();
-    let nodes=rt.switch_snapshot.read().unwrap().as_ref().unwrap().id_to_tag.clone();
-    let now=(crate::runtime::subscription_scheduler::now_ms()/1000) as i64;
-    let item=|tag:String,time:i64|GroupItem{tag,url_test_time:time,url_test_delay:20,..Default::default()};
-    let mut groups=Vec::new();
-    let mut proxy_members:Vec<GroupItem>=nodes.values().map(|tag|item(tag.clone(),0)).collect();
-    for target in native::referenced_targets(&typed) {
-        let wrapper=native::wrapper_tag(&target);let test=native::urltest_tag(&target);
-        let members=native::eligible_members(&typed,&target);
-        let selected=if target==AutoSelectTarget::Global {"node-a"} else {"node-c"};
-        let mut wrapper_members=vec![item(test.clone(),0)];
-        wrapper_members.extend(members.iter().map(|id|item(nodes[id].clone(),0)));
-        groups.push(Group{tag:wrapper.clone(),selected:test.clone(),items:wrapper_members,..Default::default()});
-        groups.push(Group{tag:test,selected:nodes[selected].clone(),items:members.iter().map(|id|item(nodes[id].clone(),now)).collect(),..Default::default()});
-        proxy_members.push(item(wrapper,0));
+fn native_fixture(
+    default: Option<AutoSelectTarget>,
+    rule_scope: bool,
+) -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>, Value) {
+    let (rt, dir) = test_runtime();
+    let mut config = auto_config("node-a", None);
+    config["autoSelectEnabled"] = serde_json::json!(true);
+    if let Some(target) = default {
+        config["selectionIntent"] = polaris_store::auto_select::intent(&target);
     }
-    let selected=polaris_store::auto_select::target(&config).map(|target|native::wrapper_tag(&target)).unwrap_or_else(||nodes["node-a"].clone());
-    groups.push(Group{tag:PROXY_SELECTOR_TAG.into(),selected,items:proxy_members,..Default::default()});
-    let sink=Arc::new(TestPutSink::default());
-    sink.follow_puts.store(true,Ordering::SeqCst);
-    *sink.groups.lock().unwrap()=Some(groups.iter().map(|group|GroupSelection{tag:group.tag.clone(),selected:group.selected.clone()}).collect());
-    *sink.native_groups.lock().unwrap()=Some(groups);
-    *rt.management_api_stub.lock().unwrap()=Some(Arc::clone(&sink));
-    (rt,dir,sink,config)
+    if rule_scope {
+        config["appRules"] = serde_json::json!([{"appId":"independent","enabled":true,"action":"proxy","targetAutoSelect":{"scope":"subscription","subscriptionId":"sub"}}]);
+    }
+    let config = running(&rt, &config);
+    let typed: UserConfig = serde_json::from_value(config.clone()).unwrap();
+    let nodes = rt
+        .switch_snapshot
+        .read()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .id_to_tag
+        .clone();
+    let now = (crate::runtime::subscription_scheduler::now_ms() / 1000) as i64;
+    let item = |tag: String, time: i64| GroupItem {
+        tag,
+        url_test_time: time,
+        url_test_delay: 20,
+        ..Default::default()
+    };
+    let mut groups = Vec::new();
+    let mut proxy_members: Vec<GroupItem> =
+        nodes.values().map(|tag| item(tag.clone(), 0)).collect();
+    for target in native::referenced_targets(&typed) {
+        let wrapper = native::wrapper_tag(&target);
+        let test = native::urltest_tag(&target);
+        let members = native::eligible_members(&typed, &target);
+        let selected = if target == AutoSelectTarget::Global {
+            "node-a"
+        } else {
+            "node-c"
+        };
+        let mut wrapper_members = vec![item(test.clone(), 0)];
+        wrapper_members.extend(members.iter().map(|id| item(nodes[id].clone(), 0)));
+        groups.push(Group {
+            tag: wrapper.clone(),
+            selected: test.clone(),
+            items: wrapper_members,
+            ..Default::default()
+        });
+        groups.push(Group {
+            tag: test,
+            selected: nodes[selected].clone(),
+            items: members
+                .iter()
+                .map(|id| item(nodes[id].clone(), now))
+                .collect(),
+            ..Default::default()
+        });
+        proxy_members.push(item(wrapper, 0));
+    }
+    let selected = polaris_store::auto_select::target(&config)
+        .map(|target| native::wrapper_tag(&target))
+        .unwrap_or_else(|| nodes["node-a"].clone());
+    groups.push(Group {
+        tag: PROXY_SELECTOR_TAG.into(),
+        selected,
+        items: proxy_members,
+        ..Default::default()
+    });
+    let sink = Arc::new(TestPutSink::default());
+    sink.follow_puts.store(true, Ordering::SeqCst);
+    *sink.groups.lock().unwrap() = Some(
+        groups
+            .iter()
+            .map(|group| GroupSelection {
+                tag: group.tag.clone(),
+                selected: group.selected.clone(),
+            })
+            .collect(),
+    );
+    *sink.native_groups.lock().unwrap() = Some(groups);
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    (rt, dir, sink, config)
 }
 
-fn subscription_target() -> AutoSelectTarget { AutoSelectTarget::Subscription{subscription_id:"sub".into()} }
+fn subscription_target() -> AutoSelectTarget {
+    AutoSelectTarget::Subscription {
+        subscription_id: "sub".into(),
+    }
+}
 
 #[tokio::test]
 async fn native_groups_own_production_and_legacy_writer_cannot_override_a_reference() {
-    let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-    assert_eq!(rt.auto_select_closed(),Some(crate::runtime::auto_select::Gate::SwitchedOff));
+    let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    assert_eq!(
+        rt.auto_select_closed(),
+        Some(crate::runtime::auto_select::Gate::SwitchedOff)
+    );
     assert!(!rt.auto_select_active());
-    let status=rt.native_auto_status().await;
-    assert_eq!(status.native_auto_groups.len(),2);
-    assert!(status.native_auto_groups.iter().all(|group|group.confirmed));
-    assert_eq!(status.actual_server_id.as_deref(),Some("node-a"));
-    assert_eq!(rt.config.current().unwrap(),config);
+    let status = rt.native_auto_status().await;
+    assert_eq!(status.native_auto_groups.len(), 2);
+    assert!(status
+        .native_auto_groups
+        .iter()
+        .all(|group| group.confirmed));
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert_eq!(rt.config.current().unwrap(), config);
     assert!(sink.calls().is_empty());
-    let source=module_code("runtime/proxy");
+    let source = module_code("runtime/proxy");
     let body=method_body(&source,"    async fn do_switch_io(self: &Arc<Self>, machine: &mut AutoSwitchMachine, reason: &str) -> bool {");
-    assert!(body.find("polaris_store::auto_select::target").unwrap()<body.find("plan_runtime_candidates(").unwrap());
+    assert!(
+        body.find("polaris_store::auto_select::target").unwrap()
+            < body.find("plan_runtime_candidates(").unwrap()
+    );
 }
 
 #[tokio::test]
 async fn native_status_observes_runtime_and_rejects_stop_or_old_generation() {
-    let (rt,_dir,_sink,mut desired)=native_fixture(Some(AutoSelectTarget::Global),true);
-    desired["selectedServerId"]=serde_json::json!("node-c");
+    let (rt, _dir, _sink, mut desired) = native_fixture(Some(AutoSelectTarget::Global), true);
+    desired["selectedServerId"] = serde_json::json!("node-c");
     rt.config.save_full(&desired).unwrap();
-    let status=rt.native_auto_status().await;
-    assert_eq!(status.actual_server_id.as_deref(),Some("node-a"));
-    assert_eq!(rt.status().actual_server_id.as_deref(),Some("node-a"));
+    let status = rt.native_auto_status().await;
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert_eq!(rt.status().actual_server_id.as_deref(), Some("node-a"));
     rt.gate.bump_generation();
-    assert_eq!(rt.native_auto_cached_status().actual_server_id,None);
-    rt.status.write().unwrap().running=false;
-    assert_eq!(rt.status().actual_server_id,None);
-    assert!(rt.native_auto_cached_status().native_auto_groups.iter().all(|group|!group.confirmed));
+    assert_eq!(rt.native_auto_cached_status().actual_server_id, None);
+    rt.status.write().unwrap().running = false;
+    assert_eq!(rt.status().actual_server_id, None);
+    assert!(rt
+        .native_auto_cached_status()
+        .native_auto_groups
+        .iter()
+        .all(|group| !group.confirmed));
 }
 
 #[tokio::test]
 async fn native_default_same_reference_is_noop_and_independent_rule_group_is_preserved() {
-    let (rt,_dir,sink,mut desired)=native_fixture(Some(AutoSelectTarget::Global),true);
-    desired["selectedServerId"]=serde_json::json!("node-c");
+    let (rt, _dir, sink, mut desired) = native_fixture(Some(AutoSelectTarget::Global), true);
+    desired["selectedServerId"] = serde_json::json!("node-c");
     rt.config.save_full(&desired).unwrap();
-    let status=rt.native_auto_select_default(AutoSelectTarget::Global).await.unwrap();
-    assert_eq!(status.actual_server_id.as_deref(),Some("node-a"));
-    assert_eq!(rt.config.current().unwrap()["selectedServerId"],"node-a");
+    let status = rt
+        .native_auto_select_default(AutoSelectTarget::Global)
+        .await
+        .unwrap();
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-a");
     assert!(sink.calls().is_empty());
     assert!(rt.pending_force_restart.read().unwrap().is_none());
-    let status=rt.native_auto_select_default(subscription_target()).await.unwrap();
-    assert_eq!(status.actual_server_id.as_deref(),Some("node-c"));
-    assert_eq!(rt.config.current().unwrap()["appRules"],desired["appRules"]);
+    let status = rt
+        .native_auto_select_default(subscription_target())
+        .await
+        .unwrap();
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-c"));
+    assert_eq!(
+        rt.config.current().unwrap()["appRules"],
+        desired["appRules"]
+    );
     assert!(rt.pending_force_restart.read().unwrap().is_none());
 }
 
 #[tokio::test]
 async fn native_manual_pin_same_leaf_clears_only_default_without_restart() {
-    for (target,outcome) in [("node-a",SwitchOutcome::NoOp),("node-b",SwitchOutcome::HotSwitched)] {
-        let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-        let (_,_,intent,cleared)=server_switch_core(&rt.config,target,|_|Ok(()),||rt.register_selector_intent()).unwrap();
+    for (target, outcome) in [
+        ("node-a", SwitchOutcome::NoOp),
+        ("node-b", SwitchOutcome::HotSwitched),
+    ] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let (_, _, intent, cleared) = server_switch_core(
+            &rt.config,
+            target,
+            |_| Ok(()),
+            || rt.register_selector_intent(),
+        )
+        .unwrap();
         assert!(cleared);
-        let result=rt.switch_selected_server_if_current(target,intent).await.unwrap();
-        assert_eq!(result,Some(outcome));
-        assert!(rt.config.current().unwrap().get("selectionIntent").is_none());
-        assert_eq!(rt.config.current().unwrap()["appRules"],config["appRules"]);
-        assert_eq!(rt.native_auto_status().await.actual_server_id.as_deref(),Some(target));
-        assert_eq!(sink.calls().len(),1);
+        let result = rt
+            .switch_selected_server_if_current(target, intent)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(outcome));
+        assert!(rt
+            .config
+            .current()
+            .unwrap()
+            .get("selectionIntent")
+            .is_none());
+        assert_eq!(rt.config.current().unwrap()["appRules"], config["appRules"]);
+        assert_eq!(
+            rt.native_auto_status().await.actual_server_id.as_deref(),
+            Some(target)
+        );
+        assert_eq!(sink.calls().len(), 1);
         assert!(rt.pending_force_restart.read().unwrap().is_none());
     }
 }
 
 #[tokio::test]
 async fn native_off_requires_every_scope_before_first_write_and_never_guesses_desired() {
-    for missing in ["history","group","outside"] {
-        let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-        let sub_test=native::urltest_tag(&subscription_target());
-        { let mut groups=sink.native_groups.lock().unwrap();
-        let groups=groups.as_mut().unwrap();
-        match missing {
-            "history"=>for item in groups.iter_mut().flat_map(|group|&mut group.items) {if item.tag=="Node C" {item.url_test_time=0;}},
-            "group"=>groups.retain(|group|group.tag!=sub_test),
-            "outside"=>groups.iter_mut().find(|group|group.tag==sub_test).unwrap().selected="Node A".into(),
-            _=>unreachable!(),
+    for missing in ["history", "group", "outside"] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let sub_test = native::urltest_tag(&subscription_target());
+        {
+            let mut groups = sink.native_groups.lock().unwrap();
+            let groups = groups.as_mut().unwrap();
+            match missing {
+                "history" => {
+                    for item in groups.iter_mut().flat_map(|group| &mut group.items) {
+                        if item.tag == "Node C" {
+                            item.url_test_time = 0;
+                        }
+                    }
+                }
+                "group" => groups.retain(|group| group.tag != sub_test),
+                "outside" => {
+                    groups
+                        .iter_mut()
+                        .find(|group| group.tag == sub_test)
+                        .unwrap()
+                        .selected = "Node A".into()
+                }
+                _ => unreachable!(),
+            }
         }
-        }
-        assert_eq!(rt.native_auto_set_enabled(false).await.unwrap_err(),"AUTO_SELECT_NO_ACTUAL_EXIT","{missing}");
+        assert_eq!(
+            rt.native_auto_set_enabled(false).await.unwrap_err(),
+            "AUTO_SELECT_NO_ACTUAL_EXIT",
+            "{missing}"
+        );
         assert!(sink.calls().is_empty());
-        assert_eq!(rt.config.current().unwrap(),config);
+        assert_eq!(rt.config.current().unwrap(), config);
     }
 }
 
 #[tokio::test]
 async fn native_off_partial_failure_rolls_back_and_does_not_commit_flag_or_pins() {
-    for failure in ["second-put","readback","persist"] {
-        let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
+    for failure in ["second-put", "readback", "persist"] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
         match failure {
-            "second-put"=>{sink.fail_at.lock().unwrap().insert(2);},
-            "readback"=>sink.follow_puts.store(false,Ordering::SeqCst),
-            "persist"=>rt.config.fail_next_config_persist_for_test(),
-            _=>unreachable!(),
+            "second-put" => {
+                sink.fail_at.lock().unwrap().insert(2);
+            }
+            "readback" => sink.follow_puts.store(false, Ordering::SeqCst),
+            "persist" => rt.config.fail_next_config_persist_for_test(),
+            _ => unreachable!(),
         }
-        assert_eq!(rt.native_auto_set_enabled(false).await.unwrap_err(),"AUTO_SELECT_SWITCH_FAILED","{failure}");
-        assert_eq!(rt.config.current().unwrap(),config);
-        let groups=sink.native_groups.lock().unwrap();
-        for target in [AutoSelectTarget::Global,subscription_target()] {
-            assert_eq!(groups.as_ref().unwrap().iter().find(|group|group.tag==native::wrapper_tag(&target)).unwrap().selected,native::urltest_tag(&target));
+        assert_eq!(
+            rt.native_auto_set_enabled(false).await.unwrap_err(),
+            "AUTO_SELECT_SWITCH_FAILED",
+            "{failure}"
+        );
+        assert_eq!(rt.config.current().unwrap(), config);
+        let groups = sink.native_groups.lock().unwrap();
+        for target in [AutoSelectTarget::Global, subscription_target()] {
+            assert_eq!(
+                groups
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find(|group| group.tag == native::wrapper_tag(&target))
+                    .unwrap()
+                    .selected,
+                native::urltest_tag(&target)
+            );
         }
         assert!(rt.selector_reconcile.is_required());
         assert!(rt.pending_force_restart.read().unwrap().is_none());
@@ -976,388 +1120,634 @@ async fn native_off_partial_failure_rolls_back_and_does_not_commit_flag_or_pins(
 
 #[tokio::test]
 async fn native_off_stop_or_new_intent_at_put_cannot_commit_an_obsolete_receipt() {
-    for stop in [false,true] {
-        let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-        let owner=Arc::clone(&rt);
-        *sink.on_put.lock().unwrap()=Some(Box::new(move|| {
-            if stop {owner.gate.bump_generation();owner.status.write().unwrap().running=false;}
-            else {owner.register_selector_intent();}
+    for stop in [false, true] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let owner = Arc::clone(&rt);
+        *sink.on_put.lock().unwrap() = Some(Box::new(move || {
+            if stop {
+                owner.gate.bump_generation();
+                owner.status.write().unwrap().running = false;
+            } else {
+                owner.register_selector_intent();
+            }
         }));
         assert!(rt.native_auto_set_enabled(false).await.is_err());
-        assert_eq!(rt.config.current().unwrap(),config);
+        assert_eq!(rt.config.current().unwrap(), config);
         assert!(rt.pending_force_restart.read().unwrap().is_none());
-        if stop { assert_eq!(sink.calls().len(),1,"rollback cannot write to a replaced core"); }
+        if stop {
+            assert_eq!(
+                sink.calls().len(),
+                1,
+                "rollback cannot write to a replaced core"
+            );
+        }
     }
 }
 
 #[tokio::test]
 async fn native_off_pins_each_confirmed_tcp_group_without_restarting_or_rebinding_default() {
-    let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-    let status=rt.native_auto_set_enabled(false).await.unwrap();
+    let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let status = rt.native_auto_set_enabled(false).await.unwrap();
     assert!(!status.feature_enabled);
-    assert!(status.native_auto_groups.iter().all(|group|group.confirmed && group.state=="pinned"));
-    assert_eq!(status.actual_server_id.as_deref(),Some("node-a"));
-    let saved=rt.config.current().unwrap();
-    assert_eq!(saved["selectionIntent"],config["selectionIntent"]);
-    assert_eq!(saved["appRules"],config["appRules"]);
-    let typed:UserConfig=serde_json::from_value(saved).unwrap();
-    assert_eq!(native::pin(&typed,&AutoSelectTarget::Global),Some("node-a"));
-    assert_eq!(native::pin(&typed,&subscription_target()),Some("node-c"));
-    assert_eq!(sink.calls().len(),2);
+    assert!(status
+        .native_auto_groups
+        .iter()
+        .all(|group| group.confirmed && group.state == "pinned"));
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    let saved = rt.config.current().unwrap();
+    assert_eq!(saved["selectionIntent"], config["selectionIntent"]);
+    assert_eq!(saved["appRules"], config["appRules"]);
+    let typed: UserConfig = serde_json::from_value(saved).unwrap();
+    assert_eq!(
+        native::pin(&typed, &AutoSelectTarget::Global),
+        Some("node-a")
+    );
+    assert_eq!(native::pin(&typed, &subscription_target()), Some("node-c"));
+    assert_eq!(sink.calls().len(), 2);
     assert!(rt.pending_force_restart.read().unwrap().is_none());
-    let status=rt.native_auto_set_enabled(true).await.unwrap();
+    let status = rt.native_auto_set_enabled(true).await.unwrap();
     assert!(status.feature_enabled);
-    assert!(status.native_auto_groups.iter().all(|group|group.confirmed && group.state=="auto"));
+    assert!(status
+        .native_auto_groups
+        .iter()
+        .all(|group| group.confirmed && group.state == "auto"));
     assert!(rt.pending_force_restart.read().unwrap().is_none());
 }
 
 #[tokio::test]
 async fn native_stopped_off_requires_verified_pins_but_empty_manual_mode_needs_no_node() {
-    let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-    rt.status.write().unwrap().running=false;
-    assert_eq!(rt.native_auto_set_enabled(false).await.unwrap_err(),"AUTO_SELECT_NO_ACTUAL_EXIT");
-    assert_eq!(rt.config.current().unwrap(),config);
+    let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    rt.status.write().unwrap().running = false;
+    assert_eq!(
+        rt.native_auto_set_enabled(false).await.unwrap_err(),
+        "AUTO_SELECT_NO_ACTUAL_EXIT"
+    );
+    assert_eq!(rt.config.current().unwrap(), config);
     assert!(sink.calls().is_empty());
-    rt.status.write().unwrap().running=true;
+    rt.status.write().unwrap().running = true;
     rt.native_auto_set_enabled(false).await.unwrap();
     rt.native_auto_set_enabled(true).await.unwrap();
-    rt.status.write().unwrap().running=false;
-    assert!(!rt.native_auto_set_enabled(false).await.unwrap().feature_enabled);
-    let (empty,_dir)=test_runtime();
-    empty.config.save_full(&polaris_store::default_config()).unwrap();
-    assert!(!empty.native_auto_set_enabled(false).await.unwrap().feature_enabled);
+    rt.status.write().unwrap().running = false;
+    assert!(
+        !rt.native_auto_set_enabled(false)
+            .await
+            .unwrap()
+            .feature_enabled
+    );
+    let (empty, _dir) = test_runtime();
+    empty
+        .config
+        .save_full(&polaris_store::default_config())
+        .unwrap();
+    assert!(
+        !empty
+            .native_auto_set_enabled(false)
+            .await
+            .unwrap()
+            .feature_enabled
+    );
 }
 
 #[tokio::test]
 async fn native_enable_without_references_keeps_manual_default_and_app_http_ownership() {
-    let (rt,_dir,sink,mut config)=native_fixture(None,false);
-    config["autoSelectEnabled"]=serde_json::json!(false);
+    let (rt, _dir, sink, mut config) = native_fixture(None, false);
+    config["autoSelectEnabled"] = serde_json::json!(false);
     rt.config.save_full(&config).unwrap();
-    mark_running_with_snapshot(&rt,&config);
+    mark_running_with_snapshot(&rt, &config);
     rt.native_auto_status().await;
-    let status=rt.native_auto_set_enabled(true).await.unwrap();
+    let status = rt.native_auto_set_enabled(true).await.unwrap();
     assert!(status.feature_enabled);
     assert!(status.native_auto_groups.is_empty());
-    assert_eq!(status.actual_server_id.as_deref(),Some("node-a"));
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
     assert!(sink.calls().is_empty());
-    assert!(!rt.native_owns_any(&["node-a".into(),"node-b".into()]));
+    assert!(!rt.native_owns_any(&["node-a".into(), "node-b".into()]));
     assert!(rt.pending_force_restart.read().unwrap().is_none());
 }
 
 #[tokio::test]
 async fn native_dirty_or_empty_scope_is_refused_before_intent_or_runtime_changes() {
-    for dirty in [false,true] {
-        let (rt,_dir,sink,mut config)=native_fixture(Some(AutoSelectTarget::Global),true);
-        if dirty {config["servers"][1]["port"]=serde_json::json!(19002);}
+    for dirty in [false, true] {
+        let (rt, _dir, sink, mut config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        if dirty {
+            config["servers"][1]["port"] = serde_json::json!(19002);
+        }
         rt.config.save_full(&config).unwrap();
-        let before=rt.config.current().unwrap();
-        let target=if dirty {subscription_target()} else {AutoSelectTarget::Subscription{subscription_id:"absent".into()}};
-        assert_eq!(rt.native_auto_select_default(target).await.unwrap_err(),if dirty {"AUTO_SELECT_REQUIRES_APPLY"} else {"AUTO_SELECT_SCOPE_EMPTY"});
-        assert_eq!(rt.config.current().unwrap(),before);
+        let before = rt.config.current().unwrap();
+        let target = if dirty {
+            subscription_target()
+        } else {
+            AutoSelectTarget::Subscription {
+                subscription_id: "absent".into(),
+            }
+        };
+        assert_eq!(
+            rt.native_auto_select_default(target).await.unwrap_err(),
+            if dirty {
+                "AUTO_SELECT_REQUIRES_APPLY"
+            } else {
+                "AUTO_SELECT_SCOPE_EMPTY"
+            }
+        );
+        assert_eq!(rt.config.current().unwrap(), before);
         assert!(sink.calls().is_empty());
     }
 }
 
-#[tokio::test(start_paused=true)]
+#[tokio::test(start_paused = true)]
 async fn native_new_graph_reload_projects_only_runtime_and_seeds_observed_exit() {
-    let (rt,_dir,sink,mut desired)=native_fixture(None,true);
-    desired["mixedPort"]=serde_json::json!(7999);
-    desired["selectedServerId"]=serde_json::json!("node-c");
+    let (rt, _dir, sink, mut desired) = native_fixture(None, true);
+    desired["mixedPort"] = serde_json::json!(7999);
+    desired["selectedServerId"] = serde_json::json!("node-c");
     rt.config.save_full(&desired).unwrap();
-    let status=rt.native_auto_select_default(AutoSelectTarget::Global).await.unwrap();
-    assert_eq!(status.actual_server_id.as_deref(),Some("node-a"));
-    assert!(status.native_auto_groups.iter().find(|group|group.target==AutoSelectTarget::Global).is_some_and(|group|!group.confirmed));
-    let pending=rt.pending_force_restart.read().unwrap();
-    let (_,projected,_)=pending.as_ref().expect("new graph requires controlled reload");
-    assert_eq!(projected["mixedPort"],7890);
-    assert_eq!(projected["selectedServerId"],"node-a");
-    assert_eq!(rt.config.current().unwrap()["mixedPort"],7999);
-    assert_eq!(rt.config.current().unwrap()["selectedServerId"],"node-a");
+    let status = rt
+        .native_auto_select_default(AutoSelectTarget::Global)
+        .await
+        .unwrap();
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert!(status
+        .native_auto_groups
+        .iter()
+        .find(|group| group.target == AutoSelectTarget::Global)
+        .is_some_and(|group| !group.confirmed));
+    let pending = rt.pending_force_restart.read().unwrap();
+    let (_, projected, _) = pending
+        .as_ref()
+        .expect("new graph requires controlled reload");
+    assert_eq!(projected["mixedPort"], 7890);
+    assert_eq!(projected["selectedServerId"], "node-a");
+    assert_eq!(rt.config.current().unwrap()["mixedPort"], 7999);
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-a");
     assert!(sink.calls().is_empty());
 }
 
 #[tokio::test]
 async fn native_obsolete_read_or_busy_lifecycle_cannot_save_a_new_reference() {
-    for race in ["busy","intent","generation"] {
-        let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-        if race=="busy" { rt.gate.begin(); }
-        else {
-            let owner=Arc::clone(&rt);
-            *sink.on_groups.lock().unwrap()=Some(Box::new(move|| {
-                if race=="generation" { owner.gate.bump_generation(); }
-                else { owner.register_selector_intent(); }
+    for race in ["busy", "intent", "generation"] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        if race == "busy" {
+            rt.gate.begin();
+        } else {
+            let owner = Arc::clone(&rt);
+            *sink.on_groups.lock().unwrap() = Some(Box::new(move || {
+                if race == "generation" {
+                    owner.gate.bump_generation();
+                } else {
+                    owner.register_selector_intent();
+                }
             }));
         }
-        assert!(rt.native_auto_select_default(subscription_target()).await.is_err(),"{race}");
-        assert_eq!(rt.config.current().unwrap(),config,"{race}");
-        assert!(sink.calls().is_empty(),"{race}");
-        assert!(rt.pending_force_restart.read().unwrap().is_none(),"{race}");
+        assert!(
+            rt.native_auto_select_default(subscription_target())
+                .await
+                .is_err(),
+            "{race}"
+        );
+        assert_eq!(rt.config.current().unwrap(), config, "{race}");
+        assert!(sink.calls().is_empty(), "{race}");
+        assert!(rt.pending_force_restart.read().unwrap().is_none(), "{race}");
     }
 }
 
 #[tokio::test]
 async fn native_default_partial_apply_or_intent_race_preserves_runtime_and_pending_reference() {
-    for race in ["put","intent","stop"] {
-        let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-        if race=="put" { sink.fail_at.lock().unwrap().insert(2); }
-        else {
-            let owner=Arc::clone(&rt);
-            *sink.on_put.lock().unwrap()=Some(Box::new(move|| {
-                if race=="stop" { owner.gate.bump_generation();owner.status.write().unwrap().running=false; }
-                else { owner.register_selector_intent(); }
+    for race in ["put", "intent", "stop"] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        if race == "put" {
+            sink.fail_at.lock().unwrap().insert(2);
+        } else {
+            let owner = Arc::clone(&rt);
+            *sink.on_put.lock().unwrap() = Some(Box::new(move || {
+                if race == "stop" {
+                    owner.gate.bump_generation();
+                    owner.status.write().unwrap().running = false;
+                } else {
+                    owner.register_selector_intent();
+                }
             }));
         }
-        assert!(rt.native_auto_select_default(subscription_target()).await.is_err(),"{race}");
-        assert_eq!(rt.current_config_snapshot().unwrap()["selectionIntent"],config["selectionIntent"],"R must not claim a rejected apply");
-        assert_eq!(rt.config.current().unwrap()["selectionIntent"],polaris_store::auto_select::intent(&subscription_target()),"the requested reference remains retryable");
+        assert!(
+            rt.native_auto_select_default(subscription_target())
+                .await
+                .is_err(),
+            "{race}"
+        );
+        assert_eq!(
+            rt.current_config_snapshot().unwrap()["selectionIntent"],
+            config["selectionIntent"],
+            "R must not claim a rejected apply"
+        );
+        assert_eq!(
+            rt.config.current().unwrap()["selectionIntent"],
+            polaris_store::auto_select::intent(&subscription_target()),
+            "the requested reference remains retryable"
+        );
         assert!(rt.pending_force_restart.read().unwrap().is_none());
-        if race=="stop" { assert_eq!(sink.calls().len(),1); }
-        else { assert_eq!(rt.native_auto_status().await.actual_server_id.as_deref(),Some("node-a")); }
+        if race == "stop" {
+            assert_eq!(sink.calls().len(), 1);
+        } else {
+            assert_eq!(
+                rt.native_auto_status().await.actual_server_id.as_deref(),
+                Some("node-a")
+            );
+        }
     }
 }
 
-#[tokio::test(start_paused=true)]
+#[tokio::test(start_paused = true)]
 async fn native_mode_projection_preserves_queued_default_and_unapplied_desired_fields() {
-    let (rt,_dir,_sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-    let mut desired=config.clone();desired["mixedPort"]=serde_json::json!(7999);
+    let (rt, _dir, _sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let mut desired = config.clone();
+    desired["mixedPort"] = serde_json::json!(7999);
     rt.config.save_full(&desired).unwrap();
-    let mut pending=config.clone();pending["selectionIntent"]=polaris_store::auto_select::intent(&subscription_target());
-    let intent=rt.register_selector_intent();
-    rt.restart_selected_projection(&pending,rt.core_generation(),intent);
+    let mut pending = config.clone();
+    pending["selectionIntent"] = polaris_store::auto_select::intent(&subscription_target());
+    let intent = rt.register_selector_intent();
+    rt.restart_selected_projection(&pending, rt.core_generation(), intent);
     rt.native_auto_set_enabled(false).await.unwrap();
-    let queued=rt.pending_force_restart.read().unwrap();
-    let (_,queued,_)=queued.as_ref().unwrap();
-    assert_eq!(queued["selectionIntent"],pending["selectionIntent"]);
-    assert_eq!(queued["autoSelectEnabled"],false);
-    assert_eq!(queued["mixedPort"],7890);
-    assert_eq!(rt.config.current().unwrap()["mixedPort"],7999);
-    assert_eq!(rt.current_config_snapshot().unwrap()["selectionIntent"],config["selectionIntent"]);
+    let queued = rt.pending_force_restart.read().unwrap();
+    let (_, queued, _) = queued.as_ref().unwrap();
+    assert_eq!(queued["selectionIntent"], pending["selectionIntent"]);
+    assert_eq!(queued["autoSelectEnabled"], false);
+    assert_eq!(queued["mixedPort"], 7890);
+    assert_eq!(rt.config.current().unwrap()["mixedPort"], 7999);
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectionIntent"],
+        config["selectionIntent"]
+    );
     rt.gate.bump_generation();
 }
 
 #[tokio::test]
 async fn native_wrong_endpoint_dirty_connection_and_missing_history_stay_pending() {
-    for source in ["url","connection","history","missing"] {
-        let (rt,_dir,sink,mut desired)=native_fixture(Some(AutoSelectTarget::Global),true);
+    for source in ["url", "connection", "history", "missing"] {
+        let (rt, _dir, sink, mut desired) = native_fixture(Some(AutoSelectTarget::Global), true);
         match source {
-            "url"=>desired["speedTestUrl"]=serde_json::json!("https://other.example/generate_204"),
-            "connection"=>desired["servers"][0]["port"]=serde_json::json!(19009),
-            "history"=>for group in sink.native_groups.lock().unwrap().as_mut().unwrap() {
-                for item in &mut group.items { item.url_test_time=0; }
-            },
-            "missing"=>*sink.native_groups.lock().unwrap()=None,
-            _=>unreachable!(),
+            "url" => {
+                desired["speedTestUrl"] = serde_json::json!("https://other.example/generate_204")
+            }
+            "connection" => desired["servers"][0]["port"] = serde_json::json!(19009),
+            "history" => {
+                for group in sink.native_groups.lock().unwrap().as_mut().unwrap() {
+                    for item in &mut group.items {
+                        item.url_test_time = 0;
+                    }
+                }
+            }
+            "missing" => *sink.native_groups.lock().unwrap() = None,
+            _ => unreachable!(),
         }
         rt.config.save_full(&desired).unwrap();
-        let status=rt.native_auto_status().await;
-        let global=status.native_auto_groups.iter().find(|group|group.target==AutoSelectTarget::Global).unwrap();
-        assert!(!global.confirmed,"{source}");assert_eq!(global.state,"pending","{source}");
+        let status = rt.native_auto_status().await;
+        let global = status
+            .native_auto_groups
+            .iter()
+            .find(|group| group.target == AutoSelectTarget::Global)
+            .unwrap();
+        assert!(!global.confirmed, "{source}");
+        assert_eq!(global.state, "pending", "{source}");
         assert!(sink.calls().is_empty());
-        if source=="missing" {assert_eq!(status.actual_server_id,None);}
-        else {assert_eq!(status.actual_server_id.as_deref(),Some("node-a"));}
-        assert!(rt.native_auto_set_enabled(false).await.is_err(),"{source}");
-        assert!(rt.config.current().unwrap()["autoSelectEnabled"].as_bool().unwrap());
+        if source == "missing" {
+            assert_eq!(status.actual_server_id, None);
+        } else {
+            assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+        }
+        assert!(rt.native_auto_set_enabled(false).await.is_err(), "{source}");
+        assert!(rt.config.current().unwrap()["autoSelectEnabled"]
+            .as_bool()
+            .unwrap());
     }
 }
 
 #[tokio::test]
 async fn native_status_event_fires_on_change_only_and_tracks_confirmed_actual_exit() {
-    let (rt,_dir,sink,_config)=native_fixture(Some(AutoSelectTarget::Global),true);
-    let events=Arc::new(Mutex::new(Vec::<Value>::new()));
-    rt.set_error_emitter(Box::new(RecordingErrorEmitter{auto_select_status:Arc::clone(&events),..Default::default()}));
-    for _ in 0..3 {rt.native_auto_status().await;}
-    assert_eq!(events.lock().unwrap().len(),1);
-    let global=native::urltest_tag(&AutoSelectTarget::Global);
-    sink.native_groups.lock().unwrap().as_mut().unwrap().iter_mut().find(|group|group.tag==global).unwrap().selected="Node B".into();
+    let (rt, _dir, sink, _config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        auto_select_status: Arc::clone(&events),
+        ..Default::default()
+    }));
+    for _ in 0..3 {
+        rt.native_auto_status().await;
+    }
+    assert_eq!(events.lock().unwrap().len(), 1);
+    let global = native::urltest_tag(&AutoSelectTarget::Global);
+    sink.native_groups
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|group| group.tag == global)
+        .unwrap()
+        .selected = "Node B".into();
     rt.native_auto_status().await;
     rt.native_auto_status().await;
-    let seen=events.lock().unwrap();
-    assert_eq!(seen.len(),2);
-    assert_eq!(seen[0]["actualServerId"],"node-a");assert_eq!(seen[1]["actualServerId"],"node-b");
-    assert!(seen[1]["nativeAutoGroups"][0]["confirmed"].as_bool().unwrap());
+    let seen = events.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0]["actualServerId"], "node-a");
+    assert_eq!(seen[1]["actualServerId"], "node-b");
+    assert!(seen[1]["nativeAutoGroups"][0]["confirmed"]
+        .as_bool()
+        .unwrap());
 }
 
 #[test]
 fn native_concurrent_announcements_never_deliver_an_old_generation_after_a_new_one() {
-    let (rt,_dir,_sink,_config)=native_fixture(Some(AutoSelectTarget::Global),true);
-    let events=Arc::new(Mutex::new(Vec::<Value>::new()));
-    rt.set_error_emitter(Box::new(RecordingErrorEmitter{auto_select_status:Arc::clone(&events),..Default::default()}));
+    let (rt, _dir, _sink, _config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        auto_select_status: Arc::clone(&events),
+        ..Default::default()
+    }));
     rt.auto_select_announce();
     std::thread::scope(|scope| {
-        for _ in 0..4 {scope.spawn(|| {for _ in 0..200 {rt.auto_select_announce();}});}
-        scope.spawn(|| {for _ in 1..=50 {rt.gate.bump_generation();rt.auto_select_announce();}});
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    rt.auto_select_announce();
+                }
+            });
+        }
+        scope.spawn(|| {
+            for _ in 1..=50 {
+                rt.gate.bump_generation();
+                rt.auto_select_announce();
+            }
+        });
     });
-    let seen:Vec<u64>=events.lock().unwrap().iter().map(|status|status["generation"].as_u64().unwrap()).collect();
-    assert!(seen.len()>=2);
-    assert!(seen.windows(2).all(|pair|pair[0]<pair[1]),"{seen:?}");
+    let seen: Vec<u64> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|status| status["generation"].as_u64().unwrap())
+        .collect();
+    assert!(seen.len() >= 2);
+    assert!(seen.windows(2).all(|pair| pair[0] < pair[1]), "{seen:?}");
 }
 
 #[test]
 fn native_route_projection_uses_running_emitted_members_and_clears_unknown_or_stopped() {
-    let (rt,_dir,_sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-    let mut desired=config.clone();desired["servers"][0]["address"]=serde_json::json!("unapplied.example");
+    let (rt, _dir, _sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let mut desired = config.clone();
+    desired["servers"][0]["address"] = serde_json::json!("unapplied.example");
     rt.config.save_full(&desired).unwrap();
-    rt.switch_snapshot.write().unwrap().as_mut().unwrap().id_to_tag.remove("node-c");
-    let projected=rt.emitted_exit_route_config().unwrap();
-    assert_eq!(projected.servers.len(),2);
-    assert!(!projected.servers.iter().any(|node|node.id=="node-c"));
-    assert_eq!(projected.servers[0].address,config["servers"][0]["address"].as_str().unwrap());
-    *rt.switch_snapshot.write().unwrap()=None;
+    rt.switch_snapshot
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .id_to_tag
+        .remove("node-c");
+    let projected = rt.emitted_exit_route_config().unwrap();
+    assert_eq!(projected.servers.len(), 2);
+    assert!(!projected.servers.iter().any(|node| node.id == "node-c"));
+    assert_eq!(
+        projected.servers[0].address,
+        config["servers"][0]["address"].as_str().unwrap()
+    );
+    *rt.switch_snapshot.write().unwrap() = None;
     assert!(rt.emitted_exit_route_config().is_none());
-    rt.status.write().unwrap().running=false;
+    rt.status.write().unwrap().running = false;
     assert!(rt.emitted_exit_route_config().is_none());
 }
 
-#[cfg(not(target_os="ios"))]
+#[cfg(not(target_os = "ios"))]
 #[test]
 fn native_runtime_snapshot_excludes_configured_but_unemitted_nodes() {
-    let (rt,_dir)=test_runtime();
-    let mut raw=two_node_config(7890,"node-a");
-    raw["autoSelectEnabled"]=serde_json::json!(true);
-    raw["selectionIntent"]=polaris_store::auto_select::intent(&AutoSelectTarget::Global);
-    let typed:UserConfig=serde_json::from_value(raw.clone()).unwrap();
-    let deps=rt.generate_deps(30_101,0,0,None,&[20_010],&raw,false);
-    let mut emitted=polaris_config_engine::builder::generate_sing_box_config(&typed,&BTreeMap::new(),&deps).unwrap();
-    assert!(serde_json::to_value(&emitted).unwrap().get("selectionIntent").is_none());
-    assert!(emitted.outbounds.iter().any(|outbound|outbound.tag==native::wrapper_tag(&AutoSelectTarget::Global)));
-    emitted.outbounds.retain(|outbound|outbound.tag!="Node B");
-    let snapshot=ProxyRuntime::build_switch_snapshot(&typed,&emitted,&deps);
+    let (rt, _dir) = test_runtime();
+    let mut raw = two_node_config(7890, "node-a");
+    raw["autoSelectEnabled"] = serde_json::json!(true);
+    raw["selectionIntent"] = polaris_store::auto_select::intent(&AutoSelectTarget::Global);
+    let typed: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    let deps = rt.generate_deps(30_101, 0, 0, None, &[20_010], &raw, false);
+    let mut emitted =
+        polaris_config_engine::builder::generate_sing_box_config(&typed, &BTreeMap::new(), &deps)
+            .unwrap();
+    assert!(serde_json::to_value(&emitted)
+        .unwrap()
+        .get("selectionIntent")
+        .is_none());
+    assert!(emitted
+        .outbounds
+        .iter()
+        .any(|outbound| outbound.tag == native::wrapper_tag(&AutoSelectTarget::Global)));
+    emitted
+        .outbounds
+        .retain(|outbound| outbound.tag != "Node B");
+    let snapshot = ProxyRuntime::build_switch_snapshot(&typed, &emitted, &deps);
     assert!(snapshot.id_to_tag.contains_key("node-a"));
     assert!(!snapshot.id_to_tag.contains_key("node-b"));
 }
 
-
 #[tokio::test]
 async fn native_manual_unattested_put_does_not_fall_through_to_structural_restart() {
-    let (rt,_dir,sink,config)=native_fixture(Some(AutoSelectTarget::Global),true);
-    sink.follow_puts.store(false,Ordering::SeqCst);
-    let (_,_,intent,_)=server_switch_core(&rt.config,"node-b",|_|Ok(()),||rt.register_selector_intent()).unwrap();
-    assert_eq!(rt.switch_selected_server_if_current("node-b",intent).await.unwrap(),Some(SwitchOutcome::Pending));
-    assert_eq!(rt.current_config_snapshot().unwrap()["selectionIntent"],config["selectionIntent"]);
-    assert_eq!(rt.native_auto_status().await.actual_server_id.as_deref(),Some("node-a"));
+    let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    sink.follow_puts.store(false, Ordering::SeqCst);
+    let (_, _, intent, _) = server_switch_core(
+        &rt.config,
+        "node-b",
+        |_| Ok(()),
+        || rt.register_selector_intent(),
+    )
+    .unwrap();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectionIntent"],
+        config["selectionIntent"]
+    );
+    assert_eq!(
+        rt.native_auto_status().await.actual_server_id.as_deref(),
+        Some("node-a")
+    );
     assert!(rt.pending_force_restart.read().unwrap().is_none());
     assert!(rt.selector_reconcile.is_required());
 }
 
-
 #[tokio::test]
 async fn native_real_config_writer_invalidates_edited_pins_without_fabricating_refresh_winners() {
-    let (rt,_dir,_sink,_config)=native_fixture(Some(AutoSelectTarget::Global),true);
+    let (rt, _dir, _sink, _config) = native_fixture(Some(AutoSelectTarget::Global), true);
     rt.native_auto_set_enabled(false).await.unwrap();
-    let mut desired=rt.config.current().unwrap();
-    desired["mixedPort"]=serde_json::json!(7999);
+    let mut desired = rt.config.current().unwrap();
+    desired["mixedPort"] = serde_json::json!(7999);
     rt.config.save_full(&desired).unwrap();
-    let unchanged:UserConfig=serde_json::from_value(rt.config.current().unwrap()).unwrap();
-    assert_eq!(unchanged.auto_select_pins.len(),2,"unrelated pending edits cannot discard verified pins");
-    desired["servers"][2]["address"]=serde_json::json!("replacement.example");
+    let unchanged: UserConfig = serde_json::from_value(rt.config.current().unwrap()).unwrap();
+    assert_eq!(
+        unchanged.auto_select_pins.len(),
+        2,
+        "unrelated pending edits cannot discard verified pins"
+    );
+    desired["servers"][2]["address"] = serde_json::json!("replacement.example");
     rt.config.save_full(&desired).unwrap();
-    let changed:UserConfig=serde_json::from_value(rt.config.current().unwrap()).unwrap();
-    assert_eq!(native::pin(&changed,&AutoSelectTarget::Global),Some("node-a"));
-    assert_eq!(native::pin(&changed,&subscription_target()),None);
-    let status=rt.native_auto_status().await;
-    assert_eq!(status.actual_server_id.as_deref(),Some("node-a"));
-    assert!(!status.native_auto_groups.iter().find(|group|group.target==subscription_target()).unwrap().confirmed);
-    rt.status.write().unwrap().running=false;
-    assert_eq!(rt.native_auto_set_enabled(false).await.unwrap_err(),"AUTO_SELECT_NO_ACTUAL_EXIT");
+    let changed: UserConfig = serde_json::from_value(rt.config.current().unwrap()).unwrap();
+    assert_eq!(
+        native::pin(&changed, &AutoSelectTarget::Global),
+        Some("node-a")
+    );
+    assert_eq!(native::pin(&changed, &subscription_target()), None);
+    let status = rt.native_auto_status().await;
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert!(
+        !status
+            .native_auto_groups
+            .iter()
+            .find(|group| group.target == subscription_target())
+            .unwrap()
+            .confirmed
+    );
+    rt.status.write().unwrap().running = false;
+    assert_eq!(
+        rt.native_auto_set_enabled(false).await.unwrap_err(),
+        "AUTO_SELECT_NO_ACTUAL_EXIT"
+    );
 }
-
 
 #[test]
 fn native_retest_requests_http_without_an_app_winner_write() {
-    let body=method_body(&module_code("runtime/proxy"),
-        "    pub(crate) async fn native_auto_retest(&self) -> Result<NativeAutoStatus,String> {");
+    let body = method_body(
+        &module_code("runtime/proxy"),
+        "    pub(crate) async fn native_auto_retest(&self) -> Result<NativeAutoStatus,String> {",
+    );
     assert!(body.contains(".url_test("));
     assert!(!body.contains("native_put(") && !body.contains("auto_select_explicit"));
-    assert!(body.contains("self.native_auto_status().await"),"ACK is not a winner receipt");
+    assert!(
+        body.contains("self.native_auto_status().await"),
+        "ACK is not a winner receipt"
+    );
 }
 
 #[tokio::test]
 async fn native_off_rejects_unapplied_runtime_only_or_retargeted_references_before_any_put() {
     for change in ["remove-rule", "empty-desired", "retarget-rule"] {
-        let (rt,_dir,sink,original)=native_fixture(Some(AutoSelectTarget::Global),true);
-        let runtime=rt.current_config_snapshot().unwrap();
-        let mut desired=original.clone();
-        if change=="retarget-rule" { desired["appRules"][0]["targetAutoSelect"]=serde_json::json!({"scope":"manual"}); }
-        else { desired["appRules"]=serde_json::json!([]); }
-        if change=="empty-desired" { desired.as_object_mut().unwrap().remove("selectionIntent"); }
+        let (rt, _dir, sink, original) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let runtime = rt.current_config_snapshot().unwrap();
+        let mut desired = original.clone();
+        if change == "retarget-rule" {
+            desired["appRules"][0]["targetAutoSelect"] = serde_json::json!({"scope":"manual"});
+        } else {
+            desired["appRules"] = serde_json::json!([]);
+        }
+        if change == "empty-desired" {
+            desired.as_object_mut().unwrap().remove("selectionIntent");
+        }
         rt.config.save_full(&desired).unwrap();
-        let saved=rt.config.current().unwrap();
-        assert_eq!(rt.native_auto_set_enabled(false).await.unwrap_err(),"AUTO_SELECT_REQUIRES_APPLY","{change}");
+        let saved = rt.config.current().unwrap();
+        assert_eq!(
+            rt.native_auto_set_enabled(false).await.unwrap_err(),
+            "AUTO_SELECT_REQUIRES_APPLY",
+            "{change}"
+        );
         assert!(sink.calls().is_empty());
-        assert_eq!(rt.config.current().unwrap(),saved);
-        assert_eq!(rt.current_config_snapshot().unwrap(),runtime);
+        assert_eq!(rt.config.current().unwrap(), saved);
+        assert_eq!(rt.current_config_snapshot().unwrap(), runtime);
     }
 }
 
 #[tokio::test]
 async fn native_mode_read_race_cannot_write_even_before_first_put() {
     for change in ["saved", "intent", "generation"] {
-        let (rt,_dir,sink,_)=native_fixture(Some(AutoSelectTarget::Global),true);
-        let owner=Arc::clone(&rt);
-        *sink.on_groups.lock().unwrap()=Some(Box::new(move|| {
-            match change {
-                "saved"=>{let mut config=owner.config.current().unwrap();config["appRules"]=serde_json::json!([]);owner.config.save_full(&config).unwrap();},
-                "intent"=>{owner.register_selector_intent();},
-                _=>{owner.gate.bump_generation();},
+        let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let owner = Arc::clone(&rt);
+        *sink.on_groups.lock().unwrap() = Some(Box::new(move || match change {
+            "saved" => {
+                let mut config = owner.config.current().unwrap();
+                config["appRules"] = serde_json::json!([]);
+                owner.config.save_full(&config).unwrap();
+            }
+            "intent" => {
+                owner.register_selector_intent();
+            }
+            _ => {
+                owner.gate.bump_generation();
             }
         }));
         assert!(rt.native_auto_set_enabled(false).await.is_err());
         assert!(sink.calls().is_empty());
-        assert_eq!(rt.config.current().unwrap()["autoSelectEnabled"],true);
+        assert_eq!(rt.config.current().unwrap()["autoSelectEnabled"], true);
     }
 }
 
-#[tokio::test(start_paused=true)]
+#[tokio::test(start_paused = true)]
 async fn native_enable_absent_graph_reports_reload_not_applied_and_preserves_runtime_flag() {
-    let (rt,_dir,sink,_)=native_fixture(Some(AutoSelectTarget::Global),true);
+    let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), true);
     rt.native_auto_set_enabled(false).await.unwrap();
-    sink.native_groups.lock().unwrap().as_mut().unwrap().retain(|group| !group.tag.ends_with("-test"));
-    let status=rt.native_auto_set_enabled(true).await.unwrap();
-    assert_eq!(status.apply_outcome,Some("restarting"));
-    assert_eq!(rt.config.current().unwrap()["autoSelectEnabled"],true);
-    assert_eq!(rt.current_config_snapshot().unwrap()["autoSelectEnabled"],false);
+    sink.native_groups
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .retain(|group| !group.tag.ends_with("-test"));
+    let status = rt.native_auto_set_enabled(true).await.unwrap();
+    assert_eq!(status.apply_outcome, Some("restarting"));
+    assert_eq!(rt.config.current().unwrap()["autoSelectEnabled"], true);
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["autoSelectEnabled"],
+        false
+    );
     assert!(rt.pending_force_restart.read().unwrap().is_some());
     rt.gate.bump_generation(); // superseded/failed reload cannot turn the earlier receipt into applied
-    assert_eq!(status.apply_outcome,Some("restarting"));
+    assert_eq!(status.apply_outcome, Some("restarting"));
 }
 
 #[tokio::test]
 async fn native_stopped_enable_returns_saved_not_runtime_applied() {
-    let (rt,_dir,_sink,_)=native_fixture(None,false);
-    rt.status.write().unwrap().running=false;
-    let status=rt.native_auto_set_enabled(true).await.unwrap();
-    assert_eq!(status.apply_outcome,Some("saved"));
-    assert_eq!(status.actual_server_id,None);
+    let (rt, _dir, _sink, _) = native_fixture(None, false);
+    rt.status.write().unwrap().running = false;
+    let status = rt.native_auto_set_enabled(true).await.unwrap();
+    assert_eq!(status.apply_outcome, Some("saved"));
+    assert_eq!(status.actual_server_id, None);
 }
 
 #[tokio::test]
 async fn native_mode_scheduler_failure_is_deferred_and_obsolete_claim_is_rejected() {
-    let (rt,_dir,_sink,config)=native_fixture(None,false);
-    let generation=rt.core_generation();let intent=rt.selector_reconcile.intent_generation();
-    let owner=Arc::clone(&rt);
-    let _=std::thread::spawn(move|| {let _lock=owner.pending_force_restart.write().unwrap();panic!("poison restart storage");}).join();
-    assert_eq!(rt.commit_native_mode_projection(&config,generation,intent,true),Some(SwitchOutcome::Deferred));
+    let (rt, _dir, _sink, config) = native_fixture(None, false);
+    let generation = rt.core_generation();
+    let intent = rt.selector_reconcile.intent_generation();
+    let owner = Arc::clone(&rt);
+    let _ = std::thread::spawn(move || {
+        let _lock = owner.pending_force_restart.write().unwrap();
+        panic!("poison restart storage");
+    })
+    .join();
+    assert_eq!(
+        rt.commit_native_mode_projection(&config, generation, intent, true),
+        Some(SwitchOutcome::Deferred)
+    );
     rt.gate.bump_generation();
-    assert_eq!(rt.commit_native_mode_projection(&config,generation,intent,true),None);
+    assert_eq!(
+        rt.commit_native_mode_projection(&config, generation, intent, true),
+        None
+    );
 }
 
 #[tokio::test]
 async fn native_cancel_before_admission_or_during_status_never_uses_cached_completed_results() {
     use crate::commands::speedtest::SpeedTestCancel;
     use crate::runtime::speedtest::InterruptReason;
-    for before in [true,false] {
-        let (rt,_dir,sink,_)=native_fixture(Some(AutoSelectTarget::Global),true);
-        let cancel=SpeedTestCancel::default();
-        let observed=Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let observed_by_read=Arc::clone(&observed);
-        let during_read=cancel.clone();
-        *sink.on_groups.lock().unwrap()=Some(Box::new(move|| {
-            observed_by_read.store(true,Ordering::SeqCst);
-            if !before { during_read.cancel(InterruptReason::Preempted); }
+    for before in [true, false] {
+        let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let cancel = SpeedTestCancel::default();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_by_read = Arc::clone(&observed);
+        let during_read = cancel.clone();
+        *sink.on_groups.lock().unwrap() = Some(Box::new(move || {
+            observed_by_read.store(true, Ordering::SeqCst);
+            if !before {
+                during_read.cancel(InterruptReason::Preempted);
+            }
         }));
-        if before { cancel.cancel(InterruptReason::Cancelled); }
-        assert!(rt.native_measure_requested(&["node-a".into()],&cancel).await.is_empty());
-        assert_eq!(observed.load(Ordering::SeqCst),!before);
+        if before {
+            cancel.cancel(InterruptReason::Cancelled);
+        }
+        assert!(rt
+            .native_measure_requested(&["node-a".into()], &cancel)
+            .await
+            .is_empty());
+        assert_eq!(observed.load(Ordering::SeqCst), !before);
         assert!(cancel.reason().is_some());
         assert!(sink.calls().is_empty());
         assert!(rt.pending_force_restart.read().unwrap().is_none());
@@ -1366,29 +1756,42 @@ async fn native_cancel_before_admission_or_during_status_never_uses_cached_compl
 
 #[tokio::test]
 async fn native_manual_sentinels_are_runtime_attested_despite_pending_saved_selection() {
-    for id in ["__direct__","__block__"] {
-        let (rt,_dir,sink,mut applied)=native_fixture(None,false);
-        applied["selectedServerId"]=serde_json::json!(id);
-        applied["proxyMode"]=serde_json::json!("smart");
-        mark_running_with_snapshot(&rt,&applied);
-        *rt.startup_snapshot.write().unwrap()=Some(applied.clone());
+    for id in ["__direct__", "__block__"] {
+        let (rt, _dir, sink, mut applied) = native_fixture(None, false);
+        applied["selectedServerId"] = serde_json::json!(id);
+        applied["proxyMode"] = serde_json::json!("smart");
+        mark_running_with_snapshot(&rt, &applied);
+        *rt.startup_snapshot.write().unwrap() = Some(applied.clone());
         // Desired remains a different ordinary node; it cannot provide actual identity.
-        assert_ne!(rt.config.current().unwrap()["selectedServerId"],id);
+        assert_ne!(rt.config.current().unwrap()["selectedServerId"], id);
         {
-            let mut groups=sink.native_groups.lock().unwrap();
-            let proxy=groups.as_mut().unwrap().iter_mut().find(|group|group.tag==PROXY_SELECTOR_TAG).unwrap();
-            proxy.selected="direct".into();
-            proxy.items.push(GroupItem{tag:"direct".into(),..Default::default()});
+            let mut groups = sink.native_groups.lock().unwrap();
+            let proxy = groups
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|group| group.tag == PROXY_SELECTOR_TAG)
+                .unwrap();
+            proxy.selected = "direct".into();
+            proxy.items.push(GroupItem {
+                tag: "direct".into(),
+                ..Default::default()
+            });
         }
-        assert_eq!(rt.native_auto_status().await.actual_server_id.as_deref(),Some(id));
-        assert_eq!(rt.status().actual_server_id.as_deref(),Some(id));
-        if id=="__direct__" { *sink.native_groups.lock().unwrap()=None; }
-        else { *rt.startup_snapshot.write().unwrap()=None; }
-        assert_eq!(rt.native_auto_status().await.actual_server_id,None);
-        assert_eq!(rt.status().actual_server_id,None);
+        assert_eq!(
+            rt.native_auto_status().await.actual_server_id.as_deref(),
+            Some(id)
+        );
+        assert_eq!(rt.status().actual_server_id.as_deref(), Some(id));
+        if id == "__direct__" {
+            *sink.native_groups.lock().unwrap() = None;
+        } else {
+            *rt.startup_snapshot.write().unwrap() = None;
+        }
+        assert_eq!(rt.native_auto_status().await.actual_server_id, None);
+        assert_eq!(rt.status().actual_server_id, None);
     }
 }
-
 
 /// Deterministic suspension points: capture the one-shot ticket and A first,
 /// accept B, then release the old success/failure. No timers or network involved.
@@ -1397,26 +1800,58 @@ async fn native_observation_fences_old_success_failure_and_relay_queue() {
     let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), false);
     let events = Arc::new(Mutex::new(Vec::<Value>::new()));
     rt.set_error_emitter(Box::new(RecordingErrorEmitter {
-        auto_select_status: Arc::clone(&events), ..Default::default()
+        auto_select_status: Arc::clone(&events),
+        ..Default::default()
     }));
     let generation = rt.core_generation();
     let a = sink.native_groups.lock().unwrap().clone().unwrap();
     let mut b = a.clone();
-    let tag = rt.switch_snapshot.read().unwrap().as_ref().unwrap().id_to_tag["node-b"].clone();
-    b.iter_mut().find(|group| group.tag == PROXY_SELECTOR_TAG).unwrap().selected = tag;
+    let tag = rt
+        .switch_snapshot
+        .read()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .id_to_tag["node-b"]
+        .clone();
+    b.iter_mut()
+        .find(|group| group.tag == PROXY_SELECTOR_TAG)
+        .unwrap()
+        .selected = tag;
     let suspended = rt.native_observation_revision();
-    let relay = rt.publish_native_groups(generation, suspended, b.clone()).unwrap();
-    assert_eq!(rt.native_auto_cached_status().actual_server_id.as_deref(), Some("node-b"));
-    assert!(rt.publish_native_groups(generation, suspended, a.clone()).is_none());
-    assert!(rt.publish_native_groups(generation, suspended, Vec::new()).is_none());
-    assert_eq!(rt.native_auto_cached_status().actual_server_id.as_deref(), Some("node-b"));
+    let relay = rt
+        .publish_native_groups(generation, suspended, b.clone())
+        .unwrap();
+    assert_eq!(
+        rt.native_auto_cached_status().actual_server_id.as_deref(),
+        Some("node-b")
+    );
+    assert!(rt
+        .publish_native_groups(generation, suspended, a.clone())
+        .is_none());
+    assert!(rt
+        .publish_native_groups(generation, suspended, Vec::new())
+        .is_none());
+    assert_eq!(
+        rt.native_auto_cached_status().actual_server_id.as_deref(),
+        Some("node-b")
+    );
 
     // A selector readback wins while the relay has an old A frame queued. Its
     // old connection ticket must be rejected, forcing a fresh subscription.
     let selector = rt.publish_native_groups(generation, relay, b).unwrap();
-    assert!(rt.publish_native_groups(generation, relay, a.clone()).is_none());
-    assert_eq!(rt.native_auto_cached_status().actual_server_id.as_deref(), Some("node-b"));
-    assert_eq!(events.lock().unwrap().len(), 1, "rejected frames must not announce stale state");
+    assert!(rt
+        .publish_native_groups(generation, relay, a.clone())
+        .is_none());
+    assert_eq!(
+        rt.native_auto_cached_status().actual_server_id.as_deref(),
+        Some("node-b")
+    );
+    assert_eq!(
+        events.lock().unwrap().len(),
+        1,
+        "rejected frames must not announce stale state"
+    );
     assert_eq!(events.lock().unwrap()[0]["actualServerId"], "node-b");
     rt.bump_generation();
     assert!(rt.publish_native_groups(generation, selector, a).is_none());
@@ -1428,48 +1863,92 @@ async fn native_status_inflight_response_cannot_replace_a_newer_observation() {
     for failed in [false, true] {
         let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), false);
         let mut b = sink.native_groups.lock().unwrap().clone().unwrap();
-        let tag = rt.switch_snapshot.read().unwrap().as_ref().unwrap().id_to_tag["node-b"].clone();
-        b.iter_mut().find(|group| group.tag == PROXY_SELECTOR_TAG).unwrap().selected = tag;
-        if failed { *sink.native_groups.lock().unwrap() = None; }
+        let tag = rt
+            .switch_snapshot
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .id_to_tag["node-b"]
+            .clone();
+        b.iter_mut()
+            .find(|group| group.tag == PROXY_SELECTOR_TAG)
+            .unwrap()
+            .selected = tag;
+        if failed {
+            *sink.native_groups.lock().unwrap() = None;
+        }
         let newer = Arc::clone(&rt);
         // Existing request seam fires after the status ticket is captured, before
         // the request returns its independently held A (or failure).
         *sink.on_groups.lock().unwrap() = Some(Box::new(move || {
             let revision = newer.native_observation_revision();
-            assert!(newer.publish_native_groups(newer.core_generation(), revision, b).is_some());
+            assert!(newer
+                .publish_native_groups(newer.core_generation(), revision, b)
+                .is_some());
         }));
         let status = rt.native_auto_status().await;
-        assert_eq!(status.actual_server_id.as_deref(), Some("node-b"), "failed={failed}");
+        assert_eq!(
+            status.actual_server_id.as_deref(),
+            Some("node-b"),
+            "failed={failed}"
+        );
     }
 }
-
 
 #[test]
 fn native_measure_frame_rechecks_current_identity_and_membership_without_publishing() {
     for change in ["fingerprint", "remove"] {
-        let (rt, _dir, sink, request_config) = native_fixture(Some(AutoSelectTarget::Global), false);
+        let (rt, _dir, sink, request_config) =
+            native_fixture(Some(AutoSelectTarget::Global), false);
         let generation = rt.core_generation();
         let url = crate::commands::speedtest::resolve_speed_test_url(&request_config);
         let frame = sink.native_groups.lock().unwrap().clone().unwrap();
         let revision = rt.native_observation_revision();
-        let initial = rt.native_measure_frame_status(generation, &url, &frame).unwrap();
-        assert!(initial.native_measurements.iter().any(|sample| sample.server_id == "node-b"));
+        let initial = rt
+            .native_measure_frame_status(generation, &url, &frame)
+            .unwrap();
+        assert!(initial
+            .native_measurements
+            .iter()
+            .any(|sample| sample.server_id == "node-b"));
 
         // Request and native frame still describe the old emitted connection.
         // D changes during its wait without changing G, Auto, or test URL.
         let mut latest = request_config.clone();
         let servers = latest["servers"].as_array_mut().unwrap();
         if change == "fingerprint" {
-            servers.iter_mut().find(|node| node["id"] == "node-b").unwrap()["port"] = serde_json::json!(19002);
+            servers
+                .iter_mut()
+                .find(|node| node["id"] == "node-b")
+                .unwrap()["port"] = serde_json::json!(19002);
         } else {
             servers.retain(|node| node["id"] != "node-b");
         }
         rt.config.save_full(&latest).unwrap();
         assert_eq!(rt.core_generation(), generation);
         // This is the production frame-processing seam, which loads D itself.
-        let current = rt.native_measure_frame_status(generation, &url, &frame).unwrap();
-        assert!(!current.native_measurements.iter().any(|sample| sample.server_id == "node-b"), "{change}");
-        assert!(current.native_measurements.iter().any(|sample| sample.server_id == "node-a"), "unchanged clean sample: {change}");
-        assert_eq!(rt.native_observation_revision(), revision, "measurement frames stay local");
+        let current = rt
+            .native_measure_frame_status(generation, &url, &frame)
+            .unwrap();
+        assert!(
+            !current
+                .native_measurements
+                .iter()
+                .any(|sample| sample.server_id == "node-b"),
+            "{change}"
+        );
+        assert!(
+            current
+                .native_measurements
+                .iter()
+                .any(|sample| sample.server_id == "node-a"),
+            "unchanged clean sample: {change}"
+        );
+        assert_eq!(
+            rt.native_observation_revision(),
+            revision,
+            "measurement frames stay local"
+        );
     }
 }

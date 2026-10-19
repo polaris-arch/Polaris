@@ -6,7 +6,8 @@
 use std::collections::BTreeMap;
 
 use crate::builder::outbound_helpers::{
-    is_quic_managed_tls, normalize_duration, parse_ws_early_data, should_emit_tls_engine, supports_tls_fragment,
+    is_quic_managed_tls, normalize_duration, parse_ws_early_data, should_emit_tls_engine,
+    supports_tls_fragment,
 };
 use crate::singbox::{
     DomainResolver, Ech, Hysteria2Obfs, Multiplex, OneOrMany, Outbound, OutboundTls, Reality,
@@ -93,8 +94,13 @@ pub fn build_proxy_outbound(
             let mut ob = Outbound::shell(&type_field, tag);
             ob.extra = extra;
             if let Some(tls) = ob.extra.get("tls").and_then(serde_json::Value::as_object) {
-                if matches!(tls.get("engine").and_then(serde_json::Value::as_str), Some("apple" | "windows"))
-                    && ["fragment", "record_fragment"].iter().any(|key| tls.get(*key).and_then(serde_json::Value::as_bool) == Some(true)) {
+                if matches!(
+                    tls.get("engine").and_then(serde_json::Value::as_str),
+                    Some("apple" | "windows")
+                ) && ["fragment", "record_fragment"]
+                    .iter()
+                    .any(|key| tls.get(*key).and_then(serde_json::Value::as_bool) == Some(true))
+                {
                     return Err("TLS_FRAGMENT_UNSUPPORTED");
                 }
             }
@@ -594,18 +600,32 @@ pub fn build_proxy_outbound(
             // 会自行置 InsecureSkipVerify 并挂 pin 回调（std_client.go :138-146、utls_client.go :212-220、
             // system_client_engine.go :104），insecure 真假都由 pin 单独把关。reality 不在此列 ——
             // 见下方 Reality 段整体替换本块时写死的 None。
-            certificate_sha256: if tls_pin::modeled_cert_pins_are_emitted(server.protocol, server.security.as_ref()) { tls_pin::cert_pins_for_kernel(
-                server
-                    .tls_settings
-                    .as_ref()
-                    .and_then(|t| t.certificate_sha256.as_deref()),
-            )? } else { None },
-            certificate_public_key_sha256: if tls_pin::modeled_cert_pins_are_emitted(server.protocol, server.security.as_ref()) { tls_pin::cert_pins_for_kernel(
-                server
-                    .tls_settings
-                    .as_ref()
-                    .and_then(|t| t.certificate_public_key_sha256.as_deref()),
-            )? } else { None },
+            certificate_sha256: if tls_pin::modeled_cert_pins_are_emitted(
+                server.protocol,
+                server.security.as_ref(),
+            ) {
+                tls_pin::cert_pins_for_kernel(
+                    server
+                        .tls_settings
+                        .as_ref()
+                        .and_then(|t| t.certificate_sha256.as_deref()),
+                )?
+            } else {
+                None
+            },
+            certificate_public_key_sha256: if tls_pin::modeled_cert_pins_are_emitted(
+                server.protocol,
+                server.security.as_ref(),
+            ) {
+                tls_pin::cert_pins_for_kernel(
+                    server
+                        .tls_settings
+                        .as_ref()
+                        .and_then(|t| t.certificate_public_key_sha256.as_deref()),
+                )?
+            } else {
+                None
+            },
         });
 
         let tls_engine = server
@@ -735,8 +755,15 @@ pub fn build_proxy_outbound(
     }
 
     // 抗封后处理。
-    if server.tls_settings.as_ref().is_some_and(|t| t.fragment == Some(true))
-        && ob.tls.as_ref().is_some_and(|tls| matches!(tls.engine.as_deref(), Some("apple" | "windows"))) {
+    if server
+        .tls_settings
+        .as_ref()
+        .is_some_and(|t| t.fragment == Some(true))
+        && ob
+            .tls
+            .as_ref()
+            .is_some_and(|tls| matches!(tls.engine.as_deref(), Some("apple" | "windows")))
+    {
         return Err("TLS_FRAGMENT_UNSUPPORTED");
     }
     apply_anti_censorship_options(&mut ob, server, arch);
@@ -868,8 +895,10 @@ fn generate_transport_config(server: &ServerConfig) -> Option<Transport> {
 /// 抗封后处理（ECH/fragment/spoof/multiplex/hy2 端口跳跃）。上游 `applyAntiCensorshipOptions`。
 fn apply_anti_censorship_options(ob: &mut Outbound, server: &ServerConfig, arch: &str) {
     let protocol_lower = protocol_str(server.protocol);
-    let fragment_unsupported =
-        !supports_tls_fragment(&protocol_lower, ob.tls.as_ref().and_then(|t| t.engine.as_deref()));
+    let fragment_unsupported = !supports_tls_fragment(
+        &protocol_lower,
+        ob.tls.as_ref().and_then(|t| t.engine.as_deref()),
+    );
 
     // ECH + fragment + spoof（需 tls 块）。
     if let Some(tls) = ob.tls.as_mut() {

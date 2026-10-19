@@ -574,7 +574,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         return { receipt, failure, config: await api.config.get(), readGeneration };
       } catch (error) {
         if (!configReadGeneration.isCurrent(readGeneration)) return null;
-        throw Object.assign(error instanceof Error ? error : new Error('Selection readback failed'), { code: 'SERVER_SWITCH_READBACK_FAILED', commandFailure: failure });
+        throw Object.assign(error instanceof Error ? error : new Error('SERVER_SWITCH_READBACK_FAILED'), { code: 'SERVER_SWITCH_READBACK_FAILED', commandFailure: failure });
       }
     });
     if (!readback || !configReadGeneration.isCurrent(readback.readGeneration)) return null;

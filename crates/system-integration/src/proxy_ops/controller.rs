@@ -191,13 +191,15 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
         };
         match self.ops.snapshot_relation(apply_base, applied, &current) {
             ProxySnapshotRelation::Exact | ProxySnapshotRelation::Prefix => {
-                if let Err(error) = validate_restore_scope(apply_base, applied, &current)
-                    .and_then(|()| {
+                if let Err(error) =
+                    validate_restore_scope(apply_base, applied, &current).and_then(|()| {
                         match self.marker.begin_apply_rollback(txn_id, &current) {
                             ProxyMarkerMutationOutcome::Updated => {}
-                            _ => return Err(SystemIntegrationError::proxy(
-                                "持久化 immediate rollback anchor 失败或事务已变化，停止写入",
-                            )),
+                            _ => {
+                                return Err(SystemIntegrationError::proxy(
+                                    "持久化 immediate rollback anchor 失败或事务已变化，停止写入",
+                                ))
+                            }
                         }
                         self.ops.restore_transaction(apply_base, &current)
                     })
@@ -501,7 +503,14 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                         self.clear_current_marker(txn_id, ProxyMarkerPhase::RestoredPendingClear)?;
                     }
                     ProxySnapshotRelation::Unchanged | ProxySnapshotRelation::Prefix => {
-                        self.restore_current_transaction(txn_id, original, applied, marker.exact_prior_applied.as_ref(), &current, restored_os)?;
+                        self.restore_current_transaction(
+                            txn_id,
+                            original,
+                            applied,
+                            marker.exact_prior_applied.as_ref(),
+                            &current,
+                            restored_os,
+                        )?;
                     }
                     ProxySnapshotRelation::Foreign => {
                         return Err(SystemIntegrationError::proxy(
@@ -517,7 +526,10 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                 let may_restore = match marker.phase {
                     ProxyMarkerPhase::Applying => {
                         if let Some(rollback_base) = marker.exact_restore_base.as_ref() {
-                            match self.ops.snapshot_relation(rollback_base, apply_base, &current) {
+                            match self
+                                .ops
+                                .snapshot_relation(rollback_base, apply_base, &current)
+                            {
                                 ProxySnapshotRelation::Exact => {
                                     if apply_base == original {
                                         // Registry values may be restored while notification failed.
@@ -528,7 +540,8 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                                         true
                                     }
                                 }
-                                ProxySnapshotRelation::Unchanged | ProxySnapshotRelation::Prefix => true,
+                                ProxySnapshotRelation::Unchanged
+                                | ProxySnapshotRelation::Prefix => true,
                                 ProxySnapshotRelation::Foreign => {
                                     return Err(SystemIntegrationError::proxy(
                                         "Applying 回滚状态已被外部修改，保留 marker 并拒绝覆盖",
@@ -537,12 +550,14 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                             }
                         } else {
                             match relation {
-                                ProxySnapshotRelation::Exact | ProxySnapshotRelation::Prefix => true,
+                                ProxySnapshotRelation::Exact | ProxySnapshotRelation::Prefix => {
+                                    true
+                                }
                                 ProxySnapshotRelation::Unchanged => apply_base != original,
                                 ProxySnapshotRelation::Foreign => false,
                             }
                         }
-                    },
+                    }
                     ProxyMarkerPhase::Owned => relation == ProxySnapshotRelation::Exact,
                     ProxyMarkerPhase::Restoring | ProxyMarkerPhase::RestoredPendingClear => {
                         unreachable!()
@@ -552,18 +567,32 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                     self.clear_current_marker(txn_id, marker.phase)?;
                 } else {
                     validate_restore_scope_with_prior(
-                        original, applied, marker.exact_prior_applied.as_ref(), &current,
+                        original,
+                        applied,
+                        marker.exact_prior_applied.as_ref(),
+                        &current,
                     )?;
                     match self.marker.begin_restore(txn_id, marker.phase, &current) {
                         ProxyMarkerMutationOutcome::Updated => {}
-                        ProxyMarkerMutationOutcome::Mismatch => return Err(SystemIntegrationError::proxy(
-                            "系统代理 restore anchor CAS 已失效，停止陈旧恢复",
-                        )),
-                        ProxyMarkerMutationOutcome::PersistFailed => return Err(SystemIntegrationError::proxy(
-                            "持久化系统代理 restore anchor 失败，保留 marker 供重试",
-                        )),
+                        ProxyMarkerMutationOutcome::Mismatch => {
+                            return Err(SystemIntegrationError::proxy(
+                                "系统代理 restore anchor CAS 已失效，停止陈旧恢复",
+                            ))
+                        }
+                        ProxyMarkerMutationOutcome::PersistFailed => {
+                            return Err(SystemIntegrationError::proxy(
+                                "持久化系统代理 restore anchor 失败，保留 marker 供重试",
+                            ))
+                        }
                     }
-                    self.restore_current_transaction(txn_id, original, applied, marker.exact_prior_applied.as_ref(), &current, restored_os)?;
+                    self.restore_current_transaction(
+                        txn_id,
+                        original,
+                        applied,
+                        marker.exact_prior_applied.as_ref(),
+                        &current,
+                        restored_os,
+                    )?;
                 }
             }
         }
@@ -675,21 +704,38 @@ fn validate_restore_scope_with_prior(
     prior_applied: Option<&ProxyTransactionSnapshot>,
     current: &ProxyTransactionSnapshot,
 ) -> Result<(), SystemIntegrationError> {
-    for original in original.mac_services.iter().filter(|service| !service.had_proxy_protocol) {
-        let live = current.mac_services.iter().find(|service| service.service_id == original.service_id)
-            .ok_or_else(|| SystemIntegrationError::proxy("macOS restore live service scope missing"))?;
+    for original in original
+        .mac_services
+        .iter()
+        .filter(|service| !service.had_proxy_protocol)
+    {
+        let live = current
+            .mac_services
+            .iter()
+            .find(|service| service.service_id == original.service_id)
+            .ok_or_else(|| {
+                SystemIntegrationError::proxy("macOS restore live service scope missing")
+            })?;
         if !live.had_proxy_protocol {
             continue;
         }
-        let owned = applied.mac_services.iter().find(|service| service.service_id == original.service_id)
-            .ok_or_else(|| SystemIntegrationError::proxy("macOS restore applied service scope missing"))?;
+        let owned = applied
+            .mac_services
+            .iter()
+            .find(|service| service.service_id == original.service_id)
+            .ok_or_else(|| {
+                SystemIntegrationError::proxy("macOS restore applied service scope missing")
+            })?;
         let matches_owned = |owned: &crate::proxy::MacProxyServiceSnapshot| {
             live.configuration_plist == owned.configuration_plist
                 && live.protocol_enabled == owned.protocol_enabled
         };
         let matches_prior = prior_applied
             .and_then(|prior| {
-                prior.mac_services.iter().find(|service| service.service_id == original.service_id)
+                prior
+                    .mac_services
+                    .iter()
+                    .find(|service| service.service_id == original.service_id)
             })
             .is_some_and(|prior| matches_owned(prior));
         if !matches_owned(owned) && !matches_prior {

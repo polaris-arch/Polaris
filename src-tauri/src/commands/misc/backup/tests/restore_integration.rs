@@ -548,7 +548,8 @@ fn original_domain_rule_shape_survives_restore_save_and_reopen() {
     assert!(selected.iter().all(|cat| available.contains(cat)));
     crate::commands::config::backup_import_save_core(
         &manager, &backup, &selected, None, "linux", None,
-    ).unwrap();
+    )
+    .unwrap();
     let restored = ConfigManager::new(dir.clone()).load_full().unwrap();
     let traffic = &restored["trafficRules"][0];
     assert_eq!(traffic["id"], "old-domain");
@@ -558,7 +559,10 @@ fn original_domain_rule_shape_survives_restore_save_and_reopen() {
     assert_eq!(traffic["effects"]["route"]["action"], "proxy");
     assert_eq!(traffic["remarks"], "preserve legacy intent");
     assert_eq!(restored["dnsRules"][0]["id"], "old-domain");
-    assert_eq!(restored["dnsRules"][0]["effects"]["dns"]["action"]["serverId"], "builtin-remote");
+    assert_eq!(
+        restored["dnsRules"][0]["effects"]["dns"]["action"]["serverId"],
+        "builtin-remote"
+    );
     assert_eq!(restored["routeRuleOrder"], json!(["old-domain"]));
     assert_eq!(restored["dnsRuleOrder"], json!(["old-domain"]));
 }

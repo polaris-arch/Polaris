@@ -36,7 +36,7 @@ use polaris_config_engine::user_config::protocol_settings::{
     TuicSettings, WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
-use polaris_config_engine::user_config::tls_pin::{preserve_cert_pins, keep_valid_cert_pins};
+use polaris_config_engine::user_config::tls_pin::{keep_valid_cert_pins, preserve_cert_pins};
 use url::Url;
 
 /// 分享链接支持的 scheme 白名单。**与前端 `ui/src/shared/protocol-url-schemes.ts` 同源**
@@ -815,7 +815,13 @@ fn parse_shadowsocks(
             Some(v) => {
                 let port = match v.get("port") {
                     None => None,
-                    Some(value) => Some(value.as_u64().and_then(|p| u16::try_from(p).ok()).filter(|p| *p != 0).ok_or("ShadowTLS port must be an integer in 1..=65535")?),
+                    Some(value) => Some(
+                        value
+                            .as_u64()
+                            .and_then(|p| u16::try_from(p).ok())
+                            .filter(|p| *p != 0)
+                            .ok_or("ShadowTLS port must be an integer in 1..=65535")?,
+                    ),
                 };
                 let pw = v.get("password").and_then(|x| x.as_str());
                 let host = v.get("host").and_then(|x| x.as_str());
@@ -837,8 +843,14 @@ fn parse_shadowsocks(
 }
 
 fn checked_shadow_tls_port(value: Option<&str>) -> Result<Option<u16>, String> {
-    value.map(|raw| raw.parse::<u16>().ok().filter(|p| *p != 0)
-        .ok_or_else(|| "ShadowTLS port must be an integer in 1..=65535".to_string())).transpose()
+    value
+        .map(|raw| {
+            raw.parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| "ShadowTLS port must be an integer in 1..=65535".to_string())
+        })
+        .transpose()
 }
 
 /// ss userinfo → (method, password)。先试 base64（传统形态），失败落 SIP002 明文。
@@ -854,7 +866,11 @@ fn decode_ss_userinfo(
             if !decoded.is_empty() {
                 if let Some((m, p)) = decoded.split_once(':') {
                     let (m, p) = (m.trim().to_string(), p.to_string());
-                    if m.is_empty() || !m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                    if m.is_empty()
+                        || !m
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    {
                         return Err("加密方法无效".to_string());
                     }
                     if p.is_empty() {
@@ -880,7 +896,11 @@ fn decode_ss_userinfo(
     } else {
         return Err("无法解析加密方法和密码：既不是 Base64 编码，也不是明文格式".to_string());
     };
-    if method.is_empty() || !method.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+    if method.is_empty()
+        || !method
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return Err("加密方法无效".to_string());
     }
     if password.is_empty() {
@@ -1111,7 +1131,8 @@ fn parse_vmess(raw_url: &str, id_gen: &mut impl FnMut() -> String) -> Result<Ser
             ),
             fingerprint: json_str(v.get("fp")).and_then(|fp| normalize_token(&fp)),
             // vmess JSON 的 `pcs`：同 `parse_tls_settings` 的 `pcs`（v2rayN VmessFmt.cs @e1cb99c :147）。
-            certificate_sha256: v.get("pcs")
+            certificate_sha256: v
+                .get("pcs")
                 .map(|value| json_str(Some(value)).unwrap_or_else(|| "invalid-pin-shape".into()))
                 .and_then(|p| preserve_cert_pins(&p)),
             ..Default::default()
@@ -1158,7 +1179,8 @@ pub fn parse_share_url(
             url.split("://").next().unwrap_or(url)
         ));
     }
-    let server = parse_share_url_inner(url, id_gen, warn).map_err(|e| format!("URL 解析失败: {e}"))?;
+    let server =
+        parse_share_url_inner(url, id_gen, warn).map_err(|e| format!("URL 解析失败: {e}"))?;
     polaris_config_engine::user_config::tls_pin::validate_server_cert_pins(&server)
         .map_err(str::to_owned)?;
     Ok(server)
@@ -1772,7 +1794,9 @@ fn encode_http(c: &ServerConfig) -> String {
     let scheme = if is_https { "https" } else { "http" };
     let mut q = QueryString::new();
     if is_https {
-        if let Some(tls) = &c.tls_settings { push_tls_params(&mut q, tls); }
+        if let Some(tls) = &c.tls_settings {
+            push_tls_params(&mut q, tls);
+        }
     }
     let userinfo = encode_userinfo(c.username.as_deref(), c.password.as_deref());
     assemble(scheme, userinfo, &c.address, c.port, &q, &c.name)
@@ -1791,7 +1815,9 @@ fn encode_naive(c: &ServerConfig) -> Result<String, String> {
         .ok_or("NaiveProxy 节点缺少密码")?;
     let mut q = QueryString::new();
     push_transport_params(&mut q, c);
-    if let Some(tls) = &c.tls_settings { push_tls_params(&mut q, tls); }
+    if let Some(tls) = &c.tls_settings {
+        push_tls_params(&mut q, tls);
+    }
     let userinfo = format!(
         "{}:{}",
         percent_encode_component(username),

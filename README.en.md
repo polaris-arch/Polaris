@@ -73,16 +73,33 @@ The Windows installer does not bundle the WebView2 Runtime; it is fetched online
 
 ### First install on macOS
 
-1. Open the DMG and drag `Polaris.app` into **Applications**. Do not run it directly from the DMG.
-2. Open **Terminal** and run:
+macOS may report that the app is "damaged" or that the developer cannot
+be verified. Unsigned or unnotarized builds may be blocked, but these
+warnings do not establish safety; damage or malicious changes are also
+possible.
 
-   ```bash
-   xattr -cr /Applications/Polaris.app
-   ```
+1. Before installing, confirm that the DMG came from the project's
+official Release and matches the intended platform and version.
+Check the publisher's checksum if provided; a match does not prove
+the absence of malware. For your own build, verify the source and
+build process first. Stop if provenance or integrity is uncertain,
+or a checksum differs. Do not bypass the warning.
 
-3. Launch Polaris from **Applications**. Run the command once after each manual install or replacement from a newly downloaded DMG; in-app updates clear the quarantine attribute themselves.
+2. After verification, drag Polaris into the Applications folder on
+the right, then try opening it normally.
 
-If Polaris is installed elsewhere, replace the path with the actual `.app` path. `xattr -cr` recursively clears extended attributes on that app bundle, so run it only against a Polaris package downloaded from this repository's Releases and verified as trusted. The DMG root also carries the same five-language guide as `README First.txt`. If the prompt only says the developer cannot be verified, you can instead right-click Polaris in Finder → **Open** → confirm again.
+3. If only developer verification blocks it and you trust the verified
+build, use macOS System Settings → Privacy & Security → Open Anyway
+if available. Read and confirm the system prompts. The interface
+may vary by macOS version.
+
+If macOS reports damage or malware, or opening still fails, stop.
+Obtain and verify a fresh copy from the official source or ask the
+project maintainers for help. Do not clear quarantine attributes or
+disable system security protections to force it open. Verify the file
+again after each manual replacement.
+
+[README First.txt](packaging/macos-dmg-open-guide.txt) · [Apple Support](https://support.apple.com/en-us/102445)
 
 ### First install on Windows
 

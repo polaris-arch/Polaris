@@ -3324,11 +3324,11 @@ fn credential_index_keeps_each_nodes_own_secret_when_reordered() {
     );
 }
 
-
 #[test]
 fn managed_canonicalization_cannot_remove_active_server_after_raw_admission() {
     let (dir, mgr, _, _) = managed_apply_cas_fixture();
-    let mut raw: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
     raw["servers"] = serde_json::json!([{
         "id": "ts-a", "name": "Active node", "protocol": "tailscale",
         "tailscaleSettings": {"controlUrl": "https://control.example.test/path"}
@@ -3345,13 +3345,20 @@ fn managed_canonicalization_cannot_remove_active_server_after_raw_admission() {
         mesh_guard::reconcile_untrusted(&current, &mut admitted).unwrap();
         assert!(mgr.save_full(&incoming).is_err());
         assert!(mgr.save_full_deferred_cleanup(&current, &incoming).is_err());
-        assert!(mgr.set_value("servers", incoming["servers"].clone()).is_err());
-        assert!(mgr.update(|config| {
-            config["servers"] = incoming["servers"].clone();
-            Decision::Write(())
-        }).is_err());
+        assert!(mgr
+            .set_value("servers", incoming["servers"].clone())
+            .is_err());
+        assert!(mgr
+            .update(|config| {
+                config["servers"] = incoming["servers"].clone();
+                Decision::Write(())
+            })
+            .is_err());
         assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), disk);
-        assert_eq!(std::fs::read(dir.join(REQUIRED_MARKER_FILE)).unwrap(), marker);
+        assert_eq!(
+            std::fs::read(dir.join(REQUIRED_MARKER_FILE)).unwrap(),
+            marker
+        );
         assert_eq!(mgr.current().unwrap(), current);
     }
     let mut deleted = current.clone();
@@ -3368,7 +3375,8 @@ fn managed_canonicalization_cannot_remove_active_server_after_raw_admission() {
 #[test]
 fn managed_load_rejects_sanitizer_removed_server_before_cache_or_persistence() {
     let (dir, _, _, _) = managed_apply_cas_fixture();
-    let mut raw: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
     raw["servers"] = serde_json::json!([{
         "id": "ts-a", "name": "", "protocol": "tailscale",
         "tailscaleSettings": {"controlUrl": "https://control.example.test/path"}

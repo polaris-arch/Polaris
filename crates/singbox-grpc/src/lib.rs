@@ -192,9 +192,11 @@ impl SingBoxApiClient {
         // Reuse reconnect admission and retain only validated metadata for infallible calls.
         // Reject malformed credentials before constructing a channel; never drop auth on error.
         let authorization = reconnect::auth_request(&secret, ())
-            .map_err(|_| ClientError::Status(tonic::Status::invalid_argument(
-                "management API secret cannot be encoded as authorization metadata",
-            )))?
+            .map_err(|_| {
+                ClientError::Status(tonic::Status::invalid_argument(
+                    "management API secret cannot be encoded as authorization metadata",
+                ))
+            })?
             .metadata()
             .get("authorization")
             .cloned();
@@ -254,11 +256,11 @@ impl SingBoxApiClient {
     /// Non-reconnecting observation stream so consumers can invalidate their
     /// confirmed state immediately on disconnect rather than displaying stale truth.
     pub async fn open_groups(&self) -> Result<tonic::Streaming<daemon::Groups>, ClientError> {
-        let mut client=self.client();
-        let request=self.with_auth(Request::new(daemon::Empty {}));
-        match tokio::time::timeout(SNAPSHOT_TIMEOUT,client.subscribe_groups(request)).await {
-            Ok(stream)=>Ok(stream?.into_inner()),
-            Err(_)=>Err(ClientError::SnapshotTimeout),
+        let mut client = self.client();
+        let request = self.with_auth(Request::new(daemon::Empty {}));
+        match tokio::time::timeout(SNAPSHOT_TIMEOUT, client.subscribe_groups(request)).await {
+            Ok(stream) => Ok(stream?.into_inner()),
+            Err(_) => Err(ClientError::SnapshotTimeout),
         }
     }
 

@@ -615,13 +615,17 @@ impl ProxyRuntime {
     ///
     /// **边界**：系统代理 enable / TUN / helper 提权起核**不在本批次**——见模块级声明。
     pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {
-        self.wait_start_completion(self.explicit_start_completion(config)?).await
+        self.wait_start_completion(self.explicit_start_completion(config)?)
+            .await
     }
 
     pub(crate) async fn start_automatic(
-        self: &Arc<Self>, config: Value, admission: super::prerequisite::StartupAdmission,
+        self: &Arc<Self>,
+        config: Value,
+        admission: super::prerequisite::StartupAdmission,
     ) -> Result<ProxyStatus, StartError> {
-        self.wait_start_completion(self.startup_start_completion(config, admission)?).await
+        self.wait_start_completion(self.startup_start_completion(config, admission)?)
+            .await
     }
 
     async fn wait_start_completion(

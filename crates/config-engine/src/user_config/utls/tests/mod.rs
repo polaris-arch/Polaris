@@ -19,13 +19,16 @@ fn server(protocol: Protocol) -> ServerConfig {
 
 fn generated(node: &ServerConfig, policy: Option<&str>) -> Value {
     let effective = effective_server(node, policy).unwrap();
-    serde_json::to_value(build_proxy_outbound(
-        effective.as_ref(),
-        "node",
-        &DomainResolver::Tag("dns-bootstrap".into()),
-        "x64",
-        "linux",
-    ).expect("valid test outbound"))
+    serde_json::to_value(
+        build_proxy_outbound(
+            effective.as_ref(),
+            "node",
+            &DomainResolver::Tag("dns-bootstrap".into()),
+            "x64",
+            "linux",
+        )
+        .expect("valid test outbound"),
+    )
     .unwrap()
 }
 
@@ -212,13 +215,16 @@ fn legacy_reality_dormant_engine_is_preserved_without_emitting_a_native_engine()
     });
     let original = serde_json::to_value(&node).unwrap();
     let effective = effective_server_for_platform(&node, None, "darwin").unwrap();
-    let output = serde_json::to_value(build_proxy_outbound(
-        effective.as_ref(),
-        "node",
-        &DomainResolver::Tag("dns-bootstrap".into()),
-        "x64",
-        "darwin",
-    ).expect("valid test outbound"))
+    let output = serde_json::to_value(
+        build_proxy_outbound(
+            effective.as_ref(),
+            "node",
+            &DomainResolver::Tag("dns-bootstrap".into()),
+            "x64",
+            "darwin",
+        )
+        .expect("valid test outbound"),
+    )
     .unwrap();
     assert!(output["tls"].get("engine").is_none());
     assert_eq!(output["tls"]["utls"]["fingerprint"], "chrome");
@@ -233,13 +239,16 @@ fn legacy_dormant_engine_case_uses_the_exact_existing_emission_gate() {
         ..Default::default()
     });
     let effective = effective_server_for_platform(&node, None, "darwin").unwrap();
-    let output = serde_json::to_value(build_proxy_outbound(
-        effective.as_ref(),
-        "node",
-        &DomainResolver::Tag("dns-bootstrap".into()),
-        "x64",
-        "darwin",
-    ).expect("valid test outbound"))
+    let output = serde_json::to_value(
+        build_proxy_outbound(
+            effective.as_ref(),
+            "node",
+            &DomainResolver::Tag("dns-bootstrap".into()),
+            "x64",
+            "darwin",
+        )
+        .expect("valid test outbound"),
+    )
     .unwrap();
     assert!(output["tls"].get("engine").is_none());
     assert_eq!(output["tls"]["utls"]["fingerprint"], "chrome");
@@ -491,13 +500,16 @@ fn default_and_global_profiles_skip_native_engines_but_explicit_node_conflicts_f
                 (Some("firefox"), "firefox"),
             ] {
                 let effective = effective_server_for_platform(&node, policy, platform).unwrap();
-                let output = serde_json::to_value(build_proxy_outbound(
-                    &effective,
-                    "node",
-                    &DomainResolver::Tag("dns-bootstrap".into()),
-                    "x64",
-                    platform,
-                ).expect("valid test outbound"))
+                let output = serde_json::to_value(
+                    build_proxy_outbound(
+                        &effective,
+                        "node",
+                        &DomainResolver::Tag("dns-bootstrap".into()),
+                        "x64",
+                        platform,
+                    )
+                    .expect("valid test outbound"),
+                )
                 .unwrap();
                 if active {
                     assert!(matches!(effective, Cow::Borrowed(_)));

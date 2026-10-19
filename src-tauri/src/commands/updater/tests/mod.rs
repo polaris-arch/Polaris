@@ -2739,7 +2739,9 @@ fn update_install_stops_the_core_before_opening_the_portable_archive() {
     let opens: Vec<usize> = body.match_indices(".open(").map(|(i, _)| i).collect();
     assert_eq!(opens.len(), 1);
     let reject = body.find("Err(_reject) => {").unwrap();
-    let advisory = body.find("update_install::install_advisory(&plan)").unwrap();
+    let advisory = body
+        .find("update_install::install_advisory(&plan)")
+        .unwrap();
     assert!(!body[reject..advisory].contains(".open("));
     let stage = body.find("updater.custody.stage(&source)").unwrap();
     assert!(advisory < stage && stage < opens[0]);
@@ -2924,16 +2926,28 @@ fn full_uninstall_prepares_all_desktop_owners_before_any_destructive_step() {
     );
 }
 
-
 #[test]
 fn portable_reminder_is_read_only_and_confirmed_install_requires_fresh_custody() {
-    let body = crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
-    let readonly = body.find("if confirmed == Some(false) && os == \"windows\" && portable.is_some()").unwrap();
-    let authority = body[readonly..].find("    if let Err(error) = state.updater().custody.admits_install").unwrap() + readonly;
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
+    let readonly = body
+        .find("if confirmed == Some(false) && os == \"windows\" && portable.is_some()")
+        .unwrap();
+    let authority = body[readonly..]
+        .find("    if let Err(error) = state.updater().custody.admits_install")
+        .unwrap()
+        + readonly;
     let branch = &body[readonly..authority];
     assert!(branch.contains("requiresRedownload"));
     assert!(branch.contains("exe_path.parent()"));
-    for forbidden in [".open(", "std::fs::", "mutate_state", ".stage(", "remove_file", "remember_portable_update"] {
+    for forbidden in [
+        ".open(",
+        "std::fs::",
+        "mutate_state",
+        ".stage(",
+        "remove_file",
+        "remember_portable_update",
+    ] {
         assert!(!branch.contains(forbidden), "{forbidden}");
     }
     let stage = body.find("updater.custody.stage(&source)").unwrap();

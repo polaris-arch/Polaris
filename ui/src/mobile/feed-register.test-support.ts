@@ -234,8 +234,6 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
 
   /* ── VPN / 订阅进度 / 组网缓存 ───────────────────────────────────────── */
   { id: 'useVpnStatusStore.openVpn', role: 'state', disposition: fed(VPN_FED), note: 'OpenVPN 每个节点的状态帧。节点屏的 `deriveMeshTunnelHealth` 读的就是它。' },
-  { id: 'useVpnStatusStore.replace', role: 'action', disposition: act(STORE_VPN), note: '整帧替换 VPN 快照。首帧水合与停核清空都走它 —— 留着旧帧会让「核已停」那一屏还画着上一秒的隧道健康。' },
-  { id: 'useVpnStatusStore.setOpenVpn', role: 'action', disposition: act(STORE_VPN), note: '增量写一条 OpenVPN 状态（事件腿的落点，与整帧替换是两个入口）。' },
   { id: 'useVpnStatusStore.retainServerIds', role: 'action', disposition: act(STORE_VPN), note: 'VPN 快照的对账驱逐（节点删了它的隧道状态也要跟着走）。' },
   { id: 'useSubscriptionProgressStore.progress', role: 'state', disposition: fed(SUB_PROGRESS_FED), note: '🔴 W-24 的那一格：订阅更新进度。它由后台 scheduler 自跑，**没有任何前端调用点可挂** ⇒ 不订阅事件就永远是空表，节点屏的订阅进度恒不出现。' },
   { id: 'useSubscriptionProgressStore.retainSubscriptionIds', role: 'action', disposition: act(STORE_SUBPROG), note: '订阅进度表的对账驱逐（订阅删了它的失败进度也要跟着走）。' },

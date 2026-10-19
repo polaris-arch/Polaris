@@ -29,7 +29,7 @@ export function AutoSelectControls({ config, accept, t, getCurrentConfig, target
       {variant === 'switch' ? <>
         <strong>{t('autoSelect.choose')}</strong>
         <button type="button" role="switch" className={`swt${featureEnabled ? ' on' : ''}`} aria-checked={featureEnabled} aria-label={t('autoSelect.choose')}
-          title={featureEnabled ? t('autoSelect.fixCurrentHint') : undefined} disabled={busy} data-exit-write="auto-select-mode"
+          data-tip={featureEnabled ? t('autoSelect.fixCurrentHint') : undefined} disabled={busy} data-exit-write="auto-select-mode"
           onClick={() => run({ kind: 'setEnabled', enabled: !featureEnabled })} />
       </> : <button type="button" className="auto-choice-pick" data-auto-select-subscription={target.subscriptionId} data-exit-write="auto-select-enable" aria-pressed={selected} disabled={busy}
         onClick={() => run({ kind: 'enable', ...target })}>
@@ -37,7 +37,7 @@ export function AutoSelectControls({ config, accept, t, getCurrentConfig, target
         <span data-auto-select-actual="">{actual ? `${actual.name} · ${t('autoSelect.tcpNode')}` : t('autoSelect.pendingNode')}</span>
       </button>}
     </div>
-    {status.failed && <button type="button" onClick={status.refresh} disabled={status.loading} title={t('autoSelect.loadFailed')}>{t('autoSelect.refresh')}</button>}
+    {status.failed && <button type="button" onClick={status.refresh} disabled={status.loading} data-tip={t('autoSelect.loadFailed')}>{t('autoSelect.refresh')}</button>}
     {feedback && <p role="status" aria-live="polite" data-auto-select-feedback={feedback.tone}>{feedback.text}</p>}
   </section>;
 }

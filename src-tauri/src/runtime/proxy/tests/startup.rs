@@ -4672,20 +4672,25 @@ async fn startup_capability_proof_survives_eviction_but_rejects_real_replacement
     );
 }
 
-
 #[tokio::test]
 async fn delayed_startup_cannot_replace_newer_stop_or_queued_start() {
     let (rt, _dir, _calls) = test_runtime_gated(HelperGateDecision::Abort);
     let scheduled = rt.startup_admission().unwrap();
     rt.stop().await.unwrap();
-    assert!(rt.startup_start_completion(tun_config(), scheduled).is_err());
+    assert!(rt
+        .startup_start_completion(tun_config(), scheduled)
+        .is_err());
     assert!(rt.normal_start.lock().unwrap().as_ref().is_none());
 
     let scheduled = rt.startup_admission().unwrap();
     // No yield: the explicit producer is queued, not yet generation-claimed.
-    let explicit = rt.explicit_start_completion(serde_json::Value::Null).unwrap();
+    let explicit = rt
+        .explicit_start_completion(serde_json::Value::Null)
+        .unwrap();
     let generation = rt.core_generation();
-    assert!(rt.startup_start_completion(tun_config(), scheduled).is_err());
+    assert!(rt
+        .startup_start_completion(tun_config(), scheduled)
+        .is_err());
     assert_eq!(rt.core_generation(), generation);
     drop(explicit);
 }
@@ -4694,8 +4699,12 @@ async fn delayed_startup_cannot_replace_newer_stop_or_queued_start() {
 async fn untouched_startup_is_admitted_but_exit_retires_its_ticket() {
     let (rt, _dir, _calls) = test_runtime_gated(HelperGateDecision::Abort);
     let scheduled = rt.startup_admission().unwrap();
-    assert!(rt.startup_start_completion(serde_json::Value::Null, scheduled).is_ok());
+    assert!(rt
+        .startup_start_completion(serde_json::Value::Null, scheduled)
+        .is_ok());
     let scheduled = rt.startup_admission().unwrap();
     rt.begin_shutdown().unwrap();
-    assert!(rt.startup_start_completion(tun_config(), scheduled).is_err());
+    assert!(rt
+        .startup_start_completion(tun_config(), scheduled)
+        .is_err());
 }

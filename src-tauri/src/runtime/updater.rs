@@ -26,8 +26,8 @@
 //! [`UpdaterRuntime::with_core_binary`] 由 `lib.rs` 启动期注入。未注入时版本读取如实返回空串，
 //! 不猜、不谎报。
 
-use std::path::{Path, PathBuf};
 use crate::runtime::core_version_probe::CoreVersionProbe;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use polaris_updater::extract_version_token;

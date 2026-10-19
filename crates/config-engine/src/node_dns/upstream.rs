@@ -230,8 +230,12 @@ pub fn resolve_upstreams(ids: &[String], custom: &[CustomDnsUpstream]) -> Resolv
 /// Validate only the enabled selection at generation time, not hydration. Legacy
 /// unsupported entries remain editable; they cannot silently choose other DNS.
 pub fn validate_selected_upstreams(dns: Option<&DnsConfig>) -> Result<(), String> {
-    let Some(dns) = dns else { return Ok(()); };
-    if dns.resolve_node_domains_ahead == Some(false) { return Ok(()); }
+    let Some(dns) = dns else {
+        return Ok(());
+    };
+    if dns.resolve_node_domains_ahead == Some(false) {
+        return Ok(());
+    }
     let custom = dns.node_resolver_custom.as_deref().unwrap_or(&[]);
     for id in dns.node_resolver_pool.as_deref().unwrap_or(&[]) {
         if lookup_upstream(id, custom).is_none() {

@@ -433,11 +433,20 @@ fn u10_group_action_env_on_every_evaluate_not_on_respond() {
         .collect();
     assert_eq!(evaluates.len(), 4, "{rules:?}");
     assert_eq!(responds.len(), 4, "{rules:?}");
-    let tags: std::collections::BTreeSet<_> = evaluates.iter().map(|e| e["tag"].as_str().unwrap()).collect();
+    let tags: std::collections::BTreeSet<_> = evaluates
+        .iter()
+        .map(|e| e["tag"].as_str().unwrap())
+        .collect();
     assert_eq!(tags.len(), 4);
     for e in evaluates {
         assert!(!env_keys(e).is_empty());
-        assert_eq!(responds.iter().filter(|r| r["match_response"] == e["tag"]).count(), 1);
+        assert_eq!(
+            responds
+                .iter()
+                .filter(|r| r["match_response"] == e["tag"])
+                .count(),
+            1
+        );
     }
     for r in responds {
         assert!(env_keys(r).is_empty(), "respond 不得带环境项：{r}");

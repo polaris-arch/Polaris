@@ -56,3 +56,19 @@ fn administrative_arguments_are_exact_and_allow_a_root_sealed_manifest() {
     extra.push("--daemon".into());
     assert!(InstallArgs::parse(&extra).is_err());
 }
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn unsupported_installer_verbs_never_fall_through_to_daemon_mode() {
+    for verb in [
+        "sync-install-path",
+        "validate-install-path",
+        "snapshot-user",
+        "restore-user",
+    ] {
+        assert_eq!(
+            run(&[verb.to_owned()]),
+            Some(std::process::ExitCode::FAILURE)
+        );
+    }
+}

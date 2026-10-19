@@ -47,7 +47,7 @@ import { MobileSelect as MobileSelect } from '../MobileSelect';
  */
 
 import { useMemo, useState, type ReactElement } from 'react';
-import { useRuleTestFold } from '@/components/dialogs/RuleTestFold';
+import { useRuleTestFold } from '@/hooks/use-rule-test';
 import { useTranslation } from 'react-i18next';
 import type { Rule, RuleType } from '@/contracts/types';
 import {

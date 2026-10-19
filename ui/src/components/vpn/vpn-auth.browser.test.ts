@@ -1,3 +1,4 @@
+import { resolveChromeBinary } from '@/styles/chrome-binary.test-support';
 import { chromium, type Browser } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
 import path from 'node:path';
@@ -47,7 +48,7 @@ beforeAll(async () => {
   const address = server.httpServer!.address();
   if (!address || typeof address === 'string') throw Error('No listener');
   origin = `http://127.0.0.1:${address.port}`;
-  browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
+  browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ?? resolveChromeBinary() });
 }, 30000);
 afterAll(async () => { await browser?.close(); await server?.close(); });
 

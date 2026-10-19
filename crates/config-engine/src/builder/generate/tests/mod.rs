@@ -2324,10 +2324,17 @@ fn dns_geosite_source_fallback_keeps_its_declared_format_across_modes() {
 #[test]
 fn stale_dns_dependency_fails_generation_without_domestic_fallback() {
     use crate::user_config::dns_policy::{DnsPolicyDefaults, DnsServerResource};
-    for case in ["missing-policy", "disabled-policy", "missing-bootstrap", "bootstrap-cycle"] {
+    for case in [
+        "missing-policy",
+        "disabled-policy",
+        "missing-bootstrap",
+        "bootstrap-cycle",
+    ] {
         let mut config = base_config();
         config.dns_defaults = Some(DnsPolicyDefaults {
-            unmatched_action: Some(DnsPolicyAction::Server { server_id: "private-dns".into() }),
+            unmatched_action: Some(DnsPolicyAction::Server {
+                server_id: "private-dns".into(),
+            }),
             ..Default::default()
         });
         if case != "missing-policy" {
@@ -2339,7 +2346,8 @@ fn stale_dns_dependency_fails_generation_without_domestic_fallback() {
             })).unwrap();
             config.dns_servers.push(resource);
         }
-        let error = generate_sing_box_config(&config, &BTreeMap::new(), &deps_default()).unwrap_err();
+        let error =
+            generate_sing_box_config(&config, &BTreeMap::new(), &deps_default()).unwrap_err();
         assert!(error.contains("DNS"), "{case}: {error}");
     }
 }
@@ -2349,15 +2357,22 @@ fn dns_node_dependency_removed_by_platform_gate_rejects_generation() {
     use crate::user_config::dns_policy::DnsServerResource;
     let mut config = base_config();
     config.servers.push(ServerConfig {
-        id: "naive-dns".into(), name: "Naive DNS".into(), protocol: Protocol::Naive,
-        address: "proxy.example".into(), port: 443,
-        username: Some("user".into()), password: Some("password".into()),
+        id: "naive-dns".into(),
+        name: "Naive DNS".into(),
+        protocol: Protocol::Naive,
+        address: "proxy.example".into(),
+        port: 443,
+        username: Some("user".into()),
+        password: Some("password".into()),
         ..Default::default()
     });
-    config.dns_servers.push(serde_json::from_value::<DnsServerResource>(serde_json::json!({
-        "id":"private-dns", "name":"Private", "enabled":true, "type":"udp",
-        "endpoint":{"host":"10.0.0.53"}, "outbound":{"type":"node","nodeId":"naive-dns"}
-    })).unwrap());
+    config.dns_servers.push(
+        serde_json::from_value::<DnsServerResource>(serde_json::json!({
+            "id":"private-dns", "name":"Private", "enabled":true, "type":"udp",
+            "endpoint":{"host":"10.0.0.53"}, "outbound":{"type":"node","nodeId":"naive-dns"}
+        }))
+        .unwrap(),
+    );
     let mut deps = deps_default();
     deps.has_cronet = false;
     let error = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap_err();
@@ -2367,16 +2382,29 @@ fn dns_node_dependency_removed_by_platform_gate_rejects_generation() {
 
 #[test]
 fn default_native_auto_does_not_validate_or_route_by_stale_concrete_seed() {
-    use crate::user_config::auto_select::{AutoSelectTarget, SelectionIntent, wrapper_tag};
+    use crate::user_config::auto_select::{wrapper_tag, AutoSelectTarget, SelectionIntent};
     let mut config = base_config();
     config.auto_select_enabled = true;
     config.interrupt_connections_on_switch = Some(true);
-    config.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Global });
+    config.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
     for saved in [None, Some("missing"), Some("__direct__"), Some("__block__")] {
         config.selected_server_id = saved.map(str::to_owned);
-        let generated = generate_sing_box_config_with_report(&config, &BTreeMap::new(), &deps_default()).unwrap();
-        let selector = generated.config.outbounds.iter().find(|o| o.tag == "proxy-selector").unwrap();
-        assert_eq!(selector.default.as_deref(), Some(wrapper_tag(&AutoSelectTarget::Global).as_str()));
+        let generated =
+            generate_sing_box_config_with_report(&config, &BTreeMap::new(), &deps_default())
+                .unwrap();
+        let selector = generated
+            .config
+            .outbounds
+            .iter()
+            .find(|o| o.tag == "proxy-selector")
+            .unwrap();
+        assert_eq!(
+            selector.default.as_deref(),
+            Some(wrapper_tag(&AutoSelectTarget::Global).as_str())
+        );
         assert_eq!(selector.interrupt_exist_connections, Some(false));
         assert!(!crate::builder::route::mesh_selected_exit_falls_back_to_direct(&config));
     }

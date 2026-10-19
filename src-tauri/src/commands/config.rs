@@ -1389,9 +1389,15 @@ fn backfill_secret_and_privacy(config: &ConfigManager) -> Result<(), String> {
     }
     let cfg = loaded.config;
     let has_legacy = config_has_password(&cfg);
-    let has_secret = cfg.get("clashApiSecret").and_then(Value::as_str)
+    let has_secret = cfg
+        .get("clashApiSecret")
+        .and_then(Value::as_str)
         .is_some_and(|secret| !secret.trim().is_empty());
-    let generated_secret = if has_secret { None } else { Some(generate_local_api_secret()?) };
+    let generated_secret = if has_secret {
+        None
+    } else {
+        Some(generate_local_api_secret()?)
+    };
     // API authentication must still be published if credential migration fails.
     let privacy_result = (|| {
         let has_scrypt = polaris_store::privacy_lock::has(&StdFs, &privacy_lock_path(config))
@@ -1411,28 +1417,47 @@ fn backfill_secret_and_privacy(config: &ConfigManager) -> Result<(), String> {
     // legacy verifier if scrypt migration failed, before publishing the API secret.
     // The damaged scrypt file still fails closed until explicitly repaired.
     let preserved_legacy = if privacy_result.is_err() && !has_legacy {
-        disk_plain.as_deref().map(|plain| {
-            let salt = gen_salt()?;
-            Ok::<String, String>(format!("{}${}", hex_encode(&salt), hash_password(&salt, plain)))
-        }).transpose()?
-    } else { None };
+        disk_plain
+            .as_deref()
+            .map(|plain| {
+                let salt = gen_salt()?;
+                Ok::<String, String>(format!(
+                    "{}${}",
+                    hex_encode(&salt),
+                    hash_password(&salt, plain)
+                ))
+            })
+            .transpose()?
+    } else {
+        None
+    };
     if generated_secret.is_some() || disk_plain.is_some() {
-        config.update(|latest| {
-            let Some(obj) = latest.as_object_mut() else { return Decision::Skip(()); };
-            if !obj.get("clashApiSecret").and_then(Value::as_str)
-                .is_some_and(|secret| !secret.trim().is_empty()) {
-                if let Some(secret) = generated_secret {
-                    obj.insert("clashApiSecret".into(), json!(secret));
+        config
+            .update(|latest| {
+                let Some(obj) = latest.as_object_mut() else {
+                    return Decision::Skip(());
+                };
+                if !obj
+                    .get("clashApiSecret")
+                    .and_then(Value::as_str)
+                    .is_some_and(|secret| !secret.trim().is_empty())
+                {
+                    if let Some(secret) = generated_secret {
+                        obj.insert("clashApiSecret".into(), json!(secret));
+                    }
                 }
-            }
-            if !obj.get(PRIVACY_PASSWORD_HASH_KEY).and_then(Value::as_str)
-                .is_some_and(|hash| !hash.is_empty()) {
-                if let Some(hash) = preserved_legacy {
-                    obj.insert(PRIVACY_PASSWORD_HASH_KEY.into(), json!(hash));
+                if !obj
+                    .get(PRIVACY_PASSWORD_HASH_KEY)
+                    .and_then(Value::as_str)
+                    .is_some_and(|hash| !hash.is_empty())
+                {
+                    if let Some(hash) = preserved_legacy {
+                        obj.insert(PRIVACY_PASSWORD_HASH_KEY.into(), json!(hash));
+                    }
                 }
-            }
-            Decision::Write(())
-        }).map_err(|error| error.to_string())?;
+                Decision::Write(())
+            })
+            .map_err(|error| error.to_string())?;
     }
     privacy_result?;
     Ok(())
@@ -1633,7 +1658,9 @@ fn upgrade_legacy_to_scrypt(
 
 /// `privacy:hasPassword` 核心：scrypt 文件存在 **或** config.json 里有非空 legacy SHA-256 键。
 fn has_password_core(config: &ConfigManager) -> Result<bool, String> {
-    if polaris_store::privacy_lock::has(&StdFs, &privacy_lock_path(config)).map_err(|e| format!("{e}"))? {
+    if polaris_store::privacy_lock::has(&StdFs, &privacy_lock_path(config))
+        .map_err(|e| format!("{e}"))?
+    {
         return Ok(true);
     }
     let cfg = config.current().map_err(|e| format!("{e}"))?;
@@ -1898,9 +1925,10 @@ mod dependency_error_response_tests {
 
     #[test]
     fn dependency_response_preserves_code_without_user_identifiers() {
-        let response: ApiResponse<()> = config_store_error(polaris_store::StoreError::DnsDependency(
-            "https://user:secret@example.invalid/private".to_owned(),
-        ));
+        let response: ApiResponse<()> =
+            config_store_error(polaris_store::StoreError::DnsDependency(
+                "https://user:secret@example.invalid/private".to_owned(),
+            ));
         assert!(!response.success);
         assert_eq!(response.code.as_deref(), Some("DNS_DEPENDENCY_INVALID"));
         assert_eq!(

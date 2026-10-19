@@ -93,6 +93,6 @@ describe('VPN ready/revision/disposal lifecycle', () => {
     for (const file of ['../App.tsx', '../mobile/app-wiring.ts']) {
       const source = readFileSync(new URL(file, import.meta.url), 'utf8'); expect(source).toContain('startAppVpnStatusSync('); expect(source).not.toContain('api.vpn.getStatus(');
     }
-    const form = readFileSync(new URL('../components/vpn/VpnAuthForm.tsx', import.meta.url), 'utf8'); expect(form).not.toContain('<VpnAuthSession'); expect(form).not.toContain('key={JSON.stringify');
+    const form = readFileSync(new URL('../shared/vpn/VpnAuthForm.tsx', import.meta.url), 'utf8'); expect(form).not.toContain('<VpnAuthSession'); expect(form).not.toContain('key={JSON.stringify');
   });
 });

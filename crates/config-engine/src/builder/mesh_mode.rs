@@ -24,7 +24,9 @@ fn is_no_exit_ts(server: &ServerConfig) -> bool {
 /// One TS without an exit node and at least one real public exit. Multiple Tailscale endpoints
 /// are deliberately excluded: selection can change the MagicDNS endpoint binding.
 pub fn mode_candidates(config: &UserConfig) -> Option<(String, String)> {
-    if config.selection_intent.is_some() { return None; }
+    if config.selection_intent.is_some() {
+        return None;
+    }
     let ts: Vec<_> = config
         .servers
         .iter()

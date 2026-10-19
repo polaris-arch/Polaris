@@ -286,33 +286,40 @@ pub async fn resolve_host_allowed_typed<L: DnsLookup>(
 ) -> Result<Vec<IpAddr>, HostResolutionError> {
     let host_norm = strip_brackets_lower(host);
     if host_norm == "localhost" {
-        return Err(HostResolutionError::Unsafe(format!("订阅地址指向本机/内网/link-local，已拒绝: {host}")));
+        return Err(HostResolutionError::Unsafe(format!(
+            "订阅地址指向本机/内网/link-local，已拒绝: {host}"
+        )));
     }
     if is_ip_literal(&host_norm) {
         // 字面 IP 无「域名反查真实」语义——字面 FakeIP 没有可恢复的原域名，始终拒绝。
         if is_private_ip(&host_norm) || is_polaris_fake_ip(&host_norm) {
-            return Err(HostResolutionError::Unsafe(format!("订阅地址指向本机/内网/link-local，已拒绝: {host}")));
+            return Err(HostResolutionError::Unsafe(format!(
+                "订阅地址指向本机/内网/link-local，已拒绝: {host}"
+            )));
         }
-        return host_norm
-            .parse::<IpAddr>()
-            .map(|ip| vec![ip])
-            .map_err(|_| HostResolutionError::Unsafe(format!("订阅地址包含无法识别的 IP 字面量，已拒绝: {host}")));
+        return host_norm.parse::<IpAddr>().map(|ip| vec![ip]).map_err(|_| {
+            HostResolutionError::Unsafe(format!("订阅地址包含无法识别的 IP 字面量，已拒绝: {host}"))
+        });
     }
     // 域名：解析后逐 IP 判定（DNS rebinding 防护）。
     let resolved = match lookup.lookup_all(&host_norm).await {
         Ok(v) => v,
         Err(e) => {
-            return Err(HostResolutionError::Dns(format!("订阅地址解析失败，已拒绝: {host}（{e}）")));
+            return Err(HostResolutionError::Dns(format!(
+                "订阅地址解析失败，已拒绝: {host}（{e}）"
+            )));
         }
     };
     if resolved.is_empty() {
-        return Err(HostResolutionError::Dns(format!("订阅地址无法解析到任何 IP，已拒绝: {host}")));
+        return Err(HostResolutionError::Dns(format!(
+            "订阅地址无法解析到任何 IP，已拒绝: {host}"
+        )));
     }
     let mut allowed = Vec::with_capacity(resolved.len());
     for r in &resolved {
-        let ip = r
-            .parse::<IpAddr>()
-            .map_err(|_| HostResolutionError::Unsafe(format!("订阅地址解析到非法 IP，已拒绝: {host} → {r}")))?;
+        let ip = r.parse::<IpAddr>().map_err(|_| {
+            HostResolutionError::Unsafe(format!("订阅地址解析到非法 IP，已拒绝: {host} → {r}"))
+        })?;
         if is_polaris_fake_ip(r) {
             // 域名 FakeIP 保留 hostname 语义：直连 pin 该 IP，让外部 TUN 有机会按映射接管；
             // Polaris SOCKS5h 则忽略本地 pin、把域名交代理端解析。无 TUN 时自然连接失败。

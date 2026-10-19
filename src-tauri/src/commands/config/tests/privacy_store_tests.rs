@@ -167,7 +167,9 @@ fn scrypt_hash_never_enters_config_object() {
     assert!(plain.is_empty(), "config 里无非空明文");
     // 独立文件确实持有哈希（可验），但它不在任何前端可见的 config 出口里。
     let path = privacy_lock_path(&mgr);
-    let h = polaris_store::privacy_lock::read(&StdFs, &path).unwrap().expect("文件持有 scrypt 哈希");
+    let h = polaris_store::privacy_lock::read(&StdFs, &path)
+        .unwrap()
+        .expect("文件持有 scrypt 哈希");
     assert!(polaris_store::privacy_lock::verify("topsecret", &h));
     // strip 仍兜底剥 legacy 键（存量未迁移用户过渡期）。
     let mut with_legacy = json!({ "privacyPassword": "x", "privacyPasswordHash": "aa$bb" });
@@ -275,9 +277,13 @@ fn salt_unique_per_set() {
     let mgr = ConfigManager::new(dir.clone());
     let path = privacy_lock_path(&mgr);
     set_password_core(&mgr, "same-pw", false).unwrap();
-    let h1 = polaris_store::privacy_lock::read(&StdFs, &path).unwrap().unwrap();
+    let h1 = polaris_store::privacy_lock::read(&StdFs, &path)
+        .unwrap()
+        .unwrap();
     set_password_core(&mgr, "same-pw", false).unwrap();
-    let h2 = polaris_store::privacy_lock::read(&StdFs, &path).unwrap().unwrap();
+    let h2 = polaris_store::privacy_lock::read(&StdFs, &path)
+        .unwrap()
+        .unwrap();
     assert_ne!(h1.salt, h2.salt, "两次 set 同密码须用不同盐");
     assert_ne!(h1.hash, h2.hash, "不同盐 → 不同哈希");
     // 两者都能验过（盐随各自哈希一起存）。
@@ -413,14 +419,20 @@ fn unreadable_credential_is_not_absent() {
 #[test]
 fn privacy_mode_requires_backend_authenticated_transition() {
     let mode = AtomicBool::new(true);
-    assert_eq!(set_privacy_mode_core(&mode, false, false), Err("PRIVACY_LOCKED"));
+    assert_eq!(
+        set_privacy_mode_core(&mode, false, false),
+        Err("PRIVACY_LOCKED")
+    );
     assert!(mode.load(Ordering::Relaxed));
     assert_eq!(set_privacy_mode_core(&mode, false, true), Ok(true));
     // Existing UI's subsequent set(false) remains idempotent.
     assert_eq!(set_privacy_mode_core(&mode, false, false), Ok(false));
     assert_eq!(set_privacy_mode_core(&mode, true, false), Ok(true));
     // A stale frontend success cannot reopen a new lock generation.
-    assert_eq!(set_privacy_mode_core(&mode, false, false), Err("PRIVACY_LOCKED"));
+    assert_eq!(
+        set_privacy_mode_core(&mode, false, false),
+        Err("PRIVACY_LOCKED")
+    );
 }
 
 #[test]
@@ -428,7 +440,11 @@ fn ordinary_save_patch_and_backup_cannot_clear_or_replace_a_legacy_password() {
     let dir = temp_dir("legacy-owned-fields");
     let mgr = ConfigManager::new(dir.clone());
     let salt = gen_salt().unwrap();
-    let hash = format!("{}${}", hex_encode(&salt), hash_password(&salt, "real-password"));
+    let hash = format!(
+        "{}${}",
+        hex_encode(&salt),
+        hash_password(&salt, "real-password")
+    );
     let mut initial = mgr.load_full().unwrap();
     initial[PRIVACY_PASSWORD_HASH_KEY] = json!(hash);
     mgr.save_full(&initial).unwrap();
@@ -469,8 +485,12 @@ fn ordinary_save_and_patch_cannot_create_privacy_credentials() {
     backup_import_save_core(
         &mgr,
         &json!({"privacyPasswordHash": "attacker-hash", "privacyPassword": "attacker-plain"}),
-        &[BackupCategory::GeneralSettings], None, "linux", None,
-    ).unwrap();
+        &[BackupCategory::GeneralSettings],
+        None,
+        "linux",
+        None,
+    )
+    .unwrap();
     assert!(!config_has_password(&mgr.current().unwrap()));
     assert!(unlock_core(&mgr, "").unwrap());
 }

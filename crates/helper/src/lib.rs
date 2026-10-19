@@ -114,7 +114,7 @@ pub(crate) fn elapsed_ms(started: std::time::Instant) -> u64 {
 pub mod mac_migration_launchd;
 #[cfg(any(target_os = "macos", test))]
 pub mod mac_migration_observer;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod protected_install_path;
 
 #[cfg(any(target_os = "macos", all(test, unix)))]

@@ -96,7 +96,10 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     const appStore = readFileSync(join(SRC, 'store/app-store.ts'), 'utf8');
     expect(stripComments(appStore)).toMatch(/withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*await api\.config\.patch\(patch\);\s*\}\)/);
     expect(stripComments(appStore)).toMatch(/withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*await api\.config\.mutateEntities\(mutations\);\s*\}\)/);
-    expect(appStore).toContain('withConfigWriteLock(async () => {\n      const receipt = await api.server.switch(serverId)');
+    const switchTransaction = stripComments(appStore).split('const readback = await withConfigWriteLock(async () => {')[1]?.split('\n    });')[0];
+    expect(switchTransaction).toBeDefined();
+    expect(switchTransaction).toContain('await api.server.switch(serverId)');
+    expect(switchTransaction).toContain('await api.config.get()');
     // performSave 是薄壳：整个函数体（**含开头读 entries**）都在临界区内。
     expect(readFileSync(join(SRC, 'store/staged-config-store.ts'), 'utf8')).toContain(
       'withConfigWriteLock(() => performSaveLocked(set, get))'
@@ -119,7 +122,6 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
       'lib/auto-select-actions.ts',
       'store/app-store.ts',
       'store/staged-config-store.ts',
-      'tray/TrayMenu.tsx',
     ]);
     const tray = stripComments(readFileSync(join(SRC, 'tray/TrayMenu.tsx'), 'utf8'));
     expect(tray).toContain('useAppStore.getState().saveConfig({ proxyMode: mode })');
@@ -131,8 +133,10 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     expect(takeover).not.toMatch(/saveConfig\(|api\.config\.(?:patch|save)\(|withConfigWriteLock\(/);
     expect((tray.match(/api\.config\.setTakeover\(/g) ?? []).length).toBe(1);
     expect(tray).not.toContain('api.config.patch(');
-    // Only the dedicated server-switch/readback stays in Tray's local queue.
-    expect((tray.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
+    // Tray delegates to the single locked switch/readback implementation.
+    expect(tray).toContain('useAppStore.getState().switchServer(id)');
+    expect(tray).not.toContain('api.server.switch(');
+    expect((tray.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(0);
   });
 
   it('mutation entry is in the actual locked callback; moving it outside or nesting a lock fails', () => {

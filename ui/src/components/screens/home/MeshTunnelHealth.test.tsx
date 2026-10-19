@@ -63,13 +63,15 @@ const frame = (over: Partial<TailscaleStatusEvent> = {}): TailscaleStatusEvent =
 function render(opts: {
   server: ServerConfig;
   running?: boolean;
+  actualServerId?: string | null;
   ts?: TailscaleStatusEvent;
   ovpn?: OpenVpnStatusEvent;
 }): string {
   H.app = {
     servers: [opts.server],
     selectedServerId: opts.server.id,
-    proxyStatus: { running: opts.running ?? true },
+    config: { selectedServerId: opts.server.id },
+    proxyStatus: { running: opts.running ?? true, actualServerId: opts.actualServerId === undefined ? opts.server.id : opts.actualServerId },
     tailscaleStatuses: opts.ts ? { n1: opts.ts } : {},
   };
   H.vpn = { openVpn: opts.ovpn ? { n1: opts.ovpn } : {} };
@@ -120,4 +122,9 @@ describe('MeshTunnelHealth 渲染', () => {
     expect(html).toContain('<circle');
     expect(html).not.toContain('M12 3.2L21 19H3z');
   });
+});
+
+it('does not attribute saved-node health to an unknown or different actual running exit', () => {
+  expect(render({ server: tsLanOnly, ts: frame({ expired: true }), actualServerId: null })).toBe('');
+  expect(render({ server: tsLanOnly, ts: frame({ expired: true }), actualServerId: 'another-node' })).toBe('');
 });

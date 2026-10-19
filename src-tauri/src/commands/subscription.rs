@@ -943,10 +943,9 @@ impl SubscriptionFetchIdentity {
 /// Use the store's exact canonicalization before entering a mutating transaction.
 /// A malformed edit must not be silently dropped by save-time sanitization.
 fn normalized_subscription_update(subscription: Value) -> Result<Value, String> {
-    let cleaned = polaris_store::sanitize_config(
-        &json!({ "subscriptions": [subscription] }).to_string(),
-    )
-    .map_err(|_| "订阅字段校验失败".to_owned())?;
+    let cleaned =
+        polaris_store::sanitize_config(&json!({ "subscriptions": [subscription] }).to_string())
+            .map_err(|_| "订阅字段校验失败".to_owned())?;
     cleaned["subscriptions"]
         .as_array()
         .filter(|subscriptions| subscriptions.len() == 1)
@@ -1070,7 +1069,9 @@ fn node_generation_identity(value: &Value) -> Option<String> {
         // must not split the provider/sourceTag/control identity.
         Some(node_fingerprint(value))
     } else {
-        Some(polaris_net_stack::subscription::server_generation_identity(&node))
+        Some(polaris_net_stack::subscription::server_generation_identity(
+            &node,
+        ))
     }
 }
 
@@ -1352,22 +1353,35 @@ fn reconcile_subscription_servers(
     // Compare dependency structure, not ephemeral imported IDs. Include unrelated
     // persisted nodes for existing local references, in a separate ID namespace.
     let graph_nodes = |values: &[Value]| -> Vec<(String, String, Option<String>)> {
-        values.iter().map(|value| {
-            let id = value.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let detour = value.get("detour").and_then(Value::as_str).map(str::to_owned);
-            let mut projection = value.clone();
-            if let Some(object) = projection.as_object_mut() { object.remove("detour"); }
-            // Unparseable nodes retain an exact serialized signature rather than
-            // masquerading as a valid source node with an empty identity.
-            let signature = node_generation_identity(&projection)
-                .unwrap_or_else(|| format!("invalid:{}", projection));
-            (id, signature, detour)
-        }).collect()
+        values
+            .iter()
+            .map(|value| {
+                let id = value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let detour = value
+                    .get("detour")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let mut projection = value.clone();
+                if let Some(object) = projection.as_object_mut() {
+                    object.remove("detour");
+                }
+                // Unparseable nodes retain an exact serialized signature rather than
+                // masquerading as a valid source node with an empty identity.
+                let signature = node_generation_identity(&projection)
+                    .unwrap_or_else(|| format!("invalid:{}", projection));
+                (id, signature, detour)
+            })
+            .collect()
     };
     let mut old_graph_values = this_sub.clone();
     old_graph_values.extend(others.iter().cloned());
     let classes = polaris_net_stack::subscription::dependency_identity_classes(&[
-        graph_nodes(&old_graph_values), graph_nodes(&new_vals),
+        graph_nodes(&old_graph_values),
+        graph_nodes(&new_vals),
     ]);
     let old_classes = &classes[0];
     let new_classes = &classes[1];
@@ -1380,7 +1394,10 @@ fn reconcile_subscription_servers(
     let mut new_coarse: HashMap<String, usize> = HashMap::new();
     for (index, old) in old_nodes.iter().enumerate() {
         let old = old.as_ref().expect("unconsumed old node");
-        old_coarse.entry(node_fingerprint(old)).or_default().push(index);
+        old_coarse
+            .entry(node_fingerprint(old))
+            .or_default()
+            .push(index);
         if let Some(key) = old_classes[index] {
             exact.entry(key).or_default().push_back(index);
         }
@@ -1404,7 +1421,9 @@ fn reconcile_subscription_servers(
     }
     let reserved: std::collections::HashSet<usize> = matches.iter().flatten().copied().collect();
     for (index, new) in new_vals.iter().enumerate() {
-        if matches[index].is_some() { continue; }
+        if matches[index].is_some() {
+            continue;
+        }
         let key = node_fingerprint(new);
         // Only ORIGINAL singleton buckets can inherit the existing compatibility
         // contract (e.g. an SNI/path update). Remaining ambiguous nodes never guess.
@@ -1420,19 +1439,32 @@ fn reconcile_subscription_servers(
 
     // All matches are reserved before any edge is rewritten. Provider leftovers
     // already carry stable IDs and are left untouched by this imported-ID map.
-    let imported_to_final: HashMap<String, String> = new_vals.iter().zip(&matches).filter_map(|(new, matched)| {
-        let imported = new.get("id")?.as_str()?;
-        let final_id = matched.and_then(|index| old_nodes[index].as_ref())
-            .and_then(|old| old.get("id")).and_then(Value::as_str).unwrap_or(imported);
-        Some((imported.to_owned(), final_id.to_owned()))
-    }).collect();
+    let imported_to_final: HashMap<String, String> = new_vals
+        .iter()
+        .zip(&matches)
+        .filter_map(|(new, matched)| {
+            let imported = new.get("id")?.as_str()?;
+            let final_id = matched
+                .and_then(|index| old_nodes[index].as_ref())
+                .and_then(|old| old.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or(imported);
+            Some((imported.to_owned(), final_id.to_owned()))
+        })
+        .collect();
 
     let mut reconciled: Vec<Value> = Vec::with_capacity(new_vals.len());
     let (mut added, mut updated) = (0usize, 0usize);
     for (mut nv, matched_index) in new_vals.into_iter().zip(matches) {
-        if let Some(target) = nv.get("detour").and_then(Value::as_str)
-            .and_then(|id| imported_to_final.get(id)).cloned() {
-            nv.as_object_mut().expect("serialized ServerConfig").insert("detour".into(), Value::String(target));
+        if let Some(target) = nv
+            .get("detour")
+            .and_then(Value::as_str)
+            .and_then(|id| imported_to_final.get(id))
+            .cloned()
+        {
+            nv.as_object_mut()
+                .expect("serialized ServerConfig")
+                .insert("detour".into(), Value::String(target));
         }
         let matched = matched_index.and_then(|index| old_nodes[index].take());
         if let Some(old) = matched {

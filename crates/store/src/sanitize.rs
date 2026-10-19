@@ -490,7 +490,12 @@ pub fn selection_intent_auto(subscription_id: &str) -> Value {
 pub(crate) fn sanitize_selection_intent(obj: &mut Map<String, Value>) {
     // Native scopes remain references even if currently empty/deleted. Never silently
     // clear a scoped reference into the unrelated default exit.
-    if obj.get(SELECTION_INTENT_KEY).is_some_and(|value| value.get("mode").and_then(Value::as_str)==Some("auto")) { return; }
+    if obj
+        .get(SELECTION_INTENT_KEY)
+        .is_some_and(|value| value.get("mode").and_then(Value::as_str) == Some("auto"))
+    {
+        return;
+    }
     let Some(intent) = obj.get(SELECTION_INTENT_KEY) else {
         return;
     };
@@ -683,11 +688,14 @@ fn sanitize_rule_effects(rule: &mut Value) {
     let dns_ok = effects.get("dns").is_none_or(|dns| {
         dns.as_object().is_some_and(|dns| {
             dns.get("resolver").is_none_or(|value| {
-                value.as_str().is_some_and(|resolver| matches!(resolver, "inherit" | "direct" | "proxy"))
+                value
+                    .as_str()
+                    .is_some_and(|resolver| matches!(resolver, "inherit" | "direct" | "proxy"))
+            }) && dns.get("answerMode").is_none_or(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|mode| matches!(mode, "real" | "fakeIp"))
             })
-                && dns.get("answerMode").is_none_or(|value| {
-                    value.as_str().is_some_and(|mode| matches!(mode, "real" | "fakeIp"))
-                })
         })
     });
     if !dns_ok {

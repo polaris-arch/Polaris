@@ -36,7 +36,8 @@ fn custom_outbound_json(raw: serde_json::Value) -> serde_json::Value {
         &test_dial_resolver(),
         "x64",
         "linux",
-    ).expect("valid test outbound");
+    )
+    .expect("valid test outbound");
     serde_json::to_value(&ob).unwrap()
 }
 
@@ -135,7 +136,8 @@ fn vless_basic() {
     let mut s = server(Protocol::Vless, "a.com");
     s.uuid = Some("uuid-1".into());
     s.security = Some(SecurityMode::Tls); // vless 需显式 security=tls 才生成 TLS 块
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     assert_eq!(ob.type_field, "vless");
     assert_eq!(ob.uuid.as_deref(), Some("uuid-1"));
     assert_eq!(ob.packet_encoding.as_deref(), Some("xudp")); // 默认 xudp
@@ -152,7 +154,8 @@ fn vless_basic() {
 fn trojan_default_alpn() {
     let mut s = server(Protocol::Trojan, "t.com");
     s.password = Some("pw".into());
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     assert_eq!(
         ob.tls.as_ref().unwrap().alpn.as_ref().unwrap(),
         &vec!["http/1.1".to_string()]
@@ -167,7 +170,8 @@ fn shadowsocks_method_password() {
         password: "secret".into(),
         ..Default::default()
     }));
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     assert_eq!(ob.method.as_deref(), Some("aes-256-gcm"));
     assert_eq!(ob.password.as_deref(), Some("secret"));
 }
@@ -185,7 +189,8 @@ fn hysteria2_obfs_gecko() {
         }),
         ..Default::default()
     }));
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     let obfs = ob.obfs.as_ref().unwrap();
     let crate::singbox::outbound::ObfsField::Object(obfs) = obfs else {
         panic!("hysteria2 的 obfs 必须是对象形态（v1 才是裸字符串）");
@@ -201,7 +206,8 @@ fn hysteria2_no_chrome_parrot_key_by_default() {
     let mut s = server(Protocol::Hysteria2, "h.com");
     s.password = Some("pw".into());
     s.hysteria2_settings = Some(Box::new(ps::Hysteria2Settings::default()));
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     assert_eq!(ob.disable_chrome_parrot, None);
     let json = serde_json::to_value(&ob).unwrap();
     assert!(json.get("disable_chrome_parrot").is_none());
@@ -210,7 +216,8 @@ fn hysteria2_no_chrome_parrot_key_by_default() {
         disable_chrome_parrot: Some(false),
         ..Default::default()
     }));
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     assert!(serde_json::to_value(&ob)
         .unwrap()
         .get("disable_chrome_parrot")
@@ -236,7 +243,8 @@ fn hysteria2_zero_bandwidth_is_omitted_but_nonzero_is_kept() {
         down_mbps: Some(0),
         ..Default::default()
     }));
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     let json = serde_json::to_value(&ob).unwrap();
     assert!(json.get("up_mbps").is_none(), "0 不该下发：{json}");
     assert!(json.get("down_mbps").is_none(), "0 不该下发：{json}");
@@ -247,7 +255,8 @@ fn hysteria2_zero_bandwidth_is_omitted_but_nonzero_is_kept() {
         down_mbps: Some(500),
         ..Default::default()
     }));
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     let json = serde_json::to_value(&ob).unwrap();
     assert_eq!(json["up_mbps"], 100);
     assert_eq!(json["down_mbps"], 500);
@@ -262,7 +271,8 @@ fn hysteria2_chrome_parrot_disabled_when_opted_in() {
         disable_chrome_parrot: Some(true),
         ..Default::default()
     }));
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     assert_eq!(ob.disable_chrome_parrot, Some(true));
     assert_eq!(
         serde_json::to_value(&ob).unwrap()["disable_chrome_parrot"],
@@ -275,7 +285,8 @@ fn naive_only_server_name_tls() {
     let mut s = server(Protocol::Naive, "n.com");
     s.username = Some("u".into());
     s.password = Some("p".into());
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     // naive TLS 仅 server_name，无 alpn/insecure。
     let tls = ob.tls.as_ref().unwrap();
     assert!(tls.alpn.is_none());
@@ -289,7 +300,8 @@ fn ssh_no_tls() {
         user: Some("root".into()),
         ..Default::default()
     }));
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     assert!(ob.tls.is_none());
     assert_eq!(ob.user.as_deref(), Some("root"));
 }
@@ -304,7 +316,8 @@ fn ssh_no_tls() {
 /// 必须经 serde 入口，才覆盖「存量/订阅脏数据进来」的真实路径。
 fn outbound_json_from(server_json: &str) -> serde_json::Value {
     let s: ServerConfig = serde_json::from_str(server_json).expect("节点必须能反序列化");
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     serde_json::to_value(&ob).unwrap()
 }
 
@@ -808,7 +821,8 @@ fn ws_transport_ed_parse() {
         path: Some("/ws?ed=2560".into()),
         ..Default::default()
     }));
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux").expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), "x64", "linux")
+        .expect("valid test outbound");
     let t = ob.transport.as_ref().unwrap();
     assert_eq!(t.type_field, "ws");
     assert_eq!(t.path.as_deref(), Some("/ws")); // ed 剥离
@@ -828,7 +842,8 @@ fn ws_transport_ed_parse() {
 /// **恰恰读这两个参数**，故本批需要一个能改这两维的版本。
 fn outbound_json_on(server_json: &str, arch: &str, platform: &str) -> serde_json::Value {
     let s: ServerConfig = serde_json::from_str(server_json).expect("节点必须能反序列化");
-    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), arch, platform).expect("valid test outbound");
+    let ob = build_proxy_outbound(&s, "proxy-s1", &test_dial_resolver(), arch, platform)
+        .expect("valid test outbound");
     serde_json::to_value(&ob).unwrap()
 }
 
@@ -1874,14 +1889,20 @@ fn cert_pins_coexist_with_utls_engine_ech_and_insecure() {
 
 #[test]
 fn absent_pins_stay_absent_but_invalid_pins_reject_even_with_insecure() {
-    let valid = outbound_json_from(r#"{"id":"s1","name":"n","protocol":"trojan","address":"a.com","port":443,"password":"pw","tlsSettings":{"serverName":"s.com"}}"#);
+    let valid = outbound_json_from(
+        r#"{"id":"s1","name":"n","protocol":"trojan","address":"a.com","port":443,"password":"pw","tlsSettings":{"serverName":"s.com"}}"#,
+    );
     assert!(valid["tls"].get("certificate_sha256").is_none());
     for pin in ["chrome".to_owned(), format!("{PIN_X_HEX},bad")] {
         let node: ServerConfig = serde_json::from_value(serde_json::json!({
             "id":"s1", "name":"n", "protocol":"trojan", "address":"a.com", "port":443,
             "password":"pw", "tlsSettings":{"allowInsecure":true, "certificateSha256":pin}
-        })).unwrap();
-        assert_eq!(build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", "linux").unwrap_err(), "TLS_PIN_INVALID");
+        }))
+        .unwrap();
+        assert_eq!(
+            build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", "linux").unwrap_err(),
+            "TLS_PIN_INVALID"
+        );
     }
 }
 
@@ -1891,8 +1912,12 @@ fn native_engine_explicit_fragment_rejects_but_go_fragment_remains_supported() {
         let node: ServerConfig = serde_json::from_value(serde_json::json!({
             "id":"s1", "name":"n", "protocol":"trojan", "address":"a.com", "port":443,
             "password":"pw", "tlsSettings":{"engine":engine, "fragment":true}
-        })).unwrap();
-        assert_eq!(build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", platform).unwrap_err(), "TLS_FRAGMENT_UNSUPPORTED");
+        }))
+        .unwrap();
+        assert_eq!(
+            build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", platform).unwrap_err(),
+            "TLS_FRAGMENT_UNSUPPORTED"
+        );
         let go = build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", "linux").unwrap();
         assert_eq!(go.tls.unwrap().fragment, Some(true));
     }
@@ -1935,19 +1960,29 @@ fn naive_never_carries_cert_pins() {
 #[test]
 fn discarded_modeled_pins_are_not_parsed_by_direct_outbound_generation() {
     for (protocol, security) in [
-        (Protocol::Naive, None), (Protocol::Vless, Some(SecurityMode::Reality)),
-        (Protocol::Tor, None), (Protocol::Tailcat, None), (Protocol::Ssh, None),
+        (Protocol::Naive, None),
+        (Protocol::Vless, Some(SecurityMode::Reality)),
+        (Protocol::Tor, None),
+        (Protocol::Tailcat, None),
+        (Protocol::Ssh, None),
         (Protocol::Custom, None),
     ] {
-        for pin in [None, Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"), Some("invalid-pin")] {
+        for pin in [
+            None,
+            Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"),
+            Some("invalid-pin"),
+        ] {
             let mut node = server(protocol, "example.invalid");
             node.security = security.clone();
             if node.security.as_ref().is_some_and(SecurityMode::is_reality) {
                 node.reality_settings = Some(Default::default());
             }
-            node.tls_settings = Some(ps::TlsSettings {allow_insecure: Some(true),
+            node.tls_settings = Some(ps::TlsSettings {
+                allow_insecure: Some(true),
                 certificate_sha256: pin.map(str::to_owned),
-                certificate_public_key_sha256: pin.map(str::to_owned), ..Default::default()});
+                certificate_public_key_sha256: pin.map(str::to_owned),
+                ..Default::default()
+            });
             let out = build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", "linux")
                 .expect("discarded modeled pins are irrelevant to this protocol");
             if let Some(tls) = out.tls {

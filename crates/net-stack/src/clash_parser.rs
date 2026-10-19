@@ -129,11 +129,15 @@ impl ClashParseResult {
     /// 第二份判据迟早与内核漂移，而漂移的表现是「要么产出起不来的配置、要么把好配置误报成无效」。
     pub(crate) fn finish(mut self) -> Self {
         let before = self.servers.len();
-        self.servers.retain(|server| polaris_config_engine::user_config::tls_pin::validate_server_cert_pins(server).is_ok());
+        self.servers.retain(|server| {
+            polaris_config_engine::user_config::tls_pin::validate_server_cert_pins(server).is_ok()
+        });
         let rejected = before - self.servers.len();
         if rejected > 0 {
             self.failed += rejected;
-            self.warnings.push(format!("{rejected} 个节点证书指纹无效，已拒绝导入（TLS_PIN_INVALID）"));
+            self.warnings.push(format!(
+                "{rejected} 个节点证书指纹无效，已拒绝导入（TLS_PIN_INVALID）"
+            ));
         }
         let mut ignored: Vec<String> = self
             .servers
@@ -758,8 +762,11 @@ fn apply_transport_and_tls(
                 config.network = Some("ws".to_string());
                 let ws_opts = p.get("ws-opts");
                 let path = ws_opts.and_then(|w| w.get("path")).and_then(str);
-                let header_json = ws_opts.and_then(|w| w.get("headers"))
-                    .map(serde_json::to_value).transpose().map_err(|_| "Invalid WS headers")?;
+                let header_json = ws_opts
+                    .and_then(|w| w.get("headers"))
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|_| "Invalid WS headers")?;
                 if !crate::import_fields::headers_supported(header_json.as_ref(), false) {
                     return Err("Unrepresentable WS headers".into());
                 }
@@ -841,16 +848,25 @@ fn apply_transport_and_tls(
                         }
                     }
                 } else if let Some(headers) = http_opts.and_then(|h| h.get("headers")) {
-                    let headers = serde_json::to_value(headers).map_err(|_| "Invalid HTTP headers")?;
-                    if let Some(host) = headers.as_object().and_then(|h| h.iter().find(|(k, _)| k.eq_ignore_ascii_case("host"))) {
+                    let headers =
+                        serde_json::to_value(headers).map_err(|_| "Invalid HTTP headers")?;
+                    if let Some(host) = headers
+                        .as_object()
+                        .and_then(|h| h.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")))
+                    {
                         http_settings.host = crate::import_fields::string_list(Some(host.1));
                     }
                 }
-                http_settings.method = h2_opts.and_then(|h| h.get("method"))
-                    .or_else(|| http_opts.and_then(|h| h.get("method"))).and_then(str);
-                let headers = h2_opts.and_then(|h| h.get("headers"))
+                http_settings.method = h2_opts
+                    .and_then(|h| h.get("method"))
+                    .or_else(|| http_opts.and_then(|h| h.get("method")))
+                    .and_then(str);
+                let headers = h2_opts
+                    .and_then(|h| h.get("headers"))
                     .or_else(|| http_opts.and_then(|h| h.get("headers")))
-                    .map(serde_json::to_value).transpose().map_err(|_| "Invalid HTTP headers")?;
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|_| "Invalid HTTP headers")?;
                 if !crate::import_fields::headers_supported(headers.as_ref(), true) {
                     return Err("Unrepresentable HTTP headers".into());
                 }
@@ -1524,7 +1540,9 @@ fn map_node(
             }
             Protocol::Http => {
                 let is_tls = m.get("tls").and_then(bool_val) == Some(true)
-                    || m.get("type").and_then(str).is_some_and(|t| t.eq_ignore_ascii_case("https"));
+                    || m.get("type")
+                        .and_then(str)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("https"));
                 config.username = m.get("username").and_then(str);
                 config.password = m.get("password").and_then(str);
                 config.network = Some("tcp".to_string());
@@ -1665,7 +1683,10 @@ pub fn parse_clash_proxies_with_origin(
 
     let mut graph = crate::import_fields::ImportGraph::default();
     for proxy in seq {
-        let tag = proxy.get("name").and_then(Value::as_str).map(|s| serde_json::Value::String(s.into()));
+        let tag = proxy
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|s| serde_json::Value::String(s.into()));
         graph.observe(tag.as_ref());
     }
     for proxy in seq {

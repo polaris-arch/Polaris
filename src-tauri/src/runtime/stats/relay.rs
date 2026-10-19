@@ -409,7 +409,9 @@ pub(super) async fn run_connections_stream(
                 return;
             };
             if ((!detail_open && offline_detail_was_open)
-                || (detail_open && (!offline_detail_was_open || detail_baseline_due) && !detail_pending.reset))
+                || (detail_open
+                    && (!offline_detail_was_open || detail_baseline_due)
+                    && !detail_pending.reset))
                 && !begin_detail_generation(&lifecycle, task_epoch, &mut detail_pending)
             {
                 return;

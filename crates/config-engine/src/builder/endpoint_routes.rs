@@ -952,7 +952,9 @@ fn selected_server_precludes_selector_fallback(s: &ServerConfig) -> bool {
 /// 已为 `true` 的状态下，无需第二道判据。
 pub fn selector_default_may_fall_back(config: &UserConfig) -> bool {
     // Auto generation rejects an empty group or missing pin; it never falls back globally.
-    if config.selection_intent.is_some() { return false; }
+    if config.selection_intent.is_some() {
+        return false;
+    }
     let Some(sid) = config.selected_server_id.as_deref() else {
         return true; // 未选节点 → selected_tag 恒为字面量 "proxy" → 必落兜底
     };
@@ -979,7 +981,9 @@ pub fn referenced_server_ids(config: &UserConfig) -> BTreeSet<String> {
     let mut stack: Vec<String> = Vec::new();
     for target in crate::user_config::auto_select::referenced_targets(config) {
         if config.auto_select_enabled {
-            stack.extend(crate::user_config::auto_select::eligible_members(config, &target));
+            stack.extend(crate::user_config::auto_select::eligible_members(
+                config, &target,
+            ));
         } else if let Some(pin) = crate::user_config::auto_select::pin(config, &target) {
             stack.push(pin.to_owned());
         }

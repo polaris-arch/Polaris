@@ -113,7 +113,7 @@ describe('② union 的每一支在宿主里都有 case（`never` 兜底不许�
   const HOST_SRC = strip(read('./MobileFormHost.tsx'));
 
   /** union 分支：`| { kind: 'x'` 的字面量。 */
-  const unionKinds = [...STORE_SRC.matchAll(/\|\s*\{\s*kind:\s*'([a-z-]+)'/g)].map((m) => m[1]).sort();
+  const unionKinds = [...STORE_SRC.matchAll(/\|\s*\{\s*(?:readonly\s+)?kind:\s*'([a-z-]+)'/g)].map((m) => m[1]).sort();
   /** 宿主的 case 标签。 */
   const hostCases = [...HOST_SRC.matchAll(/case\s+'([a-z-]+)':/g)].map((m) => m[1]).sort();
 
@@ -138,7 +138,7 @@ describe('② union 的每一支在宿主里都有 case（`never` 兜底不许�
    * 某条入口点开之后什么都不发生的形态。批 3 新增四支（组网三张表 + Tailscale 设置表）；
    * 批 13 新增 `rule`（连接行的「新建规则」，`RuleFormPanel`）。
    */
-  it('落地的十九个 kind 一个不少一个不多（少一个 = 那条入口点开是空的）', () => {
+  it('落地的二十一个 kind 一个不少一个不多（少一个 = 那条入口点开是空的）', () => {
     /* 2026-09-13（批 10 / 规则屏）加了六支：规则表、DNS 服务器 / 分组两张表、
        添加自定义应用、资源目录、按 URL 下载。加一支而不补 case ⇒ 宿主的 `never` 兜底编译不过，
        这条断言守的是另一半：**加了 case 却忘了在这里登记**（那时没有任何东西会红）。
@@ -154,6 +154,7 @@ describe('② union 的每一支在宿主里都有 case（`never` 兜底不许�
         'confirm',
         'dns-group',
         'dns-server',
+        'identity-repair',
         'import',
         'mesh-join',
         'network-profile',
@@ -167,6 +168,7 @@ describe('② union 的每一支在宿主里都有 case（`never` 兜底不许�
         'ts-exit',
         'ts-login',
         'ts-settings',
+        'vpn-auth',
         'warp',
         'wg',
       ].sort(),

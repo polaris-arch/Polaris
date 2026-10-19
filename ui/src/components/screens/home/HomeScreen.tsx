@@ -596,6 +596,10 @@ export function HomeScreen() {
         );
         return;
       }
+      if (code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID) {
+        toast.error(proxyErrorText({ errorCode: code }, key => t(key)));
+        return;
+      }
       // 残留 root 孤儿阻断起核 → 专属标题，**不能**落到下面的「sing-box 启动失败，请检查服务器
       // 配置」：那句话把用户导向错误的下一步（残留进程与服务器配置毫无关系，照它改永远修不好）。
       // Rust 诊断会带 pid/命令，只进脱敏日志；这里只显示稳定码对应的本地化处置指引。

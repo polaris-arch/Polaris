@@ -31,7 +31,10 @@ pub(crate) type Dialer = Arc<dyn Fn(String, u16) -> DialFuture + Send + Sync>;
 /// `target` = `host:port`（裸 IPv6 字面量已方括号包裹）。返回一条 **lazy** tonic Channel——
 /// 不立即建连，首个 RPC 时才握 TCP + h2。复用同 channel 的所有 RPC 走同一条 h2 连接。
 pub(crate) async fn connect_h2c(target: &str) -> Result<Channel, tonic::transport::Error> {
-    connect_h2c_with(target, Arc::new(|host, port| Box::pin(TcpStream::connect((host, port)))))
+    connect_h2c_with(
+        target,
+        Arc::new(|host, port| Box::pin(TcpStream::connect((host, port)))),
+    )
 }
 
 /// [`connect_h2c`] 的本体：拨号器可注入。

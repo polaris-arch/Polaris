@@ -810,7 +810,9 @@ pub fn migrate_custom_rule_effects(value: &mut Value) -> bool {
         if let Some(target) = map.get("targetServerId").and_then(Value::as_str) {
             route.insert("targetServerId".into(), Value::String(target.into()));
         }
-        if let Some(target) = map.get("targetAutoSelect") { route.insert("targetAutoSelect".into(),target.clone()); }
+        if let Some(target) = map.get("targetAutoSelect") {
+            route.insert("targetAutoSelect".into(), target.clone());
+        }
 
         let mut effects = Map::new();
         effects.insert("route".into(), Value::Object(route));
@@ -930,7 +932,9 @@ fn migrate_legacy_domain_rule(old: &Value) -> Vec<Value> {
         if let Some(t) = target.clone() {
             m.insert("targetServerId".into(), t);
         }
-        if let Some(t) = auto_target.clone() { m.insert("targetAutoSelect".into(), t); }
+        if let Some(t) = auto_target.clone() {
+            m.insert("targetAutoSelect".into(), t);
+        }
         if let Some(r) = remarks.clone() {
             m.insert("remarks".into(), r);
         }
@@ -949,7 +953,9 @@ fn migrate_legacy_domain_rule(old: &Value) -> Vec<Value> {
         if let Some(t) = target.clone() {
             m.insert("targetServerId".into(), t);
         }
-        if let Some(t) = auto_target.clone() { m.insert("targetAutoSelect".into(), t); }
+        if let Some(t) = auto_target.clone() {
+            m.insert("targetAutoSelect".into(), t);
+        }
         if let Some(r) = remarks.clone() {
             m.insert("remarks".into(), r);
         }
@@ -978,7 +984,9 @@ fn migrate_legacy_domain_rule(old: &Value) -> Vec<Value> {
         if let Some(t) = target.clone() {
             m.insert("targetServerId".into(), t);
         }
-        if let Some(t) = auto_target.clone() { m.insert("targetAutoSelect".into(), t); }
+        if let Some(t) = auto_target.clone() {
+            m.insert("targetAutoSelect".into(), t);
+        }
         if let Some(r) = remarks.clone() {
             let base = r.as_str().unwrap_or("");
             m.insert("remarks".into(), Value::String(format!("{base} (IP)")));
@@ -1001,7 +1009,9 @@ fn migrate_legacy_domain_rule(old: &Value) -> Vec<Value> {
         if let Some(t) = target {
             m.insert("targetServerId".into(), t);
         }
-        if let Some(t) = auto_target.clone() { m.insert("targetAutoSelect".into(), t); }
+        if let Some(t) = auto_target.clone() {
+            m.insert("targetAutoSelect".into(), t);
+        }
         if let Some(r) = remarks {
             m.insert("remarks".into(), r);
         }

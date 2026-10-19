@@ -597,7 +597,7 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     why: '桌面主连接持有该节点时用户确认断开后的第二次按 id 登出前复核该节点仍在磁盘镜像中；确认等待期间节点可能被删除，effective 暂存集合不能证明后端仍有对象（与 TsSettingsPanel 那条逐字同一件事）。',
   },
   {
-    file: 'components/vpn/VpnAuthForm.tsx',
+    file: 'shared/vpn/VpnAuthForm.tsx',
     shape: 'useAppStore((state)=>state.servers.find((server)=>server.id=…',
     count: 1,
     surface: 'operation',

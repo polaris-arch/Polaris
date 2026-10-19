@@ -239,7 +239,9 @@ pub fn assemble_diagnostic_report(src: &DiagnosticReportSource) -> String {
         redacted_user_config: crate::redact::redact_deep(&src.user_config, &extra),
         redacted_singbox_config: if src.unverified_runtime {
             serde_json::json!({"error": "运行配置与脱敏元数据未能核对，已省略该段"})
-        } else { crate::redact::redact_deep(&src.singbox_config, &extra) },
+        } else {
+            crate::redact::redact_deep(&src.singbox_config, &extra)
+        },
         app_log_tail: src.app_log_tail.clone(),
         singbox_log_tail: src.singbox_log_tail.clone(),
         node_identifiers: crate::redact::collect_report_node_identifiers(

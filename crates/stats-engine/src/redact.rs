@@ -586,9 +586,13 @@ pub fn collect_report_node_identifiers(
                 for host in hosts {
                     add(&host, false);
                 }
-                if node.get("type").and_then(Value::as_str).is_some_and(|kind| {
-                    !matches!(kind, "direct" | "block" | "dns" | "selector" | "urltest")
-                }) {
+                if node
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        !matches!(kind, "direct" | "block" | "dns" | "selector" | "urltest")
+                    })
+                {
                     if let Some(tag) = node.get("tag").and_then(Value::as_str) {
                         add(tag, true);
                     }

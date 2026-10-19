@@ -1124,18 +1124,33 @@ fn clash_tls_and_shadow_import_preserve_absence_or_explicit_profile() {
 
 #[test]
 fn import_finalization_validates_only_emitted_modeled_pins() {
-    use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
     use polaris_config_engine::user_config::protocol_settings::TlsSettings;
+    use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
     for (protocol, security, emitted) in [
-        (Protocol::Trojan, None, true), (Protocol::MasqueClient, None, true),
-        (Protocol::Vless, Some(SecurityMode::Reality), false), (Protocol::Naive, None, false),
-        (Protocol::Tor, None, false), (Protocol::Tailcat, None, false),
-        (Protocol::Ssh, None, false), (Protocol::Custom, None, false),
+        (Protocol::Trojan, None, true),
+        (Protocol::MasqueClient, None, true),
+        (Protocol::Vless, Some(SecurityMode::Reality), false),
+        (Protocol::Naive, None, false),
+        (Protocol::Tor, None, false),
+        (Protocol::Tailcat, None, false),
+        (Protocol::Ssh, None, false),
+        (Protocol::Custom, None, false),
     ] {
-        for pin in [None, Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"), Some("invalid-pin")] {
-            let server = ServerConfig {protocol, security:security.clone(),
-                tls_settings:Some(TlsSettings {certificate_sha256:pin.map(str::to_owned),
-                    allow_insecure:Some(true), ..Default::default()}), ..Default::default()};
+        for pin in [
+            None,
+            Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"),
+            Some("invalid-pin"),
+        ] {
+            let server = ServerConfig {
+                protocol,
+                security: security.clone(),
+                tls_settings: Some(TlsSettings {
+                    certificate_sha256: pin.map(str::to_owned),
+                    allow_insecure: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
             let mut result = ClashParseResult::default();
             result.servers.push(server);
             let result = result.finish();

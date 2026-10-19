@@ -20,7 +20,10 @@ async fn detail_subscription_edge_survives_coalesced_watch_off_on() {
     let open = registry.should_stream(Topic::Detail);
     assert!(open && was_open && registry.should_stream_connections());
     let baseline_due = lifecycle.consume_detail_baseline(epoch).unwrap();
-    assert!(baseline_due, "off/on edge must survive unchanged demand level");
+    assert!(
+        baseline_due,
+        "off/on edge must survive unchanged demand level"
+    );
     assert!(open != was_open || (open && baseline_due));
     assert_eq!(lifecycle.consume_detail_baseline(epoch), Some(false));
     lifecycle.request_detail_baseline();
@@ -34,10 +37,16 @@ async fn detail_subscription_edge_survives_coalesced_watch_off_on() {
 fn detail_edge_is_requested_only_after_subscription_admission_and_before_wake() {
     let source = module_code("runtime/stats");
     let subscribe = method_body(&source, "    pub fn subscribe(");
-    let admit = subscribe.find("self.register_subscription(window_label, topic)").unwrap();
-    let request = subscribe.find("self.connection_lifecycle.request_detail_baseline();").unwrap();
+    let admit = subscribe
+        .find("self.register_subscription(window_label, topic)")
+        .unwrap();
+    let request = subscribe
+        .find("self.connection_lifecycle.request_detail_baseline();")
+        .unwrap();
     let wake = subscribe.find("self.gate.bump();").unwrap();
     assert!(admit < request && request < wake);
     assert!(subscribe.contains("if topic == Topic::Detail {"));
-    assert!(source.contains("detail_open != detail_was_open || (detail_open && detail_baseline_due)"));
+    assert!(
+        source.contains("detail_open != detail_was_open || (detail_open && detail_baseline_due)")
+    );
 }

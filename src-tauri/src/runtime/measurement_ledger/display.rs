@@ -16,7 +16,9 @@ use crate::commands::{
 };
 use crate::response::ApiResponse;
 use crate::runtime::{
-    measurement_scheduler::{self, freshness_period_index, indexed_entry_freshness_cap_ms, LedgerView},
+    measurement_scheduler::{
+        self, freshness_period_index, indexed_entry_freshness_cap_ms, LedgerView,
+    },
     AppRuntime,
 };
 
@@ -256,8 +258,8 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
         .as_str()
         .map_or_else(BTreeSet::new, |id| BTreeSet::from([id.to_owned()]));
     let plan = measurement_scheduler::plan_subscriptions(&config, &auto_scope);
-    let periods=freshness_period_index(&plan);
-    let cap=|id: &str,entry: &LedgerEntry|indexed_entry_freshness_cap_ms(&periods,id,entry);
+    let periods = freshness_period_index(&plan);
+    let cap = |id: &str, entry: &LedgerEntry| indexed_entry_freshness_cap_ms(&periods, id, entry);
     let now = crate::runtime::subscription_scheduler::now_ms();
     let emission_digest =
         generation.and_then(|generation| proxy.ready_main_emission_digest(generation));
@@ -268,9 +270,15 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
         &connections,
     );
     // One authoritative UI projector; native samples carry distinct provenance.
-    if let Some(native) = proxy.native_measurement_rows(&config, now, emission_digest.as_deref()).as_object() {
+    if let Some(native) = proxy
+        .native_measurement_rows(&config, now, emission_digest.as_deref())
+        .as_object()
+    {
         for (id, record) in native {
-            rows.as_object_mut().expect("display rows object").entry(id.clone()).or_insert_with(|| json!({}))["nativeHttp"] = record.clone();
+            rows.as_object_mut()
+                .expect("display rows object")
+                .entry(id.clone())
+                .or_insert_with(|| json!({}))["nativeHttp"] = record.clone();
         }
     }
     let mut frontend = config.clone();

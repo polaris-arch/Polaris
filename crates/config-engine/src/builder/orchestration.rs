@@ -104,25 +104,41 @@ pub fn config_generation_norm(
 
     // 构建投影对象（对齐 Polaris 的字段排除/投影规则）。
     let mut proj = serde_json::Map::new();
-    let has_auto_references = !crate::user_config::auto_select::referenced_targets(config).is_empty();
+    let has_auto_references =
+        !crate::user_config::auto_select::referenced_targets(config).is_empty();
     let native_auto_active = has_auto_references && config.auto_select_enabled;
     // References can hot-switch only while the generated group graph is unchanged.
     // Keep the unique target set structural, not each rule's choice of a member.
     if has_auto_references {
-        proj.insert("nativeAutoTargets".into(), serde_json::to_value(crate::user_config::auto_select::referenced_targets(config)).unwrap());
+        proj.insert(
+            "nativeAutoTargets".into(),
+            serde_json::to_value(crate::user_config::auto_select::referenced_targets(config))
+                .unwrap(),
+        );
     }
 
     // 全量 config 序列化后投影（而非 spread + null 覆盖——Rust 无 spread）。
     let full = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
     if let Some(obj) = full.as_object() {
         for (k, v) in obj {
-            if !has_auto_references && matches!(k.as_str(), "autoSelectEnabled" | "autoSelectPins" | "selectionIntent") { continue; }
-            if k == "speedTestUrl" && !native_auto_active { continue; }
+            if !has_auto_references
+                && matches!(
+                    k.as_str(),
+                    "autoSelectEnabled" | "autoSelectPins" | "selectionIntent"
+                )
+            {
+                continue;
+            }
+            if k == "speedTestUrl" && !native_auto_active {
+                continue;
+            }
             if k == "subscriptions" && !native_auto_active {
                 let mut value = v.clone();
                 if let Some(subscriptions) = value.as_array_mut() {
                     for subscription in subscriptions {
-                        if let Some(subscription) = subscription.as_object_mut() { subscription.remove("speedTestIntervalMinutes"); }
+                        if let Some(subscription) = subscription.as_object_mut() {
+                            subscription.remove("speedTestIntervalMinutes");
+                        }
                     }
                 }
                 proj.insert(k.clone(), value);
@@ -224,7 +240,7 @@ pub fn config_generation_norm(
                             .and_then(serde_json::Value::as_object_mut)
                         {
                             route.remove("targetServerId");
-                    route.remove("targetAutoSelect");
+                            route.remove("targetAutoSelect");
                         }
                     }
                     v
@@ -245,7 +261,7 @@ pub fn config_generation_norm(
                             .and_then(serde_json::Value::as_object_mut)
                         {
                             route.remove("targetServerId");
-                    route.remove("targetAutoSelect");
+                            route.remove("targetAutoSelect");
                         }
                     }
                     v
@@ -265,7 +281,14 @@ pub fn config_generation_norm(
                     // Watchers own matcher values only; all outer rule semantics invalidate the core.
                     let mut value = serde_json::to_value(r).expect("serializable rule");
                     if let Some(object) = value.as_object_mut() {
-                        for key in ["remarks", "targetServerId", "targetAutoSelect", "values", "conditions", "type"] {
+                        for key in [
+                            "remarks",
+                            "targetServerId",
+                            "targetAutoSelect",
+                            "values",
+                            "conditions",
+                            "type",
+                        ] {
                             object.remove(key);
                         }
                         if let Some(route) = object
@@ -275,7 +298,7 @@ pub fn config_generation_norm(
                             .and_then(serde_json::Value::as_object_mut)
                         {
                             route.remove("targetServerId");
-                    route.remove("targetAutoSelect");
+                            route.remove("targetAutoSelect");
                         }
                         object.insert("__ext".into(), serde_json::json!(1));
                         object.insert("conds".into(), serde_json::json!(conds));

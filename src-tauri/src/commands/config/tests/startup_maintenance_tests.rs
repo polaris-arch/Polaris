@@ -155,21 +155,30 @@ fn failed_privacy_maintenance_still_persists_api_secret_and_remains_retryable() 
         for unreadable in [false, true] {
             let dir = temp_dir("independent-secret");
             let mut cfg = valid_config();
-            if let Some(secret) = initial_secret { cfg["clashApiSecret"] = json!(secret); }
+            if let Some(secret) = initial_secret {
+                cfg["clashApiSecret"] = json!(secret);
+            }
             std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
             let mgr = ConfigManager::new(dir.clone());
             let credential = privacy_lock_path(&mgr);
-            if unreadable { std::fs::create_dir(&credential).unwrap(); }
-            else { std::fs::write(&credential, "{broken").unwrap(); }
+            if unreadable {
+                std::fs::create_dir(&credential).unwrap();
+            } else {
+                std::fs::write(&credential, "{broken").unwrap();
+            }
             let done = AtomicBool::new(false);
             assert!(run_startup_maintenance(&mgr, &done).is_err());
             assert!(!done.load(Ordering::SeqCst));
-            let disk: Value = serde_json::from_str(&std::fs::read_to_string(mgr.path()).unwrap()).unwrap();
+            let disk: Value =
+                serde_json::from_str(&std::fs::read_to_string(mgr.path()).unwrap()).unwrap();
             let secret = disk["clashApiSecret"].as_str().unwrap().to_owned();
             assert_eq!(secret.len(), 32);
             // Explicit fixture repair, never a real user's credential.
-            if unreadable { std::fs::remove_dir(&credential).unwrap(); }
-            else { std::fs::remove_file(&credential).unwrap(); }
+            if unreadable {
+                std::fs::remove_dir(&credential).unwrap();
+            } else {
+                std::fs::remove_file(&credential).unwrap();
+            }
             assert!(run_startup_maintenance(&mgr, &done).is_ok());
             assert!(done.load(Ordering::SeqCst));
             assert_eq!(mgr.current().unwrap()["clashApiSecret"], secret);
@@ -189,7 +198,10 @@ fn plaintext_survives_failed_scrypt_migration_without_blocking_api_secret_public
     assert!(unlock_core(&mgr, "legacy-password").is_err());
     let disk: Value = serde_json::from_str(&std::fs::read_to_string(mgr.path()).unwrap()).unwrap();
     assert!(!disk["clashApiSecret"].as_str().unwrap().is_empty());
-    assert!(verify_password(disk[PRIVACY_PASSWORD_HASH_KEY].as_str().unwrap(), "legacy-password"));
+    assert!(verify_password(
+        disk[PRIVACY_PASSWORD_HASH_KEY].as_str().unwrap(),
+        "legacy-password"
+    ));
     assert_ne!(disk["privacyPassword"], "legacy-password");
     std::fs::remove_file(privacy_lock_path(&mgr)).unwrap();
     backfill_secret_and_privacy(&mgr).unwrap();
@@ -223,20 +235,35 @@ fn duplicate_identity_cold_recovery(plain_password: bool) {
         &serde_json::from_value::<crate::runtime::config::IdentityRepairRequest>(json!({
             "version": preview["version"],
             "choices": [{"indices":[0,1],"keeperIndex":0}]
-        })).unwrap(),
+        }))
+        .unwrap(),
         || "recovered-fixture-id".into(),
-    ).unwrap();
+    )
+    .unwrap();
     let repaired: Value = serde_json::from_slice(&std::fs::read(mgr.path()).unwrap()).unwrap();
-    assert_eq!(repaired, expected, "repair changes only the explicitly chosen nonkeeper ID");
-    assert!(serde_json::to_value(mgr.identity_conflicts().unwrap()).unwrap()["groups"].as_array().unwrap().is_empty());
+    assert_eq!(
+        repaired, expected,
+        "repair changes only the explicitly chosen nonkeeper ID"
+    );
+    assert!(
+        serde_json::to_value(mgr.identity_conflicts().unwrap()).unwrap()["groups"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     run_startup_maintenance(&mgr, &done).unwrap();
     assert!(done.load(Ordering::SeqCst));
     let mut frontend = mgr.load_full().unwrap();
     apply_frontend_view(&mut frontend);
-    assert!(frontend["clashApiSecret"].as_str().is_some_and(|s| !s.trim().is_empty()));
+    assert!(frontend["clashApiSecret"]
+        .as_str()
+        .is_some_and(|s| !s.trim().is_empty()));
     assert!(frontend.get("privacyPassword").is_none());
     if plain_password {
-        assert!(polaris_store::privacy_lock::has(&polaris_store::StdFs, &privacy_lock_path(&mgr)).unwrap());
+        assert!(
+            polaris_store::privacy_lock::has(&polaris_store::StdFs, &privacy_lock_path(&mgr))
+                .unwrap()
+        );
     }
 }
 

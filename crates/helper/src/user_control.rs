@@ -254,7 +254,7 @@ pub fn conf_dir(support: &Path, caller: &CallerIdentity) -> io::Result<PathBuf> 
 
 /// Private transaction backup. The single byte discriminator preserves absence
 /// without inventing a live credential. Call only under the installer lease.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn snapshot_registration(
     support: &Path,
     caller: &CallerIdentity,
@@ -263,7 +263,7 @@ pub fn snapshot_registration(
     snapshot_registration_with_owner(support, caller, backup, OwnerPolicy::privileged())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn snapshot_registration_with_owner(
     support: &Path,
     caller: &CallerIdentity,
@@ -329,7 +329,7 @@ fn snapshot_registration_with_owner(
     std::fs::File::open(parent)?.sync_all()
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn restore_registration(
     support: &Path,
     caller: &CallerIdentity,
@@ -338,7 +338,7 @@ pub fn restore_registration(
     restore_registration_with_owner(support, caller, backup, OwnerPolicy::privileged())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn restore_registration_with_owner(
     support: &Path,
     caller: &CallerIdentity,

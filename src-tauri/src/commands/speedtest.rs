@@ -2406,7 +2406,10 @@ pub async fn server_speed_test(
         Err(error) => return Ok(ApiResponse::err(error.to_string())),
     };
     if let Err(code) = validate_speed_test_url(&saved) {
-        return Ok(ApiResponse::err_with_code("Correct the HTTP(S) speed-test URL in settings", code));
+        return Ok(ApiResponse::err_with_code(
+            "Correct the HTTP(S) speed-test URL in settings",
+            code,
+        ));
     }
     let ticket = if NormalMainAction::ManualSpeedTest
         .requirement(polaris_helper_proto::Platform::current())
@@ -2452,7 +2455,10 @@ pub async fn server_speed_test(
         Err(error) => return Ok(ApiResponse::err(error.to_string())),
     };
     if let Err(code) = validate_speed_test_url(&config) {
-        return Ok(ApiResponse::err_with_code("Correct the HTTP(S) speed-test URL in settings", code));
+        return Ok(ApiResponse::err_with_code(
+            "Correct the HTTP(S) speed-test URL in settings",
+            code,
+        ));
     }
     if let Some(ticket) = ticket.as_ref() {
         if let Err(error) = proxy.validate_ready_main(ticket).await {
@@ -2522,22 +2528,54 @@ pub async fn server_speed_test(
         release_then_emit(guard, done, emit_done);
         return Ok(response);
     }
-    let requested_all=server_ids.clone().unwrap_or_else(||all_server_ids(&config));
-    let native_owned=crate::runtime::proxy::native_auto::native_owned_members(&config);
-    let native_requested:Vec<String>=requested_all.iter().filter(|id|native_owned.contains(*id)).cloned().collect();
-    let native_results=if native_requested.is_empty() { BTreeMap::new() }
-        else { proxy.native_measure_requested(&native_requested,guard.cancel()).await };
-    let native_pending:Vec<String>=native_requested.iter().filter(|id|!native_results.contains_key(*id)).cloned().collect();
-    let server_ids=Some(requested_all.iter().filter(|id|!native_owned.contains(*id)).cloned().collect::<Vec<_>>());
+    let requested_all = server_ids
+        .clone()
+        .unwrap_or_else(|| all_server_ids(&config));
+    let native_owned = crate::runtime::proxy::native_auto::native_owned_members(&config);
+    let native_requested: Vec<String> = requested_all
+        .iter()
+        .filter(|id| native_owned.contains(*id))
+        .cloned()
+        .collect();
+    let native_results = if native_requested.is_empty() {
+        BTreeMap::new()
+    } else {
+        proxy
+            .native_measure_requested(&native_requested, guard.cancel())
+            .await
+    };
+    let native_pending: Vec<String> = native_requested
+        .iter()
+        .filter(|id| !native_results.contains_key(*id))
+        .cloned()
+        .collect();
+    let server_ids = Some(
+        requested_all
+            .iter()
+            .filter(|id| !native_owned.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
     if server_ids.as_ref().is_some_and(Vec::is_empty) {
         let cancelled = guard.cancel().reason().is_some();
-        let outcome=if native_pending.is_empty() && !cancelled {"completed"} else {"interrupted"};
-        let mut payload=json!({"runId":run_id,"outcome":outcome,"pending":native_pending,"serverIds":requested_all,
+        let outcome = if native_pending.is_empty() && !cancelled {
+            "completed"
+        } else {
+            "interrupted"
+        };
+        let mut payload = json!({"runId":run_id,"outcome":outcome,"pending":native_pending,"serverIds":requested_all,
             "tested":native_results.len(),"ok":native_results.len(),"total":requested_all.len()});
-        if !native_pending.is_empty() || cancelled { payload["reason"]=json!(guard.cancel().reason().map_or("native_pending",|reason|reason.as_str())); }
-        release_then_emit(guard,Some(payload),emit_done);
-        return Ok(ApiResponse::ok(json!({"runId":run_id,"outcome":outcome,"results":native_results,
-            "nativePending":native_pending,"notInPool":[],"tsNotReady":[]})));
+        if !native_pending.is_empty() || cancelled {
+            payload["reason"] = json!(guard
+                .cancel()
+                .reason()
+                .map_or("native_pending", |reason| reason.as_str()));
+        }
+        release_then_emit(guard, Some(payload), emit_done);
+        return Ok(ApiResponse::ok(
+            json!({"runId":run_id,"outcome":outcome,"results":native_results,
+            "nativePending":native_pending,"notInPool":[],"tsNotReady":[]}),
+        ));
     }
     let active = config
         .get("selectedServerId")
@@ -2606,20 +2644,40 @@ pub async fn server_speed_test(
             &open_readback,
         )
         .await;
-        if let Some(payload)=done.as_mut() {
-            payload["tested"]=json!(payload.get("tested").and_then(Value::as_u64).unwrap_or(0)+native_results.len() as u64);
-            payload["ok"]=json!(payload.get("ok").and_then(Value::as_u64).unwrap_or(0)+native_results.len() as u64);
-            payload["total"]=json!(requested_all.len());
-            payload["serverIds"]=json!(requested_all);
-            if let Some(pending)=payload.get_mut("pending").and_then(Value::as_array_mut) { pending.extend(native_pending.iter().map(|id|json!(id))); }
-            if !native_pending.is_empty() { payload["outcome"]=json!("interrupted"); if payload.get("reason").is_none() {payload["reason"]=json!(guard.cancel().reason().map_or("native_pending",|reason|reason.as_str()));} }
-        }
-        if let Some(data)=response.data.as_mut() {
-            if let Some(results)=data.get_mut("results").and_then(Value::as_object_mut) {
-                for (id,latency) in &native_results { results.insert(id.clone(),json!(latency)); }
+        if let Some(payload) = done.as_mut() {
+            payload["tested"] = json!(
+                payload.get("tested").and_then(Value::as_u64).unwrap_or(0)
+                    + native_results.len() as u64
+            );
+            payload["ok"] = json!(
+                payload.get("ok").and_then(Value::as_u64).unwrap_or(0)
+                    + native_results.len() as u64
+            );
+            payload["total"] = json!(requested_all.len());
+            payload["serverIds"] = json!(requested_all);
+            if let Some(pending) = payload.get_mut("pending").and_then(Value::as_array_mut) {
+                pending.extend(native_pending.iter().map(|id| json!(id)));
             }
-            data["nativePending"]=json!(native_pending);
-            if !native_pending.is_empty() { data["outcome"]=json!("interrupted"); }
+            if !native_pending.is_empty() {
+                payload["outcome"] = json!("interrupted");
+                if payload.get("reason").is_none() {
+                    payload["reason"] = json!(guard
+                        .cancel()
+                        .reason()
+                        .map_or("native_pending", |reason| reason.as_str()));
+                }
+            }
+        }
+        if let Some(data) = response.data.as_mut() {
+            if let Some(results) = data.get_mut("results").and_then(Value::as_object_mut) {
+                for (id, latency) in &native_results {
+                    results.insert(id.clone(), json!(latency));
+                }
+            }
+            data["nativePending"] = json!(native_pending);
+            if !native_pending.is_empty() {
+                data["outcome"] = json!("interrupted");
+            }
         }
         release_then_emit(guard, done, emit_done);
         return Ok(response);
@@ -2796,17 +2854,34 @@ pub async fn server_speed_test(
         },
     )
     .await;
-    let mut combined_results=round_results_json(&results);
-    if let Some(results)=combined_results.as_object_mut() {
-        for (id,latency) in &native_results { results.insert(id.clone(),json!(latency)); }
+    let mut combined_results = round_results_json(&results);
+    if let Some(results) = combined_results.as_object_mut() {
+        for (id, latency) in &native_results {
+            results.insert(id.clone(), json!(latency));
+        }
     }
-    if let Some(payload)=done.as_mut() {
-        payload["tested"]=json!(payload.get("tested").and_then(Value::as_u64).unwrap_or(0)+native_results.len() as u64);
-        payload["ok"]=json!(payload.get("ok").and_then(Value::as_u64).unwrap_or(0)+native_results.len() as u64);
-        payload["total"]=json!(requested_all.len());
-        payload["serverIds"]=json!(requested_all);
-        if let Some(pending)=payload.get_mut("pending").and_then(Value::as_array_mut) { pending.extend(native_pending.iter().map(|id|json!(id))); }
-        if !native_pending.is_empty() { payload["outcome"]=json!("interrupted"); if payload.get("reason").is_none() {payload["reason"]=json!(guard.cancel().reason().map_or("native_pending",|reason|reason.as_str()));} }
+    if let Some(payload) = done.as_mut() {
+        payload["tested"] = json!(
+            payload.get("tested").and_then(Value::as_u64).unwrap_or(0)
+                + native_results.len() as u64
+        );
+        payload["ok"] = json!(
+            payload.get("ok").and_then(Value::as_u64).unwrap_or(0) + native_results.len() as u64
+        );
+        payload["total"] = json!(requested_all.len());
+        payload["serverIds"] = json!(requested_all);
+        if let Some(pending) = payload.get_mut("pending").and_then(Value::as_array_mut) {
+            pending.extend(native_pending.iter().map(|id| json!(id)));
+        }
+        if !native_pending.is_empty() {
+            payload["outcome"] = json!("interrupted");
+            if payload.get("reason").is_none() {
+                payload["reason"] = json!(guard
+                    .cancel()
+                    .reason()
+                    .map_or("native_pending", |reason| reason.as_str()));
+            }
+        }
     }
     release_then_emit(guard, done, emit_done);
 
@@ -3691,15 +3766,27 @@ pub(crate) async fn run_scheduled_round(
         return ScheduledRound::Ran(RoundReport {
             started_at: at,
             ended_at: at,
-            skipped: targets.iter().map(|id| (id.clone(), "SPEED_TEST_URL_INVALID")).collect(),
+            skipped: targets
+                .iter()
+                .map(|id| (id.clone(), "SPEED_TEST_URL_INVALID"))
+                .collect(),
             ..RoundReport::default()
         });
     }
     let url = resolve_speed_test_url(&config);
     let gen0 = proxy.core_generation();
-    let superseded = || is_superseded(proxy.core_generation(), gen0, proxy.status().running)
-        || app.state::<AppRuntime>().config().current().is_ok_and(|latest|
-            crate::runtime::proxy::native_auto::native_owned_members(&latest).iter().any(|id|targets.contains(id)));
+    let superseded = || {
+        is_superseded(proxy.core_generation(), gen0, proxy.status().running)
+            || app
+                .state::<AppRuntime>()
+                .config()
+                .current()
+                .is_ok_and(|latest| {
+                    crate::runtime::proxy::native_auto::native_owned_members(&latest)
+                        .iter()
+                        .any(|id| targets.contains(id))
+                })
+    };
     // 读回流在准入之后才开；测量闭包从这里取同一份去登记自己的连接。
     let round_readback: std::sync::OnceLock<Readback> = std::sync::OnceLock::new();
     let open_readback = || {
@@ -4157,13 +4244,18 @@ fn record_measured(
 pub(crate) fn validate_speed_test_url(config: &Value) -> Result<(), &'static str> {
     match config.get("speedTestUrl") {
         None | Some(Value::Null) => Ok(()),
-        Some(Value::String(raw)) => polaris_config_engine::user_config::auto_select::validate_test_url(Some(raw)),
+        Some(Value::String(raw)) => {
+            polaris_config_engine::user_config::auto_select::validate_test_url(Some(raw))
+        }
         Some(_) => Err(polaris_config_engine::user_config::auto_select::SPEED_TEST_URL_INVALID),
     }
 }
 
 pub(crate) fn resolve_speed_test_url(config: &Value) -> String {
-    polaris_config_engine::user_config::auto_select::configured_test_url(config.get("speedTestUrl").and_then(Value::as_str)).to_owned()
+    polaris_config_engine::user_config::auto_select::configured_test_url(
+        config.get("speedTestUrl").and_then(Value::as_str),
+    )
+    .to_owned()
 }
 
 /// warm-TTFB 计时的**纯时序核**（隧道的建立与 I/O 全部经 [`WarmTunnel`] 注入 ⇒ 「两段各自独立计时、
@@ -4464,7 +4556,9 @@ pub(crate) fn spawn_warm_rtt_probe(
     let Some(run_id) = next_speed_test_run_id(&SPEED_TEST_RUN_SEQUENCE) else {
         return;
     };
-    if validate_speed_test_url(config).is_err() { return; }
+    if validate_speed_test_url(config).is_err() {
+        return;
+    }
     let request = SpeedTestRequest {
         origin: SpeedTestOrigin::Companion,
         targets: vec![active_id.clone()],

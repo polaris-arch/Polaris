@@ -1457,7 +1457,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       ...['mapping.txt', 'usage.txt', 'seeds.txt', 'configuration.txt'].map(
         (name) => `src-tauri/gen/android/app/build/outputs/mapping/arm64Release/${name}`,
       ),
-      ...['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest'].map(
+      ...['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest'].map(
         (name) => `src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.${name}.xml`,
       ),
       '${{ runner.temp }}/s5-android-unit-results.json',
@@ -1519,10 +1519,10 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     }
     expect(executable(releaseCheck)).not.toMatch(/gh release/);
     // 留存 SDK 与原观察不分发 APK/SO；S5 必须走真实 app Gradle/AAR，不能借 host/stub 结果冒签。
-    const s5Units = executable(stepBlock(releaseCheck, 'Verify S5 Android network observation unit tests'));
+    const s5Units = executable(stepBlock(releaseCheck, 'Verify S5 Android network observation and admission unit tests'));
     expect(s5Units).toContain('bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android');
     expect(s5Units).toContain(':app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest');
-    for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest']) {
+    for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest']) {
       expect(s5Units).toContain(`--tests com.polaris2.app.vpn.${name}`);
     }
     expect(s5Units).toContain('python3 -I -');

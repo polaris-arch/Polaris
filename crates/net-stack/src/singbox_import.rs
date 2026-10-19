@@ -283,7 +283,9 @@ fn apply_transport(server: &mut ServerConfig, transport: &Value) {
                 path: str_val(transport.get("path")),
                 headers: {
                     let mut values = transport_headers(headers).unwrap_or_default();
-                    if let Some(host) = host { values.insert("Host".into(), host); }
+                    if let Some(host) = host {
+                        values.insert("Host".into(), host);
+                    }
                     (!values.is_empty()).then_some(values)
                 },
                 max_early_data: num_val(transport.get("max_early_data")),
@@ -460,8 +462,10 @@ fn map_singbox_outbound(
         let kind = transport.get("type").and_then(Value::as_str).unwrap_or("");
         if matches!(kind, "ws" | "httpupgrade" | "http")
             && (!crate::import_fields::headers_supported(transport.get("headers"), kind == "http")
-                || (kind == "http" && transport.get("host").is_some()
-                    && crate::import_fields::string_list(transport.get("host")).is_none())) {
+                || (kind == "http"
+                    && transport.get("host").is_some()
+                    && crate::import_fields::string_list(transport.get("host")).is_none()))
+        {
             return MapOutcome::Fail;
         }
     }
@@ -731,7 +735,9 @@ fn map_singbox_outbound(
                 headers: crate::import_fields::http_headers(ob.get("headers")),
                 ..Default::default()
             };
-            if http != HttpSettings::default() { s.http_settings = Some(Box::new(http)); }
+            if http != HttpSettings::default() {
+                s.http_settings = Some(Box::new(http));
+            }
         }
         "ssh" => {
             // ssh：固定 tcp/none（private_key_path 是本机路径、跨设备订阅无意义，刻意不映射）。
@@ -825,7 +831,8 @@ pub fn parse_singbox_outbounds(
 ) -> ClashParseResult {
     let mut graph = crate::import_fields::ImportGraph::default();
     observe_tags(&mut graph, outbounds);
-    let result = parse_singbox_outbounds_unresolved(outbounds, sub_id, now, id_gen, origin, &mut graph);
+    let result =
+        parse_singbox_outbounds_unresolved(outbounds, sub_id, now, id_gen, origin, &mut graph);
     graph.finish(result)
 }
 
@@ -855,7 +862,8 @@ fn parse_singbox_outbounds_unresolved(
         }
         if !crate::import_fields::valid_detour(ob.get("detour")) {
             r.failed += 1;
-            r.warnings.push("Invalid import detour declaration (IMPORT_DETOUR_INVALID)".into());
+            r.warnings
+                .push("Invalid import detour declaration (IMPORT_DETOUR_INVALID)".into());
             continue;
         }
         let ty = str_val(ob.get("type"))
@@ -904,7 +912,12 @@ fn parse_singbox_outbounds_unresolved(
             // 本机文件 + 形状合法 → custom 逃生舱（原文逐字保留、可编辑、换核即用）。
             // 形状判据与生成侧同源，见 [`custom_wrappable`]。
             if origin == ImportOrigin::LocalFile && custom_wrappable(ob) {
-                if ob.get("detour").is_some() { r.failed += 1; r.warnings.push("Custom detour is unsupported (IMPORT_DETOUR_INVALID)".into()); continue; }
+                if ob.get("detour").is_some() {
+                    r.failed += 1;
+                    r.warnings
+                        .push("Custom detour is unsupported (IMPORT_DETOUR_INVALID)".into());
+                    continue;
+                }
                 r.servers
                     .push(make_custom_node(ob, sub_id, now, id_gen, false));
                 continue;
@@ -964,24 +977,38 @@ fn parse_singbox_outbounds_unresolved(
 
 fn observe_tags(graph: &mut crate::import_fields::ImportGraph, values: &Value) {
     if let Some(values) = values.as_array() {
-        for value in values { graph.observe(value.get("tag")); }
+        for value in values {
+            graph.observe(value.get("tag"));
+        }
     }
 }
 
-fn push_imported(result: &mut ClashParseResult, mut server: ServerConfig, source: &Value, graph: &mut crate::import_fields::ImportGraph) {
+fn push_imported(
+    result: &mut ClashParseResult,
+    mut server: ServerConfig,
+    source: &Value,
+    graph: &mut crate::import_fields::ImportGraph,
+) {
     graph.register(&mut server, source.get("tag"), source.get("detour"));
     result.servers.push(server);
 }
 
 /// Resolve the single document tag namespace only after both arrays and TLS admission finish.
-pub fn parse_singbox_document(document: &Value, sub_id: &str, now: &str, id_gen: &mut impl FnMut() -> String, origin: ImportOrigin) -> ClashParseResult {
+pub fn parse_singbox_document(
+    document: &Value,
+    sub_id: &str,
+    now: &str,
+    id_gen: &mut impl FnMut() -> String,
+    origin: ImportOrigin,
+) -> ClashParseResult {
     let null = Value::Null;
     let outbounds = document.get("outbounds").unwrap_or(&null);
     let endpoints = document.get("endpoints").unwrap_or(&null);
     let mut graph = crate::import_fields::ImportGraph::default();
     observe_tags(&mut graph, outbounds);
     observe_tags(&mut graph, endpoints);
-    let mut result = parse_singbox_outbounds_unresolved(outbounds, sub_id, now, id_gen, origin, &mut graph);
+    let mut result =
+        parse_singbox_outbounds_unresolved(outbounds, sub_id, now, id_gen, origin, &mut graph);
     let ep = parse_singbox_endpoints_unresolved(endpoints, sub_id, now, id_gen, origin, &mut graph);
     result.servers.extend(ep.servers);
     result.failed += ep.failed;
@@ -1019,7 +1046,8 @@ pub fn parse_singbox_endpoints(
 ) -> ClashParseResult {
     let mut graph = crate::import_fields::ImportGraph::default();
     observe_tags(&mut graph, endpoints);
-    let result = parse_singbox_endpoints_unresolved(endpoints, sub_id, now, id_gen, origin, &mut graph);
+    let result =
+        parse_singbox_endpoints_unresolved(endpoints, sub_id, now, id_gen, origin, &mut graph);
     graph.finish(result)
 }
 
@@ -1050,7 +1078,8 @@ fn parse_singbox_endpoints_unresolved(
         }
         if !crate::import_fields::valid_detour(ep.get("detour")) {
             r.failed += 1;
-            r.warnings.push("Invalid import detour declaration (IMPORT_DETOUR_INVALID)".into());
+            r.warnings
+                .push("Invalid import detour declaration (IMPORT_DETOUR_INVALID)".into());
             continue;
         }
         let ty = str_val(ep.get("type"))
@@ -1169,7 +1198,12 @@ fn parse_singbox_endpoints_unresolved(
             }
             _ => {
                 if origin == ImportOrigin::LocalFile && custom_wrappable(ep) {
-                    if ep.get("detour").is_some() { r.failed += 1; r.warnings.push("Custom detour is unsupported (IMPORT_DETOUR_INVALID)".into()); continue; }
+                    if ep.get("detour").is_some() {
+                        r.failed += 1;
+                        r.warnings
+                            .push("Custom detour is unsupported (IMPORT_DETOUR_INVALID)".into());
+                        continue;
+                    }
                     r.servers
                         .push(make_custom_node(ep, sub_id, now, id_gen, true));
                     continue;
@@ -2331,7 +2365,8 @@ fn map_tailcat_outbound(
     }
     s.tailcat_settings = Some(Box::new(t));
 
-    let emitted = build_proxy_outbound(&s, "import", &DomainResolver::Tag(String::new()), "", "").ok()?;
+    let emitted =
+        build_proxy_outbound(&s, "import", &DomainResolver::Tag(String::new()), "", "").ok()?;
     let bag = &mut s.tailcat_settings.as_mut()?.extra;
     drop_unemitted_bag_keys(bag, &emitted.extra, &mut ignored);
     Some((s, ignored))

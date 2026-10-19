@@ -128,8 +128,12 @@ fn 桌面流标识文案不变() {
 
 fn timed_status(total: i64, observed_at_ms: Option<u64>, reset: bool) -> StatusFrame {
     StatusFrame {
-        status: SingBoxStatus { uplink_total: total, downlink_total: total,
-            traffic_available: true, ..Default::default() },
+        status: SingBoxStatus {
+            uplink_total: total,
+            downlink_total: total,
+            traffic_available: true,
+            ..Default::default()
+        },
         observed_at_ms,
         reset,
     }
@@ -154,7 +158,10 @@ fn android_batch_uses_prequeue_observation_time_not_drain_time() {
     let mut meter = polaris_stats_engine::StatsAggregator::new();
     for (index, time) in [1_000, 2_000, 3_000].into_iter().enumerate() {
         timed_status(index as i64 * 1_048_576, Some(time), false).apply(&mut meter, 90_000);
-        assert_eq!(meter.snapshot().upload_speed, if index == 0 { 0 } else { 1_048_576 });
+        assert_eq!(
+            meter.snapshot().upload_speed,
+            if index == 0 { 0 } else { 1_048_576 }
+        );
     }
     assert_eq!(meter.snapshot().total_upload, 2_097_152);
     // Equal/backward observations provide no elapsed window: re-prime, no fake 1ms rate.

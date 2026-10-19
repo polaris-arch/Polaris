@@ -252,10 +252,19 @@ async fn read_body_truncating(
 
 /// Manual redirects must preserve browser method semantics without replaying credentials
 /// or token bodies to an unapproved origin. The caller only supplies redirect status codes.
-fn redirect_request(req: &UnlockRequest, status: u16, location: &str) -> Result<UnlockRequest, String> {
+fn redirect_request(
+    req: &UnlockRequest,
+    status: u16,
+    location: &str,
+) -> Result<UnlockRequest, String> {
     let current = url::Url::parse(&req.url).map_err(|_| "invalid request URL".to_string())?;
-    let next = current.join(location).map_err(|_| "invalid redirect URL".to_string())?;
-    if !matches!(next.scheme(), "http" | "https") || !next.username().is_empty() || next.password().is_some() {
+    let next = current
+        .join(location)
+        .map_err(|_| "invalid redirect URL".to_string())?;
+    if !matches!(next.scheme(), "http" | "https")
+        || !next.username().is_empty()
+        || next.password().is_some()
+    {
         return Err("unsupported redirect target".to_string());
     }
     if current.scheme() == "https" && next.scheme() != "https" {
@@ -268,8 +277,10 @@ fn redirect_request(req: &UnlockRequest, status: u16, location: &str) -> Result<
         redirected.method = HttpMethod::Get;
         redirected.body = None;
         redirected.headers.retain(|key, _| {
-            !matches!(key.to_ascii_lowercase().as_str(),
-                "content-type" | "content-length" | "content-encoding" | "transfer-encoding")
+            !matches!(
+                key.to_ascii_lowercase().as_str(),
+                "content-type" | "content-length" | "content-encoding" | "transfer-encoding"
+            )
         });
     }
     if cross_origin {
@@ -279,12 +290,22 @@ fn redirect_request(req: &UnlockRequest, status: u16, location: &str) -> Result<
             return Err("refusing cross-origin redirect with request body".to_string());
         }
         redirected.headers.retain(|key, _| {
-            !matches!(key.to_ascii_lowercase().as_str(),
-                "authorization" | "proxy-authorization" | "cookie" | "cookie2" | "origin" | "referer" | "host")
+            !matches!(
+                key.to_ascii_lowercase().as_str(),
+                "authorization"
+                    | "proxy-authorization"
+                    | "cookie"
+                    | "cookie2"
+                    | "origin"
+                    | "referer"
+                    | "host"
+            )
         });
         // An explicit empty header also suppresses the client's domain-scoped cookie jar:
         // cookie domains alone do not isolate ports or otherwise prove same-origin trust.
-        redirected.headers.insert("Cookie".to_string(), String::new());
+        redirected
+            .headers
+            .insert("Cookie".to_string(), String::new());
     }
     Ok(redirected)
 }

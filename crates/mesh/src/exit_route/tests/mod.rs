@@ -732,7 +732,10 @@ fn native_auto_candidate_needs_route_without_saved_default() {
     let mut cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     cfg.selected_server_id = None;
     cfg.auto_select_enabled = true;
-    cfg.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Global });
+    cfg.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
     assert_eq!(plan_mesh_exit_route(&cfg, false).unwrap().server_id, "ts1");
     cfg.servers.clear(); // runtime projection excludes a pruned/non-emitted member
     assert!(plan_mesh_exit_route(&cfg, false).is_none());
@@ -740,11 +743,19 @@ fn native_auto_candidate_needs_route_without_saved_default() {
 
 #[test]
 fn disabled_auto_uses_only_pinned_member_not_old_saved_default() {
-    use polaris_config_engine::user_config::auto_select::{AutoSelectTarget, AutoSelectPin, SelectionIntent};
+    use polaris_config_engine::user_config::auto_select::{
+        AutoSelectPin, AutoSelectTarget, SelectionIntent,
+    };
     let mut cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
-    cfg.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Global });
+    cfg.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
     assert!(plan_mesh_exit_route(&cfg, false).is_none());
-    cfg.auto_select_pins.push(AutoSelectPin { target: AutoSelectTarget::Global, server_id: "ts1".into() });
+    cfg.auto_select_pins.push(AutoSelectPin {
+        target: AutoSelectTarget::Global,
+        server_id: "ts1".into(),
+    });
     assert!(plan_mesh_exit_route(&cfg, false).is_some());
     cfg.auto_select_pins[0].server_id = "other".into();
     assert!(plan_mesh_exit_route(&cfg, false).is_none());
@@ -754,9 +765,11 @@ fn disabled_auto_uses_only_pinned_member_not_old_saved_default() {
 fn independent_rule_needs_route_and_disabled_rule_releases_it() {
     let mut cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     cfg.selected_server_id = Some("direct".into());
-    let rule: polaris_config_engine::user_config::rule::AppRule = serde_json::from_value(serde_json::json!({
-        "appId":"route", "enabled":true, "action":"proxy", "targetServerId":"ts1"
-    })).unwrap();
+    let rule: polaris_config_engine::user_config::rule::AppRule =
+        serde_json::from_value(serde_json::json!({
+            "appId":"route", "enabled":true, "action":"proxy", "targetServerId":"ts1"
+        }))
+        .unwrap();
     cfg.app_rules.push(rule);
     assert!(plan_mesh_exit_route(&cfg, false).is_some());
     cfg.app_routing_enabled = Some(false);
@@ -767,26 +780,39 @@ fn independent_rule_needs_route_and_disabled_rule_releases_it() {
 fn duplicate_system_demand_never_chooses_arbitrary_first_node() {
     use polaris_config_engine::user_config::auto_select::{AutoSelectTarget, SelectionIntent};
     let mut cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
-    let mut second = cfg.servers[0].clone(); second.id = "ts2".into(); cfg.servers.push(second);
+    let mut second = cfg.servers[0].clone();
+    second.id = "ts2".into();
+    cfg.servers.push(second);
     cfg.auto_select_enabled = true;
-    cfg.selection_intent = Some(SelectionIntent { mode:"auto".into(), target:AutoSelectTarget::Global });
+    cfg.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
     assert!(plan_mesh_exit_route(&cfg, false).is_none());
 }
 
 #[tokio::test]
 async fn native_auto_pin_same_leaf_keeps_route_then_pruned_graph_clears() {
-    use polaris_config_engine::user_config::auto_select::{AutoSelectTarget, AutoSelectPin, SelectionIntent};
+    use polaris_config_engine::user_config::auto_select::{
+        AutoSelectPin, AutoSelectTarget, SelectionIntent,
+    };
     let op = mock_with_iface("polaris-ts");
     let mut mgr = MeshExitRouteManager::new(op.clone(), NoopExitRouteLog, Platform::Linux);
     let mut cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     cfg.selected_server_id = None;
     cfg.auto_select_enabled = true;
-    cfg.selection_intent = Some(SelectionIntent { mode:"auto".into(), target:AutoSelectTarget::Global });
+    cfg.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
     reconcile_now(&mut mgr, &cfg, false).await;
     assert!(mgr.installed().is_some());
     op.routes.lock().unwrap().clear();
     cfg.auto_select_enabled = false;
-    cfg.auto_select_pins.push(AutoSelectPin { target:AutoSelectTarget::Global, server_id:"ts1".into() });
+    cfg.auto_select_pins.push(AutoSelectPin {
+        target: AutoSelectTarget::Global,
+        server_id: "ts1".into(),
+    });
     reconcile_now(&mut mgr, &cfg, false).await;
     assert!(op.routes.lock().unwrap().is_empty());
     cfg.servers.clear();
@@ -804,7 +830,10 @@ async fn failed_native_candidate_route_does_not_publish_installed_state() {
     let mut cfg = config_with(ts_system_exit_server(Some("100.64.0.1")));
     cfg.selected_server_id = None;
     cfg.auto_select_enabled = true;
-    cfg.selection_intent = Some(SelectionIntent { mode:"auto".into(), target:AutoSelectTarget::Global });
+    cfg.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
     reconcile_now(&mut mgr, &cfg, false).await;
     assert!(mgr.installed().is_none());
     cfg.selection_intent = None; // rollback to prior manual/direct runtime graph

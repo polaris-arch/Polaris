@@ -80,7 +80,8 @@ pub fn build_id_to_tag_map<S: ServerLike>(
             } else if trimmed.starts_with("rule-sel-")
                 || trimmed.starts_with("stls-out-")
                 || trimmed.starts_with("probe-selector-")
-                || trimmed.starts_with(crate::user_config::auto_select::TAG_PREFIX) {
+                || trimmed.starts_with(crate::user_config::auto_select::TAG_PREFIX)
+            {
                 format!("node-{trimmed}")
             } else {
                 trimmed.to_string()

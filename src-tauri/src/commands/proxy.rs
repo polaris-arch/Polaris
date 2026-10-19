@@ -99,7 +99,10 @@ async fn proxy_start_with_admission(
     }
     if let Err(error) = crate::commands::config::run_startup_maintenance_once(state.config()) {
         log::warn!("proxy:start 安全配置维护未完成，未启动: {error}");
-        return Ok(ApiResponse::err_with_code(error, "CONFIG_SECURITY_MAINTENANCE_FAILED"));
+        return Ok(ApiResponse::err_with_code(
+            error,
+            "CONFIG_SECURITY_MAINTENANCE_FAILED",
+        ));
     }
     // 盘是单一真值（`current()` = 进程内权威缓存，每次 `save_full` 同刻刷新；缓存冷则读盘）。
     let config = match state.config().current() {
@@ -958,7 +961,10 @@ mod rule_pattern_admission_tests {
     use super::*;
     #[tokio::test]
     async fn new_oversized_pattern_rejects_before_platform_or_binary_access() {
-        assert_eq!(check_rule_patterns(std::path::Path::new("unused"), &["a".repeat(1025)]).await, Some(false));
+        assert_eq!(
+            check_rule_patterns(std::path::Path::new("unused"), &["a".repeat(1025)]).await,
+            Some(false)
+        );
     }
 
     #[test]

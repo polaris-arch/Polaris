@@ -595,26 +595,38 @@ impl ProxyRuntime {
     }
 }
 
-
 impl ProxyRuntime {
     /// Route demand comes from running R intersected with the emitted graph.
     /// Saved D and configured-but-pruned endpoints cannot authorize OS routes.
     pub(super) fn emitted_exit_route_config(&self) -> Option<UserConfig> {
-        if !self.core_running() { return None; }
-        let mut config:UserConfig=serde_json::from_value(self.current_config_snapshot()?).ok()?;
-        let nodes=self.switch_snapshot.read().ok()?;
-        let nodes=&nodes.as_ref()?.id_to_tag;
-        config.servers.retain(|server|nodes.contains_key(&server.id));
+        if !self.core_running() {
+            return None;
+        }
+        let mut config: UserConfig =
+            serde_json::from_value(self.current_config_snapshot()?).ok()?;
+        let nodes = self.switch_snapshot.read().ok()?;
+        let nodes = &nodes.as_ref()?.id_to_tag;
+        config
+            .servers
+            .retain(|server| nodes.contains_key(&server.id));
         Some(config)
     }
 
-    pub(super) async fn reconcile_emitted_exit_route(&self, generation:u64) {
-        if self.core_generation()!=generation { return; }
-        let config=self.emitted_exit_route_config();
-        if self.core_generation()!=generation { return; }
+    pub(super) async fn reconcile_emitted_exit_route(&self, generation: u64) {
+        if self.core_generation() != generation {
+            return;
+        }
+        let config = self.emitted_exit_route_config();
+        if self.core_generation() != generation {
+            return;
+        }
         match config {
-            Some(config)=>self.mesh.exit_route_reconcile(&config,config.enable_ipv6.unwrap_or(false)).await,
-            None=>self.mesh.exit_route_clear().await,
+            Some(config) => {
+                self.mesh
+                    .exit_route_reconcile(&config, config.enable_ipv6.unwrap_or(false))
+                    .await
+            }
+            None => self.mesh.exit_route_clear().await,
         }
     }
 }

@@ -132,17 +132,25 @@ pub fn plan_mesh_exit_route(config: &UserConfig, enable_ipv6: bool) -> Option<Me
     }
     // Runtime must pass the actual emitted server projection, never an uncommitted
     // desired graph. Native URLTest needs the same scoped route as a selected leaf.
-    let mut required: HashSet<String> = config.effective_selected_server_id()
-        .map(str::to_owned).into_iter().collect();
+    let mut required: HashSet<String> = config
+        .effective_selected_server_id()
+        .map(str::to_owned)
+        .into_iter()
+        .collect();
     if config.proxy_mode == ProxyMode::Smart {
         for rule in config.effective_traffic_rules() {
-            if rule.enabled && rule.route_action() == Some(polaris_config_engine::user_config::RuleAction::Proxy) {
+            if rule.enabled
+                && rule.route_action()
+                    == Some(polaris_config_engine::user_config::RuleAction::Proxy)
+            {
                 required.extend(rule.route_target_server_id().map(str::to_owned));
             }
         }
         if config.app_routing_enabled != Some(false) {
             for rule in &config.app_rules {
-                if rule.enabled && rule.action == polaris_config_engine::user_config::RuleAction::Proxy {
+                if rule.enabled
+                    && rule.action == polaris_config_engine::user_config::RuleAction::Proxy
+                {
                     required.extend(rule.target_server_id.clone());
                 }
             }
@@ -161,20 +169,33 @@ pub fn plan_mesh_exit_route(config: &UserConfig, enable_ipv6: bool) -> Option<Me
     // Include physical detour dependencies without looping on malformed imports.
     let mut pending: Vec<String> = required.iter().cloned().collect();
     while let Some(id) = pending.pop() {
-        if let Some(parent) = config.servers.iter().find(|s| s.id == id).and_then(|s| s.detour.as_ref()) {
-            if required.insert(parent.clone()) { pending.push(parent.clone()); }
+        if let Some(parent) = config
+            .servers
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.detour.as_ref())
+        {
+            if required.insert(parent.clone()) {
+                pending.push(parent.clone());
+            }
         }
     }
     let mut candidates = config.servers.iter().filter(|s| {
-        required.contains(&s.id) && s.protocol == Protocol::Tailscale
-            && mesh_uses_system_interface(s) && mesh_node_carries_full_tunnel(s)
-            && s.tailscale_settings.as_ref().and_then(|t| t.exit_node.as_deref())
+        required.contains(&s.id)
+            && s.protocol == Protocol::Tailscale
+            && mesh_uses_system_interface(s)
+            && mesh_node_carries_full_tunnel(s)
+            && s.tailscale_settings
+                .as_ref()
+                .and_then(|t| t.exit_node.as_deref())
                 .is_some_and(|exit| !exit.trim().is_empty())
     });
     let ts = candidates.next()?;
     // The generator rejects duplicate System interfaces. Never choose an arbitrary
     // first route if an invalid graph reaches this defensive boundary.
-    if candidates.next().is_some() { return None; }
+    if candidates.next().is_some() {
+        return None;
+    }
     let mut cidrs: Vec<String> = EXIT_DEFAULT_V4.iter().map(|s| s.to_string()).collect();
     if enable_ipv6 {
         cidrs.extend(EXIT_DEFAULT_V6.iter().map(|s| s.to_string()));

@@ -632,19 +632,26 @@ fn desktop_source_with_explicit_null_windows_overlay_is_invalid() {
 fn failed_state_publication_does_not_mutate_memory_or_disk() {
     let tmp = TestDir::new("polaris-updater-failed-publication-");
     let runtime = rt(tmp.path());
-    runtime.mutate_state(|state| state.skipped_version = Some("1.2.3".into())).unwrap();
+    runtime
+        .mutate_state(|state| state.skipped_version = Some("1.2.3".into()))
+        .unwrap();
     // Block the staging path without depending on permission behavior as root.
     std::fs::create_dir(tmp.path().join("update-state.json.tmp")).unwrap();
-    assert!(runtime.mutate_state(|state| state.skipped_version = Some("9.9.9".into())).is_err());
+    assert!(runtime
+        .mutate_state(|state| state.skipped_version = Some("9.9.9".into()))
+        .is_err());
     assert_eq!(runtime.state().skipped_version.as_deref(), Some("1.2.3"));
-    assert_eq!(rt(tmp.path()).state().skipped_version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        rt(tmp.path()).state().skipped_version.as_deref(),
+        Some("1.2.3")
+    );
 }
-
 
 #[test]
 fn version_reader_uses_shared_bounded_probe_without_changing_fallback_semantics() {
     let source = include_str!("../../updater.rs");
-    let body = crate::commands::guard_scan::top_level_fn_body(source, "pub fn read_core_version_line(");
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(source, "pub fn read_core_version_line(");
     assert!(body.contains("self.core_version_probe.first_line(&bin)"));
     assert!(!body.contains(".output()"));
 }

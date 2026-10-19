@@ -1098,7 +1098,11 @@ fn parse_subscription_bundle_inner(
                     enforce_json_node_count(&v, &["outbounds", "endpoints"], limits)
                         .map_err(SubscriptionParseError::limit)?;
                     crate::singbox_import::parse_singbox_document(
-                        &v, subscription_id, now, id_gen, origin,
+                        &v,
+                        subscription_id,
+                        now,
+                        id_gen,
+                        origin,
                     )
                 }
                 Err(e) => ClashParseResult {
@@ -1365,8 +1369,7 @@ pub fn server_generation_identity(server: &ServerConfig) -> String {
     projection.id.clear();
     projection.name.clear();
     projection.subscription_id = None;
-    let generation =
-        polaris_config_engine::builder::orchestration::server_fingerprint(&projection);
+    let generation = polaris_config_engine::builder::orchestration::server_fingerprint(&projection);
     if server.protocol == polaris_config_engine::user_config::server_config::Protocol::Tailscale {
         serde_json::to_string(&(server_fingerprint(server), generation)).expect("string tuple")
     } else {
@@ -1378,12 +1381,21 @@ pub fn server_generation_identity(server: &ServerConfig) -> String {
 /// 同节点多源留内联那份。
 #[must_use]
 pub fn dedupe_by_fingerprint(servers: Vec<ServerConfig>) -> Vec<ServerConfig> {
-    let graph = servers.iter().map(|server| {
-        let mut projection = server.clone();
-        projection.detour = None;
-        (server.id.clone(), server_generation_identity(&projection), server.detour.clone())
-    }).collect();
-    let classes = dependency_identity_classes(&[graph]).pop().unwrap_or_default();
+    let graph = servers
+        .iter()
+        .map(|server| {
+            let mut projection = server.clone();
+            projection.detour = None;
+            (
+                server.id.clone(),
+                server_generation_identity(&projection),
+                server.detour.clone(),
+            )
+        })
+        .collect();
+    let classes = dependency_identity_classes(&[graph])
+        .pop()
+        .unwrap_or_default();
     let mut retained: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
     let mut remap = std::collections::HashMap::new();
     let mut out = Vec::with_capacity(servers.len());

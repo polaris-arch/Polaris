@@ -11,11 +11,17 @@ pub struct SubscriptionRefreshAdmission {
 
 impl SubscriptionRefreshAdmission {
     pub fn try_admit(&self, id: &str) -> Option<SubscriptionRefreshOwner<'_>> {
-        let mut active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if !active.insert(id.to_owned()) {
             return None;
         }
-        Some(SubscriptionRefreshOwner { admission: self, id: id.to_owned() })
+        Some(SubscriptionRefreshOwner {
+            admission: self,
+            id: id.to_owned(),
+        })
     }
 }
 
@@ -28,7 +34,11 @@ pub struct SubscriptionRefreshOwner<'a> {
 
 impl Drop for SubscriptionRefreshOwner<'_> {
     fn drop(&mut self) {
-        self.admission.active.lock().unwrap_or_else(|error| error.into_inner()).remove(&self.id);
+        self.admission
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
     }
 }
 
@@ -62,7 +72,8 @@ mod tests {
         std::future::poll_fn(|cx| {
             assert!(refresh.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())
-        }).await;
+        })
+        .await;
         assert!(admission.try_admit("s").is_none());
         drop(refresh);
         assert!(admission.try_admit("s").is_some());

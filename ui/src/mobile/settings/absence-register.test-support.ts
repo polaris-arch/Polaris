@@ -145,7 +145,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
   // `Primitives.tsx` 是这一屏的原语库（Button / Switch / Card / SetRow …）：它声明的组件不是
   // 「数据块」。豁免是挣来的 —— ⓪ 组要求它在本屏 desktopDirs 里、且自己一句 `t('…')` 都不渲染。
   primitiveModules: ['ui/src/components/screens/settings/Primitives.tsx'],
-  extraBlockSources: [],
+  extraBlockSources: ['ui/src/mobile/SavedAutoSelectControls.tsx'],
   sharedPrimitives: [
     'ui/src/components/Fold.tsx',
     'ui/src/components/Icons.tsx',
@@ -168,6 +168,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
      * 终端环境变量的两颗复制与 `proxy.clear` 就是从这条缝漏掉的（2026-09-06 复审 major）。
      */
 
+    { id: 'AppUpdateCard.tsx|k:mobileSettings.update.openReleases', disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/settings/UpdatePage.tsx', mustContain: 'openReleases' } }, note: 'Manual release-page navigation is available in both update surfaces.' },
     /* ── 应用更新卡（整卡的处置见 blocks 面 AppUpdateCard 一条）──────────────── */
     {
       id: 'AppUpdateCard.tsx|k:settings.about.checkUpdate',
@@ -186,7 +187,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '「移动端更新页只有一行说明」在接线那天就已经为假。',
     },
     {
-      id: 'AppUpdateCard.tsx|k:settings.update.portableClearAndCheck',
+      id: 'AppUpdateCard.tsx|f:discardPortableAndCheck',
       disposition: {
         kind: 'platform-absent',
         // 与同一张卡上的「退出并打开文件夹」同锚：这张卡只在后端回 Windows 便携形态那条告知时才出现。
@@ -621,11 +622,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
       note: '重新检测的第三个渲染位（另一档状态下出现）。同上，同一条腿。',
     },
-    {
-      id: 'SettingsHelper.tsx|k:helper.viewLogsAction',
-      disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
-      note: '查看提权助手安装失败日志。移动端没有 Helper 安装或修复失败面板；通用日志仍由连接页的日志入口承接。',
-    },
+
     {
       id: 'SettingsHelper.tsx|k:helper.btmCopyPath',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
@@ -892,6 +889,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
   ],
 
   blocks: [
+    { id: 'SavedAutoSelectControls', disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/settings/NetworkPage.tsx', mustContain: '<SavedAutoSelectControls' } }, note: 'Shared automatic-selection feature switch; both settings surfaces read and commit through the same current-config action owner.' },
     /* ── 九张子页：与 `MobileSettings.test.tsx ①` 同一份真值源，本门另有正面断言把交接钉死 ── */
     {
       id: 'SettingsGeneral',

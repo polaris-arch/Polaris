@@ -1189,11 +1189,18 @@ impl ProxyRuntime {
             .map_err(|error| StartError::from(error.to_string()))?;
         let user_config: UserConfig = serde_json::from_value(config.clone())
             .map_err(|e| format!("配置解析失败（UserConfig）: {e}"))?;
-        if let Err(message) = polaris_config_engine::user_config::auto_select::validate_test_url(user_config.speed_test_url.as_deref()) {
+        if let Err(message) = polaris_config_engine::user_config::auto_select::validate_test_url(
+            user_config.speed_test_url.as_deref(),
+        ) {
             self.set_error(message, code::SPEED_TEST_URL_INVALID);
-            return Err(StartError::coded(message.to_owned(), code::SPEED_TEST_URL_INVALID));
+            return Err(StartError::coded(
+                message.to_owned(),
+                code::SPEED_TEST_URL_INVALID,
+            ));
         }
-        if let Err(message) = polaris_config_engine::node_dns::upstream::validate_selected_upstreams(user_config.dns_config.as_ref()) {
+        if let Err(message) = polaris_config_engine::node_dns::upstream::validate_selected_upstreams(
+            user_config.dns_config.as_ref(),
+        ) {
             self.set_error(&message, code::NODE_RESOLVER_UNSUPPORTED);
             return Err(StartError::coded(message, code::NODE_RESOLVER_UNSUPPORTED));
         }

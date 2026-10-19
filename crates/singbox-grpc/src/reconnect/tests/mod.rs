@@ -23,7 +23,11 @@ fn auth_request_sets_bearer_value_for_valid_secret() {
 
 #[test]
 fn auth_request_without_secret_omits_authorization() {
-    assert!(auth_request(&None, ()).unwrap().metadata().get("authorization").is_none());
+    assert!(auth_request(&None, ())
+        .unwrap()
+        .metadata()
+        .get("authorization")
+        .is_none());
 }
 
 #[test]

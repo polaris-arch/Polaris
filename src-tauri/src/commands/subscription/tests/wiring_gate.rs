@@ -190,8 +190,12 @@ fn the_update_shell_cannot_return_without_a_terminal_frame() {
         "变异锁：删掉终态帧 → 订阅信息栏永远挂在「更新中」，且失败无处可见"
     );
     // Rejected overlap has not started progress and must not terminate the active owner.
-    let progress = shell.find("let sink:").expect("admitted operation owns progress");
-    let admission = shell.find("subscription_refresh.try_admit(subscription_id)").unwrap();
+    let progress = shell
+        .find("let sink:")
+        .expect("admitted operation owns progress");
+    let admission = shell
+        .find("subscription_refresh.try_admit(subscription_id)")
+        .unwrap();
     assert!(admission < progress);
     // Once progress has started, every outcome must reach the owner's terminal frame.
     assert!(

@@ -31,7 +31,8 @@ fn expected_rule_matches(current: &Value, expected: Option<&Value>, required: bo
 /// 单一真值在 config-engine `user_config::rule_validate::validate_rule`；前端 rule-dialog 只保留
 /// `isValidIpCidr` 做输入内联提示，提交门以此为准。
 fn validate_rule_payload(rule: &Value) -> Result<(), String> {
-    polaris_store::auto_select::validate_raw(&json!({"trafficRules":[rule]})).map_err(|error|error.to_string())?;
+    polaris_store::auto_select::validate_raw(&json!({"trafficRules":[rule]}))
+        .map_err(|error| error.to_string())?;
     let parsed: Rule =
         serde_json::from_value(rule.clone()).map_err(|e| format!("规则结构非法: {e}"))?;
     let result = validate_rule(&parsed);
@@ -169,9 +170,15 @@ fn sync_plane_order(cfg: &mut Value, order_key: &str, rules: &[Value]) {
 /// Writer-fenced admission: exact retries are no-ops, never replacements.
 fn admit_rule_add(rules: &[Value], incoming: &Value) -> Result<bool, String> {
     polaris_store::validate::validate_rule_ids(rules)?;
-    let id = incoming.get("id").and_then(Value::as_str)
-        .filter(|id| !id.is_empty()).ok_or("rule.id required")?;
-    match rules.iter().find(|rule| rule.get("id").and_then(Value::as_str) == Some(id)) {
+    let id = incoming
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or("rule.id required")?;
+    match rules
+        .iter()
+        .find(|rule| rule.get("id").and_then(Value::as_str) == Some(id))
+    {
         Some(existing) if existing == incoming => Ok(false),
         Some(_) => Err("Rule id already exists; reopen and retry".to_owned()),
         None => Ok(true),
@@ -288,14 +295,24 @@ pub async fn rules_update(
         Ok(cfg) => cfg,
         Err(error) => return ApiResponse::err(error.to_string()),
     };
-    let observed = plane_rules(&snapshot, collection_key).into_iter()
+    let observed = plane_rules(&snapshot, collection_key)
+        .into_iter()
         .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()));
-    let Some(observed) = observed else { return ApiResponse::err_with_code("Rule no longer exists", ERR_RULE_CONFLICT); };
-    if !expected_rule_matches(&observed, expected_rule.as_ref(), require_expected.unwrap_or(false)) {
+    let Some(observed) = observed else {
+        return ApiResponse::err_with_code("Rule no longer exists", ERR_RULE_CONFLICT);
+    };
+    if !expected_rule_matches(
+        &observed,
+        expected_rule.as_ref(),
+        require_expected.unwrap_or(false),
+    ) {
         return ApiResponse::err_with_code("Rule changed; reopen and retry", ERR_RULE_CONFLICT);
     }
     let old_patterns = regex_patterns(&observed);
-    let changed_patterns: Vec<String> = regex_patterns(&rule).into_iter().filter(|p| !old_patterns.contains(p)).collect();
+    let changed_patterns: Vec<String> = regex_patterns(&rule)
+        .into_iter()
+        .filter(|p| !old_patterns.contains(p))
+        .collect();
     if let Err(code) = admit_patterns(&state, &changed_patterns).await {
         return ApiResponse::err_with_code("Rule pattern check did not accept this change", code);
     }
@@ -311,7 +328,10 @@ pub async fn rules_update(
             return Decision::Skip(Err((format!("Rule not found: {id}"), None)));
         };
         if rules[idx] != observed {
-            return Decision::Skip(Err(("Rule changed during validation; retry".to_string(), Some(ERR_RULE_CONFLICT))));
+            return Decision::Skip(Err((
+                "Rule changed during validation; retry".to_string(),
+                Some(ERR_RULE_CONFLICT),
+            )));
         }
         if !expected_rule_matches(
             &rules[idx],

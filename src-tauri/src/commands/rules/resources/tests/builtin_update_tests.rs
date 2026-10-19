@@ -74,17 +74,24 @@ async fn builtin_update_commits_live_and_metadata_before_done() {
     let client = TestHttp::new(200, b"SRS-new");
     let sink = RecordingSink::default();
     let saved = AtomicUsize::new(0);
-    let outcome = update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |resource, staged, operation| {
-        publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
-        assert_eq!(
-            std::fs::read(dir.join(&plan.file_name)).unwrap(),
-            b"SRS-new"
-        );
-        assert!(!resource.downloaded_at.is_empty());
-        assert_eq!(sink.statuses(), ["downloading"]);
-        saved.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    })
+    let outcome = update_builtin_resource(
+        &sink,
+        &client,
+        &PublicLookup,
+        &plan,
+        &dir,
+        |resource, staged, operation| {
+            publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
+            assert_eq!(
+                std::fs::read(dir.join(&plan.file_name)).unwrap(),
+                b"SRS-new"
+            );
+            assert!(!resource.downloaded_at.is_empty());
+            assert_eq!(sink.statuses(), ["downloading"]);
+            saved.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
     .await;
     assert!(matches!(
         outcome,
@@ -105,10 +112,11 @@ async fn builtin_http_or_invalid_content_failure_preserves_live() {
         let (plan, dir) = fixture();
         let sink = RecordingSink::default();
         let client = TestHttp::new(status, body);
-        let outcome = update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_, _, _| {
-            panic!("下载失败不能保存元数据")
-        })
-        .await;
+        let outcome =
+            update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_, _, _| {
+                panic!("下载失败不能保存元数据")
+            })
+            .await;
         assert!(matches!(outcome, DownloadOutcome::Failed { .. }));
         assert_eq!(
             std::fs::read(dir.join(&plan.file_name)).unwrap(),
@@ -266,18 +274,28 @@ fn reset_and_publish_share_writer_fence_and_capture_precedes_queue() {
     use crate::commands::guard_scan::top_level_fn_body;
     let src = crate::test_support::crate_code("commands/rules/resources.rs");
     let reset = top_level_fn_body(&src, "pub fn rule_resources_reset_builtin(");
-    assert!(reset.find("update_with_explicit_deletions(deletions, |cfg|").unwrap()
-        < reset.find(".retire()").unwrap());
+    assert!(
+        reset
+            .find("update_with_explicit_deletions(deletions, |cfg|")
+            .unwrap()
+            < reset.find(".retire()").unwrap()
+    );
     assert!(!reset.contains(".await"));
     let update = top_level_fn_body(&src, "async fn update_builtin_resource<");
-    assert!(update.find("BuiltinUpdateOperation::begin").unwrap()
-        < update.find(".lock().await").unwrap());
+    assert!(
+        update.find("BuiltinUpdateOperation::begin").unwrap()
+            < update.find(".lock().await").unwrap()
+    );
     assert!(!update.contains("std::fs::rename"));
     let persist = top_level_fn_body(&src, "fn persist_builtin_geo_updated(");
-    assert!(persist.find("state.config().update(|cfg|").unwrap()
-        < persist.find("publish_builtin_file(").unwrap());
-    assert!(persist.find("publish_builtin_file(").unwrap()
-        < persist.find(".entry(\"builtinGeoMeta\")").unwrap());
+    assert!(
+        persist.find("state.config().update(|cfg|").unwrap()
+            < persist.find("publish_builtin_file(").unwrap()
+    );
+    assert!(
+        persist.find("publish_builtin_file(").unwrap()
+            < persist.find(".entry(\"builtinGeoMeta\")").unwrap()
+    );
 }
 
 struct PausedHttp {
@@ -307,7 +325,11 @@ async fn download_paused_across_reset_cannot_publish_or_mark_metadata_done() {
     let sink = RecordingSink::default();
     let saved = AtomicUsize::new(0);
     let update = update_builtin_resource(
-        &sink, &client, &PublicLookup, &plan, &dir,
+        &sink,
+        &client,
+        &PublicLookup,
+        &plan,
+        &dir,
         |_, staged, operation| {
             publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
             saved.fetch_add(1, Ordering::SeqCst);
@@ -339,17 +361,20 @@ async fn cancelling_paused_download_cleans_only_its_stage_and_releases_gate() {
     };
     let sink = RecordingSink::default();
     {
-        let update = update_builtin_resource(
-            &sink, &client, &PublicLookup, &plan, &dir,
-            |_, _, _| panic!("cancelled download must not publish"),
-        );
+        let update =
+            update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_, _, _| {
+                panic!("cancelled download must not publish")
+            });
         tokio::pin!(update);
         tokio::select! {
             _ = &mut update => panic!("download must still be paused"),
             () = client.entered.notified() => {}
         }
     }
-    assert_eq!(std::fs::read(dir.join(&plan.file_name)).unwrap(), b"SRS-old");
+    assert_eq!(
+        std::fs::read(dir.join(&plan.file_name)).unwrap(),
+        b"SRS-old"
+    );
     assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
     assert!(builtin_update_lock(&plan.id).download.try_lock().is_ok());
     std::fs::remove_dir_all(dir).unwrap();
