@@ -744,10 +744,11 @@ def verify_import(component, cache, source, go, gomobile, gobind, developer, *, 
     require(observed_tools == expected_tools, 'actual consumer tool/SDK bytes differ')
     current_binding = (read_receipt(root / 'component-current-binding.json')
                        if 'componentReuse' in facts else receipt['input'])
+    scratch = private_dir(root / 'import-check')
     if 'nativeEnvironment' in current_binding:
         from producer import apple_native_environment
         from fork_input import tool_environment
-        native_env = tool_environment(go, gomobile, gobind, cache, root / 'import-check', developer=Path(developer))
+        native_env = tool_environment(go, gomobile, gobind, cache, scratch, developer=Path(developer))
         require(apple_native_environment(go, native_env) == current_binding['nativeEnvironment'],
                 'actual consumer Go/native environment differs')
     with (slot_locks(Path(component), Path(component).parent / 'cache')
@@ -755,7 +756,7 @@ def verify_import(component, cache, source, go, gomobile, gobind, developer, *, 
         verify_replacements(facts['localReplacementSources'], receipt, Path(component))
         from consume import verify_original
         verify_original(Path(component) / 'Libbox.xcframework', Path(component) / 'component-receipt.json',
-                        'apple', {}, private_dir(root / 'import-check'))
+                        'apple', {}, scratch)
     return receipt
 
 

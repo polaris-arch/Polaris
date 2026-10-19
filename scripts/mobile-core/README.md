@@ -141,7 +141,11 @@ with `-trimpath`; only admitted module-root locations and the generator filename
 header are normalized for comparison. Original receipt paths and BuildIDs are
 never rewritten. Native compilation overrides remain identity inputs; custom or
 unrecognized effective compiler/CGO settings and ambient include/library/config
-paths disable both restore and export, leaving the normal fresh build available.
+paths disable both restore and export, leaving the normal fresh build available. The
+formal Apple execution environment excludes host PKG_CONFIG_PATH search
+extensions (including setup-python's injected directory) before both production
+and verification; this is an actual input boundary, not a cache-path exception.
+Android and other native overrides retain their existing behavior.
 
 The package contains the original receipt, two-slice output, bind log, compiler
 objects, external archives, generated-source and local-replacement closure. It

@@ -238,6 +238,11 @@ def tool_environment(go, gomobile, gobind, cache, scratch, *, sdk=None, ndk=None
         env['PATH'] = str(Path(jdk) / 'bin') + os.pathsep + env['PATH']
     else:
         require(developer is not None and ndk is None and jdk is None, 'explicit Apple developer directory required')
+        # Formal Apple inputs do not accept host pkg-config search extensions.
+        # setup-python injects its own lib/pkgconfig directory into the job;
+        # remove it from the actual compiler environment, not just cache facts.
+        # Other ambient native overrides remain observed and disable reuse.
+        env.pop('PKG_CONFIG_PATH', None)
         env['DEVELOPER_DIR'] = str(developer)
     return env
 
