@@ -11,6 +11,8 @@ serde_json = { workspace = true }
 regex = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+# Resolve raw HTTP Location hops using the same URL semantics as unlock-transport.
+url = "2"
 
 [dev-dependencies]
 # tokio 仅测试用：驱动 async checker 的执行器（macros + 单线程 rt 足够，对齐 workspace 其它 crate 习惯）。

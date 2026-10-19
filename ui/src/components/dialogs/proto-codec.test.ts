@@ -1188,12 +1188,12 @@ describe('vmess / trojan：uTLS 指纹 + trojan ALPN', () => {
     }
   });
 
-  it('fp 首档是空串而非 chrome —— 后端对这两个协议的缺省是 none（新建节点不得凭空多出 utls 块）', () => {
+  it('fp 首档为空串：保留默认意图，不预填显式 Chrome', () => {
     for (const proto of ['vmess', 'trojan'] as const) {
       const f = allFields(proto).find((x) => x.k === 'fp');
       const values = f && f.t === 'select' ? f.options.map(([v]) => v) : [];
-      expect(values[0], `${proto} 的 fp 首档必须是「不启用」`).toBe('');
-      expect(values).toEqual(['', '@default', 'none']);
+      expect(values[0], `${proto} 的 fp 首档必须是「默认」`).toBe('');
+      expect(values).toEqual(['', 'none']);
       // 新建路径（draftFromSpecs）不得把 chrome 当默认值 seed 进草稿。
       expect(draftFromSpecs(allFields(proto)).fp).toBe('');
       const out = protoCodec[proto].toConfig(
@@ -1206,11 +1206,11 @@ describe('vmess / trojan：uTLS 指纹 + trojan ALPN', () => {
     for (const proto of ['vless', 'anytls'] as const) {
       const f = allFields(proto).find((x) => x.k === 'fp');
       const values = f && f.t === 'select' ? f.options.map(([v]) => v) : [];
-      expect(values).toEqual(['', '@default', 'none']);
+      expect(values).toEqual(['', 'none']);
     }
   });
 
-  it('fp 有值 → 下发并回填；清空 → 删键（后端回落 none 即不下发 utls）', () => {
+  it('fp 有值 → 保存并回填；清空 → 删键，交给运行默认策略', () => {
     for (const proto of ['vmess', 'trojan'] as const) {
       const draft = protoCodec[proto].fromConfig(SAMPLES[proto]);
       draft.fp = 'safari';
@@ -2489,12 +2489,12 @@ describe('TLS 分片 fragment（vless / vmess / trojan / anytls / http）', () =
 });
 
 describe('http 协议的 uTLS 指纹（此前 5 协议里唯一漏的那一个）', () => {
-  it('取值集必须是带空首项的 O_FP_OPT —— 用 O_FP 会让新建节点凭空多出 utls 块', () => {
+  it('取值集必须以默认空值开头，不预填显式指纹', () => {
     const spec = allFields('http').find((f) => f.k === 'fp');
     expect(spec, 'http 缺少 fp 控件').toBeDefined();
     expect(spec?.t).toBe('select');
-    // 🔴 select 首项陷阱：draftFromSpecs 把首项当默认 seed。后端对 http 的 final_fp 缺省是 none
-    //    ⇒ 首项必须是「不下发」语义的空串（vless/anytls 缺省 chrome，故它们才可以用 O_FP）。
+    // draftFromSpecs 把首项当默认 seed。空串不伪造已保存的显式浏览器，
+    // 运行配置再按引擎能力决定是否使用 Chrome。
     expect(spec?.t === 'select' ? spec.options[0][0] : null).toBe('');
     expect(draftFromSpecs(allFields('http')).fp).toBe('');
   });

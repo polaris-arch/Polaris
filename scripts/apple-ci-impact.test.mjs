@@ -32,12 +32,12 @@ test('real Apple and shared producer/application edits select the final App leg'
     'scripts/mobile-core/apple-cache.py', 'scripts/mobile-core/test_apple_entry.py',
     'scripts/mobile-core/apple_merge_reuse.py', 'scripts/mobile-core/test_apple_merge_reuse.py',
     'src-tauri/capabilities/default.json', 'src-tauri/capabilities/tray.json',
-    'scripts/fetch-protoc.mjs', 'scripts/lib/extract-zip.mjs',
+    'scripts/fetch-protoc.mjs', 'scripts/lib/extract-zip.mjs', 'scripts/lib/bounded-download.mjs',
     'ui/src/App.tsx', 'Cargo.lock', 'src-tauri/tauri.ios.conf.json', '.github/workflows/apple.yml']) {
     assert.equal(appleRequired([path]), true, path);
   }
   for (const path of ['docs/notes.md', 'src-tauri/gen/android/app/build.gradle.kts',
-    'src-tauri/capabilities-not-real/control.json', 'scripts/lib/unrelated.mjs', 'scripts/fetch-protoc-not-real.mjs']) {
+    'src-tauri/capabilities-not-real/control.json', 'scripts/lib/unrelated.mjs', 'scripts/lib/bounded-download-not-real.mjs', 'scripts/fetch-protoc-not-real.mjs']) {
     assert.equal(appleRequired([path]), false, path);
   }
   assert.equal(appleRequired([], true), true);
@@ -829,4 +829,42 @@ test('actual Git and both CLIs agree; force-full, invalid context and owner evol
     git('add', '.'); git('commit', '-qm', 'later edit'); after = git('rev-parse', 'HEAD');
     writeFileSync(eventPath, JSON.stringify({ ...c.event, before: evolvedBase, after })); check(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Apple lifecycle and monitor controls run once and their success gates both carriers', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/apple.yml', import.meta.url), 'utf8');
+  const blocks = workflow.split(/^ {6}- /m).slice(1);
+  const controls = blocks.filter(block => block.includes('LifecycleTests.swift'));
+  assert.equal(controls.length, 1);
+  assert.match(controls[0], /id: swift_lifecycle\n/);
+  assert.doesNotMatch(controls[0], /\bif:|continue-on-error:/);
+  assert.match(controls[0], /xcrun swiftc -Onone -parse-as-library/);
+  for (const source of ['src-tauri/gen/apple/PacketTunnel/TunnelLifecycle.swift',
+    'crates/tauri-plugin-polaris-ios/ios/Sources/VpnEvidence.swift',
+    'crates/tauri-plugin-polaris-ios/ios/Tests/LifecycleTests.swift']) {
+    assert.ok(controls[0].includes(source));
+  }
+  assert.match(controls[0], /\n\s+"\$RUNNER_TEMP\/polaris-ios-lifecycle-tests"\n/);
+  assert.equal(blocks.filter(block => block.includes('MonitorTests.swift')).length, 1);
+  assert.match(controls[0], /set -euo pipefail/);
+  assert.match(controls[0], /xcrun swiftc -Onone -parse-as-library \\\n\s+src-tauri\/gen\/apple\/PacketTunnel\/TunnelMonitorSession\.swift \\\n\s+crates\/tauri-plugin-polaris-ios\/ios\/Tests\/MonitorTests\.swift \\\n\s+-o "\$RUNNER_TEMP\/polaris-ios-monitor-tests"/);
+  assert.match(controls[0], /\n\s+"\$RUNNER_TEMP\/polaris-ios-monitor-tests"\n/);
+  const shared = blocks.find(block => block.includes('id: shared_ready\n'));
+  assert.ok(shared.includes("steps.swift_lifecycle.conclusion == 'success'"));
+  assert.doesNotMatch(shared, /swiftc|continue-on-error:/);
+  assert.ok(workflow.indexOf(controls[0]) < workflow.indexOf('ci_apple.py build'));
+  for (const carrier of ['device_arm64', 'sim_arm64']) {
+    const block = blocks.find(block => block.includes(`id: ${carrier}\n`));
+    assert.ok(block.includes("steps.shared_ready.conclusion == 'success'"));
+  }
+});
+
+test('Apple download entry dependencies retain actual native build routing', () => {
+  for (const entry of ['fetch-dashboard.mjs', 'fetch-protoc.mjs']) {
+    const source = readFileSync(new URL(entry, import.meta.url), 'utf8');
+    for (const dependency of ['extract-zip.mjs', 'bounded-download.mjs']) {
+      assert.ok(source.includes(`from './lib/${dependency}'`));
+      assert.equal(appleRequired([`scripts/lib/${dependency}`]), true);
+    }
+  }
 });

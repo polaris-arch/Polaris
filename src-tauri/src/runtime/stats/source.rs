@@ -185,12 +185,28 @@ pub(super) struct ConnectionsStream {
     inner: android::Pump<SingBoxConnectionEvents>,
 }
 
+/// Transport-only timing metadata, never compared across clock domains.
+/// Android timestamps native callback observation before Kotlin queueing; desktop
+/// uses receive time and an explicit reset from the reconnecting transport.
+pub(super) struct StatusFrame {
+    pub(super) status: SingBoxStatus,
+    pub(super) observed_at_ms: Option<u64>,
+    pub(super) reset: bool,
+}
+
+impl StatusFrame {
+    pub(super) fn apply(self, meter: &mut polaris_stats_engine::StatsAggregator, received_at_ms: u64) {
+        if self.reset { meter.reset(); }
+        meter.on_status(&self.status, self.observed_at_ms.unwrap_or(received_at_ms));
+    }
+}
+
 /// Status 长驻流（同上）。
 pub(super) struct StatusStream {
     #[cfg(not(target_os = "android"))]
     inner: ReconnectingStream<daemon::Status>,
     #[cfg(target_os = "android")]
-    inner: android::Pump<SingBoxStatus>,
+    inner: android::Pump<StatusFrame>,
 }
 
 impl ConnectionsStream {
@@ -210,11 +226,15 @@ impl ConnectionsStream {
 
 impl StatusStream {
     /// 下一帧；`None` 的语义同 [`ConnectionsStream::recv`]。
-    pub(super) async fn recv(&mut self) -> Option<SingBoxStatus> {
+    pub(super) async fn recv(&mut self) -> Option<StatusFrame> {
         #[cfg(not(target_os = "android"))]
         {
-            let st = self.inner.recv().await?;
-            Some(super::relay::daemon_status_to_engine(&st))
+            let (st, reset) = self.inner.recv_with_reset().await?;
+            Some(StatusFrame {
+                status: super::relay::daemon_status_to_engine(&st),
+                observed_at_ms: None,
+                reset,
+            })
         }
         #[cfg(target_os = "android")]
         {
@@ -496,10 +516,12 @@ mod android {
     /// Status 流的回包（同上）。
     type StatusBatch = Batch<BridgeStatus>;
 
-    /// libbox `StatusMessage` 的九个字段，与 proto `message Status` 同形。
+    /// Nine libbox Status fields plus required prequeue callback observation metadata.
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct BridgeStatus {
+        // Required bridge metadata: never substitute Rust batch-drain time.
+        observed_at_ms: u64,
         memory: u64,
         goroutines: i32,
         connections_in: i32,
@@ -566,18 +588,22 @@ mod android {
         process_path: String,
     }
 
-    impl From<BridgeStatus> for SingBoxStatus {
+    impl From<BridgeStatus> for super::StatusFrame {
         fn from(s: BridgeStatus) -> Self {
-            SingBoxStatus {
-                memory: s.memory,
-                goroutines: s.goroutines,
-                connections_in: s.connections_in,
-                connections_out: s.connections_out,
-                traffic_available: s.traffic_available,
-                uplink: s.uplink,
-                downlink: s.downlink,
-                uplink_total: s.uplink_total,
-                downlink_total: s.downlink_total,
+            super::StatusFrame {
+                observed_at_ms: Some(s.observed_at_ms),
+                reset: false, // outer subscription resets the meter before the first frame
+                status: SingBoxStatus {
+                    memory: s.memory,
+                    goroutines: s.goroutines,
+                    connections_in: s.connections_in,
+                    connections_out: s.connections_out,
+                    traffic_available: s.traffic_available,
+                    uplink: s.uplink,
+                    downlink: s.downlink,
+                    uplink_total: s.uplink_total,
+                    downlink_total: s.downlink_total,
+                },
             }
         }
     }
@@ -775,11 +801,11 @@ mod android {
         Some(Pump { rx, stop })
     }
 
-    pub(super) async fn open_status() -> Option<Pump<SingBoxStatus>> {
+    pub(super) async fn open_status() -> Option<Pump<super::StatusFrame>> {
         super::detached_open(&STATUS_STREAM_LOCK, open_status_inner).await
     }
 
-    async fn open_status_inner(guard: MutexGuard<'static, ()>) -> Option<Pump<SingBoxStatus>> {
+    async fn open_status_inner(guard: MutexGuard<'static, ()>) -> Option<Pump<super::StatusFrame>> {
         let plugin = android_bridge::plugin()?;
         if let Err(e) = plugin.run_mobile_plugin_async::<()>("statsOpen", ()).await {
             log::debug!("Status 流：libbox 命令通道建流失败 {e}");
@@ -855,6 +881,24 @@ mod android {
             close_status_stream(plugin).await;
         });
         Some(Pump { rx, stop })
+    }
+
+    #[cfg(test)]
+    mod timing_tests {
+        use super::*;
+
+        #[test]
+        fn status_bridge_requires_and_preserves_callback_observation_time() {
+            let json = r#"{"observedAtMs":1200,"memory":0,"goroutines":0,"connectionsIn":0,
+                "connectionsOut":0,"trafficAvailable":true,"uplink":0,"downlink":0,
+                "uplinkTotal":1048576,"downlinkTotal":0}"#;
+            let decoded: BridgeStatus = serde_json::from_str(json).unwrap();
+            let frame: super::super::StatusFrame = decoded.into();
+            assert_eq!(frame.observed_at_ms, Some(1200));
+            assert_eq!(frame.status.uplink_total, 1048576);
+            let missing = json.replace("\"observedAtMs\":1200,", "");
+            assert!(serde_json::from_str::<BridgeStatus>(&missing).is_err());
+        }
     }
 }
 

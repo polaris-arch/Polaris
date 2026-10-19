@@ -13,6 +13,7 @@
  */
 
 import type { ReactNode } from 'react';
+import { intersectOverlayBoxes, placeAnchoredMenu, type OverlayBox } from '@/lib/overlay-position';
 
 /** 触发器/菜单矩形（视口坐标，取自 getBoundingClientRect）。 */
 export interface Rect {
@@ -32,10 +33,12 @@ export interface CselPosition {
   left: number;
   /** fixed top（视口坐标，px） */
   top: number;
-  /** 菜单宽度锁定为触发器宽度（长选项省略号，不撑宽菜单，对齐原型 :1485 注释） */
+  /** Actual measured width, constrained to the content boundary. */
   width: number;
   /** 是否向上翻转（下方空间不足） */
   flipped: boolean;
+  maxHeight: number;
+  usable: boolean;
 }
 
 /** 视口边缘留白（原型 positionCsel 的 8px）。 */
@@ -59,24 +62,34 @@ export function computeCselPosition(
   trigger: Rect,
   menuHeight: number,
   vp: Viewport,
+  menuWidth = trigger.width,
+  boundary?: OverlayBox,
+  rtl = false,
 ): CselPosition {
-  const width = trigger.width;
-
-  let top = trigger.bottom + CSEL_GAP;
-  let flipped = false;
-  if (top + menuHeight > vp.height - CSEL_EDGE) {
-    // 下方不足 → 翻转向上；翻转后若容器比菜单还矮则贴顶边（绝不越出视口）
-    top = Math.max(CSEL_EDGE, trigger.top - menuHeight - CSEL_GAP);
-    flipped = true;
+  const box = intersectOverlayBoxes({ left: 0, top: 0, ...vp }, boundary ?? { left: 0, top: 0, ...vp });
+  // Below one compact scrollable row (including menu border/padding), do not display a sliver.
+  // The component closes instead; no fixed inset may push an empty intersection outside its owner.
+  if (box.width < 2 * CSEL_EDGE + 48 || box.height < 2 * CSEL_EDGE + 32) {
+    return { left: box.left, top: box.top, width: 0, maxHeight: 0, flipped: false, usable: false };
   }
-
-  let left = trigger.left;
-  if (left + width > vp.width - CSEL_EDGE) {
-    left = Math.max(CSEL_EDGE, vp.width - width - CSEL_EDGE);
-  }
-  left = Math.max(CSEL_EDGE, left);
-
-  return { left, top, width, flipped };
+  const width = Math.min(Math.max(0, menuWidth), Math.max(0, box.width - 2 * CSEL_EDGE));
+  const below = Math.max(0, box.top + box.height - CSEL_EDGE - trigger.bottom - CSEL_GAP);
+  const above = Math.max(0, trigger.top - CSEL_GAP - box.top - CSEL_EDGE);
+  const flipped = menuHeight > below && above > below;
+  // A shallow card may have no usable space on either side. Shift within the card,
+  // allowing overlap with the trigger rather than rendering an unselectable zero-height list.
+  const sideSpace = flipped ? above : below;
+  const available = Math.max(0, box.height - 2 * CSEL_EDGE);
+  const maxHeight = sideSpace < Math.min(menuHeight, 44) ? available : Math.min(available, sideSpace);
+  const height = Math.min(menuHeight, maxHeight);
+  const anchored = placeAnchoredMenu(
+    { left: trigger.left, top: trigger.top, width: trigger.width, height: trigger.bottom - trigger.top },
+    { w: width, h: height }, box, rtl ? 'right' : 'left', CSEL_GAP,
+  );
+  const top = flipped
+    ? Math.max(box.top + CSEL_EDGE, Math.min(trigger.top - CSEL_GAP - height, box.top + box.height - CSEL_EDGE - height))
+    : anchored.top;
+  return { left: anchored.left, top, width, flipped, maxHeight: height, usable: true };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

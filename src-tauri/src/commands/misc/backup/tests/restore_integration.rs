@@ -532,3 +532,33 @@ fn empty_foreign_rule_class_does_not_disable_or_clear_local_rules_and_dependenci
     assert_eq!(reopened["ruleResources"], current["ruleResources"]);
     assert_eq!(reopened["networkProfiles"], current["networkProfiles"]);
 }
+
+#[test]
+fn original_domain_rule_shape_survives_restore_save_and_reopen() {
+    let dir = TestDir::new("polaris-backup-original-domain-rule");
+    let manager = ConfigManager::new(dir.clone());
+    seeded_config(&manager, "target");
+    let backup = json!({"customRules":[{
+        "id":"old-domain", "domains":["*.legacy.example.invalid"],
+        "action":"proxy", "enabled":true, "bypassFakeIP":true,
+        "remarks":"preserve legacy intent"
+    }]});
+    let selected = [BackupCategory::CustomRules, BackupCategory::DnsRules];
+    let available = detect_categories(&backup);
+    assert!(selected.iter().all(|cat| available.contains(cat)));
+    crate::commands::config::backup_import_save_core(
+        &manager, &backup, &selected, None, "linux", None,
+    ).unwrap();
+    let restored = ConfigManager::new(dir.clone()).load_full().unwrap();
+    let traffic = &restored["trafficRules"][0];
+    assert_eq!(traffic["id"], "old-domain");
+    assert_eq!(traffic["type"], "domainSuffix");
+    assert_eq!(traffic["values"], json!(["legacy.example.invalid"]));
+    assert_eq!(traffic["enabled"], true);
+    assert_eq!(traffic["effects"]["route"]["action"], "proxy");
+    assert_eq!(traffic["remarks"], "preserve legacy intent");
+    assert_eq!(restored["dnsRules"][0]["id"], "old-domain");
+    assert_eq!(restored["dnsRules"][0]["effects"]["dns"]["action"]["serverId"], "builtin-remote");
+    assert_eq!(restored["routeRuleOrder"], json!(["old-domain"]));
+    assert_eq!(restored["dnsRuleOrder"], json!(["old-domain"]));
+}

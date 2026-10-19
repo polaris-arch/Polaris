@@ -1146,6 +1146,8 @@ pub fn run() {
             server_delete,
             server_delete_batch,
             server_switch,
+            server_identity_conflicts,
+            server_identity_repair,
             server_generate_url,
             tailcat_keypair,
             // ── mesh 节点（warp + tailscale）──
@@ -1209,6 +1211,8 @@ pub fn run() {
             local_import_pick_file,
             // ── 路由规则（rules:add/update/delete/reorder）──
             rules_add,
+            rules_preview_regex,
+            rules_validate_regex,
             rules_update,
             rules_delete,
             rules_reorder,
@@ -1264,6 +1268,8 @@ pub fn run() {
             speed_test_result_snapshot,
             // ── 自动选择（意图 / 立即切换 / 状态）──
             auto_select_enable,
+            auto_select_set_enabled,
+            auto_select_disable,
             auto_select_switch_now,
             auto_select_status,
             // ── 更新（version + app update）与内核信息 ──
@@ -1409,6 +1415,9 @@ pub fn run() {
         }
         // 平台直接终止无法 veto；只 best effort，未确认关闭绝不写 clean marker。
         tauri::RunEvent::Exit => {
+            if let Some(runtime) = app_handle.try_state::<runtime::AppRuntime>() {
+                runtime.unlock.shutdown_events();
+            }
             exit_lifecycle::final_exit_best_effort(app_handle);
             #[cfg(windows)]
             windows_session_end::destroy(app_handle);

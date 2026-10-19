@@ -271,7 +271,7 @@ impl UnlockEventSink for PausingCommitSink {
 #[test]
 fn completed_invalidate_cannot_be_refilled_by_run_after_its_last_guard() {
     let runtime = Arc::new(runtime());
-    let sink = Arc::new(PausingCommitSink::new(2));
+    let sink = Arc::new(PausingCommitSink::new(2 + ServiceId::ALL.len()));
     let task_runtime = Arc::clone(&runtime);
     let task_sink = Arc::clone(&sink);
     let task = std::thread::spawn(move || {
@@ -333,7 +333,7 @@ fn legal_commit_before_invalidate_is_cleared_atomically() {
     let (done_tx, done_rx) = mpsc::channel();
     let committing = Arc::clone(&runtime);
     let commit = std::thread::spawn(move || {
-        committing.commit_epoch(&RecordingSink::default(), 0, || {
+        committing.commit_epoch(&RecordingSink::default(), 0, |_| {
             let snapshot = UnlockSnapshot {
                 checked_at: Some(500),
                 ..Default::default()
@@ -1548,3 +1548,5 @@ async fn round_deadline_does_not_affect_fast_healthy_round() {
     assert!(snap.results.values().all(|r| r.status == UnlockStatus::Ok));
     assert!(rt.peek(1_000).is_some(), "健康轮照常入缓存");
 }
+
+mod publication_regressions;

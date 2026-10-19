@@ -1,3 +1,4 @@
+import { configuredExitId } from '@/domain/actual-exit';
 /**
  * 首页「Tailscale 出口名不副实」行内警示（§H，迁移自 上游 `home/ts-exit-warning.tsx`）。
  * 挂在「出口节点」下拉正下方：选中 TS 当全局出口但出不了公网（未认证 / 未选出口设备 / 出口设备离线 /
@@ -21,7 +22,7 @@ export function TsExitWarning() {
   const { t } = useTranslation();
   const config = useEffectiveConfig();
   const servers = useAppStore((s) => s.servers);
-  const selectedServerId = useAppStore((s) => s.selectedServerId);
+  const selectedServerId = useAppStore((s) => configuredExitId(s.proxyStatus, s.config));
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
   const openDialog = useDialogStore((s) => s.open);
 

@@ -1746,7 +1746,7 @@ fn build_temp_node(
         &DomainResolver::Tag(DIRECT_DNS_TAG.to_string()),
         &env.arch,
         &env.platform,
-    );
+    )?;
     // **detour 一律剥掉**：临时核只装被测节点自己，链式前置节点的 tag 在核里根本不存在 ⇒ 留着必 FATAL。
     // 代价是「代理链节点测的是它自己那一跳」——如实、且与旧行为（根本测不了）相比只增不减。
     let mut val = serde_json::to_value(ob).map_err(|_| "出站序列化")?;

@@ -346,3 +346,24 @@ fn recheck_interval_is_far_below_the_dialog_timescale() {
         "复查节拍 {HELPER_MUTATION_RECHECK_INTERVAL:?} 太粗 —— 用户点连接到服务变更完成只有几秒"
     );
 }
+
+#[test]
+fn explicit_helper_install_validates_platform_before_stopping_and_preserves_ordinary_guard() {
+    let source = crate_code("commands/helper.rs");
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(&source, "pub async fn helper_install(");
+    assert!(body.contains("mode.unwrap_or_default()"));
+    assert!(body.contains("mode == HelperInstallMode::Ordinary"));
+    assert!(body.contains("helper_install_blocked_by_proxy("));
+    assert!(
+        body.find("mode.supported_on(helper.platform())").unwrap()
+            < body
+                .find("with_helper_service_mutation_core_guard(")
+                .unwrap()
+    );
+    assert!(body.contains("helper.install_with_mode(mode)"));
+    assert!(
+        !body.contains("HelperInstallMode::StopAndUpgrade"),
+        "the command must not invent disruptive intent"
+    );
+}

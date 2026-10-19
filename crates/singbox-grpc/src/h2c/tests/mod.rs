@@ -12,6 +12,7 @@ fn client_dialing_through(dial: Dialer) -> SingBoxApiClient {
         channel: connect_h2c_with("127.0.0.1:1", dial).unwrap(),
         target: "127.0.0.1:1".into(),
         secret: None,
+        authorization: None,
     }
 }
 
@@ -19,7 +20,7 @@ fn client_dialing_through(dial: Dialer) -> SingBoxApiClient {
 fn silent_dialer() -> (Dialer, Arc<AtomicUsize>) {
     let dials = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&dials);
-    let dial: Dialer = Arc::new(move |_| {
+    let dial: Dialer = Arc::new(move |_, _| {
         counted.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::pending())
     });
@@ -114,7 +115,7 @@ async fn a_unary_call_to_an_accepting_but_mute_peer_expires_at_the_deadline() {
 async fn time_spent_dialing_counts_against_the_unary_deadline() {
     let addr = accepting_but_mute_listener().await;
     let spent_dialing = CONNECT_TIMEOUT - Duration::from_millis(200);
-    let dial: Dialer = Arc::new(move |_| {
+    let dial: Dialer = Arc::new(move |_, _| {
         let addr = addr.clone();
         Box::pin(async move {
             tokio::time::sleep(spent_dialing).await;
@@ -134,4 +135,18 @@ async fn time_spent_dialing_counts_against_the_unary_deadline() {
         waited >= UNARY_DEADLINE && waited < UNARY_DEADLINE + spent_dialing / 2,
         "等了 {waited:?}"
     );
+}
+
+#[tokio::test]
+async fn connector_preserves_host_and_port_for_ipv4_dns_and_ipv6() {
+    for (uri, expected) in [("http://127.0.0.1:1234", "127.0.0.1"), ("http://localhost:1234", "localhost"), ("http://[::1]:1234", "::1")] {
+        let expected = expected.to_string();
+        let dial: Dialer = Arc::new(move |host, port| {
+            assert_eq!(host, expected);
+            assert_eq!(port, 1234);
+            Box::pin(async { Err(io("observed test address")) })
+        });
+        let mut connector = TcpConnector { dial };
+        assert!(connector.call(uri.parse().unwrap()).await.is_err());
+    }
 }

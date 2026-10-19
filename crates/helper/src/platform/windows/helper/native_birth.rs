@@ -277,6 +277,17 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                     code,
                 )));
             }
+            // Retain the parent's original native identity before child launch.
+            // Failure is not permission to substitute PID-only polling.
+            let parent = match p
+                .parent_pid
+                .filter(|pid| *pid > 0)
+                .map(|pid| self.proc.capture_parent(pid))
+                .transpose()
+            {
+                Ok(parent) => parent,
+                Err(error) => return start_error(error),
+            };
             let birth = match self.proc.mint_native_birth() {
                 Ok(birth) => birth,
                 Err(error) => return start_error(error),
@@ -287,6 +298,8 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                 &p.log,
                 p.fwd,
                 birth,
+                conf_dir,
+                &peer.identity,
             ) {
                 Ok(started) => started,
                 Err(error) => return start_error(error),
@@ -303,15 +316,15 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
                 owner: Some(peer.identity.clone()),
                 core: Some(core),
             });
-            (target, started)
+            (target, started, parent)
         };
-        let (target, info) = started;
-        if let Some(ppid) = p.parent_pid.filter(|p| *p > 0) {
+        let (target, info, parent) = started;
+        if let Some(parent) = parent {
             let current = Arc::clone(&self.child_mu);
             let dead = Arc::clone(&self.child_mu);
             let proc = Arc::clone(&self.proc);
             self.proc.spawn_watch_parent(
-                ppid,
+                parent,
                 target.pid.get(),
                 Box::new(move |_| {
                     current.lock().is_ok_and(|state| {

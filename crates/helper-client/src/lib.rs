@@ -50,8 +50,8 @@ pub use connector::PipeConnector;
 #[cfg(unix)]
 pub use connector::UnixConnector;
 pub use manager::{
-    HelperManager, HelperStatus, InstallParams, InstallPaths, ManagerError, StdSysOps, SysOps,
-    READY_POLL_ATTEMPTS, READY_POLL_DELAY,
+    HelperManager, HelperStatus, InstallParams, InstallPaths, MaintenanceUtility, ManagerError,
+    StdSysOps, SysOps, READY_POLL_ATTEMPTS, READY_POLL_DELAY,
 };
 pub use privilege::{
     classify_outcome, is_user_cancelled, osascript_escalation, pkexec_escalation, run_escalation,

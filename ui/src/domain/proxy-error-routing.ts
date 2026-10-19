@@ -85,6 +85,11 @@ export function handleProxyErrorEvent(
   deps: { t: (key: string, fallback?: string) => string; refreshProxyStatus: () => Promise<void> }
 ): void {
   const { t, refreshProxyStatus } = deps;
+  if (data.errorCode === 'NODE_RESOLVER_UNSUPPORTED' || data.errorCode === 'SPEED_TEST_URL_INVALID') {
+    void refreshProxyStatus();
+    if (!isProxyStartClaimed()) toast.error(proxyErrorText(data, t));
+    return;
+  }
   if (data.errorCode === 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED') {
     void refreshProxyStatus();
     if (isProxyStartClaimed()) return;

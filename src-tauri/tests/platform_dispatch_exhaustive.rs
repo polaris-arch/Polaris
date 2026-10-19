@@ -180,6 +180,48 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    (
+        "crates/helper-client/src/manager.rs",
+        "matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)",
+        1,
+        "Explicit stop-and-upgrade is macOS-only. Android/iOS/Other cannot obtain this desktop maintenance mode; ordinary requests still require existing platform admission.",
+    ),
+    (
+        "crates/helper/src/mac_migration_guard.rs",
+        "let paths = InstallPaths::for_platform(Platform::Mac)",
+        3,
+        "This macOS-only root CLI binds three independent guard paths to the fixed Mac installation. Android/iOS/Other never compile or dispatch this service-stop implementation.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if matches!(platform, Platform::Win)",
+        1,
+        "Only Windows installer-owned exit stages select Windows diagnostics. Android/iOS/Other retain the generic diagnostic and gain no desktop maintenance capability.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if matches!(platform, Platform::Win) && code == 75",
+        1,
+        "Only the fixed Windows installer uses native exit 75 as upgrade admission evidence. Other platforms require their exact installer marker; Android/iOS/Other cannot infer admission from an arbitrary exit.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "let utility = if self.platform == Platform::Win",
+        1,
+        "Windows retains its bundled native cleaner and does not prepare a Unix maintenance utility. Android/iOS/Other are rejected before this desktop uninstall path.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)",
+        1,
+        "Explicit stop-and-upgrade is macOS-only. Android/iOS/Other cannot obtain this desktop maintenance mode; ordinary requests still require existing platform admission.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "else if matches!(platform, Platform::Linux) && code == 127",
+        1,
+        "安装命令仅在 Linux 将 exit 127 判为授权未完成；Android/iOS/Other 和未来平台不继承 PolicyKit 语义，仍保留安装失败分类，且桌面 helper 平台准入不变。",
+    ),
     ("crates/helper-client/src/manager.rs",
      "!raw.contains([ , , ]) && (path.is_absolute() || platform == Platform::Win && raw.as_bytes().get(1) == Some(&b ) && matches!(raw.as_bytes().get(2), Some(b | b )))", 1,
      "Only Windows accepts a drive-qualified staged path when the authoring host uses Unix path syntax. Android/iOS/Other cannot borrow that path rule or pass native caller admission."),
@@ -353,7 +395,7 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
         "src-tauri/src/runtime/helper.rs",
         "if matches!(platform, Platform::Linux) && code == 127",
         1,
-        "pkexec 127 → AuthorizationUnavailable 的判据。Android → 走 Failed 分支，不可达\
+        "pkexec 127 → AuthorizationIncomplete 的判据。Android → 走 Failed 分支，不可达\
          （Android 上没有提权脚本可跑）。",
     ),
     (

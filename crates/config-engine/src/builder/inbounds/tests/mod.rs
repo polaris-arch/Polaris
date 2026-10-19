@@ -242,6 +242,7 @@ fn inbound_exclude_warns_custom_rule_overlap() {
             enabled: true,
             bypass_fakeip: None,
             target_server_id: None,
+            target_auto_select: None,
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,

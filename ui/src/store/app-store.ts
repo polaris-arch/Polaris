@@ -441,13 +441,13 @@ const EMPTY_PENDING: PendingChangesState = {
   restartDeferred: false,
 };
 
-const initialUnlock: UnlockDisplayState = {
+const freshUnlock = (): UnlockDisplayState => ({
   results: {},
   running: false,
   checkedAt: null,
   egress: null,
   lastRunAt: null,
-};
+});
 
 export const useAppStore = create<AppState>((set, get) => ({
   config: null,
@@ -472,13 +472,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   ipInfo: null,
   ipInfoRevision: -1,
 
-  unlock: initialUnlock,
+  unlock: freshUnlock(),
 
   pendingChanges: EMPTY_PENDING,
   invalidNodes: [],
 
   helperStatus: null,
-  privacyMode: false,
+  privacyMode: true,
   tailscaleStatuses: {},
   serverPageAction: null,
 
@@ -492,6 +492,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     publishConfig(config, -1, 'selection');
     const publication = configReadGeneration.current();
     if (configScope !== 'tray') await hydrateStagedConfig(config, () => configReadGeneration.isCurrent(publication));
+    await get().refreshProxyStatus();
   },
 
   saveConfig: async (patch) => {
@@ -565,24 +566,28 @@ export const useAppStore = create<AppState>((set, get) => ({
     // 与暂存保存/配置补丁共用同一条 webview 内写队列：快速连点必须按调用顺序落盘，
     // 否则较慢的旧 IPC 可能最后回包，把最后一次点击覆盖回旧节点。
     const readback = await withConfigWriteLock(async () => {
-      const receipt = await api.server.switch(serverId);
+      let receipt: Awaited<ReturnType<typeof api.server.switch>> | undefined;
+      let failure: unknown;
+      try { receipt = await api.server.switch(serverId); } catch (error) { failure = error; }
       const readGeneration = configReadGeneration.beginRead();
       try {
-        return { receipt, config: await api.config.get(), readGeneration };
+        return { receipt, failure, config: await api.config.get(), readGeneration };
       } catch (error) {
         if (!configReadGeneration.isCurrent(readGeneration)) return null;
-        throw error;
+        throw Object.assign(error instanceof Error ? error : new Error('Selection readback failed'), { code: 'SERVER_SWITCH_READBACK_FAILED', commandFailure: failure });
       }
     });
     if (!readback || !configReadGeneration.isCurrent(readback.readGeneration)) return null;
-    const { receipt, config } = readback;
+    const { receipt, config, failure } = readback;
     publishConfig(config, -1, 'selection');
     const publicationGeneration = configReadGeneration.current();
     const hydration = configScope === 'tray' ? Promise.resolve()
       : hydrateStagedConfig(config, () => configReadGeneration.isCurrent(publicationGeneration));
     if (typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios') await hydration;
     // A newer publication/read also owns feedback during asynchronous iOS hydration.
-    return configReadGeneration.isCurrent(publicationGeneration) ? receipt : null;
+    await get().refreshProxyStatus();
+    if (failure !== undefined) throw failure;
+    return configReadGeneration.isCurrent(publicationGeneration) ? receipt ?? null : null;
   },
 
   setProxyStatus: (status) => set({ proxyStatus: status }),
@@ -688,7 +693,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     })),
 
   /** 复位 idle（停代理 / IPC 失败兜底）：连 lastRunAt 一并清，重连后不被陈旧冷却误锁刷新钮。 */
-  resetUnlock: () => set({ unlock: initialUnlock }),
+  resetUnlock: () => set({ unlock: freshUnlock() }),
   setPendingChanges: (changes) => set({ pendingChanges: changes }),
   setInvalidNodes: (nodes) => set({ invalidNodes: nodes }),
   setPrivacyMode: (enabled) => set({ privacyMode: enabled }),
@@ -848,11 +853,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       trafficStats: null,
       ipInfo: null,
       // 不重置 ipInfoRevision：WebView 同一进程内清空显示态后，旧事件仍可能迟到。
-      unlock: initialUnlock,
+      unlock: freshUnlock(),
       pendingChanges: EMPTY_PENDING,
       invalidNodes: [],
       helperStatus: null,
-      privacyMode: false,
+      privacyMode: true,
       // 原始帧只在核跑着时有意义（reset 语义 = 回到「什么都不知道」），清掉即回落到
       // 「无帧 → 出口告警不据陈旧帧下认证/离线结论」。
       tailscaleStatuses: {},

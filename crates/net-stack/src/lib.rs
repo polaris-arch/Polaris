@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+mod import_fields;
 pub mod clash_parser;
 pub mod safe_redirect;
 pub mod share_link;

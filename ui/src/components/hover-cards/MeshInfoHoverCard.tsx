@@ -41,7 +41,7 @@ import { useTranslation } from 'react-i18next';
 import type { ServerConfig } from '@/contracts/types';
 import type { TailscaleStatusEvent, TailscaleStatusSnapshot } from '@/contracts/tailscale-status';
 import { dedupeTrim } from '@/domain/collections';
-import { isAccountBasedProtocol, isMeshNode, stripCatchAll } from '@/domain/endpoint-routes';
+import { declaresMeshRoutes, endpointForcedRouteCidrs, isAccountBasedProtocol, isMeshNode, stripCatchAll } from '@/domain/endpoint-routes';
 import { api } from '@/ipc/api-client';
 import { cn } from '@/lib/utils';
 
@@ -109,6 +109,9 @@ export function meshConfigRows(server: ServerConfig): MeshInfoRow[] {
     // 布尔项只在**开着**时入列：关着是缺省态，摆一行「未开启」是噪声。它的值文案见 ROW_EMPTY_TEXT。
     if (ts?.acceptRoutes) rows.push({ id: 'acceptRoutes', values: [] });
     return rows;
+  }
+  if (declaresMeshRoutes(server.protocol)) {
+    return [{ id: 'routes', values: endpointForcedRouteCidrs(server) }];
   }
   const wg = server.wireguardSettings;
   return [

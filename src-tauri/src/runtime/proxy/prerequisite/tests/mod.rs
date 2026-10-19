@@ -25,6 +25,7 @@ fn ticket() -> ReadyMainTicket {
         generation: 7,
         saved_digest: digest(&saved).unwrap(),
         emission_digest: "final-emission".into(),
+        diagnostic_secret_keys: BTreeSet::new(),
         targets: BTreeMap::from([("second".into(), "Second".into())]),
         status: ProxyStatus {
             running: true,
@@ -488,6 +489,7 @@ pub(super) fn ready_for(runtime: &ProxyRuntime) -> (Arc<ReadyMainCore>, ActionBi
         generation: runtime.core_generation(),
         saved_digest: digest(&saved).unwrap(),
         emission_digest: "observed-final-emission".into(),
+        diagnostic_secret_keys: BTreeSet::new(),
         targets: BTreeMap::new(),
         status: status.clone(),
         api_secret: String::new(),
@@ -1367,4 +1369,23 @@ fn android_main_retirement_binds_raw_config_whole_claim_and_one_original_stop() 
     assert!(raw.contains("actual == emitted"));
     assert!(raw.contains("sha256_hex(&bytes)"));
     assert!(raw.contains("take(4 * 1024 * 1024 + 1)"));
+}
+
+#[test]
+fn diagnostic_custom_keys_require_exact_committed_emission_and_generation() {
+    let (runtime, _directory) = runtime();
+    let (mut core, _) = ready_for(&runtime);
+    runtime.ready_main.write().unwrap().take();
+    let emitted = serde_json::json!({"outbounds": [{"tenantCredential": "synthetic-only"}]});
+    let unique = Arc::get_mut(&mut core).unwrap();
+    unique.emission_digest = digest(&emitted).unwrap();
+    unique.diagnostic_secret_keys.insert("tenantcredential".into());
+    *runtime.ready_main.write().unwrap() = Some(Arc::clone(&core));
+    assert!(runtime.diagnostic_runtime_secret_keys(&emitted).unwrap().contains("tenantcredential"));
+    assert!(runtime.diagnostic_runtime_secret_keys(&serde_json::json!({})).is_none());
+    core.committed.store(false, Ordering::SeqCst);
+    assert!(runtime.diagnostic_runtime_secret_keys(&emitted).is_none());
+    core.committed.store(true, Ordering::SeqCst);
+    runtime.gate.bump_generation();
+    assert!(runtime.diagnostic_runtime_secret_keys(&emitted).is_none());
 }

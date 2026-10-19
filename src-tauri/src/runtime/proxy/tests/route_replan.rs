@@ -457,6 +457,7 @@ fn existing_selector_roots_are_hot_switchable_but_runtime_additions_require_rest
                 enabled: true,
                 action: RuleAction::Proxy,
                 target_server_id: Some("node-c".into()),
+                target_auto_select: None,
                 destination_resolution: None,
                 resolution_only: false,
             }),

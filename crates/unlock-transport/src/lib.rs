@@ -250,6 +250,45 @@ async fn read_body_truncating(
     }
 }
 
+/// Manual redirects must preserve browser method semantics without replaying credentials
+/// or token bodies to an unapproved origin. The caller only supplies redirect status codes.
+fn redirect_request(req: &UnlockRequest, status: u16, location: &str) -> Result<UnlockRequest, String> {
+    let current = url::Url::parse(&req.url).map_err(|_| "invalid request URL".to_string())?;
+    let next = current.join(location).map_err(|_| "invalid redirect URL".to_string())?;
+    if !matches!(next.scheme(), "http" | "https") || !next.username().is_empty() || next.password().is_some() {
+        return Err("unsupported redirect target".to_string());
+    }
+    if current.scheme() == "https" && next.scheme() != "https" {
+        return Err("refusing insecure redirect downgrade".to_string());
+    }
+    let cross_origin = current.origin() != next.origin();
+    let mut redirected = req.clone();
+    redirected.url = next.to_string();
+    if status == 303 || (matches!(status, 301 | 302) && req.method == HttpMethod::Post) {
+        redirected.method = HttpMethod::Get;
+        redirected.body = None;
+        redirected.headers.retain(|key, _| {
+            !matches!(key.to_ascii_lowercase().as_str(),
+                "content-type" | "content-length" | "content-encoding" | "transfer-encoding")
+        });
+    }
+    if cross_origin {
+        // Removing Authorization alone would still send Disney assertion/refresh tokens
+        // in a preserved POST body. Refuse such redirects before dispatching the next hop.
+        if redirected.body.is_some() {
+            return Err("refusing cross-origin redirect with request body".to_string());
+        }
+        redirected.headers.retain(|key, _| {
+            !matches!(key.to_ascii_lowercase().as_str(),
+                "authorization" | "proxy-authorization" | "cookie" | "cookie2" | "origin" | "referer" | "host")
+        });
+        // An explicit empty header also suppresses the client's domain-scoped cookie jar:
+        // cookie domains alone do not isolate ports or otherwise prove same-origin trust.
+        redirected.headers.insert("Cookie".to_string(), String::new());
+    }
+    Ok(redirected)
+}
+
 /// The same before/after boundary wraps every redirect send and terminal body read.
 /// The closure is invoked before polling I/O, so a revoked binding never dispatches another hop.
 async fn with_hop_guard<T, G, F, Fut>(guard: &G, operation: F) -> Result<T, String>
@@ -327,18 +366,18 @@ impl UnlockClient {
     where
         VFut: std::future::Future<Output = Result<(), String>> + Send,
     {
-        let mut current = req.url.clone();
+        let mut hop_req = req.clone();
         let mut chain: Vec<RedirectHop> = Vec::new();
 
         for _ in 0..=MAX_REDIRECTS {
-            let mut builder = match req.method {
-                HttpMethod::Get => self.client.get(&current),
-                HttpMethod::Post => self.client.post(&current),
+            let mut builder = match hop_req.method {
+                HttpMethod::Get => self.client.get(&hop_req.url),
+                HttpMethod::Post => self.client.post(&hop_req.url),
             };
-            for (k, v) in &req.headers {
+            for (k, v) in &hop_req.headers {
                 builder = builder.header(k.as_str(), v.as_str());
             }
-            if let Some(body) = &req.body {
+            if let Some(body) = &hop_req.body {
                 builder = builder.body(body.clone());
             }
 
@@ -357,7 +396,7 @@ impl UnlockClient {
             let resp = sent;
             let status = resp.status().as_u16();
 
-            if (300..400).contains(&status) {
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
                 if let Some(loc) = resp
                     .headers()
                     .get(wreq::header::LOCATION)
@@ -368,16 +407,12 @@ impl UnlockClient {
                         status,
                         location: loc.clone(),
                     });
-                    // wreq 6 不再 re-export `Url`（`wreq::Url` 没了）；`http::Uri` 无相对引用解析。
-                    // 直接用 `url` crate —— 与 wreq 5 的 `wreq::Url` 同一实现，也是 wreq 6 内部解
-                    // `Location` 用的同一条路径（`src/client/layer/redirect/future.rs:196`），语义不变。
-                    // 注意：链里存的仍是**原始 Location 串**（上面 `loc.clone()`），checker 按原样解析。
-                    match url::Url::parse(&current).and_then(|b| b.join(&loc)) {
+                    match redirect_request(&hop_req, status, &loc) {
                         Ok(next) => {
-                            current = next.to_string();
+                            hop_req = next;
                             continue;
                         }
-                        Err(e) => return UnlockResponse::err(format!("重定向目标非法 {loc}: {e}")),
+                        Err(error) => return UnlockResponse::err(error),
                     }
                 }
                 // 30x 无 Location → 当终态（与 net-stack 同口径）。

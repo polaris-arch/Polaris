@@ -46,7 +46,20 @@ export function verifyAck(secret, request, reply) {
   return ack !== null && canonical(ack) === canonical({...request,kind:'ACK'});
 }
 /** Source facts and runtime observations stay separate; health+zero is not policy rejection. */
+function validateCounters(report) {
+  for (const protocol of ['tcp', 'udp']) {
+    const counters = report?.[protocol];
+    if (!counters || typeof counters !== 'object' || Array.isArray(counters) ||
+        Object.keys(counters).sort().join() !== 'bytes,health,invalid,matched,replay,sealed' ||
+        typeof counters.sealed !== 'boolean' ||
+        !['matched', 'health', 'invalid', 'replay', 'bytes'].every(key => Number.isSafeInteger(counters[key]) && counters[key] >= 0)) {
+      throw Error('bounded typed observation counters required');
+    }
+  }
+}
+const hex = (value, length) => typeof value === 'string' && new RegExp(`^[0-9a-f]{${length}}$`).test(value);
 export function classifyObservations(report) {
+  validateCounters(report);
   return {tcpWitness:report.tcp.matched > 0 ? 'ObservedPass' : report.tcp.health > 0 ? 'ObservedNoMatch' : 'NotObserved',
     udpAppSocket:report.udp.matched > 0 ? 'ObservedPass' : report.udp.health > 0 ? 'ObservedNoMatch' : 'NotObserved',
     witnessEvidenceScope:'AppSocketAuthenticatedRequestReceived', independentPeerAck:'NotObserved',
@@ -55,7 +68,17 @@ export function classifyObservations(report) {
 }
 /** invoke is the existing authenticated Tauri Debug bridge, not an app_process/socket factory. */
 export async function collectDebugBatch(invoke, args, expected) {
-  if (!['prepare','arm','snapshot','probe','health','close','cleanupObserve'].includes(args.action)) throw Error('unknown batch action');
+  if (!args || !['prepare','arm','snapshot','probe','health','close','cleanupObserve'].includes(args.action)) throw Error('unknown batch action');
+  if (!expected || !hex(expected.apkSha256, 64) || !hex(expected.sourcePin, 64)) throw Error('expected pins required');
+  if (args.action === 'prepare') {
+    if (args.sessionId != null || typeof args.plan !== 'string' || args.plan.length > 4096) throw Error('finite prepare plan required');
+    const plan = validatePlan(JSON.parse(args.plan));
+    if (plan.apkSha256 !== expected.apkSha256 || plan.expectedSourcePin !== expected.sourcePin) throw Error('prepare pins differ');
+  } else if (!hex(args.sessionId, 32) || args.plan != null) throw Error('owned session required');
+  const sessionFields = ['sessionId', 'bootNonce', 'nonce'];
+  if ((args.action !== 'prepare' || sessionFields.some(key => expected[key] !== undefined)) &&
+      !(hex(expected.sessionId, 32) && hex(expected.bootNonce, 32) && hex(expected.nonce, 48))) throw Error('complete expected session binding required');
+  if (args.action !== 'prepare' && args.sessionId !== expected.sessionId) throw Error('requested session differs from expected session');
   const response = await invoke('debug_android_batch_qa',args);
   if (response?.success !== true || typeof response.data !== 'string' || response.data.length > 65536) throw Error('batch bridge unavailable');
   const report = JSON.parse(response.data);

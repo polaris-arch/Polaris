@@ -5,7 +5,7 @@
 #
 # 硬约束（写进脚本而不是文档，因为文档对执行没有强制力）：
 #   - 接管模式钉死 system、不建 TUN ⇒ 全程不改路由表，SSH 控制通道不可能断。
-#   - 应用生命周期由 `timeout` 界定，脚本不对任何 pid 发信号。
+#   - Direct-child owners enforce bounded TERM/KILL/reap; no arbitrary PID/group signals.
 #   - 冷启到首帧实测约 60s（软件渲染的 VM），预热不足会把「还没画」误判成「起不来」。
 #
 # ── GRAPHICS：本脚本曾经比生产**更保守** ──
@@ -22,12 +22,18 @@
 #
 # 换言之默认值只保证「既有 failover 结论逐字不变」，不保证图形向量被覆盖；要覆盖就显式跑
 # `GRAPHICS=default`，这是两个不同目的的腿，不是同一条的两种口味。
-set -u
+set -eu
 
 SCEN=${1:?缺场景名}
 OBS=${2:?缺观测秒数}
 [[ "$OBS" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: OBS 必须为正整数"; exit 2; }
+# A fresh shared batch nonce is mandatory; negative legs also need the earlier control directory.
+: "${BATCH_ID:?set a fresh shared 32-hex batch nonce}"
+[[ "$BATCH_ID" =~ ^[0-9a-f]{32}$ ]] || exit 2
+export BATCH_ID
 GRAPHICS=${GRAPHICS:-escape}
+export GRAPHICS
+[[ ${#OBS} -le 4 && "$OBS" -le 3600 ]] || { echo 'FATAL: OBS exceeds finite 3600-second budget'; exit 2; }
 case "$GRAPHICS" in
   escape|default) ;;
   *) echo "FATAL: GRAPHICS 只能是 escape 或 default，实为 '$GRAPHICS'"; exit 1 ;;
@@ -48,25 +54,40 @@ export DISPLAY=:$DISP HOME=/root
 
 # ── 配置：补丁而非重建，保留默认配置的全部 57 个键 ──
 python3 "$HERE/scenario.py" "$SCEN" < "$APPDIR/config.json" > "$OUT/config.json" || exit 1
+python3 "$HERE/evidence_guard.py" provenance "$OUT" || exit 2
 cp "$OUT/config.json" "$APPDIR/config.json"
 : > "$APPDIR/logs/polaris.log"
 : > "$APPDIR/logs/singbox.log"
 
-# ── Xvfb：本轮独占，预算 = 本轮预算 + 余量（严格长于应用的 timeout）──
-setsid timeout $((WARMUP + OBS + 120)) Xvfb :$DISP -screen 0 1400x900x24 -nolisten tcp \
-  > "$OUT/xvfb.log" 2>&1 &
-for _ in $(seq 1 15); do sleep 1; xdpyinfo -display :$DISP >/dev/null 2>&1 && break; done
+# ── Xvfb: separate owned root, finite application budget plus margin ──
+# Owners retain direct child custody and bound TERM then KILL/reap. Cancellation
+# is a private file request, never a signal to a caller-provided/recycled PID.
+cleanup() {
+  : > "$OUT/app.cancel"
+  : > "$OUT/xvfb.cancel"
+  [ -z "${APP:-}" ] || wait "$APP" || true
+  [ -z "${XVFB:-}" ] || wait "$XVFB" || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+python3 "$HERE/evidence_guard.py" own "$OUT" xvfb $((WARMUP + OBS + 120)) \
+  Xvfb :$DISP -screen 0 1400x900x24 -nolisten tcp > "$OUT/xvfb.log" 2>&1 &
+XVFB=$!
+for _ in $(seq 1 15); do
+  sleep 1
+  python3 "$HERE/evidence_guard.py" live "$OUT" xvfb >/dev/null || continue
+  xdpyinfo -display :$DISP >/dev/null 2>&1 && break
+done
+python3 "$HERE/evidence_guard.py" live "$OUT" xvfb >/dev/null || { echo 'FATAL: owned Xvfb is not alive'; exit 2; }
 xdpyinfo -display :$DISP >/dev/null 2>&1 || { echo "FATAL: Xvfb 起不来 (:$DISP)"; exit 1; }
+python3 "$HERE/evidence_guard.py" live "$OUT" xvfb >/dev/null || exit 2
 
-# ── 应用：生命周期由 timeout 界定 ──
+# ── Application: bounded direct-child owner ──
 # 图形环境按 GRAPHICS 分腿（见头注）。**写进证据包**：事后只看 timeline 分不出这轮是哪条腿，
 # 而两条腿的「绿」覆盖面完全不同，混读就是把 escape 腿的绿当成默认腿的绿。
-if [ "$GRAPHICS" = escape ]; then
-  GFX_ENV=(WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1)
-else
-  GFX_ENV=()
-fi
-printf 'graphics=%s\nenv=%s\n' "$GRAPHICS" "${GFX_ENV[*]:-<none>}" > "$OUT/graphics.txt"
+# The owner strips inherited graphics escape flags before setting this leg.
+printf 'graphics=%s\n' "$GRAPHICS" > "$OUT/graphics.txt"
 monotonic() { python3 -c 'import time; print(time.monotonic())'; }
 app_identity() {
   python3 - "$OUT/app.pid" <<'PYID'
@@ -80,9 +101,8 @@ except (OSError, ValueError, IndexError):
     pass
 PYID
 }
-# `${a[@]+"${a[@]}"}`：bash < 4.4 在 `set -u` 下展开空数组会报 unbound，VM 的 bash 版本不由本仓决定。
-env ${GFX_ENV[@]+"${GFX_ENV[@]}"} \
-  timeout $((WARMUP + OBS + 45)) bash -c 'echo $$ > "$1"; exec /usr/bin/polaris' _ "$OUT/app.pid" > "$OUT/stdout.log" 2>&1 &
+python3 "$HERE/evidence_guard.py" own "$OUT" app $((WARMUP + OBS + 45)) \
+  /usr/bin/polaris > "$OUT/stdout.log" 2>&1 &
 APP=$!
 for _ in $(seq 1 100); do [ -s "$OUT/app.pid" ] && break; sleep 0.05; done
 IDENTITY=$(app_identity)
@@ -101,7 +121,7 @@ while true; do
   t=$(python3 -c 'import sys; print(float(sys.argv[1])-float(sys.argv[2]))' "$NOW" "$START")
   CURRENT=$(app_identity)
   [ -n "$IDENTITY" ] && [ "$CURRENT" = "$IDENTITY" ] || { echo "应用在 t=${t}s 退出或身份改变"; break; }
-  wp=$(pgrep -c -f WebKitWebProcess 2>/dev/null); wp=${wp:-0}
+  wp=$(python3 "$HERE/evidence_guard.py" sample "$OUT" "$IDENTITY" "$t") || break
   win=$(xwininfo -root -tree 2>/dev/null | grep -oE '"Polaris":.*' | grep -oE '[0-9]+x[0-9]+\+[0-9-]+\+[0-9-]+' | head -1)
   import -window root "$OUT/t${t}.png" 2>/dev/null || break
   col=$(identify -format '%k' "$OUT/t${t}.png" 2>/dev/null)
@@ -116,7 +136,8 @@ while true; do
   fi
 done
 
-wait $APP 2>/dev/null
+cleanup
+python3 "$HERE/evidence_guard.py" provenance "$OUT" || exit 2
 cp "$APPDIR/logs/polaris.log" "$OUT/polaris.log" 2>/dev/null
 cp "$APPDIR/logs/singbox.log" "$OUT/singbox.log" 2>/dev/null
 python3 - "$OUT" "$START" "$END" "$WARMUP" "$OBS" "$IDENTITY" "$FINAL_IDENTITY" "$COMPLETED" <<'PYRECORD'
@@ -126,7 +147,7 @@ record = dict(start=float(sys.argv[2]), end=float(sys.argv[3]), warmup=int(sys.a
               requested=int(sys.argv[5]), identity=sys.argv[6], final_identity=sys.argv[7],
               completed=sys.argv[8] == "true")
 record["sha256"] = {name: hashlib.sha256((out / name).read_bytes()).hexdigest()
-                    for name in ("polaris.log", "timeline.tsv")}
+                    for name in ("polaris.log", "timeline.tsv", "graphics.txt", "graphics-samples.jsonl", "provenance.json", "app.cleanup.json", "xvfb.cleanup.json")}
 (out / "observation.json").write_text(json.dumps(record) + "\n")
 PYRECORD
 # ── G0 自曝闸：配置被校验拒掉会**静默回落默认配置**，场景根本没应用而日志一切正常。
@@ -177,5 +198,9 @@ echo "--- polaris.log ($(wc -l < "$OUT/polaris.log") 行) ---"
 cat "$OUT/polaris.log"
 
 # A printed gate is not a result: the same consumer owns the final exit status.
-python3 "$HERE/assert.py" "$OUT"
-exit $?
+if [ "$SCEN" = plain-broken ]; then
+  python3 "$HERE/assert.py" "$OUT"
+else
+  : "${CONTROL_EVIDENCE:?earlier passing plain-broken evidence required}"
+  python3 "$HERE/assert.py" "$CONTROL_EVIDENCE" "$OUT"
+fi

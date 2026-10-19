@@ -1,3 +1,5 @@
+import { isSpeedTestUrl, speedTestUrlInvalid as invalidSpeedUrl, adoptSpeedTestUrlDraft } from '@/domain/periodic-speed-test';
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
 /**
  * 设置 → 网络（移动端）。桌面对照：`components/screens/settings/SettingsNetwork.tsx`（六块）。
@@ -32,18 +34,12 @@ import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-
 import { useSpeedTestSchedule } from '@/hooks/use-speed-test-schedule';
 import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
 import type { SpeedTestMeteredPolicy } from '@/contracts/types';
-import { globalUtlsOptions, tlsFingerprintStatus } from '@/domain/utls';
+import { globalUtlsOptions, isSavedUtlsSelection, tlsFingerprintStatus } from '@/domain/utls';
 import { MobileSelect, MobileSwitch, MobileTextInput, SettingsGroup, SettingsRow } from './SettingsChrome';
 import type { MobileSettingsPageProps } from './settings-pages';
 
 type WebRtcMode = 'off' | 'proxy' | 'block';
 
-/** 与后端 `icon_cache.rs::is_http_url` 逐字同口径（只看前缀）。`new URL()` 会放行一批后端随即
- *  回落默认的写法，两侧口径分叉就变成「填了没生效还不报错」。 */
-function isHttpUrl(value: string): boolean {
-  const v = value.trim().toLowerCase();
-  return v.startsWith('http://') || v.startsWith('https://');
-}
 
 /** 后端 `commands/speedtest.rs` 的 DEFAULT_SPEED_TEST_URL；留空即回落到它。 */
 const DEFAULT_SPEED_TEST_URL = 'http://www.gstatic.com/generate_204';
@@ -59,11 +55,13 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
      外部改动（备份导入 / 另一处保存 → useConfig 静默重拉）要能回填草稿，但不能打断正在输入的用户，
      故用种子快照守卫：草稿 ≠ 上次种子 = 用户改过，保留。 */
   const [speedUrl, setSpeedUrl] = useState(config.speedTestUrl ?? '');
-  const [speedUrlInvalid, setSpeedUrlInvalid] = useState(false);
+  // Derive from the visible draft: hydration and local edits cannot leave a stale warning.
+  const speedUrlInvalid = invalidSpeedUrl(speedUrl);
   const seeded = useRef(config.speedTestUrl ?? '');
   useEffect(() => {
     const next = config.speedTestUrl ?? '';
-    setSpeedUrl((cur) => (cur !== seeded.current ? cur : next));
+    const previous = seeded.current;
+    setSpeedUrl((cur) => (adoptSpeedTestUrlDraft(cur, previous, next)));
     seeded.current = next;
   }, [config.speedTestUrl]);
 
@@ -95,11 +93,9 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
 
   function commitSpeedTestUrl(): void {
     const v = speedUrl.trim();
-    if (v && !isHttpUrl(v)) {
-      setSpeedUrlInvalid(true);
+    if (v && !isSpeedTestUrl(v)) {
       return;
     }
-    setSpeedUrlInvalid(false);
     const next = v || undefined;
     setSpeedUrl(v);
     if (next === (config.speedTestUrl ?? undefined)) return;
@@ -151,6 +147,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
 
   return (
     <>
+      <SavedAutoSelectControls t={t} variant="switch" />
       <SettingsGroup header={t('settings.network.interfaceBlock')}>
         <SettingsRow
           first
@@ -218,12 +215,12 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
             </MobileSelect>
           }
         />
-        <SettingsRow stacked id="utls-policy" label={t('settings.utls.label')} desc={t('settings.utls.description') + ' ' + (tlsFingerprintStatus(tlsFingerprints, t) ?? '')}
+        <SettingsRow stacked id="utls-policy" label={t('settings.utls.label')} desc={[t('settings.utls.description'), isSavedUtlsSelection(config.utlsPolicy) ? t('node.utls.savedHint') : null, tlsFingerprintStatus(tlsFingerprints, t)].filter(Boolean).join(' ')}
           control={
-            <MobileSelect value={config.utlsPolicy ?? 'follow'} ariaLabel={t('settings.utls.label')}
+            <MobileSelect value={config.utlsPolicy ?? 'default'} ariaLabel={t('settings.utls.label')}
               onChange={(value) => commit('utls-policy', update({ utlsPolicy: value }))}>
               {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
-                <option key={value} value={value}>{value === 'follow' || value === 'default' ? t(label) : label}</option>
+                <option key={value} value={value}>{label.startsWith('node.utls.') || label.startsWith('settings.utls.') ? t(label) : label}</option>
               ))}
             </MobileSelect>
           }
@@ -290,8 +287,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
               ariaLabel={t('settings.network.speedTestUrl')}
               onChange={(v) => {
                 setSpeedUrl(v);
-                if (speedUrlInvalid) setSpeedUrlInvalid(false);
-              }}
+                }}
               onCommit={commitSpeedTestUrl}
             />
           }

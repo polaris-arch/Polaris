@@ -210,14 +210,13 @@ describe('computeTestMatch —— 轴不匹配算「不适用」，不算未命�
     expect(computeTestMatch([{ t: 'domain', v: 'a.com' }], 'or', '1.2.3.4')).toBe('untestable');
   });
 
-  it('AND 里混一个不适用的条件，不会把整条拖成 miss', () => {
-    // 变异靶：把「轴不匹配 → continue」改成 push(false) → 本条转红。
-    // 那正是「一条『域名 + 端口』的 AND 规则永远测不出命中」的形态。
+  it('AND with unavailable context remains unknown', () => {
+    // No port context: neither a proven hit nor a proven miss.
     const conds: Cond[] = [
       { t: 'domainSuffix', v: 'google.com' },
       { t: 'port', v: '443' },
     ];
-    expect(computeTestMatch(conds, 'and', 'www.google.com')).toBe('hit');
+    expect(computeTestMatch(conds, 'and', 'www.google.com')).toBe('untestable');
   });
 
   it('空输入 = empty；无值的条件不参与', () => {
@@ -229,13 +228,13 @@ describe('computeTestMatch —— 轴不匹配算「不适用」，不算未命�
     expect(computeTestMatch([{ t: 'domainSuffix', v: 'google.com' }], 'or', 'a.b.google.com')).toBe('hit');
     expect(computeTestMatch([{ t: 'domain', v: 'google.com' }], 'or', 'a.google.com')).toBe('miss');
     expect(computeTestMatch([{ t: 'domainKeyword', v: 'goog' }], 'or', 'x.google.com')).toBe('hit');
-    expect(computeTestMatch([{ t: 'domainRegex', v: '^stun\\..+' }], 'or', 'stun.l.google.com')).toBe('hit');
+    expect(computeTestMatch([{ t: 'domainRegex', v: '^stun\\..+' }], 'or', 'stun.l.google.com')).toBe('untestable');
   });
 
-  it('IP 轴：ipCidr 走前缀启发式、geoip 恒命中（客户端无 GeoIP 库）', () => {
+  it('IP masks are numeric; unavailable GeoIP content is unknown', () => {
     expect(computeTestMatch([{ t: 'ipCidr', v: '8.8.0.0/16' }], 'or', '8.8.4.4')).toBe('hit');
     expect(computeTestMatch([{ t: 'ipCidr', v: '10.0.0.0/8' }], 'or', '8.8.4.4')).toBe('miss');
-    expect(computeTestMatch([{ t: 'geoip', v: 'cn' }], 'or', '1.2.3.4')).toBe('hit');
+    expect(computeTestMatch([{ t: 'geoip', v: 'cn' }], 'or', '1.2.3.4')).toBe('untestable');
   });
 });
 
@@ -474,8 +473,8 @@ describe('接线：useLazyPool 的「只拉一次」由 in-flight 标记守，�
 describe('typed regex draft round trip', () => {
   it.each(['^\\D+$', '^\\W+$', '^\\S+$'])('preserves uppercase escape %s in entity and draft paths', (expression) => {
     const input = expression.includes('W') ? '...' : 'a.com';
-    expect(matchConditionValues([{ type: 'domainRegex', values: [expression] }], 'and', input)).toBe('hit');
-    expect(computeTestMatch([{ t: 'domainRegex', v: expression }], 'and', input)).toBe('hit');
+    expect(matchConditionValues([{ type: 'domainRegex', values: [expression] }], 'and', input)).toBe('untestable');
+    expect(computeTestMatch([{ t: 'domainRegex', v: expression }], 'and', input)).toBe('untestable');
   });
   it('preserves comma syntax in every regex while retaining ordinary CSV', () => {
     const expressions = ['^[a,b]\\.example$', '^a{1,3}\\.example$', '^a\\,b$'];

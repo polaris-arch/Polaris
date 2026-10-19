@@ -1015,6 +1015,7 @@ const FRAME_CONTRACTS = [
     what: 'Status',
     encoder: 'fun encodeStatus(',
     bridgeStruct: 'BridgeStatus',
+    transportFields: ['observed_at_ms'],
     desktopFn: 'fn daemon_status_to_engine(',
     desktopLiteral: 'SingBoxStatus',
     floor: 8,
@@ -1057,7 +1058,9 @@ for (const c of FRAME_CONTRACTS) {
   if (desktop.length < c.floor) {
     hardFail(`A9 FLOOR：桌面 ${c.desktopLiteral} 字面量只解析到 ${desktop.length} 个字段（下限 ${c.floor}）`);
   }
-  if (!sameSet(bridge.fields, desktop)) {
+  // Timing metadata is required by A8 but is not a displayed engine field.
+  const payloadFields = bridge.fields.filter((field) => !(c.transportFields ?? []).includes(field));
+  if (!sameSet(payloadFields, desktop)) {
     fail(
       `A9 ${c.what}帧：Android 桥的 ${c.bridgeStruct} 字段 [${bridge.fields.join(', ')}] 与桌面 ` +
         `${c.desktopFn.replace('fn ', '')} 实际映射的 [${desktop.join(', ')}] 不一致（Android 少映：` +

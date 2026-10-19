@@ -1,3 +1,4 @@
+import { IdentityRepairPanel } from './IdentityRepairPanel';
 /**
  * 移动端表单宿主 —— `MobileFormDesc` 的**唯一**渲染点（对应桌面 `dialogs/DialogHost.tsx`）。
  *
@@ -22,6 +23,7 @@
  * 不参与外壳的滚动区/停靠区排版；放进外壳会让它被 `overflow` 裁掉，也会逼外壳多认识一个概念。
  */
 
+import { VpnAuthPanel } from './VpnAuthPanel';
 import { Fragment, type ReactElement } from 'react';
 import './forms.css';
 import { AppAddPanel } from './AppAddPanel';
@@ -44,6 +46,9 @@ import { useMobileFormStore, type MobileFormEntry } from './form-store';
 
 function renderPanel(entry: MobileFormEntry): ReactElement {
   switch (entry.kind) {
+    case 'vpn-auth':
+      return <VpnAuthPanel instanceId={entry.instanceId} protocol={entry.protocol} serverId={entry.serverId} />;
+    case 'identity-repair': return <IdentityRepairPanel instanceId={entry.instanceId} />;
     case 'node':
       return (
         <NodeFormPanel

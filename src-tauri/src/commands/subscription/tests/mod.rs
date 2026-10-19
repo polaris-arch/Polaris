@@ -38,3 +38,5 @@ mod progress_tests;
 /// 本地导入命令（桌面与 Android 同一 IPC）的端到端产物：MASQUE / Tailcat 节点、failed 计数、
 /// 证书固定提示与 reality pin 剔除。
 mod local_import_tests;
+
+mod boundary_regressions;

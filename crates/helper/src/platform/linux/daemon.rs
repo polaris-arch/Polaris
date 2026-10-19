@@ -187,9 +187,14 @@ async fn async_main(cfg: ServerConfig) -> ExitCode {
     // main.go 退出兜底（:46-57）：
     // C6-2：先同步 terminate 当前 child（TERM→≤5s→KILL）+ waitReaps(6s) 等在途后台 terminate 归零
     // （杜绝留下带 CAP_NET_ADMIN 的孤儿核），再 setForward(false) 复位全局转发态。
-    server.reap_on_shutdown();
+    let reaped = server.reap_on_shutdown();
     set_forward_prod(false);
-    ExitCode::SUCCESS
+    if reaped {
+        ExitCode::SUCCESS
+    } else {
+        log::error!("helper shutdown custody is not confirmed complete");
+        ExitCode::FAILURE
+    }
 }
 
 #[cfg(test)]

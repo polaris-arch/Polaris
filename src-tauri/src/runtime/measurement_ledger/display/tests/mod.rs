@@ -570,6 +570,7 @@ fn temp_subscription_and_global_interface_edits_expire_results_without_changing_
             subscriptions: vec![SubscriptionInterfacePolicy {
                 id: "sub".to_owned(),
                 proxy_bind_interface: subscription_override.then(|| "Sub-A".to_owned()),
+                speed_test_interval_minutes: None,
             }],
             ..Default::default()
         };

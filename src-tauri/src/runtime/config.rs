@@ -34,6 +34,10 @@ use serde_json::Value;
 use crate::commands::config::config_version;
 use crate::runtime::proxy::mesh_apply::{self, ApplyClaim, ApplyError, ApplyStep, PhaseEvent};
 
+mod identity_repair;
+pub(crate) use identity_repair::{validate_server_identities, IDENTITY_AMBIGUOUS};
+pub use identity_repair::{IdentityConflicts, IdentityRepairRequest};
+
 const DEFERRED_DELETIONS_FILE: &str = "pending-config-deletions.json";
 const DEFERRED_DELETIONS_VERSION: u8 = 2;
 const STAGED_PENDING_FILE: &str = "staged-config.pending";
@@ -304,7 +308,13 @@ fn reconcile_tailscale_credentials(
         let current = match previous_by_id.get(&id.as_deref()) {
             Some(Some(current)) => Some(*current),
             None => None,
-            Some(None) => return Err(StoreError::validation("credentialRevisionChanged")),
+            Some(None) => {
+                return Err(StoreError::validation(if id.is_some() {
+                    IDENTITY_AMBIGUOUS
+                } else {
+                    "credentialRevisionChanged"
+                }))
+            }
         };
         if let Some(intent) = intent {
             let object = intent
@@ -940,6 +950,13 @@ impl ConfigManager {
             }
             None => {}
         }
+        // ConfigStore::load has already sanitized/migrated the document. Protect the
+        // actual result before either publishing it or warming the runtime cache,
+        // including loads whose sanitizer changed servers without a migration delta.
+        if mesh_guard::has_managed_fields(&config) {
+            let previous = self.raw_disk_for_mesh_under_write_lock()?;
+            mesh_guard::reconcile_untrusted(&previous, &mut config)?;
+        }
         // 加载或校验失败 → 回落默认（LoadResult 已处理），但记日志保留 error 上下文。
         if let Some(e) = &error {
             log::warn!("config load fallback (loaded_from_disk={loaded_from_disk}): {e}");
@@ -1334,6 +1351,7 @@ impl ConfigManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut raw = self.raw_disk_for_mesh_under_write_lock()?;
+        let previous_config=raw.clone();
         let policy: MeshRoutePolicy = serde_json::from_value(raw[mesh_guard::POLICY_KEY].clone())
             .map_err(StoreError::from_parse)?;
         let previous: MeshRouteState = serde_json::from_value(raw[mesh_guard::STATE_KEY].clone())
@@ -1463,6 +1481,7 @@ impl ConfigManager {
                 }
             }
         }
+        crate::runtime::proxy::native_auto::invalidate_changed_pins(&previous_config, &mut raw);
         let mut canonical = ConfigStore::canonicalize_for_save(&raw)?;
         let new_epoch = format!("{}{}", random_tmp_suffix(), random_tmp_suffix());
         let canonical_servers = canonical["servers"]
@@ -2054,9 +2073,15 @@ impl ConfigManager {
     ) -> Result<Value, StoreError> {
         let previous = self.raw_disk_for_mesh_under_write_lock()?;
         let mut incoming = config.clone();
+        validate_server_identities(&incoming)?;
         reconcile_tailscale_credentials(&previous, &mut incoming, trusted_target)?;
         mesh_guard::reconcile_untrusted(&previous, &mut incoming)?;
-        ConfigStore::canonicalize_for_save(&incoming)
+        crate::runtime::proxy::native_auto::invalidate_changed_pins(&previous, &mut incoming);
+        let mut canonical = ConfigStore::canonicalize_for_save(&incoming)?;
+        // Sanitization can remove a malformed server even when the raw identity passed.
+        // Compare the actual publication against the same disk snapshot under write_lock.
+        mesh_guard::reconcile_untrusted(&previous, &mut canonical)?;
+        Ok(canonical)
     }
 
     /// Only the original admitted login/logout transaction calls this seam. Full saved

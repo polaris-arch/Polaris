@@ -393,6 +393,18 @@ pub(crate) fn entry_freshness_cap_ms(
     )
 }
 
+/// Build once per ledger read instead of scanning every group's members per node.
+pub(crate) fn freshness_period_index(plan: &BTreeMap<String,SubPlan>) -> BTreeMap<String,u64> {
+    let mut index=BTreeMap::new();
+    for sub in plan.values() { for id in &sub.members { index.entry(id.clone()).or_insert(sub.period_ms); } }
+    index
+}
+pub(crate) fn indexed_entry_freshness_cap_ms(periods: &BTreeMap<String,u64>, id: &str, entry: &LedgerEntry) -> u64 {
+    let period=periods.get(id).copied().unwrap_or(polaris_store::SPEED_TEST_INTERVAL_MINUTES_DEFAULT*60_000);
+    let backoff=if entry.consecutive_failures>=BACKOFF_AFTER_FAILURES {u64::from(BACKOFF_SKIP_ROUNDS)+1} else {1};
+    (period*entry.period_factor*backoff*2).max(FRESHNESS_FLOOR_MS)
+}
+
 /// 用户是否开着周期测速的全局总开关。
 fn user_enabled(config: &Value) -> bool {
     config
@@ -629,7 +641,13 @@ fn effective_plan(config: &Value, platform: Platform) -> BTreeMap<String, SubPla
             .map(str::to_string)
             .into_iter()
             .collect();
-    plan_subscriptions(config, &auto_intent)
+    let mut plan = plan_subscriptions(config, &auto_intent);
+    // Only native-owned candidates yield. Feature ON with a manual default and no
+    // Auto rule leaves ordinary HTTP periodic measurements intact.
+    let native = crate::runtime::proxy::native_auto::native_owned_members(config);
+    for subscription in plan.values_mut() { subscription.members.retain(|id| !native.contains(id)); }
+    plan.retain(|_, subscription| !subscription.members.is_empty());
+    plan
 }
 
 impl Planner {
@@ -1793,8 +1811,8 @@ impl MeasurementScheduler {
                             app.state::<AppRuntime>().proxy().measurement_core_sha256(),
                         );
                     let Shared { planner, plan, .. } = &mut *shared;
-                    let cap =
-                        |id: &str, entry: &LedgerEntry| entry_freshness_cap_ms(plan, id, entry);
+                    let periods=freshness_period_index(plan);
+                    let cap=|id: &str,entry: &LedgerEntry|indexed_entry_freshness_cap_ms(&periods,id,entry);
                     let current = ledger.current_results(
                         &start
                             .subs
@@ -1854,13 +1872,14 @@ impl MeasurementScheduler {
                     let plan = shared.plan.clone();
                     drop(shared);
                     // 每轮收尾时按软上限淘汰一次。
+                    let periods=freshness_period_index(&plan);
                     ledger.evict(&EvictContext {
                         nodes: &current_server_fingerprints(&config).into_keys().collect(),
                         url_digest: &polaris_updater::sha256_hex(
                             resolve_speed_test_url(&config).as_bytes(),
                         ),
                         now_ms: now.wall,
-                        freshness_cap_ms: &|id, entry| entry_freshness_cap_ms(&plan, id, entry),
+                        freshness_cap_ms: &|id,entry|indexed_entry_freshness_cap_ms(&periods,id,entry),
                     });
                     this.announce(&app, true);
                     this.wake.notify_one();

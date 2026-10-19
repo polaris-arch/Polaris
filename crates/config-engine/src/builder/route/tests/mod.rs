@@ -156,6 +156,7 @@ fn v4_ignores_stale_per_traffic_rule_resolution() {
                 enabled: true,
                 action: RuleAction::Block,
                 target_server_id: None,
+                target_auto_select: None,
                 destination_resolution: Some(DestinationResolution {
                     mode: DestinationResolutionMode::DnsRules,
                     server_id: None,
@@ -168,6 +169,7 @@ fn v4_ignores_stale_per_traffic_rule_resolution() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -205,6 +207,7 @@ fn legacy_explicit_destination_resolution_survives_non_smart_mode() {
                     enabled: true,
                     action: RuleAction::Block,
                     target_server_id: None,
+                    target_auto_select: None,
                     destination_resolution: Some(DestinationResolution {
                         mode: DestinationResolutionMode::DnsRules,
                         server_id: None,
@@ -223,6 +226,7 @@ fn legacy_explicit_destination_resolution_survives_non_smart_mode() {
             enabled: true,
             bypass_fakeip: None,
             target_server_id: None,
+            target_auto_select: None,
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
@@ -573,6 +577,7 @@ fn browser_doh_block_emits_only_when_switched_on() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -978,6 +983,7 @@ fn dangling_custom_geo_rule() -> crate::user_config::rule::Rule {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -1354,6 +1360,7 @@ fn direct_mode_never_prunes_so_final_stays_direct() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -1422,6 +1429,7 @@ fn app_rule_process_name_route() {
         action: RuleAction::Proxy,
         enabled: true,
         target_server_id: None,
+        target_auto_select: None,
     });
     config.custom_app_presets.push(CustomAppPreset {
         id: "custom-app".into(),
@@ -1467,6 +1475,7 @@ fn app_rule_block_emits_rule_level_reject_and_no_udp443_pair() {
         action: RuleAction::Block,
         enabled: true,
         target_server_id: None,
+        target_auto_select: None,
     });
     config.custom_app_presets.push(CustomAppPreset {
         id: "custom-app".into(),

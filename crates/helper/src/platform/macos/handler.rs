@@ -52,6 +52,8 @@ pub struct MacConfig {
     pub support_dir: String,
     /// install-core 的受保护内核目录（`helper.go:595` flag `--coredir`）。
     pub core_dir: String,
+    /// Start admission stays closed until the root installer commits and releases it.
+    pub upgrade_closed: bool,
 }
 
 impl MacConfig {
@@ -61,6 +63,7 @@ impl MacConfig {
         Self {
             support_dir: support_dir.into(),
             core_dir: core_dir.into(),
+            upgrade_closed: false,
         }
     }
 }

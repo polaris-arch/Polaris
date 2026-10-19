@@ -1,3 +1,4 @@
+import { autoSelectChoice } from '@/domain/auto-select-choice';
 /**
  * 规则「效果」两格的**平台无关状态** —— 目标出站的值编码、DNS 效果的整份草稿与候选。
  *
@@ -40,6 +41,7 @@ export function ruleRouteTargetChoice(baseRouteEffect: RuleRouteEffect | null): 
   if (!baseRouteEffect) return 'proxy';
   if (baseRouteEffect.action === 'direct') return 'direct';
   if (baseRouteEffect.action === 'block') return 'block';
+  if (baseRouteEffect.targetAutoSelect) return autoSelectChoice(baseRouteEffect.targetAutoSelect);
   return baseRouteEffect.targetServerId ? `node:${baseRouteEffect.targetServerId}` : 'proxy';
 }
 

@@ -303,12 +303,9 @@ fn fields_to_object(fields: BTreeMap<String, Vec<serde_json::Value>>) -> serde_j
     serde_json::Value::Object(m)
 }
 
-/// 文件名安全 base：id 仅 [A-Za-z0-9_-] → custom-rule-`<id>`；否则 sha1 派生唯一名。
-/// 上游 `customRuleFileBase`：`/^[A-Za-z0-9_-]+$/` → `custom-rule-<id>`；
-/// 否则 `custom-rule-h${createHash('sha1').update(id).digest('hex').slice(0,12)}`。
-///
-/// 落盘后非法 id 会以此名暴露到磁盘（build_custom_rule_files / 孤儿对账），
-/// 故 hash 分支必须真派生唯一名（撞车即两条规则共用一文件，值互相覆盖）。
+/// Safe literal IDs retain their filenames. Other IDs use a full digest in a
+/// disjoint `~` namespace, preventing literal IDs from aliasing derived names.
+/// All writers/readers and orphan reconciliation use this same helper.
 pub fn custom_rule_file_base(id: &str) -> String {
     rule_file_base_with_prefix("custom-rule-", id)
 }
@@ -319,7 +316,9 @@ pub fn custom_rule_file_base(id: &str) -> String {
 /// 就是一条目录穿越面（`../../x`），而落盘侧与读取侧一旦各写一份派生规则，两边会在非法 id 上
 /// 分家（写的是 hash 名、找的是裸名 ⇒ 文件永远"不存在" ⇒ 该腿 100% 不可达且无人报错）。
 ///
-/// 输出对 `"custom-rule-"` 前缀逐字节等同于提取前，故 [`is_custom_rule_orphan_file`] 的正则面不变。
+/// Safe IDs retain their existing names. Derived names use `~`, which is not in
+/// the literal-ID alphabet; a user-supplied h<digest> cannot capture a derived file.
+/// Existing orphan reconciliation recognizes both old and new derived names.
 pub fn rule_file_base_with_prefix(prefix: &str, id: &str) -> String {
     if !id.is_empty()
         && id
@@ -328,12 +327,12 @@ pub fn rule_file_base_with_prefix(prefix: &str, id: &str) -> String {
     {
         return format!("{prefix}{id}");
     }
-    // 非法 id（空 / 含特殊字符）→ sha1(id) 十六进制前 12 位。
+    // Keep the full digest in a disjoint namespace; do not truncate to 48 bits.
     let mut hasher = Sha1::new();
     hasher.update(id.as_bytes());
     let digest = hasher.finalize();
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    format!("{prefix}h{}", &hex[..12])
+    format!("{prefix}~{hex}")
 }
 
 /// 是否启用 FakeIP（纯看开关，不分模式，缺省 true）。上游 `usesFakeIp`。

@@ -575,12 +575,13 @@ class BoxService(
         }
         if (attempt.closed.isDone) {
             val failure = attempt.closeFailure()
-            if (failure != null) VpnBridge.finishStop("android: 内核关闭失败")
+            if (failure != null) VpnBridge.finishStop("android: 内核关闭失败", attempt)
             return
         }
         val firstStop = state != ServiceState.Stopping
         closeFailed = false
         state = ServiceState.Stopping
+        VpnBridge.publishLifecycle(attempt, "unavailable")
         if (BuildConfig.DEBUG) runCatching {
             DebugBatchQa.nativeInputChanged(attempt)
             DebugAppliedInputs.witness.seal(attempt)
@@ -641,7 +642,7 @@ class BoxService(
                 synchronized(this) {
                     if (mainAttempt === attempt && state == ServiceState.Stopping && !attempt.closed.isDone) {
                         closeFailed = true
-                        VpnBridge.finishStop("android: 主核 cleanupUnknown，关闭仍在进行")
+                        VpnBridge.finishStop("android: 主核 cleanupUnknown，关闭仍在进行", attempt)
                     }
                 }
             } catch (_: Exception) {
@@ -658,13 +659,13 @@ class BoxService(
                 AndroidNativeMain.unknown(attempt)
                 Log.e(TAG, "主核关闭回执失败 component=${safeCloseFailureComponent(failure)} type=${failure.javaClass.simpleName}")
                 closeFailed = true
-                VpnBridge.finishStop("android: 内核关闭失败")
+                VpnBridge.finishStop("android: 内核关闭失败", attempt)
                 return
             }
             // The old attempt cannot settle a later bridge: new admission remains
             // forbidden until this exact close result is acknowledged and cleared.
             check(MainKernelAttemptRegistry.completeAfterClose(attempt) {
-                deliverStop = VpnBridge.takeFinishStop()
+                deliverStop = VpnBridge.takeFinishStop(attempt = attempt)
                 commandServer = null
                 mainAttempt = null
                 state = ServiceState.Stopped

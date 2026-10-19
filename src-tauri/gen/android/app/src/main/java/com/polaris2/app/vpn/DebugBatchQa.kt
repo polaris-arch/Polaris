@@ -21,6 +21,8 @@ import java.net.ServerSocket
 import java.net.SocketTimeoutException
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -49,6 +51,10 @@ internal object DebugBatchQa {
         val udp = DebugBatchCounter(planSha, sessionId, nonce, udpInstance, "udp", deadline)
         val lease = DebugBatchLease()
         val io = Executors.newFixedThreadPool(2) { Thread(it, "polaris-qa-io") }
+        // One independently runnable observation per original session. TCP/UDP
+        // own the two I/O workers; PC exchanges own the command worker.
+        val observer = ThreadPoolExecutor(0, 1, 10, TimeUnit.SECONDS, ArrayBlockingQueue<Runnable>(1),
+            { Thread(it, "polaris-qa-observer") }, ThreadPoolExecutor.AbortPolicy())
         val guardian = Executors.newSingleThreadScheduledExecutor { Thread(it, "polaris-qa-guardian") }
         @Volatile var controllerLeaseUntil = minOf(deadline, SystemClock.elapsedRealtime() + 10000)
         @Volatile var armed = false
@@ -79,6 +85,7 @@ internal object DebugBatchQa {
             tcp.seal(); udp.seal()
             signalTask?.rejectBeforeRun()
             lease.seal()
+            observer.shutdownNow().forEach { (it as DebugBatchTask).rejectBeforeRun() }
             io.shutdownNow().forEach { (it as DebugBatchTask).rejectBeforeRun() }; guardian.shutdownNow()
             // No join here: a guardian or I/O callback may be the caller. External
             // cleanupObserve reads actual executor termination and the exact ledger.
@@ -87,7 +94,7 @@ internal object DebugBatchQa {
         fun completeFor(reporter: DebugBatchLease.CommandTicket?): Boolean {
             val s = lease.snapshotFor(reporter)
             return s.sealed && s.workers == 0 && s.commands == 0 && s.acquiring == 0 && s.closing == 0 && s.handles == 0 &&
-                   !s.closeFailed && io.isTerminated && guardian.isTerminated
+                   !s.closeFailed && io.isTerminated && observer.isTerminated && guardian.isTerminated
         }
         fun submit(action: () -> Unit) {
             if (!lease.workerBorn()) return
@@ -111,7 +118,7 @@ internal object DebugBatchQa {
                 try { samplePlatform(activity) } finally { signalPending.set(false) }
             }) { close("guard-observer-unavailable") }
             signalTask = task
-            try { DebugBatchCommandExecutor.value.execute(task) }
+            try { observer.execute(task) }
             catch (_: Throwable) { task.rejectBeforeRun(); close("guard-observer-rejected") }
         }
         private fun samplePlatform(activity: Activity) {

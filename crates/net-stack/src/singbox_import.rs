@@ -35,7 +35,7 @@ use polaris_config_engine::user_config::protocol_settings::{
 use polaris_config_engine::user_config::server_config::{
     Protocol, SecurityMode, ServerConfig, WireGuardSettings,
 };
-use polaris_config_engine::user_config::tls_pin::keep_valid_cert_pins;
+use polaris_config_engine::user_config::tls_pin::preserve_cert_pins;
 
 use crate::clash_parser::ClashParseResult;
 
@@ -158,26 +158,9 @@ fn effective_port(ob: &Value) -> Option<u16> {
     port_val(low)
 }
 
-/// sing-box transport headers（`{k: v | [v..]}`）→ `{k: v}`（取字符串或数组首元素）。
+/// WebSocket's model permits one value per header; admission rejects larger arrays.
 fn transport_headers(v: Option<&Value>) -> Option<BTreeMap<String, String>> {
-    let obj = v?.as_object()?;
-    let mut m = BTreeMap::new();
-    for (k, val) in obj {
-        let s = match val {
-            Value::Array(a) => a.first().and_then(|x| str_val(Some(x))),
-            other => str_val(Some(other)),
-        };
-        if let Some(s) = s {
-            m.insert(k.clone(), s);
-        }
-    }
-    (!m.is_empty()).then_some(m)
-}
-
-fn host_header(host: String) -> BTreeMap<String, String> {
-    let mut m = BTreeMap::new();
-    m.insert("Host".to_string(), host);
-    m
+    crate::import_fields::ws_headers(v)
 }
 
 // ── TLS / 传输 / 多路复用 ─────────────────────────────────────────────────────────
@@ -208,12 +191,12 @@ fn cert_pins_str(v: Option<&Value>) -> Option<String> {
     let joined = match v? {
         Value::Array(a) => a
             .iter()
-            .filter_map(|x| str_val(Some(x)))
+            .map(|x| str_val(Some(x)).unwrap_or_else(|| "invalid-pin-shape".into()))
             .collect::<Vec<_>>()
             .join(","),
-        other => str_val(Some(other))?,
+        other => str_val(Some(other)).unwrap_or_else(|| "invalid-pin-shape".into()),
     };
-    keep_valid_cert_pins(&joined)
+    preserve_cert_pins(&joined)
 }
 
 /// TLS/Reality 层（上游：`ob.tls && ob.tls.enabled !== false`）。
@@ -248,22 +231,21 @@ fn apply_tls(server: &mut ServerConfig, tls: Option<&Value>) {
         engine: str_ne(tls.get("engine")).and_then(|engine| normalize_token(&engine)),
         allow_insecure: Some(bool_true(tls.get("insecure"))),
         alpn,
-        utls_mode: Some(
-            if tls
-                .get("utls")
-                .and_then(|u| u.get("enabled"))
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
-                if str_ne(tls.get("utls").and_then(|u| u.get("fingerprint"))).is_some() {
-                    polaris_config_engine::user_config::utls::UtlsMode::Profile
+        // Keep absence distinct from an explicit disabled block. A present
+        // block still follows sing-box's `enabled` flag, including a missing
+        // flag being false; a dormant fingerprint must not turn it back on.
+        utls_mode: tls.get("utls").filter(|utls| utls.is_object()).map(|utls| {
+            use polaris_config_engine::user_config::utls::UtlsMode;
+            if utls.get("enabled").and_then(Value::as_bool) == Some(true) {
+                if str_ne(utls.get("fingerprint")).is_some() {
+                    UtlsMode::Profile
                 } else {
-                    polaris_config_engine::user_config::utls::UtlsMode::Default
+                    UtlsMode::Default
                 }
             } else {
-                polaris_config_engine::user_config::utls::UtlsMode::Disabled
-            },
-        ),
+                UtlsMode::Disabled
+            }
+        }),
         fingerprint: str_ne(tls.get("utls").and_then(|u| u.get("fingerprint")))
             .and_then(|f| normalize_token(&f)),
         ech: ech_enabled.then_some(true),
@@ -299,7 +281,13 @@ fn apply_transport(server: &mut ServerConfig, transport: &Value) {
             server.network = Some(t.clone());
             server.ws_settings = Some(Box::new(WebSocketSettings {
                 path: str_val(transport.get("path")),
-                headers: host.map(host_header).or_else(|| transport_headers(headers)),
+                headers: {
+                    let mut values = transport_headers(headers).unwrap_or_default();
+                    if let Some(host) = host { values.insert("Host".into(), host); }
+                    (!values.is_empty()).then_some(values)
+                },
+                max_early_data: num_val(transport.get("max_early_data")),
+                early_data_header_name: str_ne(transport.get("early_data_header_name")),
                 ..Default::default()
             }));
         }
@@ -314,7 +302,9 @@ fn apply_transport(server: &mut ServerConfig, transport: &Value) {
             server.network = Some("http".to_string());
             server.http_settings = Some(Box::new(HttpSettings {
                 path: str_val(transport.get("path")),
-                ..Default::default()
+                host: crate::import_fields::string_list(transport.get("host")),
+                method: str_ne(transport.get("method")),
+                headers: crate::import_fields::http_headers(headers),
             }));
         }
         _ => {}
@@ -466,6 +456,18 @@ fn map_singbox_outbound(
     id_gen: &mut impl FnMut() -> String,
     origin: ImportOrigin,
 ) -> MapOutcome {
+    if let Some(transport) = ob.get("transport") {
+        let kind = transport.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(kind, "ws" | "httpupgrade" | "http")
+            && (!crate::import_fields::headers_supported(transport.get("headers"), kind == "http")
+                || (kind == "http" && transport.get("host").is_some()
+                    && crate::import_fields::string_list(transport.get("host")).is_none())) {
+            return MapOutcome::Fail;
+        }
+    }
+    if ty == "http" && !crate::import_fields::headers_supported(ob.get("headers"), true) {
+        return MapOutcome::Fail;
+    }
     // ── tor：**无地址协议**，必须排在下面的 server/port 前置守卫之前（2026-08-11）──
     // 实测给内核传 `server` 得 `outbounds[0].server: json: unknown field "server"`，
     // 故它天生没有这两个键，走公共前置只会被判 Fail 而静默丢掉整个节点。
@@ -624,7 +626,13 @@ fn map_singbox_outbound(
         "hysteria2" => {
             s.password = Some(str_val(ob.get("password")).unwrap_or_default());
             s.security = Some(SecurityMode::Tls);
-            let mut hy2 = Hysteria2Settings::default();
+            let mut hy2 = Hysteria2Settings {
+                up_mbps: num_val(ob.get("up_mbps")),
+                down_mbps: num_val(ob.get("down_mbps")),
+                network: str_ne(ob.get("network")),
+                disable_chrome_parrot: ob.get("disable_chrome_parrot").and_then(Value::as_bool),
+                ..Default::default()
+            };
             // obfs：salamander（type+password）/ gecko（+min/max_packet_size 随机填充，仅 gecko）。
             // 与导出侧 buildOutbound 对称：需 type+password 双备；未知 type 不设（graceful #263）。
             let obfs = ob.get("obfs");
@@ -718,6 +726,12 @@ fn map_singbox_outbound(
         "http" => {
             s.username = str_ne(ob.get("username"));
             s.password = str_ne(ob.get("password"));
+            let http = HttpSettings {
+                path: str_val(ob.get("path")),
+                headers: crate::import_fields::http_headers(ob.get("headers")),
+                ..Default::default()
+            };
+            if http != HttpSettings::default() { s.http_settings = Some(Box::new(http)); }
         }
         "ssh" => {
             // ssh：固定 tcp/none（private_key_path 是本机路径、跨设备订阅无意义，刻意不映射）。
@@ -809,6 +823,20 @@ pub fn parse_singbox_outbounds(
     id_gen: &mut impl FnMut() -> String,
     origin: ImportOrigin,
 ) -> ClashParseResult {
+    let mut graph = crate::import_fields::ImportGraph::default();
+    observe_tags(&mut graph, outbounds);
+    let result = parse_singbox_outbounds_unresolved(outbounds, sub_id, now, id_gen, origin, &mut graph);
+    graph.finish(result)
+}
+
+fn parse_singbox_outbounds_unresolved(
+    outbounds: &Value,
+    sub_id: &str,
+    now: &str,
+    id_gen: &mut impl FnMut() -> String,
+    origin: ImportOrigin,
+    graph: &mut crate::import_fields::ImportGraph,
+) -> ClashParseResult {
     let mut r = ClashParseResult::default();
     let Some(arr) = outbounds.as_array() else {
         return r;
@@ -823,6 +851,11 @@ pub fn parse_singbox_outbounds(
     for ob in arr {
         if !ob.is_object() {
             r.failed += 1;
+            continue;
+        }
+        if !crate::import_fields::valid_detour(ob.get("detour")) {
+            r.failed += 1;
+            r.warnings.push("Invalid import detour declaration (IMPORT_DETOUR_INVALID)".into());
             continue;
         }
         let ty = str_val(ob.get("type"))
@@ -854,7 +887,7 @@ pub fn parse_singbox_outbounds(
             match map_tailcat_outbound(ob, sub_id, now, id_gen) {
                 Some((s, ignored)) => {
                     r.warnings.extend(ignored_keys_warning(&s.name, &ignored));
-                    r.servers.push(s);
+                    push_imported(&mut r, s, ob, graph);
                 }
                 None => {
                     missing_fields += 1;
@@ -871,6 +904,7 @@ pub fn parse_singbox_outbounds(
             // 本机文件 + 形状合法 → custom 逃生舱（原文逐字保留、可编辑、换核即用）。
             // 形状判据与生成侧同源，见 [`custom_wrappable`]。
             if origin == ImportOrigin::LocalFile && custom_wrappable(ob) {
+                if ob.get("detour").is_some() { r.failed += 1; r.warnings.push("Custom detour is unsupported (IMPORT_DETOUR_INVALID)".into()); continue; }
                 r.servers
                     .push(make_custom_node(ob, sub_id, now, id_gen, false));
                 continue;
@@ -885,7 +919,7 @@ pub fn parse_singbox_outbounds(
             continue;
         }
         match map_singbox_outbound(ob, &ty, sub_id, now, id_gen, origin) {
-            MapOutcome::Server(s) => r.servers.push(*s),
+            MapOutcome::Server(s) => push_imported(&mut r, *s, ob, graph),
             MapOutcome::Fail => {
                 missing_fields += 1;
                 r.failed += 1;
@@ -925,7 +959,35 @@ pub fn parse_singbox_outbounds(
             "跳过 {missing_fields} 个缺 server/port 或配置非法的 outbound"
         ));
     }
-    r.finish()
+    r
+}
+
+fn observe_tags(graph: &mut crate::import_fields::ImportGraph, values: &Value) {
+    if let Some(values) = values.as_array() {
+        for value in values { graph.observe(value.get("tag")); }
+    }
+}
+
+fn push_imported(result: &mut ClashParseResult, mut server: ServerConfig, source: &Value, graph: &mut crate::import_fields::ImportGraph) {
+    graph.register(&mut server, source.get("tag"), source.get("detour"));
+    result.servers.push(server);
+}
+
+/// Resolve the single document tag namespace only after both arrays and TLS admission finish.
+pub fn parse_singbox_document(document: &Value, sub_id: &str, now: &str, id_gen: &mut impl FnMut() -> String, origin: ImportOrigin) -> ClashParseResult {
+    let null = Value::Null;
+    let outbounds = document.get("outbounds").unwrap_or(&null);
+    let endpoints = document.get("endpoints").unwrap_or(&null);
+    let mut graph = crate::import_fields::ImportGraph::default();
+    observe_tags(&mut graph, outbounds);
+    observe_tags(&mut graph, endpoints);
+    let mut result = parse_singbox_outbounds_unresolved(outbounds, sub_id, now, id_gen, origin, &mut graph);
+    let ep = parse_singbox_endpoints_unresolved(endpoints, sub_id, now, id_gen, origin, &mut graph);
+    result.servers.extend(ep.servers);
+    result.failed += ep.failed;
+    result.skipped += ep.skipped;
+    result.warnings.extend(ep.warnings);
+    graph.finish(result)
 }
 
 // ── endpoints[] ─────────────────────────────────────────────────────────────────
@@ -955,6 +1017,20 @@ pub fn parse_singbox_endpoints(
     id_gen: &mut impl FnMut() -> String,
     origin: ImportOrigin,
 ) -> ClashParseResult {
+    let mut graph = crate::import_fields::ImportGraph::default();
+    observe_tags(&mut graph, endpoints);
+    let result = parse_singbox_endpoints_unresolved(endpoints, sub_id, now, id_gen, origin, &mut graph);
+    graph.finish(result)
+}
+
+fn parse_singbox_endpoints_unresolved(
+    endpoints: &Value,
+    sub_id: &str,
+    now: &str,
+    id_gen: &mut impl FnMut() -> String,
+    origin: ImportOrigin,
+    graph: &mut crate::import_fields::ImportGraph,
+) -> ClashParseResult {
     let mut r = ClashParseResult::default();
     let Some(arr) = endpoints.as_array() else {
         return r;
@@ -970,6 +1046,11 @@ pub fn parse_singbox_endpoints(
     for ep in arr {
         if !ep.is_object() {
             r.failed += 1;
+            continue;
+        }
+        if !crate::import_fields::valid_detour(ep.get("detour")) {
+            r.failed += 1;
+            r.warnings.push("Invalid import detour declaration (IMPORT_DETOUR_INVALID)".into());
             continue;
         }
         let ty = str_val(ep.get("type"))
@@ -1014,7 +1095,6 @@ pub fn parse_singbox_endpoints(
                         "listen_port",
                         "udp_timeout",
                         "name",
-                        "detour",
                         "domain_resolver",
                     ]
                     .iter()
@@ -1022,7 +1102,7 @@ pub fn parse_singbox_endpoints(
                     .map(|key| (*key).to_string())
                     .collect();
                     r.warnings.extend(ignored_keys_warning(&s.name, &ignored));
-                    r.servers.push(s);
+                    push_imported(&mut r, s, ep, graph);
                 }
                 None => {
                     missing_fields += 1;
@@ -1045,7 +1125,7 @@ pub fn parse_singbox_endpoints(
                     server.bind_interface = imported.bind_interface;
                     server.tailscale_settings = Some(Box::new(imported.settings));
                     r.warnings.extend(imported.warnings);
-                    r.servers.push(server);
+                    push_imported(&mut r, server, ep, graph);
                 }
                 Err(field) => {
                     r.failed += 1;
@@ -1063,7 +1143,7 @@ pub fn parse_singbox_endpoints(
             "masque-client" => match map_endpoint_masque(ep, sub_id, now, id_gen) {
                 Some((s, ignored)) => {
                     r.warnings.extend(ignored_keys_warning(&s.name, &ignored));
-                    r.servers.push(s);
+                    push_imported(&mut r, s, ep, graph);
                 }
                 None => {
                     masque_failed += 1;
@@ -1073,13 +1153,13 @@ pub fn parse_singbox_endpoints(
             "openconnect" | "openvpn-client" => {
                 match map_endpoint_vpn_client(&ty, ep, sub_id, now, id_gen) {
                     Some(s) => {
-                        let ignored: Vec<String> = ["detour", "domain_resolver"]
+                        let ignored: Vec<String> = ["domain_resolver"]
                             .iter()
                             .filter(|key| ep.get(**key).is_some())
                             .map(|key| (*key).to_string())
                             .collect();
                         r.warnings.extend(ignored_keys_warning(&s.name, &ignored));
-                        r.servers.push(s);
+                        push_imported(&mut r, s, ep, graph);
                     }
                     None => {
                         missing_fields += 1;
@@ -1089,6 +1169,7 @@ pub fn parse_singbox_endpoints(
             }
             _ => {
                 if origin == ImportOrigin::LocalFile && custom_wrappable(ep) {
+                    if ep.get("detour").is_some() { r.failed += 1; r.warnings.push("Custom detour is unsupported (IMPORT_DETOUR_INVALID)".into()); continue; }
                     r.servers
                         .push(make_custom_node(ep, sub_id, now, id_gen, true));
                     continue;
@@ -1137,7 +1218,7 @@ pub fn parse_singbox_endpoints(
              的 masque-client endpoint"
         ));
     }
-    r.finish()
+    r
 }
 
 /// `endpoints[].{type:"wireguard"}` → [`Protocol::Wireguard`] 节点。必填缺失 → `None`（计 failed）。
@@ -1153,7 +1234,7 @@ pub fn parse_singbox_endpoints(
 /// | `peers[0].public_key` | `wireguardSettings.peerPublicKey` |
 /// | `peers[0].pre_shared_key` | `wireguardSettings.preSharedKey` |
 /// | `peers[0].allowed_ips` | catch-all → `allowInternet`；具体段 → `allowedIPs` |
-/// | `peers[0].persistent_keepalive_interval` | `persistentKeepalive`（>0 才写） |
+/// | `peers[0].persistent_keepalive_interval` | `persistentKeepalive`（缺省与显式 0 都禁用） |
 /// | `peers[0].reserved` | `reserved`（**恰 3 项**才写，与生成侧 `s.reserved.len() == 3` 对称） |
 /// | `mtu` | `mtu`（>0 才写） |
 /// | `on_demand` / `bind_interface` | 顶层 `onDemand` / `bindInterface`（[`ENDPOINT_TOP_LEVEL_KEYS`]，同 MASQUE） |
@@ -1171,7 +1252,7 @@ pub fn parse_singbox_endpoints(
 ///   导入时保持用户态默认值；用户态并不禁止入站，是否可反向接入由路由与对端配置决定。
 /// - **`listen_port` / `udp_timeout` / `name`**：`WireGuardSettings` 无落点；
 ///   导入汇合处应向用户报告这些字段未保留。
-/// - **`detour`**：`ServerConfig.detour` 存的是**本地节点 id**，外部 tag 无从解析。
+/// `detour` is resolved from the document tag namespace to local IDs after both arrays.
 ///
 /// [`build_wireguard_endpoint`]: polaris_config_engine::builder::endpoints::build_wireguard_endpoint
 /// `openconnect` / `openvpn-client` endpoint → [`ServerConfig`]。
@@ -1969,7 +2050,8 @@ fn nonempty_listable_strings(value: &Value) -> bool {
 }
 
 fn remote_scalar_shape(key: &str, value: &Value, ty: &str) -> bool {
-    // 丢弃字段不进入配置；内部 tag 没有本机解析语义。
+    // detour shape is validated at document admission and resolved after both arrays.
+    // Remaining listed fields are handled by protocol-specific import policy.
     if matches!(
         key,
         "system" | "name" | "advertise_routes" | "detour" | "domain_resolver" | "http_client"
@@ -2097,11 +2179,11 @@ fn drop_unemitted_bag_keys(
 /// - `server` / `server_port` / `username` / `password` → 顶层（生成侧读顶层，不另存第二份）；
 /// - `on_demand` / `bind_interface` → 顶层同名字段（生成侧装配层按顶层写，袋里那份会被覆盖或删掉）；
 /// - `tls` 只收生成侧读的四项（`server_name` / `insecure` / 两种 pin），pin 走与其它协议同一个
-///   [`keep_valid_cert_pins`]；`security` 恒 `Tls`（生成侧恒开 TLS）——不复用 [`apply_tls`]：它会把
+///   [`preserve_cert_pins`]；`security` 恒 `Tls`（生成侧恒开 TLS）——不复用 [`apply_tls`]：它会把
 ///   `alpn` / `utls` / `ech` / `reality` 存进 `tlsSettings`，而 MASQUE 生成侧一个都不下发（`reality` 还会
 ///   让导入汇合点 `drop_unemitted_cert_pins` 把 pin 当成不生效而删掉）；
 /// - `path` / `headers` / `version` / `mtu` → `masqueClientSettings` 具名字段，其余进透传袋；
-/// - `detour` / `domain_resolver` 指向文件内的 tag，对本机无意义，静默丢（与其余导入腿同口径）。
+/// - `detour` 由文档级第二遍解析为本地 id；`domain_resolver` 不迁移。
 ///
 /// # 与生成侧同一判据
 ///
@@ -2183,7 +2265,7 @@ fn map_endpoint_masque(
 ///
 /// 三把 key、psk、DERP 字段进 `tailcatSettings` 具名字段，其余进透传袋；`bind_interface` → 顶层；
 /// `http_client` 丢弃并告警（拉图出口由生成侧决定：`direct` 或前置代理，写成 selector 会自锁）；
-/// `detour` / `domain_resolver` 静默丢（文件内 tag，同其余导入腿）。
+/// `detour` 由文档级第二遍解析为本地 id；`domain_resolver` 不迁移。
 ///
 /// 与生成侧同一判据：`tailcat_emit_check` 不过（缺服务端 key / key 形态错 / DERP 冲突，内核整核起不来）
 /// ⇒ 计 failed；servers 模式下残留的 `derp_region` / `derp_map_url` 生成侧不下发 ⇒ 不存并告警；
@@ -2249,7 +2331,7 @@ fn map_tailcat_outbound(
     }
     s.tailcat_settings = Some(Box::new(t));
 
-    let emitted = build_proxy_outbound(&s, "import", &DomainResolver::Tag(String::new()), "", "");
+    let emitted = build_proxy_outbound(&s, "import", &DomainResolver::Tag(String::new()), "", "").ok()?;
     let bag = &mut s.tailcat_settings.as_mut()?.extra;
     drop_unemitted_bag_keys(bag, &emitted.extra, &mut ignored);
     Some((s, ignored))
@@ -2287,9 +2369,11 @@ fn map_wireguard_endpoint(
         allow_internet: Some(has_catch_all(&allowed)),
         ..Default::default()
     };
-    if let Some(k) = num_val(peer.get("persistent_keepalive_interval")).filter(|k| *k > 0) {
-        wg.persistent_keepalive = Some(k);
-    }
+    // sing-box's absent/zero keepalive disables periodic packets; our local default is 25.
+    wg.persistent_keepalive = Some(match peer.get("persistent_keepalive_interval") {
+        None => 0,
+        Some(value) => num_val(Some(value))?,
+    });
     if let Some(m) = num_val(ep.get("mtu")).filter(|m| *m > 0) {
         wg.mtu = Some(m);
     }

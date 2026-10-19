@@ -237,8 +237,6 @@ const READ_CALLS: readonly string[] = [
   'api.proxy.onTailscaleStatus',
   'api.proxy.onTailscaleAuth',
   'api.proxy.onTailscaleLoginProgress',
-  'api.vpn.getStatus',
-  'api.vpn.onOpenVpnStatus',
   'api.subscription.onAutoUpdate',
   // 2026-09-06 复审 major 补接的两条桌面订阅（登录期出口让位 / 自动换节点）。同一类：登记监听，
   // 没有用户在等回执；它们**自己就是**回执 —— 回调体里落的是全局 toast（后端自驱改了出口，
@@ -282,8 +280,6 @@ const READ_CALLS: readonly string[] = [
   'api.server.onSpeedTestResult',
   'api.server.onSpeedTestDone',
   'api.config.getPrivacyMode',
-  'api.config.onEnterPrivacyMode',
-  'api.config.onExitPrivacyMode',
   // 「设没设过密码」的状态回读（遮罩进入锁定态时查一次，决定空密码放不放行）。
   // 它自带兜底（读不到按「已设密码」处理），失败不需要用户做任何事。
   'api.privacy.hasPassword',

@@ -90,3 +90,23 @@ fn captured_rule_tag_format_and_path_cannot_be_swapped() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn fifo_source_swap_after_lstat_is_rejected_without_waiting_for_writer() {
+    use nix::sys::stat::Mode;
+    let dir = TestDir::new("polaris-source-fifo-race-");
+    let file = dir.join("source.json");
+    fs::write(&file, b"{}\n").unwrap();
+    let replaced = std::cell::Cell::new(false);
+    let result = read_trusted_source_after_lstat(&file, &[dir.path().to_path_buf()], || {
+        replaced.set(true);
+        fs::remove_file(&file).unwrap();
+        nix::unistd::mkfifo(&file, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    });
+    assert!(
+        replaced.get(),
+        "fixture must reach the metadata/open race window"
+    );
+    assert!(result.is_err());
+}

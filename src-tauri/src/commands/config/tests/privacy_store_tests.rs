@@ -45,7 +45,7 @@ fn frontend_full_save_without_hash_preserves_password() {
 
 /// 回填**不得**堵死清除密码：清除走的是「键缺失」（`obj.remove`），若回填无条件生效则永远清不掉。
 ///
-/// 打断 `preserve_server_owned_secrets` 的「入参显式带该键 → 尊重入参」分支 → 本测转红。
+/// 专用密码路径直接写 ConfigManager，不受普通配置所有权回填干扰。
 #[test]
 fn clearing_password_still_works_through_its_own_path() {
     let dir = temp_dir("clear");
@@ -66,9 +66,9 @@ fn clearing_password_still_works_through_its_own_path() {
     );
 }
 
-/// 入参显式带 hash（专线写入）→ 尊重入参，不被当前值顶掉。
+/// 普通配置提交携带 hash 也不能创建后端凭据。
 #[test]
-fn explicit_hash_in_payload_wins_over_backfill() {
+fn explicit_hash_in_ordinary_payload_is_removed_without_an_owner_value() {
     let dir = temp_dir("explicit");
     let mgr = ConfigManager::new(dir.clone());
     set_password_core(&mgr, "old", false).expect("set 应成功");
@@ -76,11 +76,7 @@ fn explicit_hash_in_payload_wins_over_backfill() {
     let mut incoming = mgr.current().unwrap();
     incoming[PRIVACY_PASSWORD_HASH_KEY] = json!("aabb$newhash");
     preserve_server_owned_secrets(&mgr, &mut incoming);
-    assert_eq!(
-        incoming[PRIVACY_PASSWORD_HASH_KEY],
-        json!("aabb$newhash"),
-        "显式入参不被回填覆盖"
-    );
+    assert!(incoming.get(PRIVACY_PASSWORD_HASH_KEY).is_none());
 }
 
 #[test]
@@ -171,7 +167,7 @@ fn scrypt_hash_never_enters_config_object() {
     assert!(plain.is_empty(), "config 里无非空明文");
     // 独立文件确实持有哈希（可验），但它不在任何前端可见的 config 出口里。
     let path = privacy_lock_path(&mgr);
-    let h = polaris_store::privacy_lock::read(&StdFs, &path).expect("文件持有 scrypt 哈希");
+    let h = polaris_store::privacy_lock::read(&StdFs, &path).unwrap().expect("文件持有 scrypt 哈希");
     assert!(polaris_store::privacy_lock::verify("topsecret", &h));
     // strip 仍兜底剥 legacy 键（存量未迁移用户过渡期）。
     let mut with_legacy = json!({ "privacyPassword": "x", "privacyPasswordHash": "aa$bb" });
@@ -279,9 +275,9 @@ fn salt_unique_per_set() {
     let mgr = ConfigManager::new(dir.clone());
     let path = privacy_lock_path(&mgr);
     set_password_core(&mgr, "same-pw", false).unwrap();
-    let h1 = polaris_store::privacy_lock::read(&StdFs, &path).unwrap();
+    let h1 = polaris_store::privacy_lock::read(&StdFs, &path).unwrap().unwrap();
     set_password_core(&mgr, "same-pw", false).unwrap();
-    let h2 = polaris_store::privacy_lock::read(&StdFs, &path).unwrap();
+    let h2 = polaris_store::privacy_lock::read(&StdFs, &path).unwrap().unwrap();
     assert_ne!(h1.salt, h2.salt, "两次 set 同密码须用不同盐");
     assert_ne!(h1.hash, h2.hash, "不同盐 → 不同哈希");
     // 两者都能验过（盐随各自哈希一起存）。
@@ -388,4 +384,93 @@ fn retained_credentials_stay_raw_while_real_frontend_projection_and_version_are_
     assert!(!login.contains("ApiResponse::ok(server)"));
     assert!(!login.contains("ApiResponse::ok(saved)"));
     assert!(login.contains("json!({\"started\": true})"));
+}
+
+#[test]
+fn corrupt_credential_does_not_disable_password_and_can_be_repaired_while_unlocked() {
+    let dir = temp_dir("corrupt-fail-closed");
+    let mgr = ConfigManager::new(dir.clone());
+    set_password_core(&mgr, "before", false).unwrap();
+    std::fs::write(privacy_lock_path(&mgr), "{truncated").unwrap();
+    assert!(has_password_core(&mgr).is_err());
+    assert!(unlock_core(&mgr, "anything").is_err());
+    assert!(set_password_core(&mgr, "replacement", true).is_err());
+    // An already-unlocked owner can repair the damaged record; no silent removal.
+    set_password_core(&mgr, "replacement", false).unwrap();
+    assert!(unlock_core(&mgr, "replacement").unwrap());
+    assert!(!unlock_core(&mgr, "before").unwrap());
+}
+
+#[test]
+fn unreadable_credential_is_not_absent() {
+    let dir = temp_dir("unreadable-fail-closed");
+    let mgr = ConfigManager::new(dir.clone());
+    std::fs::create_dir_all(privacy_lock_path(&mgr)).unwrap();
+    assert!(has_password_core(&mgr).is_err());
+    assert!(unlock_core(&mgr, "").is_err());
+}
+
+#[test]
+fn privacy_mode_requires_backend_authenticated_transition() {
+    let mode = AtomicBool::new(true);
+    assert_eq!(set_privacy_mode_core(&mode, false, false), Err("PRIVACY_LOCKED"));
+    assert!(mode.load(Ordering::Relaxed));
+    assert_eq!(set_privacy_mode_core(&mode, false, true), Ok(true));
+    // Existing UI's subsequent set(false) remains idempotent.
+    assert_eq!(set_privacy_mode_core(&mode, false, false), Ok(false));
+    assert_eq!(set_privacy_mode_core(&mode, true, false), Ok(true));
+    // A stale frontend success cannot reopen a new lock generation.
+    assert_eq!(set_privacy_mode_core(&mode, false, false), Err("PRIVACY_LOCKED"));
+}
+
+#[test]
+fn ordinary_save_patch_and_backup_cannot_clear_or_replace_a_legacy_password() {
+    let dir = temp_dir("legacy-owned-fields");
+    let mgr = ConfigManager::new(dir.clone());
+    let salt = gen_salt().unwrap();
+    let hash = format!("{}${}", hex_encode(&salt), hash_password(&salt, "real-password"));
+    let mut initial = mgr.load_full().unwrap();
+    initial[PRIVACY_PASSWORD_HASH_KEY] = json!(hash);
+    mgr.save_full(&initial).unwrap();
+    for forged in [Value::Null, json!(""), json!("attacker-hash")] {
+        let mut incoming = mgr.current().unwrap();
+        incoming[PRIVACY_PASSWORD_HASH_KEY] = forged.clone();
+        incoming[PRIVACY_PASSWORD_KEY] = json!("attacker-plain");
+        config_save_core(&mgr, &mut incoming, None, false).unwrap();
+        assert_eq!(mgr.current().unwrap()[PRIVACY_PASSWORD_HASH_KEY], hash);
+        let mut patch = serde_json::Map::new();
+        patch.insert(PRIVACY_PASSWORD_HASH_KEY.into(), forged.clone());
+        patch.insert(PRIVACY_PASSWORD_KEY.into(), json!("attacker-plain"));
+        config_patch_core(&mgr, patch).unwrap();
+        assert_eq!(mgr.current().unwrap()[PRIVACY_PASSWORD_HASH_KEY], hash);
+        backup_import_save_core(&mgr, &json!({"privacyPasswordHash": forged, "privacyPassword": "attacker-plain", "logLevel": "warn"}),
+            &[BackupCategory::GeneralSettings], None, "linux", None).unwrap();
+        assert_eq!(mgr.current().unwrap()[PRIVACY_PASSWORD_HASH_KEY], hash);
+    }
+    assert!(unlock_core(&mgr, "real-password").unwrap());
+    assert!(!unlock_core(&mgr, "attacker-plain").unwrap());
+    set_password_core(&mgr, "", false).unwrap();
+    assert!(!has_password_core(&mgr).unwrap());
+}
+
+#[test]
+fn ordinary_save_and_patch_cannot_create_privacy_credentials() {
+    let dir = temp_dir("no-caller-credential-owner");
+    let mgr = ConfigManager::new(dir.clone());
+    let mut incoming = mgr.load_full().unwrap();
+    incoming[PRIVACY_PASSWORD_HASH_KEY] = json!("attacker-hash");
+    incoming[PRIVACY_PASSWORD_KEY] = json!("attacker-plain");
+    config_save_core(&mgr, &mut incoming, None, false).unwrap();
+    assert!(!config_has_password(&mgr.current().unwrap()));
+    let mut patch = serde_json::Map::new();
+    patch.insert(PRIVACY_PASSWORD_HASH_KEY.into(), json!("attacker-hash"));
+    config_patch_core(&mgr, patch).unwrap();
+    assert!(!config_has_password(&mgr.current().unwrap()));
+    backup_import_save_core(
+        &mgr,
+        &json!({"privacyPasswordHash": "attacker-hash", "privacyPassword": "attacker-plain"}),
+        &[BackupCategory::GeneralSettings], None, "linux", None,
+    ).unwrap();
+    assert!(!config_has_password(&mgr.current().unwrap()));
+    assert!(unlock_core(&mgr, "").unwrap());
 }

@@ -64,6 +64,13 @@ pub enum NativeChildPoll {
     Unknown,
 }
 
+/// A retained parent process object, acquired before the child is launched.
+/// Polling must never reopen its numeric PID. Unknown is not proof of exit.
+pub trait ParentProcess: Send {
+    fn pid(&self) -> u32;
+    fn poll(&self) -> NativeChildPoll;
+}
+
 /// 受管核的进程身份（D2/D3）：从 helper **持有的进程句柄**读出的两个事实。
 ///
 /// 两个字段各自可缺（FFI 读失败）—— 缺就是 `None`，绝不填一个猜的值：下游据此判「不可观测」，
@@ -128,6 +135,8 @@ pub trait ProcOps: Send + Sync {
         _log: &str,
         _fwd: bool,
         _birth: HelperBirthToken,
+        _conf_dir: &str,
+        _owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -222,15 +231,19 @@ pub trait ProcOps: Send + Sync {
     /// 与 [`read_object_security`](ProcOps::read_object_security) 同一处置。
     fn list_dir_names(&self, dir: &str) -> Result<Vec<String>, String>;
 
+    fn capture_parent(&self, _pid: u32) -> std::io::Result<Box<dyn ParentProcess>> {
+        Err(std::io::Error::other("parent process custody unavailable"))
+    }
+
     /// 启动父死看护线程（`helper.go:131-159` `watchParent` + `helper.go:387-388` 的 `go watchParent`）。
     ///
-    /// 每秒探测父 app（`ppid`）存活；父死且 `is_current(child_pid)` 仍为真 → `on_parent_dead(child_pid)`
+    /// 每秒查询已持有的父 app 进程对象；父死且 `is_current(child_pid)` 仍为真 → `on_parent_dead(child_pid)`
     /// 收割 child。退出条件（防线程泄漏）：`is_current` 返 false（child 已被 stop/cleanup/新 start 摘除）
-    /// 或父死收割完成。生产侧起后台线程（`&self` 不被线程捕获，用无状态 pid FFI）；mock 单次评估
+    /// 或父死收割完成。生产侧线程拥有原始进程 HANDLE，不通过数值 PID 重新打开；mock 单次评估
     /// （测试双，无线程/sleep）。**调用方须在释放 child 锁后调用**（闭包会重入 child 锁）。
     fn spawn_watch_parent(
         &self,
-        ppid: u32,
+        parent: Box<dyn ParentProcess>,
         child_pid: u32,
         is_current: Box<dyn Fn(u32) -> bool + Send>,
         on_parent_dead: Box<dyn Fn(u32) + Send>,
@@ -613,6 +626,8 @@ impl ProcOps for MockProcOps {
         log: &str,
         fwd: bool,
         birth: HelperBirthToken,
+        _conf_dir: &str,
+        _owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
         assert!(
             self.inner.native_target.lock().unwrap().is_none(),
@@ -801,9 +816,32 @@ impl ProcOps for MockProcOps {
             .unwrap_or_else(|| Ok(Vec::new()))
     }
 
+    fn capture_parent(&self, pid: u32) -> std::io::Result<Box<dyn ParentProcess>> {
+        struct CapturedParent {
+            pid: u32,
+            alive: bool,
+        }
+        impl ParentProcess for CapturedParent {
+            fn pid(&self) -> u32 {
+                self.pid
+            }
+            fn poll(&self) -> NativeChildPoll {
+                if self.alive {
+                    NativeChildPoll::Running
+                } else {
+                    NativeChildPoll::Exited
+                }
+            }
+        }
+        Ok(Box::new(CapturedParent {
+            pid,
+            alive: self.process_alive(pid),
+        }))
+    }
+
     fn spawn_watch_parent(
         &self,
-        ppid: u32,
+        parent: Box<dyn ParentProcess>,
         child_pid: u32,
         is_current: Box<dyn Fn(u32) -> bool + Send>,
         on_parent_dead: Box<dyn Fn(u32) + Send>,
@@ -811,10 +849,10 @@ impl ProcOps for MockProcOps {
         self.inner
             .watch_parent_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        *self.inner.last_watch_args.lock().unwrap() = Some((ppid, child_pid));
+        *self.inner.last_watch_args.lock().unwrap() = Some((parent.pid(), child_pid));
         // 测试双：单次评估父死看护逻辑（无后台线程 / 无 sleep）。父死（process_alive=false）且
         // child 仍当前 → on_parent_dead 收割。alive_return 默认 true → 不触发（仅验接线计数）。
-        if !self.process_alive(ppid) && is_current(child_pid) {
+        if parent.poll() == NativeChildPoll::Exited && is_current(child_pid) {
             on_parent_dead(child_pid);
         }
     }

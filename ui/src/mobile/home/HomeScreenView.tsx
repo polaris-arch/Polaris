@@ -19,7 +19,7 @@ import type {
 import { HOME_CARD_ORDER } from './view-model';
 import { fmtBytes, fmtRate, latLevel } from '@/components/screens/shared/format';
 import { useNodeSortStore } from '@/store/use-node-sort-store';
-import { splinePath, scaleMax } from './traffic-buffer';
+import { timedTrafficPath, scaleMax, trafficObservationLabel } from './traffic-buffer';
 
 /* ═══════════ 小原语（全部 code-rendered；本屏不引任何位图）═══════════ */
 
@@ -641,7 +641,7 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                       ? t('home.routingDirect')
                       : props.node.kind === 'block'
                         ? t('home.routingBlock')
-                        : t('home.plsConfigServer')}
+                        : t(props.node.pending ? 'autoSelect.pendingNode' : 'home.plsConfigServer')}
                 </span>
                 <span className="h-nodemeta">
                   {props.node.kind === 'node' ? (
@@ -825,6 +825,7 @@ export function HomeScreenView(props: HomeScreenViewProps): ReactElement {
                   </button>
                 </li>
               </ul>
+              <hr className="auto-choice-divider" />
               <HomeNodePickerList autoSelectControls={props.autoSelectControls} rows={props.pickRows} subscriptions={props.pickerSubscriptions}
                 query={props.pickerQuery} sortByLatency={sortByLatency} t={t} onUseAsExit={props.onUseAsExit} />
               </div>
@@ -1153,18 +1154,8 @@ function TrafficChart({
   t: HomeScreenViewProps['t'];
 }): ReactElement {
   const max = scaleMax(samples);
-  const down = splinePath(
-    samples.map((s) => s.down),
-    300,
-    100,
-    max,
-  );
-  const up = splinePath(
-    samples.map((s) => s.up),
-    300,
-    100,
-    max,
-  );
+  const down = timedTrafficPath(samples, 'down', 300, 100, max);
+  const up = timedTrafficPath(samples, 'up', 300, 100, max);
   const last = samples[samples.length - 1];
   return (
     <>
@@ -1214,7 +1205,7 @@ function TrafficChart({
       </div>
       {/* X 轴五个刻度，60 秒窗口。 */}
       {down !== '' && <div className="h-xaxis">
-        {['-60s', '-45s', '-30s', '-15s', t('mobileHome.axisNow')].map((label) => (
+        {['-60s', '-45s', '-30s', '-15s', trafficObservationLabel(samples, at => new Date(at).toLocaleTimeString())].map((label) => (
           <span key={label}>{label}</span>
         ))}
       </div>}

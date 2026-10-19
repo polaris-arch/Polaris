@@ -125,3 +125,47 @@ fn 桌面换管理口即断流() {
 fn 桌面流标识文案不变() {
     assert_eq!(stream_label(9090), "port=9090");
 }
+
+fn timed_status(total: i64, observed_at_ms: Option<u64>, reset: bool) -> StatusFrame {
+    StatusFrame {
+        status: SingBoxStatus { uplink_total: total, downlink_total: total,
+            traffic_available: true, ..Default::default() },
+        observed_at_ms,
+        reset,
+    }
+}
+
+#[test]
+fn recovered_desktop_subscription_primes_instead_of_averaging_outage() {
+    let mut meter = polaris_stats_engine::StatsAggregator::new();
+    timed_status(0, None, true).apply(&mut meter, 1_000);
+    timed_status(1_048_576, None, false).apply(&mut meter, 2_000);
+    assert_eq!(meter.snapshot().upload_speed, 1_048_576);
+    // Same core generation and port, but a new underlying subscription.
+    timed_status(11_534_336, None, true).apply(&mut meter, 12_000);
+    assert_eq!(meter.snapshot().upload_speed, 0);
+    assert_eq!(meter.snapshot().total_upload, 11_534_336);
+    timed_status(11_534_336, None, false).apply(&mut meter, 13_000);
+    assert_eq!(meter.snapshot().upload_speed, 0);
+}
+
+#[test]
+fn android_batch_uses_prequeue_observation_time_not_drain_time() {
+    let mut meter = polaris_stats_engine::StatsAggregator::new();
+    for (index, time) in [1_000, 2_000, 3_000].into_iter().enumerate() {
+        timed_status(index as i64 * 1_048_576, Some(time), false).apply(&mut meter, 90_000);
+        assert_eq!(meter.snapshot().upload_speed, if index == 0 { 0 } else { 1_048_576 });
+    }
+    assert_eq!(meter.snapshot().total_upload, 2_097_152);
+    // Equal/backward observations provide no elapsed window: re-prime, no fake 1ms rate.
+    timed_status(3_145_728, Some(3_000), false).apply(&mut meter, 90_000);
+    assert_eq!(meter.snapshot().upload_speed, 0);
+    timed_status(4_194_304, Some(2_000), false).apply(&mut meter, 90_000);
+    assert_eq!(meter.snapshot().upload_speed, 0);
+    timed_status(5_242_880, Some(3_000), false).apply(&mut meter, 90_000);
+    assert_eq!(meter.snapshot().upload_speed, 1_048_576);
+    // New Android subscription starts a separate clock baseline.
+    meter.reset();
+    timed_status(10_485_760, Some(50_000), false).apply(&mut meter, 90_000);
+    assert_eq!(meter.snapshot().upload_speed, 0);
+}

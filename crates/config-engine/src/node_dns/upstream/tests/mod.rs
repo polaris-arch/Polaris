@@ -85,7 +85,7 @@ fn duplicate_of_builtin_is_merged_before_counting_cap() {
 
 #[test]
 fn empty_tier1_falls_back_to_defaults() {
-    // 只勾 system / 全是无效 id → Tier1 空 → 回退 [ali, dnspod]（不留「无抢跑上游」的死配置）。
+    // Supported system-only selection retains the existing fallback; invalid IDs do not.
     let r = resolve_upstreams(&ids(&["system"]), &[]);
     assert_eq!(
         r.tier1.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
@@ -93,7 +93,7 @@ fn empty_tier1_falls_back_to_defaults() {
     );
     assert_eq!(r.tier2.len(), 1);
     let r2 = resolve_upstreams(&ids(&["nope", "gone"]), &[]);
-    assert_eq!(r2.tier1.len(), 2);
+    assert!(r2.tier1.is_empty()); // Explicit unknown IDs must never select other resolvers.
 }
 
 #[test]
@@ -251,7 +251,7 @@ fn plan_uses_pool_when_race_on_and_defaults_when_absent() {
 
     // 缺省（老配置无 resolveNodeDomainsAhead / 无 pool）→ 开 + 默认池。
     let r2 = plan_upstreams(Some(&DnsConfig::default()), NON_TUN).expect("缺省视为开");
-    assert_eq!(r2.tier1.len(), 2);
+    assert!(r2.tier1.is_empty()); // Explicit unknown IDs must never select other resolvers.
     let r3 = plan_upstreams(None, NON_TUN).expect("无 dnsConfig 也视为开");
     assert_eq!(r3.tier1.len(), 2);
 }
@@ -298,4 +298,21 @@ fn plan_consumes_custom_pool_entry_end_to_end() {
             .any(|u| u.ip.as_deref() == Some("9.9.9.9")),
         "自定义 IP 须进直连放行"
     );
+}
+
+#[test]
+fn explicit_unsupported_selection_fails_generation_validation_without_hydration_changes() {
+    let mut dns = DnsConfig::default();
+    dns.node_resolver_custom = Some(vec![custom("tls", "tls://1.1.1.1")]);
+    dns.node_resolver_pool = Some(ids(&["tls"]));
+    assert!(validate_selected_upstreams(Some(&dns)).unwrap_err().starts_with("NODE_RESOLVER_UNSUPPORTED:"));
+    assert!(resolve_upstreams(dns.node_resolver_pool.as_ref().unwrap(), dns.node_resolver_custom.as_ref().unwrap()).tier1.is_empty());
+    dns.node_resolver_pool = Some(ids(&["ali"]));
+    assert!(validate_selected_upstreams(Some(&dns)).is_ok()); // Legacy unselected entry remains editable.
+    dns.node_resolver_pool = Some(ids(&["tls"]));
+    dns.resolve_node_domains_ahead = Some(false);
+    assert!(validate_selected_upstreams(Some(&dns)).is_ok());
+    assert!(validate_selected_upstreams(None).is_ok());
+    assert!(validate_selected_upstreams(Some(&DnsConfig::default())).is_ok());
+    assert!(!is_valid_custom_upstream_spec("https://[:::]/dns-query"));
 }

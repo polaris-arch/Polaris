@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use crate::builder::outbound_helpers::{
-    is_quic_managed_tls, normalize_duration, parse_ws_early_data, should_emit_tls_engine,
+    is_quic_managed_tls, normalize_duration, parse_ws_early_data, should_emit_tls_engine, supports_tls_fragment,
 };
 use crate::singbox::{
     DomainResolver, Ech, Hysteria2Obfs, Multiplex, OneOrMany, Outbound, OutboundTls, Reality,
@@ -74,7 +74,8 @@ pub fn build_proxy_outbound(
     node_resolver: &DomainResolver,
     arch: &str,
     platform: &str,
-) -> Outbound {
+) -> Result<Outbound, &'static str> {
+    tls_pin::validate_server_cert_pins(server)?;
     let protocol = protocol_str(server.protocol);
 
     // 自定义协议（逃生舱）：**真透传** —— 用户给什么就下发什么，只做两处既有且有理由的改写
@@ -91,7 +92,13 @@ pub fn build_proxy_outbound(
         {
             let mut ob = Outbound::shell(&type_field, tag);
             ob.extra = extra;
-            return ob;
+            if let Some(tls) = ob.extra.get("tls").and_then(serde_json::Value::as_object) {
+                if matches!(tls.get("engine").and_then(serde_json::Value::as_str), Some("apple" | "windows"))
+                    && ["fragment", "record_fragment"].iter().any(|key| tls.get(*key).and_then(serde_json::Value::as_bool) == Some(true)) {
+                    return Err("TLS_FRAGMENT_UNSUPPORTED");
+                }
+            }
+            return Ok(ob);
         }
         // 形状非法（非对象 / 无 string `type`）。装配层 `builder/outbounds.rs` 用**同一条判据**
         // （`custom_outbound_type`）把这种节点剔除并记进 `invalid_nodes`，故主生成路径到不了这里；
@@ -100,7 +107,7 @@ pub fn build_proxy_outbound(
         // 此时保留 `{"type":"custom","tag":…}` 这颗**毒丸**是刻意的：随包 sing-box 对它的判决是
         // `unknown outbound type: custom`（实测 rc=1），临时核起不来 = 该节点测速失败，如实。
         // 换成「编一个像样的 outbound」反而会把「用户 JSON 写坏了」伪装成「这节点就是慢」。
-        return Outbound::shell(&protocol, tag);
+        return Ok(Outbound::shell(&protocol, tag));
     }
 
     let mut ob = Outbound {
@@ -478,7 +485,7 @@ pub fn build_proxy_outbound(
                 }
             }
             // Tor 自带传输层，不叠 TLS/transport。
-            return ob;
+            return Ok(ob);
         }
         // ── Tailcat（2026-09-24）── 无地址 outbound，写法同 Tor：清 server/port → 铺透传袋 → 剥掉
         // 生成侧自己决定的键 → 写具名键。调用方须先过 `tailcat_emit_check`（坏 key / DERP 冲突会让
@@ -524,7 +531,7 @@ pub fn build_proxy_outbound(
                 }
             }
             // Tailcat 自带 WireGuard + DERP，不叠 TLS/transport。
-            return ob;
+            return Ok(ob);
         }
         Protocol::Ssh => {
             if let Some(s) = &server.ssh_settings {
@@ -541,7 +548,7 @@ pub fn build_proxy_outbound(
                 ob.kex_algorithm = s.kex_algorithm.clone();
             }
             // SSH 不需 TLS/transport，直接返回。
-            return ob;
+            return Ok(ob);
         }
         _ => {}
     }
@@ -583,22 +590,22 @@ pub fn build_proxy_outbound(
             ech: None,
             fragment: None,
             // 证书固定。std / uTLS / windows / apple 四个客户端都实现了 pin 校验，ECH 包的是同一个
-            // tls.Config（pin 回调随之生效）⇒ 本段无条件下发。与 insecure 并存无冲突：内核见 pin
+            // tls.Config（pin 回调随之生效）⇒ 按共享能力判据下发。与 insecure 并存无冲突：内核见 pin
             // 会自行置 InsecureSkipVerify 并挂 pin 回调（std_client.go :138-146、utls_client.go :212-220、
             // system_client_engine.go :104），insecure 真假都由 pin 单独把关。reality 不在此列 ——
             // 见下方 Reality 段整体替换本块时写死的 None。
-            certificate_sha256: tls_pin::cert_pins_for_kernel(
+            certificate_sha256: if tls_pin::modeled_cert_pins_are_emitted(server.protocol, server.security.as_ref()) { tls_pin::cert_pins_for_kernel(
                 server
                     .tls_settings
                     .as_ref()
                     .and_then(|t| t.certificate_sha256.as_deref()),
-            ),
-            certificate_public_key_sha256: tls_pin::cert_pins_for_kernel(
+            )? } else { None },
+            certificate_public_key_sha256: if tls_pin::modeled_cert_pins_are_emitted(server.protocol, server.security.as_ref()) { tls_pin::cert_pins_for_kernel(
                 server
                     .tls_settings
                     .as_ref()
                     .and_then(|t| t.certificate_public_key_sha256.as_deref()),
-            ),
+            )? } else { None },
         });
 
         let tls_engine = server
@@ -614,11 +621,7 @@ pub fn build_proxy_outbound(
             ob.tls.as_mut().unwrap().utls = crate::user_config::utls::node_utls(
                 tls.and_then(|t| t.utls_mode),
                 tls.and_then(|t| t.fingerprint.as_deref()),
-                if matches!(server.protocol, Protocol::Vless | Protocol::Anytls) {
-                    "chrome"
-                } else {
-                    "none"
-                },
+                crate::user_config::utls::ordinary_fallback(server, platform),
             );
         }
     }
@@ -732,9 +735,13 @@ pub fn build_proxy_outbound(
     }
 
     // 抗封后处理。
+    if server.tls_settings.as_ref().is_some_and(|t| t.fragment == Some(true))
+        && ob.tls.as_ref().is_some_and(|tls| matches!(tls.engine.as_deref(), Some("apple" | "windows"))) {
+        return Err("TLS_FRAGMENT_UNSUPPORTED");
+    }
     apply_anti_censorship_options(&mut ob, server, arch);
 
-    ob
+    Ok(ob)
 }
 
 /// custom 逃生舱 raw JSON → `(type, 其余键)`，供 outbound / endpoint 两条腿共用。
@@ -862,7 +869,7 @@ fn generate_transport_config(server: &ServerConfig) -> Option<Transport> {
 fn apply_anti_censorship_options(ob: &mut Outbound, server: &ServerConfig, arch: &str) {
     let protocol_lower = protocol_str(server.protocol);
     let fragment_unsupported =
-        is_quic_managed_tls(&protocol_lower) || server.protocol == Protocol::Naive;
+        !supports_tls_fragment(&protocol_lower, ob.tls.as_ref().and_then(|t| t.engine.as_deref()));
 
     // ECH + fragment + spoof（需 tls 块）。
     if let Some(tls) = ob.tls.as_mut() {

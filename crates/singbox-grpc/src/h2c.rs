@@ -24,14 +24,14 @@ type DialFuture = Pin<Box<dyn Future<Output = std::io::Result<TcpStream>> + Send
 
 /// 把 `host:port` 拨成一条 TCP 连接。生产只有 [`TcpStream::connect`] 一种；做成可替换的值，
 /// 是为了让「对端对 SYN 毫无响应」这种不出回环就造不出来的情形也有用例。
-pub(crate) type Dialer = Arc<dyn Fn(String) -> DialFuture + Send + Sync>;
+pub(crate) type Dialer = Arc<dyn Fn(String, u16) -> DialFuture + Send + Sync>;
 
 /// 连接到 sing-box 管理 API（h2c，明文 HTTP/2）。
 ///
 /// `target` = `host:port`（裸 IPv6 字面量已方括号包裹）。返回一条 **lazy** tonic Channel——
 /// 不立即建连，首个 RPC 时才握 TCP + h2。复用同 channel 的所有 RPC 走同一条 h2 连接。
 pub(crate) async fn connect_h2c(target: &str) -> Result<Channel, tonic::transport::Error> {
-    connect_h2c_with(target, Arc::new(|addr| Box::pin(TcpStream::connect(addr))))
+    connect_h2c_with(target, Arc::new(|host, port| Box::pin(TcpStream::connect((host, port)))))
 }
 
 /// [`connect_h2c`] 的本体：拨号器可注入。
@@ -80,7 +80,7 @@ impl Service<http::Uri> for TcpConnector {
 
             debug!("h2c：TCP 拨号 {addr}");
             let limit = crate::CONNECT_TIMEOUT;
-            let tcp = match tokio::time::timeout(limit, dial(addr.clone())).await {
+            let tcp = match tokio::time::timeout(limit, dial(host.to_owned(), port)).await {
                 Ok(dialed) => dialed.map_err(|e| io(&format!("h2c TCP connect {addr}: {e}")))?,
                 Err(_) => {
                     return Err(std::io::Error::new(

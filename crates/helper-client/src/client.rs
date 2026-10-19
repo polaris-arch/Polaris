@@ -22,7 +22,7 @@
 //!
 //! - **超时**：单请求超时由调用方传入（默认 [`DEFAULT_REQUEST_TIMEOUT_MS`]；较长只读操作由调用方显式给定预算）。
 //!   超时返回 [`ClientError::Timeout`]（对齐 上游 `helper socket 超时`，HelperManager.ts:441）。
-//! - **重连**：[`HelperClient::send_with_retry`] 在连接失败 / 超时时按策略重试（默认 0 次 —— Polaris sendCommand
+//! - **重连**：[`HelperClient::send_with_retry`] 仅在明确连接失败时按策略重试（默认 0 次 —— Polaris sendCommand
 //!   不重试，调用方决定。重试用于「刚 install 完等 daemon 起来」场景，对齐 Polaris install 后轮询就绪
 //!   `HelperManager.ts:519-522`）。
 //!
@@ -46,6 +46,20 @@ use std::time::{Duration, Instant};
 pub trait Connector: Send {
     /// 建立一条新连接。失败返回 [`ClientError`]（连接拒绝 = helper 未装/未跑，对齐 上游 `sock.on('error')`）。
     fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError>;
+
+    /// Establish a connection within the caller's absolute request budget.
+    /// The default supports immediate/in-memory connectors only. Production
+    /// connectors must override this with deadline-aware native I/O.
+    fn connect_until(&self, deadline: Instant) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        let connection = self.connect()?;
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        Ok(connection)
+    }
 }
 
 /// helper 客户端错误（对齐 Polaris 的 reject 路径：超时 / 连接错误 / IO 错误 / 协议错误）。
@@ -54,7 +68,8 @@ pub enum ClientError {
     /// 连接 helper 失败（socket/pipe 不存在 = helper 未安装或未运行）。
     #[error("连接 helper 失败: {0}")]
     Connect(String),
-    /// 读响应超时（对齐 上游 `helper socket 超时`，HelperManager.ts:441）。
+    /// Request budget exhausted. This does NOT prove the request was unexecuted:
+    /// after a write starts, mutation outcome is unknown and must not be replayed.
     #[error("helper socket 超时")]
     Timeout,
     /// IO 错误（读写失败、对端关闭等）。
@@ -121,16 +136,60 @@ impl HelperClient {
         req: &Request,
         timeout: Duration,
     ) -> Result<Response, ClientError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| ClientError::Io(std::io::ErrorKind::InvalidInput.into()))?;
+        let frame = codec::encode(self.platform, &self.token, req);
+        // These exact zero-argument commands cannot be confused with a shorter
+        // optional-argument mutation. Keep old-helper installer admission reachable;
+        // do not send ordinary runtime requests to byte-pipe helpers.
+        let legacy_unambiguous = matches!(
+            req,
+            Request::Ping
+                | Request::Version
+                | Request::PrepareHelperUpgrade
+                | Request::CancelHelperUpgrade
+        );
+        self.send_frame_until(&frame, deadline, legacy_unambiguous)
+    }
+
+    /// Read-only readiness probe including native framing capability. An old
+    /// byte-pipe helper must show needs_repair, even if its legacy Ping works.
+    pub fn probe_framed_transport(&self, timeout: Duration) -> Result<Response, ClientError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| ClientError::Io(std::io::ErrorKind::InvalidInput.into()))?;
+        let frame = codec::encode(self.platform, &self.token, &Request::Ping);
+        self.send_frame_until(&frame, deadline, false)
+    }
+
+    fn send_frame_until(
+        &self,
+        frame: &[u8],
+        deadline: Instant,
+        legacy_unambiguous: bool,
+    ) -> Result<Response, ClientError> {
+        if frame.len() > codec::MAX_FRAME_BYTES {
+            return Err(ClientError::Io(std::io::ErrorKind::InvalidInput.into()));
+        }
         // 1. 建连接
-        let mut conn = self.connector.connect().map_err(|e| {
+        let mut conn = self.connector.connect_until(deadline).map_err(|e| {
             log::warn!("helper 连接失败: {e}");
             e
         })?;
+        if !conn.supports_request_boundaries() && !legacy_unambiguous {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "helper upgrade required: named pipe message framing unavailable",
+            )));
+        }
         // 2. 编帧（复用 helper-proto codec）
-        let frame = codec::encode(self.platform, &self.token, req);
         // 3. 写帧 + shutdown（对齐 Polaris sock.end(frame)，HelperManager.ts:438）
-        conn.write_all(&frame).map_err(ClientError::Io)?;
+        conn.write_all_until(frame, deadline)
+            .map_err(map_io_error)?;
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
         conn.shutdown().map_err(ClientError::Io)?;
         // 4. 读单行响应（行协议：响应一行 \n 结尾）
         let line = read_response_line(&mut *conn, deadline)?;
@@ -142,7 +201,8 @@ impl HelperClient {
         Ok(Response::parse(trimmed))
     }
 
-    /// 带重试的发送：连接失败 / 超时时按 `retry_delay` 间隔重试 `max_retries` 次。
+    /// Retry only explicit connection failures. Any timeout, write error, partial
+    /// reply or EOF has an unknown mutation outcome and is never replayed.
     ///
     /// 用于「install 后等 daemon 起来」场景（上游 `HelperManager.ts:519-522` 轮询就绪）：
     /// daemon 注册到 launchd/systemd/SCM 后绑定 socket 需要时间，首次 ping 可能 ECONNREFUSED。
@@ -160,6 +220,10 @@ impl HelperClient {
             }
             match self.send_with_timeout(req, timeout) {
                 Ok(resp) => return Ok(resp),
+                // Only an explicit connection failure proves no bytes were sent.
+                // Write/response timeout (and EOF) has UNKNOWN mutation outcome;
+                // never replay it, even if the caller requested retries.
+                Err(e) if !matches!(e, ClientError::Connect(_)) => return Err(e),
                 Err(e) => {
                     log::debug!("helper 请求第 {attempt} 次失败: {e}");
                     last_err = Some(e);
@@ -209,18 +273,22 @@ fn read_response_line(
         if remaining.is_zero() {
             return Err(ClientError::Timeout);
         }
-        conn.set_read_timeout(remaining).map_err(ClientError::Io)?;
         let mut byte_buf = Vec::new();
-        let result = conn.read_until_timeout(&mut byte_buf);
+        let result = conn.read_until_deadline(&mut byte_buf, deadline);
         if Instant::now() >= deadline {
             return Err(ClientError::Timeout);
         }
         match result {
             Ok(0) => {
-                // EOF —— helper 关闭连接，返回当前已读内容（可能为空）
-                break;
+                if buf.is_empty() {
+                    return Err(ClientError::EmptyResponse);
+                }
+                return Err(ClientError::Io(std::io::ErrorKind::UnexpectedEof.into()));
             }
             Ok(n) => {
+                if n > byte_buf.len() || n > codec::MAX_FRAME_BYTES.saturating_sub(buf.len()) {
+                    return Err(ClientError::Io(std::io::ErrorKind::InvalidData.into()));
+                }
                 buf.extend_from_slice(&byte_buf[..n]);
                 // 检查是否读到行尾
                 if buf.last() == Some(&b'\n') {
@@ -237,7 +305,14 @@ fn read_response_line(
             Err(e) => return Err(ClientError::Io(e)),
         }
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    String::from_utf8(buf).map_err(|_| ClientError::Io(std::io::ErrorKind::InvalidData.into()))
+}
+
+fn map_io_error(error: std::io::Error) -> ClientError {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => ClientError::Timeout,
+        _ => ClientError::Io(error),
+    }
 }
 
 #[cfg(test)]

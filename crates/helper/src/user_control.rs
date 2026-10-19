@@ -117,6 +117,8 @@ pub fn register(
     }
     let result: io::Result<()> = (|| {
         let mut file = options.open(&temporary)?;
+        #[cfg(target_os = "macos")]
+        crate::protected_install_path::no_extended_acl(&file)?;
         file.write_all(raw.as_bytes())?;
         file.sync_all()?;
         #[cfg(windows)]
@@ -248,6 +250,174 @@ pub fn conf_dir(support: &Path, caller: &CallerIdentity) -> io::Result<PathBuf> 
         }
     }
     Ok(path)
+}
+
+/// Private transaction backup. The single byte discriminator preserves absence
+/// without inventing a live credential. Call only under the installer lease.
+#[cfg(unix)]
+pub fn snapshot_registration(
+    support: &Path,
+    caller: &CallerIdentity,
+    backup: &Path,
+) -> io::Result<()> {
+    snapshot_registration_with_owner(support, caller, backup, OwnerPolicy::privileged())
+}
+
+#[cfg(unix)]
+fn snapshot_registration_with_owner(
+    support: &Path,
+    caller: &CallerIdentity,
+    backup: &Path,
+    policy: OwnerPolicy,
+) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    policy.check(support)?;
+    let parent = backup
+        .parent()
+        .ok_or_else(|| io::Error::other("backup parent missing"))?;
+    policy.check(parent)?;
+    let mut bytes = vec![0u8];
+    let users = support.join("users");
+    let destination = users.join(caller.key());
+    for directory in [&users, &destination] {
+        match std::fs::symlink_metadata(directory) {
+            Ok(_) => {
+                policy.check(directory)?;
+                let _ = PayloadDir::open(directory, policy.uid)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    let record = destination.join("registration");
+    match std::fs::symlink_metadata(&record) {
+        Ok(_) => {
+            let directory = PayloadDir::open(&destination, policy.uid)?;
+            let (file, len) = directory.open_regular("registration")?;
+            #[cfg(target_os = "macos")]
+            crate::protected_install_path::no_extended_acl(&file)?;
+            let metadata = file.metadata()?;
+            if metadata.mode() & 0o7077 != 0 {
+                return Err(io::Error::other(
+                    "registration is not private or has special mode bits",
+                ));
+            }
+            if len > 64 * 1024 {
+                return Err(io::Error::other("registration too large"));
+            }
+            bytes[0] = 1;
+            bytes.extend_from_slice(&(metadata.mode() & 0o777).to_le_bytes());
+            bytes.extend_from_slice(&metadata.gid().to_le_bytes());
+            file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != len + 9 {
+                return Err(io::Error::other("registration changed size"));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(backup)?;
+    #[cfg(target_os = "macos")]
+    crate::protected_install_path::no_extended_acl(&file)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(unix)]
+pub fn restore_registration(
+    support: &Path,
+    caller: &CallerIdentity,
+    backup: &Path,
+) -> io::Result<()> {
+    restore_registration_with_owner(support, caller, backup, OwnerPolicy::privileged())
+}
+
+#[cfg(unix)]
+fn restore_registration_with_owner(
+    support: &Path,
+    caller: &CallerIdentity,
+    backup: &Path,
+    policy: OwnerPolicy,
+) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    policy.check(support)?;
+    let parent = backup
+        .parent()
+        .ok_or_else(|| io::Error::other("backup parent missing"))?;
+    let objects = PayloadDir::open(parent, policy.uid)?;
+    let name = backup
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| io::Error::other("invalid backup name"))?;
+    let (file, len) = objects.open_regular(name)?;
+    #[cfg(target_os = "macos")]
+    crate::protected_install_path::no_extended_acl(&file)?;
+    if len == 0 || len > 64 * 1024 + 9 {
+        return Err(io::Error::other("invalid registration backup size"));
+    }
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 + 10).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != len {
+        return Err(io::Error::other("registration backup changed size"));
+    }
+    let users = support.join("users");
+    let directory = users.join(caller.key());
+    let record = directory.join("registration");
+    if bytes == [0] {
+        if !directory.try_exists()? {
+            return Ok(());
+        }
+        policy.check(&users)?;
+        let objects = PayloadDir::open(&directory, policy.uid)?;
+        match std::fs::symlink_metadata(&record) {
+            Ok(_) => {
+                let _ = objects.open_regular("registration")?;
+                std::fs::remove_file(&record)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        return std::fs::File::open(&directory)?.sync_all();
+    }
+    if bytes.first() != Some(&1) || bytes.len() < 9 {
+        return Err(io::Error::other("invalid registration backup marker"));
+    }
+    let mode = u32::from_le_bytes(
+        bytes[1..5]
+            .try_into()
+            .map_err(|_| io::Error::other("invalid backup mode"))?,
+    );
+    let gid = u32::from_le_bytes(
+        bytes[5..9]
+            .try_into()
+            .map_err(|_| io::Error::other("invalid backup group"))?,
+    );
+    if mode & !0o700 != 0 {
+        return Err(io::Error::other("invalid private registration mode"));
+    }
+    policy.check(&users)?;
+    let _directory = PayloadDir::open(&directory, policy.uid)?;
+    let temporary = directory.join(format!(".restore-{}.new", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    #[cfg(target_os = "macos")]
+    crate::protected_install_path::no_extended_acl(&file)?;
+    file.write_all(&bytes[9..])?;
+    nix::unistd::fchown(&file, None, Some(nix::unistd::Gid::from_raw(gid)))?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &record)?;
+    std::fs::File::open(&directory)?.sync_all()
 }
 
 #[cfg(test)]

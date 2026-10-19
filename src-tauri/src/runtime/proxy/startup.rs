@@ -543,6 +543,7 @@ pub(super) fn normalize_kernel_gate_config(value: &mut Value) {
                 .is_some_and(|tag| {
                     tag == "update-in"
                         || tag == "subscription-update-in"
+                        || tag == polaris_config_engine::builder::helpers::PROBE_PROXY_INBOUND_TAG
                         || tag.starts_with("probe-in-")
                 });
             if dynamic {
@@ -1184,8 +1185,18 @@ impl ProxyRuntime {
         let mut retry_backoff_ms: u128 = 0;
 
         let t_preflight = std::time::Instant::now();
+        polaris_store::auto_select::validate_raw(&config)
+            .map_err(|error| StartError::from(error.to_string()))?;
         let user_config: UserConfig = serde_json::from_value(config.clone())
             .map_err(|e| format!("配置解析失败（UserConfig）: {e}"))?;
+        if let Err(message) = polaris_config_engine::user_config::auto_select::validate_test_url(user_config.speed_test_url.as_deref()) {
+            self.set_error(message, code::SPEED_TEST_URL_INVALID);
+            return Err(StartError::coded(message.to_owned(), code::SPEED_TEST_URL_INVALID));
+        }
+        if let Err(message) = polaris_config_engine::node_dns::upstream::validate_selected_upstreams(user_config.dns_config.as_ref()) {
+            self.set_error(&message, code::NODE_RESOLVER_UNSUPPORTED);
+            return Err(StartError::coded(message, code::NODE_RESOLVER_UNSUPPORTED));
+        }
         if let Err(message) = self.validate_required_bind_interfaces(&user_config).await {
             self.set_error(&message, code::OUTBOUND_INTERFACE_UNAVAILABLE);
             return Err(StartError::coded(
@@ -1516,6 +1527,7 @@ impl ProxyRuntime {
             // 桌面腿不消费它（核自己去读 `config_path`）。
             let gate_config_json = gate.config_json;
             let singbox_config = gate.config;
+            require_management_api_auth(&singbox_config)?;
             let effective_user_config = gate.effective_user_config;
             let mesh_route_prepared = self.prepare_mesh_route_run(
                 gate.mesh_route_candidates,
@@ -2222,6 +2234,7 @@ impl ProxyRuntime {
         let user_config = effective_user_config;
 
         let new_status = ProxyStatus {
+            actual_server_id: None,
             main_generation: my_gen,
             owned_stop_context: None, // IPC read-time context; never a stored selector mirror.
             running: true,
@@ -2342,6 +2355,7 @@ impl ProxyRuntime {
         // 日志页唯一的核日志来源，也是「改级别立刻生效、不必重启核」的承载（见方法文档）。
         // `log_pipe_handoff` 区分直起（有 stderr 管道，需交接 + 丢首帧历史）与 helper 起（无管道，收历史）。
         self.spawn_core_log_relay(my_gen, api_port, log_pipe_handoff.clone());
+        self.spawn_native_auto_relay(my_gen, api_port);
         // C3：核就绪 → 挂自动换节点心跳（同世代范式）。**无条件挂**，开关在循环内每 tick 读 `autoSwitchNode`
         // 动态判（对齐 上游 运行期 enable/disable）。与崩溃监测解耦：崩溃原地重启同节点，本腿只对「核活着
         // 但代理链不通」换节点。世代守卫退场同 relay。
@@ -2474,9 +2488,7 @@ impl ProxyRuntime {
         // 接线**（`HelperExitRouteOp`：mac/win 经 helper `route -ifscope`、Linux `ip rule/route` 表 7732）
         // → 生产下是真手术（真机门），测试构造 `enabled=false` 诚实 no-op，见 `runtime/mesh.rs`。
         let t_mesh_route = std::time::Instant::now();
-        self.mesh
-            .exit_route_reconcile(&user_config, user_config.enable_ipv6.unwrap_or(false))
-            .await;
+        self.reconcile_emitted_exit_route(my_gen).await;
         let mesh_route_ms = t_mesh_route.elapsed().as_millis();
         log::info!("起核耗时：mesh路由接线={mesh_route_ms}ms");
         // C7：TUN 起核尾接管系统 DNS（mac networksetup；Linux helper→resolved；Windows no-op）。
@@ -4009,7 +4021,7 @@ impl ProxyRuntime {
                 &rejection,
                 &gen_out.config,
                 &tag_to_id,
-                user_config.selected_server_id.as_deref(),
+                user_config.effective_selected_server_id(),
                 &already_peeled,
             ) {
                 PeelTarget::Unattributable => {
@@ -4974,6 +4986,44 @@ pub(super) fn attest_effective_exit(
     if user_config.proxy_mode == ProxyMode::Direct {
         return ExitAttestation::Match;
     }
+    if let Some(intent) = user_config
+        .selection_intent
+        .as_ref()
+        .filter(|intent| intent.mode == "auto")
+    {
+        // Legacy selectedServerId is only a startup seed for a reference. Attest
+        // the generated wrapper, then let native readback prove the actual leaf.
+        let expected = polaris_config_engine::user_config::auto_select::wrapper_tag(&intent.target);
+        let selected = singbox_config
+            .outbounds
+            .iter()
+            .find(|outbound| outbound.tag == PROXY_SELECTOR_TAG)
+            .and_then(|outbound| outbound.default.as_deref());
+        if selected != Some(expected.as_str()) {
+            return ExitAttestation::UnresolvedExit {
+                expected_tag: expected,
+            };
+        }
+        if user_config.proxy_mode == ProxyMode::Smart
+            && user_config
+                .region_routing
+                .as_ref()
+                .is_some_and(|r| r.enabled && r.reverse)
+            && region_reverse_rule_sets_intact(user_config, singbox_config)
+        {
+            return ExitAttestation::Match;
+        }
+        return match effective_exit_tag(singbox_config) {
+            Some(actual) if actual == expected => ExitAttestation::Match,
+            Some(actual) => ExitAttestation::WrongExit {
+                expected_tag: expected,
+                actual_tag: actual,
+            },
+            None => ExitAttestation::UnresolvedExit {
+                expected_tag: expected,
+            },
+        };
+    }
     // Block must precede reverse/mesh exemptions, and stale persisted selection
     // must precede its success. Non-block and explicit direct-mode gates retain
     // their existing order and meaning.
@@ -5211,3 +5261,27 @@ fn write_private_runtime_config(path: &Path, text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+
+/// Only actual generated API services require a credential. Platforms/configurations
+/// that omit the service remain valid; internal restarts share this admission check.
+fn require_management_api_auth(config: &SingBoxConfig) -> Result<(), StartError> {
+    if config
+        .services
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|service| {
+            service.type_field == "api"
+                && service
+                    .secret
+                    .as_deref()
+                    .is_none_or(|secret| secret.trim().is_empty())
+        })
+    {
+        return Err(StartError::coded(
+            "本地管理 API 缺少密钥，请重试配置加载".to_string(),
+            "CONFIG_SECURITY_MAINTENANCE_FAILED",
+        ));
+    }
+    Ok(())
+}

@@ -107,7 +107,7 @@ export type NodeIdentity =
     }
   | { readonly kind: 'direct' }
   | { readonly kind: 'block' }
-  | { readonly kind: 'none' };
+  | { readonly kind: 'none'; readonly pending?: boolean };
 
 /** 节点选择器里的一行。 */
 export interface NodePickRow {

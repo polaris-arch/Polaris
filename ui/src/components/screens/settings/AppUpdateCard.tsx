@@ -6,6 +6,7 @@ import {
   appUpdateIncludePrerelease,
   type AppUpdateChannel,
 } from '@/domain/app-update-channel';
+import { systemApi } from '@/ipc/api-client';
 import { toast } from '@/lib/error-handler';
 import {
   Card,
@@ -44,6 +45,7 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
     downloadIntegrity,
     installing,
     manualCompletionUnverified,
+    manualInstallerOpened,
     clearingPortable,
     discardPortableAndCheck,
     checkUpdate,
@@ -56,6 +58,19 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
   const downloadUnverified = downloadIntegrity === 'unverified';
   const progressActive = us === 'checking' || us === 'downloading';
   const progressView = useProgressDisclosure(progressActive);
+
+  const openReleasePage = async () => {
+    try {
+      await systemApi.openExternal('https://github.com/polaris-arch/Polaris/releases');
+    } catch {
+      toast.error(t('settings.about.openExternalFail'));
+    }
+  };
+  const manualReleaseAction = (
+    <Button variant="flow" size="sm" onClick={() => void openReleasePage()}>
+      <span>{t('mobileSettings.update.openReleases')}</span>
+    </Button>
+  );
 
   return (
     <Card className="core-card" id="app-update-card">
@@ -148,12 +163,14 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
             </details>
           )}
           <div style={{ display: 'flex', gap: 9, marginTop: 12 }}>
+            {releaseDigestMissing ? manualReleaseAction : (
             <Button variant="flow" size="sm" onClick={downloadUpdate}>
               <svg viewBox="0 0 24 24" width="14" fill="none" stroke="currentColor" strokeWidth={1.8}>
                 <path d="M12 3v11M8 10l4 4 4-4M4 19h16" />
               </svg>
               <span>{t('settings.update.download')}</span>
             </Button>
+            )}
             <Button variant="ghost" size="sm" onClick={() => void skipVersion()}>
               <span>{t('settings.update.bannerSkip')}</span>
             </Button>
@@ -203,7 +220,7 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
                   <Pill variant="warn">{t('settings.update.prereleaseTag')}</Pill>
                 </>
               )}
-              <CardSub>{t('settings.update.restartToInstall')}</CardSub>
+              {!downloadUnverified && <CardSub>{t('settings.update.restartToInstall')}</CardSub>}
               {downloadUnverified && (
                 <CardSub style={{ marginTop: 4, lineHeight: 1.7 }}>
                   {t('settings.update.digestMissingAfter')}
@@ -213,6 +230,7 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
             {downloadUnverified && (
               <Pill variant="warn">{t('settings.update.digestMissingTag')}</Pill>
             )}
+            {downloadUnverified ? manualReleaseAction : (
             <Button
               variant="flow"
               size="sm"
@@ -221,6 +239,7 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
             >
               <span>{t('settings.update.restartAndInstall')}</span>
             </Button>
+            )}
           </div>
         </div>
       )}
@@ -230,7 +249,7 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
           <div className="core-ver">
             <Dot variant="ok" />
             <div style={{ flex: 1 }}>
-              <b>{t(manualCompletionUnverified ? 'settings.update.portableCompletionUnknown' : 'settings.update.downloadedManual')}</b>{' '}
+              <b>{t(manualInstallerOpened ? 'settings.update.manualInstallPending' : manualCompletionUnverified ? 'settings.update.portableCompletionUnknown' : 'settings.update.downloadedManual')}</b>{' '}
               <span className="cv-tag">{updateInfo?.version}</span>
               {updateInfo?.isPrerelease && (
                 <>
@@ -251,9 +270,11 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
               <Pill variant="warn">{t('settings.update.digestMissingTag')}</Pill>
             )}
             <Button variant="ghost" size="sm" disabled={installing || clearingPortable} onClick={discardPortableAndCheck}>
-              <span>{t('settings.update.portableClearAndCheck')}</span>
+              <span>{t(manualInstallerOpened ? 'settings.about.checkUpdate' : 'settings.update.portableClearAndCheck')}</span>
             </Button>
             {/* 这一下会停核并退出应用：调用在飞时置灰，不让第二次点击再发一遍。 */}
+            {downloadUnverified && manualReleaseAction}
+            {!manualInstallerOpened && !downloadUnverified && (
             <Button
               variant="flow"
               size="sm"
@@ -262,6 +283,7 @@ export default function AppUpdateCard({ config, update }: AppUpdateCardProps) {
             >
               <span>{t('settings.update.portableQuitAndOpen')}</span>
             </Button>
+            )}
           </div>
         </div>
       )}

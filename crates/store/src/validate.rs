@@ -383,7 +383,36 @@ pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
             )));
         }
     }
-    validate_real_query_fallback_reference(value)?;
+    validate_real_query_fallback_reference(value)
+        .map_err(|error| crate::StoreError::DnsDependency(error.to_string()))?;
+    // Project only the DNS-owned fields: unrelated optional node data must not make
+    // this graph check a second whole-config deserializer. Absent collections retain
+    // UserConfig's legacy defaults; explicit collections remain authoritative.
+    let mut projection: serde_json::Map<String, Value> = [
+        "dnsServers", "dnsServerGroups", "dnsDefaults", "dnsRules", "policyRules", "customRules",
+    ]
+    .into_iter()
+    .filter_map(|key| value.get(key).map(|value| (key.to_string(), value.clone())))
+    .collect();
+    // Pre-migration DomainRule records have no effects/type and contain no explicit
+    // DNS dependency. Leave their existing tolerant save/migration path untouched.
+    for key in ["customRules", "policyRules", "dnsRules"] {
+        if let Some(Value::Array(rules)) = projection.get_mut(key) {
+            rules.retain(|rule| rule.get("effects").is_some());
+        }
+    }
+    projection.insert("servers".into(), Value::Array(Vec::new()));
+    let mut dns: polaris_config_engine::user_config::app_config::UserConfig =
+        serde_json::from_value(Value::Object(projection))
+            .map_err(|error| crate::StoreError::validation(format!("DNS policy: {error}")))?;
+    dns.servers = value.get("servers").and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|node| node.get("id").and_then(Value::as_str))
+        .map(|id| polaris_config_engine::user_config::server_config::ServerConfig {
+            id: id.to_string(),
+            ..Default::default()
+        }).collect();
+    polaris_config_engine::user_config::dns_policy::validate_dns_dependencies(&dns)
+        .map_err(crate::StoreError::DnsDependency)?;
     Ok(())
 }
 
@@ -488,6 +517,32 @@ pub(crate) fn validate_raw_mesh_inbound_policies(value: &Value) -> Result<(), cr
     Ok(())
 }
 
+/// Validate pin constraints before sanitization; never turn malformed security
+/// input into an unpinned connection. No secret value is included in the error.
+pub(crate) fn validate_raw_tls_pins(value: &Value) -> Result<(), crate::StoreError> {
+    use polaris_config_engine::user_config::tls_pin::{cert_pins_for_kernel, modeled_cert_pins_are_emitted};
+    use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode};
+    for server in value.get("servers").and_then(Value::as_array).into_iter().flatten() {
+        // Decode only applicability fields before pin types are sanitized. Missing
+        // protocol uses the model default; unknown protocol cannot bypass validation.
+        let protocol = server.get("protocol").cloned()
+            .and_then(|value| serde_json::from_value::<Protocol>(value).ok())
+            .unwrap_or_default();
+        let security = server.get("security").cloned()
+            .and_then(|value| serde_json::from_value::<SecurityMode>(value).ok());
+        if !modeled_cert_pins_are_emitted(protocol, security.as_ref()) { continue; }
+        if let Some(tls) = server.get("tlsSettings").filter(|v| !v.is_null()) {
+            for key in ["certificateSha256", "certificatePublicKeySha256"] {
+                if let Some(pin) = tls.get(key).filter(|v| !v.is_null()) {
+                    let raw = pin.as_str().ok_or_else(|| crate::StoreError::validation("TLS_PIN_INVALID"))?;
+                    cert_pins_for_kernel(Some(raw)).map_err(crate::StoreError::validation)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 校验端口字段范围。required=true 时缺失/非法 → Err。
 fn validate_port(
     obj: &serde_json::Map<String, Value>,
@@ -508,3 +563,114 @@ fn validate_port(
 
 #[cfg(test)]
 mod tests;
+
+/// Write-only guard: explicit DNS policy must not be erased by tolerant loading's
+/// sanitizer, including when its containing rule has a malformed legacy mirror.
+pub(crate) fn validate_raw_rule_dns_actions(value: &Value) -> Result<(), crate::StoreError> {
+    use polaris_config_engine::user_config::{DnsPolicyAction, RuleDnsEffect};
+    for key in ["customRules", "policyRules", "trafficRules", "dnsRules"] {
+        for (index, rule) in value.get(key).and_then(Value::as_array).into_iter().flatten().enumerate() {
+            let Some(dns) = rule.get("effects").and_then(|effects| effects.get("dns")) else {
+                continue;
+            };
+            let Some(action) = dns.get("action") else { continue; };
+            let invalid = || crate::StoreError::DnsDependency(format!(
+                "{key}[{index}]: explicit DNS action or containing rule is malformed"
+            ));
+            serde_json::from_value::<DnsPolicyAction>(action.clone()).map_err(|_| invalid())?;
+            serde_json::from_value::<RuleDnsEffect>(dns.clone()).map_err(|_| invalid())?;
+            // sanitize_rules otherwise discards the whole record before dependency validation.
+            if !rule.get("id").and_then(Value::as_str).is_some_and(|id| !id.trim().is_empty())
+                || !rule.get("type").and_then(Value::as_str).is_some_and(is_known_rule_type)
+                || !rule.get("values").is_some_and(Value::is_array)
+                || !rule.get("action").and_then(Value::as_str).is_some_and(|action| matches!(action, "proxy" | "direct" | "block"))
+                || !rule.get("enabled").is_some_and(Value::is_boolean)
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Plane-local rule identities must remain unambiguous. Do not silently select a
+/// winner from old malformed data; callers can repair the complete collection.
+/// Missing IDs retain existing legacy migration/sanitization behavior.
+pub fn validate_rule_ids(rules: &[Value]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for id in rules.iter().filter_map(|rule| rule.get("id").and_then(Value::as_str)) {
+        if !id.is_empty() && !seen.insert(id) {
+            return Err("duplicate rule id; repair the rule collection before saving".to_owned());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_raw_rule_ids(config: &Value) -> Result<(), crate::StoreError> {
+    for key in ["trafficRules", "dnsRules", "policyRules", "customRules"] {
+        if let Some(rules) = config.get(key).and_then(Value::as_array) {
+            validate_rule_ids(rules).map_err(crate::StoreError::validation)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod rule_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn identities_are_plane_local_but_duplicates_in_each_input_are_rejected() {
+        assert!(validate_raw_rule_ids(&json!({
+            "trafficRules": [{"id":"same"}], "dnsRules": [{"id":"same"}]
+        })).is_ok());
+        for key in ["trafficRules", "dnsRules", "policyRules", "customRules"] {
+            assert!(validate_raw_rule_ids(&json!({key: [{"id":"same"}, {"id":"same"}]})).is_err());
+        }
+    }
+
+    #[test]
+    fn batch_or_import_rejects_duplicates_before_sanitizer_can_hide_them() {
+        let mut input = crate::default_config();
+        let rule = json!({"id":"same", "type":"domain", "values":["example.com"],
+            "action":"proxy", "enabled":true});
+        input["trafficRules"] = json!([rule.clone()]);
+        // Positive control: unrelated shape/default errors must not satisfy this test.
+        assert!(crate::ConfigStore::canonicalize_for_save(&input).is_ok());
+        input["trafficRules"] = json!([rule.clone(), rule]);
+        assert!(crate::ConfigStore::canonicalize_for_save(&input).is_err());
+        assert_eq!(input["trafficRules"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn persisted_legacy_duplicates_remain_readable_and_complete_repair_can_save() {
+        let mut input = crate::default_config();
+        let rule = json!({"id":"same", "type":"domain", "values":["example.com"],
+            "action":"proxy", "enabled":true});
+        input["configSchemaVersion"] = json!(4);
+        for key in ["trafficRules", "policyRules", "customRules"] {
+            input[key] = json!([rule.clone(), rule.clone()]);
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("polaris-rule-ids-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.json");
+        let bytes = serde_json::to_vec(&input).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = crate::ConfigStore::load(&crate::StdFs, &path);
+        assert!(loaded.loaded_from_disk);
+        assert!(loaded.error.is_none());
+        assert_eq!(loaded.config["trafficRules"].as_array().unwrap().len(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(crate::ConfigStore::canonicalize_for_save(&loaded.config).is_err());
+        let mut repaired = loaded.config;
+        for key in ["trafficRules", "policyRules", "customRules"] {
+            repaired[key] = json!([rule.clone()]);
+        }
+        assert!(crate::ConfigStore::canonicalize_for_save(&repaired).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+}

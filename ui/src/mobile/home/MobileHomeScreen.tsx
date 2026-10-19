@@ -1,6 +1,7 @@
 import { prepareRuleAppend } from '@/lib/use-rule-append';
 import { useQualifiedLatencies } from '../use-qualified-latencies';
 import { requestIOSMeasurementConsent } from '../MeasurementStartNotice';
+import { configuredExitId } from '@/domain/actual-exit';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * 移动端「首页」的**接线层**：读 store、订阅事件流、发 IPC，把结果整形成 `view-model.ts` 的 props。
@@ -269,9 +270,10 @@ export function MobileHomeScreen(): ReactElement {
   }, [proxyRunning]);
 
   /* ── 派生 ────────────────────────────────────────────────────────────────── */
+  const displayServerId = configuredExitId(proxyStatus, config);
   const currentServer = useMemo(
-    () => servers.find((s) => s.id === selectedServerId),
-    [servers, selectedServerId],
+    () => servers.find((s) => s.id === displayServerId),
+    [servers, displayServerId],
   );
 
   /* 复用桌面那条腿而不是就地写 `running ? …`：连接三态的定义只该有一份。TUN 下它的口径是
@@ -307,9 +309,9 @@ export function MobileHomeScreen(): ReactElement {
 
   /** 哨兵选择**不是节点** —— 必须在碰 `currentServer` 之前分支，否则卡片会渲染出一个空名字。 */
   const node: NodeIdentity = useMemo(() => {
-    if (isDirectSelection(selectedServerId)) return { kind: 'direct' };
-    if (isBlockSelection(selectedServerId)) return { kind: 'block' };
-    if (currentServer === undefined) return { kind: 'none' };
+    if (isDirectSelection(displayServerId)) return { kind: 'direct' };
+    if (isBlockSelection(displayServerId)) return { kind: 'block' };
+    if (currentServer === undefined) return { kind: 'none', pending: !!config?.selectionIntent || proxyRunning };
     const code = resolveExitNodeFlagCode(proxyRunning, ipInfo?.proxy?.countryCode);
     return {
       kind: 'node',
@@ -321,7 +323,7 @@ export function MobileHomeScreen(): ReactElement {
       latencyMs: latencyMap[currentServer.id],
       latencyStale: isLatencyStale(testedAt[currentServer.id]),
     };
-  }, [selectedServerId, currentServer, latencyMap, testedAt, proxyRunning, ipInfo]);
+  }, [displayServerId, currentServer, latencyMap, testedAt, proxyRunning, ipInfo, config?.selectionIntent]);
 
   const tsId = currentServer?.protocol?.toLowerCase() === 'tailscale' ? currentServer.id : undefined;
   const tsLoggedIn = useAppStore((s) => (tsId ? !!s.tailscaleLoginStates[tsId] : false));
@@ -359,7 +361,7 @@ export function MobileHomeScreen(): ReactElement {
    * 以便 node 直测），调用方必须再过一道 `localizeRegion` —— 少这一道，境外直连出口会把一个裸
    * `US` 直接呈现给用户，而不是「美国」。
    */
-  const directRoute = routing === 'direct' || isDirectSelection(selectedServerId);
+  const directRoute = routing === 'direct' || isDirectSelection(displayServerId);
   const exitRegionRaw = resolveExitRegion(proxyRunning && !directRoute, ipInfo?.proxy, ipInfo?.direct);
   const exitRegion =
     exitRegionRaw.kind === 'text'
@@ -401,6 +403,11 @@ export function MobileHomeScreen(): ReactElement {
   const stagedOnly = useMemo(() => stagedOnlyIds(servers, diskServers), [servers, diskServers]);
 
   const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerSession = useRef(0);
+  const ruleSession = useRef(0);
+  const pendingRuleSession = useRef<number | null>(null);
+  const pendingPickerSession = useRef<number | null>(null);
+  useEffect(() => () => { pickerSession.current += 1; ruleSession.current += 1; }, []);
   const [pickerQuery, setPickerQuery] = useState('');
   /* 「给这个主机加一条规则」面板挂着的观测对象；`null` = 面板没开。存对象而不是存 host 字符串 ——
      判定（是 IP 还是域名）在开面板那一刻做一次就够，存字符串会让每个消费点各判一遍。 */
@@ -421,13 +428,13 @@ export function MobileHomeScreen(): ReactElement {
     return servers
       .map((s) => ({
         server: s,
-        isCurrent: s.id === selectedServerId,
+        isCurrent: s.id === displayServerId,
         stagedOnly: stagedOnly.has(s.id),
         latencyMs: latencyMap[s.id],
         latencyStale: isLatencyStale(testedAt[s.id]),
         protocolLabel: protocolLabelOf(s.protocol),
       }));
-  }, [servers, latencyMap, testedAt, selectedServerId, stagedOnly]);
+  }, [servers, latencyMap, testedAt, displayServerId, stagedOnly]);
 
   /**
    * 「阻断」在**直连模式**下不可选，并把原因写在旁边。判据与桌面 `HomeScreen.tsx` 的
@@ -523,6 +530,10 @@ export function MobileHomeScreen(): ReactElement {
     checkRun.current.requestId = requestId;
     checkRun.current.backendRequested = false;
     setManualCheckBusy(true);
+    let requestedUnlockState = useAppStore.getState().unlock;
+    const ownsUnlockDisplay = () => checkRun.current.alive
+      && checkRun.current.generation === generation
+      && useAppStore.getState().unlock === requestedUnlockState;
     void runWrite('network-check', async () => {
       if (requestId) {
         if (!await requestIOSMeasurementConsent()) return;
@@ -540,8 +551,10 @@ export function MobileHomeScreen(): ReactElement {
           || (state.proxyStatus !== previous && !manualNetworkContextMatches(result.context, requestId, state.proxyStatus))) return;
         state.setProxyStatus(current);
         if (result.ipInfo.data) setIpInfo(result.ipInfo.data);
-        if (result.unlock.data) applyUnlockSnapshot(result.unlock.data);
-        state.setUnlock({ running: false });
+        if (ownsUnlockDisplay()) {
+          if (result.unlock.data) applyUnlockSnapshot(result.unlock.data);
+          else state.setUnlock({ running: false });
+        }
         // The same explicit network action also refreshes the current RTT, after ready.
         await latencyCheck.runCurrent(true);
         const failures = [result.ipInfo.error && t('prerequisite.ipInfoFailed'),
@@ -550,19 +563,22 @@ export function MobileHomeScreen(): ReactElement {
         return;
       }
       beginUnlockCheck();
+      requestedUnlockState = useAppStore.getState().unlock;
       const [ip, services] = await Promise.allSettled([
         api.ipInfo.get(true, true),
         unlockApi.run(true),
       ] as const);
       const currentState = useAppStore.getState();
       const current = currentState.proxyStatus;
-      if (checkRun.current.generation !== generation ||
+      if (!checkRun.current.alive || checkRun.current.generation !== generation ||
           (current?.running === true) !== startedRunning || current?.startTime !== startedAt ||
           currentState.selectedServerId !== startedServerId ||
           (getEffectiveConfig()?.proxyMode ?? 'smart') !== startedRouting) return;
       if (ip.status === 'fulfilled') setIpInfo(ip.value);
-      if (services.status === 'fulfilled') applyUnlockSnapshot(services.value);
-      useAppStore.getState().setUnlock({ running: false });
+      if (ownsUnlockDisplay()) {
+        if (services.status === 'fulfilled') applyUnlockSnapshot(services.value);
+        else useAppStore.getState().setUnlock({ running: false });
+      }
       if (ip.status === 'rejected') throw ip.reason;
       if (services.status === 'rejected') throw services.reason;
     }).finally(() => {
@@ -570,7 +586,7 @@ export function MobileHomeScreen(): ReactElement {
       checkRun.current.busy = false;
       checkRun.current.requestId = null;
       checkRun.current.backendRequested = false;
-      if (requestId && requested && checkRun.current.generation === generation) useAppStore.getState().setUnlock({ running: false });
+      if (requestId && requested && ownsUnlockDisplay()) useAppStore.getState().setUnlock({ running: false });
       if (checkRun.current.alive) setManualCheckBusy(false);
     });
   }, [runWrite, beginUnlockCheck, applyUnlockSnapshot, setIpInfo, normalMainRequired, latencyCheck, t]);
@@ -578,22 +594,26 @@ export function MobileHomeScreen(): ReactElement {
   const onUseAsExit = useCallback(
     (server: ServerConfig) => {
       // Only a known manual selection may skip the authoritative switch/readback.
+      const session = pickerSession.current;
+      if (pendingPickerSession.current === session) return;
       const config = useAppStore.getState().config;
       if (config && config.selectionIntent === undefined && server.id === config.selectedServerId) {
         setPickerOpen(false);
         return;
       }
+      pendingPickerSession.current = session;
       void runWrite('switch-node', async () => {
         const receipt = await switchServer(server.id);
-        if (!receipt) return;
+        if (!receipt || pickerSession.current !== session) return;
         const feedback = mobileSwitchReceiptFeedback(receipt, server.name, t);
         if (feedback?.tone === 'success') toast.success(feedback.text);
         else if (feedback?.tone === 'warning') toast.warning(feedback.text);
         else if (feedback) toast.info(feedback.text);
-      }).then(() => {
+      }, () => pickerSession.current === session).then(() => {
         /* 失败也关：选择器是一层覆盖，错误留在它下面等于看不见。关掉之后行内错误就贴在
            动作行的「切换节点」那颗控件下面 —— 那是用户刚刚动过的地方，且是可见的。 */
-        setPickerOpen(false);
+        if (pendingPickerSession.current === session) pendingPickerSession.current = null;
+        if (pickerSession.current === session) setPickerOpen(false);
       });
     },
     [runWrite, switchServer, t],
@@ -604,22 +624,26 @@ export function MobileHomeScreen(): ReactElement {
     (kind: 'direct' | 'block') => {
       if (kind === 'block' && blockDisabledReason !== null) return;
       const id = kind === 'direct' ? DIRECT_SERVER_ID : BLOCK_SERVER_ID;
+      const session = pickerSession.current;
+      if (pendingPickerSession.current === session) return;
       const config = useAppStore.getState().config;
       if (config && config.selectionIntent === undefined && id === config.selectedServerId) {
         setPickerOpen(false);
         return;
       }
+      pendingPickerSession.current = session;
       void runWrite('switch-node', async () => {
         const receipt = await switchServer(id);
-        if (!receipt) return;
+        if (!receipt || pickerSession.current !== session) return;
         const label = t(kind === 'direct' ? 'home.routingDirect' : 'home.routingBlock');
         const feedback = mobileSwitchReceiptFeedback(receipt, label, t);
         if (feedback?.tone === 'success') toast.success(feedback.text);
         else if (feedback?.tone === 'warning') toast.warning(feedback.text);
         else if (feedback) toast.info(feedback.text);
-      }).then(() => {
+      }, () => pickerSession.current === session).then(() => {
         /* 失败也关，理由同 `onUseAsExit`：选择器是一层覆盖，错误留在它下面等于看不见。 */
-        setPickerOpen(false);
+        if (pendingPickerSession.current === session) pendingPickerSession.current = null;
+        if (pickerSession.current === session) setPickerOpen(false);
       });
     },
     [blockDisabledReason, runWrite, switchServer, t],
@@ -657,6 +681,7 @@ export function MobileHomeScreen(): ReactElement {
   const onOpenRuleSubject = useCallback((host: string) => {
     const subject = ruleSubjectForValue(host);
     if (subject === null) return;
+    ruleSession.current += 1;
     setRuleSubject(subject);
     setRuleSubjectView('menu');
     setNewRuleAction('proxy');
@@ -675,6 +700,9 @@ export function MobileHomeScreen(): ReactElement {
     (action: RuleAction, remarks: string) => {
       const subject = ruleSubject;
       if (subject === null) return;
+      const session = ruleSession.current;
+      if (pendingRuleSession.current === session) return;
+      pendingRuleSession.current = session;
       void runWrite('rule-add', async () => {
         const rule = {
           type: subject.type,
@@ -696,9 +724,10 @@ export function MobileHomeScreen(): ReactElement {
           await api.rules.add(rule, 'route');
           void loadConfig(true);
         }
-      }).then(() => {
+      }, () => ruleSession.current === session).then(() => {
         /* 成功失败都关：面板是一层覆盖，`rule-add` 的行内错误贴在它下面那张卡上。 */
-        setRuleSubject(null);
+        if (pendingRuleSession.current === session) pendingRuleSession.current = null;
+        if (ruleSession.current === session) setRuleSubject(null);
       });
     },
     [ruleSubject, runWrite, stagingEnabled, stage, t, loadConfig],
@@ -731,6 +760,9 @@ export function MobileHomeScreen(): ReactElement {
     (target: RuleAppendTarget) => {
       const subject = ruleSubject;
       if (subject === null) return;
+      const session = ruleSession.current;
+      if (pendingRuleSession.current === session) return;
+      pendingRuleSession.current = session;
       void runWrite('rule-add', async () => {
         const { base, next, stagingNow: stagingEnabled } = prepareRuleAppend(target, subject);
         if (next === null) throw new Error(t('rules.appendFail'));
@@ -747,8 +779,9 @@ export function MobileHomeScreen(): ReactElement {
           await api.rules.update(next, 'route', base);
           void loadConfig(true);
         }
-      }).then(() => {
-        setRuleSubject(null);
+      }, () => ruleSession.current === session).then(() => {
+        if (pendingRuleSession.current === session) pendingRuleSession.current = null;
+        if (ruleSession.current === session) setRuleSubject(null);
       });
     },
     [ruleSubject, runWrite, rules, t, stagingEnabled, stage, loadConfig],
@@ -770,8 +803,8 @@ export function MobileHomeScreen(): ReactElement {
       tsExitWarning={tsExitWarning}
       onTsExitAction={onTsExitAction}
       pickerOpen={pickerOpen}
-      onOpenPicker={() => { setPickerQuery(''); setPickerOpen(true); }}
-      onClosePicker={() => setPickerOpen(false)}
+      onOpenPicker={() => { pickerSession.current += 1; setPickerQuery(''); setPickerOpen(true); }}
+      onClosePicker={() => { pickerSession.current += 1; setPickerOpen(false); }}
       pickerQuery={pickerQuery}
       onPickerQuery={setPickerQuery}
       autoSelectControls={<SavedAutoSelectControls showStatus t={t} query={pickerQuery} />}
@@ -814,7 +847,7 @@ export function MobileHomeScreen(): ReactElement {
       ruleSubject={ruleSubjectVM}
       ruleSubjectView={ruleSubjectView}
       onOpenRuleSubject={onOpenRuleSubject}
-      onCloseRuleSubject={() => setRuleSubject(null)}
+      onCloseRuleSubject={() => { ruleSession.current += 1; setRuleSubject(null); }}
       onRuleSubjectView={setRuleSubjectView}
       onQuickRule={onQuickRule}
       newRuleAction={newRuleAction}

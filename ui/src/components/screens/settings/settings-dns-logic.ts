@@ -4,6 +4,7 @@
  * 此处不持有 React state、不发 IPC、也不写配置；页面组件独占草稿、确认和 update 事务。
  * 保留为独立 owner，避免输入校验/竞速池身份规则与呈现层耦合。
  */
+import { isIpLiteral as isStrictIpLiteral } from '@/domain/ip-cidr';
 import type { CustomDnsUpstream, DnsConfig } from '@/contracts/types';
 
 export const MAX_DOH_RACE_UPSTREAMS = 3;
@@ -152,7 +153,7 @@ export function parseDnsServerSpec(spec: string | undefined | null): ParsedDnsSe
 /** DoH host 是字面 IP 时无需 bootstrap。 */
 export function isIpDoh(url: string): boolean {
   const parsed = parseDnsServerSpec(url);
-  return parsed ? !parsed.isDomain : false;
+  return parsed ? isIpLiteral(parsed.server) : false;
 }
 
 /** 只有 TUN 下关闭 FakeIP 需要风险确认。 */
@@ -178,8 +179,9 @@ export function fakeIpTogglePatch(next: boolean): Partial<DnsConfig> {
 export function isPureIpDnsSpec(spec: string): boolean {
   const s = spec.trim();
   if (!s) return true;
+  if (/^tls:/i.test(s)) return false; // Node pre-resolution supports HTTPS/UDP, not DoT.
   const parsed = parseDnsServerSpec(s);
-  return parsed ? !parsed.isDomain : false;
+  return parsed ? isStrictIpLiteral(parsed.server) : false;
 }
 
 export const DNS_FALLBACK = {

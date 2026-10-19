@@ -138,6 +138,7 @@ fn config_generation_norm_global_ignores_user_routing() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -160,6 +161,7 @@ fn traffic_rules_target_is_hot_switch_axis_and_legacy_mirror_is_ignored() {
         action: RuleAction::Proxy,
         enabled: true,
         target_server_id: Some(target.into()),
+        target_auto_select: None,
         ..Default::default()
     };
     let mut old = UserConfig {
@@ -194,6 +196,7 @@ fn traffic_rules_target_is_hot_switch_axis_and_legacy_mirror_is_ignored() {
                 enabled: true,
                 action: RuleAction::Proxy,
                 target_server_id: Some(target.into()),
+                target_auto_select: None,
                 destination_resolution: None,
                 resolution_only: false,
             }),
@@ -256,3 +259,17 @@ fn norm_server_projection_preserves_id_order_filter_and_duplicate_order() {
 }
 
 mod audit_regressions;
+
+#[test]
+fn native_measurement_settings_are_structural_only_with_native_groups() {
+    use crate::user_config::auto_select::{AutoSelectTarget, SelectionIntent};
+    let old = UserConfig::default();
+    let mut next = old.clone();
+    next.auto_select_enabled = true;
+    next.speed_test_url = Some("https://example.test/check".into());
+    assert_eq!(config_generation_norm(&old, None), config_generation_norm(&next, None));
+    next.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Global });
+    assert_ne!(config_generation_norm(&old, None), config_generation_norm(&next, None));
+    let mut changed_url = next.clone(); changed_url.speed_test_url = Some("https://other.test/check".into());
+    assert_ne!(config_generation_norm(&next, None), config_generation_norm(&changed_url, None));
+}

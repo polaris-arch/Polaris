@@ -31,6 +31,7 @@ polaris-helper-proto = { path = "../crates/helper-proto" }
 sha2 = "0.11"
 
 [dependencies]
+regex = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

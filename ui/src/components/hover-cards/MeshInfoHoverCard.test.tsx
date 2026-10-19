@@ -293,3 +293,11 @@ describe('G3 接线真的在（纯逻辑对了但没挂 = 全绿的缺陷）', (
     expect(SELF).toContain('isAccountBasedProtocol(server.protocol)');
   });
 });
+
+describe('declared mesh route configuration', () => {
+  it.each(['openconnect', 'openvpn-client', 'masque-client'] as const)('%s shows configured CIDRs without fake WireGuard address rows', (protocol) => {
+    const server = { ...VLESS, protocol, meshRoutes: ['10.42.0.0/16', 'fd42::/64', '10.42.0.0/16', '0.0.0.0/0'] } as ServerConfig;
+    expect(meshConfigRows(server)).toEqual([{ id: 'routes', values: ['10.42.0.0/16', 'fd42::/64'] }]);
+    expect(meshRuntimeRows(server, undefined)).toEqual([]);
+  });
+});

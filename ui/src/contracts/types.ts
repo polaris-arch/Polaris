@@ -1,4 +1,4 @@
-import type { SelectionIntent } from './auto-select';
+import type { SelectionIntent, AutoSelectTarget } from './auto-select';
 import type {
   NaiveSettings,
   Hysteria2Settings,
@@ -604,6 +604,8 @@ export interface UserConfig {
   // 选择意图：缺席即手动；自动选择时由后端置上（`auto_select_enable`），点任一节点时由后端清掉。
   // 界面只读：全量保存与补丁带上的值一律被后端以盘上为准覆盖。`selectedServerId` 始终是实际出口。
   selectionIntent?: SelectionIntent;
+  autoSelectEnabled?: boolean;
+  autoSelectPins?: { target: AutoSelectTarget; serverId: string }[];
 
   // 代理模式
   proxyMode: ProxyMode;
@@ -762,7 +764,7 @@ export interface UserConfig {
   // 原 systemProxyBypass 已并入此字段（单一清单，杜绝两处重复）。
   bypassLANList?: string[];
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
-  utlsPolicy?: string; // follow (legacy default), default, or a supported core profile
+  utlsPolicy?: string; // default (Chrome; initial policy), follow, or a supported core profile
   tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
   // WebRTC 防泄露（仅 TUN 模式生效）：off=关；proxy=对 STUN 经协议嗅探强制走代理（srflx=代理 IP，WebRTC 正常）；
   // block=reject STUN（断 P2P、零公网 IP 泄露）。默认 undefined=off（零行为变化）。系统代理模式拦不住（浏览器 WebRTC

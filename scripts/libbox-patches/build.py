@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the pinned Android libbox without changing the supplied source repository."""
+"""Retired Android producer; retained helpers inspect historical component receipts."""
 import argparse
 import hashlib
 import importlib.util
@@ -205,105 +205,11 @@ def publish(aar, receipt, output, receipt_output):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('source', nargs='?', type=Path, default=Path.home() / 'Code/sing-box-v1150a8')
-    parser.add_argument('--module-source', action='append', default=[], metavar='MODULE=REPOSITORY')
-    args = parser.parse_args()
-    # No repository/tool/cache access is allowed before common pins and ABI policy admission.
-    manifest, core, policy = android.admit()
-    shared = android.provider()
-    tool = android.tools(manifest, policy, run)
-    identity = android.input_identity(manifest, core, policy, tool['identity'])
-    producer_candidate = android.candidate(run)
-    source, commit = args.source.expanduser().resolve(), manifest['sourceCommit']
-    require(source.is_dir(), f'Local source repository missing: {source}; pass its path explicitly')
-    official_version, version = core['bundledCoreVersion'], core['sourceBuild']['version']
-    require(run(['git', '-C', str(source), 'rev-parse', f'v{official_version}^{{commit}}'], capture=True).strip() == commit,
-            'Android source commit does not match the core-manifest official version tag')
-    repositories = android.module_sources(args.module_source, manifest)
-    go, jdk, ndk, env = tool['go'], tool['jdk'], tool['ndk'], tool['env']
-    tmp_root = Path('/var/tmp/polaris-libbox')
-    tmp_root.mkdir(exist_ok=True)
-    env['TMPDIR'] = str(tmp_root)
-    # A fresh checkout under ~/Code keeps shared core trees untouched and patches repeatable.
-    with tempfile.TemporaryDirectory(prefix='polaris-libbox-build-', dir=Path.home() / 'Code') as checkout_name:
-        checkout = Path(checkout_name)
-        source_receipt = shared.provision(PATCH_DIR / 'source-manifest.json', source, checkout, repositories, go)
-        android.validate_source_receipt(source_receipt, manifest, core)
-        android.verify_checkout(checkout, source_receipt, shared)
-        require(re.search(r'^go\s+' + re.escape(manifest['goVersion']) + r'\s*$', (checkout / 'go.mod').read_text(), re.M), 'Source Go requirement differs from pinned toolchain')
-        tag_source = (checkout / 'cmd/internal/build_libbox/main.go').read_text()
-        upstream_tags = []
-        for expression in re.findall(r'(?m)^\s*sharedTags = append\(sharedTags, ([^\n]+)\)', tag_source):
-            upstream_tags.extend(re.findall(r'"([^"\n]+)"', expression))
-        require(upstream_tags == manifest['buildTags'], 'Android feature tags differ from upstream source')
-        host_tags = libbox_test_tags(manifest)
-        # Test the patched close chain as real package behavior before binding.
-        # The libbox tests remain explicit because unrelated upstream tests may
-        # require extra modules outside this pinned offline build.
-        run([str(go), 'test', '-race', '-ldflags=-checklinkname=0', '-count=1', '.', './daemon',
-             './adapter/endpoint', './adapter/inbound', './adapter/outbound',
-             './adapter/service', './adapter/certificate', './common/construction',
-             './common/certificate', './log', './route', './dns', './service/api',
-             './service/ssmapi', './service/ccm', './service/ocm'], cwd=checkout, env=env)
-        run([str(go), 'test', '-race', '-count=1', './experimental/clashmode'], cwd=checkout, env=env)
-        files = run([str(go), 'list', '-tags', host_tags, '-f', '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}', './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
-        run([str(go), 'test', '-tags', host_tags, '-race', '-ldflags=-checklinkname=0', '-count=1', *files,
-             str(checkout / 'experimental/libbox/command_server_transient_test.go'),
-             str(checkout / 'experimental/libbox/interface_binding_test.go'),
-             str(checkout / 'experimental/libbox/config_validation_test.go'),
-             str(checkout / 'experimental/libbox/config_construction_persistence_test.go'),
-             str(checkout / 'experimental/libbox/dns_lifecycle_test.go'),
-             str(checkout / 'experimental/libbox/dns_platform_lifecycle_test.go'),
-             str(checkout / 'experimental/libbox/monitor_lifecycle_test.go')], cwd=checkout, env=env)
-        # Optional registry services must preserve existing usage files with
-        # either tag independently and with both real implementations present.
-        for optional in ['with_ccm', 'with_ocm', 'with_ccm,with_ocm']:
-            tags = libbox_test_tags(manifest, optional)
-            tagged_files = run([str(go), 'list', '-tags', tags, '-f',
-                                '{{range .GoFiles}}{{$.Dir}}/{{.}} {{end}}',
-                                './experimental/libbox'], cwd=checkout, env=env, capture=True).split()
-            tagged_tests = [str(checkout / 'experimental/libbox/config_validation_test.go'),
-                            str(checkout / 'experimental/libbox/config_construction_persistence_test.go'),
-                            str(checkout / 'experimental/libbox/dns_lifecycle_test.go'),
-                            str(checkout / 'experimental/libbox/dns_platform_lifecycle_test.go'),
-                            str(checkout / 'experimental/libbox/monitor_lifecycle_test.go')]
-            if optional == 'with_ccm,with_ocm':
-                tagged_tests.append(str(checkout / 'experimental/libbox/config_optional_persistence_test.go'))
-            run([str(go), 'test', '-tags', tags, '-race', '-ldflags=-checklinkname=0',
-                 '-count=1', *tagged_files, *tagged_tests], cwd=checkout, env=env)
-        run([str(go), 'test', '-ldflags=-checklinkname=0', '-count=1', './common/dialer'], cwd=checkout, env=env)
-        android.verify_checkout(checkout, source_receipt, shared)
-        linker_flags = android.linker_flags(core, shared, source_receipt)
-        aar = checkout / 'libbox.aar'
-        command = [str(tool['gomobile']), 'bind', '-o', str(aar), '-target', 'android',
-                   '-androidapi', str(manifest['androidAPI']), '-bootclasspath', str(tool['jar']), '-javapkg=io.nekohasekai', '-libname=box',
-                   '-trimpath', '-buildvcs=false', '-ldflags', linker_flags,
-                   '-tags', ','.join(manifest['buildTags']), './experimental/libbox']
-        print(f'Building Android libbox {version} from {commit}, NDK {manifest["ndkVersion"]}', flush=True)
-        run(command, cwd=checkout, env=env)
-        # The actual callee removes build/<arch>/libbox; reject any remaining generated compiler input.
-        android.verify_checkout(checkout, source_receipt, shared)
-        current_tool = android.tools(manifest, policy, run)
-        require(android.input_identity(manifest, core, policy, current_tool['identity']) == identity, 'Producer inputs changed during bind')
-        artifacts = inspect_aar(aar, checkout, manifest, core, policy, tool, source_receipt)
-        receipt = {'schema': 'polaris-android-libbox-receipt-v1',
-                   'componentProducerCandidate': producer_candidate,
-                   'sourceCommit': commit, 'officialTag': f'v{official_version}', 'version': version,
-                   'sourceReceipt': source_receipt, 'androidInput': identity,
-                   'linkerFlags': linker_flags, 'buildVCS': False,
-                   'validationCleanupContract': {'version': 'polaris-validation-v1', 'constructedBoxCleanup': 'CleanupUnknown', 'exactCleanupEnabled': False},
-                   'tests': 'All existing package/race/libbox/CCM/OCM/dialer tests passed before the original four-ABI bind',
-                   **artifacts}
-        output = ROOT / 'src-tauri/gen/android/app/libs/libbox.aar'
-        output.parent.mkdir(parents=True, exist_ok=True)
-        receipt['aar'] = {'path': str(output.relative_to(ROOT)), 'sha256': sha256(aar.read_bytes()), 'bytes': aar.stat().st_size}
-        receipt['outputFingerprint'] = android.digest(android.canonical(receipt))
-        # Both files are staged only after the same cache predicate succeeds.
-        verify_component(aar, receipt, manifest, core, policy, tool, identity, checkout)
-        require(android.candidate(run) == producer_candidate, 'Component producer source candidate changed during build')
-        publish(aar, receipt, output, PATCH_DIR / 'build-receipt.json')
-        print(f'Validated four ABIs, source BuildID, 16K PT_LOAD, tags and Java API: {receipt["aar"]["sha256"]}', flush=True)
+    # Refuse before argument parsing, source/tool/cache access or publication.
+    # Importable historical receipt predicates above deliberately remain available.
+    raise RuntimeError(
+        'Legacy Android libbox build is retired. Use bash scripts/build-mobile-core.sh android '
+        'with the required source/tool/work/cache arguments; see scripts/mobile-core/README.md.')
 
 
 

@@ -349,7 +349,9 @@ fn append_dns_policy_action(
                 .filter(|(_, tag)| emitted_server_tags.contains(tag))
                 .collect();
             for (index, (_, server_tag)) in members.iter().enumerate() {
-                let response_tag = format!("dns-eval-{}-{index}", group.id);
+                // This sequence is append-only across rules, OR/environment variants and
+                // fallbacks. Allocate by emitted position, never by reusable group ID.
+                let response_tag = format!("dns-eval-{}", out.len());
                 let mut evaluate = dns_rule_from_matcher(matcher.clone());
                 evaluate.action = Some("evaluate".into());
                 evaluate.server = Some(server_tag.clone());
@@ -2234,7 +2236,7 @@ fn find_ts_resolve_node<'a>(
     }
     // 上游 `candidates.find(s => s.id === selectedServerId) ?? candidates[0]`。
     // 优先选中的 TS（若它在候选中），否则候选列表第一个。
-    let selected = config.selected_server_id.as_deref();
+    let selected = config.effective_selected_server_id();
     candidates
         .iter()
         .find(|s| Some(s.id.as_str()) == selected)

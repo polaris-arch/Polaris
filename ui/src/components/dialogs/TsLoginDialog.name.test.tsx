@@ -22,7 +22,7 @@ function node(id: string, name: string, protocol: ServerConfig['protocol']): Ser
 function render(servers: ServerConfig[], serverId?: string): string {
   useAppStore.setState({ servers } as never);
   Object.assign(useAppStore.getInitialState(), { servers });
-  return renderToStaticMarkup(<TsLoginDialog serverId={serverId} />);
+  return renderToStaticMarkup(<TsLoginDialog instanceId="test-login" serverId={serverId} />);
 }
 
 describe('TsLoginDialog node name', () => {

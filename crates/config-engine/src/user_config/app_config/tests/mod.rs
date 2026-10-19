@@ -15,8 +15,13 @@ fn fully_populated() -> UserConfig {
         subscriptions: vec![SubscriptionInterfacePolicy {
             id: "sub".into(),
             proxy_bind_interface: Some("en0".into()),
+            speed_test_interval_minutes: None,
         }],
         selected_server_id: Some(String::new()),
+        auto_select_enabled: true,
+        selection_intent: Some(super::super::auto_select::SelectionIntent { mode: "auto".into(), target: super::super::auto_select::AutoSelectTarget::Global }),
+        auto_select_pins: Vec::new(),
+        speed_test_url: Some("https://example.test/".into()),
         proxy_mode: default_proxy_mode(),
         proxy_mode_type: default_proxy_mode_type(),
         tun_config: Some(TunModeConfig::default()),
@@ -90,4 +95,22 @@ fn field_names_equals_serde_projection() {
 fn field_names_has_no_duplicates() {
     let unique: BTreeSet<&str> = UserConfig::FIELD_NAMES.iter().copied().collect();
     assert_eq!(unique.len(), UserConfig::FIELD_NAMES.len());
+}
+
+#[test]
+fn utls_default_initialization_and_missing_fields_preserve_explicit_policies() {
+    assert_eq!(
+        UserConfig::default().utls_policy.as_deref(),
+        Some("default")
+    );
+    let mut raw = serde_json::to_value(UserConfig::default()).unwrap();
+    raw.as_object_mut().unwrap().remove("utlsPolicy");
+    let missing: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(missing.utls_policy.as_deref(), Some("default"));
+    for policy in ["follow", "default", "random", "randomized", "firefox"] {
+        raw["utlsPolicy"] = serde_json::json!(policy);
+        let parsed: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(parsed.utls_policy.as_deref(), Some(policy));
+        assert_eq!(serde_json::to_value(&parsed).unwrap()["utlsPolicy"], policy);
+    }
 }

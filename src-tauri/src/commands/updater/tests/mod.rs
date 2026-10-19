@@ -2735,27 +2735,14 @@ fn update_install_stops_the_core_before_opening_the_portable_archive() {
         "留底必须在交付之后、提交退出之前：早了记的是一次没发生的交付，晚了进程已经没了"
     );
 
-    // 两个系统打开均是自动替换之前的显式手动交付：形态错配，或 macOS 准入失败。
-    // 它们必须各自在受控分支早退，不得流入便携替换/提交退出。
+    // Unsupported assets now fail closed. Only a receipt-bound staged DMG can be opened.
     let opens: Vec<usize> = body.match_indices(".open(").map(|(i, _)| i).collect();
-    assert_eq!(
-        opens.len(),
-        2,
-        "系统打开只允许形态错配与 macOS 准入失败两条受控手动交付"
-    );
-    let reject = body.find("Err(reject) => {").expect("形态错配回退不见了");
-    let advisory = body
-        .find("update_install::install_advisory(&plan)")
-        .expect("安装前告知判定不见了");
-    assert!(reject < opens[0] && opens[0] < advisory);
-    // 那一处打开受 `hands_to_system` 把守：便携形态拿到安装程序时不交系统（交出去就是运行它）。
-    let guard = body[reject..opens[0]]
-        .find("if reject.hands_to_system() {")
-        .expect("形态错配回退没有先问 `hands_to_system`");
-    assert!(
-        !body[reject + guard..opens[0]].contains("} else {"),
-        "`.open(` 必须在 `hands_to_system()` 为真的那一支里"
-    );
+    assert_eq!(opens.len(), 1);
+    let reject = body.find("Err(_reject) => {").unwrap();
+    let advisory = body.find("update_install::install_advisory(&plan)").unwrap();
+    assert!(!body[reject..advisory].contains(".open("));
+    let stage = body.find("updater.custody.stage(&source)").unwrap();
+    assert!(advisory < stage && stage < opens[0]);
 
     let mac = body
         .find("if plan.platform == update_install::InstallPlatform::Macos {")
@@ -2764,12 +2751,12 @@ fn update_install_stops_the_core_before_opening_the_portable_archive() {
         .find("if let Err(error) = update_install::preflight_mac_admission(bundle) {")
         .expect("只有准入失败才可手动交付")
         + mac;
-    assert!(advisory < mac && mac < admission && admission < opens[1] && opens[1] < prepare);
+    assert!(advisory < mac && mac < admission && admission < opens[0] && opens[0] < prepare);
     let manual = &body[mac..prepare];
     assert!(manual.contains("if let Some(bundle) = plan.app_bundle_path.as_deref() {"));
     assert!(manual.contains("app.shell().open(file_path.clone(), None)"));
-    assert!(!body[admission..opens[1]].contains("} else {"));
-    let manual_return = body[opens[1]..prepare]
+    assert!(!body[admission..opens[0]].contains("} else {"));
+    let manual_return = body[opens[0]..prepare]
         .find("return Ok(match opened {")
         .expect("手动交付必须在关闭 Start 准入前整条早退");
     assert!(manual_return > 0);
@@ -2935,4 +2922,23 @@ fn full_uninstall_prepares_all_desktop_owners_before_any_destructive_step() {
         body.contains("let _exit_ready ="),
         "the Ready guard spans helper scripts and config removal"
     );
+}
+
+
+#[test]
+fn portable_reminder_is_read_only_and_confirmed_install_requires_fresh_custody() {
+    let body = crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
+    let readonly = body.find("if confirmed == Some(false) && os == \"windows\" && portable.is_some()").unwrap();
+    let authority = body[readonly..].find("    if let Err(error) = state.updater().custody.admits_install").unwrap() + readonly;
+    let branch = &body[readonly..authority];
+    assert!(branch.contains("requiresRedownload"));
+    assert!(branch.contains("exe_path.parent()"));
+    for forbidden in [".open(", "std::fs::", "mutate_state", ".stage(", "remove_file", "remember_portable_update"] {
+        assert!(!branch.contains(forbidden), "{forbidden}");
+    }
+    let stage = body.find("updater.custody.stage(&source)").unwrap();
+    let handoff = body.find("hand_apk_to_system_installer(").unwrap();
+    assert!(authority < stage && stage < handoff);
+    assert!(body[authority..stage].contains("updateTrustRequired"));
+    assert!(body[stage..handoff].contains("plan.installer_path = installer.clone()"));
 }

@@ -40,6 +40,14 @@ use crate::runtime::AppRuntime;
 use polaris_config_engine::builder::orchestration::stable_stringify;
 use serde::Serialize;
 
+/// DNS dependency diagnostics may contain user-controlled identifiers. IPC gets a stable code only.
+fn config_store_error<T>(error: polaris_store::StoreError) -> ApiResponse<T> {
+    if let Some(code) = error.code() {
+        return ApiResponse::err_with_code("DNS dependency is invalid or still in use", code);
+    }
+    ApiResponse::err(format!("{error}"))
+}
+
 /// 上游 `CONFIG_GET`：加载完整 UserConfig（剥除 privacyPassword）。
 ///
 /// F1：缺省字段在此边界补成**生效值**（`bypassLANList` 的 27 条 `DEFAULT_BYPASS_LAN`、
@@ -54,7 +62,9 @@ use serde::Serialize;
 pub fn config_get(state: State<'_, AppRuntime>) -> ApiResponse<Value> {
     // 启动期一次性配置维护（对齐 上游 `loadConfig` 内联步骤，Polaris 运行时 `load_full` 未接线 →
     // 收口在前端首个配置入口）：清孤儿 tmp + 回填 clashApiSecret + F29 旧明文密码无损迁移为哈希。best-effort。
-    run_startup_maintenance_once(state.config());
+    if let Err(error) = run_startup_maintenance_once(state.config()) {
+        return ApiResponse::err_with_code(error, "CONFIG_SECURITY_MAINTENANCE_FAILED");
+    }
     match state.config().load_full() {
         Ok(mut cfg) => {
             apply_frontend_view(&mut cfg);
@@ -423,7 +433,7 @@ pub fn config_save(
             );
             ApiResponse::ok(outcome)
         }
-        Err(e) => ApiResponse::err(format!("{e}")),
+        Err(e) => config_store_error(e),
     }
 }
 
@@ -615,7 +625,7 @@ fn config_edit_response(
             apply_frontend_view(&mut frontend);
             ApiResponse::ok(frontend)
         }
-        Err(e) => ApiResponse::err(format!("{e}")),
+        Err(e) => config_store_error(e),
     }
 }
 
@@ -736,6 +746,9 @@ pub fn config_mutate_entities(
         }
         Err(error) => {
             log::warn!("config:mutateEntities rejected: {error}");
+            if error.code().is_some() {
+                return config_store_error(error);
+            }
             ApiResponse::err(crate::i18n::t(
                 crate::i18n::app_lang(&app),
                 crate::i18n::key::NATIVE_UNKNOWN_ERROR,
@@ -994,7 +1007,7 @@ pub fn config_update_mode(
             }
             ok_void()
         }
-        Err(e) => ApiResponse::err(format!("{e}")),
+        Err(e) => config_store_error(e),
     }
 }
 
@@ -1025,7 +1038,7 @@ pub fn config_set_value(
             );
             ok_void()
         }
-        Err(e) => ApiResponse::err(format!("{e}")),
+        Err(e) => config_store_error(e),
     }
 }
 
@@ -1099,6 +1112,28 @@ pub(crate) fn invalidate_unlock_on_exit_change<S: UnlockEventSink>(
 
 /// 隐私模式当前状态（进程内；重启复位——对齐前端 app-store 的 `privacyMode: false` 初值）。
 static PRIVACY_MODE: AtomicBool = AtomicBool::new(false);
+// Serializes validation, password replacement, mode transition and its event.
+static PRIVACY_TRANSITION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn set_privacy_mode_core(
+    mode: &AtomicBool,
+    value: bool,
+    authenticated: bool,
+) -> Result<bool, &'static str> {
+    if !value && mode.load(Ordering::Relaxed) && !authenticated {
+        return Err("PRIVACY_LOCKED");
+    }
+    Ok(mode.swap(value, Ordering::Relaxed) != value)
+}
+
+fn emit_privacy_transition(app: &AppHandle, value: bool) {
+    let event = if value {
+        EVENT_ENTER_PRIVACY_MODE
+    } else {
+        EVENT_EXIT_PRIVACY_MODE
+    };
+    let _ = app.emit(event, ());
+}
 
 /// 历史遗留明文密码键（旧版本残留）。由 `store::migrate` 每次 load 清空 + 本层在 `config_get`
 /// （全量快照的唯一出口；`configChanged` 已无载荷，不构成全量快照出口）剥除。单键出口
@@ -1145,10 +1180,9 @@ pub(crate) fn strip_privacy_secrets(cfg: &mut Value) {
 ///
 /// `set_password_core` **清除密码用的就是「键缺失」**（`obj.remove(HASH_KEY)`）。若在汇流点无条件回填，
 /// 清除密码会永久失效（每次都把旧 hash 填回来）。故只作用于「前端全量提交」的两个入口
-/// （`config_save` / `backup_import_apply`）；后端自己读 `current()` 改键的路径（server/rules/
-/// subscription/set_value…）本就带着 hash，不受影响。
+/// （config_save / patch / backup）；专用密码 setter 与迁移直接写 ConfigManager，不走此边界。
 ///
-/// 语义：**入参显式带该键 → 尊重入参**（专线写入 / 清除）；入参缺该键 → 从当前配置回填。
+/// 普通提交始终镜像当前隐私凭据，删除调用方注入；专用写入直接使用 ConfigManager。
 #[cfg(test)]
 pub(crate) fn preserve_server_owned_secrets(config: &ConfigManager, incoming: &mut Value) {
     // 读不到当前配置（首启无文件等）→ 无可回填，原样保存（不猜、不阻断保存）。
@@ -1162,48 +1196,22 @@ fn preserve_server_owned_secrets_from(current: &Value, incoming: &mut Value) {
     let Some(obj) = incoming.as_object_mut() else {
         return;
     };
-    for key in [PRIVACY_PASSWORD_KEY, PRIVACY_PASSWORD_HASH_KEY] {
-        if obj.contains_key(key) {
-            continue;
-        }
-        if let Some(v) = current.get(key) {
-            obj.insert(key.to_string(), v.clone());
+    for key in PRIVACY_KEYS {
+        match current.get(key) {
+            Some(value) => {
+                obj.insert(key.to_string(), value.clone());
+            }
+            None => {
+                obj.remove(key);
+            }
         }
     }
 }
 
 // ── 后端权威字段（前端零写入权）在全量保存边界的强制回正 ────────────────────────────
 //
-// # 与 `preserve_server_owned_secrets` 是两条不同策略，不能合并
-//
-// 隐私密钥在 `config_get`（全量快照的唯一出口）被 `strip_privacy_secrets` 剥除 ⇒ 前端快照里
-// **根本没有该键**，故「键缺失即回填、键在即尊重入参」够用（且必须尊重入参——清密码用的就是键缺失）。
-//
-// 本组字段**照常下发前端**（`TrayMenu` 要读 `recentServerIds` 渲染「节点·最近」）⇒ 前端快照里
-// **键在、值陈旧**，回填策略永不触发，必须无条件以磁盘为准。
-//
-// # 历史缺陷与当前边界（用户 2026-07-21 真机报「托盘最近节点只剩 1 条」）
-//
-// 后端 `server_switch` 写 `recentServerIds`（`commands/server.rs` 的 `push_recent_server_id`：
-// unshift + 去重 + `truncate(3)`）后经 `broadcast_config_changed` 广播；前端保鲜总线
-// （`ui/src/App.tsx` 的 `api.config.onChanged(() => void loadConfig(true))`）本应把新值拉回，但
-// `ui/src/store/app-store.ts` 的乐观写腿（`switchServer` / `saveConfig`）在 mutation 后调
-// `invalidateLoadConfig()`，而其代际守卫（`if (myGeneration !== loadConfigGeneration) return`）
-// **无法区分**「mutation 之前发起的陈旧 load（该丢）」与「mutation 自己的新鲜回声（该留）」，一律丢弃
-// ⇒ store 留陈旧值 ⇒ 旧实现的多个全量保存入口能把后端刚写的历史整份抹回。
-//
-// # 为什么边界保护仍保留
-//
-// 当前即时编辑已改为顶层 patch / 集合实体事务，整份保存只剩版本化暂存与备份导入；两者在
-// `ConfigManager::update*` 的同一锁内拿磁盘现值、执行本策略并落盘。MRU/订阅后台写无法再插进
-// “回填权威字段 → 保存”的窗口。本策略因此是字段所有权的最后一道约束，不再承担并发补丁职责。
-//
-// # 为什么不做深合并（本仓刻意不引入 merge）
-//
-// 深合并会同时废掉「清空数组」（传 `[]`）与「删键」两种删除表达，且射程覆盖**全部**字段——用户删掉
-// 最后一条规则会发现删不掉。上游 全仓 save 路径零 merge 正是这个原因；它对唯一需要保护的字段
-// （隐私密码）的解法是**把字段搬出 config 对象**（独立 `privacy-lock.json`），而非在 save 路径加保护。
-// 字段级所有权划分把「以磁盘为准」的射程压到前端根本不写的键上，删除困境自然不存在。
+// Both privacy credentials and these fields mirror their backend owner on ordinary writes.
+// Privacy values are additionally omitted from renderer snapshots.
 
 /// 「后端权威」配置字段：**前端零写入权**（UI 只读或全仓零引用），真值只由后端写路径产生。
 ///
@@ -1216,7 +1224,7 @@ fn preserve_server_owned_secrets_from(current: &Value, incoming: &mut Value) {
 ///
 /// `appRulesSeeded` 同样**不收**：它在 `polaris_store::backup` 的 `DATA_FIELDS` 里，随 appRules 类
 /// 被备份导入合法写入 ⇒ 所有权有争议，不满足「零写入权」。
-const BACKEND_AUTHORITATIVE_KEYS: [&str; 5] = [
+const BACKEND_AUTHORITATIVE_KEYS: [&str; 7] = [
     // 托盘「节点·最近」MRU。只由 `server_switch` 写；ui 全仓仅 TrayMenu 读。
     "recentServerIds",
     // 内置 geo 元数据（随包）。只由 geo seed 写；ui 全仓零读零写。
@@ -1228,6 +1236,8 @@ const BACKEND_AUTHORITATIVE_KEYS: [&str; 5] = [
     // 「自动选择」置上。前端零写入权：全量保存与补丁带来的值一律以盘上为准，既冲不掉、也造不出
     // 一个意图；指向的订阅被删掉时由保存前的清洗移除。
     polaris_store::SELECTION_INTENT_KEY,
+    polaris_store::auto_select::ENABLED_KEY,
+    polaris_store::auto_select::PINS_KEY,
     // 曾有第三项 `diagnosticCapture`（诊断采集态）。整条机制已删除（核日志改由 `SubscribeLog` 全级别
     // 送达、级别筛在客户端，不再需要「临时把核提级到 debug」的会话），故该键不再是任何人的权威字段。
     // 旧配置里的残留由 `polaris_store::migrate::migrate_diagnostic_capture` 还原级别后清除。
@@ -1276,22 +1286,24 @@ fn enforce_backend_authoritative_fields_from(current: &Value, incoming: &mut Val
 //
 // 上游 在 `loadConfig` 里做了三件启动维护：sweepStaleTmpFiles / 回填 clashApiSecret / F29 旧明文密码
 // 迁移为哈希。Polaris 的 `store::ConfigStore::load` 是纯逻辑（load 成功路径绝不写盘，仅返回 migration_delta
-// 供调用方决策），故这三件需 FS 写 + crypto 的维护收口在**前端首个配置入口** `config_get`，一次性执行。
+// 供调用方决策），故维护由 `config_get` 与 `proxy_start` 共用入口执行；只有成功才记完成。
 
 /// 进程内一次性守卫：启动维护只跑一次（对齐 上游 `tmpSwept` / 首次 loadConfig 语义）。
 static STARTUP_MAINTENANCE_DONE: AtomicBool = AtomicBool::new(false);
 
-/// 启动期一次性维护：清孤儿 tmp + 回填 clashApiSecret + F29 明文密码无损迁移。全 best-effort，绝不阻断。
-fn run_startup_maintenance_once(config: &ConfigManager) {
-    if STARTUP_MAINTENANCE_DONE.swap(true, Ordering::SeqCst) {
-        return;
+/// 安全维护成功后才记完成；错误显式返回，后续调用允许重试。
+pub(crate) fn run_startup_maintenance_once(config: &ConfigManager) -> Result<(), String> {
+    run_startup_maintenance(config, &STARTUP_MAINTENANCE_DONE)
+}
+
+fn run_startup_maintenance(config: &ConfigManager, done: &AtomicBool) -> Result<(), String> {
+    if done.load(Ordering::SeqCst) {
+        return Ok(());
     }
-    // ① 清扫原子写遗留的孤儿 tmp（进程 write(tmp) 成功后 rename 前被硬杀/断电留下；随机名不会被下次写覆盖自愈）。
     sweep_stale_tmp_files(config.path());
-    // ② 回填 clashApiSecret（本地管理 API/dashboard 出厂鉴权）+ F29 旧明文密码无损迁移为 salted hash。
-    if let Err(e) = backfill_secret_and_privacy(config) {
-        log::warn!("启动配置维护（clashApiSecret / 隐私哈希回填）失败（不阻断）: {e}");
-    }
+    backfill_secret_and_privacy(config)?;
+    done.store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 /// 清扫孤儿 tmp（`<config>.<12hex>.tmp` 且 mtime>60s）。上游 `sweepStaleTmpFiles`。
@@ -1351,9 +1363,12 @@ pub(crate) fn generate_local_api_secret() -> Result<String, String> {
 /// 仍留），算 **scrypt** 哈希存进独立 `privacy-lock.json`（0600），并触发 config save_full 抹掉盘上残留明文。
 /// 仅当盘上有明文 **且** 既无 scrypt 文件 **又** 无 legacy SHA-256 键时执行（不覆盖用户已设的新密码）。
 ///
-/// clashApiSecret 与「明文迁移触发的明文抹除」合并为**一次** save_full 落盘。幂等：secret 已在 /
-/// 无旧明文 / 已有 scrypt 文件或 legacy 键 → 不写。
+/// API secret publication is independent of privacy migration failure; errors remain retryable.
+/// Canonical config saves retain a supported legacy verifier before scrubbing plaintext on failure.
 fn backfill_secret_and_privacy(config: &ConfigManager) -> Result<(), String> {
+    let _transition = PRIVACY_TRANSITION
+        .lock()
+        .map_err(|_| "隐私锁状态不可用".to_string())?;
     let path = config.path();
     // 盘上旧明文密码：in-memory load 经 migrate 抹成 ""，故直读盘取明文（load 成功不落盘 → 盘上此刻仍留明文）。
     let disk_plain: Option<String> = std::fs::read_to_string(path)
@@ -1370,68 +1385,56 @@ fn backfill_secret_and_privacy(config: &ConfigManager) -> Result<(), String> {
     // 否则会用默认配置覆盖损坏原文件 = 破坏 `store::ConfigStore::load` 的「不覆盖损坏磁盘」保护（数据丢失）。
     let loaded = polaris_store::ConfigStore::load(&polaris_store::StdFs, path);
     if loaded.error.is_some() && !loaded.was_missing {
-        return Ok(()); // 损坏配置：只备份（load 已做），绝不回填覆盖
+        return Err("配置损坏或不可读取，安全维护未完成；原文件已保留".into());
     }
-    let mut cfg = loaded.config;
-    // 已有隐私密码 = scrypt 文件存在 **或** legacy SHA-256 键存在（任一都不得被旧明文覆盖）。
-    let has_scrypt_file = polaris_store::privacy_lock::has(&StdFs, &privacy_lock_path(config));
+    let cfg = loaded.config;
     let has_legacy = config_has_password(&cfg);
-    let Some(obj) = cfg.as_object_mut() else {
-        return Ok(());
-    };
-    let mut changed = false;
-
-    // clashApiSecret 回填（缺失/空 → 随机生成）。
-    let has_secret = obj
-        .get("clashApiSecret")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty());
-    if !has_secret {
-        obj.insert(
-            "clashApiSecret".to_string(),
-            json!(generate_local_api_secret()?),
-        );
-        changed = true;
-    }
-
-    // F29 无损迁移：盘上有旧明文 && 既无 scrypt 文件又无 legacy 键 → 用明文算 **scrypt** 存独立文件。
-    // changed=true 触发下方 save_full → 用 migrate 已抹空明文的 cfg 覆盖盘上 config.json（scrub 残留明文）。
-    let needs_plain_scrub = disk_plain.is_some();
-    if let Some(plain) = disk_plain {
-        if !has_scrypt_file && !has_legacy {
-            let salt = gen_salt()?;
-            let hash = polaris_store::privacy_lock::hash_password(&plain, &salt)
-                .map_err(|e| format!("{e}"))?;
-            polaris_store::privacy_lock::write(&StdFs, &privacy_lock_path(config), &hash)
-                .map_err(|e| format!("{e}"))?;
-            changed = true;
+    let has_secret = cfg.get("clashApiSecret").and_then(Value::as_str)
+        .is_some_and(|secret| !secret.trim().is_empty());
+    let generated_secret = if has_secret { None } else { Some(generate_local_api_secret()?) };
+    // API authentication must still be published if credential migration fails.
+    let privacy_result = (|| {
+        let has_scrypt = polaris_store::privacy_lock::has(&StdFs, &privacy_lock_path(config))
+            .map_err(|error| error.to_string())?;
+        if let Some(plain) = disk_plain.as_deref() {
+            if !has_scrypt && !has_legacy {
+                let salt = gen_salt()?;
+                let record = polaris_store::privacy_lock::hash_password(plain, &salt)
+                    .map_err(|error| error.to_string())?;
+                polaris_store::privacy_lock::write(&StdFs, &privacy_lock_path(config), &record)
+                    .map_err(|error| error.to_string())?;
+            }
         }
-    }
-    // 独立 scrypt 文件可能已在上一次迁移中写成、但 config 原子写随后失败。只要盘上仍有旧明文，
-    // 本轮就必须再次落配置完成 scrub；不能因 scrypt 已存在而永久留下明文。
-    changed |= needs_plain_scrub;
-
-    if changed {
-        let generated_secret = cfg.get("clashApiSecret").cloned();
-        // 基于锁内最新配置补字段并触发 migrate/sanitize 落盘，避免启动期其它写入恰好插入时被整份覆盖。
-        config
-            .update(|latest| {
-                let Some(obj) = latest.as_object_mut() else {
-                    return Decision::Skip(());
-                };
-                let has_secret = obj
-                    .get("clashApiSecret")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty());
-                if !has_secret {
-                    if let Some(secret) = generated_secret {
-                        obj.insert("clashApiSecret".to_string(), secret);
-                    }
+        Ok::<(), String>(())
+    })();
+    // Canonicalization scrubs plaintext. Preserve the password using the existing
+    // legacy verifier if scrypt migration failed, before publishing the API secret.
+    // The damaged scrypt file still fails closed until explicitly repaired.
+    let preserved_legacy = if privacy_result.is_err() && !has_legacy {
+        disk_plain.as_deref().map(|plain| {
+            let salt = gen_salt()?;
+            Ok::<String, String>(format!("{}${}", hex_encode(&salt), hash_password(&salt, plain)))
+        }).transpose()?
+    } else { None };
+    if generated_secret.is_some() || disk_plain.is_some() {
+        config.update(|latest| {
+            let Some(obj) = latest.as_object_mut() else { return Decision::Skip(()); };
+            if !obj.get("clashApiSecret").and_then(Value::as_str)
+                .is_some_and(|secret| !secret.trim().is_empty()) {
+                if let Some(secret) = generated_secret {
+                    obj.insert("clashApiSecret".into(), json!(secret));
                 }
-                Decision::Write(())
-            })
-            .map_err(|e| format!("{e}"))?;
+            }
+            if !obj.get(PRIVACY_PASSWORD_HASH_KEY).and_then(Value::as_str)
+                .is_some_and(|hash| !hash.is_empty()) {
+                if let Some(hash) = preserved_legacy {
+                    obj.insert(PRIVACY_PASSWORD_HASH_KEY.into(), json!(hash));
+                }
+            }
+            Decision::Write(())
+        }).map_err(|error| error.to_string())?;
     }
+    privacy_result?;
     Ok(())
 }
 
@@ -1469,7 +1472,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// **legacy** salted SHA-256：`sha256(salt || password)` → hex。复用 `polaris_helper::core_hash::sha256_hex`。
 /// 新密码已改用 scrypt 独立文件（见 `store::privacy_lock`）；本函数仅供**存量 SHA-256 用户的解锁校验**
-/// （经 [`verify_password`] → [`unlock_core`] legacy 分支）复算比对，production 不再用它**创建**新哈希。
+/// （经 [`verify_password`] → [`unlock_core`] legacy 分支）复算比对；旧明文迁移失败时也用它保全凭据，
+/// 避免独立 API secret 持久化时的明文清理丢失密码。新设密码始终使用 scrypt。
 fn hash_password(salt: &[u8], password: &str) -> String {
     let mut data = salt.to_vec();
     data.extend_from_slice(password.as_bytes());
@@ -1566,9 +1570,11 @@ fn set_password_core(
     }
     let path = privacy_lock_path(config);
     if password.is_empty() {
-        // 清除：删 scrypt 文件（不存在视为成功）。
-        polaris_store::privacy_lock::remove(&StdFs, &path)
-            .map_err(|e| SetPasswordError::Other(format!("{e}")))?;
+        // Clear legacy first: a failed config commit must not resurrect an old password
+        // after deleting the authoritative scrypt record.
+        clear_legacy_hash_key(config).map_err(|e| SetPasswordError::Other(format!("{e}")))?;
+        return polaris_store::privacy_lock::remove(&StdFs, &path)
+            .map_err(|e| SetPasswordError::Other(format!("{e}")));
     } else {
         // 新盐 → scrypt 哈希 → 写独立文件（0600）。文件写成功后才抹 legacy 键，避免中途失败致锁死。
         let salt = gen_salt().map_err(SetPasswordError::Other)?;
@@ -1589,7 +1595,7 @@ fn set_password_core(
 fn unlock_core(config: &ConfigManager, password: &str) -> Result<bool, String> {
     let path = privacy_lock_path(config);
     // ① scrypt 文件存在 → 唯一判据（忽略残留 legacy 键）。
-    if let Some(h) = polaris_store::privacy_lock::read(&StdFs, &path) {
+    if let Some(h) = polaris_store::privacy_lock::read(&StdFs, &path).map_err(|e| format!("{e}"))? {
         return Ok(polaris_store::privacy_lock::verify(password, &h));
     }
     // ② 无 scrypt 文件 → 回退 legacy SHA-256。
@@ -1627,7 +1633,7 @@ fn upgrade_legacy_to_scrypt(
 
 /// `privacy:hasPassword` 核心：scrypt 文件存在 **或** config.json 里有非空 legacy SHA-256 键。
 fn has_password_core(config: &ConfigManager) -> Result<bool, String> {
-    if polaris_store::privacy_lock::has(&StdFs, &privacy_lock_path(config)) {
+    if polaris_store::privacy_lock::has(&StdFs, &privacy_lock_path(config)).map_err(|e| format!("{e}"))? {
         return Ok(true);
     }
     let cfg = config.current().map_err(|e| format!("{e}"))?;
@@ -1642,7 +1648,7 @@ pub fn config_get_privacy_mode(_state: State<'_, AppRuntime>) -> ApiResponse<boo
 
 /// 上游 `CONFIG_SET_PRIVACY_MODE`：切换隐私模式（进/出）+ 状态变更时 emit enter/exit 事件。
 ///
-/// 密码闸在 unlock 侧（前端退出前先 `privacy_unlock` 验证）；本 command 落状态转移 + 广播事件，
+/// 未验证只能进入隐私模式；退出由 `privacy_unlock` 验证后在后端原子提交并广播。
 /// 供 UI（Logs/Connections 脱敏）与 log builder（隐私模式抬日志级别）联动。
 #[allow(
     clippy::needless_pass_by_value,
@@ -1654,14 +1660,13 @@ pub fn config_set_privacy_mode(
     _state: State<'_, AppRuntime>,
     value: bool,
 ) -> ApiResponse<()> {
-    let prev = PRIVACY_MODE.swap(value, Ordering::Relaxed);
-    if prev != value {
-        let evt = if value {
-            EVENT_ENTER_PRIVACY_MODE
-        } else {
-            EVENT_EXIT_PRIVACY_MODE
-        };
-        let _ = app.emit(evt, ());
+    let Ok(_transition) = PRIVACY_TRANSITION.lock() else {
+        return ApiResponse::err_with_code("隐私锁状态不可用", "PRIVACY_STATE_UNAVAILABLE");
+    };
+    match set_privacy_mode_core(&PRIVACY_MODE, value, false) {
+        Ok(true) => emit_privacy_transition(&app, value),
+        Ok(false) => {}
+        Err(code) => return ApiResponse::err_with_code("请通过密码验证解锁", code),
     }
     ok_void()
 }
@@ -1675,7 +1680,7 @@ pub fn config_set_privacy_mode(
 pub fn privacy_has_password(state: State<'_, AppRuntime>) -> ApiResponse<bool> {
     match has_password_core(state.config()) {
         Ok(has) => ApiResponse::ok(has),
-        Err(e) => ApiResponse::err(e),
+        Err(e) => ApiResponse::err_with_code(e, "PRIVACY_CREDENTIAL_UNAVAILABLE"),
     }
 }
 
@@ -1694,6 +1699,9 @@ pub fn privacy_has_password(state: State<'_, AppRuntime>) -> ApiResponse<bool> {
 )]
 #[tauri::command]
 pub fn privacy_set_password(state: State<'_, AppRuntime>, password: String) -> ApiResponse<Value> {
+    let Ok(_transition) = PRIVACY_TRANSITION.lock() else {
+        return ApiResponse::err_with_code("隐私锁状态不可用", "PRIVACY_STATE_UNAVAILABLE");
+    };
     let locked = PRIVACY_MODE.load(Ordering::Relaxed);
     match set_password_core(state.config(), &password, locked) {
         Ok(()) => ApiResponse::ok(json!({ "success": true })),
@@ -1720,7 +1728,7 @@ async fn apply_unlock_rate_limit(ok: bool) {
     }
 }
 
-/// 上游 `PRIVACY_UNLOCK`：解锁（验证密码，常量时间比较）。返回 `{ok:bool}`（前端契约）。
+/// `PRIVACY_UNLOCK` 验证密码并在同一后端临界区退出隐私态、广播事件，返回 `{ok:bool}`。
 ///
 /// 已设密码 → 仅哈希匹配返 `true`（scrypt 文件优先，legacy SHA-256 回退+透明升级）；未设密码 → 自由解锁
 /// （`true`，对齐「留空则任何人可解锁」）。
@@ -1728,23 +1736,33 @@ async fn apply_unlock_rate_limit(ok: bool) {
 /// 契约 L141：解锁失败经 [`apply_unlock_rate_limit`] 弱限速 300ms。`async fn` + `tokio::time::sleep`——
 /// **绝不 `std::thread::sleep`**：本 command 跑在 tauri 的 tokio executor 上，`std::thread::sleep`
 /// 会硬阻塞该 worker 线程、冻结同线程上其余并发 IPC；`tokio::time::sleep` 只让出当前 task，executor
-/// 照常调度其余任务（对齐仓内既有用法，如 `runtime/stats.rs`）。`unlock_core` 本身是纯同步计算（无 IO），
+/// 照常调度其余任务（对齐仓内既有用法，如 `runtime/stats.rs`）。验证包含同步文件读取和 KDF，
 /// 限速前先同步跑完拿到 `ok`，`state` 借用不跨随后的 `.await`（本仓 async command 惯例，
 /// 见 `commands/proxy::system_proxy_disable`）。
 #[tauri::command]
 pub async fn privacy_unlock(
+    app: AppHandle,
     state: State<'_, AppRuntime>,
     password: String,
 ) -> Result<ApiResponse<Value>, ()> {
     // tauri 硬性要求：async command 若带引用型入参（`State<'_, _>`），返回值必须是 `Result`
     // （否则宏展开报 `AsyncCommandMustReturnResult` / `'static` 借用期不够）——同 `system_proxy_disable`。
-    let result = unlock_core(state.config(), &password);
+    let result = (|| {
+        let _transition = PRIVACY_TRANSITION
+            .lock()
+            .map_err(|_| "隐私锁状态不可用".to_string())?;
+        let ok = unlock_core(state.config(), &password)?;
+        if ok && set_privacy_mode_core(&PRIVACY_MODE, false, true).map_err(str::to_string)? {
+            emit_privacy_transition(&app, false);
+        }
+        Ok::<bool, String>(ok)
+    })();
     Ok(match result {
         Ok(ok) => {
             apply_unlock_rate_limit(ok).await;
             ApiResponse::ok(json!({ "ok": ok }))
         }
-        Err(e) => ApiResponse::err(e),
+        Err(e) => ApiResponse::err_with_code(e, "PRIVACY_CREDENTIAL_UNAVAILABLE"),
     })
 }
 
@@ -1873,3 +1891,21 @@ pub(crate) async fn apply_config_broadcast_core<F, C>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod dependency_error_response_tests {
+    use super::*;
+
+    #[test]
+    fn dependency_response_preserves_code_without_user_identifiers() {
+        let response: ApiResponse<()> = config_store_error(polaris_store::StoreError::DnsDependency(
+            "https://user:secret@example.invalid/private".to_owned(),
+        ));
+        assert!(!response.success);
+        assert_eq!(response.code.as_deref(), Some("DNS_DEPENDENCY_INVALID"));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("DNS dependency is invalid or still in use")
+        );
+    }
+}

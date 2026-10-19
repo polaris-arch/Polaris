@@ -133,8 +133,14 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
     private var serviceReady = false
     private var serviceEpoch = 0L
 
+    // Native Disconnect cancels but does not join Go/JNI callbacks. Identity is
+    // per subscription, not per service: a same-service reopen also replaces it.
+    private var subscriptionToken: Any? = null
+    private var closeToken = Any()
+
     /** 只在 [worker] 那一条线程上读写（[open] / [close] / [closeClient] 都经它），故不需要同步。 */
     private var client: CommandClient? = null
+    private var clientToken: Any? = null
 
     /** 单线程：`@Command` 一律不在主线程上阻塞（K4 的承重约束），长轮询也在这里等。 */
     private val worker: ExecutorService =
@@ -146,41 +152,49 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
     /** 建流。`onDone(null)` = 成功；`onDone(msg)` = 失败（Rust 侧等一拍重试，同桌面建流失败腿）。 */
     fun open(onDone: (String?) -> Unit) {
         lock.lock()
-        val requestEpoch = try { serviceEpoch } finally { lock.unlock() }
+        val (requestEpoch, requestClose) = try { serviceEpoch to closeToken } finally { lock.unlock() }
         worker.execute {
+            val token = Any()
+            var ownsSubscription = false
             val err = runCatching {
                 // 排队的旧 open 不能先关掉新代 client 再报过期。
                 lock.lock()
                 try {
-                    check(serviceReady && serviceEpoch == requestEpoch) { "内核命令服务未就绪或已换代" }
+                    check(serviceReady && serviceEpoch == requestEpoch && closeToken === requestClose) { "内核命令服务未就绪或已换代" }
                 } finally {
                     lock.unlock()
                 }
                 closeClient()
                 lock.lock()
                 try {
-                    check(serviceReady && serviceEpoch == requestEpoch) { "内核命令服务未就绪或已换代" }
+                    check(serviceReady && serviceEpoch == requestEpoch && closeToken === requestClose) { "内核命令服务未就绪或已换代" }
                     frames.clear()
                     nextSeq = 0L
                     closedReason = null
+                    subscriptionToken = token
+                    ownsSubscription = true
                 } finally {
                     lock.unlock()
                 }
                 val options = CommandClientOptions()
                 subscribe(options)
                 options.statusInterval = STATUS_INTERVAL_NANOS
-                val c = Libbox.newCommandClient(this@CommandStream, options)
+                val c = Libbox.newCommandClient(SubscriptionHandler(token), options)
+                client = c // failure cleanup owns this exact client, too
+                clientToken = token
                 c.connect()
-                client = c
                 lock.lock()
-                val stale = try { !serviceReady || serviceEpoch != requestEpoch }
+                val stale = try { !serviceReady || serviceEpoch != requestEpoch || subscriptionToken !== token }
                     finally { lock.unlock() }
                 if (stale) {
                     closeClient()
                     error("内核命令服务已换代")
                 }
             }.exceptionOrNull()
-            if (err != null) Log.w(TAG, "[$name] 建流失败", err)
+            if (err != null) {
+                if (ownsSubscription) closeClient(token)
+                Log.w(TAG, "[$name] 建流失败", err)
+            }
             onDone(err?.let { it.message ?: it.toString() })
         }
     }
@@ -188,25 +202,22 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
     /** 收流。可在任意线程调用；正在长轮询的请求会被立刻唤醒并空手返回。 */
     fun close() {
         lock.lock()
-        try {
-            markClosed()
-        } finally {
-            lock.unlock()
-        }
-        worker.execute { closeClient() }
+        val token = try {
+            subscriptionToken.also { markClosed() }
+        } finally { lock.unlock() }
+        // This queued retirement cannot close a successor admitted before execute.
+        if (token != null) worker.execute { closeClient(token) }
     }
 
     /** 停核屏障与收流同锁生效；随后任何排队的 open 都须拒绝。 */
     fun suspendForStop() {
         lock.lock()
-        try {
+        val token = try {
             serviceReady = false
             serviceEpoch += 1
-            markClosed()
-        } finally {
-            lock.unlock()
-        }
-        worker.execute { closeClient() }
+            subscriptionToken.also { markClosed() }
+        } finally { lock.unlock() }
+        if (token != null) worker.execute { closeClient(token) }
     }
 
     fun activate() {
@@ -220,6 +231,8 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
     }
 
     private fun markClosed() {
+        closeToken = Any()
+        subscriptionToken = null
         closedReason = closedReason ?: "已收流"
         frames.clear()
         ready.signalAll()
@@ -281,10 +294,35 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
         }
     }
 
-    private fun closeClient() {
+    private fun closeClient(expectedToken: Any? = null) {
+        // Null is used only by the serial open replacement path.
+        if (expectedToken != null && client != null && clientToken !== expectedToken) return
+        lock.lock()
+        try {
+            if (expectedToken == null || subscriptionToken === expectedToken) subscriptionToken = null
+        } finally { lock.unlock() }
         val c = client ?: return
         client = null
+        clientToken = null
         runCatching { c.disconnect() }
+    }
+
+    // The actual handler passed to JNI checks its exact token and keeps the
+    // stream lock through the callback's mutation (enqueue reenters this lock).
+    // No thread-local token and no assumption that disconnect drained callbacks.
+    private inner class SubscriptionHandler(private val token: Any) : CommandClientHandler by this@CommandStream {
+        private fun current(action: () -> Unit) {
+            lock.lock()
+            try {
+                if (subscriptionToken === token && serviceReady && closedReason == null) action()
+            } finally { lock.unlock() }
+        }
+        override fun connected() = current { this@CommandStream.connected() }
+        override fun disconnected(message: String?) = current { this@CommandStream.disconnected(message) }
+        override fun writeStatus(message: StatusMessage) = current { this@CommandStream.writeStatus(message) }
+        override fun writeConnectionEvents(events: ConnectionEvents?) = current {
+            this@CommandStream.writeConnectionEvents(events)
+        }
     }
 
     // ── CommandClientHandler ────────────────────────────────────────────────────
@@ -358,8 +396,11 @@ internal abstract class CommandStream(private val name: String) : CommandClientH
 // 均为必需键，没有 serde default 兜底）。两侧字段集由契约门 A8/A9 双向对拍。
 // ══════════════════════════════════════════════════════════════════════════════
 
-/** libbox `StatusMessage` → 桌面 `SingBoxStatus` 的九个字段（proto `message Status` 同形）。 */
+/** Nine libbox Status payload fields plus bridge-only callback observation time. */
 private fun encodeStatus(m: StatusMessage): JSObject = JSObject().apply {
+    // Native callback observation, before the bounded bridge queue. This is not
+    // a daemon sampling timestamp; never stamp frames when a poll drains them.
+    put("observedAtMs", android.os.SystemClock.elapsedRealtime())
     put("memory", m.memory)
     put("goroutines", m.goroutines)
     put("connectionsIn", m.connectionsIn)

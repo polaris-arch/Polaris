@@ -1,4 +1,4 @@
-import { invoke, invokeScalar, listen, listenReady } from '../ipc-client';
+import { invoke, invokeScalar, listen, listenReady, isTauri } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { UserConfig, StagedClassification, SaveOutcome } from '../../contracts/types';
 import type { TunExclusionPreview } from '../../contracts/tun-exclusion-preview';
@@ -136,6 +136,8 @@ export const configApi = {
   },
 
   async getPrivacyMode(): Promise<boolean> {
+    // Explicit browser-preview authority, never a fallback for native IPC failure.
+    if (!isTauri()) return false;
     return invoke(IPC_CHANNELS.CONFIG_GET_PRIVACY_MODE);
   },
 
@@ -148,13 +150,13 @@ export const configApi = {
    * 进入隐私模式（锁屏）。后端 `config_set_privacy_mode(true)` 状态跃迁时真 emit
    * （config.rs:355-362：仅 prev≠value 才发）；托盘「立即锁定」/ idle 计时 / 别的窗口均经此收敛主窗遮罩。
    */
-  onEnterPrivacyMode(listener: () => void): () => void {
-    return listen(IPC_CHANNELS.EVENT_ENTER_PRIVACY_MODE, listener);
+  onEnterPrivacyMode(listener: () => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_ENTER_PRIVACY_MODE, listener);
   },
 
   /** 退出隐私模式。后端 `config_set_privacy_mode(false)` 真 emit（解锁成功后由前端调 setPrivacyMode(false) 触发）。 */
-  onExitPrivacyMode(listener: () => void): () => void {
-    return listen(IPC_CHANNELS.EVENT_EXIT_PRIVACY_MODE, listener);
+  onExitPrivacyMode(listener: () => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_EXIT_PRIVACY_MODE, listener);
   },
 };
 // ============================================================================

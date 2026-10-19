@@ -87,3 +87,42 @@ describe('createTopicSubscription', () => {
     expect(got).toEqual([42]);
   });
 });
+
+describe('native listener readiness', () => {
+  it('waits for registration and applies latest demand only', async () => {
+    const f = fakePort();
+    let ready!: (off: () => void) => void;
+    f.port.onFrame = () => new Promise((resolve) => { ready = resolve; });
+    const sub = createTopicSubscription(f.port, () => {});
+    sub.setWanted(true);
+    sub.setWanted(false);
+    expect(f.calls).toEqual([]);
+    ready(() => f.calls.push('unlisten'));
+    await Promise.resolve();
+    expect(f.calls).toEqual([]);
+    sub.setWanted(true);
+    expect(f.calls).toEqual(['subscribe']);
+    sub.dispose();
+    expect(f.calls).toEqual(['subscribe', 'unlisten', 'unsubscribe']);
+  });
+  it('disposal during registration prevents subscribe and releases late listener', async () => {
+    const f = fakePort();
+    let ready!: (off: () => void) => void;
+    f.port.onFrame = () => new Promise((resolve) => { ready = resolve; });
+    const sub = createTopicSubscription(f.port, () => {});
+    sub.setWanted(true);
+    sub.dispose();
+    ready(() => f.calls.push('unlisten'));
+    await Promise.resolve();
+    expect(f.calls).toEqual(['unlisten']);
+  });
+  it('registration failure never starts producer', async () => {
+    const f = fakePort();
+    f.port.onFrame = () => Promise.reject(new Error('registration failed'));
+    const sub = createTopicSubscription(f.port, () => {});
+    sub.setWanted(true);
+    await Promise.resolve(); await Promise.resolve();
+    sub.dispose();
+    expect(f.calls).toEqual([]);
+  });
+});

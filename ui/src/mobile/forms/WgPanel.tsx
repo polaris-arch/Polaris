@@ -48,6 +48,7 @@ import {
   isWarpDraft,
   parseConfToDraft,
   reservedInputInvalid,
+  workersInputInvalid,
   validateWgDraft,
   splitCsv,
   type WgDraft,
@@ -191,6 +192,11 @@ export function WgPanel({
     if (reservedInputInvalid(draft.reserved)) {
       revealGroup('advanced');
       setNotice({ tone: 'err', text: t('wg.errReserved') });
+      return;
+    }
+    if (workersInputInvalid(draft.workers)) {
+      revealGroup('advanced');
+      setNotice({ tone: 'err', text: t('wg.errWorkers') });
       return;
     }
     const policy = normalizeMeshInboundPolicy(meshPolicy);

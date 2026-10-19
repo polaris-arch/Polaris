@@ -446,3 +446,25 @@ fn canonical_fixture_root_does_not_admit_later_ancestor_symlinks() {
         ArtifactError::Invalid("artifact directory is not a real directory")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn fifo_replacement_after_lstat_is_rejected_without_waiting_for_writer() {
+    use nix::sys::stat::Mode;
+    let dir = tempdir();
+    let file = dir.join("candidate.json");
+    fs::write(&file, b"{}\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let replaced = std::cell::Cell::new(false);
+    let result = read_checked_after_lstat(dir.path(), "candidate.json", 4096, || {
+        replaced.set(true);
+        fs::remove_file(&file).unwrap();
+        nix::unistd::mkfifo(&file, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    });
+    assert!(
+        replaced.get(),
+        "fixture must reach the metadata/open race window"
+    );
+    assert!(result.is_err());
+}

@@ -1,3 +1,4 @@
+import { autoSelectTargetLabel } from '@/domain/auto-select-choice';
 import { configCanonicalText } from '@/lib/staged-config';
 /**
  * RulesScreen —— 自定义规则屏（1:1 提取自原型 polaris-prototype.html L1869-1919 #s-rules）。
@@ -343,7 +344,7 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
       const optimistic = prev.map((r) => (r.id === next.id ? next : r));
       useAppStore.setState(plane === 'dns' ? { dnsRules: optimistic } : { rules: optimistic });
       try {
-        await api.rules.update(next, plane);
+        await api.rules.update(next, plane, rule);
       } catch (err) {
         // 同 handleDrop：开关弹回原位是静默的。停用了以为停用了、其实规则还在生效 → 必须报。
         console.error('[RulesScreen] toggle failed:', err);
@@ -748,7 +749,9 @@ export function RulesScreen({ plane = 'route' }: { plane?: 'route' | 'dns' }) {
                   }
                   index={i}
                   targetNodeName={
-                    targetServerId ? serverNameById.get(targetServerId) : undefined
+                    route?.action === 'proxy' && route.targetAutoSelect
+                      ? autoSelectTargetLabel(config, route.targetAutoSelect, t)
+                      : targetServerId ? serverNameById.get(targetServerId) : undefined
                   }
                   dnsActionName={dnsActionName}
                   targetMissing={

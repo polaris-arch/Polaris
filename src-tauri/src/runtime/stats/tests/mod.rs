@@ -2322,3 +2322,5 @@ fn subscribe_rejects_foreign_labels_before_registering() {
         "label 闸必须在 `reg.subscribe(...)` **之前**（登记后再判等于没判）"
     );
 }
+
+mod detail_baseline_regressions;

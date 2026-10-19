@@ -811,7 +811,7 @@ pub fn endpoint_force_route_report(
         .iter()
         .filter(|s| is_mesh_node(s))
         .filter(|s| {
-            should_force_route_subnets(s, config.selected_server_id.as_deref(), &rule_targeted)
+            should_force_route_subnets(s, config.effective_selected_server_id(), &rule_targeted)
         })
         .map(|s| {
             let file_exists = s.protocol == Protocol::Tailscale
@@ -951,6 +951,8 @@ fn selected_server_precludes_selector_fallback(s: &ServerConfig) -> bool {
 /// 选中节点 tag 时该路径返回 Err（`outbounds.rs:558`）而非静默重算 ⇒ 静默重算必然发生在本谓词
 /// 已为 `true` 的状态下，无需第二道判据。
 pub fn selector_default_may_fall_back(config: &UserConfig) -> bool {
+    // Auto generation rejects an empty group or missing pin; it never falls back globally.
+    if config.selection_intent.is_some() { return false; }
     let Some(sid) = config.selected_server_id.as_deref() else {
         return true; // 未选节点 → selected_tag 恒为字面量 "proxy" → 必落兜底
     };
@@ -975,6 +977,13 @@ pub fn referenced_server_ids(config: &UserConfig) -> BTreeSet<String> {
         config.servers.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut result: BTreeSet<String> = BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
+    for target in crate::user_config::auto_select::referenced_targets(config) {
+        if config.auto_select_enabled {
+            stack.extend(crate::user_config::auto_select::eligible_members(config, &target));
+        } else if let Some(pin) = crate::user_config::auto_select::pin(config, &target) {
+            stack.push(pin.to_owned());
+        }
+    }
 
     let seed = |id: Option<&str>, stack: &mut Vec<String>| {
         if let Some(id) = id {
@@ -985,7 +994,7 @@ pub fn referenced_server_ids(config: &UserConfig) -> BTreeSet<String> {
             }
         }
     };
-    seed(config.selected_server_id.as_deref(), &mut stack);
+    seed(config.effective_selected_server_id(), &mut stack);
     let smart = config.proxy_mode == crate::user_config::proxy_mode::ProxyMode::Smart;
     if smart {
         for r in config.effective_traffic_rules() {

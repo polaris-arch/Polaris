@@ -1,3 +1,4 @@
+import type { AutoSelectTarget } from '../auto-select';
 export type RuleAction = 'proxy' | 'direct' | 'block';
 
 /** DNS 解析效果使用的解析器。`inherit` 按流量动作选择：代理→代理 DNS，其余→直连 DNS。 */
@@ -65,6 +66,7 @@ export interface RuleRouteEffect {
   action: RuleAction;
   /** 目标代理服务器 ID（仅当 action === 'proxy' 时有效）。 */
   targetServerId?: string;
+  targetAutoSelect?: AutoSelectTarget;
   /** @deprecated schema v4 起连接解析由 dnsDefaults 全局拥有。 */
   destinationResolution?: DestinationResolution;
   /** @deprecated schema v4 迁移会删除这类影子流量规则。 */
@@ -141,6 +143,7 @@ export interface Rule {
   bypassFakeIP?: boolean;
   /** 目标代理服务器 ID（仅当 action === 'proxy' 时有效） */
   targetServerId?: string;
+  targetAutoSelect?: AutoSelectTarget;
   /** 规则备注说明 */
   remarks?: string;
   /**
@@ -366,6 +369,7 @@ export interface AppRule {
   enabled: boolean;
   /** 目标代理服务器 ID (仅当 action === 'proxy' 时有效) */
   targetServerId?: string;
+  targetAutoSelect?: AutoSelectTarget;
 }
 
 /** 自定义应用分流预设（用户手动添加） */

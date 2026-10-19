@@ -9,6 +9,7 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
     private let monitorQueue = DispatchQueue(label: "com.polaris.tunnel-path")
     private let monitors = TunnelMonitorSession<NWPathMonitor, LibboxInterfaceUpdateListenerProtocol>()
     private var settings: NEPacketTunnelNetworkSettings?
+    private var settingsReset = UUID()
     private let stateLock = NSLock()
     private let settingsOperation = NSLock()
 
@@ -56,16 +57,31 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
         }
         guard settingsOperation.try() else { throw tunnelError("Another tunnel settings operation is already active") }
         defer { settingsOperation.unlock() }
-        try apply(network)
-        stateLock.lock(); settings = network; stateLock.unlock()
+        let token = provider.settingsGeneration()
+        stateLock.lock(); let previous = settings; let reset = settingsReset; stateLock.unlock()
+        try apply(network, token: token)
+        try publish(network, replacing: previous, reset: reset, token: token)
         // Upstream Libbox locates the extension's utun socket; no KVC/private key path.
         let fd = LibboxGetTunnelFileDescriptor()
         guard fd >= 0 else { throw tunnelError("The packet tunnel file descriptor is unavailable") }
         ret0_.pointee = fd
     }
 
-    private func apply(_ network: NEPacketTunnelNetworkSettings?) throws {
-        let token = provider.settingsGeneration()
+    // Lock order: settingsOperation -> lifecycle publication gate -> stateLock.
+    // Never wait for NE or invoke external code while either state lock is held.
+    private func publish(_ network: NEPacketTunnelNetworkSettings,
+                         replacing previous: NEPacketTunnelNetworkSettings?, reset: UUID, token: UInt64) throws {
+        let accepted = provider.publishSettings(token) {
+            self.stateLock.lock(); defer { self.stateLock.unlock() }
+            // reset() must not be undone by an in-flight operation's callback.
+            guard self.settingsReset == reset, self.settings === previous else { return false }
+            self.settings = network
+            return true
+        }
+        guard accepted else { throw tunnelError("Tunnel settings publication was superseded") }
+    }
+
+    private func apply(_ network: NEPacketTunnelNetworkSettings?, token: UInt64) throws {
         guard provider.acceptsSettings(token) else { throw tunnelError("Tunnel settings request is stale or uncertain") }
         let result = TunnelSettingsCompletion()
         provider.setTunnelNetworkSettings(network) { error in
@@ -169,15 +185,22 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
     private func cancelMonitor(_ record: TunnelMonitorSession<NWPathMonitor, LibboxInterfaceUpdateListenerProtocol>.Record?) {
         if let record { monitors.takeCancellation(record)?.cancel() }
     }
-    func reset() { resetMonitor(); stateLock.lock(); settings = nil; stateLock.unlock() }
+    func reset() { resetMonitor(); stateLock.lock(); settingsReset = UUID(); settings = nil; stateLock.unlock() }
     func clearDNSCache() {
         guard settingsOperation.try() else {
             provider.cancelTunnelWithError(tunnelError("DNS settings change could not be accepted while another settings operation is active")); return
         }
         defer { settingsOperation.unlock() }
-        stateLock.lock(); let settings = self.settings; stateLock.unlock()
+        let token = provider.settingsGeneration()
+        stateLock.lock(); let settings = self.settings; let reset = settingsReset; stateLock.unlock()
         guard let settings else { return }
-        do { try apply(nil); try apply(settings) } catch { provider.cancelTunnelWithError(error) }
+        do {
+            try apply(nil, token: token)
+            stateLock.lock(); let retained = settingsReset == reset && self.settings === settings; stateLock.unlock()
+            guard retained else { throw tunnelError("DNS settings replay was superseded by reset") }
+            // Both calls belong to one operation; never borrow a newer generation.
+            try apply(settings, token: token)
+        } catch { provider.cancelTunnelWithError(error) }
     }
 
     func findConnectionOwner(_ ipProtocol: Int32, sourceAddress: String?, sourcePort: Int32, destinationAddress: String?, destinationPort: Int32) throws -> LibboxConnectionOwner { throw tunnelError("Process ownership is unavailable on iOS") }
@@ -209,13 +232,20 @@ final class TunnelPlatform: NSObject, LibboxPlatformInterfaceProtocol, LibboxCom
     func setSystemProxyEnabled(_ enabled: Bool) throws {
         guard settingsOperation.try() else { throw tunnelError("Another tunnel settings operation is already active") }
         defer { settingsOperation.unlock() }
-        stateLock.lock(); let settings = self.settings; stateLock.unlock()
-        guard let settings, let proxy = settings.proxySettings else { throw tunnelError("Tunnel HTTP proxy is unavailable") }
-        stateLock.lock()
+        let token = provider.settingsGeneration()
+        stateLock.lock(); let settings = self.settings; let reset = settingsReset; stateLock.unlock()
+        guard let settings, let retainedProxy = settings.proxySettings else { throw tunnelError("Tunnel HTTP proxy is unavailable") }
+        // NE settings are reference types. Copy the nested object explicitly:
+        // a shallow network copy alone could expose the pending toggle to readers.
+        guard let candidate = settings.copy() as? NEPacketTunnelNetworkSettings,
+              let proxy = retainedProxy.copy() as? NEProxySettings else {
+            throw tunnelError("Tunnel HTTP proxy settings could not be copied")
+        }
         proxy.httpEnabled = enabled
         proxy.httpsEnabled = enabled
-        stateLock.unlock()
-        try apply(settings)
+        candidate.proxySettings = proxy
+        try apply(candidate, token: token)
+        try publish(candidate, replacing: settings, reset: reset, token: token)
     }
     func triggerNativeCrash() throws { throw tunnelError("Native crash injection is disabled") }
     func writeDebugMessage(_ message: String?) { if let message { provider.logDebugMessage(message) } }

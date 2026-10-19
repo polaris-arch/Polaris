@@ -72,6 +72,22 @@ pub async fn proxy_start(
     app: AppHandle,
     state: State<'_, AppRuntime>,
 ) -> Result<ApiResponse<()>, ()> {
+    proxy_start_with_admission(app, state, None).await
+}
+
+pub(crate) async fn proxy_start_automatic(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    admission: crate::runtime::proxy::StartupAdmission,
+) -> Result<ApiResponse<()>, ()> {
+    proxy_start_with_admission(app, state, Some(admission)).await
+}
+
+async fn proxy_start_with_admission(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    admission: Option<crate::runtime::proxy::StartupAdmission>,
+) -> Result<ApiResponse<()>, ()> {
     // 主窗连接会先复用 staged save；托盘与 2s 自动连接没有冲突裁决 UI，只能 fail-closed。
     // 不设这道门会让界面显示草稿新值、内核却按旧磁盘值启动，形成最危险的双真值。
     if should_block_unsaved_start(
@@ -80,6 +96,10 @@ pub async fn proxy_start(
     ) {
         log::info!("proxy:start 被未保存配置草稿拦截");
         return Ok(unsaved_config_response(&app));
+    }
+    if let Err(error) = crate::commands::config::run_startup_maintenance_once(state.config()) {
+        log::warn!("proxy:start 安全配置维护未完成，未启动: {error}");
+        return Ok(ApiResponse::err_with_code(error, "CONFIG_SECURITY_MAINTENANCE_FAILED"));
     }
     // 盘是单一真值（`current()` = 进程内权威缓存，每次 `save_full` 同刻刷新；缓存冷则读盘）。
     let config = match state.config().current() {
@@ -98,7 +118,11 @@ pub async fn proxy_start(
     // 更糟的是它**先于** `start()` 返回，使 `start()` 内新增的 TUN 提权引导门（弹框 → 就地授权安装 →
     // 原地续起核）在这条最主要的入口上永远跑不到 —— 用户点「安装」只会跳设置页。门已下沉到
     // `ProxyRuntime::start_inner` 的唯一汇流点，这里放行即可。
-    Ok(match proxy.start(config).await {
+    let started = match admission {
+        Some(admission) => proxy.start_automatic(config, admission).await,
+        None => proxy.start(config).await,
+    };
+    Ok(match started {
         // **只在核真起来了才广播 proxyStarted**。让位腿（本次起核被 stop 取消 / 被更新的 start 接管）
         // 也返 `Ok`，但返回的是 `status()` 快照、`running:false` —— 此前一律 emit，等于告诉渲染端和托盘
         // 「已连接」，而核根本没起：用户点取消后会看到一次「已连接」提示、托盘也会翻成运行态，随后才被
@@ -245,7 +269,8 @@ fn stop_expectation(
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn proxy_get_status(state: State<'_, AppRuntime>) -> ApiResponse<ProxyStatus> {
+pub async fn proxy_get_status(state: State<'_, AppRuntime>) -> ApiResponse<ProxyStatus> {
+    state.proxy().native_auto_status().await;
     ApiResponse::from_result(state.proxy().status_with_owned_stop_context())
 }
 
@@ -850,3 +875,108 @@ pub async fn system_proxy_get_status(
 
 #[cfg(test)]
 mod tests;
+
+/// Syntax-only input: no copied user config, listeners, endpoints, resources,
+/// cache, DNS transports or service start. Only actual-core check may decide.
+fn rule_pattern_check_config(patterns: &[String]) -> Value {
+    json!({"outbounds":[{"type":"direct","tag":"rule-check-direct"}],
+        "route":{"rules":[{"domain_regex":patterns,"outbound":"rule-check-direct"}],
+                 "final":"rule-check-direct"}})
+}
+
+pub(crate) async fn check_rule_patterns(
+    dir: &std::path::Path,
+    patterns: &[String],
+) -> Option<bool> {
+    if patterns.is_empty() {
+        return Some(true);
+    }
+    if patterns.len() > 32 || patterns.iter().any(|p| p.is_empty() || p.len() > 1024) {
+        return Some(false);
+    }
+    if cfg!(target_os = "ios") {
+        return None;
+    }
+    // One low-frequency explicit-submit checker slot. Capacity rejection is
+    // unavailable, never syntax failure; there is no queue or hidden retry.
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering;
+    if BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return None;
+    }
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            BUSY.store(false, Ordering::Release);
+        }
+    }
+    let _slot = Slot;
+    let cfg = rule_pattern_check_config(patterns);
+    if cfg!(target_os = "android") {
+        use polaris_core_supervisor::config_gate::ConfigCheckVerdict;
+        return match crate::runtime::proxy::android_bridge::check_config_admitted(&cfg.to_string())
+            .await
+        {
+            Ok(ConfigCheckVerdict::Accepted) => Some(true),
+            Ok(ConfigCheckVerdict::Rejected(_)) | Ok(ConfigCheckVerdict::Unattributable(_)) => {
+                Some(false)
+            }
+            Ok(ConfigCheckVerdict::Unavailable(_)) | Err(_) => None,
+        };
+    }
+    let binary = crate::runtime::proxy::resolve_core_binary().ok()?;
+    let path = dir.join(format!("rule-check-{}.json", probe_tmp_suffix()));
+    // Never clobber another file. The existing custody checker makes its own
+    // private snapshot; this guard owns only this input file, including cancellation.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    struct Input(std::path::PathBuf);
+    impl Drop for Input {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _input = Input(path.clone());
+    use std::io::Write;
+    file.write_all(&serde_json::to_vec(&cfg).ok()?).ok()?;
+    drop(file);
+    match run_probe_check(&binary, &path).await {
+        Ok(ProbeCheck::Supported) => Some(true),
+        Ok(ProbeCheck::Unsupported(_)) => Some(false),
+        Ok(ProbeCheck::Indeterminate) | Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod rule_pattern_admission_tests {
+    use super::*;
+    #[tokio::test]
+    async fn new_oversized_pattern_rejects_before_platform_or_binary_access() {
+        assert_eq!(check_rule_patterns(std::path::Path::new("unused"), &["a".repeat(1025)]).await, Some(false));
+    }
+
+    #[test]
+    fn only_inert_route_predicates_are_constructed_and_strings_are_preserved() {
+        let patterns = vec![
+            r"\p{ASCII}".to_owned(),
+            "(a{1001}){0}".into(),
+            "[[:x]".into(),
+        ];
+        let config = rule_pattern_check_config(&patterns);
+        assert_eq!(config.as_object().unwrap().len(), 2);
+        assert_eq!(config["route"]["rules"][0]["domain_regex"], json!(patterns));
+        assert_eq!(
+            config["outbounds"],
+            json!([{"type":"direct","tag":"rule-check-direct"}])
+        );
+        for key in ["inbounds", "endpoints", "dns", "experimental", "rule_set"] {
+            assert!(config.get(key).is_none());
+        }
+    }
+}

@@ -385,34 +385,42 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        // **按字节读、不用 `lines()`**：`AsyncBufReadExt::lines()` 遇非 UTF-8 字节返回
-        // `Err(InvalidData)`，而 `while let Ok(Some(_))` 会把它当成流结束 ⇒ 整条 drain 就此退出、
-        // 而核还活着 ⇒ 管道无人读、写满即把核堵死（起核期正是 FATAL 最可能出现、也最需要日志的
-        // 那一段）。`read_until` 是字节级的，坏字节经 `from_utf8_lossy` 渲染成 U+FFFD，排空不中断。
-        // 全 app 只剩这一份排空实现，源码守卫 `no_child_stream_drain_uses_lines` 盯着它不许退回。
+        // Byte framing tolerates invalid UTF-8. Oversized lines are drained to newline/EOF
+        // without retaining their tail or logging a partial credential prefix.
         let mut reader = BufReader::new(stream);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {}
-                Err(error) => return Err(error), // 真 I/O 错
-            }
-            while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-                buf.pop();
-            }
-            let line = redact_known_process_secrets(&String::from_utf8_lossy(&buf), &secrets);
-            let level = singbox_line_level(&line);
+        while let Some(record) = read_bounded_core_log_line(&mut reader).await? {
+            let line = if record.truncated {
+                "[core log line exceeded 65536 bytes; content omitted]".to_owned()
+            } else {
+                redact_known_process_secrets(&String::from_utf8_lossy(&record.bytes), &secrets)
+            };
+            let level = if record.truncated {
+                if record.fatal_facts.error {
+                    log::Level::Error
+                } else {
+                    log::Level::Warn
+                }
+            } else {
+                singbox_line_level(&line)
+            };
             // 已交接给 SubscribeLog 流 → 不转发（分类照跑：就绪后的 log.Fatal 仍只走 stderr）。
             // 瞬态核没有那条流，`handoff` 恒 `None` ⇒ 恒转发。
             if !handoff.as_ref().is_some_and(|h| h.load(Ordering::SeqCst)) {
                 log::log!(target: target, level, "{line}");
             }
             let Some(slot) = fatal.as_ref() else { continue };
-            let Some(kind) = classify_core_fatal_line(&line, level) else {
-                continue;
+            let kind = if record.truncated && secrets.is_empty() {
+                record.fatal_facts.classify()
+            } else if record.truncated {
+                // Credential-bearing login drains normally have no fatal slot. If one is
+                // supplied, do not derive a fatal cause from unredacted credential content.
+                let prefix =
+                    redact_known_process_secrets(&String::from_utf8_lossy(&record.bytes), &secrets);
+                classify_core_fatal_line(&prefix, singbox_line_level(&prefix))
+            } else {
+                classify_core_fatal_line(&line, level)
             };
+            let Some(kind) = kind else { continue };
             // **首个命中为准**：核在 FATAL 之后可能还吐一串收尾错误，后来的更泛化，覆盖会稀释真因。
             if let Ok(mut g) = slot.lock() {
                 g.get_or_insert(kind);
@@ -420,6 +428,105 @@ where
         }
         Ok(())
     })
+}
+
+const CORE_LOG_LINE_LIMIT: usize = 64 * 1024;
+const FATAL_TOKEN_OVERLAP: usize = 64;
+const TUN_CONFIGURE_TOKEN: &str = "configure tun interface";
+const ADDRESS_STEP_TOKENS: &[&str] = &["set ipv4 address", "set ipv6 address", "add address "];
+
+#[derive(Default)]
+struct FatalLineFacts {
+    error: bool,
+    dhcp: bool,
+    tun: bool,
+    address: bool,
+}
+
+impl FatalLineFacts {
+    fn observe(&mut self, window: &[u8]) {
+        let text = String::from_utf8_lossy(window);
+        self.error |= singbox_line_level(&text) == log::Level::Error;
+        self.dhcp |= text.contains(DHCP_MONITOR_MISSING_TOKEN);
+        self.tun |= text.contains(TUN_CONFIGURE_TOKEN);
+        self.address |= ADDRESS_STEP_TOKENS.iter().any(|token| text.contains(token));
+    }
+
+    fn classify(&self) -> Option<CoreFatalKind> {
+        // Reuse the same final classifier and precedence. Only fixed public tokens are
+        // retained, never an unbounded line or bytes that could contain credentials.
+        let mut evidence = String::new();
+        if self.dhcp {
+            evidence.push_str(DHCP_MONITOR_MISSING_TOKEN);
+        }
+        if self.tun {
+            evidence.push_str(TUN_CONFIGURE_TOKEN);
+        }
+        if self.address {
+            evidence.push_str(ADDRESS_STEP_TOKENS[0]);
+        }
+        classify_core_fatal_line(
+            &evidence,
+            if self.error {
+                log::Level::Error
+            } else {
+                log::Level::Info
+            },
+        )
+    }
+}
+
+struct BoundedCoreLogLine {
+    bytes: Vec<u8>,
+    truncated: bool,
+    fatal_facts: FatalLineFacts,
+}
+
+async fn read_bounded_core_log_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<BoundedCoreLogLine>> {
+    let mut record = BoundedCoreLogLine {
+        bytes: Vec::new(),
+        truncated: false,
+        fatal_facts: FatalLineFacts::default(),
+    };
+    let mut tail = Vec::new();
+    let mut saw_bytes = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if !saw_bytes {
+                return Ok(None);
+            }
+            break;
+        }
+        let end = available.iter().position(|byte| *byte == b'\n');
+        // Bound the classification window even if the supplied BufRead has a huge buffer.
+        let count = end.map_or(available.len(), |index| index + 1).min(8192);
+        let chunk = &available[..count];
+        saw_bytes = true;
+        let keep = (CORE_LOG_LINE_LIMIT - record.bytes.len()).min(chunk.len());
+        record.bytes.extend_from_slice(&chunk[..keep]);
+        record.truncated |= keep < chunk.len();
+        tail.extend_from_slice(chunk);
+        record.fatal_facts.observe(&tail);
+        if tail.len() > FATAL_TOKEN_OVERLAP {
+            tail.drain(..tail.len() - FATAL_TOKEN_OVERLAP);
+        }
+        let finished = chunk.last() == Some(&b'\n');
+        reader.consume(count);
+        if finished {
+            break;
+        }
+    }
+    while record
+        .bytes
+        .last()
+        .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+    {
+        record.bytes.pop();
+    }
+    Ok(Some(record))
 }
 
 pub(crate) fn redact_known_process_secrets(raw: &str, secrets: &[String]) -> String {
@@ -634,10 +741,9 @@ pub(super) fn classify_core_fatal_line(line: &str, level: log::Level) -> Option<
         return Some(CoreFatalKind::DhcpMonitorMissing);
     }
     // 外层包装必须在：单看 `add address` 会把任何提到该词的行都算上。
-    if !line.contains("configure tun interface") {
+    if !line.contains(TUN_CONFIGURE_TOKEN) {
         return None;
     }
-    const ADDRESS_STEP_TOKENS: &[&str] = &["set ipv4 address", "set ipv6 address", "add address "];
     if ADDRESS_STEP_TOKENS.iter().any(|t| line.contains(t)) {
         return Some(CoreFatalKind::TunAddressUnavailable);
     }
@@ -777,4 +883,73 @@ pub(super) fn log_axes_from_config(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     (log_level, disable_log_file)
+}
+
+#[cfg(test)]
+mod bounded_line_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_unterminated_line_is_bounded_and_tail_fatal_is_retained() {
+        let mut input = vec![b'x'; CORE_LOG_LINE_LIMIT * 8];
+        input.extend_from_slice(b" FATAL configure tun interface: set ipv4 address");
+        let mut reader = BufReader::with_capacity(7, input.as_slice());
+        let record = read_bounded_core_log_line(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.truncated);
+        assert_eq!(record.bytes.len(), CORE_LOG_LINE_LIMIT);
+        assert_eq!(
+            record.fatal_facts.classify(),
+            Some(CoreFatalKind::TunAddressUnavailable)
+        );
+        assert!(read_bounded_core_log_line(&mut reader)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_line_does_not_join_secrets_or_fatal_tokens_with_next_line() {
+        let mut input = vec![b'x'; CORE_LOG_LINE_LIMIT + 1];
+        input.extend_from_slice(b"secret-prefix ERROR\nmissing monitor for auto DHCP\n");
+        let mut reader = BufReader::with_capacity(3, input.as_slice());
+        let first = read_bounded_core_log_line(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.truncated);
+        assert_eq!(first.fatal_facts.classify(), None);
+        let next = read_bounded_core_log_line(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!next.truncated);
+        assert_eq!(next.fatal_facts.classify(), None);
+        assert_eq!(
+            redact_known_process_secrets("secret-prefix-suffix", &["secret-prefix-suffix".into()]),
+            "[REDACTED]"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_lines_preserve_invalid_utf8_crlf_and_eof() {
+        let mut reader = BufReader::with_capacity(1, &b"a\xff\r\nlast"[..]);
+        let first = read_bounded_core_log_line(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.bytes, b"a\xff");
+        let last = read_bounded_core_log_line(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.bytes, b"last");
+        assert!(!last.truncated);
+        assert!(read_bounded_core_log_line(&mut reader)
+            .await
+            .unwrap()
+            .is_none());
+    }
 }

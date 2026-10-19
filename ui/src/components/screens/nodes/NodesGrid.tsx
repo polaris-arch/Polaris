@@ -1,3 +1,6 @@
+import { useAppStore } from '@/store/app-store';
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
+import { autoSelectTarget } from '@/domain/auto-select-target';
 import type { TFunction } from 'i18next';
 import type { ServerConfig, SubscriptionConfig, PendingNodeChanges } from '@/contracts/types';
 import type { ServerGroup } from '@/domain/server-grouping';
@@ -66,8 +69,10 @@ export function NodesGrid({
   toggleSelect,
   blockedHint,
 }: Props) {
+  const autoSelected = useAppStore(state => state.config?.selectionIntent !== undefined);
   return (
     <div className="node-grid" ref={gridRef}>
+      {!batchMode && !!activeGroup?.servers.length && <SavedAutoSelectControls t={t} target={autoSelectTarget(activeGroup)} variant="card" />}
       {visibleServers.length === 0 ? (
         <div className="stub" style={{ gridColumn: '1 / -1' }}>
           <p>
@@ -93,6 +98,7 @@ export function NodesGrid({
               server={server}
               sourceLabel={source ? source.kind === 'subscription' ? source.name : t(`nodes.tab.${source.kind}`) : undefined}
               isCurrent={server.id === selectedServerId}
+              autoSelected={autoSelected}
               isExit={isMesh}
               lanOnly={lanOnly}
               speedTestable={blockReason === null}

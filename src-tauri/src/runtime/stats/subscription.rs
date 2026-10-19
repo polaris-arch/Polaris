@@ -45,6 +45,7 @@ struct ConnectionStreamLifecycleState {
     current_epoch: u64,
     detail_generation: u64,
     aggregate_baseline_due: bool,
+    detail_baseline_due: bool,
 }
 
 /// 连接流任务跨 spawn/abort 存活的唯一归属 owner。
@@ -142,6 +143,22 @@ impl ConnectionStreamLifecycle {
             return None;
         }
         Some(std::mem::take(&mut state.aggregate_baseline_due))
+    }
+
+    /// Preserve a successful detail subscription edge even when watch coalesces off/on.
+    pub(super) fn request_detail_baseline(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .detail_baseline_due = true;
+    }
+
+    pub(super) fn consume_detail_baseline(&self, epoch: u64) -> Option<bool> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.current_epoch != epoch {
+            return None;
+        }
+        Some(std::mem::take(&mut state.detail_baseline_due))
     }
 
     /// 给当前任务分配下一代 detail reset；非当前任务无权推进全局编号。
@@ -271,6 +288,9 @@ impl StatsRelay {
         // 必须在 bump 之前置：bump 会立刻唤醒流任务，先 bump 后置就有一轮读不到这笔账。
         if topic == Topic::Connections {
             self.connection_lifecycle.request_aggregate_baseline();
+        }
+        if topic == Topic::Detail {
+            self.connection_lifecycle.request_detail_baseline();
         }
         // 订阅集变了 → 唤醒该 topic 已在跑但正断流待命的 relay（无订阅时停在门上的那条腿）。
         self.gate.bump();

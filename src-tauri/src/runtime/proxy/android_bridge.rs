@@ -764,9 +764,13 @@ fn map_rejected_code(code: Option<&str>) -> &'static str {
 /// It is an internal retry receipt, never exposed as a ProxyStatus error code.
 pub(super) const ENDPOINT_RETIRED_NO_BIRTH: &str = "API_ENDPOINT_RETIRED";
 
+#[cfg(any(target_os = "android", test))]
+mod lifecycle_observation;
+
 #[cfg(target_os = "android")]
 mod handle {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::lifecycle_observation::{Observation, TerminalEvent};
+    use std::sync::Mutex;
     use std::sync::OnceLock;
     use tauri::plugin::PluginHandle;
     use tauri::Wry;
@@ -778,21 +782,27 @@ mod handle {
     /// 未接线（setup 前的极早期失败）⇒ 起停核返一个**有码**的错误，绝不 panic、也绝不静默成功。
     pub(super) static PLUGIN: OnceLock<PluginHandle<Wry>> = OnceLock::new();
 
-    /// 起核回执的记账位（`is_alive` 的 Android 腿真值）。
-    ///
-    /// **是「提交记录」而不是「存活探测」**，与 helper 腿的 `self.pid` 同一类事实：它说的是
-    /// 「我们请服务起过核、且它回执成功，之后没人请它停」。核在本进程内（libbox），没有 pid 可
-    /// `kill(0)`、没有 child 可 `try_wait`，而 `is_alive` 是**同步**闭包（`Fn()->bool`）—— 跨桥问一次
-    /// `BoxService.state` 是异步往返，放进那个闭包只能 `block_on`，而它本就跑在 async 上下文里（必 panic）。
-    ///
-    /// **射程自曝**：核若在本进程内自行死掉（用户在系统设置里撤销 VPN 授权 → `onRevoke`），本位
-    /// 不会翻转。起核期由就绪门的 TCP 探测兜住（管理口连不上 ⇒ `Timeout` ⇒ 有码失败）；就绪之后
-    /// Android 上崩溃自愈本就不适用（`spawn_crash_monitor` 观察到 `child=None` ⇒ `Absent` ⇒ `Retire`）。
-    /// 补上这条需要 Kotlin 侧主动向 Rust 推事件，属另一批的射程。
-    pub(super) static CORE_STARTED: AtomicBool = AtomicBool::new(false);
-
-    pub(super) fn set_core_started(v: bool) {
-        CORE_STARTED.store(v, Ordering::SeqCst);
+    // One process channel, not a new permanent Tauri callback per start.
+    static EVENTS: OnceLock<tauri::ipc::Channel> = OnceLock::new();
+    static OBSERVATION: OnceLock<Mutex<Observation>> = OnceLock::new();
+    pub(super) fn observation() -> &'static Mutex<Observation> {
+        OBSERVATION.get_or_init(|| Mutex::new(Observation::default()))
+    }
+    pub(super) fn events() -> tauri::ipc::Channel {
+        EVENTS
+            .get_or_init(|| {
+                tauri::ipc::Channel::new(|body| {
+                    if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                        if let Ok(event) = serde_json::from_str::<TerminalEvent>(&json) {
+                            if let Ok(mut state) = observation().lock() {
+                                state.observe(event);
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .clone()
     }
 }
 
@@ -1195,9 +1205,19 @@ async fn start_core_with_claim_and_birth(
             run_id: String,
             config_digest: String,
             claim: Option<String>,
+            lifecycle_events: tauri::ipc::Channel,
         }
         let plugin = plugin_handle()?;
-        match call_with_budget::<AndroidStartReceipt, _>(
+        handle::observation()
+            .lock()
+            .map_err(|_| {
+                (
+                    "Android 生命周期状态不可用".to_owned(),
+                    code::STARTUP_FAILED,
+                )
+            })?
+            .begin(run_id);
+        let result = call_with_budget::<AndroidStartReceipt, _>(
             plugin,
             "start",
             MainStartArgs {
@@ -1205,16 +1225,28 @@ async fn start_core_with_claim_and_birth(
                 run_id: run_id.to_owned(),
                 config_digest: config_digest.clone(),
                 claim: claim.map(str::to_owned),
+                lifecycle_events: handle::events(),
             },
             START_TIMEOUT,
             request_birth,
         )
-        .await
-        {
+        .await;
+        let accepted = match &result {
             Ok(receipt) if receipt.matches_request(run_id, &config_digest, claim) => {
-                handle::set_core_started(true);
-                Ok(receipt)
+                handle::observation()
+                    .lock()
+                    .map(|mut s| s.confirm(receipt.exact_target()))
+                    .unwrap_or(false)
             }
+            _ => false,
+        };
+        if !accepted {
+            if let Ok(mut state) = handle::observation().lock() {
+                state.abort(run_id);
+            }
+        }
+        match result {
+            Ok(receipt) if accepted => Ok(receipt),
             Ok(_) => Err((
                 "Android 起核回执身份不符（内核可能仍在，须核实并关闭确切 run）".to_string(),
                 code::STARTUP_FAILED,
@@ -1264,6 +1296,7 @@ pub(super) async fn stop_core_with_birth(
     #[cfg(target_os = "android")]
     {
         let plugin = plugin_handle().map_err(|(msg, _)| msg)?;
+        let target = handle::observation().lock().ok().and_then(|s| s.target());
         let r =
             match call_with_budget::<(), _>(plugin, "stop", (), STOP_TIMEOUT, Some(request_birth))
                 .await
@@ -1281,7 +1314,9 @@ pub(super) async fn stop_core_with_birth(
         // 记账只在**确认停下**时清：桥失败时隧道可能还在，把记账清成「没核」会让下一次起核
         // 以为现场是干净的。
         if r.is_ok() {
-            handle::set_core_started(false);
+            if let Ok(mut state) = handle::observation().lock() {
+                state.clear_exact(target.as_ref());
+            }
         }
         r
     }
@@ -1823,12 +1858,15 @@ pub(crate) async fn hand_apk_to_system_installer(apk_path: &str) -> Result<ApkHa
     }
 }
 
-/// `is_alive` 的 Android 腿。语义与射程见 `handle::CORE_STARTED` 的文档
-/// （该模块 `cfg(android)`，非 Android 编译单元里不存在，故此处不做 intra-doc 链接）。
+/// Android availability: exact run/birth native terminal events override the start ACK.
+/// This is not a retirement receipt and never releases native custody or reconnects.
 pub(super) fn core_started() -> bool {
     #[cfg(target_os = "android")]
     {
-        handle::CORE_STARTED.load(std::sync::atomic::Ordering::SeqCst)
+        handle::observation()
+            .lock()
+            .map(|s| s.running())
+            .unwrap_or(false)
     }
     #[cfg(not(target_os = "android"))]
     {

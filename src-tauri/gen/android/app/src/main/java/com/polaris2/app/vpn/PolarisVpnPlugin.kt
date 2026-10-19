@@ -29,6 +29,7 @@ import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
+import app.tauri.plugin.Channel
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
@@ -85,6 +86,7 @@ class MainStartArgs {
     lateinit var runId: String
     lateinit var configDigest: String
     var claim: String? = null
+    lateinit var lifecycleEvents: Channel
 }
 
 @InvokeArg
@@ -106,6 +108,7 @@ internal data class MainStartRequest(
     val configDigest: String,
     val claim: String?,
     val nativeTicket: AndroidNativeAdmission.Ticket,
+    val lifecycleEvents: Channel? = null,
 )
 
 @InvokeArg
@@ -608,7 +611,7 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("android: 主核身份已被使用", ERR_STARTUP_FAILED)
             return
         }
-        if (!VpnBridge.beginStart(MainStartRequest(cfg, args.runId, args.configDigest, args.claim, nativeTicket), invoke)) {
+        if (!VpnBridge.beginStart(MainStartRequest(cfg, args.runId, args.configDigest, args.claim, nativeTicket, args.lifecycleEvents), invoke)) {
             AndroidNativeMain.cancelBeforeBirth(nativeTicket)
             invoke.reject("Android 隧道已在运行或正在起停中", ERR_STARTUP_FAILED)
             return
@@ -1624,6 +1627,29 @@ internal object VpnBridge {
         }
     }
 
+    /** Availability only. Queue delivery outside native/bridge locks. Run + birth
+     * are taken from the exact native attempt, never from an unbound global stop. */
+    fun publishLifecycle(attempt: MainKernelAttempt<*>, state: String) {
+        val deliver = synchronized(this) { lifecycleDeliveryLocked(attempt, state) }
+        deliver?.invoke()
+    }
+
+    private fun lifecycleDeliveryLocked(attempt: MainKernelAttempt<*>?, state: String): (() -> Unit)? {
+        check(state == "unavailable" || state == "closed")
+        val current = request ?: return null
+        if (attempt == null || current.runId != attempt.runId || current.nativeTicket != attempt.nativeTicket) return null
+        val channel = current.lifecycleEvents ?: return null // System-start has no Rust observer.
+        val event = JSObject().put("runId", attempt.runId)
+            .put("birthNonce", attempt.birthNonce).put("state", state)
+        return {
+            Handler(Looper.getMainLooper()).post {
+                runCatching { channel.send(event) }
+                    .onFailure { Log.e(TAG, "主核状态事件投递失败", it) }
+            }
+            Unit
+        }
+    }
+
     enum class StopAdmission { Started, AlreadyStopped, Busy }
 
     /** A second request must not replace the first pending Stop acknowledgement. */
@@ -1637,7 +1663,8 @@ internal object VpnBridge {
     }
 
     /** Take all bridge callbacks under B, then deliver them outside B and registry R. */
-    fun takeFinishStop(error: String? = null): () -> Unit = synchronized(this) {
+    fun takeFinishStop(error: String? = null, attempt: MainKernelAttempt<*>? = null): () -> Unit = synchronized(this) {
+        val terminal = lifecycleDeliveryLocked(attempt, if (error == null) "closed" else "unavailable")
         val stopInvoke = pendingStop
         pendingStop = null
         stopping = false
@@ -1650,6 +1677,7 @@ internal object VpnBridge {
             running = false
             stopping = true
             return@synchronized {
+                terminal?.invoke()
                 runCatching { startInvoke?.reject(error, PolarisVpnPlugin.ERR_STARTUP_FAILED) }
                     .onFailure { Log.e(TAG, "起核失败回执投递失败", it) }
                 runCatching { stopInvoke?.reject(error, "ANDROID_CORE_STOP_FAILED") }
@@ -1661,6 +1689,7 @@ internal object VpnBridge {
         request = null
         // 服务在起核途中被停掉：起核那条 Invoke 也要有回执，否则 Rust 侧只能等超时。
         return@synchronized {
+            terminal?.invoke()
             runCatching { startInvoke?.reject("Android 隧道在起核途中被停止", PolarisVpnPlugin.ERR_STARTUP_FAILED) }
                 .onFailure { Log.e(TAG, "起核停机回执投递失败", it) }
             runCatching { stopInvoke?.resolve() }
@@ -1669,5 +1698,5 @@ internal object VpnBridge {
     }
 
     /** 服务无论因何停下都结账；调用者不可持 registry R。 */
-    fun finishStop(error: String? = null) { takeFinishStop(error).invoke() }
+    fun finishStop(error: String? = null, attempt: MainKernelAttempt<*>? = null) { takeFinishStop(error, attempt).invoke() }
 }

@@ -20,6 +20,8 @@ export interface ProxyErrorTextInput {
 /** Rust `runtime/proxy.rs::code` 的全量用户可见映射。 */
 export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   STARTUP_FAILED: 'errors.startupFailed',
+  NODE_RESOLVER_UNSUPPORTED: 'errors.nodeResolverUnsupported',
+  SPEED_TEST_URL_INVALID: 'errors.speedTestUrlInvalid',
   IOS_SESSION_ACTIVE: 'errors.iosSessionActive',
   IOS_FOREGROUND_REQUIRED: 'prerequisite.foregroundRequired',
   IOS_VPN_PERMISSION_DENIED: 'prerequisite.permissionDenied',

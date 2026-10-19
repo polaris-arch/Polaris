@@ -19,6 +19,20 @@ pub trait ConfigFs {
     /// 读取文件内容（utf-8）。文件不存在 → Err(StoreError::Io)。
     fn read_to_string(&self, path: &Path) -> Result<String, crate::StoreError>;
 
+    /// Missing is distinct from unreadable. Production overrides this with the OS error kind.
+    fn read_optional(&self, path: &Path) -> Result<Option<String>, crate::StoreError> {
+        if self.exists(path) {
+            self.read_to_string(path).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Publish a complete credential record; failure before replacement preserves the old record.
+    fn write_atomic(&self, path: &Path, content: &str) -> Result<(), crate::StoreError> {
+        atomic_write_plan(path, &random_tmp_suffix(), content).execute(self)
+    }
+
     /// 写入文件（覆盖）。需保证 mode 0o600（运行时实现负责；含密 clashApiSecret）。
     fn write(&self, path: &Path, content: &str) -> Result<(), crate::StoreError>;
 
@@ -168,6 +182,18 @@ impl StdFs {
 }
 
 impl ConfigFs for StdFs {
+    fn read_optional(&self, path: &Path) -> Result<Option<String>, crate::StoreError> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => Ok(Some(raw)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(crate::StoreError::Io(error.to_string())),
+        }
+    }
+
+    fn write_atomic(&self, path: &Path, content: &str) -> Result<(), crate::StoreError> {
+        durable_atomic_write(path, content, &random_tmp_suffix()).map(|_| ())
+    }
+
     fn read_to_string(&self, path: &Path) -> Result<String, crate::StoreError> {
         std::fs::read_to_string(path).map_err(|e| crate::StoreError::Io(e.to_string()))
     }

@@ -104,6 +104,7 @@ const INTERRUPT_MSG_KEY: Record<SpeedTestInterruptReason, string> = {
   core_unresponsive: 'nodes.speedTestCoreUnresponsive',
   cancelled: 'nodes.speedTestCancelled',
   preempted: 'nodes.speedTestPreempted',
+  native_pending: 'nodes.speedTestNativePending',
 };
 
 /**

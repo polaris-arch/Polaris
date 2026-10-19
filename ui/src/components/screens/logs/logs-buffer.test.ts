@@ -103,3 +103,21 @@ describe('接线：LogsScreen 的水合腿真的换成了合并', () => {
     expect(src).toContain('const MAX_BUFFERED_ROWS = 500');
   });
 });
+
+describe('clear receipt and stale reads', () => {
+  it('preserves stream records allocated after native clear while removing old rows', async () => {
+    const { retainAfterClear } = await import('./logs-buffer');
+    expect(ids(retainAfterClear([row(40), row(41), row(42), row()], 42))).toEqual([42]);
+    expect(() => retainAfterClear([], Number.NaN)).toThrow('LOG_CLEAR_RECEIPT_INVALID');
+    expect(() => retainAfterClear([], -1)).toThrow('LOG_CLEAR_RECEIPT_INVALID');
+  });
+  it('both desktop and mobile retire held hydration/search and preserve post-clear buffers', () => {
+    for (const path of ['./LogsScreen.tsx', '../../../mobile/connections/MobileConnectionsScreen.tsx']) {
+      const source = readFileSync(fileURLToPath(new URL(path, import.meta.url)), 'utf8');
+      expect(source.match(/epoch !== logReadEpoch.current/g)).toHaveLength(2);
+      expect(source).toContain('const boundary = await api.logs.clear()');
+      expect(source).toContain('setLogs(previous => retainAfterClear(previous, boundary))');
+      expect(source).toContain('pendingRef.current = retainAfterClear(pendingRef.current, boundary)');
+    }
+  });
+});

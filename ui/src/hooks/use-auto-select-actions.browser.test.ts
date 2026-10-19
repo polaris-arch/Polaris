@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { chromium, type Browser, type Page } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { statusFixture } from '@/contracts/auto-select-status.test-support';
+import { nativeAutoFixture } from '@/contracts/native-auto.test-support';
 
 const root = path.resolve(import.meta.dirname, '../..');
 // Exercise the actual host-injected DOM blur route, not a test-only hide helper.
@@ -39,9 +39,9 @@ await i18nReady; i18n.addResourceBundle('zh-CN','translation',zhCN,true,true); a
 localStorage.setItem('polaris.language','zh-CN');
 const params=new URLSearchParams(location.search),surface=params.get('surface');
 if(surface.startsWith('mobile'))document.documentElement.dataset.mobileOs='android';
-const initial=${JSON.stringify(statusFixture())};
+const initial=${JSON.stringify(nativeAutoFixture())};
 const servers=['a','b'].map(id=>({id:'node-'+id,name:'Fixture '+id,protocol:'socks',address:'fixture.invalid',port:1,subscriptionId:'sub-'+id}));
-let disk={selectedServerId:'node-a',proxyMode:'smart',proxyModeType:'manual',servers,subscriptions:[{id:'sub-a',name:'Subscription A',url:'https://fixture.invalid'},{id:'sub-b',name:'Subscription B',url:'https://fixture.invalid'},{id:'empty',name:'Empty subscription',url:'https://fixture.invalid'}],desktopNotifications:false};
+let disk={autoSelectEnabled:true,selectedServerId:'node-a',proxyMode:'smart',proxyModeType:'manual',servers,subscriptions:[{id:'sub-a',name:'Subscription A',url:'https://fixture.invalid'},{id:'sub-b',name:'Subscription B',url:'https://fixture.invalid'},{id:'empty',name:'Empty subscription',url:'https://fixture.invalid'}],desktopNotifications:false};
 if(params.get('auto')==='1')disk.selectionIntent={mode:'auto',scope:'subscription',subscriptionId:'sub-a'};
 let status={...initial,intent:disk.selectionIntent?initial.intent:{mode:'manual',scope:null,subscriptionId:null}};
 let id=0;const handlers=new Map(),listeners=[];
@@ -54,6 +54,7 @@ const f=window.__actions={calls:[],reads:0,jobs,readJobs,messages:[],readFail:fa
  configListeners:()=>listeners.filter(l=>l.event===C.EVENT_CONFIG_CHANGED).length,
  nativeConfigSignal(){for(const l of [...listeners])if(l.event===C.EVENT_CONFIG_CHANGED)handlers.get(l.handler)?.({payload:{}});},
  setProxy(value){proxyState={...proxyState,...value};},
+ runtime(value){proxyState={...proxyState,...value};useAppStore.setState({proxyStatus:proxyState});},
  setIp(value){Object.assign(ipSnapshot,value);},
  nativeShow(){${trayShowScript}},
  nativeGeometry(){${trayGeometryScript}},
@@ -82,7 +83,8 @@ const f=window.__actions={calls:[],reads:0,jobs,readJobs,messages:[],readFail:fa
  publish(patch){disk={...disk,...patch};useAppStore.setState({config:structuredClone(disk),servers:disk.servers,selectedServerId:disk.selectedServerId});for(const l of listeners)if(l.event===C.EVENT_CONFIG_CHANGED)handlers.get(l.handler)?.({payload:undefined});},
  manual(){delete disk.selectionIntent;f.publish({selectedServerId:'node-b'});},
  finish(index=0,options={}){const job=jobs[index];if(options.reject){job.resolve({success:false,error:'fixture rejected',code:options.reject});return;}
-  if(!options.noSave){if(job.cmd===C.AUTO_SELECT_ENABLE)disk.selectionIntent={mode:'auto',scope:'subscription',subscriptionId:job.args.subscriptionId};
+  if(!options.noSave){if(job.cmd===C.AUTO_SELECT_ENABLE)disk.selectionIntent={mode:'auto',scope:job.args.scope||'subscription',subscriptionId:job.args.subscriptionId};
+   if(job.cmd===C.AUTO_SELECT_DISABLE)delete disk.selectionIntent;
    if(job.cmd===C.SERVER_SWITCH){disk.selectedServerId=job.args.serverId;delete disk.selectionIntent;}}
   status={...initial,intent:disk.selectionIntent?{...disk.selectionIntent}:{mode:'manual',scope:null,subscriptionId:null},exit:{serverId:disk.selectedServerId,inSubscription:!!disk.selectionIntent}};
   if(options.staleAuto)status={...initial};
@@ -98,7 +100,7 @@ window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:surface==='tray'?'tra
  invoke(cmd,args={}){
   if(cmd==='plugin:event|listen'){const key=++id;listeners.push({id:key,event:args.event,handler:args.handler});return Promise.resolve(key);}
   if(cmd==='plugin:event|unlisten'){const at=listeners.findIndex(l=>l.id===args.eventId);if(at>=0)listeners.splice(at,1);return Promise.resolve();}
-  if([C.AUTO_SELECT_ENABLE,C.AUTO_SELECT_SWITCH_NOW,C.SERVER_SWITCH].includes(cmd)){f.calls.push({cmd,args});return new Promise(resolve=>{jobs.push({cmd,args,resolve});if(!f.hold)f.finish(jobs.length-1);});}
+  if([C.AUTO_SELECT_ENABLE,C.AUTO_SELECT_DISABLE,C.AUTO_SELECT_SWITCH_NOW,C.SERVER_SWITCH].includes(cmd)){f.calls.push({cmd,args});return new Promise(resolve=>{jobs.push({cmd,args,resolve});if(!f.hold)f.finish(jobs.length-1);});}
   if(cmd===C.TRAY_HIDE){f.hides.push(args);return Promise.resolve({success:true,data:null});}
   if(cmd==='plugin:notification|is_permission_granted')return Promise.resolve(true);
   if(cmd==='plugin:notification|notify'){f.notifications.push(args);return Promise.resolve();}
@@ -130,7 +132,9 @@ const Component=components[surface];const render=()=>app.render(<Component/>);ap
 `;
 let server: ViteDevServer, browser: Browser, origin: string;
 const surfaces = ['desktop-nodes', 'mobile-nodes', 'desktop-home', 'mobile-home', 'tray'] as const;
-const controls = (page: Page) => page.locator('[data-auto-select-controls]');
+const controls = (page: Page) => page.locator('[data-auto-select-controls][data-auto-select-subscription="sub-a"]');
+const pressed = async (page: Page) => await controls(page).count() ? controls(page).locator('button[data-auto-select-subscription="sub-a"]').getAttribute('aria-pressed') : 'false';
+const busy = async (page: Page) => await controls(page).count() ? controls(page).getAttribute('aria-busy') : 'false';
 const state = (page: Page) => page.evaluate(() => { const f=(window as any).__actions;return {calls:f.calls,reads:f.reads,config:f.state(),saved:f.saved(),messages:f.messages}; });
 async function open(surface: typeof surfaces[number], auto = false) {
   const page=await browser.newPage({viewport:{width:surface.startsWith('mobile')?390:1100,height:844}});page.setDefaultTimeout(7000);
@@ -139,7 +143,11 @@ async function open(surface: typeof surfaces[number], auto = false) {
   if(surface==='desktop-home')await page.locator('#node-trigger').click();
   if(surface==='mobile-home')await page.locator('[data-write-control="switch-node"], [data-home-action="switch-node"]').first().click();
   if(surface==='tray')await page.getByText('全部节点',{exact:true}).click();
+  if(!await controls(page).count() && ['desktop-home','mobile-home','tray'].includes(surface)) {
+    const group=page.getByText('Subscription A',{exact:true});if(await group.count())await group.first().click();
+  }
   try{await controls(page).waitFor();}catch(error){throw Error(`${surface} mounted failure: ${errors.join('; ')}; ${await page.locator('body').innerText()}; ${String(error)}`);}
+
   return page;
 }
 
@@ -151,176 +159,62 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
  },30000);
  afterAll(async()=>{await browser?.close();await server?.close();});
  for(const surface of surfaces){
-  it(`${surface}: production entry enables saved Auto and disables only the separate empty choice`,async()=>{
-   const page=await open(surface);try{
-    expect(await controls(page).locator('[data-auto-select-subscription="empty"]').isDisabled()).toBe(true);
-    expect(await controls(page).locator('[data-auto-select-empty="empty"]').isVisible()).toBe(true);
-    await controls(page).locator('[data-auto-select-subscription="sub-a"]').click();
-    await expect.poll(async()=> (await state(page)).saved.selectionIntent?.subscriptionId).toBe('sub-a');
-    await expect.poll(()=>controls(page).textContent()).toContain('意图已保存');
-    expect((await state(page)).saved.servers).toHaveLength(2);
-    expect((await state(page)).calls[0]).toEqual({cmd:'auto_select_enable',args:{subscriptionId:'sub-a'}});
-   }finally{await page.close();}
+  it(`${surface}: Auto choice preserves real nodes and has no separate mode switch`,async()=>{
+    const page=await open(surface);try{
+      expect(await page.locator('[data-auto-select-controls][data-auto-select-subscription="empty"]').count()).toBe(0);
+      expect(await controls(page).locator('[role="switch"]').count()).toBe(0);
+      await controls(page).locator('[data-exit-write="auto-select-enable"]').click();
+      await expect.poll(async()=>(await state(page)).saved.selectionIntent?.subscriptionId).toBe('sub-a');
+      expect((await state(page)).saved.servers).toHaveLength(2);
+    }finally{await page.close();}
   });
-  it(`${surface}: eight immediate clicks issue one native enable with no optimistic selection`,async()=>{
-   const page=await open(surface);try{
-    await page.evaluate(()=> (window as any).__actions.hold=true);
-    await controls(page).locator('[data-auto-select-subscription="sub-a"]').evaluate(el=>{for(let i=0;i<8;i++)(el as HTMLButtonElement).click();});
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    expect((await state(page)).saved.selectionIntent).toBeUndefined();
-    expect(await controls(page).locator('[data-auto-select-subscription="sub-a"]').getAttribute('aria-pressed')).toBe('false');
-    await page.evaluate(()=> (window as any).__actions.finish(0,{status:'pending'}));
-    await expect.poll(()=>controls(page).locator('[data-auto-select-feedback]').textContent()).toContain('等待运行侧确认');
-    expect(await controls(page).locator('[data-auto-select-feedback]').getAttribute('data-auto-select-feedback')).toBe('info');
-   }finally{await page.close();}
+  it(`${surface}: rapid clicks share one authoritative write and never select optimistically`,async()=>{
+    const page=await open(surface);try{
+      await page.evaluate(()=>{const f=(window as any).__actions;f.hold=true;for(let i=0;i<8;i++)document.querySelector<HTMLButtonElement>('[data-auto-select-controls][data-auto-select-subscription="sub-a"] [data-exit-write="auto-select-enable"]')!.click();});
+      await expect.poll(async()=>(await state(page)).calls.length).toBe(1);
+      expect((await state(page)).config.selectionIntent).toBeUndefined();expect(await busy(page)).toBe('true');
+      await page.evaluate(()=>(window as any).__actions.finish());
+      await expect.poll(()=>pressed(page)).toBe('true');
+    }finally{await page.close();}
   });
-  it(`${surface}: failed switch-now placement keeps saved Auto and shows incomplete runtime`,async()=>{
-   const page=await open(surface,true);try{
-    await page.evaluate(()=> (window as any).__actions.hold=true);
-    await controls(page).locator('[data-exit-write="auto-select-now"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    expect((await state(page)).calls[0].cmd).toBe('auto_select_switch_now');
-    await page.evaluate(()=> (window as any).__actions.finish(0,{status:'failed'}));
-    await expect.poll(()=>controls(page).locator('[data-auto-select-feedback]').textContent()).toContain('运行侧换点未完成');
-    expect((await state(page)).saved.selectionIntent.subscriptionId).toBe('sub-a');
-    expect(await controls(page).locator('[data-auto-select-feedback]').getAttribute('data-auto-select-feedback')).toBe('warning');
-   }finally{await page.close();}
+  it(`${surface}: failed readback cannot claim a saved reference`,async()=>{
+    const page=await open(surface);try{
+      await page.evaluate(()=>(window as any).__actions.readFail=true);
+      await controls(page).locator('[data-exit-write="auto-select-enable"]').click();
+      await expect.poll(()=>busy(page)).toBe('false');
+      expect((await state(page)).config.selectionIntent).toBeUndefined();
+      expect(await controls(page).locator('[data-auto-select-feedback="error"]').count()).toBe(1);
+    }finally{await page.close();}
   });
-  it(`${surface}: rejected cancellation keeps Auto and a successful retry confirms manual truth`,async()=>{
-   const page=await open(surface,true);try{
-    await page.evaluate(()=> (window as any).__actions.hold=true);
-    await controls(page).locator('[data-exit-write="auto-select-manual"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    expect((await state(page)).calls[0]).toEqual({cmd:'server_switch',args:{serverId:'node-a'}});
-    await page.evaluate(()=> (window as any).__actions.finish(0,{reject:'AUTO_SELECT_SWITCH_FAILED'}));
-    await expect.poll(()=>controls(page).locator('[data-auto-select-feedback]').textContent()).toContain('切换未完成');
-    expect(await controls(page).locator('[data-auto-select-subscription="sub-a"]').getAttribute('aria-pressed')).toBe('true');
-    await controls(page).locator('[data-exit-write="auto-select-manual"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(2);
-    await page.evaluate(()=> (window as any).__actions.finish(1));
-    await expect.poll(()=>controls(page).locator('[data-auto-select-feedback]').textContent()).toContain('手动选择已保存');
-    expect((await state(page)).saved.selectionIntent).toBeUndefined();
-    expect((await state(page)).saved.selectedServerId).toBe('node-a');
-   }finally{await page.close();}
+  it(`${surface}: newer saved manual selection beats a delayed Auto readback`,async()=>{
+    const page=await open(surface);try{
+      await page.evaluate(()=>{const f=(window as any).__actions;f.hold=true;f.delayNextRead=true;});
+      await controls(page).locator('[data-exit-write="auto-select-enable"]').click();
+      await page.evaluate(()=>(window as any).__actions.finish());
+      await page.waitForFunction(()=>(window as any).__actions.readJobs.length===1);
+      await page.evaluate(()=>{const f=(window as any).__actions;f.manual();f.releaseRead();});
+      await expect.poll(async()=>(await state(page)).config.selectedServerId).toBe('node-b');
+      expect((await state(page)).config.selectionIntent).toBeUndefined();
+    }finally{await page.close();}
   });
-  it(`${surface}: successful command with failed config readback remains unconfirmed and retryable`,async()=>{
-   const page=await open(surface);try{
-    await page.evaluate(()=> {const f=(window as any).__actions;f.hold=true;f.readFail=true;});
-    await controls(page).locator('[data-auto-select-subscription="sub-a"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    await page.evaluate(()=> (window as any).__actions.finish());
-    await expect.poll(()=>controls(page).locator('[data-auto-select-feedback]').textContent()).toContain('尚不能确认结果');
-    expect(await controls(page).locator('[data-auto-select-subscription="sub-a"]').getAttribute('aria-pressed')).toBe('false');
-    await page.evaluate(()=> (window as any).__actions.readFail=false);
-    await controls(page).locator('[data-auto-select-subscription="sub-a"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(2);
-    await page.evaluate(()=> (window as any).__actions.finish(1));
-    await expect.poll(()=>controls(page).textContent()).toContain('意图已保存');
-   }finally{await page.close();}
+  it(`${surface}: actual group node follows confirmed native events only`,async()=>{
+    const page=await open(surface,true);try{
+      await page.evaluate(()=>{ const f=(window as any).__actions; f.runtime({running:true,starting:false,mainGeneration:1}); f.event({generation:1,nativeAutoGroups:[{target:{scope:'subscription',subscriptionId:'sub-a'},actualServerId:'node-a',confirmed:true,state:'auto'}]}); });
+      await expect.poll(()=>controls(page).locator('[data-auto-select-actual]').textContent()).toContain('Fixture a');
+      await page.evaluate(()=>(window as any).__actions.runtime({running:true,starting:false,mainGeneration:2}));
+      await expect.poll(()=>controls(page).locator('[data-auto-select-actual]').textContent()).not.toContain('Fixture a');
+      await page.evaluate(()=>(window as any).__actions.event({generation:2}));
+      await expect.poll(()=>controls(page).locator('[data-auto-select-actual]').textContent()).toContain('Fixture a');
+      await page.evaluate(()=>(window as any).__actions.event({nativeAutoGroups:[{target:{scope:'subscription',subscriptionId:'sub-a'},actualServerId:'node-b',confirmed:true,state:'auto'}]}));
+      await expect.poll(()=>controls(page).locator('[data-auto-select-actual]').textContent()).not.toContain('Fixture b');
+    }finally{await page.close();}
   });
-  it(`${surface}: late old receipt cannot revive Auto after a saved manual snapshot`,async()=>{
-   const page=await open(surface);try{
-    await page.evaluate(()=> (window as any).__actions.hold=true);
-    await controls(page).locator('[data-auto-select-subscription="sub-a"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    await page.evaluate(()=> (window as any).__actions.manual());
-    await expect.poll(async()=> (await state(page)).saved.selectedServerId).toBe('node-b');
-    await page.evaluate(()=> (window as any).__actions.finish(0,{noSave:true,staleAuto:true}));
-    await expect.poll(()=> controls(page).getAttribute('aria-busy')).toBe('false');
-    expect(await controls(page).locator('[data-auto-select-feedback]').count()).toBe(0);
-    expect((await state(page)).saved.selectionIntent).toBeUndefined();
-    expect(await controls(page).locator('[data-auto-select-subscription="sub-a"]').getAttribute('aria-pressed')).toBe('false');
-   }finally{await page.close();}
-  });
-  it(`${surface}: a captured old config readback never overwrites a newer saved manual snapshot`, async () => {
-   const page=await open(surface);try {
-    await page.evaluate(()=> {const f=(window as any).__actions;f.hold=true;f.delayNextRead=true;});
-    await controls(page).locator('[data-auto-select-subscription="sub-a"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    await page.evaluate(()=> (window as any).__actions.finish());
-    await expect.poll(()=>page.evaluate(()=>typeof (window as any).__actions.releaseRead)).toBe('function');
-    await page.evaluate(()=> (window as any).__actions.manual());
-    await expect.poll(()=>controls(page).locator('[data-auto-select-subscription="sub-a"]').getAttribute('aria-pressed')).toBe('false');
-    await page.evaluate(()=> (window as any).__actions.releaseRead());
-    await expect.poll(()=>controls(page).getAttribute('aria-busy')).toBe('false');
-    expect((await state(page)).saved.selectionIntent).toBeUndefined();
-    expect((await state(page)).config.selectionIntent).toBeUndefined();
-    expect((await state(page)).config.selectedServerId).toBe('node-b');
-    expect(await controls(page).locator('[data-auto-select-feedback]').count()).toBe(0);
-   }finally{await page.close();}
-  });
-  for(const refreshPending of [false,true])it(`${surface}: same-selection newer ${refreshPending?'in-flight refresh':'published whole config'} survives old CONFIG_GET`,async()=>{
-   const page=await open(surface,true);try{
-    await page.evaluate(()=>{const f=(window as any).__actions;f.hold=true;f.delayNextRead=true;});
-    await controls(page).locator('[data-exit-write="auto-select-now"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    await page.evaluate(()=> (window as any).__actions.finish());
-    await expect.poll(()=>page.evaluate(()=> (window as any).__actions.readJobs.length)).toBe(1);
-    const patch={servers:[{id:'node-a',name:'New Server C2',protocol:'socks',address:'new.invalid',port:2,subscriptionId:'sub-a'}],subscriptions:[{id:'sub-a',name:'New Subscription C2',url:'https://new.invalid'}],trafficRules:[{id:'rule-c2',name:'New Rule C2',action:'direct'}]};
-    await page.evaluate(({patch,refreshPending})=>{const f=(window as any).__actions;if(refreshPending){f.changeDisk(patch);f.delayNextRead=true;f.refresh();}else f.publish(patch);},{patch,refreshPending});
-    if(refreshPending)await expect.poll(()=>page.evaluate(()=> (window as any).__actions.readJobs.length)).toBe(2);
-    else await expect.poll(()=>page.evaluate(()=> (window as any).__actions.displayed()?.servers[0]?.name)).toBe('New Server C2');
-    await page.evaluate(()=> (window as any).__actions.readJobs[0].release());
-    await expect.poll(()=>controls(page).getAttribute('aria-busy')).toBe('false');
-    expect(await controls(page).locator('[data-auto-select-feedback]').count()).toBe(0);
-    if(refreshPending){
-     if(surface!=='tray')expect(await page.evaluate(()=> (window as any).__actions.loading())).toBe(true);
-     await page.evaluate(()=> (window as any).__actions.readJobs[1].release());
-    }
-    await expect.poll(()=>page.evaluate(()=> (window as any).__actions.displayed()?.servers[0]?.name)).toBe('New Server C2');
-    const shown=await page.evaluate(()=> (window as any).__actions.displayed());
-    expect(shown.subscriptions).toEqual(patch.subscriptions);expect(shown.trafficRules).toEqual(patch.trafficRules);
-    expect(shown.selectedServerId).toBe('node-a');expect(shown.selectionIntent.subscriptionId).toBe('sub-a');
-    if(surface!=='tray')await expect.poll(()=>page.evaluate(()=> (window as any).__actions.loading())).toBe(false);
-   }finally{await page.close();}
-  });
-  it(`${surface}: an unmounted action reads authoritative truth without emitting stale feedback`,async()=>{
-   const page=await open(surface);try{
-    await page.evaluate(()=> (window as any).__actions.hold=true);
-    await controls(page).locator('[data-auto-select-subscription="sub-a"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    const reads=(await state(page)).reads;
-    await page.evaluate(()=> {const f=(window as any).__actions;f.unmount();f.finish();});
-    await expect.poll(async()=> (await state(page)).reads).toBeGreaterThan(reads);
-    expect(await controls(page).count()).toBe(0);expect((await state(page)).messages).toEqual([]);
-    expect((await state(page)).saved.selectionIntent.subscriptionId).toBe('sub-a');
-   }finally{await page.close();}
-  });
-  it(`${surface}: no-target rejection explains the backend gate while keeping current actual exit`,async()=>{
-   const page=await open(surface,true);try{
-    await page.evaluate(()=> (window as any).__actions.hold=true);
-    await controls(page).locator('[data-exit-write="auto-select-now"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    await page.evaluate(()=> (window as any).__actions.finish(0,{reject:'AUTO_SELECT_NO_TARGET'}));
-    await expect.poll(()=>controls(page).locator('[data-auto-select-feedback]').textContent()).toContain('没有满足切换条件');
-    expect((await state(page)).saved.selectedServerId).toBe('node-a');
-   }finally{await page.close();}
-  });
-  it(`${surface}: the shared write lane serializes a rapid manual choice after in-flight Auto`, async () => {
-   const page=await open(surface);try {
-    await page.evaluate(()=> (window as any).__actions.hold=true);
-    await controls(page).locator('[data-auto-select-subscription="sub-a"]').click();
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(1);
-    await page.evaluate(()=> {const f=(window as any).__actions;f.manualPending=f.manualWrite();});
-    expect((await state(page)).calls).toHaveLength(1);
-    await page.evaluate(()=> (window as any).__actions.finish(0));
-    await expect.poll(async()=> (await state(page)).calls.length).toBe(2);
-    expect((await state(page)).calls[1]).toEqual({cmd:'server_switch',args:{serverId:'node-b'}});
-    await page.evaluate(async()=> {const f=(window as any).__actions;f.finish(1);await f.manualPending;f.publish({});});
-    await expect.poll(async()=> (await state(page)).config.selectedServerId).toBe('node-b');
-    await expect.poll(()=>controls(page).locator('[data-auto-select-subscription="sub-a"]').getAttribute('aria-pressed')).toBe('false');
-    expect((await state(page)).saved.selectionIntent).toBeUndefined();
-    expect(await controls(page).locator('[data-auto-select-feedback]').count()).toBe(0);
-   }finally{await page.close();}
-  });
-  it(`${surface}: status events show backend failure and repeated penalty without frontend timers`,async()=>{
-   const page=await open(surface,true);try{
-    const panel=page.locator('[data-auto-select-status]');await panel.waitFor();
-    await page.evaluate(()=> (window as any).__actions.event({mode:'commitFailed',reason:'commitFailed',barred:[{serverId:'node-b',remainingMs:240000,failures:3}],commit:{consecutiveFailures:2,retryAfterMs:60000,lastFailure:null}}));
-    await expect.poll(()=> panel.textContent()).toContain('换点未完成');
-    await expect.poll(()=> panel.textContent()).toContain('已因故障换走 3 次');
-    expect(await panel.textContent()).toContain('排除期还剩 240 秒');
-   }finally{await page.close();}
+  it(`${surface}: master OFF hides entries without rewriting concurrent group references in UI`,async()=>{
+    const page=await open(surface,true);try{
+      await page.evaluate(()=>(window as any).__actions.publish({autoSelectEnabled:false,autoSelectPins:[{target:{scope:'subscription',subscriptionId:'sub-a'},serverId:'node-a'}]}));
+      await expect.poll(()=>page.locator('[data-auto-select-controls]').count()).toBe(0);
+      expect((await state(page)).saved.selectionIntent.subscriptionId).toBe('sub-a');
+    }finally{await page.close();}
   });
  }
  for (const [surface,choice] of [['mobile-nodes','node-a'],['mobile-home','node-a'],['mobile-home','__direct__'],['mobile-home','__block__']] as const) {
@@ -529,5 +423,30 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS==='1')('five real mounted Auto 
    expect(await page.locator('.tray-status').getAttribute('class')).toContain('stopped');
   }finally{await page.close();}
  });
+
+ for (const surface of ['desktop-home', 'mobile-home', 'tray'] as const) {
+  it(`${surface}: global Auto is before groups and writes explicit global scope`, async () => {
+   const page = await open(surface); try {
+    const global = page.locator('[data-auto-select-controls][data-auto-select-scope="global"]');
+    expect(await page.locator('[data-auto-select-controls]').first().getAttribute('data-auto-select-scope')).toBe('global');
+    await global.locator('[data-exit-write="auto-select-enable"]').click();
+    await expect.poll(async () => (await state(page)).saved.selectionIntent?.scope).toBe('global');
+    expect((await state(page)).calls[0]).toEqual({cmd:'auto_select_enable',args:{scope:'global'}});
+    expect((await state(page)).saved.servers).toHaveLength(2);
+   } finally { await page.close(); }
+  });
+ }
+ for (const surface of ['desktop-nodes', 'mobile-nodes'] as const) {
+  it(`${surface}: All tab is first and Auto is the first card`, async () => {
+   const page = await open(surface); try {
+    const tabs = page.locator(surface === 'desktop-nodes' ? '.sub-tabs > button' : '.mn-segs > button');
+    expect(await tabs.first().textContent()).toContain('全部');
+    await tabs.first().click();
+    const global = page.locator('[data-auto-select-controls][data-auto-select-scope="global"]');
+    await global.waitFor();
+    expect(await global.evaluate(el => el.closest('.auto-choice')?.parentElement?.firstElementChild === el || el.parentElement?.parentElement?.firstElementChild === el.parentElement)).toBe(true);
+   } finally { await page.close(); }
+  });
+ }
 
 });

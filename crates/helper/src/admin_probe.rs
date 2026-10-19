@@ -166,24 +166,29 @@ fn retained_ready_with_client(
     }
 }
 
-pub fn probe(support: &Path) -> io::Result<String> {
+fn slot_and_protocol(support: &Path) -> io::Result<(Slot, u32)> {
     let platform = Platform::current();
     let (client, pong) = authenticated(support)?;
     let request = match platform {
         Platform::Linux => Request::LinuxStatusBirth,
         Platform::Mac | Platform::Win => Request::NativeStatusBirth,
         Platform::Other | Platform::Android | Platform::Ios => {
-            return Err(io::Error::other("native helper unavailable"))
+            return Err(io::Error::other("native helper unavailable"));
         }
     };
     let response = client
         .send_with_timeout(&request, Duration::from_secs(5))
         .map_err(|_| io::Error::other("native helper custody unavailable"))?;
-    Ok(format!(
-        "helper-slot {} proto={}",
-        classify(platform, &response).token(),
-        pong.proto_version
-    ))
+    Ok((classify(platform, &response), pong.proto_version))
+}
+
+pub fn probe_slot(support: &Path) -> io::Result<Slot> {
+    slot_and_protocol(support).map(|(slot, _)| slot)
+}
+
+pub fn probe(support: &Path) -> io::Result<String> {
+    let (slot, protocol) = slot_and_protocol(support)?;
+    Ok(format!("helper-slot {} proto={}", slot.token(), protocol))
 }
 
 #[cfg(test)]

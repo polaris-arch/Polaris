@@ -199,6 +199,7 @@ fn global_utls_policy_invalidates_main_and_temp_connection_digests_without_editi
             security: Some(SecurityMode::Tls),
             ..srv("utls-node")
         }],
+        utls_policy: Some("follow".into()),
         ..Default::default()
     };
     let original = serde_json::to_value(&config.servers).unwrap();
@@ -226,4 +227,34 @@ fn global_utls_policy_invalidates_main_and_temp_connection_digests_without_editi
         measurement_temp_table(&config.servers, &config)
     );
     assert_eq!(serde_json::to_value(&config.servers).unwrap(), original);
+}
+
+#[test]
+fn missing_global_policy_matches_default_and_explicit_off_ignores_global_profiles() {
+    let node = ServerConfig {
+        security: Some(SecurityMode::Tls),
+        ..srv("default-utls")
+    };
+    let mut config = polaris_config_engine::user_config::UserConfig {
+        servers: vec![node],
+        ..Default::default()
+    };
+    let main = measurement_table_config(&config);
+    let temp = measurement_temp_table(&config.servers, &config);
+    config.utls_policy = None;
+    assert_eq!(main, measurement_table_config(&config));
+    assert_eq!(temp, measurement_temp_table(&config.servers, &config));
+    config.servers[0].tls_settings = Some(
+        polaris_config_engine::user_config::protocol_settings::TlsSettings {
+            utls_mode: Some(polaris_config_engine::user_config::utls::UtlsMode::Disabled),
+            ..Default::default()
+        },
+    );
+    let main = measurement_table_config(&config);
+    let temp = measurement_temp_table(&config.servers, &config);
+    for policy in ["follow", "default", "random", "firefox"] {
+        config.utls_policy = Some(policy.into());
+        assert_eq!(main, measurement_table_config(&config));
+        assert_eq!(temp, measurement_temp_table(&config.servers, &config));
+    }
 }

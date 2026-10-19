@@ -338,7 +338,7 @@ describe('O07 shared config with fenced ancillary hydration', () => {
     expect(MENU).toContain('useAppStore((state) => state.config)');
     expect(MENU).toContain('config?.servers ?? []');
     expect(MENU).toContain('config?.subscriptions ?? []');
-    expect(MENU).toContain('config?.selectedServerId ?? null');
+    expect(MENU).toContain('configuredExitId(proxyStatus, config)');
     expect(MENU).not.toMatch(/api\.config\.onChanged(?:Ready)?\(/);
     const hydrate = MENU.slice(MENU.indexOf('const hydrate ='), MENU.indexOf('refreshOnShow.current ='));
     expect(hydrate).not.toContain('api.config.get(');
@@ -400,20 +400,33 @@ describe('O07 shared config with fenced ancillary hydration', () => {
     expect(PLATFORM).toContain('super::window::notify_screen_change_remeasure(&app)');
     expect(PLATFORM).not.toContain('__POLARIS_TRAY_REMEASURE__');
   });
-  it('selection feedback owns the accepted publication across await, not its invalidated old read token', () => {
+  it('selection feedback uses the shared settlement receipt and current presentation fence', () => {
     const start = MENU.indexOf('const switchExit =');
     const body = MENU.slice(start, MENU.indexOf('\n  const switchNode =', start));
-    const hasFence = (source: string) => /const acceptance = useAppStore\.getState\(\)\.acceptSelectionConfig\(saved\);\s*const publicationGeneration = configReadGeneration\.current\(\);\s*await acceptance;\s*if \(!current\(\) \|\| !configReadGeneration\.isCurrent\(publicationGeneration\)\) return;\s*const feedback = traySwitchFeedback/.test(source);
+    const hasFence = (source: string) => /const receipt = await useAppStore\.getState\(\)\.switchServer\(id\);\s*if \(!current\(\) \|\| !receipt\) return;\s*const feedback = traySwitchFeedback\(receipt, node, t\)/.test(source);
     expect(hasFence(body)).toBe(true);
-    expect(hasFence(body.replace(' || !configReadGeneration.isCurrent(publicationGeneration)', ''))).toBe(false);
-    expect(hasFence(body.replace('isCurrent(publicationGeneration)', 'isCurrent(readGeneration)'))).toBe(false);
+    expect(hasFence(body.replace('!current() || ', ''))).toBe(false);
+    expect(hasFence(body.replace(' || !receipt', ''))).toBe(false);
+    expect(body).not.toContain('api.config.get(');
   });
-  it('ordinary writes use the shared settlement path while selection retains its dedicated GET fence', () => {
+  it('ordinary writes and selection reuse their shared settlement owners', () => {
     expect(MENU).toContain('useAppStore.getState().saveConfig({ proxyMode: mode })');
     expect(MENU).toContain('api.config.setTakeover(modeType)');
-    expect(MENU).toContain('saved: await api.config.get(), readGeneration');
-    expect(MENU).toContain('if (!configReadGeneration.isCurrent(readGeneration)) return');
+    expect(MENU).toContain('await useAppStore.getState().switchServer(id)');
+    expect(MENU).not.toContain('configReadGeneration');
     expect(MENU).toContain('acceptSelectionConfig(saved)');
     expect(MENU).not.toContain('setConfig(saved)');
+  });
+});
+
+describe('async tray action presentation ownership', () => {
+  it('check update, lock and speed test all capture the active interaction', () => {
+    const source = read('./TrayMenu.tsx');
+    for (const [name, next] of [['checkUpdate', '// 立即锁定'], ['lockNow', '// A2'], ['onSpeedTest', '/* ── 打开设置']]) {
+      const begin = source.indexOf(`const ${name} = async`);
+      const body = source.slice(begin, source.indexOf(next, begin));
+      expect(body).toContain('life === trayLifecycle.current && operation === interactionEpoch.current');
+      expect(body).toContain('current()');
+    }
   });
 });

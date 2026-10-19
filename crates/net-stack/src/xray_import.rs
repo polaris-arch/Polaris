@@ -13,9 +13,8 @@
 //! [`crate::clash_parser`] 同口径），否则 `"Chrome"` / `"AES-128-GCM"` 大小写变体会让 sing-box FATAL
 //! （上游 #298 修的正是此类）。`security` 走 [`SecurityMode`] 类型化归一，天然消除大小写变体。
 //!
-//! **未知传输 → tcp（DESIGN-REVIEW(xray-transport-fallback)）**：忠实迁移 上游 `applyStreamSettings`
-//! 的 `else { network = 'tcp' }`——xray 专属传输（kcp/quic/xhttp 等）静默降级为 tcp。这与 Polaris
-//! 分享链接族的 #263「未知传输=整节点拒绝」纪律相反；此分歧源自 oracle，见模块尾部 review 注记。
+//! 显式未知或畸形传输拒绝整条节点并报告；缺省 TCP，受支持别名与共享
+//! [`normalize_transport`] / builder 保持一致，不把 Xray 专属传输静默改写为 TCP。
 
 #![forbid(unsafe_code)]
 
@@ -23,13 +22,13 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use polaris_config_engine::user_config::normalize::normalize_token;
+use polaris_config_engine::user_config::normalize::{normalize_token, normalize_transport};
 use polaris_config_engine::user_config::protocol_settings::{
     GrpcSettings, HttpSettings, RealitySettings, ShadowsocksSettings, TlsSettings,
     WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
-use polaris_config_engine::user_config::tls_pin::keep_valid_cert_pins;
+use polaris_config_engine::user_config::tls_pin::preserve_cert_pins;
 
 use crate::clash_parser::ClashParseResult;
 
@@ -87,28 +86,35 @@ fn first<'a>(parent: Option<&'a Value>, key: &str) -> Option<&'a Value> {
 
 // ── streamSettings → 传输/安全层 ─────────────────────────────────────────────────
 
-/// xray `streamSettings` → `ServerConfig` 传输/安全层字段（上游 `applyStreamSettings`）。
-fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>) {
-    let Some(ss) = ss.filter(|v| v.is_object()) else {
-        return;
-    };
+/// Only absence defaults to TCP; explicit malformed/unsupported declarations fail closed.
+fn stream_network(ss: Option<&Value>) -> Result<&'static str, &'static str> {
+    let Some(ss) = ss else { return Ok("tcp"); };
+    if !ss.is_object() {
+        return Err("Invalid Xray streamSettings: expected an object");
+    }
+    match ss.get("network") {
+        None => Ok("tcp"),
+        Some(Value::String(raw)) => normalize_transport(raw)
+            .ok_or("不支持的传输层类型: Xray network"),
+        Some(_) => Err("Invalid Xray network: expected a supported transport string"),
+    }
+}
 
-    // —— 传输层 —— （上游: (str(ss.network) || 'tcp').toLowerCase()）
-    let network = str_ne(ss.get("network"))
-        .unwrap_or_else(|| "tcp".to_string())
-        .to_ascii_lowercase();
-    match network.as_str() {
+/// xray `streamSettings` → `ServerConfig`; network was validated at the import boundary.
+fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>, network: &str) {
+    server.network = Some(network.to_string());
+    let Some(ss) = ss else { return; };
+
+    match network {
         "ws" => {
             server.network = Some("ws".to_string());
             let ws = ss.get("wsSettings");
             let headers = ws.and_then(|w| w.get("headers"));
-            let host = str_ne(headers.and_then(|h| h.get("Host")))
-                .or_else(|| str_ne(headers.and_then(|h| h.get("host"))));
             server.ws_settings = Some(Box::new(WebSocketSettings {
                 path: Some(
                     str_ne(ws.and_then(|w| w.get("path"))).unwrap_or_else(|| "/".to_string()),
                 ),
-                headers: host.map(host_header),
+                headers: crate::import_fields::ws_headers(headers),
                 ..Default::default()
             }));
         }
@@ -131,6 +137,8 @@ fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>) {
                 path: Some(
                     str_ne(h2.and_then(|h| h.get("path"))).unwrap_or_else(|| "/".to_string()),
                 ),
+                method: str_ne(h2.and_then(|h| h.get("method"))),
+                headers: crate::import_fields::http_headers(h2.and_then(|h| h.get("headers"))),
                 // 上游: Array.isArray(host) ? host : str(host) ? [str(host)] : undefined
                 host: match host_val {
                     Some(Value::Array(a)) => {
@@ -153,8 +161,8 @@ fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>) {
                 ..Default::default()
             }));
         }
-        // DESIGN-REVIEW(xray-transport-fallback)：未知传输静默降级 tcp（忠实 上游；与 #263 相反）。
-        _ => server.network = Some("tcp".to_string()),
+        // The validated TCP transport has no additional transport settings.
+        _ => {}
     }
 
     // —— 安全层 —— （上游: (str(ss.security) || 'none').toLowerCase()）
@@ -177,15 +185,14 @@ fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>) {
                         == Some(true),
                 ),
                 alpn,
-                fingerprint: normalize_token(
-                    &str_ne(tls.and_then(|t| t.get("fingerprint")))
-                        .unwrap_or_else(|| "chrome".to_string()),
-                ),
+                fingerprint: str_ne(tls.and_then(|t| t.get("fingerprint")))
+                    .and_then(|fp| normalize_token(&fp)),
                 // Xray `tlsSettings.pinnedPeerCertSha256`：逗号分隔 hex（可带 `:`），整张证书 DER 的 SHA-256
                 // （XTLS/Xray-core infra/conf/transport_security.go @60e2a0c :314、:364-379）⇒ `certificateSha256`。
                 // 语义差同 share_link 的 `pcs`：Xray 也接受命中链上 CA，sing-box 只比叶子。
-                certificate_sha256: str_ne(tls.and_then(|t| t.get("pinnedPeerCertSha256")))
-                    .and_then(|p| keep_valid_cert_pins(&p)),
+                certificate_sha256: tls.and_then(|t| t.get("pinnedPeerCertSha256"))
+                    .map(|v| str_val(Some(v)).unwrap_or_else(|| "invalid-pin-shape".into()))
+                    .and_then(|p| preserve_cert_pins(&p)),
                 ..Default::default()
             });
         }
@@ -194,10 +201,10 @@ fn apply_stream_settings(server: &mut ServerConfig, ss: Option<&Value>) {
             let reality = ss.get("realitySettings");
             server.tls_settings = Some(TlsSettings {
                 server_name: str_val(reality.and_then(|r| r.get("serverName"))),
-                fingerprint: normalize_token(
-                    &str_ne(reality.and_then(|r| r.get("fingerprint")))
-                        .unwrap_or_else(|| "chrome".to_string()),
-                ),
+                // Preserve the source; the shared REALITY policy supplies
+                // Chrome at generation time only when fingerprint is absent.
+                fingerprint: str_ne(reality.and_then(|r| r.get("fingerprint")))
+                    .and_then(|fp| normalize_token(&fp)),
                 ..Default::default()
             });
             server.reality_settings = Some(RealitySettings {
@@ -248,6 +255,7 @@ fn new_server(
 fn map_xray_outbound(
     o: &Value,
     proto: &str,
+    network: &str,
     sub_id: &str,
     now: &str,
     id_gen: &mut impl FnMut() -> String,
@@ -283,7 +291,7 @@ fn map_xray_outbound(
                 server.flow =
                     str_ne(user.and_then(|u| u.get("flow"))).and_then(|f| normalize_token(&f));
             }
-            apply_stream_settings(&mut server, o.get("streamSettings"));
+            apply_stream_settings(&mut server, o.get("streamSettings"), network);
             Some(server)
         }
         "trojan" => {
@@ -293,7 +301,7 @@ fn map_xray_outbound(
             let password = str_ne(srv.get("password"))?;
             let mut server = new_server(id_gen, &tag, Protocol::Trojan, address, port, sub_id, now);
             server.password = Some(password);
-            apply_stream_settings(&mut server, o.get("streamSettings"));
+            apply_stream_settings(&mut server, o.get("streamSettings"), network);
             Some(server)
         }
         "shadowsocks" => {
@@ -316,7 +324,7 @@ fn map_xray_outbound(
                 password,
                 ..Default::default()
             }));
-            apply_stream_settings(&mut server, o.get("streamSettings"));
+            apply_stream_settings(&mut server, o.get("streamSettings"), network);
             Some(server)
         }
         "http" | "socks" => {
@@ -342,7 +350,7 @@ fn map_xray_outbound(
             // 则由下面这句覆盖（`security: "tls"` ⇒ HTTPS 代理）。
             server.network = Some("tcp".to_string());
             server.security = Some(SecurityMode::None);
-            apply_stream_settings(&mut server, o.get("streamSettings"));
+            apply_stream_settings(&mut server, o.get("streamSettings"), network);
             Some(server)
         }
         _ => None,
@@ -404,7 +412,26 @@ pub fn parse_xray_outbounds(
             }
             continue;
         }
-        match map_xray_outbound(ob, &proto, sub_id, now, id_gen) {
+        let stream = ob.get("streamSettings");
+        let network = match stream_network(stream) {
+            Ok(network) => network,
+            Err(message) => {
+                r.failed += 1;
+                r.warnings.push(message.into());
+                continue;
+            }
+        };
+        let settings = match network {
+            "ws" => stream.and_then(|s| s.get("wsSettings")),
+            "http" | "h2" => stream.and_then(|s| s.get("httpSettings")),
+            _ => None,
+        };
+        if !crate::import_fields::headers_supported(settings.and_then(|s| s.get("headers")), network != "ws") {
+            r.failed += 1;
+            r.warnings.push("Unrepresentable transport headers".into());
+            continue;
+        }
+        match map_xray_outbound(ob, &proto, network, sub_id, now, id_gen) {
             Some(server) => r.servers.push(server),
             None => r.failed += 1,
         }

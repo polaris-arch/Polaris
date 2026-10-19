@@ -127,6 +127,7 @@ pub fn default_app_rules() -> Vec<AppRule> {
             action: RuleAction::Proxy,
             enabled: true,
             target_server_id: None,
+            target_auto_select: None,
         })
         .collect()
 }

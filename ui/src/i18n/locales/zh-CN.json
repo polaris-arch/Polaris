@@ -41,7 +41,7 @@
     "actionError": {
       "partialCleanup": "卸载清理仅部分完成，受保护的服务文件可能仍有残留。请重新卸载助手并授予管理员权限。",
       "cancelled": "已取消管理员授权",
-      "authorizationUnavailable": "当前桌面会话没有可用的管理员认证代理。请启动 PolicyKit 认证代理后重试",
+      "authorizationIncomplete": "管理员操作未完成，请查看日志",
       "proxyRunning": "请先断开由 helper 管理的代理，再升级 helper",
       "unsupported": "此平台不支持提权 helper",
       "missingAsset": "应用内置的 helper 文件不可用",
@@ -67,7 +67,11 @@
     },
     "failureNextStep": "请查看日志中的 Helper 安装记录以确认失败原因。重新检测不会再次安装 Helper。",
     "viewLogsAction": "查看日志",
-    "installSelectedCoreAction": "安装本版本配套内核"
+    "installSelectedCoreAction": "安装本版本配套内核",
+    "stopAndUpgradeAction": "停止连接并升级…",
+    "stopAndUpgradeTitle": "停止 com.polaris.helper 并升级？",
+    "stopAndUpgradeWarning": "这会停止 com.polaris.helper 及其管理的所有连接，包括其他应用会话的连接。这些连接将被中断，随后 Polaris 会请求管理员授权以升级助手。只有同意停止上述所有连接时才继续。",
+    "stopAndUpgradeConfirm": "停止所有受管连接并升级"
   },
   "proxy": {
     "systemProxyResidualDesc": "TUN 模式下检测到系统代理仍开启（{{proxy}}），它不是 Polaris 设置的，可能导致连接异常。如非必要建议关闭。",
@@ -497,17 +501,13 @@
     },
     "pendingResetShortConfirm": "放弃草稿？",
     "pendingResetDone": "已放弃未保存改动",
-    "pendingSavedStillNeedsApply": "已保存的改动仍待应用",
-    "switchPending": "{{node}} · 已保存，正在应用连接更改",
-    "switchRestarting": "{{node}} · 已保存，正在重启连接以完成切换",
-    "switchSavedForNextStart": "{{node}} · 已保存，下次连接时生效",
-    "switchRequiresApply": "{{node}} · 已保存，请应用待处理更改后使用"
+    "pendingSavedStillNeedsApply": "已保存的改动仍待应用"
   },
   "settings": {
     "utls": {
       "label": "全局 uTLS 指纹",
-      "description": "跟随节点保留原设置；其他选项仅覆盖生成配置，不修改节点。Random 在核心进程启动时选定模板，Randomized 为随机化模板。",
-      "follow": "跟随节点"
+      "description": "新配置预设为默认（Chrome）。跟随保留节点指纹；默认、随机或浏览器选项覆盖未显式关闭的适用节点，节点明确关闭优先。随机在每次内核启动时选择一种浏览器模板。",
+      "follow": "跟随"
     },
     "coex": {
       "windowsHint": "各原生来源独立展示，完整性和 compartment 可能仍为未知。不推断接口关联、路由选择或安全结论。",
@@ -920,13 +920,16 @@
       "downloadDone": "下载完成",
       "restartToInstall": "重启 Polaris 即可安装",
       "digestMissingTag": "无校验摘要",
-      "digestMissingBefore": "该版本未附带 sha256 摘要，下载完成后无法逐字节核对安装包与发布方一致。更新不会因此被阻断；若已启用 GitHub 加速镜像，该镜像也在本次下载的信任范围内。",
-      "digestMissingAfter": "本次下载未做 sha256 摘要核对——该版本未附带摘要，无法逐字节确认安装包与发布方一致。是否安装由你决定。",
+      "digestMissingBefore": "此发布没有可信的 SHA-256 摘要，无法在应用内自动下载或安装。请打开发布页手动安装。",
+      "digestMissingAfter": "此安装包没有经过 SHA-256 摘要验证，无法通过应用安装。请打开发布页手动安装。",
       "restartAndInstall": "重启并安装",
+      "manualInstallPending": "等待手动安装",
+      "manualInstallerOpened": "安装磁盘映像已打开。请手动安装应用，再重新打开检查版本。目前尚未确认安装完成。",
       "downloadedManual": "已下载，需手动替换",
       "portableQuitAndOpen": "退出并打开文件夹",
       "failed": "更新失败",
       "downloadInterrupted": "下载中断",
+      "updateTrustRequired": "此安装包尚未通过本次安装验证。请重新检查更新并下载。",
       "installRestartRequired": "未能完成安装前的准备，且本次运行已不能再启动代理。请重启应用后重试。",
       "portableReminderClearFailed": "无法清除更新提示，记录仍保留。请重试；下载的压缩包不会被删除。",
       "err": {
@@ -939,7 +942,7 @@
         "digestHexInvalid": "发布信息里的 sha256 摘要不是合法的十六进制（发布方写坏，重试无用）",
         "digestMismatch": "更新包校验失败（可能被截断或篡改）",
         "landingFailed": "更新包落盘失败",
-        "recheckFailed": "检查更新失败"
+        "recheckFailed": "更新检查失败。请重新检查并下载已验证的安装包，或从发布页面手动安装。"
       },
       "coreCard": "sing-box 内核",
       "corePackaged": "随包内核自报版本",
@@ -1071,9 +1074,22 @@
         "hint": "本报告只描述一份配置快照中的强制路由匹配，不证明当前流量承载、连通或稳定归属。",
         "loading": "正在刷新路由证据…",
         "unavailable": "暂时无法取得路由证据。",
-        "scope": { "preview": "草稿预览", "applied": "运行快照", "persistedUnknown": "配置快照，当前加载状态未确认" },
-        "configSource": { "draft": "草稿配置", "running": "运行配置", "persisted": "已保存配置" },
-        "load": { "startupReady": "启动加载已确认", "fileWrittenUnacknowledged": "文件已写入，内核加载未确认", "loadFailed": "加载失败", "unknown": "加载状态未知" },
+        "scope": {
+          "preview": "草稿预览",
+          "applied": "运行快照",
+          "persistedUnknown": "配置快照，当前加载状态未确认"
+        },
+        "configSource": {
+          "draft": "草稿配置",
+          "running": "运行配置",
+          "persisted": "已保存配置"
+        },
+        "load": {
+          "startupReady": "启动加载已确认",
+          "fileWrittenUnacknowledged": "文件已写入，内核加载未确认",
+          "loadFailed": "加载失败",
+          "unknown": "加载状态未知"
+        },
         "stale": "这份快照已过期，不能把其中网段当成当前状态。",
         "version": "配置版本",
         "generation": "运行代次",
@@ -1094,11 +1110,30 @@
         "reportUnknown": "报告整体的不确定原因",
         "noCandidates": "这份报告未列出路由候选项。",
         "engagedReason": "此候选参与本层的原因",
-        "engaged": { "alwaysRouteSubnets": "始终路由所声明的子网", "selected": "已选为出口节点", "ruleTargeted": "被规则指定", "generationFailed": "候选生成失败", "unknown": "原因未归类" },
-        "relation": { "equal": "与先行节点网段相同", "requestedWithinEarlier": "本网段包含于先行节点的网段", "earlierWithinRequested": "先行节点的网段包含于本网段" },
-        "leg": { "preferredBy": "运行期目标匹配", "externalRuleSet": "引用网段文件", "inline": "直接网段规则" },
+        "engaged": {
+          "alwaysRouteSubnets": "始终路由所声明的子网",
+          "selected": "已选为出口节点",
+          "ruleTargeted": "被规则指定",
+          "generationFailed": "候选生成失败",
+          "unknown": "原因未归类"
+        },
+        "relation": {
+          "equal": "与先行节点网段相同",
+          "requestedWithinEarlier": "本网段包含于先行节点的网段",
+          "earlierWithinRequested": "先行节点的网段包含于本网段"
+        },
+        "leg": {
+          "preferredBy": "运行期目标匹配",
+          "externalRuleSet": "引用网段文件",
+          "inline": "直接网段规则"
+        },
         "coverage": "本层覆盖情况",
-        "coverageValue": { "full": "全部", "partial": "部分", "none": "未覆盖", "unknown": "未知" },
+        "coverageValue": {
+          "full": "全部",
+          "partial": "部分",
+          "none": "未覆盖",
+          "unknown": "未知"
+        },
         "generationFailed": "此节点未生成路由候选。",
         "configured": "节点声明的网段（不是已分配网段）",
         "observed": "观测到的主机地址",
@@ -1114,7 +1149,13 @@
         "invalid": "无效网段",
         "excludedCatchAll": "不参与组网归属的全网段",
         "unknownReasons": "结果未知的原因",
-        "source": { "declared": "声明", "observed": "观测", "retained": "保留", "bootstrap": "默认推算", "opaque": "运行期匹配" },
+        "source": {
+          "declared": "声明",
+          "observed": "观测",
+          "retained": "保留",
+          "bootstrap": "默认推算",
+          "opaque": "运行期匹配"
+        },
         "unknownOpaque": "规则目标范围无法枚举",
         "unknownInvalid": "输入网段无效",
         "unknownLimit": "诊断取材或结果超过限制",
@@ -1231,7 +1272,7 @@
       "builtinTag": "内置",
       "noQuotaTag": "不占额度",
       "addCustomDoh": "添加自定义 DoH",
-      "customDohIpOnly": "需为纯 IP 形式（如 223.5.5.5 / tls://223.5.5.5:853），域名会被拒绝",
+      "customDohIpOnly": "节点解析仅支持 IP 地址的 HTTPS 或 UDP 上游，不支持 TLS。",
       "raceEmptyFallback": "全部关闭时回退默认竞速 ali/dnspod",
       "fakeIpFilterFold": "不使用 FakeIP 的域名",
       "fakeIpFilterHint": "普通例外在用户 DNS 规则之前使用国内 DNS；门户网络检测例外仍使用内部解析器。这会指定真实解析器，并非仅跳过 FakeIP。",
@@ -1503,7 +1544,7 @@
     "testMatch": "测试匹配（可选）",
     "testMiss": "未命中",
     "testPh": "输入域名或 IP 试命中…",
-    "testUntestable": "该规则无法用域名 / IP 测试",
+    "testUntestable": "当前输入和数据不足以判断是否匹配。",
     "yourRegion": "你所在的地区",
     "manualNote": "手动接管：需在系统或应用中把代理指向本地端口，仅指向该端口的流量才会经这些规则匹配",
     "reorderFail": "规则排序保存失败",
@@ -1605,7 +1646,9 @@
       "matchIn": "当前处在该网络",
       "matchOut": "当前不在该网络",
       "matchUnknown": "是否处在该网络：未知（代理未运行或正在检测）"
-    }
+    },
+    "editConflict": "规则已变更或删除，请重新打开后保存。",
+    "syntaxUnavailable": "暂时无法验证表达式，请检查所选内核后重试。"
   },
   "sub": {
     "editTitle": "编辑订阅",
@@ -1693,6 +1736,7 @@
     "createTaskRecoveredHint": "订阅添加在后台执行，应用重启后会在这里继续显示进度。"
   },
   "errors": {
+    "dnsDependencyInvalid": "DNS 服务器或分组的引用无效或仍被使用。请检查 DNS 规则、默认 DNS 和分组引用后重试。",
     "iosSessionActive": "系统中已有 Polaris VPN 会话，请先在 iOS 系统设置中停止该会话，再连接。",
     "operationFailed": "操作失败，请稍后重试",
     "systemDnsTakeoverFailed": "Linux 系统 DNS 未能接入 Polaris。代理仍在运行，但域名解析可能失败或绕过 DNS 规则；请检查 Helper 与 systemd-resolved 后重连。",
@@ -1723,7 +1767,9 @@
     "coreBundleMismatch": "随包内核与本应用的内容身份不符，请重新安装 Polaris。",
     "helperCoreAbsent": "本应用选定的内核尚未安装，请前往「设置 › Helper」安装。",
     "helperCoreInvalid": "已安装内核未通过内容核验，请前往「设置 › Helper」修复。",
-    "helperCoreOccupied": "助手资源已被占用，或上一内核尚未收口。请先在属主应用中正常断开，再重试；归属无法确认时，请安排管理员维护。"
+    "helperCoreOccupied": "助手资源已被占用，或上一内核尚未收口。请先在属主应用中正常断开，再重试；归属无法确认时，请安排管理员维护。",
+    "nodeResolverUnsupported": "所选节点 DNS 不受支持。请在设置 > DNS 中选择 IP 地址的 HTTPS 或 UDP 解析器。",
+    "speedTestUrlInvalid": "测速地址无效。请在设置 > 网络中修正，或清空以使用默认地址。"
   },
   "privacy": {
     "wrongPassword": "解锁密码错误",
@@ -1847,11 +1893,11 @@
     }
   },
   "import": {
-    "detBase64": "识别到 Base64 内容（提交后端解码）",
+    "detBase64": "已识别 Base64 内容，导入时将尝试解析",
     "detClash": "识别到 Clash 配置",
     "detLinks": "识别到 {{n}} 条分享链接",
     "detSub": "这看起来是订阅链接",
-    "detUnknown": "格式待后端解析",
+    "detUnknown": "尚未识别格式，导入时将尝试解析",
     "discardMsg": "已粘贴的内容将不会保存。",
     "discardTitle": "放弃导入？",
     "dropHere": "拖拽配置文件到此，或点击选择",
@@ -1904,12 +1950,18 @@
   },
   "node": {
     "utls": {
-      "legacy": "未设置（兼容原默认）",
-      "default": "核心默认指纹",
-      "disabled": "关闭 uTLS（保留 TLS）",
+      "legacy": "默认",
+      "default": "默认",
+      "disabled": "关闭 uTLS",
       "loading": "正在读取内核指纹能力…",
       "unavailable": "无法读取指纹能力：{{reason}}。保留现有设置，由实际内核检查。",
-      "realityRequired": "REALITY 需要 uTLS，请选择内核默认或受支持的指纹。"
+      "realityRequired": "REALITY 需要 uTLS，不能关闭。默认使用 Chrome，也可选择受支持的浏览器指纹。",
+      "random": "随机",
+      "description": "默认在支持 uTLS 的连接上使用 Chrome。关闭只禁用 uTLS，保留 TLS；REALITY 不允许关闭。随机在每次内核启动时选择一种浏览器模板。",
+      "engineUnsupported": "当前系统 TLS 引擎不支持 uTLS。默认不会强制启用；如需浏览器指纹，请先改用 Go TLS 引擎。",
+      "savedCoreDefault": "已保存：核心默认（请改选浏览器）",
+      "savedRandomized": "已保存：Randomized（请改选浏览器）",
+      "savedHint": "此历史设置仍保留原值，实际运行受全局策略影响。可改选浏览器指纹后保存；不会自动替换已保存值。"
     },
     "add": "添加",
     "addTitle": "添加节点",
@@ -2208,10 +2260,10 @@
     "speedTestBlockedLanOnly": "该组网节点关闭了「允许访问外网」：只承载内网网段，公网测速必然超时",
     "speedTestBlockedStagedOnly": "该节点还没保存到配置文件：运行核里没有它，测不出真实延迟。点条上的「保存」后即可测速",
     "speedTestBlockedSystem": "该节点绑定 System 内核接口：测速会走系统默认路由，测出的是直连的假数值，故不可测",
-    "speedTestBlockedTsCoreNotReady": "Tailscale 出口测速需要代理正在运行（主核测速池），请先连接再测",
+    "speedTestBlockedTsCoreNotReady": "请先连接代理，再测试 Tailscale 出口延迟",
     "speedTestBlockedTsNoExit": "Tailscale 未设置出口节点（Exit Node）：没有公网出口，测速必然超时",
     "speedTestNoActiveExit": "当前出口为直连或未选节点，无可测出站",
-    "speedTestOnlyActive": "测速探测池本次不可用（端口分配失败已回退），仅当前出口可测",
+    "speedTestOnlyActive": "无法启动其他节点的测速，本次仅可测试当前出口",
     "speedTestSentinelExit": "当前出口是直连或阻断：没有节点承载，无延迟可测",
     "speedTestSkipped": "{{count}} 个节点未纳入本次测速（未入运行核测速池，重启内核后纳入）",
     "speedTestSkippedTsNotReady": "{{count}} 个 Tailscale 节点未纳入本次测速（尚未登录就绪，登录后可测）",
@@ -2289,6 +2341,7 @@
     "speedTestCoreUnresponsive": "测速内核无响应",
     "speedTestCancelled": "测速已取消",
     "speedTestPreempted": "测速已被另一轮测速打断",
+    "speedTestNativePending": "等待内核 HTTP 测速结果",
     "speedTestNotApplicable": "不支持测速",
     "speedTestInterruptedSummary": "已完成 {{tested}}/{{total}} 节点，其余保留原值",
     "speedTestResume": "继续剩余",
@@ -2334,7 +2387,7 @@
     "batchDeleteConfirmMobile": "确定删除选中的 {{count}} 个节点吗？此操作无法撤销。"
   },
   "procPick": {
-    "empty": "暂无进程数据 / 后端未接入",
+    "empty": "暂无进程数据，请刷新重试",
     "error": "进程列表加载失败",
     "hint": "从运行中的进程选择，快速加入进程规则",
     "loading": "加载中…",
@@ -2350,7 +2403,7 @@
     "clickRefresh": "点击「刷新清单」获取资源清单",
     "download": "下载",
     "downloaded": "已下载",
-    "errUnavailable": "下载后端尚未接入（需 HTTP 下载能力）",
+    "errUnavailable": "未收到下载结果，请重试。",
     "extBuiltin": "远程获取失败 · 回落内置精选清单",
     "extCache": "远程获取失败 · 使用本地缓存清单",
     "extFetching": "获取中…",
@@ -2431,7 +2484,7 @@
     "urlDlgErrUrlEmpty": "请输入资源 URL",
     "urlDlgErrUrlInvalid": "URL 格式不合法（需 http/https）",
     "urlDlgErrNameEmpty": "请输入名称",
-    "urlDlgErrUnavailable": "下载后端尚未接入（需 HTTP 下载能力）",
+    "urlDlgErrUnavailable": "未收到下载结果，请重试。",
     "urlDlgErrFailed": "下载失败",
     "urlDlgDiscardTitle": "放弃下载？",
     "urlDlgDiscardMsg": "已填写的内容将不会保存。",
@@ -2802,7 +2855,7 @@
     "sortAsc": "升序",
     "sortDesc": "降序",
     "sortedBy": "已按「{{key}}」{{dir}}排列",
-    "pauseNote": "暂停即退订：整条数据链停机，不是只冻结画面；恢复后下一帧（约 1 秒）回填。",
+    "pauseNote": "暂停后停止接收连接数据更新；恢复后约 1 秒显示最新数据。",
     "pausedNote": "已暂停：连接明细已退订，列表不再更新。",
     "overview": {
       "hostsTitle": "TOP 域名（按连接数）",
@@ -2954,7 +3007,7 @@
     "viewDetails": "查看{{title}}说明",
     "nodeDetails": "{{name}} · 节点说明",
     "speedTest": "测速",
-    "stagedNodeDetails": "节点尚未保存，暂时不能选为出口或测速。请通过底部提示条保存；主核运行时，已保存的改动仍需应用后才会生效。",
+    "stagedNodeDetails": "节点尚未保存，不能选择或测速。请在底部保存；代理运行中还需应用更改。",
     "tsExitTitle": "Tailscale 出口",
     "tsExitNeedsAuth": "授权未完成，不能经 Tailscale 出网。",
     "tsExitNoDevice": "未选出口设备，外网仍直连。",
@@ -3152,14 +3205,14 @@
     "refresh": "刷新状态",
     "loading": "正在读取选择状态…",
     "loadFailed": "读取状态失败，请刷新重试。",
-    "unrecognized": "此版本不认识保存的选择意图，未进行自动选择。",
+    "unrecognized": "此版本不支持已保存的自动选择设置，请重新选择分组。",
     "unknown": "暂时无法解释此状态，请刷新或检查应用版本。",
     "unavailable": "不可用",
     "direct": "直连",
     "block": "阻断",
-    "scope": "订阅：{{subscription}} · 实际出口：{{exit}}",
+    "scope": "范围：{{subscription}} · 当前连接：{{exit}}",
     "rate": "本次运行的限频窗口内，择优换点 {{count}} / {{max}} 次",
-    "barred": "暂时排除的挑战节点（最近状态）",
+    "barred": "暂时跳过的节点（最近状态）",
     "barredNode": "{{name}}：最近状态中排除期还剩 {{seconds}} 秒",
     "stalled": "选择评估长时间没有更新，请检查代理与周期测速状态。",
     "starved": "长时间没有可用于选点的新鲜数据，请检查周期测速。",
@@ -3167,27 +3220,27 @@
       "manual": "手动选择",
       "settled": "自动选择已评估",
       "waitingFirstRound": "等待首轮周期测速",
-      "noCandidates": "订阅内没有可用候选，保留实际出口",
-      "noData": "没有新鲜数据可据以选点",
+      "noCandidates": "此分组暂无可用节点，保留当前出口",
+      "noData": "暂无最新测速结果，无法自动选节点",
       "notEvaluated": "此刻未进行自动选择评估",
       "needsRestart": "候选切换需要重启代理，后台未切换",
       "rateLimited": "已达到择优换点频度上限",
       "commitFailed": "换点未完成，不能视为已切换"
     },
     "reason": {
-      "intentUnrecognized": "保存的选择意图不受此版本支持",
+      "intentUnrecognized": "此版本不支持已保存的自动选择设置",
       "switchedOff": "自动选择功能未开放",
       "platformNotOpen": "本平台暂未开放自动选择",
       "coreNotRunning": "代理未运行，请先连接代理",
-      "reconciling": "实际出口正在对账",
+      "reconciling": "正在确认当前连接的节点",
       "configPending": "有尚未应用的配置变更",
       "background": "应用不在前台，评估暂停",
-      "subscriptionEmpty": "订阅内没有节点",
+      "subscriptionEmpty": "分组内没有节点",
       "measuring": "测速尚未收尾，正在等待",
       "periodicDisabled": "全局周期测速已关闭",
       "meteredPaused": "计费网络策略暂停了周期测速",
       "powerSave": "省电策略暂停了周期测速",
-      "notYetEvaluated": "意图已保存，等待下一次评估",
+      "notYetEvaluated": "设置已保存，等待比较节点测速结果",
       "settled": "当前出口没有被明显更优的候选胜过",
       "challengerPending": "存在更优候选，换点条件尚未齐备",
       "currentFailedOnce": "当前出口测速失败一次，等待确认",
@@ -3197,17 +3250,17 @@
       "currentExpired": "当前出口的测速结果已过期",
       "currentUnmeasured": "当前出口尚未测速",
       "currentSkipped": "当前出口未纳入最近一轮测速",
-      "currentMismatch": "测速读回未证实当前出口身份",
+      "currentMismatch": "无法确认测速结果对应当前节点",
       "commitFailed": "目标未通过运行态确认，已恢复原出口",
-      "commitNotEligible": "提交时目标已不满足热切条件",
-      "commitReconciling": "目标与原出口均未证实，正在后台对账",
+      "commitNotEligible": "目标节点需重启才能切换，本次未切换",
+      "commitReconciling": "正在确认连接的是原节点还是新节点",
       "commitYielded": "换点已让位给用户操作或新的配置",
-      "retryPending": "上次换点未完成，等待后端重试",
-      "firstPlacement": "已完成订阅内首次落点",
+      "retryPending": "上次切换未完成，等待重试",
+      "firstPlacement": "已首次选中此分组内的节点",
       "better": "已切换到持续更优的候选",
       "currentFailed": "当前出口连续测速失败后已换点",
       "failover": "已因连通性故障切换出口",
-      "winnerRemoved": "原出口已从订阅删除，已在同订阅内改选",
+      "winnerRemoved": "原出口已从分组删除，已在同分组内改选",
       "requested": "已按用户请求完成换点"
     },
     "lacking": {
@@ -3219,15 +3272,15 @@
       "cooldown": "须等待换点冷却结束"
     },
     "choose": "自动选节点",
-    "choice": "订阅：{{subscription}}",
-    "choiceSelected": "已选 · 订阅：{{subscription}}",
-    "choiceHelp": "选择一个订阅，在其中自动选节点。实际出口以连接状态为准；点击任一节点改为手动选择。",
+    "choice": "分组：{{subscription}}",
+    "choiceSelected": "已选 · 分组：{{subscription}}",
+    "choiceHelp": "选择一个分组，在其中自动选节点。实际出口以连接状态为准；点击任一节点改为手动选择。",
     "switchNow": "立即评估切换",
     "keepManual": "保留当前出口，改为手动",
-    "intentSaved": "自动选择意图已保存；实际出口等待后端评估。",
+    "intentSaved": "自动选择已保存，尚未确认切换。",
     "manualSaved": "手动选择已保存。",
-    "placementFailed": "自动意图已保存，但运行侧换点未完成，请检查实际出口与状态。",
-    "selectionChanged": "选择已更新，请以当前实际出口与意图为准。",
+    "placementFailed": "自动选择已保存，但切换未完成，请重试。",
+    "selectionChanged": "选择已更新，请查看当前连接节点。",
     "actionFailed": "选择操作失败，请检查当前状态后重试。",
     "details": "本次运行的评估详情",
     "basis": "当前出口依据：{{state}} · {{latency}} · {{binding}} · {{at}}",
@@ -3238,10 +3291,10 @@
     "commit": "连续提交失败 {{count}} 次 · 重试间隔 {{seconds}} 秒（最近状态）",
     "lastFailure": "最近未完成：{{name}} · {{reason}} · {{at}}",
     "noDataAge": "没有选点数据已持续 {{seconds}} 秒（最近状态）",
-    "outside": "实际出口不在自动订阅内。",
-    "outsideOverdue": "实际出口长时间未落入自动订阅，请检查候选与测速。",
-    "unverified": "此依据未通过运行态读回证实。",
-    "allUnverified": "全部可选候选都未被运行态读回证实。",
+    "outside": "实际出口不在自动分组内。",
+    "outsideOverdue": "实际出口长时间未落入自动分组，请检查候选与测速。",
+    "unverified": "尚未确认此结果对应当前连接节点。",
+    "allUnverified": "所有可选节点的连接状态均未确认。",
     "switchCounts": "本次运行以来：故障换点 {{failover}} 次 · 自动选点 {{select}} 次",
     "dataSource": "周期测速暂停原因：{{blocked}} · 最近跳过原因：{{skip}}",
     "none": "无",
@@ -3250,15 +3303,22 @@
       "AUTO_SELECT_SWITCHED_OFF": "自动选择功能未开放。",
       "AUTO_SELECT_PLATFORM_NOT_OPEN": "本平台暂未开放自动选择。",
       "AUTO_SELECT_SUBSCRIPTION_NOT_FOUND": "订阅已不存在，请刷新节点。",
-      "AUTO_SELECT_SUBSCRIPTION_EMPTY": "订阅内没有节点。",
-      "AUTO_SELECT_NOT_AUTO": "当前不是自动选择，请先选择自动订阅。",
+      "AUTO_SELECT_SUBSCRIPTION_EMPTY": "分组内没有节点。",
+      "AUTO_SELECT_NOT_AUTO": "当前不是自动选择，请先选择自动分组。",
       "AUTO_SELECT_NO_TARGET": "此刻没有满足切换条件的候选，保留实际出口。",
       "AUTO_SELECT_SWITCH_FAILED": "切换未完成，请检查实际出口与选择状态。",
-      "AUTO_SELECT_READBACK_FAILED": "操作后无法同步已保存配置，尚不能确认结果；请刷新检查。"
+      "AUTO_SELECT_READBACK_FAILED": "操作后无法同步已保存配置，尚不能确认结果；请刷新检查。",
+      "AUTO_SELECT_NO_ACTUAL_EXIT": "暂时无法确认当前连接节点，请刷新状态后重试。",
+      "AUTO_SELECT_SCOPE_EMPTY": "此范围内没有可用的出口节点。",
+      "AUTO_SELECT_INVALID_SCOPE": "自动选择范围无效，请重新选择。",
+      "SERVER_SWITCH_READBACK_FAILED": "操作后未能同步节点状态，请刷新确认，勿重复切换。",
+      "AUTO_SELECT_BUSY": "正在切换，请稍后重试",
+      "AUTO_SELECT_INVALID_CONFIG": "自动组配置无效",
+      "AUTO_SELECT_REQUIRES_APPLY": "请先应用待生效修改"
     },
     "receipt": {
       "applied": "已切换到 {{name}}",
-      "pending": "已保存 {{name}}，等待运行侧确认。",
+      "pending": "已保存 {{name}}，尚未确认连接到该节点。",
       "restarting": "已保存 {{name}}，代理正在重启。",
       "notRunning": "已保存 {{name}}，下次连接时使用。",
       "deferred": "已保存 {{name}}，需要应用配置后生效。"
@@ -3276,11 +3336,11 @@
       "unverified": "未证实"
     },
     "event": {
-      "firstPlacement": "{{name}} · 已完成订阅内首次落点",
+      "firstPlacement": "{{name}} · 已首次选中此分组内的节点",
       "better": "{{name}} · 已切换到持续更优的候选",
       "currentFailed": "{{name}} · 当前出口连续测速失败后已换点",
       "failover": "{{name}} · 已因连通性故障切换出口",
-      "winnerRemoved": "{{name}} · 原出口已从订阅删除，已在同订阅内改选",
+      "winnerRemoved": "{{name}} · 原出口已从分组删除，已在同分组内改选",
       "requested": "{{name}} · 已按用户请求完成换点",
       "unknown": "实际出口已变为 {{name}}"
     },
@@ -3289,32 +3349,44 @@
       "userDisabled": "全局周期测速已关闭",
       "platformNotEnabled": "本平台暂未启用周期测速",
       "coreNotRunning": "代理未运行",
-      "noSubscription": "没有订阅启用周期测速",
+      "noSubscription": "没有分组启用周期测速",
       "background": "应用不在前台",
       "metered": "计费网络策略暂停测速",
       "powerSave": "省电策略暂停测速",
       "gateBusy": "测速通道正在被占用",
       "preempted": "本轮已让位给其他测速",
-      "budget": "本轮超出时间预算",
-      "frozen": "配置事务暂时冻结测速",
-      "poolUnavailable": "候选测量池不可用",
+      "budget": "本轮测速超时",
+      "frozen": "正在更新配置，测速暂时暂停",
+      "poolUnavailable": "节点测速服务暂不可用",
       "nothingTestable": "本轮没有可测节点",
       "noTargets": "本轮没有待测目标",
-      "crashed": "本轮异常结束，没有回执"
+      "crashed": "本轮测速异常结束，未返回结果"
     },
     "cause": {
-      "firstPlacement": "订阅内首次落点",
+      "firstPlacement": "首次选择分组内的节点",
       "better": "持续更优的候选",
       "currentFailed": "当前出口连续测速失败",
       "failover": "连通性故障",
-      "winnerRemoved": "原出口从订阅删除",
+      "winnerRemoved": "原出口从分组删除",
       "requested": "用户请求评估切换"
     },
     "outcome": {
       "held": "本次评估未换点",
       "switch": "本次评估决定换点，运行结果以实际出口为准",
       "notEvaluated": "本次未评估"
-    }
+    },
+    "auto": "自动",
+    "pendingNode": "等待确认节点",
+    "scopeLabels": {
+      "global": "全部",
+      "manual": "自建节点",
+      "mesh": "组网"
+    },
+    "featureOn": "已开启自动选择",
+    "featureOff": "已关闭自动选择",
+    "fixedCurrent": "已固定当前节点",
+    "fixCurrentHint": "将各自动组固定到当前节点",
+    "tcpNode": "TCP 节点"
   },
   "measurement": {
     "unavailable": "结果暂不可读",
@@ -3330,6 +3402,27 @@
     "nodePath": "节点测量",
     "bindingMismatch": "实际承载与请求节点不同",
     "iosTitle": "通过VPN测量",
-    "iosWillStart": "此测量使用正常VPN连接。如果尚未连接，将开启VPN并保持连接。"
+    "iosWillStart": "此测量使用正常VPN连接。如果尚未连接，将开启VPN并保持连接。",
+    "nativeHttp": "内核 HTTP"
+  },
+  "identityRepair": {
+    "title": "修复重复节点标识",
+    "explanation": "请在每组中选择一条保留原标识的节点。原有规则和选择引用将继续指向所选节点，其余节点获得新标识。不会合并或删除节点。保存不会连接或应用其他待生效的修改。",
+    "group": "冲突组 {{count}}",
+    "record": "第 {{index}} 条：",
+    "confirmReferences": "我确认原有引用继续保留给所选节点。",
+    "save": "确认并保存新标识",
+    "reload": "重新读取冲突列表",
+    "review": "查看重复标识",
+    "ambiguous": "节点标识重复，无法切换。请到节点页面查看并处理标识冲突。",
+    "none": "当前没有重复节点标识。",
+    "stale": "配置已变化。请重新读取列表并选择；尚未自动重试。",
+    "unsupported": "此组或配置暂不支持在此修复。涉及 Tailscale 的记录需要单独恢复身份。本次未作修改。",
+    "invalidChoice": "选择不完整或已经失效。请重新读取列表并选择。",
+    "failed": "无法确认是否保存成功。请先重新读取列表，再决定是否重试。",
+    "loadFailed": "无法读取冲突列表，请重新读取。",
+    "saved": "新标识已保存，未启动连接。",
+    "savedPending": "新标识已保存，当前连接未变。请在准备好后检查并应用待生效的修改。",
+    "savedRefreshFailed": "新标识已保存，但无法读取最新配置。再次修改前请重新打开节点页面。"
   }
 }

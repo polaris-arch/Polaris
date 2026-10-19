@@ -47,7 +47,7 @@ fn parse_ss_pids_ignores_non_digit_after_pid_eq() {
 
 // ===== FreePortDeps mock + free_port 逻辑 =====
 
-/// 完全可控的 deps mock：proc_uid / proc_comm / kill 全部按预置表返回。
+/// 完全可控的 deps mock：proc_uid / proc_comm 按预置表返回；不提供终止原语。
 struct MockDeps {
     /// pid → uid 映射（缺省 → None）。
     uids: std::collections::HashMap<u32, u32>,
@@ -80,10 +80,6 @@ impl FreePortDeps for MockDeps {
     fn proc_comm(&self, pid: u32) -> Option<String> {
         self.comms.get(&pid).cloned()
     }
-    fn kill(&self, pid: u32) -> bool {
-        self.killed.lock().unwrap().push(pid);
-        true
-    }
 }
 
 #[test]
@@ -95,13 +91,18 @@ fn free_port_empty_pids_returns_free() {
 }
 
 #[test]
-fn free_port_kills_own_singbox() {
-    // 对端 uid 自己的 sing-box → kill。
+fn free_port_never_kills_own_singbox() {
+    // 同 UID 的 sing-box 也不能证明进程出生身份。
     let deps = MockDeps::with(1234, 1000, "sing-box");
     let r = free_port(&[1234], 1000, &deps);
-    assert_eq!(r, FreePort::Killed { pids: vec![1234] });
-    assert_eq!(wire(&r), "OK killed 1234");
-    assert_eq!(*deps.killed.lock().unwrap(), vec![1234]);
+    assert_eq!(
+        r,
+        FreePort::Foreign {
+            names: vec!["sing-box".into()]
+        }
+    );
+    assert_eq!(wire(&r), "OK foreign sing-box");
+    assert!(deps.killed.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -163,7 +164,7 @@ fn free_port_foreign_when_proc_uid_missing() {
 }
 
 #[test]
-fn free_port_mixed_killed_and_foreign_returns_foreign() {
+fn free_port_mixed_candidates_remain_foreign() {
     // 混合占用：有 sing-box（杀）+ 有 foreign（不杀）→ Go :327 归 foreign。
     let mut deps = MockDeps::new();
     deps.uids.insert(100, 1000);
@@ -173,12 +174,12 @@ fn free_port_mixed_killed_and_foreign_returns_foreign() {
     let r = free_port(&[100, 200], 1000, &deps);
     // 混合 → Foreign（Go: if len(foreign) > 0 → foreign）。
     assert!(matches!(r, FreePort::Foreign { .. }));
-    // sing-box 仍被杀（foreign 分支不影响 kill 调用已发生）。
-    assert_eq!(*deps.killed.lock().unwrap(), vec![100]);
+    // 所有候选保持未终止，混合列表也不能扩大权限。
+    assert!(deps.killed.lock().unwrap().is_empty());
 }
 
 #[test]
-fn free_port_multiple_singbox_all_killed() {
+fn free_port_multiple_singbox_all_remain_foreign() {
     let mut deps = MockDeps::new();
     for pid in [100, 200, 300] {
         deps.uids.insert(pid, 1000);
@@ -187,9 +188,9 @@ fn free_port_multiple_singbox_all_killed() {
     let r = free_port(&[100, 200, 300], 1000, &deps);
     assert_eq!(
         r,
-        FreePort::Killed {
-            pids: vec![100, 200, 300]
+        FreePort::Foreign {
+            names: vec!["sing-box".into(), "sing-box".into(), "sing-box".into()]
         }
     );
-    assert_eq!(wire(&r), "OK killed 100,200,300");
+    assert_eq!(wire(&r), "OK foreign sing-box | sing-box | sing-box");
 }

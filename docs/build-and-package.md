@@ -90,7 +90,8 @@ node scripts/fetch-dashboard.mjs
 ```
 
 `fetch-core` 验证固定发布输入后放入 `resources/<平台>/`。Linux / Windows 的 Cronet 动态库也必须
-符合清单摘要；macOS 使用静态输入。`fetch-dashboard` 获取 sing-box `gh-pages` 面板，当前没有 SHA256 pin。
+符合清单摘要；macOS 使用静态输入。`fetch-dashboard` 从固定 commit 获取 sing-box 面板，验证归档字节数与 SHA256，
+并在复用或落盘前核对清理后的完整文件清单摘要。
 资源不入库；Tauri 打包配置引用的文件必须事先准备好，不能把获取资源视作运行期在线换核功能。
 
 #### 发布打包与原生验收包

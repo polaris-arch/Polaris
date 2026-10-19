@@ -221,19 +221,88 @@ fn port_zero_and_overflow_rejected() {
     assert_eq!(out.failed, 2);
 }
 
-// ── DESIGN-REVIEW(xray-transport-fallback)：未知传输 → tcp（锁 上游 现行行为）──────
+fn transport_node(network: Value) -> Value {
+    json!({
+        "protocol": "vless",
+        "settings": { "vnext": [{ "address": "a.com", "port": 443, "users": [{ "id": "u" }] }] },
+        "streamSettings": { "network": network }
+    })
+}
+
 #[test]
-fn unknown_transport_falls_back_to_tcp() {
-    let out = parse(json!({ "outbounds": [{
-            "protocol": "vless",
-            "settings": { "vnext": [{ "address": "a.com", "port": 443, "users": [{ "id": "u" }] }] },
-            "streamSettings": { "network": "kcp" }
-        }] }));
-    assert_eq!(
-        out.servers[0].network.as_deref(),
-        Some("tcp"),
-        "忠实 上游：未知传输降级 tcp"
-    );
+fn unsupported_or_malformed_transport_is_reported_without_hiding_valid_siblings() {
+    for network in [
+        json!("kcp"), json!("quic"), json!("xhttp"), json!("splithttp"),
+        json!("future-transport"), json!(""), json!(" "), json!(null),
+        json!(false), json!(1), json!([]), json!({}),
+    ] {
+        let out = parse(json!({ "outbounds": [transport_node(network.clone()), transport_node(json!("tcp"))] }));
+        assert_eq!(out.failed, 1, "{network}");
+        assert_eq!(out.skipped, 0, "supported protocol, invalid transport: {network}");
+        assert_eq!(out.warnings.len(), 1, "{network}");
+        assert_eq!(out.servers.len(), 1, "{network}");
+        assert_eq!(out.servers[0].network.as_deref(), Some("tcp"));
+        assert_eq!(out.servers[0].id, "id-1", "reject before allocating an ID");
+    }
+}
+
+#[test]
+fn transport_rejection_also_applies_to_vmess_and_trojan() {
+    for protocol in ["vmess", "trojan"] {
+        let mut node = transport_node(json!("quic"));
+        node["protocol"] = json!(protocol);
+        if protocol == "trojan" {
+            node["settings"] = json!({ "servers": [{ "address": "a.com", "port": 443, "password": "p" }] });
+        }
+        let mut valid = node.clone();
+        valid["streamSettings"]["network"] = json!("grpc");
+        let out = parse(json!({ "outbounds": [node, valid] }));
+        assert_eq!(out.failed, 1);
+        assert_eq!(out.warnings.len(), 1);
+        assert_eq!(out.servers.len(), 1);
+        assert_eq!(out.servers[0].network.as_deref(), Some("grpc"));
+        assert!(out.servers[0].grpc_settings.is_some());
+    }
+}
+
+#[test]
+fn supported_transports_and_aliases_remain_supported() {
+    for (raw, canonical) in [
+        ("tcp", "tcp"), ("raw", "tcp"), ("none", "tcp"),
+        ("ws", "ws"), ("grpc", "grpc"), ("h2", "http"),
+        ("http", "http"), ("httpupgrade", "httpupgrade"), (" WS ", "ws"),
+        (" RAW ", "tcp"), ("H2", "http"), ("HTTPUPGRADE", "httpupgrade"),
+    ] {
+        let out = parse(json!({ "outbounds": [transport_node(json!(raw))] }));
+        assert_eq!(out.failed, 0, "{raw}");
+        assert_eq!(out.skipped, 0, "{raw}");
+        assert!(out.warnings.is_empty(), "{raw}");
+        assert_eq!(out.servers.len(), 1, "{raw}");
+        assert_eq!(out.servers[0].network.as_deref(), Some(canonical), "{raw}");
+    }
+}
+
+#[test]
+fn only_absent_stream_or_network_defaults_to_tcp() {
+    let mut absent = transport_node(json!("tcp"));
+    absent.as_object_mut().unwrap().remove("streamSettings");
+    let mut absent_network = transport_node(json!("tcp"));
+    absent_network["streamSettings"] = json!({});
+    let out = parse(json!({ "outbounds": [absent, absent_network] }));
+    assert_eq!(out.failed, 0);
+    assert!(out.warnings.is_empty());
+    assert_eq!(out.servers.len(), 2);
+    for server in out.servers {
+        assert_eq!(server.network.as_deref(), Some("tcp"));
+    }
+    for stream in [json!(null), json!(false), json!(1), json!("tcp"), json!([])] {
+        let mut node = transport_node(json!("tcp"));
+        node["streamSettings"] = stream;
+        let out = parse(json!({ "outbounds": [node] }));
+        assert!(out.servers.is_empty());
+        assert_eq!(out.failed, 1);
+        assert_eq!(out.warnings.len(), 1);
+    }
 }
 
 // ── h2 host 数组 / 单串两形态 ─────────────────────────────────────────────────
@@ -400,7 +469,7 @@ fn xray_pinned_peer_cert_sha256_maps_to_certificate_sha256() {
             "protocol": "trojan",
             "settings": { "servers": [{ "address": "a.com", "port": 443, "password": "pw" }] },
             "streamSettings": { "security": "tls",
-                "tlsSettings": { "serverName": "s.com", "pinnedPeerCertSha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881,bad" } }
+                "tlsSettings": { "serverName": "s.com", "pinnedPeerCertSha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881" } }
         }] }));
     assert_eq!(
         out.servers[0]
@@ -412,3 +481,93 @@ fn xray_pinned_peer_cert_sha256_maps_to_certificate_sha256() {
         Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881")
     );
 }
+
+#[test]
+fn xray_tls_import_preserves_source_fingerprint_or_absence() {
+    use polaris_config_engine::builder::outbound::build_proxy_outbound;
+    use polaris_config_engine::singbox::dns::DomainResolver;
+    use polaris_config_engine::user_config::utls::effective_server;
+    for protocol in ["vless", "vmess", "trojan", "http"] {
+        for fingerprint in [
+            None,
+            Some(""),
+            Some("none"),
+            Some("firefox"),
+            Some("randomized"),
+        ] {
+            let mut tls = json!({"serverName":"example.com"});
+            if let Some(fp) = fingerprint {
+                tls["fingerprint"] = json!(fp);
+            }
+            let settings = if matches!(protocol, "vless" | "vmess") {
+                json!({"vnext":[{"address":"example.com","port":443,"users":[{"id":"uuid"}]}]})
+            } else {
+                json!({"servers":[{"address":"example.com","port":443,"password":"secret"}]})
+            };
+            let parsed = parse(json!({"outbounds":[{
+                "protocol":protocol,"tag":"node","settings":settings,
+                "streamSettings":{"security":"tls","tlsSettings":tls}
+            }]}));
+            assert_eq!(parsed.servers.len(), 1);
+            let node: ServerConfig =
+                serde_json::from_value(serde_json::to_value(&parsed.servers[0]).unwrap()).unwrap();
+            assert!(node.tls_settings.as_ref().unwrap().utls_mode.is_none());
+            assert_eq!(
+                node.tls_settings.as_ref().unwrap().fingerprint.as_deref(),
+                fingerprint.filter(|fp| !fp.is_empty())
+            );
+            let effective = effective_server(&node, Some("follow")).unwrap();
+            let output = serde_json::to_value(build_proxy_outbound(
+                &effective,
+                "node",
+                &DomainResolver::Tag("dns-bootstrap".into()),
+                "x64",
+                "linux",
+            ).expect("valid test outbound"))
+            .unwrap();
+            if fingerprint == Some("none") {
+                assert!(output["tls"].get("utls").is_none());
+            } else {
+                let expected = fingerprint.filter(|fp| !fp.is_empty()).unwrap_or("chrome");
+                assert_eq!(output["tls"]["utls"]["fingerprint"], expected, "{protocol}");
+            }
+        }
+    }
+}
+
+#[test]
+fn xray_reality_absence_is_preserved_until_generation() {
+    use polaris_config_engine::builder::outbound::build_proxy_outbound;
+    use polaris_config_engine::singbox::dns::DomainResolver;
+    use polaris_config_engine::user_config::utls::effective_server;
+    let parsed = parse(
+        json!({"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"uuid"}]}]},"streamSettings":{"security":"reality","realitySettings":{"publicKey":"key","serverName":"example.com"}}}]}),
+    );
+    assert_eq!(parsed.servers.len(), 1);
+    let saved: ServerConfig =
+        serde_json::from_value(serde_json::to_value(&parsed.servers[0]).unwrap()).unwrap();
+    let stored = serde_json::to_value(&saved).unwrap();
+    assert!(stored["tlsSettings"].get("fingerprint").is_none());
+    assert!(stored["tlsSettings"].get("utlsMode").is_none());
+    let effective = effective_server(&saved, Some("follow")).unwrap();
+    let output = serde_json::to_value(build_proxy_outbound(
+        &effective,
+        "node",
+        &DomainResolver::Tag("dns-bootstrap".into()),
+        "x64",
+        "linux",
+    ).expect("valid test outbound"))
+    .unwrap();
+    assert_eq!(output["tls"]["utls"]["fingerprint"], "chrome");
+    assert_eq!(serde_json::to_value(&saved).unwrap(), stored);
+}
+
+#[test]
+fn malformed_pin_does_not_disappear_from_insecure_xray_import() {
+    let result = parse(json!({"outbounds":[{"protocol":"trojan", "settings":{"servers":[{"address":"a.example", "port":443, "password":"pw"}]},
+        "streamSettings":{"security":"tls", "tlsSettings":{"allowInsecure":true, "pinnedPeerCertSha256":"bad"}}}]}));
+    assert!(result.servers.is_empty());
+    assert_eq!(result.failed, 1);
+}
+
+mod import_parity;

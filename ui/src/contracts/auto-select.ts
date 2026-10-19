@@ -6,22 +6,24 @@
  * 模式与原因全部取自这里的状态。
  *
  * 意图与实际出口分列：意图存配置的顶层键 `selectionIntent`（缺席即手动），`selectedServerId`
- * 始终是实际出口（自动选择下即当前胜出节点）。界面没有意图键的写入权：置上经
+ * 是保存的下次出口；当前实际出口取运行状态，待应用或切换失败时二者可能不同。界面没有意图键的写入权：置上经
  * `api.server.autoSelectEnable`，清掉只需点任一节点（`api.server.switch`）。
  */
 import type { ServerSwitchReceipt } from './server-switch';
 
-/** 配置里的选择意图。作用域今天只有 `subscription`。 */
+/** 配置里的选择意图。作用域为全局、自建、组网或指定订阅；仅订阅带 subscriptionId。 */
+export type AutoSelectScope = 'global' | 'manual' | 'mesh' | 'subscription';
+export type AutoSelectTarget = { scope: 'global' | 'manual' | 'mesh'; subscriptionId?: never } | { scope: 'subscription'; subscriptionId: string };
 export interface SelectionIntent {
   mode: 'auto';
-  scope: 'subscription';
-  subscriptionId: string;
+  scope: AutoSelectScope;
+  subscriptionId?: string;
 }
 
 /**
  * 状态的模式。
  *
- * `manual` 手动 / `settled` 自动且已选定 / `waitingFirstRound` 等待首轮测速 / `noCandidates` 订阅里
+ * `manual` 手动 / `settled` 自动且已选定 / `waitingFirstRound` 等待首轮测速 / `noCandidates` 所选范围里
  * 没有可用候选 / `noData` 没有数据可据以选点（当前出口没有新鲜结果，或周期测速没在供数）/
  * `notEvaluated` 此刻没有评估 / `needsRestart` 有候选但切过去须重启内核，后台不重启（可用
  * `autoSelectSwitchNow`）/ `rateLimited` 已到换点频度上限 / `commitFailed` 该换而提交没有换成。
@@ -45,7 +47,7 @@ export type AutoSelectMode = (typeof AUTO_SELECT_MODES)[number];
  * `intentUnrecognized` 配置里的意图是更新的版本写的，本版本不认识（原样留着，不据它做事）/
  * `switchedOff` 源码里的总开关关着 / `platformNotOpen` 本平台暂未开放 / `coreNotRunning` 代理未运行 /
  * `reconciling` 出口正在后台对账 / `configPending` 有已保存未应用的出口变更或未保存草稿 /
- * `background` 手机不在前台 / `subscriptionEmpty` 订阅里没有节点 / `measuring` 有测速在飞 /
+ * `background` 手机不在前台 / `subscriptionEmpty` 所选范围里没有节点（保留旧状态码） / `measuring` 有测速在飞 /
  * `periodicDisabled` 首轮未完成，周期测速的全局总开关关着 / `meteredPaused` 首轮未完成，周期测速
  * 因计费网络暂停 / `powerSave` 首轮未完成，周期测速因省电暂停 / `notYetEvaluated` 意图刚写入，
  * 还没有轮到一次评估。
@@ -124,9 +126,9 @@ export type AutoSelectCommitFailedReason = (typeof AUTO_SELECT_COMMIT_FAILED_REA
 /**
  * 换点的原因。
  *
- * `firstPlacement` 出口不在订阅内，落到订阅里最快的 / `better` 当前出口连续几轮被明显胜过 /
+ * `firstPlacement` 出口不在所选范围内，落到范围内候选 / `better` 当前出口连续几轮被明显胜过 /
  * `currentFailed` 当前出口连续测速失败 / `failover` 连通性故障切换 / `winnerRemoved` 订阅刷新删掉了
- * 胜出节点，改选同订阅的 / `requested` 用户要求立即切换，而当前出口没有新鲜结果可比。
+ * 胜出节点，改选同范围的 / `requested` 用户要求立即切换，而当前出口没有新鲜结果可比。
  */
 export const AUTO_SELECT_CAUSES = [
   'firstPlacement',
@@ -156,7 +158,7 @@ export const AUTO_SELECT_LACKING = [
 ] as const;
 export type AutoSelectLacking = (typeof AUTO_SELECT_LACKING)[number];
 
-/** 订阅成员在账本里的分布。 */
+/** 所选范围的候选成员在账本里的分布。 */
 export interface AutoSelectCounts {
   selectable: number;
   failed: number;
@@ -197,7 +199,7 @@ export interface AutoSelectStatus {
   intent: {
     /** `unrecognized`：配置里存着更新的版本写的意图，本版本不认识、不据它做事。 */
     mode: 'manual' | 'auto' | 'unrecognized';
-    scope: 'subscription' | null;
+    scope: AutoSelectScope | null;
     subscriptionId: string | null;
   };
   exit: {
@@ -205,6 +207,7 @@ export interface AutoSelectStatus {
     serverId: string | null;
     /** 是否属于意图指向的订阅；非自动意图下为空。 */
     inSubscription: boolean | null;
+    inScope?: boolean | null;
   };
   mode: AutoSelectMode;
   reason:
@@ -257,6 +260,7 @@ export interface AutoSelectStatus {
     /** 没有数据可据以选点已持续过久。 */
     starved: boolean;
     exitOutsideSubscription: boolean;
+    exitOutsideScope?: boolean;
     exitOutsideOverdue: boolean;
     /** 可选点全部没有被读回证实：读回通道在本机很可能不可用。 */
     allUnverified: boolean;
@@ -280,8 +284,9 @@ export interface AutoSelectStatus {
  * 设置意图与立即切换的回执。命令成功返回即表示写入已落盘，`intentApplied` 为真时意图此刻是
  * 自动选择。
  *
- * - `autoSelectEnable`：只有当前出口不属于该订阅、且已有新鲜候选时才带落点（首次落点）；当前
- *   出口已是该订阅的成员时只写意图，`placement` 为空，出口不动。
+ * - `autoSelectEnable`：保存范围意图。停止状态可选定范围内的下次启动节点，但实际出口仍为空；
+ *   运行中仅将后端确认的运行出口作为实际出口。没有新鲜测速数据时不声称候选最快。
+ * - `autoSelectDisable`：清掉意图，运行时保留已确认的实际出口，停止时不改变已保存出口。
  * - `autoSelectSwitchNow`：恒带落点；没有落点时命令以 `AUTO_SELECT_NO_TARGET` 被拒。
  *
  * 落点的运行侧可能没换成：`placement.status` 为 `failed`、`reason` 为 `AUTO_SELECT_SWITCH_FAILED`，
@@ -303,6 +308,12 @@ export interface AutoSelectReceipt {
  * 表示落点没通过选择校验，在成功回执的 `placement.reason` 里表示落点已落盘而运行侧没换成。
  */
 export const AUTO_SELECT_ERROR_CODES = [
+  'AUTO_SELECT_BUSY',
+  'AUTO_SELECT_INVALID_CONFIG',
+  'AUTO_SELECT_REQUIRES_APPLY',
+  'AUTO_SELECT_NO_ACTUAL_EXIT',
+  'AUTO_SELECT_SCOPE_EMPTY',
+  'AUTO_SELECT_INVALID_SCOPE',
   'AUTO_SELECT_SWITCHED_OFF',
   'AUTO_SELECT_PLATFORM_NOT_OPEN',
   'AUTO_SELECT_SUBSCRIPTION_NOT_FOUND',
@@ -325,3 +336,25 @@ export interface AutoNodeSwitchedPayload {
   cause: AutoSelectCause;
   oldServerName: string | null;
 }
+
+/** Native URLTest truth. Actual nodes refer to the exposed TCP selection only. */
+export interface NativeAutoGroup {
+  target: AutoSelectTarget;
+  actualServerId: string | null;
+  confirmed: boolean;
+  state: 'auto' | 'pinned' | 'pending' | 'empty' | 'error';
+}
+export interface NativeAutoMeasurement {
+  serverId: string; latencyMs: number; measuredAt: number; generation: number;
+  urlDigest: string; source: 'nativeHttp';
+}
+export interface NativeAutoStatus {
+  /** Action-only effective apply result; saved flag alone is not activation. */
+  applyOutcome?: 'saved' | 'applied' | 'restarting' | 'pending' | 'deferred';
+  actualServerId: string | null;
+  featureEnabled: boolean;
+  generation: number;
+  nativeAutoGroups: NativeAutoGroup[];
+  nativeMeasurements: NativeAutoMeasurement[];
+}
+export interface NativeAutoReceipt { intentApplied: boolean; status: NativeAutoStatus }

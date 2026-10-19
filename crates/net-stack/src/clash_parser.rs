@@ -19,7 +19,7 @@ use polaris_config_engine::user_config::protocol_settings::{
     SshSettings, TlsSettings, TuicSettings, WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
-use polaris_config_engine::user_config::tls_pin::{drop_unemitted_cert_pins, keep_valid_cert_pins};
+use polaris_config_engine::user_config::tls_pin::{drop_unemitted_cert_pins, preserve_cert_pins};
 use serde_yaml::Value;
 
 mod hysteria_import;
@@ -128,6 +128,13 @@ impl ClashParseResult {
     /// 判据 `protocol_can_carry_transport` 从 `config-engine` 导入，**不在本 crate 复制一份名单**：
     /// 第二份判据迟早与内核漂移，而漂移的表现是「要么产出起不来的配置、要么把好配置误报成无效」。
     pub(crate) fn finish(mut self) -> Self {
+        let before = self.servers.len();
+        self.servers.retain(|server| polaris_config_engine::user_config::tls_pin::validate_server_cert_pins(server).is_ok());
+        let rejected = before - self.servers.len();
+        if rejected > 0 {
+            self.failed += rejected;
+            self.warnings.push(format!("{rejected} 个节点证书指纹无效，已拒绝导入（TLS_PIN_INVALID）"));
+        }
         let mut ignored: Vec<String> = self
             .servers
             .iter()
@@ -177,14 +184,14 @@ fn str(v: &Value) -> Option<String> {
 /// <https://github.com/MetaCubeX/mihomo/blob/ab405bad5beeeac8b003bb01f60f134f6df54471/component/ca/fingerprint.go#L14-L57>）：
 /// 去 `:` 后 hex 解码、必须 32 字节，与 `sha256.Sum256(cert.Raw)` 比 —— 即**整张证书 DER** 的摘要
 /// （不是公钥）⇒ 映射到 sing-box `certificate_sha256`。浏览器名（`chrome` 等）mihomo 直接报错，
-/// 这里经 `keep_valid_cert_pins` 过滤掉，不留死值。
+/// 保留原始约束，汇合点拒绝非法节点并报告失败，不将其降级成未固定证书。
 ///
 /// ⚠️ 语义差：mihomo 会拿它比对链上**每一张**证书（命中中间/根证书时再以它为根验链），
 /// sing-box 只比叶子。订阅若固定的是 CA 而非叶子，导入后该节点**握手失败**（fail-closed，不会放行）。
 fn clash_cert_pin(m: &Value) -> Option<String> {
     m.get("fingerprint")
-        .and_then(str)
-        .and_then(|f| keep_valid_cert_pins(&f))
+        .map(|v| str(v).unwrap_or_else(|| "invalid-pin-shape".into()))
+        .and_then(|f| preserve_cert_pins(&f))
 }
 
 /// 数字规整。上游 `num`。返回 u32（对齐 ServerConfig.port=u16 / alterId=u32 等）。
@@ -751,18 +758,16 @@ fn apply_transport_and_tls(
                 config.network = Some("ws".to_string());
                 let ws_opts = p.get("ws-opts");
                 let path = ws_opts.and_then(|w| w.get("path")).and_then(str);
-                let host = ws_opts
-                    .and_then(|w| w.get("headers"))
-                    .and_then(pick_host_header);
+                let header_json = ws_opts.and_then(|w| w.get("headers"))
+                    .map(serde_json::to_value).transpose().map_err(|_| "Invalid WS headers")?;
+                if !crate::import_fields::headers_supported(header_json.as_ref(), false) {
+                    return Err("Unrepresentable WS headers".into());
+                }
                 let mut ws = WebSocketSettings::default();
                 if let Some(path) = path {
                     ws.path = Some(path);
                 }
-                if let Some(host) = host {
-                    let mut h = std::collections::BTreeMap::new();
-                    h.insert("Host".to_string(), host);
-                    ws.headers = Some(h);
-                }
+                ws.headers = crate::import_fields::ws_headers(header_json.as_ref());
                 if let Some(med) = ws_opts.and_then(|w| w.get("max-early-data")).and_then(num) {
                     ws.max_early_data = Some(med);
                 }
@@ -835,13 +840,22 @@ fn apply_transport_and_tls(
                             }
                         }
                     }
-                } else if let Some(host) = http_opts
-                    .and_then(|h| h.get("headers"))
-                    .and_then(pick_host_header)
-                {
-                    http_settings.host = Some(vec![host]);
+                } else if let Some(headers) = http_opts.and_then(|h| h.get("headers")) {
+                    let headers = serde_json::to_value(headers).map_err(|_| "Invalid HTTP headers")?;
+                    if let Some(host) = headers.as_object().and_then(|h| h.iter().find(|(k, _)| k.eq_ignore_ascii_case("host"))) {
+                        http_settings.host = crate::import_fields::string_list(Some(host.1));
+                    }
                 }
-                if http_settings.path.is_some() || http_settings.host.is_some() {
+                http_settings.method = h2_opts.and_then(|h| h.get("method"))
+                    .or_else(|| http_opts.and_then(|h| h.get("method"))).and_then(str);
+                let headers = h2_opts.and_then(|h| h.get("headers"))
+                    .or_else(|| http_opts.and_then(|h| h.get("headers")))
+                    .map(serde_json::to_value).transpose().map_err(|_| "Invalid HTTP headers")?;
+                if !crate::import_fields::headers_supported(headers.as_ref(), true) {
+                    return Err("Unrepresentable HTTP headers".into());
+                }
+                http_settings.headers = crate::import_fields::http_headers(headers.as_ref());
+                if http_settings != HttpSettings::default() {
                     config.http_settings = Some(Box::new(http_settings));
                 }
             }
@@ -997,7 +1011,7 @@ fn apply_ss_plugin(
                 utls_mode: None,
                 password: password.unwrap(),
                 sni: host.unwrap(),
-                fingerprint: Some("chrome".to_string()),
+                fingerprint: plugin_opts.get("fingerprint").and_then(str),
                 port: None,
             };
             if let Some(value) = plugin_opts.get("port") {
@@ -1509,7 +1523,8 @@ fn map_node(
                 config.security = Some(SecurityMode::None);
             }
             Protocol::Http => {
-                let is_tls = m.get("tls").and_then(bool_val) == Some(true);
+                let is_tls = m.get("tls").and_then(bool_val) == Some(true)
+                    || m.get("type").and_then(str).is_some_and(|t| t.eq_ignore_ascii_case("https"));
                 config.username = m.get("username").and_then(str);
                 config.password = m.get("password").and_then(str);
                 config.network = Some("tcp".to_string());
@@ -1648,9 +1663,21 @@ pub fn parse_clash_proxies_with_origin(
         std::collections::BTreeMap::new();
     let mut fail_reasons: Vec<String> = Vec::new();
 
+    let mut graph = crate::import_fields::ImportGraph::default();
     for proxy in seq {
+        let tag = proxy.get("name").and_then(Value::as_str).map(|s| serde_json::Value::String(s.into()));
+        graph.observe(tag.as_ref());
+    }
+    for proxy in seq {
+        let source = serde_json::to_value(proxy).unwrap_or(serde_json::Value::Null);
+        if !crate::import_fields::valid_detour(source.get("dialer-proxy")) {
+            result.failed += 1;
+            fail_reasons.push("Invalid dialer-proxy declaration (IMPORT_DETOUR_INVALID)".into());
+            continue;
+        }
         match map_node(proxy, subscription_id, now, id_gen, origin) {
-            NodeOutcome::Server(s, warnings) => {
+            NodeOutcome::Server(mut s, warnings) => {
+                graph.register(&mut s, source.get("name"), source.get("dialer-proxy"));
                 result.servers.push(*s);
                 result.warnings.extend(warnings);
             }
@@ -1692,7 +1719,7 @@ pub fn parse_clash_proxies_with_origin(
     // proxy-providers 直调本函数、不经 `subscription` 的汇合点，故在这里也剔一次（幂等）。
     drop_unemitted_cert_pins(&mut result.servers);
 
-    result.finish()
+    graph.finish(result)
 }
 
 // ── proxy-providers filter / exclude-filter / override ──────────────────────

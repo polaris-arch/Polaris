@@ -342,3 +342,31 @@ async fn desktop_backup_inventory_keeps_empty_success_distinct_from_failure() {
     .unwrap();
     assert_eq!(names, BTreeSet::from(["eth0".to_owned()]));
 }
+
+#[cfg(unix)]
+#[test]
+fn local_backup_replaces_existing_contents_with_private_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TestDir::new("polaris-backup-private-export-");
+    let path = dir.path().join("backup.polaris-backup");
+    std::fs::write(&path, "old backup").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let gateway = RecordingGateway::new(dir.path().join("unused-saf"));
+    let target = FilePath::Path(path.clone());
+    assert_eq!(finish_export(&gateway, Some(target), "new complete backup")["success"], true);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new complete backup");
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn local_backup_rejects_symlink_without_changing_its_target() {
+    let dir = TestDir::new("polaris-backup-symlink-export-");
+    let path = dir.path().join("backup.polaris-backup");
+    let existing = dir.path().join("existing");
+    std::fs::write(&existing, "keep").unwrap();
+    std::os::unix::fs::symlink(&existing, &path).unwrap();
+    let gateway = RecordingGateway::new(dir.path().join("unused-saf"));
+    assert_eq!(finish_export(&gateway, Some(FilePath::Path(path)), "replacement")["errorCode"], "writeFailed");
+    assert_eq!(std::fs::read_to_string(&existing).unwrap(), "keep");
+}

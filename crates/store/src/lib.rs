@@ -24,6 +24,7 @@
 #![recursion_limit = "256"]
 #![forbid(unsafe_code)]
 
+pub mod auto_select;
 pub mod backup;
 pub mod error;
 pub mod fs;

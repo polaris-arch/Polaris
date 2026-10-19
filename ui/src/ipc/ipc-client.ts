@@ -24,7 +24,7 @@ import type { ApiResponse } from '../contracts/types';
 import i18n from '../i18n';
 
 /** 是否运行在真 Tauri webview（有 __TAURI_INTERNALS__）。 */
-function isTauri(): boolean {
+export function isTauri(): boolean {
   return (
     typeof window !== 'undefined' &&
     // Tauri 2 注入 __TAURI_INTERNALS__（api/event 经它调核心）

@@ -1,4 +1,4 @@
-import { invoke, listen, listenReady } from '../ipc-client';
+import { invoke, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { StatsTopic } from '../../domain/ipc-channels';
 import { STATS_TOPIC_EVENT } from '../../domain/ipc-channels';
@@ -32,15 +32,15 @@ export const statsApi = {
   },
 
   /** stats topic：流量统计推送。 */
-  onStatsUpdated(listener: (data: TrafficStats) => void): () => void {
-    return listen<TrafficStats>(STATS_TOPIC_EVENT.stats, listener);
+  onStatsUpdated(listener: (data: TrafficStats) => void): Promise<() => void> {
+    return listenReady<TrafficStats>(STATS_TOPIC_EVENT.stats, listener);
   },
 
   /** aggregate topic：连接导航的有界目标/出口排名。 */
   onConnectionsAggregate(
     listener: (data: ConnectionsAggregate) => void
-  ): () => void {
-    return listen<ConnectionsAggregate>(STATS_TOPIC_EVENT.aggregate, listener);
+  ): Promise<() => void> {
+    return listenReady<ConnectionsAggregate>(STATS_TOPIC_EVENT.aggregate, listener);
   },
 
   /** 完整活动表流向字段变化；常态/检索投影共用该信号。 */
@@ -51,15 +51,15 @@ export const statsApi = {
   /** detail topic：活动连接 reset 基线 + 常态增量。 */
   onConnectionsDetail(
     listener: (data: ConnectionsDetailUpdate) => void
-  ): () => void {
-    return listen<ConnectionsDetailUpdate>(STATS_TOPIC_EVENT.detail, listener);
+  ): Promise<() => void> {
+    return listenReady<ConnectionsDetailUpdate>(STATS_TOPIC_EVENT.detail, listener);
   },
 
   /** closed topic：独立的已结束连接历史。 */
   onConnectionsClosed(
     listener: (data: ConnectionsClosedUpdate) => void
-  ): () => void {
-    return listen<ConnectionsClosedUpdate>(STATS_TOPIC_EVENT.closed, listener);
+  ): Promise<() => void> {
+    return listenReady<ConnectionsClosedUpdate>(STATS_TOPIC_EVENT.closed, listener);
   },
 
   /** 清空已结束历史并设置重放水位。 */

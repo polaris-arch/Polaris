@@ -9,9 +9,8 @@
  */
 import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { IpcError } from '@/ipc';
 import { toast } from '@/lib/error-handler';
-import { serverSwitchErrorText } from '@/domain/action-error-text';
+import { serverSwitchErrorCode, serverSwitchErrorText } from '@/domain/action-error-text';
 import { useAppStore } from '@/store/app-store';
 import { switchReceiptFeedback } from './switch-receipt-feedback';
 
@@ -33,7 +32,7 @@ export function useSwitchNode(): (id: string) => Promise<void> {
       } catch (err) {
         console.error('[switch-node] switch server failed:', err);
         toast.error(
-          serverSwitchErrorText(err instanceof IpcError ? err.code : undefined, t)
+          serverSwitchErrorText(serverSwitchErrorCode(err), t)
         );
       }
     },

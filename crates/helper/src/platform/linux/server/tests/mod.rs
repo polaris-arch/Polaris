@@ -1125,3 +1125,12 @@ fn reaper_hands_busy_dns_to_completion_and_never_reverts_another_birth() {
         assert_eq!(dns.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
+
+#[test]
+fn shutdown_tail_counter_does_not_certify_live_reader() {
+    let group = ReapGroup::new();
+    let tail = ReapTail::new(&group);
+    assert!(!group.wait(Duration::ZERO));
+    drop(tail);
+    assert!(group.wait(Duration::ZERO));
+}

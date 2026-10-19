@@ -425,7 +425,6 @@ export function NodesScreenView(props: NodesScreenViewProps): ReactElement {
         />
       </div>
 
-      {props.autoSelectStatus}
 
       {/* ── ③ 订阅摘要 ────────────────────────────────────────────────────── */}
       {props.sub !== undefined && (
@@ -589,6 +588,7 @@ export function NodesScreenView(props: NodesScreenViewProps): ReactElement {
       <MobileSpeedTestProgress />
 
       {/* ── ⑥ 列表 ─────────────────────────────────────────────────────────── */}
+      {props.rows.length === 0 && props.autoSelectStatus && <div className="mn-list">{props.autoSelectStatus}</div>}
       {props.rows.length === 0 ? (
         <div className="mn-empty">
           {/* 桌面那句 `nodes.empty` 指向右上角的「添加」。2026-09-06（W-01）那条路径通了 ⇒
@@ -597,6 +597,7 @@ export function NodesScreenView(props: NodesScreenViewProps): ReactElement {
         </div>
       ) : (
         <div className="mn-list" role="list">
+          {props.autoSelectStatus && <div role="listitem">{props.autoSelectStatus}</div>}
           {props.rows.map((row) => (
             <NodeRow
               key={row.server.id}

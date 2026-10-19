@@ -190,6 +190,7 @@ fn sanitize_value_in_place(value: &mut Value) {
     sanitize_subscriptions(obj);
     // 订阅清洗之后再判：意图指向的订阅必须在清洗后的订阅表里。
     sanitize_selection_intent(obj);
+    crate::auto_select::sanitize(obj);
     sanitize_network_interfaces(obj);
     sanitize_custom_rules(obj);
     sanitize_policy_rules(obj);
@@ -487,6 +488,9 @@ pub fn selection_intent_auto(subscription_id: &str) -> Value {
 /// - 结构完好而取值本版本不认识 → **原样保留**。它多半是更新的版本写的（新的模式或作用域）：
 ///   在这里删掉，用户回到新版本时意图就丢了。本版本读取时按不生效处理。
 pub(crate) fn sanitize_selection_intent(obj: &mut Map<String, Value>) {
+    // Native scopes remain references even if currently empty/deleted. Never silently
+    // clear a scoped reference into the unrelated default exit.
+    if obj.get(SELECTION_INTENT_KEY).is_some_and(|value| value.get("mode").and_then(Value::as_str)==Some("auto")) { return; }
     let Some(intent) = obj.get(SELECTION_INTENT_KEY) else {
         return;
     };
@@ -678,13 +682,12 @@ fn sanitize_rule_effects(rule: &mut Value) {
 
     let dns_ok = effects.get("dns").is_none_or(|dns| {
         dns.as_object().is_some_and(|dns| {
-            dns.get("resolver")
-                .and_then(Value::as_str)
-                .is_some_and(|resolver| matches!(resolver, "inherit" | "direct" | "proxy"))
-                && dns
-                    .get("answerMode")
-                    .and_then(Value::as_str)
-                    .is_some_and(|mode| matches!(mode, "real" | "fakeIp"))
+            dns.get("resolver").is_none_or(|value| {
+                value.as_str().is_some_and(|resolver| matches!(resolver, "inherit" | "direct" | "proxy"))
+            })
+                && dns.get("answerMode").is_none_or(|value| {
+                    value.as_str().is_some_and(|mode| matches!(mode, "real" | "fakeIp"))
+                })
         })
     });
     if !dns_ok {

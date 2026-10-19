@@ -1,6 +1,6 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { TFunction } from 'i18next';
-import { computeTestMatch, type Cond, type TestResult } from './rule-cond';
+import { computeTestMatchAsync, type Cond, type TestResult } from './rule-cond';
 import { revealOnToggle } from '@/components/reveal';
 
 function Chevron() {
@@ -11,9 +11,21 @@ function Chevron() {
   );
 }
 
-/** 测试匹配结果——客户端启发式即时反馈，从 `RuleForm` 外提，供状态与其消费的 JSX 共用。 */
+/** Bounded asynchronous preview; unavailable context is never reported as a match. */
 export function useRuleTestFold(conds: readonly Cond[], logic: 'and' | 'or', test: string): TestResult {
-  return useMemo(() => computeTestMatch(conds, logic, test), [conds, logic, test]);
+  const query = useMemo(() => ({ conds, logic, test }), [conds, logic, test]);
+  const [reply, setReply] = useState<{ query: typeof query; result: TestResult } | null>(null);
+  useEffect(() => {
+    let current = true;
+    const timer = setTimeout(() => {
+      void computeTestMatchAsync(query.conds, query.logic, query.test)
+        .then((result) => { if (current) setReply({ query, result }); })
+        .catch(() => { if (current) setReply({ query, result: 'untestable' }); });
+    }, 200);
+    return () => { current = false; clearTimeout(timer); };
+  }, [query]);
+  // Identity, rather than equal text, prevents an A→B→A edit from reviving an old result.
+  return reply?.query === query ? reply.result : test.trim() ? 'untestable' : 'empty';
 }
 
 interface RuleTestFoldProps {
@@ -23,7 +35,7 @@ interface RuleTestFoldProps {
   testResult: TestResult;
 }
 
-/** 测试匹配（折叠，客户端启发式即时反馈）。 */
+/** 测试匹配（折叠；缺少上下文或不支持的表达式明确显示无法判断）。 */
 export function RuleTestFold({ t, test, setTest, testResult }: RuleTestFoldProps) {
   return (
     <div className="fld">

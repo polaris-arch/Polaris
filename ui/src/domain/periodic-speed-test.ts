@@ -72,3 +72,20 @@ export function globalPeriodicSpeedTestEnabled(
 export function showsGlobalOffHint(globalEnabled: boolean, subscriptionEnabled: boolean): boolean {
   return !globalEnabled && subscriptionEnabled;
 }
+
+/** HTTP test endpoint grammar shared by both settings surfaces. Blank means default. */
+export function isSpeedTestUrl(value: string): boolean {
+  try {
+    const url = new URL(value.trim());
+    return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname.length > 0;
+  } catch { return false; }
+}
+
+/** Adopt externally refreshed config only while the visible input is unedited. */
+export function adoptSpeedTestUrlDraft(current: string, previous: string, next: string): string {
+  return current === previous ? next : current;
+}
+/** Always derives from the displayed value, including external hydration. */
+export function speedTestUrlInvalid(value: string): boolean {
+  return !!value.trim() && !isSpeedTestUrl(value);
+}

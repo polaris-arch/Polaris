@@ -1,3 +1,7 @@
+import { configSaveErrorText } from '@/domain/action-error-text';
+import type { AutoSelectTarget } from '@/contracts/auto-select';
+import { autoSelectChoice, autoSelectTargetLabel } from '@/domain/auto-select-choice';
+import { autoSelectTarget } from '@/domain/auto-select-target';
 import { appRuleDisabled } from '@/components/screens/app-policy/app-policy-logic';
 /**
  * 移动端「规则」屏 —— 四合一入口（IA spec §1.2 / §2.2）。
@@ -688,6 +692,7 @@ export function MobileRulesScreen(): ReactElement {
       if (rule.action === 'block') {
         return { text: tr('appPolicy.action.block'), tone: 'block', value: 'block' };
       }
+      if (rule.targetAutoSelect) return { text: autoSelectTargetLabel(config, rule.targetAutoSelect, tr), tone: 'proxy', value: autoSelectChoice(rule.targetAutoSelect) };
       if (rule.targetServerId) {
         const name = serverNameById.get(rule.targetServerId);
         /* 节点已删时文案退回「指定节点」，但**值仍指向那个 id** —— 选择器据此在列表里勾它，
@@ -700,7 +705,7 @@ export function MobileRulesScreen(): ReactElement {
       }
       return { text: tr('appPolicy.followGlobal'), tone: 'proxy', value: 'follow' };
     },
-    [appRuleById, serverNameById, tr],
+    [appRuleById, serverNameById, tr, config],
   );
 
   const appCategories = useMemo(
@@ -768,7 +773,7 @@ export function MobileRulesScreen(): ReactElement {
       const action = rule?.enabled ? rule.action : undefined;
       if (action === 'direct') direct += 1;
       else if (action === 'block') block += 1;
-      else if (action === 'proxy' && rule?.targetServerId) node += 1;
+      else if (action === 'proxy' && (rule?.targetServerId || rule?.targetAutoSelect)) node += 1;
       else follow += 1;
     }
     return { total: allPresets.length, follow, node, direct, block };
@@ -821,6 +826,7 @@ export function MobileRulesScreen(): ReactElement {
           { value: 'block', label: tr('appPolicy.action.block'), danger: true },
         ],
       },
+      ...(config?.autoSelectEnabled ? [{ label: tr('autoSelect.auto'), options: [{ value: autoSelectChoice({ scope: 'global' }), label: autoSelectTargetLabel(config, { scope: 'global' }, tr) }] }] : []),
       ...appNodeGroups.map((group) => ({
         id: group.id,
         label: group.isManual
@@ -828,13 +834,13 @@ export function MobileRulesScreen(): ReactElement {
           : group.isMesh
             ? tr('nodes.tab.mesh')
             : group.name,
-        options: group.servers.map((server) => ({
+        options: [ ...(config?.autoSelectEnabled && group.servers.length ? [{ value: autoSelectChoice(autoSelectTarget(group)), label: autoSelectTargetLabel(config, autoSelectTarget(group), tr) }] : []), ...group.servers.map((server) => ({
           value: `node:${server.id}`,
           label: server.name,
-        })),
+        }))],
       })),
     ],
-    [appNodeGroups, tr],
+    [appNodeGroups, tr, config],
   );
   /** 面板打开的那一行当前选中的节点（非节点档为 undefined ⇒ 全折叠，**不猜第一组**）。 */
   const appPolicyOpenGroups = useMemo(() => {
@@ -857,7 +863,7 @@ export function MobileRulesScreen(): ReactElement {
    * 且 `half-truth-facts.test.ts` 的静音 toast 棘轮正是为了不让这批回声继续增长。
    */
   const handleAppPolicyPick = useCallback(
-    async (appId: string, pick: AppPolicyWritablePick, targetServerId?: string) => {
+    async (appId: string, pick: AppPolicyWritablePick, targetServerId?: string | AutoSelectTarget) => {
       setAppPolicySheetId(null);
       clearWriteError(`appRule:${appId}`);
       const next: AppRule = appRuleForPick(appId, pick, targetServerId);
@@ -1236,7 +1242,7 @@ export function MobileRulesScreen(): ReactElement {
           );
         } catch (err) {
           console.error('[MobileRulesScreen] dns server toggle failed:', err);
-          reportWriteError(`dnsres:${id}`, tr('common.saveFailed'));
+          reportWriteError(`dnsres:${id}`, configSaveErrorText(err, tr));
         }
       })();
     },
@@ -1258,7 +1264,7 @@ export function MobileRulesScreen(): ReactElement {
           );
         } catch (err) {
           console.error('[MobileRulesScreen] dns group toggle failed:', err);
-          reportWriteError(`dnsres:${id}`, tr('common.saveFailed'));
+          reportWriteError(`dnsres:${id}`, configSaveErrorText(err, tr));
         }
       })();
     },
@@ -1302,7 +1308,7 @@ export function MobileRulesScreen(): ReactElement {
             );
           } catch (err) {
             console.error('[MobileRulesScreen] dns server delete failed:', err);
-            reportWriteError(`dnsres:${id}`, tr('common.saveFailed'));
+            reportWriteError(`dnsres:${id}`, configSaveErrorText(err, tr));
           }
         })();
       });
@@ -1338,7 +1344,7 @@ export function MobileRulesScreen(): ReactElement {
             );
           } catch (err) {
             console.error('[MobileRulesScreen] dns group delete failed:', err);
-            reportWriteError(`dnsres:${id}`, tr('common.saveFailed'));
+            reportWriteError(`dnsres:${id}`, configSaveErrorText(err, tr));
           }
         })();
       });
@@ -1533,7 +1539,9 @@ export function MobileRulesScreen(): ReactElement {
         return {
           rule,
           enabled: (plane === 'dns' ? dnsEffect?.enabled : route?.enabled) !== false,
-          targetNodeName: targetServerId ? serverNameById.get(targetServerId) : undefined,
+          targetNodeName: route?.action === 'proxy' && route.targetAutoSelect
+            ? autoSelectTargetLabel(config, route.targetAutoSelect, tr)
+            : targetServerId ? serverNameById.get(targetServerId) : undefined,
           dnsActionName,
           targetMissing: !!targetServerId && !serverNameById.has(targetServerId),
           stagedOnly: (plane === 'dns' ? stagedOnlyDns : stagedOnlyRoute).has(rule.id),
@@ -1557,6 +1565,7 @@ export function MobileRulesScreen(): ReactElement {
         };
       }),
     [
+      config,
       serverNameById,
       dnsServerNameById,
       dnsGroupNameById,

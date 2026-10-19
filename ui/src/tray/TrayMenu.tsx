@@ -1,9 +1,11 @@
+import { serverSwitchErrorCode, serverSwitchErrorText } from '@/domain/action-error-text';
+import { configuredExitId } from '@/domain/actual-exit';
+import { autoSelectTarget } from '@/domain/auto-select-target';
 import { needsHelperRecovery, revealHelperRecovery } from '@/domain/helper-recovery';
 import { MeasurementLabel } from '@/mobile/MeasurementLabel';
 import { useAppStore, acquireConfigSync, refreshConfig } from '@/store/app-store';
 import { autoSelectT } from './auto-select-labels';
 import { AutoSelectControls } from '@/mobile/AutoSelectControls';
-import { configReadGeneration } from '@/lib/config-read-generation';
 /**
  * 托盘自绘浮层 UI（原型 `.tray-menu` L2905-2963 移植）——**真实接线，无假 UI**。
  *
@@ -49,7 +51,6 @@ import { sortServersByLatency } from '@/domain/server-latency-sort';
 import { speedTestableIds } from '@/domain/endpoint-routes';
 // 桌面通知出口（浮层无 toast 层，且托盘操作常在主窗关闭时发生 → 系统通知是唯一送达路径）。
 import { notifyDesktop, setDesktopNotificationsEnabled } from '@/lib/desktop-notify';
-import { withConfigWriteLock } from '@/lib/config-write-lock';
 import { traySwitchFeedback } from './switch-receipt';
 import { useNodeSortStore } from '@/store/use-node-sort-store';
 import { useLatencyStore, subscribeLatencyEvents } from '@/store/use-latency-store';
@@ -145,7 +146,8 @@ export default function TrayMenu() {
   configRef.current = config;
   const servers = config?.servers ?? [];
   const subscriptions = config?.subscriptions ?? [];
-  const selectedId = config?.selectedServerId ?? null;
+  const proxyStatus = useAppStore(state => state.proxyStatus);
+  const selectedId = configuredExitId(proxyStatus, config);
   const mounted = useRef(false);
   const trayLifecycle = useRef(0);
   const hydrateGeneration = useRef(0);
@@ -597,18 +599,8 @@ export default function TrayMenu() {
     const life = trayLifecycle.current, operation = interactionEpoch.current;
     const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
     try {
-      const { receipt, saved, readGeneration } = await withConfigWriteLock(async () => {
-        const receipt = await api.server.switch(id);
-        const readGeneration = configReadGeneration.beginRead();
-        return { receipt, saved: await api.config.get(), readGeneration };
-      });
-      if (!configReadGeneration.isCurrent(readGeneration)) return;
-      // In tray scope acceptance publishes synchronously. Capture that NEW
-      // authority before yielding: publication invalidates the dedicated read.
-      const acceptance = useAppStore.getState().acceptSelectionConfig(saved);
-      const publicationGeneration = configReadGeneration.current();
-      await acceptance;
-      if (!current() || !configReadGeneration.isCurrent(publicationGeneration)) return;
+      const receipt = await useAppStore.getState().switchServer(id);
+      if (!current() || !receipt) return;
       const feedback = traySwitchFeedback(receipt, node, t);
       setNotice(feedback.notice ?? '');
       if (feedback.close) {
@@ -616,7 +608,10 @@ export default function TrayMenu() {
         hide();
       }
     } catch (err) {
-      if (current()) noticeActionFailure(node, err);
+      if (current()) {
+        console.error('[tray] switch failed:', err);
+        setNotice(serverSwitchErrorText(serverSwitchErrorCode(err), key => key.startsWith('autoSelect.') ? autoSelectT(key) : t('tray.actionFailedDetail')));
+      }
     }
   };
 
@@ -656,6 +651,8 @@ export default function TrayMenu() {
   const onSpeedTest = async () => {
     if (testing) return;
     const ids = speedTestableIds(servers, { mainCorePool: running });
+    const life = trayLifecycle.current, operation = interactionEpoch.current;
+    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
     if (ids.length === 0) {
       setNotice(t('tray.noTestableNodes'));
       return;
@@ -667,7 +664,7 @@ export default function TrayMenu() {
     } catch (err) {
       // 后端单飞闸拒绝（在测时连点）是预期噪音，与真实失败同走 notice——两者对用户都是
       // 「点了没反应」，区分成本大于收益；文案里 detail 自会带出原因（W14）。
-      noticeActionFailure(t('tray.speedtest'), err);
+      if (current()) noticeActionFailure(t('tray.speedtest'), err);
     } finally {
       setTesting(false);
     }
@@ -696,18 +693,21 @@ export default function TrayMenu() {
    * 无更新 / 失败 → notice 行如实说（上游 在这里弹 dialog；浮层没有 dialog 层，notice 是等价表面）。
    * **绝不把失败显示成"已是最新"**（后端也不会：`update_check` 的失败语义是 `success:false`）。 */
   const checkUpdate = async () => {
+    const life = trayLifecycle.current, operation = interactionEpoch.current;
+    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
     if (checking) return;
     setChecking(true);
     setUpdateResult(null);
     try {
       const hasUpdate = await invoke<boolean>(IPC_CHANNELS.TRAY_CHECK_UPDATE);
+      if (!current()) return;
       if (hasUpdate) {
         hide(); // 提醒窗已弹出，浮层让位
         return;
       }
       setUpdateResult('latest');
     } catch {
-      setUpdateResult('failed');
+      if (current()) setUpdateResult('failed');
     } finally {
       setChecking(false);
     }
@@ -719,13 +719,15 @@ export default function TrayMenu() {
   // W14 修法顺序约束：**先 await 成功才 hide**。旧序「先 hide 再 await + 空 catch」= 失败时浮层已收起、
   // 隐私态没进、notice 无处显示——用户以为锁了实际没锁，是安全相关的「点了没反应」。
   const lockNow = async () => {
+    const life = trayLifecycle.current, operation = interactionEpoch.current;
+    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
     try {
       await api.config.setPrivacyMode(true);
     } catch (err) {
-      noticeActionFailure(t('tray.lockNow'), err);
+      if (current()) noticeActionFailure(t('tray.lockNow'), err);
       return;
     }
-    hide();
+    if (current()) hide();
   };
 
   // A2：浮层状态（与原生图标同一条优先级，见 tray-status-tone.ts）+ 降级位。
@@ -817,6 +819,9 @@ export default function TrayMenu() {
    * 选中节点会在浮层关着的期间被主窗/规则/自动切换改掉 —— 沿用上次的展开集就会展开错组。
    * 判据委托 domain 单一真值（与应用分流策略菜单、规则弹窗目标出站同一条线）。
    */
+  useEffect(() => {
+    if (view === 'nodes') setOpenGroups(defaultOpenGroupIds(groups, selectedId));
+  }, [groups, selectedId, view]);
   const openNodesView = () => {
     setOpenGroups(defaultOpenGroupIds(groups, selectedId));
     setView('nodes');
@@ -1202,6 +1207,8 @@ export default function TrayMenu() {
                     <span>{groupLabel(g)}</span>
                     <span className="tray-grp-c">{items.length}</span>
                   </button>
+                  {groupOpen && <AutoSelectControls config={config} t={autoSelectT} target={autoSelectTarget(g)}
+                    getCurrentConfig={() => configRef.current} accept={useAppStore.getState().acceptSelectionConfig} />}
                   {groupOpen &&
                     items.map((s) => {
                       const on = !directSelected && selectedId === s.id;

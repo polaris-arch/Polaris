@@ -14,17 +14,19 @@ thiserror = "2"
 # log = 连接 / 重连 / 装卸事件 facade（生产侧由 host 接管；测试侧 no-op）。
 log = "0.4"
 
+[target.'cfg(unix)'.dependencies]
+# Existing locked dependency, safe bounded Unix connect without detached workers.
+socket2 = "0.6"
+
 [target.'cfg(windows)'.dependencies]
 polaris-windows-cleaner = { path = "../windows-cleaner" }
-# Windows 命名管道客户端必须与 helper 服务端使用同一组同步 Win32 原语；std::fs::File
-# 在真机上会把 start 响应额外拖住数秒。依赖面只覆盖句柄生命周期与文件 IO。
+# Overlapped pipe I/O owns its event and drains cancellation before release.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
-    # Win32_System_Pipes = PeekNamedPipe：命名管道客户端唯一的非阻塞可读量探测原语，
-    # 是 WinPipeStream::read_until_timeout 兑现 trait 超时契约的基础（同步 ReadFile 不可中断）。
+    "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_System_SystemInformation",
 ] }

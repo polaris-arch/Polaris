@@ -25,7 +25,8 @@ export const logsApi = {
     return invoke(IPC_CHANNELS.LOGS_UNSUBSCRIBE, { subscriptionId });
   },
 
-  async clear(): Promise<void> {
+  /** First native sequence retained after clear; enables lossless stream reconciliation. */
+  async clear(): Promise<number> {
     return invoke(IPC_CHANNELS.LOGS_CLEAR);
   },
 

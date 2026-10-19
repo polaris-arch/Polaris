@@ -31,6 +31,7 @@ fn expected_rule_matches(current: &Value, expected: Option<&Value>, required: bo
 /// 单一真值在 config-engine `user_config::rule_validate::validate_rule`；前端 rule-dialog 只保留
 /// `isValidIpCidr` 做输入内联提示，提交门以此为准。
 fn validate_rule_payload(rule: &Value) -> Result<(), String> {
+    polaris_store::auto_select::validate_raw(&json!({"trafficRules":[rule]})).map_err(|error|error.to_string())?;
     let parsed: Rule =
         serde_json::from_value(rule.clone()).map_err(|e| format!("规则结构非法: {e}"))?;
     let result = validate_rule(&parsed);
@@ -38,6 +39,35 @@ fn validate_rule_payload(rule: &Value) -> Result<(), String> {
         Ok(())
     } else {
         Err(result.errors.join("; "))
+    }
+}
+
+/// Only new expressions require admission; legacy/unknown expressions remain
+/// unchanged when toggling a rule or changing unrelated metadata.
+fn regex_patterns(rule: &Value) -> Vec<String> {
+    let conditions: Vec<&Value> = match rule.get("conditions").and_then(Value::as_array) {
+        Some(values) if !values.is_empty() => values.iter().collect(),
+        _ => vec![rule],
+    };
+    conditions
+        .into_iter()
+        .filter(|c| c.get("type").and_then(Value::as_str) == Some("domainRegex"))
+        .flat_map(|c| {
+            c.get("values")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn admit_patterns(state: &AppRuntime, patterns: &[String]) -> Result<(), &'static str> {
+    match crate::commands::proxy::check_rule_patterns(state.config().dir(), patterns).await {
+        Some(true) => Ok(()),
+        Some(false) => Err(ERR_RULE_INVALID),
+        None => Err("RULE_CHECK_UNAVAILABLE"),
     }
 }
 
@@ -136,13 +166,25 @@ fn sync_plane_order(cfg: &mut Value, order_key: &str, rules: &[Value]) {
     obj.insert(order_key.to_string(), json!(order));
 }
 
+/// Writer-fenced admission: exact retries are no-ops, never replacements.
+fn admit_rule_add(rules: &[Value], incoming: &Value) -> Result<bool, String> {
+    polaris_store::validate::validate_rule_ids(rules)?;
+    let id = incoming.get("id").and_then(Value::as_str)
+        .filter(|id| !id.is_empty()).ok_or("rule.id required")?;
+    match rules.iter().find(|rule| rule.get("id").and_then(Value::as_str) == Some(id)) {
+        Some(existing) if existing == incoming => Ok(false),
+        Some(_) => Err("Rule id already exists; reopen and retry".to_owned()),
+        None => Ok(true),
+    }
+}
+
 /// 上游 `RULES_ADD`：新增规则（服务端兜底校验 + 生成 id）。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn rules_add(
+pub async fn rules_add(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     rule: Value,
@@ -169,12 +211,33 @@ pub fn rules_add(
     if let Err(msg) = validate_rule_plane(&new_rule, &plane) {
         return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
     }
+    // Identity-only preflight under the existing writer fence. Every branch skips
+    // persistence: exact retries and conflicts must not depend on checker availability.
+    // This is not cached authorization; admission repeats after the await below.
+    match state.config().update(|cfg| {
+        let rules = plane_rules(cfg, collection_key);
+        Decision::Skip(admit_rule_add(&rules, &new_rule))
+    }) {
+        Ok((Ok(false), None)) => return ApiResponse::ok(new_rule),
+        Ok((Err(msg), None)) => return ApiResponse::err_with_code(msg, ERR_RULE_CONFLICT),
+        Ok((Ok(true), None)) => {}
+        Ok(_) => unreachable!("rules_add identity preflight must never persist"),
+        Err(error) => return ApiResponse::err(error.to_string()),
+    }
+    if let Err(code) = admit_patterns(&state, &regex_patterns(&new_rule)).await {
+        return ApiResponse::err_with_code("Rule pattern check did not accept this change", code);
+    }
     let created = new_rule.clone();
     match state.config().update(|cfg| {
-        if let Some(msg) = network_profile_ref_error(cfg, &new_rule) {
-            return Decision::Skip(Err(msg));
-        }
         let mut rules = plane_rules(cfg, collection_key);
+        match admit_rule_add(&rules, &new_rule) {
+            Ok(false) => return Decision::Skip(Ok(())),
+            Err(msg) => return Decision::Skip(Err((msg, ERR_RULE_CONFLICT))),
+            Ok(true) => {}
+        }
+        if let Some(msg) = network_profile_ref_error(cfg, &new_rule) {
+            return Decision::Skip(Err((msg, ERR_RULE_INVALID)));
+        }
         rules.push(new_rule);
         sync_plane_order(cfg, order_key, &rules);
         write_plane_rules(cfg, collection_key, rules);
@@ -184,7 +247,8 @@ pub fn rules_add(
             broadcast_config_changed(&app, &cfg);
             ApiResponse::ok(created)
         }
-        Ok((Err(msg), None)) => ApiResponse::err_with_code(msg, ERR_RULE_INVALID),
+        Ok((Ok(()), None)) => ApiResponse::ok(created),
+        Ok((Err((msg, code)), None)) => ApiResponse::err_with_code(msg, code),
         Ok(_) => unreachable!("rules_add decision and persistence must agree"),
         Err(e) => ApiResponse::err(format!("{e}")),
     }
@@ -196,7 +260,7 @@ pub fn rules_add(
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn rules_update(
+pub async fn rules_update(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     rule: Value,
@@ -220,6 +284,21 @@ pub fn rules_update(
     if let Err(msg) = validate_rule_plane(&rule, &plane) {
         return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
     }
+    let snapshot = match state.config().current() {
+        Ok(cfg) => cfg,
+        Err(error) => return ApiResponse::err(error.to_string()),
+    };
+    let observed = plane_rules(&snapshot, collection_key).into_iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()));
+    let Some(observed) = observed else { return ApiResponse::err_with_code("Rule no longer exists", ERR_RULE_CONFLICT); };
+    if !expected_rule_matches(&observed, expected_rule.as_ref(), require_expected.unwrap_or(false)) {
+        return ApiResponse::err_with_code("Rule changed; reopen and retry", ERR_RULE_CONFLICT);
+    }
+    let old_patterns = regex_patterns(&observed);
+    let changed_patterns: Vec<String> = regex_patterns(&rule).into_iter().filter(|p| !old_patterns.contains(p)).collect();
+    if let Err(code) = admit_patterns(&state, &changed_patterns).await {
+        return ApiResponse::err_with_code("Rule pattern check did not accept this change", code);
+    }
     match state.config().update(|cfg| {
         if let Some(msg) = network_profile_ref_error(cfg, &rule) {
             return Decision::Skip(Err((msg, Some(ERR_RULE_INVALID))));
@@ -231,6 +310,9 @@ pub fn rules_update(
         else {
             return Decision::Skip(Err((format!("Rule not found: {id}"), None)));
         };
+        if rules[idx] != observed {
+            return Decision::Skip(Err(("Rule changed during validation; retry".to_string(), Some(ERR_RULE_CONFLICT))));
+        }
         if !expected_rule_matches(
             &rules[idx],
             expected_rule.as_ref(),
@@ -322,6 +404,7 @@ pub fn rules_delete(
 ///
 /// 判据是**逐位序列相等**（不是集合相等）：集合恒相等（上面刚校验过是排列），只有位置才携带信息。
 fn plan_reorder(rules: &[Value], ordered_ids: &[String]) -> Result<Option<Vec<Value>>, String> {
+    polaris_store::validate::validate_rule_ids(rules)?;
     // orderedIds 必须是现有 id 的严格排列（长度 + 无重复）。
     if ordered_ids.len() != rules.len() || {
         let mut s = ordered_ids.to_vec();
@@ -375,6 +458,10 @@ pub fn rules_reorder(
     };
     match state.config().update(|cfg| {
         let rules = plane_rules(cfg, collection_key);
+        // Check original members before HashMap/order projection can hide duplicates.
+        if let Err(error) = polaris_store::validate::validate_rule_ids(&rules) {
+            return Decision::Skip(Err(error));
+        }
         let by_id: std::collections::HashMap<&str, &Value> = rules
             .iter()
             .filter_map(|rule| rule.get("id").and_then(Value::as_str).map(|id| (id, rule)))

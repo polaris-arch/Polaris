@@ -65,6 +65,15 @@ fn uac_escalation_argv_structure() {
 }
 
 #[test]
+fn uac_script_path_preserves_native_quotes_and_powershell_literals() {
+    // Start-Process joins the array with spaces; the nested double quotes must
+    // survive PowerShell parsing so -File receives one complete native argument.
+    let esc = uac_escalation(r"C:\Users\O'Brien $home\App Data\安装.ps1").unwrap();
+    assert!(esc.argv[3].contains(r#"'-File','"C:\Users\O''Brien $home\App Data\安装.ps1"'"#));
+    assert!(esc.argv[3].contains("-Verb RunAs -Wait -PassThru -ErrorAction Stop"));
+}
+
+#[test]
 fn osascript_path_with_spaces_quoted() {
     // 含空格家目录不应击穿引号（Polaris osaShellArg 两层转义，HelperManager.ts:854）
     let esc = osascript_escalation("/Users/some user/App Data/install.sh");

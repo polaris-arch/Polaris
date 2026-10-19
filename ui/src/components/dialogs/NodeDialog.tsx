@@ -1,3 +1,4 @@
+import { useInputRequest } from '@/hooks/use-input-request';
 import { realityUtlsError } from '@/domain/utls';
 /**
  * NodeDialog —— 节点添加/编辑弹窗（8 协议动态表单，原型 #node-dialog :2513-2547）。
@@ -129,6 +130,9 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
   // （而非拆子组件）与本文件其余「协议特定但状态挂在 NodeForm 顶层」的既有写法（如 `detour`）一致。
   const [probing, setProbing] = useState(false);
   const [probeResult, setProbeResult] = useState<ProbeDisplay | null>(null);
+  const probeInput = JSON.stringify([proto, draft.outbound, draft.isEndpoint === true]);
+  const beginProbe = useInputRequest(probeInput);
+  useEffect(() => { setProbeResult(null); setProbing(false); }, [probeInput]);
   // Tailcat 客户端公钥（D5）：只是展示态，由后端从私钥推导；私钥一改就作废，不落盘、不进日志。
   const [tcPublicKey, setTcPublicKey] = useState('');
   const [tcKeyBusy, setTcKeyBusy] = useState(false);
@@ -167,6 +171,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
    * 语法过了才真调后端 `sing-box check`。结果统一经 [`describeProbeResult`] 映射成展示态。
    */
   const runCompatProbe = async () => {
+    const isCurrent = beginProbe();
     const raw = typeof draft.outbound === 'string' ? draft.outbound : '';
     let parsed: unknown;
     try {
@@ -179,6 +184,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
     setProbeResult(null);
     try {
       const r = await api.proxy.probeOutbound(parsed, draft.isEndpoint === true);
+      if (!isCurrent()) return;
       if (!r.ok && !r.indeterminate) {
         console.error(
           '[NodeDialog] custom outbound compatibility rejected:',
@@ -187,13 +193,14 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       }
       setProbeResult(describeProbeResult(r));
     } catch (e) {
+      if (!isCurrent()) return;
       // IPC 本身失败不是内核给出的兼容性判定；诊断只进日志，弹窗走稳定本地化兜底。
       console.error('[NodeDialog] custom outbound probe failed:', e);
       setProbeResult({
-        kind: 'unsupported',
+        kind: 'indeterminate',
       });
     } finally {
-      setProbing(false);
+      if (isCurrent()) setProbing(false);
     }
   };
 

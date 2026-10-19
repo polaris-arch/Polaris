@@ -168,7 +168,7 @@ export default function SettingsAbout() {
         <h2>Polaris</h2>
         <div className="ver">
           {info?.appVersion ? `v${info.appVersion}` : '—'}
-          {info?.singBoxVersion ? ` · sing-box ${info.singBoxVersion}` : ''}
+          {info?.coreVersion ? ` · sing-box ${info.coreVersion}` : ''}
         </div>
 
         <p className="tagline">{t('settings.about.tagline')}</p>

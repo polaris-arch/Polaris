@@ -10,12 +10,13 @@
  * `SettingsNetwork`。
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { UserConfig } from '@/contracts/types';
 import { autoStartApi, privacyApi } from '@/ipc/api-client';
+import { toast } from '@/lib/error-handler';
 import { Phead, SetBlock, SetRow, Switch, Button, TextInput } from './Primitives';
-import { autoCheckUpdateChecked } from './settings-logic';
+import { autoCheckUpdateChecked, changeAutoStart } from './settings-logic';
 
 export interface SettingsGeneralProps {
   config: UserConfig;
@@ -25,6 +26,27 @@ export interface SettingsGeneralProps {
 export default function SettingsGeneral({ config, update }: SettingsGeneralProps) {
   const { t } = useTranslation();
   const [hasPassword, setHasPassword] = useState(false);
+  const [autoStart, setAutoStart] = useState<boolean | null>(null);
+  const [autoStartBusy, setAutoStartBusy] = useState(false);
+  const autoStartGate = useRef(false);
+  const alive = useRef(false);
+  const autoStartReadSerial = useRef(0);
+  const reportAutoStartFailure = () => toast.error(t('settings.general.autoStartTitle'), t('errors.operationFailed'));
+  const readAutoStart = async () => {
+    const serial = ++autoStartReadSerial.current;
+    try {
+      const value = await autoStartApi.getStatus();
+      if (alive.current && serial === autoStartReadSerial.current) setAutoStart(value);
+    } catch (error) {
+      if (alive.current && serial === autoStartReadSerial.current) { setAutoStart(null); reportAutoStartFailure(); }
+      console.error('[SettingsGeneral] autostart read failed:', error);
+    }
+  };
+  useEffect(() => {
+    alive.current = true;
+    void readAutoStart();
+    return () => { alive.current = false; };
+  }, []);
   // 内联密码编辑器（替代简陋 window.prompt）：editing=展开输入行，pwDraft=草稿，pwErr=错误行，saving=提交中。
   const [editing, setEditing] = useState(false);
   const [pwDraft, setPwDraft] = useState('');
@@ -37,12 +59,20 @@ export default function SettingsGeneral({ config, update }: SettingsGeneralProps
   }, []);
 
   async function toggleAutoStart(next: boolean) {
-    // autoStart 同时写 OS launch agent + config；走 autoStartApi 保证两端一致
+    if (autoStartGate.current) return;
+    autoStartGate.current = true;
+    autoStartReadSerial.current++;
+    setAutoStartBusy(true);
     try {
-      await autoStartApi.set(next);
-      await update({ autoStart: next });
-    } catch {
-      // 失败回滚由 useConfig 乐观更新机制兜底
+      await changeAutoStart(next, autoStartApi,
+        (actual) => { if (alive.current) setAutoStart(actual); },
+        (actual) => update({ autoStart: actual }));
+    } catch (error) {
+      console.error('[SettingsGeneral] autostart change failed:', error);
+      if (alive.current) reportAutoStartFailure();
+    } finally {
+      autoStartGate.current = false;
+      if (alive.current) setAutoStartBusy(false);
     }
   }
 
@@ -91,7 +121,9 @@ export default function SettingsGeneral({ config, update }: SettingsGeneralProps
           没跟着改的陈述残留，一并订正。） */}
       <SetBlock header={t('settings.general.groupStartup')}>
         <SetRow label={t('settings.general.autoStartTitle')}>
-          <Switch checked={config.autoStart} onChange={toggleAutoStart} />
+          <Switch checked={autoStart ?? false} indeterminate={autoStart === null}
+            disabled={autoStartBusy || autoStart === null} onChange={toggleAutoStart} />
+          {autoStart === null && <Button variant="ghost" size="sm" onClick={() => void readAutoStart()}>{t('common.retry')}</Button>}
         </SetRow>
         <SetRow
           label={t('settings.general.silentStart')}

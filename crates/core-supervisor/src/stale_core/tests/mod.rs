@@ -962,3 +962,27 @@ fn unreadable_owner_is_not_evidence_for_another_user() {
     assert_ne!(owner_from_uid(None, Some(1000)), ProcessOwner::Other);
     assert_ne!(owner_from_uid(Some(1000), None), ProcessOwner::Other);
 }
+
+#[test]
+fn windows_stdin_config_does_not_grant_stale_process_authority() {
+    let process = argv(
+        91,
+        &[
+            r"C:\Program Files\Polaris\sing-box.exe",
+            "run",
+            "-c",
+            "stdin",
+        ],
+    );
+    assert!(app_run_config_name(
+        &process,
+        "sing-box.exe",
+        Path::new(r"C:\Users\polaris\config")
+    )
+    .is_none());
+    assert!(!is_our_core(
+        &process,
+        "sing-box.exe",
+        Path::new(r"C:\Users\polaris\config")
+    ));
+}

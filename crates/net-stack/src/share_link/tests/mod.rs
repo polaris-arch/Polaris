@@ -1546,12 +1546,12 @@ const PIN_HEX: &str = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db022587179
 #[test]
 fn pcs_query_maps_to_certificate_sha256() {
     let c = parse_ok(&format!(
-        "vless://{U}@a.com:443?security=tls&sni=s.com&pcs={PIN_HEX}%2Cchrome#n"
+        "vless://{U}@a.com:443?security=tls&sni=s.com&pcs={PIN_HEX}#n"
     ));
     assert_eq!(
         c.tls_settings.unwrap().certificate_sha256.as_deref(),
         Some(PIN_HEX),
-        "逗号串里的非法条目丢弃、合法条目原文保留"
+        "合法 pin 原文保留；混合非法值由独立失败用例覆盖"
     );
 }
 
@@ -1691,3 +1691,59 @@ fn shadow_link_disabled_preserves_standard_tls_fallback_intent() {
 }
 
 mod audit_regressions;
+
+#[test]
+fn absent_share_fingerprints_stay_absent_in_storage_and_default_to_chrome_at_runtime() {
+    use polaris_config_engine::user_config::utls::{effective_server, node_utls};
+    for link in [
+        format!("vless://{U}@example.com:443?security=tls#node"),
+        "trojan://secret@example.com:443#node".into(),
+        "anytls://secret@example.com:443#node".into(),
+        format!("vmess://{}", base64_encode(
+            format!(r#"{{"v":"2","ps":"node","add":"example.com","port":443,"id":"{U}","net":"tcp","tls":"tls"}}"#).as_bytes(),
+            false, true,
+        )),
+    ] {
+        let parsed = parse_ok(&link);
+        let saved: ServerConfig = serde_json::from_value(serde_json::to_value(&parsed).unwrap()).unwrap();
+        let round = parse_ok(&encode_share_url(&saved).unwrap());
+        for node in [&parsed, &saved, &round] {
+            let effective = effective_server(node, Some("follow")).unwrap();
+            let tls = effective.tls_settings.as_ref().unwrap();
+            assert!(tls.utls_mode.is_none());
+            assert!(tls.fingerprint.is_none(), "{link}");
+            assert_eq!(node_utls(tls.utls_mode, tls.fingerprint.as_deref(), "chrome").unwrap().fingerprint, "chrome");
+        }
+    }
+}
+
+#[test]
+fn shadow_share_imports_preserve_absence_and_explicit_fingerprints() {
+    for fingerprint in [None, Some("none"), Some("firefox"), Some("randomized")] {
+        let query = fingerprint
+            .map(|fp| format!("&shadow-tls-fp={fp}"))
+            .unwrap_or_default();
+        let nested = serde_json::json!({"password":"outer-secret","host":"sni.example.com","fingerprint":fingerprint});
+        let payload = base64_encode(nested.to_string().as_bytes(), false, true);
+        for link in [
+            format!("ss://aes-128-gcm:secret@example.com:443?shadow-tls-password=outer-secret&shadow-tls-sni=sni.example.com{query}#node"),
+            format!("ss://aes-128-gcm:secret@example.com:443?plugin=shadow-tls&shadow-tls-password=outer-secret&shadow-tls-sni=sni.example.com{query}#node"),
+            format!("ss://aes-128-gcm:secret@example.com:443?shadow-tls={payload}#node"),
+        ] {
+            let node = parse_ok(&link);
+            let round = parse_ok(&encode_share_url(&node).unwrap());
+            for node in [&node, &round] {
+                let tls = node.shadow_tls_settings.as_ref().unwrap();
+                assert!(tls.utls_mode.is_none());
+                assert_eq!(tls.fingerprint.as_deref(), fingerprint, "{link}");
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_shared_pin_is_rejected_even_when_insecure_is_requested() {
+    assert!(parse_err("trojan://pw@a.example:443?security=tls&allowInsecure=1&pcs=bad").contains("TLS_PIN_INVALID"));
+}
+
+mod import_parity;

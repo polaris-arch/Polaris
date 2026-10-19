@@ -69,3 +69,9 @@ export function maxLogId(batch: LogRow[]): number | null {
   }
   return max;
 }
+
+/** Keep only records proven to have been allocated after the authoritative clear boundary. */
+export function retainAfterClear(rows: readonly LogRow[], firstRetainedId: number): LogRow[] {
+  if (!Number.isSafeInteger(firstRetainedId) || firstRetainedId < 0) throw new Error('LOG_CLEAR_RECEIPT_INVALID');
+  return rows.filter(row => typeof row._id === 'number' && row._id >= firstRetainedId);
+}

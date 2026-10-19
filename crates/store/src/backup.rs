@@ -132,7 +132,7 @@ impl NodeCategory {
 ///   （spec §7 / D12，见 [`pick_categories`] / [`merge_categories`]）。
 /// - `selectedServerId` 跟节点走、不随通用设置导入；导入节点后若失效，[`merge_categories`] 末尾主动归零
 ///   （[`crate::validate::validate_config`] 对失效 selectedServerId 是 **Err、非归零**，不兜底会令整份导入失败）。
-const DATA_FIELDS: [&str; 22] = [
+const DATA_FIELDS: [&str; 23] = [
     "servers",
     "subscriptions",
     "customRules",
@@ -155,6 +155,8 @@ const DATA_FIELDS: [&str; 22] = [
     "selectedServerId",
     // 选择意图与 `selectedServerId` 同归类：不导出、不随通用设置导入；导入后指向的订阅已不在即移除。
     crate::sanitize::SELECTION_INTENT_KEY,
+    // Local verified runtime pins cannot be promoted by portable settings import.
+    "autoSelectPins",
     // Portable backup-only policy; never part of live config/generalSettings.
     "meshRouting",
 ];
@@ -571,6 +573,9 @@ fn normalize_policy_backup(backup: &Value) -> Value {
         return normalized;
     }
     if !normalized.get("policyRules").is_some_and(Value::is_array) {
+        // Match load migration order before promoting legacy data to authoritative planes.
+        crate::migrate::migrate_custom_rules_domain_rule(&mut normalized);
+        crate::migrate::migrate_custom_rule_effects(&mut normalized);
         crate::migrate::migrate_dns_policy_v2(&mut normalized);
     }
     crate::migrate::migrate_split_policy_rules(&mut normalized);

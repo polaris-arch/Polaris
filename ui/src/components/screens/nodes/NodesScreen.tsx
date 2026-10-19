@@ -1,4 +1,5 @@
-import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
+import { configuredExitId } from '@/domain/actual-exit';
+import { IdentityRecoveryEntry } from '@/domain/identity-repair/IdentityRecoveryEntry';
 /**
  * NodesScreen —— 节点屏（1:1 提取自原型 polaris-prototype.html L1737-1868 #s-nodes
  * + renderMesh/meshItem L4816-4842/4806-4815 组网入口 + syncNodeToolbar L4482-4485 工具栏行为）。
@@ -20,8 +21,6 @@ import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
  * **本屏不再自订 onSpeedTestProgress**，也不再画屏内进度行——见 `use-node-speed-test.ts` 的 `runSpeedTest` 判据。
  */
 
-import { AutoSelectStatusPanel } from '@/mobile/AutoSelectStatusPanel';
-import { useAutoSelectStatus } from '@/hooks/use-auto-select-status';
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useNodeSortStore } from '@/store/use-node-sort-store';
@@ -90,6 +89,9 @@ export function NodesScreen() {
     );
   }, [servers, diskServers]);
   const selectedServerId = useAppStore((s) => s.selectedServerId);
+  const proxyStatus = useAppStore(s => s.proxyStatus);
+  const savedSelectionConfig = useAppStore((s) => s.config);
+  const actualId = configuredExitId(proxyStatus, savedSelectionConfig);
   const openDialog = useDialogStore((s) => s.open);
   const closeDialog = useDialogStore((s) => s.close);
   /**
@@ -229,8 +231,14 @@ export function NodesScreen() {
    * 由重挂天然提供 —— 这条语义原先靠 `locatedRef` 守，现在由「初值只求值一次」直接给出。
    */
   const [activeTab, setActiveTab] = useState<string>(
-    () => initialNodesTab(groups, selectedServerId) ?? 'manual'
+    () => initialNodesTab(groups, actualId) ?? 'all'
   );
+  useEffect(() => {
+    if (savedSelectionConfig?.autoSelectEnabled && savedSelectionConfig.selectionIntent) return;
+    if (actualId) setActiveTab(initialNodesTab(groups, actualId) ?? groups[0]?.id ?? 'all');
+    // Only selection/mode changes navigate; changing tabs remains user-controlled.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actualId, savedSelectionConfig?.autoSelectEnabled, savedSelectionConfig?.selectionIntent !== undefined]);
   // 挂载之后的兜底：当前 tab 对应的组消失（订阅被删/清空）→ 回落首组，不留空白页。
   useEffect(() => {
     if (groups.length > 0 && !groups.some((g) => g.id === activeTab)) {
@@ -329,7 +337,8 @@ export function NodesScreen() {
         server.id,
         selectedServerId,
         needsApplyOnSelect(pendingChanges, server.id),
-        via
+        via,
+        useAppStore.getState().config?.selectionIntent !== undefined
       );
       if (action === 'noop') return;
       // 显式按钮 + 无待应用提示：直切，不收确认税。
@@ -369,7 +378,6 @@ export function NodesScreen() {
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
   const proxyStartTime = useAppStore((s) => s.proxyStatus?.startTime);
   const savedConfig = useAppStore((s) => s.config);
-  const autoSelectStatus = useAutoSelectStatus(savedConfig);
   const [meshRouteState, setMeshRouteState] = useState<ReportLoadState<MeshRouteReport>>({
     report: null, loading: true, error: false,
   });
@@ -414,7 +422,6 @@ export function NodesScreen() {
    * = 代理是否在跑。TS-exit 只有主核池路径能测（临时核建不出第二 tsnet 实例），少了这个位
    * 会把「代理没跑时的 TS 节点」当可测发出去，换回一个必然的 `-1`（UI 上读作「真实超时」）。
    */
-  const proxyStatus = useAppStore((s) => s.proxyStatus);
   const speedTestCaps = useMemo<SpeedTestCaps>(
     () => ({ mainCorePool: !!proxyStatus?.running }),
     [proxyStatus?.running]
@@ -529,6 +536,7 @@ export function NodesScreen() {
       id="s-nodes"
       className={cn('screen', view === 'list' && 'nodes-list-view', batchMode && 'nodes-batch-mode')}
     >
+      <IdentityRecoveryEntry onOpen={() => openDialog({ kind: 'identity-repair' })} />
       <NodesHeader
         t={t}
         statsText={statsText}
@@ -557,11 +565,6 @@ export function NodesScreen() {
         openDialog={openDialog}
         subscriptionActions={subscriptionActions}
       />
-
-      <SavedAutoSelectControls t={t} />
-
-      <AutoSelectStatusPanel {...autoSelectStatus} t={t}
-        servers={diskServers} subscriptions={savedConfig?.subscriptions ?? []} />
 
       <NodesToolbar
         t={t}
@@ -610,7 +613,7 @@ export function NodesScreen() {
         stagedOnly={stagedOnly}
         meshRouteBadges={meshRouteBadges}
         serverNameById={serverNameById}
-        selectedServerId={selectedServerId}
+        selectedServerId={actualId}
         selectedIds={selectedIds}
         batchMode={batchMode}
         invalidIndex={invalidIndex}

@@ -121,7 +121,7 @@ impl ProxyRuntime {
     /// emitter 未接线（单测 / setup 前极早期）→ 静默跳过，绝不打断调用腿（同 [`invalidate_unlock_cache`] 范式）。
     ///
     /// [`invalidate_unlock_cache`]: Self::invalidate_unlock_cache
-    pub(super) fn push_pending_changes(&self) {
+    pub(crate) fn push_pending_changes(&self) {
         if let Some(emitter) = self.error_emitter.get() {
             emitter.emit_pending_changes(&self.pending_changes());
         }

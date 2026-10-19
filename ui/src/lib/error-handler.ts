@@ -95,6 +95,8 @@ export function proxyErrorCategory(code: unknown): ErrorCategory | null {
     case ProxyErrorCode.TLS_CERT_ERROR:
     case ProxyErrorCode.AUTH_FAILED:
       return ErrorCategory.Connection;
+    case ProxyErrorCode.SPEED_TEST_URL_INVALID:
+    case ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED:
     case ProxyErrorCode.CONFIG_INVALID:
     case ProxyErrorCode.PORT_IN_USE:
     case ProxyErrorCode.CLASH_API_PORT_RECYCLING:

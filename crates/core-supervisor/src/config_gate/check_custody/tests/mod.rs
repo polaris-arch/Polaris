@@ -1237,3 +1237,29 @@ mod unix {
         view.verify_original_custody().unwrap();
     }
 }
+
+mod bounded_capture {
+    use super::super::*;
+
+    #[tokio::test]
+    async fn regular_validation_retention_is_bounded_but_both_streams_are_drained() {
+        let output = Arc::new(OutputCapture {
+            max_bytes: Some(256 * 1024),
+            strict_utf8: false,
+            ..Default::default()
+        });
+        output
+            .read(Some(std::io::Cursor::new(vec![b'x'; 1024 * 1024])), false)
+            .unwrap();
+        output
+            .read(Some(std::io::Cursor::new(vec![b'y'; 1024 * 1024])), true)
+            .unwrap();
+        output.finished().await.unwrap();
+        assert_eq!(output.stdout.lock().unwrap().len(), 256 * 1024);
+        assert_eq!(output.stderr.lock().unwrap().len(), 256 * 1024);
+        assert!(
+            matches!(output.result(true), RawCheck::OutputFailed(_)),
+            "truncation cannot become a successful validation"
+        );
+    }
+}

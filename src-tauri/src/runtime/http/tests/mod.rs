@@ -723,7 +723,7 @@ fn classify_2xx_is_not_an_error() {
 fn gh_mirror_is_fallback_not_primary_and_only_for_github() {
     let http = Arc::new(HttpRuntime::new().unwrap());
     let handle = tokio::runtime::Runtime::new().unwrap().handle().clone();
-    let dl = CoreDownloader::new(http, handle).with_gh_proxy("https://ghproxy.net/");
+    let dl = CoreDownloader::new(http, handle).with_test_transport().with_gh_proxy("https://ghproxy.net/");
 
     let gh = dl.candidates("https://github.com/a/b/releases/download/v1/core.zip");
     assert_eq!(gh.len(), 2, "GitHub 资产应有原址 + 镜像两个候选");
@@ -739,7 +739,7 @@ fn gh_mirror_is_fallback_not_primary_and_only_for_github() {
 fn no_gh_proxy_configured_means_no_mirror_candidate() {
     let http = Arc::new(HttpRuntime::new().unwrap());
     let handle = tokio::runtime::Runtime::new().unwrap().handle().clone();
-    let dl = CoreDownloader::new(http, handle);
+    let dl = CoreDownloader::new(http, handle).with_test_transport();
     assert_eq!(
         dl.candidates("https://github.com/a/b/core.zip").len(),
         1,
@@ -814,7 +814,7 @@ fn streaming_download_follows_redirects_and_hashes_while_writing() {
         http_response("200 OK", &[], &payload),
     ]);
     let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone());
+    let dl = CoreDownloader::new(http, rt.handle().clone()).with_test_transport();
 
     let sink = MemSink::default();
     let sink_for_factory = sink.clone();
@@ -856,7 +856,7 @@ fn streaming_download_reports_received_and_total() {
     let total = payload.len() as u64;
     let addr = spawn_server(vec![http_response("200 OK", &[], &payload)]);
     let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone());
+    let dl = CoreDownloader::new(http, rt.handle().clone()).with_test_transport();
 
     /// 一次进度回调的观测记录：`(已收字节, Content-Length)`。
     type ProgressLog = Arc<StdMutex<Vec<(u64, Option<u64>)>>>;
@@ -904,7 +904,7 @@ fn streaming_download_reports_incomplete_body_too() {
         }
     });
     let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone());
+    let dl = CoreDownloader::new(http, rt.handle().clone()).with_test_transport();
     let factory: Arc<DownloadSinkFactory> = Arc::new(|| Ok(Box::new(std::io::sink())));
     let noop: Arc<DownloadProgressFn> = Arc::new(|_, _| {});
 
@@ -938,7 +938,7 @@ fn sink_write_failure_is_reported_as_io_not_incomplete_download() {
     let payload = vec![b'p'; 8000];
     let addr = spawn_server(vec![http_response("200 OK", &[], &payload)]);
     let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone());
+    let dl = CoreDownloader::new(http, rt.handle().clone()).with_test_transport();
     // 只允许写 10 字节 → 必然在中途失败（服务端要发 8000）。
     let factory: Arc<DownloadSinkFactory> = Arc::new(|| {
         Ok(Box::new(FailingSink {
@@ -1006,7 +1006,7 @@ fn mirror_fallback_rewrites_the_sink_from_scratch() {
             .unwrap(),
     );
     let url = format!("http://github.com:{}/a/b/core.zip", addr.port());
-    let dl = CoreDownloader::new(http, rt.handle().clone())
+    let dl = CoreDownloader::new(http, rt.handle().clone()).with_test_transport()
         .with_gh_proxy(format!("http://ghmirror.invalid:{}/", addr.port()));
     assert_eq!(dl.candidates(&url).len(), 2, "本用例的前提是真有两个候选");
 
@@ -1065,7 +1065,7 @@ fn streaming_leg_rejects_an_oversized_body_on_the_read_side_too() {
     let addr = spawn_server(vec![raw]);
 
     let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone()).with_max_bytes(1024);
+    let dl = CoreDownloader::new(http, rt.handle().clone()).with_test_transport().with_max_bytes(1024);
     let sink = MemSink::default();
     let sink_for_factory = sink.clone();
     let factory: Arc<DownloadSinkFactory> =
@@ -1173,7 +1173,7 @@ fn size_limit_boundary_admits_a_body_of_exactly_the_limit() {
     // ① Content-Length 预检：`n > max_bytes` —— CL 恰好等于闸值必须放行。
     let addr = spawn_server(vec![http_response("200 OK", &[], &payload)]);
     let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone()).with_max_bytes(LIMIT);
+    let dl = CoreDownloader::new(http, rt.handle().clone()).with_test_transport().with_max_bytes(LIMIT);
     let bytes = download_bytes(dl, format!("http://{addr}/exact"))
         .expect("Content-Length 恰好等于闸值不得被预检拒掉");
     assert_eq!(bytes.len(), LIMIT);
@@ -1183,7 +1183,7 @@ fn size_limit_boundary_admits_a_body_of_exactly_the_limit() {
     raw.extend_from_slice(&payload);
     let addr3 = spawn_server(vec![raw]);
     let http3 = Arc::new(HttpRuntime::new().unwrap());
-    let dl3 = CoreDownloader::new(http3, rt.handle().clone()).with_max_bytes(LIMIT);
+    let dl3 = CoreDownloader::new(http3, rt.handle().clone()).with_test_transport().with_max_bytes(LIMIT);
     let sink = MemSink::default();
     let sink_for_factory = sink.clone();
     let factory: Arc<DownloadSinkFactory> =
@@ -1211,7 +1211,7 @@ fn per_leg_size_limit_is_honoured_not_the_global_constant() {
     // ① 闸收紧到 1 KiB → Content-Length 预检就该早拒（远小于全局 16MiB 常量）。
     let addr = spawn_server(vec![http_response("200 OK", &[], &payload)]);
     let http = Arc::new(HttpRuntime::new().unwrap());
-    let tight = CoreDownloader::new(http, rt.handle().clone()).with_max_bytes(1024);
+    let tight = CoreDownloader::new(http, rt.handle().clone()).with_test_transport().with_max_bytes(1024);
     let err = download_bytes(tight, format!("http://{addr}/asset")).expect_err("超闸值必须早拒");
     assert!(format!("{err}").contains("超过上限"), "实得: {err}");
 
@@ -1219,7 +1219,7 @@ fn per_leg_size_limit_is_honoured_not_the_global_constant() {
     let addr2 = spawn_server(vec![http_response("200 OK", &[], &payload)]);
     let http2 = Arc::new(HttpRuntime::new().unwrap());
     let loose =
-        CoreDownloader::new(http2, rt.handle().clone()).with_max_bytes(MAX_DOWNLOAD_BYTES * 8);
+        CoreDownloader::new(http2, rt.handle().clone()).with_test_transport().with_max_bytes(MAX_DOWNLOAD_BYTES * 8);
     let bytes = download_bytes(loose, format!("http://{addr2}/asset")).expect("闸放宽后应成功");
     assert_eq!(bytes.len(), payload.len());
 }
@@ -1305,7 +1305,7 @@ fn download_rejects_oversized_content_length_before_reading_body() {
         }
     });
     let http = Arc::new(HttpRuntime::new().unwrap());
-    let dl = CoreDownloader::new(http, rt.handle().clone());
+    let dl = CoreDownloader::new(http, rt.handle().clone()).with_test_transport();
     let err = download_bytes(dl, format!("http://{addr}/big")).expect_err("超缺省闸必须早拒");
     assert!(format!("{err}").contains("超过上限"), "实得: {err}");
 }
@@ -1717,4 +1717,28 @@ async fn system_dns_failure_is_err_not_empty_ok() {
         r.is_err(),
         "解析失败必须 Err（Ok(vec![]) 会让 guard 空循环放行）"
     );
+}
+
+// These policy tests do not enable the loopback stream-fixture transport.
+#[tokio::test]
+async fn executable_download_guard_rejects_private_and_insecure_targets_without_io() {
+    struct PublicDns;
+    impl polaris_net_stack::ssrf::DnsLookup for PublicDns {
+        async fn lookup_all(&self, _: &str) -> Result<Vec<String>, String> {
+            Ok(vec!["93.184.216.34".into()])
+        }
+    }
+    for url in ["http://example.invalid/a.exe", "https://u:p@example.invalid/a.exe", "https://127.0.0.1/a.exe", "https://[::1]/a.exe", "https://169.254.169.254/a.exe"] {
+        assert!(guarded_update_target(url, &PublicDns).await.is_err());
+    }
+    let admitted = guarded_update_target("https://example.invalid/a.exe?signature=secret", &PublicDns).await.unwrap();
+    assert_eq!(admitted.host, "example.invalid");
+    assert_eq!(admitted.addresses, vec!["93.184.216.34".parse::<std::net::IpAddr>().unwrap()]);
+    struct MixedDns;
+    impl polaris_net_stack::ssrf::DnsLookup for MixedDns {
+        async fn lookup_all(&self, _: &str) -> Result<Vec<String>, String> {
+            Ok(vec!["93.184.216.34".into(), "10.0.0.1".into()])
+        }
+    }
+    assert!(guarded_update_target("https://example.invalid/a.exe", &MixedDns).await.is_err());
 }

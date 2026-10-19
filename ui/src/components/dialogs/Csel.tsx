@@ -5,7 +5,7 @@
  * **被 top-layer 遮盖 + inert 冻结**（菜单在 dialog 子树外）→ 不可见不可点。**从原型照搬会踩的第一个坑。**
  *
  * React 版实现：
- *  - 触发器 + listbox 渲染在**自身组件内**（dialog 子树内）→ 仍在 top-layer，不被 inert；无 portal、无单例；
+ *  - dialog 内保留 listbox 子树以遵循 top-layer；其他位置 portal 到 body，避开 containment。
  *  - listbox 用 `position:fixed` 按触发器 getBoundingClientRect() 定位 + 近边翻转（computeCselPosition）
  *    → fixed 逃出 `.dlg-body` 的 `overflow-y:auto` 裁切（R8 下拉遮挡根治），坐标视口相对；
  *  - 键盘协议照原型（↑/↓/Enter/Space/Tab，cselKeyReduce）；**ESC 不在此处理**，交 Modal 的 cancel 统一
@@ -28,6 +28,7 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { getControlBoundary } from '@/lib/overlay-position';
 import { ModalContext } from './Modal';
 import { revealSiblingGroup, useRevealAfterCommit } from '@/components/reveal';
 import {
@@ -36,6 +37,7 @@ import {
   cselKeyReduce,
   computeCselPosition,
   CSEL_GAP,
+  CSEL_EDGE,
   flattenCselOptions,
   type CselGroup,
   type CselPosition,
@@ -148,7 +150,7 @@ export function Csel({
     setPos(null);
     // 焦点在 csel 内（trigger 或即将卸载的 option）→ 收回 trigger；在别处→不抢焦点。
     const wrap = wrapRef.current;
-    if (wrap && wrap.contains(document.activeElement)) triggerRef.current?.focus();
+    if (wrap?.contains(document.activeElement) || menuRef.current?.contains(document.activeElement)) triggerRef.current?.focus();
   }, []);
 
   const openMenu = useCallback(() => {
@@ -191,13 +193,42 @@ export function Csel({
     }
     const menu = menuRef.current;
     if (!menu) return;
-    setPos(
-      computeCselPosition(state.rect, menu.offsetHeight, {
-        width: window.innerWidth,
-        height: window.innerHeight,
-      }),
-    );
-  }, [state.open, state.rect, openGroups]);
+    const trigger = triggerRef.current;
+    if (!trigger) return;
+    const update = () => {
+      const rect = trigger.getBoundingClientRect();
+      const vp = { width: window.innerWidth, height: window.innerHeight };
+      const boundary = getControlBoundary(trigger, { left: 0, top: 0, ...vp });
+      const maxWidth = Math.max(0, Math.min(320, boundary.width - 2 * CSEL_EDGE));
+      // Apply width constraints BEFORE measuring: wrapping changes the required height.
+      menu.style.width = 'max-content';
+      menu.style.direction = getComputedStyle(trigger).direction;
+      menu.style.minWidth = `${Math.min(rect.width, maxWidth)}px`;
+      menu.style.maxWidth = `${maxWidth}px`;
+      const border = menu.offsetHeight - menu.clientHeight;
+      const height = Math.min(300, vp.height * 0.52, menu.scrollHeight + border);
+      const next = computeCselPosition(rect, height, vp, menu.getBoundingClientRect().width,
+        boundary, getComputedStyle(trigger).direction === 'rtl');
+      if (!next.usable) {
+        menu.style.visibility = 'hidden';
+        closeMenu();
+        return;
+      }
+      setPos((old) => old && Object.keys(next).every((key) => old[key as keyof CselPosition] === next[key as keyof CselPosition]) ? old : next);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(menu);
+    observer.observe(trigger);
+    for (const boundary of new Set([
+      trigger.closest('[data-overlay-boundary], .card, .dlg-body, dialog'),
+      trigger.closest('.dlg-body'),
+      trigger.closest('dialog'),
+    ])) {
+      if (boundary) observer.observe(boundary);
+    }
+    return () => observer.disconnect();
+  }, [state.open, state.rect, openGroups, options, closeMenu]);
 
   // 打开态副作用：上报 Modal（ESC/scrim 先关菜单）+ 外部点击/滚动/缩放关菜单（对齐原型 :5502）。
   useLayoutEffect(() => {
@@ -262,16 +293,15 @@ export function Csel({
     } else if (action === 'choose') choose(active);
   };
 
-  // 宽度：以触发器宽为**下限**（minWidth），实际宽随内容自适应（width:auto）——固定 width=触发器宽时
-  // CJK 选项标签（默认顺序/名称/延迟…）被 `.csel-opt>span` 的 ellipsis 截成「默./名./延.」（真机确认）。
-  // maxWidth 封顶防超长选项撑爆；右溢出交给 computeCselPosition 的近边翻转（以触发器宽估算，够用）。
+  // Measure content width within the nearest card, then use those same dimensions for placement.
   const menuStyle: React.CSSProperties = {
     position: 'fixed',
-    minWidth: state.rect?.width,
-    maxWidth: 320,
+    boxSizing: 'border-box',
+    width: 'max-content',
+    maxHeight: pos?.maxHeight,
     left: pos?.left ?? state.rect?.left ?? 0,
     top: pos?.top ?? (state.rect ? state.rect.bottom + CSEL_GAP : 0),
-    visibility: pos ? 'visible' : 'hidden',
+    visibility: pos?.usable ? 'visible' : 'hidden',
   };
 
   // 菜单节点。`position:fixed` 本应相对视口，但 `.win`/`.main` 用 `container-type:inline-size`（container

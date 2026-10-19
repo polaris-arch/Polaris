@@ -46,7 +46,7 @@ pub const REDACTED: &str = "<redacted>";
 /// `username` 保留（naive 用户名单独不可用，且有助定位），仅 password 类打码。
 ///
 /// **改这张表 = 改红线**。新增协议若引入新密钥键，必须同步加进来 + 补 `tests` 里的穷举用例。
-pub const SECRET_KEYS: [&str; 23] = [
+pub const SECRET_KEYS: [&str; 26] = [
     "password",
     "uuid",
     "privatekey",
@@ -71,6 +71,9 @@ pub const SECRET_KEYS: [&str; 23] = [
     // MASQUE `headers` 里的 Bearer/Basic 头（`{"Authorization": [...]}`，键名归一后命中）：
     // 自建 CONNECT-IP 服务端常用额外头鉴权，值即凭据。
     "authorization",
+    "proxyauthorization",
+    "cookie",
+    "setcookie",
     // Tailcat 服务端公钥（`serverPublicKey` / `server_public_key`）：服务端不校验 users 时它就是准入
     // 凭据（上游称其为 tailcat 地址里不可猜的部分）。同名族的 `serverDiscoKey` 明文过线，**不**打码。
     "serverpublickey",
@@ -462,6 +465,19 @@ fn add_host_headers(headers: Option<&Value>, out: &mut Vec<String>) {
 /// 这些 IP 不在 `config.servers` 里、否则会以明文漏进诊断报告 → 调用方传入，一并按节点 IP 身份打码。
 #[must_use]
 pub fn collect_node_identifiers(config: &Value, extra_addresses: &[String]) -> Vec<NodeIdentifier> {
+    collect_report_node_identifiers(config, &Value::Null, extra_addresses)
+}
+
+/// Collect both saved configuration and the actual running configuration. Pending edits can
+/// remove or change a node while its old address/SNI remains in the running core and log tail.
+/// Only outbound/endpoint host fields are collected from the runtime tree; DNS/routing rules
+/// and ordinary technical labels remain useful diagnostics.
+#[must_use]
+pub fn collect_report_node_identifiers(
+    config: &Value,
+    runtime_config: &Value,
+    extra_addresses: &[String],
+) -> Vec<NodeIdentifier> {
     let mut out: Vec<NodeIdentifier> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let (mut domain_n, mut ip_n, mut name_n) = (0u32, 0u32, 0u32);
@@ -559,6 +575,27 @@ pub fn collect_node_identifiers(config: &Value, extra_addresses: &[String]) -> V
             }
             if let Some(v) = str_at(s, &["name"]) {
                 add(&v, true);
+            }
+        }
+    }
+    for section in ["outbounds", "endpoints"] {
+        if let Some(nodes) = runtime_config.get(section).and_then(Value::as_array) {
+            for node in nodes {
+                let mut hosts = Vec::new();
+                collect_hosts_deep(node, &mut hosts);
+                for host in hosts {
+                    add(&host, false);
+                }
+                if node.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                    !matches!(kind, "direct" | "block" | "dns" | "selector" | "urltest")
+                }) {
+                    if let Some(tag) = node.get("tag").and_then(Value::as_str) {
+                        add(tag, true);
+                    }
+                }
+                if let Some(exit) = node.get("exit_node").and_then(Value::as_str) {
+                    add(exit, false);
+                }
             }
         }
     }

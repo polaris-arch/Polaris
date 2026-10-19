@@ -1,3 +1,5 @@
+import { isSpeedTestUrl, speedTestUrlInvalid as invalidSpeedUrl, adoptSpeedTestUrlDraft } from '@/domain/periodic-speed-test';
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
 /**
  * SettingsNetwork —— 网络子页（原型 [data-sec="network"] L2119-2169）。
@@ -15,7 +17,7 @@ import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { globalUtlsOptions, tlsFingerprintStatus } from '@/domain/utls';
+import { globalUtlsOptions, isSavedUtlsSelection, tlsFingerprintStatus } from '@/domain/utls';
 import { useTranslation } from 'react-i18next';
 import type { SpeedTestMeteredPolicy, UserConfig } from '@/contracts/types';
 import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
@@ -58,16 +60,6 @@ export interface SettingsNetworkProps {
 
 type WebRTC = 'off' | 'proxy' | 'block';
 
-
-/**
- * 测速端点是否合法 —— 与后端 `src-tauri/src/icon_cache.rs::is_http_url` 逐字同口径
- * （`http://` / `https://` 前缀，大小写不敏感），**刻意不用 `new URL()`**：后端只看前缀，
- * `new URL` 会接受一批后端随即回落默认的写法，两侧口径分叉就变成「填了没生效还不报错」。
- */
-function isHttpUrl(value: string): boolean {
-  const v = value.trim().toLowerCase();
-  return v.startsWith('http://') || v.startsWith('https://');
-}
 
 /** 测速端点缺省（后端 `commands/speedtest.rs:67` DEFAULT_SPEED_TEST_URL）；留空即回落到它。 */
 const DEFAULT_SPEED_TEST_URL = 'http://www.gstatic.com/generate_204';
@@ -185,7 +177,8 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
   const [controlPortDraft, setControlPortDraft] = useState(String(controlPort));
   const [speedUrlDraft, setSpeedUrlDraft] = useState(config.speedTestUrl ?? '');
   const [portErr, setPortErr] = useState<{ mixed?: boolean; control?: boolean }>({});
-  const [speedUrlErr, setSpeedUrlErr] = useState(false);
+  // Derive from the visible draft: hydration and local edits cannot leave a stale warning.
+  const speedUrlErr = invalidSpeedUrl(speedUrlDraft);
   const seededRef = useRef({
     mixed: String(mixedPort),
     control: String(controlPort),
@@ -200,7 +193,7 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
     const prev = seededRef.current;
     setMixedPortDraft((cur) => (cur !== prev.mixed ? cur : snap.mixed));
     setControlPortDraft((cur) => (cur !== prev.control ? cur : snap.control));
-    setSpeedUrlDraft((cur) => (cur !== prev.speedUrl ? cur : snap.speedUrl));
+    setSpeedUrlDraft((cur) => (adoptSpeedTestUrlDraft(cur, prev.speedUrl, snap.speedUrl)));
     seededRef.current = snap;
   }, [mixedPort, controlPort, config.speedTestUrl]);
 
@@ -229,11 +222,9 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
   /** 提交测速端点：非法 → 标红、保留输入、**不落盘**；清空 → 删字段（后端回落默认）。 */
   function commitSpeedTestUrl(raw: string) {
     const v = raw.trim();
-    if (v && !isHttpUrl(v)) {
-      setSpeedUrlErr(true);
+    if (v && !isSpeedTestUrl(v)) {
       return;
     }
-    setSpeedUrlErr(false);
     const next = v || undefined;
     setSpeedUrlDraft(v);
     if (next === (config.speedTestUrl ?? undefined)) return;
@@ -495,9 +486,10 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
         >
           <Segmented<WebRTC>
             id="webrtc-seg"
+            disabled={webrtcDisabled}
             ariaLabel={t('settings.network.webrtcLeakProtection')}
             value={config.webrtcLeakProtection ?? 'off'}
-            onChange={(v) => void update({ webrtcLeakProtection: v })}
+            onChange={(v) => { if (!webrtcDisabled) void update({ webrtcLeakProtection: v }); }}
             options={[
               { value: 'off', label: t('settings.network.webrtcLeakOff') },
               { value: 'proxy', label: t('settings.network.webrtcLeakProxy') },
@@ -505,14 +497,14 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             ]}
           />
         </SetRow>
-        <SetRow label={t('settings.utls.label')} tip={t('settings.utls.description')} desc={tlsFingerprintStatus(tlsFingerprints, t)}>
+        <SetRow label={t('settings.utls.label')} tip={t('settings.utls.description')} desc={[isSavedUtlsSelection(config.utlsPolicy) ? t('node.utls.savedHint') : null, tlsFingerprintStatus(tlsFingerprints, t)].filter(Boolean).join(' ')}>
           <Select
-            value={config.utlsPolicy ?? 'follow'}
+            value={config.utlsPolicy ?? 'default'}
             aria-label={t('settings.utls.label')}
             onChange={(event) => void update({ utlsPolicy: event.currentTarget.value })}
           >
             {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
-              <option key={value} value={value}>{value === 'follow' || value === 'default' ? t(label) : label}</option>
+              <option key={value} value={value}>{label.startsWith('node.utls.') || label.startsWith('settings.utls.') ? t(label) : label}</option>
             ))}
           </Select>
         </SetRow>
@@ -572,7 +564,7 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             aria-label={t('settings.advanced.mainSessionViaProxy')}
           />
         </SetRow>
-        {/* speedTestUrl → commands/speedtest.rs:539-541 resolve_speed_test_url（非法值后端静默回落
+        {/* speedTestUrl → commands/speedtest.rs:539-541 resolve_speed_test_url（显式非法值后端拒绝
             默认，故前端必须先标红，否则「填了个错 URL，测速照跑但量的是别的端点」无从察觉）。 */}
         <SetRow
           label={t('settings.network.speedTestUrl')}
@@ -586,7 +578,6 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             placeholder={DEFAULT_SPEED_TEST_URL}
             onChange={(e) => {
               setSpeedUrlDraft(e.currentTarget.value);
-              if (speedUrlErr) setSpeedUrlErr(false);
             }}
             onBlur={() => commitSpeedTestUrl(speedUrlDraft)}
             onKeyDown={(e) => {
@@ -599,6 +590,7 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
           />
           {speedUrlErr && <div className="err-line">{t('settings.network.speedTestUrlInvalid')}</div>}
         </SetRow>
+        <SavedAutoSelectControls t={t} variant="switch" />
         <SetRow
           label={t('settings.network.periodicSpeedTest')}
           tip={t('settings.network.periodicSpeedTestDesc')}

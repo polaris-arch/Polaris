@@ -182,6 +182,7 @@ fn traffic_rule_target_adds_its_detour_physical_root() {
                     enabled: true,
                     action: RuleAction::Proxy,
                     target_server_id: Some("child".into()),
+                    target_auto_select: None,
                     destination_resolution: None,
                     resolution_only: false,
                 }),

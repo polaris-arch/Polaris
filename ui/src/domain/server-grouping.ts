@@ -81,7 +81,7 @@ export function groupServersBySubscription(
   return groups;
 }
 
-/** Append an all-nodes view without changing existing first-open/default group behavior. */
+/** All is the first tab; initial selection can still reveal the active node group. */
 export function nodeViewGroups(servers: ServerConfig[], subscriptions: SubscriptionConfig[] = [], sourceNames = { manual: 'manual', mesh: 'mesh' }): ServerGroup[] {
   const groups = groupServersBySubscription(servers, subscriptions, true);
   let id = '__all_nodes__';
@@ -90,7 +90,7 @@ export function nodeViewGroups(servers: ServerConfig[], subscriptions: Subscript
     id: group.id, kind: group.isManual ? 'manual' as const : group.isMesh ? 'mesh' as const : 'subscription' as const,
     name: group.isManual ? sourceNames.manual : group.isMesh ? sourceNames.mesh : group.name,
   }])));
-  return [...groups, { id, name: 'all', isManual: false, isAll: true, servers, sources }];
+  return [{ id, name: 'all', isManual: false, isAll: true, servers, sources }, ...groups];
 }
 
 /**

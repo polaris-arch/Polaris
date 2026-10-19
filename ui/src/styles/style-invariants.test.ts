@@ -787,7 +787,7 @@ describe('三处节点选择器的视觉统一：取值必须在同一条规则�
     ).toBeGreaterThanOrEqual(2);
   });
 
-  it('④ 有图标后 label 的截断改钉在 `.csel-lbl` 类上（`:first-child` 已命不中）', () => {
+  it('④ 有图标后 label 在 `.csel-lbl` 内换行，长文本不撑爆菜单', () => {
     // prototype.css:1540 的 `.csel-opt > span:first-child` 给的 flex:1 + 省略号，在图标插到前面后
     // 命中的是图标而不是 label ⇒ 长选项会撑爆菜单而不是截断。
     expect(protoCss, '前提变了：prototype 不再用 :first-child 定 label').toMatch(
@@ -795,7 +795,8 @@ describe('三处节点选择器的视觉统一：取值必须在同一条规则�
     );
     const lbl = rules(indexCss).find((r) => /\.csel-lbl\b/.test(r.sel));
     expect(lbl, '.csel-lbl 的 flex/截断规则缺失 —— 长选项会撑爆菜单').toBeDefined();
-    expect(lbl!.body).toMatch(/text-overflow\s*:\s*ellipsis/);
+    expect(lbl!.body).toMatch(/overflow-wrap\s*:\s*anywhere/);
+    expect(lbl!.body).toMatch(/white-space\s*:\s*normal/);
   });
 
   it('⑤ 托盘组头对齐基准：uppercase 必须复位，且特异性压过 tray-overlay.css', () => {

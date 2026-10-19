@@ -328,8 +328,9 @@ export function nodeUseAction(
   selectedServerId: string | null | undefined,
   needsApply: boolean,
   via: NodeUseVia,
+  autoSelected = false,
 ): NodeUseAction {
-  if (serverId === selectedServerId) return 'noop';
+  if (serverId === selectedServerId && !autoSelected) return 'noop';
   if (needsApply) return 'confirm-apply';
   return via === 'button' ? 'switch' : 'confirm';
 }

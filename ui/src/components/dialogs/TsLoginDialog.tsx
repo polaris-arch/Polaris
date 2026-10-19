@@ -29,12 +29,14 @@ function TsIcon() {
   );
 }
 
-export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?: string; replaceIdentity?: boolean }) {
+export function TsLoginDialog({ instanceId, serverId, replaceIdentity = false }: { instanceId: string; serverId?: string; replaceIdentity?: boolean }) {
   const { t } = useTranslation();
   const backendReplacement = tsLoginUsesBackendReplacement(replaceIdentity);
   const isIOS = tsAccountActionsUseNormalMain();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((s) => s.closeInstance);
+  const alive = () => useDialogStore.getState().stack.some((dialog) => dialog.instanceId === instanceId);
+  const close = () => closeInstance(instanceId);
   const servers = useAppStore((s) => s.servers);
   const visibleServers = useEffectiveServers();
   const subscriptions = useEffectiveConfig((config) => config?.subscriptions);
@@ -175,7 +177,7 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
       close();
       return;
     }
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('ts.loginDiscardTitle'),
@@ -183,7 +185,7 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
         confirmLabel: t('ts.loginDiscard'),
         danger: true,
         onConfirm: () => {
-          close();
+          closeInstance(confirmId);
           close();
         },
       },
@@ -194,10 +196,14 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
   // Offer to stop exactly that run, then submit again; the proxy is left stopped.
   const submitRef = useRef<() => Promise<void>>(async () => {});
   const askStopThenRetry = async (id: string) => {
-    const owner = captureMainCoreOwner(id, useAppStore.getState().selectedServerId,
-      await api.proxy.getStatus().catch(() => null));
+    const attempt = activeRequest.current;
+    const revision = editRevision.current;
+    const current = () => alive() && activeRequest.current === attempt && editRevision.current === revision;
+    const status = await api.proxy.getStatus().catch(() => null);
+    if (!current()) return;
+    const owner = captureMainCoreOwner(id, useAppStore.getState().selectedServerId, status);
     if (!owner) return;
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('ts.switchStopTitle'),
@@ -205,13 +211,15 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
         confirmLabel: t('ts.switchStopConfirm'),
         danger: true,
         onConfirm: async () => {
-          close();
+          closeInstance(confirmId);
+          if (!current()) return;
           const stopped = await stopOwnedCore(owner, {
             selectedId: () => useAppStore.getState().selectedServerId,
-            serverPresent: (serverId) => useAppStore.getState().servers.some((s) => s.id === serverId),
+            serverPresent: (serverId) => current() && useAppStore.getState().servers.some((s) => s.id === serverId),
             status: () => api.proxy.getStatus(),
-            stopExpected: (expected) => api.proxy.stopExpected(expected),
+            stopExpected: (expected) => current() ? api.proxy.stopExpected(expected) : Promise.reject(new Error('LOGIN_DISMISSED')),
           });
+          if (!current()) return;
           if (stopped === 'stopped') await submitRef.current();
           else if (stopped === 'changed') toast.info(t('ts.switchStopChanged'));
           else toast.error(t('ts.switchStopFailed'));
@@ -221,6 +229,7 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
   };
 
   const handleSubmit = async () => {
+    if (!alive()) return;
     const submittedName = !nameEdited && !existingTs ? nextTsNodeName(meshNames) : name.trim();
     if (!submittedName) {
       setErrName(true);
@@ -265,7 +274,7 @@ export function TsLoginDialog({ serverId, replaceIdentity = false }: { serverId?
     if (backendOwned) setSaved(false);
     const stillActive = () => {
       const current = useTailscaleLoginProgressStore.getState().attempts[server.id];
-      return activeRequest.current?.attemptId === request.attemptId && current?.attemptId === request.attemptId
+      return alive() && activeRequest.current?.attemptId === request.attemptId && current?.attemptId === request.attemptId
         && !['failed', 'timedOut', 'cancelled'].includes(current.phase);
     };
     let startResult: Awaited<ReturnType<typeof api.server.tailscaleLogin>> | undefined;

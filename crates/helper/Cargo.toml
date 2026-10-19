@@ -42,6 +42,10 @@ log = "0.4"
 # user = Uid::current()（handler uid()，Go `os.Getuid()` 等价，替代 nix 0.31 feature-gated 的 getuid）。
 # 仅 platform::macos 的 #[cfg(target_os = "macos")] 门内代码使用 —— 编 linux/windows 时不参与解析。
 [target.'cfg(target_os = "macos")'.dependencies]
+# Strict migration plist parsing reuses already locked workspace packages.
+plist = "=1.10.0"
+serde.workspace = true
+serde_json.workspace = true
 nix = { version = "0.31", features = ["dir", "fs", "process", "signal", "socket", "user"] }
 polaris-system-integration = { path = "../system-integration" }
 
@@ -98,6 +102,9 @@ windows-sys = { version = "0.61", features = [
 polaris-system-integration = { path = "../system-integration" }
 
 [dev-dependencies]
+plist = "=1.10.0"
+serde.workspace = true
+serde_json.workspace = true
 polaris-helper-client = { path = "../helper-client", features = ["test-utils"] }
 # tempfile = content store / token / launchd inert fixture directories.
 tempfile = "3"

@@ -288,7 +288,9 @@ fn push_ring(ts_ms: u128, level: Level, target: &str, message: String) {
         return;
     }
     if let Ok(mut r) = ring().lock() {
-        let seq = LOG_SEQ.fetch_add(1, Ordering::Relaxed);
+        let Ok(seq) = LOG_SEQ.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| seq.checked_add(1)) else {
+            return; // Never wrap an old record ID back into the current stream.
+        };
         bounded_push(
             &mut r,
             LOG_RING_CAP,
@@ -340,10 +342,14 @@ pub fn search_snapshot(
 }
 
 /// 清空环形缓冲（`logs:clear`）。发号器不复位（seq 全局单调，避免游标错位）。
-pub fn clear() {
-    if let Ok(mut r) = ring().lock() {
-        r.clear();
-    }
+pub fn clear() -> Result<u64, &'static str> {
+    let mut r = ring().lock().map_err(|_| "log ring unavailable")?;
+    // Producers allocate their sequence and insert while holding this same lock.
+    // Thus every subsequent insertion has seq >= this exact retained boundary.
+    let next = LOG_SEQ.load(Ordering::Relaxed);
+    if next > 9_007_199_254_740_991 { return Err("log sequence exceeds UI precision"); }
+    r.clear();
+    Ok(next)
 }
 
 struct PolarisLogger {

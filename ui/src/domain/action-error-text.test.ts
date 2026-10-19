@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   backupErrorText,
+  configSaveErrorText,
   helperActionErrorText,
   serverSwitchErrorText,
 } from './action-error-text';
@@ -11,8 +12,8 @@ describe('structured action error text', () => {
   it('stable helper code wins over any diagnostic', () => {
     expect(helperActionErrorText('bundleMismatch', t)).toBe('translated:helper.actionError.bundleMismatch');
     expect(helperActionErrorText('missingAsset', t)).toBe('translated:helper.actionError.missingAsset');
-    expect(helperActionErrorText('authorizationUnavailable', t)).toBe(
-      'translated:helper.actionError.authorizationUnavailable'
+    expect(helperActionErrorText('authorizationIncomplete', t)).toBe(
+      'translated:helper.actionError.authorizationIncomplete'
     );
     expect(helperActionErrorText('proxyRunning', t)).toBe(
       'translated:helper.actionError.proxyRunning'
@@ -42,4 +43,18 @@ it('maps shared dependency conflicts to actionable localized backup copy', () =>
 
 it.each(["invalidInstallation", "tokenWriteFailed", "scriptWriteFailed", "authorizationLaunchFailed", "installerFailed", "upgradeDeferred"])('preserves Helper installation stage %s', code => {
   expect(helperActionErrorText(code as Parameters<typeof helperActionErrorText>[0], t)).toBe(`translated:helper.actionError.${code}`);
+});
+
+
+describe('safe DNS dependency error feedback', () => {
+  it('uses only the stable code and never displays credential-bearing diagnostics', () => {
+    expect(configSaveErrorText({ code: 'DNS_DEPENDENCY_INVALID', message: 'https://user:secret@example.invalid' }, t))
+      .toBe('translated:errors.dnsDependencyInvalid');
+    expect(configSaveErrorText({ message: 'DNS_DEPENDENCY_INVALID https://user:secret@example.invalid' }, t))
+      .toBe('translated:common.saveFailed');
+  });
+});
+
+it('explains duplicate identity recovery without exposing backend diagnostics', () => {
+  expect(serverSwitchErrorText('serverIdentityAmbiguous', key => key)).toBe('identityRepair.ambiguous');
 });

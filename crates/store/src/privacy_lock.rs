@@ -5,7 +5,7 @@
 //! 存独立 `privacy-lock.json`（永不进 config 对象 → 无需在 10+ 个 configChanged 广播点脱敏与 merge 保护）。
 //!
 //! 安全定位（沿用 上游 原文）：本特性是「前端威慑闸」加固，非 auth-grade——但密码绝不明文落盘、
-//! 绝不下发渲染端。文件缺失/损坏 → `None`（fail-open = 未设密码，符合威慑闸语义，与 上游 `readPrivacyHash` 同口径）。
+//! 绝不下发渲染端。仅文件缺失表示未设密码；损坏或不可读取返回错误，不能静默拆锁。
 //!
 //! # 为什么 scrypt 而非 salted SHA-256
 //! Polaris 早期把 salted SHA-256（**快**哈希，GPU 每秒几十亿次）存进 config.json `privacyPasswordHash`。
@@ -59,11 +59,11 @@ pub const PARAMS: ScryptParams = ScryptParams {
 
 /// 隐私锁落盘结构（对齐 上游 `PrivacyPasswordHash`）。`salt`/`hash` 均为小写 hex。
 ///
-/// `params` 随每条哈希一起落盘，[`verify`] 复算时按**存储值**取参（绝不用编译期常量覆盖），
-/// 使将来调参的存量哈希仍可校验。
+/// `params` 随哈希落盘。读取只接受本应用发布过的固定参数，避免损坏数据放大 KDF 成本。
+/// 将来调参须显式加入旧参数兼容表。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivacyPasswordHash {
-    /// 算法标识，恒 `"scrypt"`（读取时校验，异类 → 视为损坏 → `None`）。
+    /// 算法标识，恒 `"scrypt"`（异类视为损坏并返回错误）。
     pub algo: String,
     /// 盐（hex，16B）。
     pub salt: String,
@@ -118,7 +118,7 @@ pub fn hash_password(plain: &str, salt: &[u8]) -> Result<PrivacyPasswordHash, St
 /// 结构 / 参数 / hex / 算法异常一律返回 `false`（fail-closed），绝不 panic。对齐 上游 `verifyPassword`。
 #[must_use]
 pub fn verify(plain: &str, stored: &PrivacyPasswordHash) -> bool {
-    if stored.algo != "scrypt" {
+    if !valid_record(stored) {
         return false;
     }
     let (Some(salt), Some(expected)) = (hex_decode(&stored.salt), hex_decode(&stored.hash)) else {
@@ -130,20 +130,34 @@ pub fn verify(plain: &str, stored: &PrivacyPasswordHash) -> bool {
     }
 }
 
-/// 读隐私锁文件 → 有效哈希 / `None`（缺失 / 坏 JSON / 结构非法 / algo 异类 → `None`，fail-open）。
-pub fn read<F: ConfigFs + ?Sized>(fs: &F, path: &Path) -> Option<PrivacyPasswordHash> {
-    let raw = fs.read_to_string(path).ok()?;
-    let parsed: PrivacyPasswordHash = serde_json::from_str(&raw).ok()?;
-    if parsed.algo == "scrypt" && !parsed.salt.is_empty() && !parsed.hash.is_empty() {
-        Some(parsed)
-    } else {
-        None
+// Only the supported fixed-cost record shape is accepted before scrypt allocation.
+fn valid_record(stored: &PrivacyPasswordHash) -> bool {
+    stored.algo == "scrypt"
+        && stored.params == PARAMS
+        && hex_decode(&stored.salt).is_some_and(|salt| salt.len() == SALT_LEN)
+        && hex_decode(&stored.hash).is_some_and(|hash| hash.len() == PARAMS.key_len as usize)
+}
+
+/// Only a genuinely missing file is None; unreadable or corrupt records fail closed.
+pub fn read<F: ConfigFs + ?Sized>(
+    fs: &F,
+    path: &Path,
+) -> Result<Option<PrivacyPasswordHash>, StoreError> {
+    let Some(raw) = fs.read_optional(path)? else {
+        return Ok(None);
+    };
+    let parsed: PrivacyPasswordHash = serde_json::from_str(&raw).map_err(StoreError::from_parse)?;
+    if !valid_record(&parsed) {
+        return Err(StoreError::Io(
+            "invalid privacy credential record; restore or reset the local credential file".into(),
+        ));
     }
+    Ok(Some(parsed))
 }
 
 /// 是否已设隐私密码（隐私锁文件存在且结构有效）。
-pub fn has<F: ConfigFs + ?Sized>(fs: &F, path: &Path) -> bool {
-    read(fs, path).is_some()
+pub fn has<F: ConfigFs + ?Sized>(fs: &F, path: &Path) -> Result<bool, StoreError> {
+    read(fs, path).map(|record| record.is_some())
 }
 
 /// 写隐私锁文件（0600 由 [`crate::StdFs`] 的 open(2) 保证；先建父目录）。**绝不写明文**。
@@ -159,7 +173,7 @@ pub fn write<F: ConfigFs + ?Sized>(
         fs.create_dir_all(parent)?;
     }
     let content = serde_json::to_string(hash).map_err(StoreError::from_parse)?;
-    fs.write(path, &content)
+    fs.write_atomic(path, &content)
 }
 
 /// 删除隐私锁文件（清除密码；不存在视为成功，best-effort）。

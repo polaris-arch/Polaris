@@ -1,3 +1,4 @@
+import { configSaveErrorText } from '@/domain/action-error-text';
 /** Shared authoritative feed, instance-local direct intent, then staged projection. */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -238,7 +239,7 @@ export function useConfig(): UseConfigResult {
       if (isAlive()) {
         apply(failDirect(edits.current, id));
         console.error('[useConfig] save config failed:', error);
-        toast.error(tRef.current('common.saveFailed'));
+        toast.error(configSaveErrorText(error, tRef.current));
       }
       if (options?.throwOnError) throw error;
       return;

@@ -470,6 +470,7 @@ fn dns_rule_set_rule(id: &str, rule_set: &str) -> Rule {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -489,6 +490,7 @@ fn traffic_rule_set_rule(id: &str, rule_set: &str) -> Rule {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -618,6 +620,7 @@ fn dns_builtin_rule_set_definitions_survive_all_proxy_modes() {
             enabled: true,
             bypass_fakeip: None,
             target_server_id: None,
+            target_auto_select: None,
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
@@ -1273,6 +1276,7 @@ fn legacy_mesh_local_fallback_preserves_user_destination_reject_precedence() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -1597,12 +1601,7 @@ fn endpoint_detour_lands_in_generated_json() {
     }
 }
 
-/// 【门 ②】detour 目标是 endpoint 类节点 → 排除（沿用代理 outbound 早就在用的同一条），
-/// 但**引用方本身必须留在产物里**（只丢 detour，不丢节点）。
-///
-/// 变异对照：删掉 `resolve_detour_tag` 里的 `is_mesh_protocol` 那支 ⇒ WG 的 detour 变成
-/// TS 的 endpoint tag，而 `valid_tags` 只取自 outbounds ⇒ 剪枝把整个 WG endpoint 剔掉 ⇒
-/// 「WG 仍在」这条断言转红。
+/// Unsupported endpoint targets must fail before any direct physical dial is emitted.
 #[test]
 fn endpoint_detour_target_endpoint_excluded() {
     use crate::user_config::server_config::{TailscaleSettings, WireGuardSettings};
@@ -1630,28 +1629,10 @@ fn endpoint_detour_target_endpoint_excluded() {
         })),
         ..Default::default()
     });
-    let result = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap();
-    let json = serde_json::to_value(&result).unwrap();
-    let eps = json["endpoints"]
-        .as_array()
-        .expect("endpoints 必须注入顶层");
-    let wg = eps
-        .iter()
-        .find(|e| e["type"] == "wireguard")
-        .expect("WG endpoint 必须仍在产物里（只丢 detour，不丢节点）");
-    assert!(
-        wg.get("detour").is_none(),
-        "detour 目标是 endpoint ⇒ 该键根本不得出现，实得 {wg:?}"
-    );
+    assert!(generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).is_err());
 }
 
-/// 【门 ②b】detour 目标是 **openconnect / openvpn-client** → 同样排除。
-///
-/// 它们落 `endpoints[]`、tag 不在 `outbounds[]` 里，指向它们的 detour 与指向 WG/TS 是同一类
-/// 悬空引用。此前判据用的是只认 WG/TS 的 `is_mesh_protocol`，这两个协议漏在外面 ——
-/// 后果不是「多一个没用的选项」，而是**引用方整个节点被剪掉并上报 invalid**（用户侧：节点没了）。
-///
-/// 变异对照：把 `resolve_detour_tag` 的判据改回 `is_mesh_protocol` ⇒ 本条断言转红。
+/// Explicit detours to OpenConnect endpoints must fail generation, never silently dial directly.
 #[test]
 fn detour_target_openconnect_excluded() {
     use crate::user_config::protocol_settings::OpenconnectSettings;
@@ -1676,20 +1657,10 @@ fn detour_target_openconnect_excluded() {
         detour: Some("oc1".into()), // ← 目标是 endpoint 腿
         ..Default::default()
     });
-    let result = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap();
-    let json = serde_json::to_value(&result).unwrap();
-    // 按 tag 定位而不是按 type：`base_config()` 本身就带一个 vless 节点，按 type 找会命中它 ——
-    // 那个节点从来就没有 detour，断言恒绿、变异不红（落地时先踩了这一下）。
-    let vless = json["outbounds"]
-        .as_array()
-        .expect("outbounds")
-        .iter()
-        .find(|o| o["tag"] == "V")
-        .expect("引用方必须留在产物里 —— 只丢 detour，不丢节点");
-    assert!(
-        vless.get("detour").is_none(),
-        "detour 目标落在 endpoints[] ⇒ 该键根本不得出现，实得 {vless:?}"
-    );
+    let error = generate_sing_box_config(&cfg, &BTreeMap::new(), &deps_default()).unwrap_err();
+    assert!(error.contains("V"), "{error}");
+    assert!(error.contains("OC"), "{error}");
+    assert!(error.contains("端点目标"), "{error}");
 }
 
 /// 用户为 openconnect / openvpn-client 声明的内网段，必须真的变成 force-route 规则。
@@ -2347,5 +2318,66 @@ fn dns_geosite_source_fallback_keeps_its_declared_format_across_modes() {
             .collect();
         assert_eq!(definitions.len(), 1, "{mode:?}");
         assert_eq!(definitions[0].format, "source");
+    }
+}
+
+#[test]
+fn stale_dns_dependency_fails_generation_without_domestic_fallback() {
+    use crate::user_config::dns_policy::{DnsPolicyDefaults, DnsServerResource};
+    for case in ["missing-policy", "disabled-policy", "missing-bootstrap", "bootstrap-cycle"] {
+        let mut config = base_config();
+        config.dns_defaults = Some(DnsPolicyDefaults {
+            unmatched_action: Some(DnsPolicyAction::Server { server_id: "private-dns".into() }),
+            ..Default::default()
+        });
+        if case != "missing-policy" {
+            let resource: DnsServerResource = serde_json::from_value(serde_json::json!({
+                "id":"private-dns", "name":"Private", "enabled":case != "disabled-policy",
+                "type":"https", "endpoint":{"host":"resolver.example"},
+                "bootstrapServerId": if case == "bootstrap-cycle" { "private-dns" } else { "absent" },
+                "outbound":{"type":"direct"}
+            })).unwrap();
+            config.dns_servers.push(resource);
+        }
+        let error = generate_sing_box_config(&config, &BTreeMap::new(), &deps_default()).unwrap_err();
+        assert!(error.contains("DNS"), "{case}: {error}");
+    }
+}
+
+#[test]
+fn dns_node_dependency_removed_by_platform_gate_rejects_generation() {
+    use crate::user_config::dns_policy::DnsServerResource;
+    let mut config = base_config();
+    config.servers.push(ServerConfig {
+        id: "naive-dns".into(), name: "Naive DNS".into(), protocol: Protocol::Naive,
+        address: "proxy.example".into(), port: 443,
+        username: Some("user".into()), password: Some("password".into()),
+        ..Default::default()
+    });
+    config.dns_servers.push(serde_json::from_value::<DnsServerResource>(serde_json::json!({
+        "id":"private-dns", "name":"Private", "enabled":true, "type":"udp",
+        "endpoint":{"host":"10.0.0.53"}, "outbound":{"type":"node","nodeId":"naive-dns"}
+    })).unwrap());
+    let mut deps = deps_default();
+    deps.has_cronet = false;
+    let error = generate_sing_box_config(&config, &BTreeMap::new(), &deps).unwrap_err();
+    assert!(error.contains("DNS"));
+    assert!(error.contains("Naive DNS"));
+}
+
+#[test]
+fn default_native_auto_does_not_validate_or_route_by_stale_concrete_seed() {
+    use crate::user_config::auto_select::{AutoSelectTarget, SelectionIntent, wrapper_tag};
+    let mut config = base_config();
+    config.auto_select_enabled = true;
+    config.interrupt_connections_on_switch = Some(true);
+    config.selection_intent = Some(SelectionIntent { mode: "auto".into(), target: AutoSelectTarget::Global });
+    for saved in [None, Some("missing"), Some("__direct__"), Some("__block__")] {
+        config.selected_server_id = saved.map(str::to_owned);
+        let generated = generate_sing_box_config_with_report(&config, &BTreeMap::new(), &deps_default()).unwrap();
+        let selector = generated.config.outbounds.iter().find(|o| o.tag == "proxy-selector").unwrap();
+        assert_eq!(selector.default.as_deref(), Some(wrapper_tag(&AutoSelectTarget::Global).as_str()));
+        assert_eq!(selector.interrupt_exist_connections, Some(false));
+        assert!(!crate::builder::route::mesh_selected_exit_falls_back_to_direct(&config));
     }
 }

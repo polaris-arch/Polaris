@@ -347,6 +347,16 @@ pub struct ProxyMarkerData {
     pub exact_apply_base: Option<ProxyTransactionSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub exact_applied: Option<ProxyTransactionSnapshot>,
+    /// Exact state observed before restoration began. A partial apply is not the full applied
+    /// snapshot; persist this anchor before the first restore write so retries retain ownership.
+    /// In Applying it anchors immediate rollback to exact_apply_base; in Restoring it anchors
+    /// final recovery to exact_original. The phase and replacement anchor commit together.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exact_restore_base: Option<ProxyTransactionSnapshot>,
+    /// Previous Owned marker's persisted applied snapshot, never the fresh replacement capture.
+    /// Permits absent-original macOS protocol removal after a replacement returns to prior ownership.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exact_prior_applied: Option<ProxyTransactionSnapshot>,
     /// enable 前的原始代理快照（关机跨会话恢复用；Linux 写入，Win/macOS 可选）。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub original_settings: Option<SystemProxyStatus>,
@@ -356,7 +366,9 @@ pub struct ProxyMarkerData {
 }
 
 /// 当前版本唯一支持的精确系统代理 mutation plan。
-pub const PROXY_TRANSACTION_PLAN_VERSION: u32 = 1;
+// Plan 2 journals rollback/recovery origins. Old readers must refuse these markers
+// rather than ignore the anchor and clear a legitimate partial-rollback transaction.
+pub const PROXY_TRANSACTION_PLAN_VERSION: u32 = 2;
 
 const PROXY_TRANSACTION_ENVELOPE_KEY: &str = "systemProxyTxnV2";
 
@@ -848,6 +860,8 @@ fn current_marker(
         exact_original: Some(original),
         exact_apply_base: Some(apply_base),
         exact_applied: Some(applied),
+        exact_restore_base: None,
+        exact_prior_applied: None,
     }
 }
 
@@ -886,6 +900,8 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
             exact_original: None,
             exact_apply_base: None,
             exact_applied: None,
+            exact_restore_base: None,
+            exact_prior_applied: None,
             original_settings: original.and_then(|snapshot| snapshot.fallback.clone()),
             mac_service_settings: original
                 .map(|snapshot| snapshot.mac_services.clone())
@@ -979,6 +995,13 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
         {
             return ProxyMarkerReplaceOutcome::Mismatch;
         }
+        // Preserve the prior writer's persisted authority, never promote apply_base capture.
+        // Plan-one snapshots may predate the replacement PAC guard; do not infer provenance.
+        let prior_applied = if current.plan_version == PROXY_TRANSACTION_PLAN_VERSION {
+            current.exact_applied.clone()
+        } else {
+            None
+        };
         let Some(exact_original) = current.exact_original else {
             return ProxyMarkerReplaceOutcome::Mismatch;
         };
@@ -992,18 +1015,74 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
         {
             return ProxyMarkerReplaceOutcome::Mismatch;
         }
-        let replacement = current_marker(
+        let mut replacement = current_marker(
             our_host_port,
             exact_original,
             apply_base.clone(),
             applied.clone(),
         );
+        replacement.exact_prior_applied = prior_applied;
         if self.write_json_unlocked(&ProxyMarkerEnvelope {
             system_proxy_txn_v2: &replacement,
         }) {
             ProxyMarkerReplaceOutcome::Replaced(Box::new(replacement))
         } else {
             ProxyMarkerReplaceOutcome::PersistFailed
+        }
+    }
+
+    /// Persist the actual restore start together with the phase, before any OS write.
+    pub fn begin_restore(
+        &self,
+        txn_id: &str,
+        expected: ProxyMarkerPhase,
+        restore_base: &ProxyTransactionSnapshot,
+    ) -> ProxyMarkerMutationOutcome {
+        self.record_restore_start(txn_id, expected, ProxyMarkerPhase::Restoring, restore_base)
+    }
+
+    /// Keep Applying while journaling immediate rollback to the existing apply_base.
+    pub fn begin_apply_rollback(
+        &self,
+        txn_id: &str,
+        restore_base: &ProxyTransactionSnapshot,
+    ) -> ProxyMarkerMutationOutcome {
+        self.record_restore_start(
+            txn_id, ProxyMarkerPhase::Applying, ProxyMarkerPhase::Applying, restore_base,
+        )
+    }
+
+    fn record_restore_start(
+        &self,
+        txn_id: &str,
+        expected: ProxyMarkerPhase,
+        next: ProxyMarkerPhase,
+        restore_base: &ProxyTransactionSnapshot,
+    ) -> ProxyMarkerMutationOutcome {
+        let _process_guard = lock_marker_mutation();
+        let Ok(_storage_guard) = self.fs.acquire_marker_mutation_lock(&self.path) else {
+            return ProxyMarkerMutationOutcome::PersistFailed;
+        };
+        let ProxyMarkerRead::CurrentValidated(mut current) = self.read_checked_unlocked() else {
+            return ProxyMarkerMutationOutcome::Mismatch;
+        };
+        if current.txn_id.as_deref() != Some(txn_id)
+            || current.phase != expected
+            || !matches!(expected, ProxyMarkerPhase::Applying | ProxyMarkerPhase::Owned)
+            || !valid_transaction_snapshot(restore_base)
+            || !current.exact_original.as_ref().is_some_and(|original| {
+                valid_transaction_snapshot_pair(original, restore_base)
+            })
+        {
+            return ProxyMarkerMutationOutcome::Mismatch;
+        }
+        current.exact_restore_base = Some(restore_base.clone());
+        current.plan_version = PROXY_TRANSACTION_PLAN_VERSION;
+        current.phase = next;
+        if self.write_json_unlocked(&ProxyMarkerEnvelope { system_proxy_txn_v2: &current }) {
+            ProxyMarkerMutationOutcome::Updated
+        } else {
+            ProxyMarkerMutationOutcome::PersistFailed
         }
     }
 
@@ -1033,6 +1112,9 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
                     ProxyMarkerPhase::RestoredPendingClear
                 )
         ) {
+            return ProxyMarkerMutationOutcome::Mismatch;
+        }
+        if next == ProxyMarkerPhase::Owned && current.exact_restore_base.is_some() {
             return ProxyMarkerMutationOutcome::Mismatch;
         }
         current.phase = next;
@@ -1108,7 +1190,7 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
             return ProxyMarkerRead::Invalid("marker root is not an object".into());
         };
         let Some(enveloped) = root.get(PROXY_TRANSACTION_ENVELOPE_KEY) else {
-            if ["exact_original", "exact_apply_base", "exact_applied"]
+            if ["exact_original", "exact_apply_base", "exact_applied", "exact_restore_base", "exact_prior_applied"]
                 .iter()
                 .any(|key| root.contains_key(*key))
             {
@@ -1129,6 +1211,8 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
                 && data.exact_original.is_none()
                 && data.exact_apply_base.is_none()
                 && data.exact_applied.is_none()
+                && data.exact_restore_base.is_none()
+                && data.exact_prior_applied.is_none()
             {
                 ProxyMarkerRead::Legacy(data)
             } else {
@@ -1150,7 +1234,7 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
         if data.our_host_port.is_empty() {
             return ProxyMarkerRead::Invalid("marker our_host_port is empty".into());
         }
-        if data.plan_version != PROXY_TRANSACTION_PLAN_VERSION {
+        if data.plan_version != 1 && data.plan_version != PROXY_TRANSACTION_PLAN_VERSION {
             return ProxyMarkerRead::UnsupportedVersion(data.plan_version);
         }
         let has_all_v2_fields = [
@@ -1195,6 +1279,27 @@ impl<Fs: MarkerFs> ProxyMarker<Fs> {
             )
         {
             return ProxyMarkerRead::Invalid("current marker snapshot platform mismatch".into());
+        }
+        if let Some(prior) = &data.exact_prior_applied {
+            if data.plan_version != PROXY_TRANSACTION_PLAN_VERSION
+                || !valid_transaction_snapshot(prior)
+                || !valid_transaction_snapshot_pair(
+                    data.exact_apply_base.as_ref().expect("checked"), prior,
+                )
+            {
+                return ProxyMarkerRead::Invalid("invalid prior applied authority".into());
+            }
+        }
+        if let Some(restore_base) = &data.exact_restore_base {
+            if data.plan_version != PROXY_TRANSACTION_PLAN_VERSION
+                || !matches!(data.phase, ProxyMarkerPhase::Applying | ProxyMarkerPhase::Restoring | ProxyMarkerPhase::RestoredPendingClear)
+                || !valid_transaction_snapshot(restore_base)
+                || !valid_transaction_snapshot_pair(
+                    data.exact_original.as_ref().expect("checked"), restore_base,
+                )
+            {
+                return ProxyMarkerRead::Invalid("invalid exact restore anchor".into());
+            }
         }
         let projection_matches = [
             (&data.original, &data.exact_original),

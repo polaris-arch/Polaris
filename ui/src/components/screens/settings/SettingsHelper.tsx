@@ -14,13 +14,15 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { helperApi, type HelperActionErrorCode } from '@/ipc/api-client';
+import { helperApi, type HelperActionErrorCode, type HelperInstallMode } from '@/ipc/api-client';
 import { useNavStore } from '@/store/nav-store';
 import { toast } from '@/lib/error-handler';
 import type { HelperStatus } from '@/contracts/types/runtime';
 import { Phead, SetBlock, SetRow, Pill, Dot, Button, Spinner } from './Primitives';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { helperActionErrorText } from '@/domain/action-error-text';
+import { useDialogStore } from '@/components/dialogs/dialog-store';
+import { shellPlatformFromDataOs } from './settings-logic';
 
 /** 本页唯一的原地二次确认项（原型 :4234 `helper-uninstall`）。 */
 const UNINSTALL_KEY = 'helper-uninstall';
@@ -64,6 +66,8 @@ export default function SettingsHelper() {
   const [busy, setBusy] = useState(false);
   const [installFailure, setInstallFailure] = useState<HelperActionErrorCode | null>(null);
   const cleanupPending = useRef(false);
+  const installInFlight = useRef(false);
+  const migrationConfirmation = useRef<string | null>(null);
   const { armed, confirmTwice } = useConfirmTwice();
   const confirmingUninstall = armed === UNINSTALL_KEY;
 
@@ -89,7 +93,13 @@ export default function SettingsHelper() {
         })
         .catch(() => undefined);
     });
-    return off;
+    return () => {
+      off();
+      if (migrationConfirmation.current) {
+        useDialogStore.getState().closeInstance(migrationConfirmation.current);
+        migrationConfirmation.current = null;
+      }
+    };
   }, []);
 
   /**
@@ -102,11 +112,21 @@ export default function SettingsHelper() {
   }
 
   /** 安装/升级/修复共用（三态按钮都指向它）。 */
-  async function install() {
+  function install() {
+    return runInstall();
+  }
+
+  async function runInstall(mode?: HelperInstallMode) {
+    if (installInFlight.current) return;
+    installInFlight.current = true;
+    if (migrationConfirmation.current) {
+      useDialogStore.getState().closeInstance(migrationConfirmation.current);
+      migrationConfirmation.current = null;
+    }
     setBusy(true);
     setInstallFailure(null);
     try {
-      const r = await helperApi.install();
+      const r = mode === undefined ? await helperApi.install() : await helperApi.install(mode);
       if (r.success) cleanupPending.current = false;
       setStatus(r.status);
       setState(deriveState(r.status, cleanupPending.current));
@@ -121,8 +141,36 @@ export default function SettingsHelper() {
       setInstallFailure('failed');
       reportFailure(t('helper.installFail'));
     } finally {
+      installInFlight.current = false;
       setBusy(false);
     }
+  }
+
+  // This is a separate explicit action. An ordinary install failure never selects it.
+  function stopAndUpgrade() {
+    if (busy || installInFlight.current || shellPlatformFromDataOs() !== 'mac' || installFailure !== 'upgradeDeferred') return;
+    const dialogs = useDialogStore.getState();
+    if (migrationConfirmation.current && dialogs.hasInstance(migrationConfirmation.current)) return;
+    const instanceId = dialogs.open({
+      kind: 'confirm',
+      payload: {
+        title: t('helper.stopAndUpgradeTitle'),
+        message: t('helper.stopAndUpgradeWarning'),
+        confirmLabel: t('helper.stopAndUpgradeConfirm'),
+        danger: true,
+        onCancel: () => {
+          if (migrationConfirmation.current === instanceId) migrationConfirmation.current = null;
+        },
+        onConfirm: () => {
+          if (migrationConfirmation.current !== instanceId || !useDialogStore.getState().hasInstance(instanceId)) return;
+          useDialogStore.getState().closeInstance(instanceId);
+          migrationConfirmation.current = null;
+          if (shellPlatformFromDataOs() !== 'mac' || installInFlight.current) return;
+          void runInstall('stopAndUpgrade');
+        },
+      },
+    });
+    migrationConfirmation.current = instanceId;
   }
 
   /**
@@ -228,6 +276,11 @@ export default function SettingsHelper() {
               <b>{t('helper.installFail')}</b>
               <p>{helperActionErrorText(installFailure, t)}</p>
               <p>{t('helper.failureNextStep')}</p>
+              {shellPlatformFromDataOs() === 'mac' && installFailure === 'upgradeDeferred' && (
+                <Button variant="ghost" size="sm" disabled={busy} onClick={stopAndUpgrade}>
+                  {t('helper.stopAndUpgradeAction')}
+                </Button>
+              )}
               <Button variant="ghost" size="sm" onClick={() => useNavStore.getState().navigate('logs')}>
                 {t('helper.viewLogsAction')}
               </Button>

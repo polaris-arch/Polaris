@@ -7,6 +7,12 @@ import type { Rule, RuleResourceDeleteResult, RuleResourceListItem, RuleResource
 // ============================================================================
 
 export const rulesApi = {
+  validateRegex(patterns: readonly string[]): Promise<(boolean | null)[]> {
+    return invoke(IPC_CHANNELS.RULES_VALIDATE_REGEX, { patterns });
+  },
+  previewRegex(patterns: readonly string[], input: string): Promise<(boolean | null)[]> {
+    return invoke(IPC_CHANNELS.RULES_PREVIEW_REGEX, { patterns, input });
+  },
   async add(rule: Omit<Rule, 'id'>, plane: 'route' | 'dns'): Promise<Rule> {
     return invoke(IPC_CHANNELS.RULES_ADD, { rule, plane });
   },

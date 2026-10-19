@@ -1,12 +1,16 @@
+import { useAppStore } from '@/store/app-store';
+import { useStagedConfigStore } from '@/store/staged-config-store';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const ipc = vi.hoisted(() => ({
   add: vi.fn(),
+  update: vi.fn(),
   reorder: vi.fn(),
+  validateRegex: vi.fn(),
 }));
 vi.mock('@/ipc', async (importOriginal) => {
   const real = await importOriginal<typeof import('@/ipc')>();
-  return { ...real, api: { ...real.api, rules: { ...real.api.rules, add: ipc.add, reorder: ipc.reorder } } };
+  return { ...real, api: { ...real.api, rules: { ...real.api.rules, add: ipc.add, update: ipc.update, reorder: ipc.reorder, validateRegex: ipc.validateRegex } } };
 });
 vi.mock('@/lib/error-handler', () => ({ toast: { error: vi.fn(), success: vi.fn(), info: vi.fn() } }));
 import type { TFunction } from 'i18next';
@@ -62,6 +66,8 @@ const base: Rule = {
   networkProfileId: 'np-corp',
   effects: { route: { action: 'direct' } },
 };
+
+beforeEach(() => { ipc.validateRegex.mockReset().mockImplementation(async (patterns: string[]) => patterns.map(() => true)); useAppStore.setState({ rules: [base], dnsRules: [base], proxyStarting: true, proxyStopping: false }); useStagedConfigStore.setState({ enabled: true, entries: [] }); });
 
 describe('submitRule · networkProfileId', () => {
   it('新建：选了场景 ⇒ 写入；任何网络 ⇒ 不写这个键', async () => {
@@ -183,6 +189,7 @@ describe('submitRule typed regex values', () => {
     await submitRule(create.a);
     const saved = create.staged[0].nextValue as Rule;
     expect(saved.values).toEqual(values);
+    useAppStore.setState({ rules: [saved], dnsRules: [saved] });
     const edit = args({ initialPlane, isEdit: true, base: saved, conds: [{ t: 'domainRegex', v: formatConditionValues(saved.type, saved.values) }] });
     await submitRule(edit.a);
     expect((edit.staged[0].nextValue as Rule).values).toEqual(values);
@@ -192,4 +199,179 @@ describe('submitRule typed regex values', () => {
     await submitRule(create.a);
     expect((create.staged[0].nextValue as Rule).values).toEqual(['A.example', 'b.example', 'c.example']);
   });
+});
+
+describe('submitRule · independent native Auto references', () => {
+  it.each(['global', 'manual', 'mesh'])('persists %s without a synthetic node id', async (scope) => {
+    const { a, staged } = args({ target: `auto:${scope}` });
+    await submitRule(a);
+    const rule = staged[0].nextValue as Rule;
+    expect(rule.targetAutoSelect).toEqual({ scope });
+    expect(rule.effects?.route?.targetAutoSelect).toEqual({ scope });
+    expect(rule.targetServerId).toBeUndefined();
+    expect(rule.effects?.route?.targetServerId).toBeUndefined();
+  });
+  it('keeps each subscription reference separate and restores a manual target on edit', async () => {
+    for (const subscriptionId of ['A / 香港', 'D']) {
+      const { a, staged } = args({ target: `auto:subscription:${encodeURIComponent(subscriptionId)}` });
+      await submitRule(a);
+      expect((staged[0].nextValue as Rule).targetAutoSelect).toEqual({ scope: 'subscription', subscriptionId });
+    }
+    const { a, staged } = args({ target: 'node:manual-node', isEdit: true, base: { ...base, targetAutoSelect: { scope: 'global' }, effects: { route: { action: 'proxy', targetAutoSelect: { scope: 'global' } } } } });
+    useAppStore.setState({ rules: [a.base!] });
+    await submitRule(a);
+    const rule = staged[0].nextValue as Rule;
+    expect(rule.targetServerId).toBe('manual-node');
+    expect(rule.targetAutoSelect).toBeUndefined();
+    expect(rule.effects?.route?.targetAutoSelect).toBeUndefined();
+  });
+});
+
+describe('rule editor original entity admission', () => {
+  it.each([true, false])('refuses changed or removed edits without creating/replacing (staged=%s)', async stagingEnabled => {
+    for (const rules of [[], [{ ...base, remarks: 'changed elsewhere' }]]) {
+      useAppStore.setState({ rules });
+      ipc.add.mockClear();
+      const x = args({ isEdit: true, base, stagingEnabled });
+      await submitRule(x.a);
+      expect(x.staged).toEqual([]);
+      expect(ipc.add).not.toHaveBeenCalled();
+    }
+  });
+  it('missing initial edit never turns into creation', async () => {
+    const x = args({ isEdit: true, base: undefined });
+    ipc.add.mockClear();
+    await submitRule(x.a);
+    expect(x.staged).toEqual([]);
+    expect(ipc.add).not.toHaveBeenCalled();
+  });
+  it('unrelated entity changes do not invalidate this edit', async () => {
+    useAppStore.setState({ rules: [base, { ...base, id: 'other', remarks: 'changed' }] });
+    const x = args({ isEdit: true, base });
+    await submitRule(x.a);
+    expect(x.staged).toHaveLength(1);
+  });
+});
+
+ it('direct edit passes the original entity to native CAS', async () => {
+   ipc.update.mockResolvedValue(undefined);
+   const { a } = args({ isEdit: true, base, stagingEnabled: false });
+   await submitRule(a);
+   expect(ipc.update).toHaveBeenLastCalledWith(expect.objectContaining({ id: base.id }), 'route', base);
+ });
+
+
+describe('authoritative regex admission before staged or direct save', () => {
+  it.each(['[', '(', '*', '\\'])('rejects native invalid syntax verdict for %s before staging', async pattern => {
+    ipc.validateRegex.mockResolvedValueOnce([false]);
+    const request = args({ conds: [{ t: 'domainRegex', v: pattern }] });
+    await submitRule(request.a);
+    expect(ipc.validateRegex).toHaveBeenLastCalledWith([pattern]);
+    expect(request.staged).toHaveLength(0);
+  });
+  it('preserves a valid Go expression even when matching preview would be unknown', async () => {
+    const pattern = String.raw`\Q[a]+\E`;
+    ipc.validateRegex.mockResolvedValueOnce([true]);
+    const request = args({ conds: [{ t: 'domainRegex', v: pattern }] });
+    await submitRule(request.a);
+    expect((request.staged[0].nextValue as Rule).values).toEqual([pattern]);
+  });
+  it('cannot stage after input ownership expires during native admission', async () => {
+    let resolve!: (values: boolean[]) => void;
+    ipc.validateRegex.mockImplementationOnce(() => new Promise<boolean[]>(done => { resolve = done; }));
+    let current = true;
+    const request = args({ conds: [{ t: 'domainRegex', v: 'example' }], isCurrent: () => current });
+    const operation = submitRule(request.a);
+    current = false;
+    resolve([true]);
+    await operation;
+    expect(request.staged).toHaveLength(0);
+  });
+  it('rejects a missing native verdict instead of treating it as success', async () => {
+    ipc.validateRegex.mockResolvedValueOnce([]);
+    const request = args({ conds: [{ t: 'domainRegex', v: 'example' }] });
+    await submitRule(request.a);
+    expect(request.staged).toHaveLength(0);
+  });
+});
+
+it('independent: reports a dispatched write failure even after input ownership changes', async () => {
+  const { toast } = await import('@/lib/error-handler');
+  vi.mocked(toast.error).mockClear();
+  let reject!: (e: Error) => void;
+  ipc.add.mockImplementationOnce(() => new Promise((_resolve, no) => { reject = no; }));
+  let current = true;
+  const request = args({ stagingEnabled: false, isCurrent: () => current });
+  const operation = submitRule(request.a);
+  expect(ipc.add).toHaveBeenCalled();
+  current = false; // still-mounted editable form changed while native write is in flight
+  reject(new Error('DISK_WRITE_FAILED'));
+  await operation;
+  expect(toast.error).toHaveBeenCalled();
+});
+
+it('independent: does not use pre-await direct route after the core starts', async () => {
+  let resolve!: (v: boolean[]) => void;
+  ipc.validateRegex.mockImplementationOnce(() => new Promise<boolean[]>(yes => { resolve = yes; }));
+  ipc.add.mockClear().mockResolvedValue({ id: 'new' });
+  useStagedConfigStore.setState({ enabled: true, entries: [] });
+  useAppStore.setState({ proxyStarting: false, proxyStopping: false, proxyStatus: undefined });
+  const request = args({ stagingEnabled: false, conds: [{ t: 'domainRegex', v: 'example' }] });
+  const operation = submitRule(request.a);
+  useAppStore.setState({ proxyStarting: true });
+  resolve([true]);
+  await operation;
+  expect(ipc.add).not.toHaveBeenCalled();
+});
+
+it.each(['stopping', 'entries'] as const)('rechecks staging after %s changes during admission', async change => {
+  let resolve!: (v: boolean[]) => void;
+  ipc.validateRegex.mockImplementationOnce(() => new Promise<boolean[]>(yes => { resolve = yes; }));
+  ipc.add.mockClear();
+  useStagedConfigStore.setState({ enabled: true, entries: [] });
+  useAppStore.setState({ proxyStarting: false, proxyStopping: false, proxyStatus: undefined });
+  const request = args({ stagingEnabled: false, conds: [{ t: 'domainRegex', v: 'example' }] });
+  const operation = submitRule(request.a);
+  if (change === 'stopping') useAppStore.setState({ proxyStopping: true });
+  else useStagedConfigStore.setState({ entries: [{ id: 'other', kind: 'rule', label: 'other', entityPath: ['trafficRules', 'other'], nextValue: base }] });
+  resolve([true]);
+  await operation;
+  expect(ipc.add).not.toHaveBeenCalled();
+  expect(request.staged).toHaveLength(1);
+});
+it('unavailable syntax is actionable and distinct from invalid', async () => {
+  const { toast } = await import('@/lib/error-handler');
+  vi.mocked(toast.error).mockClear();
+  ipc.validateRegex.mockResolvedValueOnce([null]);
+  const request = args({ conds: [{ t: 'domainRegex', v: 'example' }] });
+  await submitRule(request.a);
+  expect(request.staged).toHaveLength(0);
+  expect(toast.error).toHaveBeenCalledWith('rules.syntaxUnavailable');
+});
+it('unchanged legacy expression does not require a checker for metadata editing', async () => {
+  const saved = { ...base, type: 'domainRegex' as const, values: [String.raw`\p{ASCII}`] };
+  useAppStore.setState({ rules: [saved] });
+  ipc.validateRegex.mockClear();
+  const request = args({ isEdit: true, base: saved, name: 'new label', conds: [{ t: 'domainRegex', v: saved.values[0] }] });
+  await submitRule(request.a);
+  expect(ipc.validateRegex).not.toHaveBeenCalled();
+  expect((request.staged[0].nextValue as Rule).values).toEqual(saved.values);
+});
+
+it('preserves an unchanged 1025-byte legacy expression when renaming', async () => {
+  const saved = { ...base, type: 'domainRegex' as const, values: ['a'.repeat(1025)] };
+  useAppStore.setState({ rules: [saved] });
+  ipc.validateRegex.mockClear();
+  const request = args({ isEdit: true, base: saved, name: 'new label', conds: [{ t: 'domainRegex', v: saved.values[0] }] });
+  await submitRule(request.a);
+  expect(ipc.validateRegex).not.toHaveBeenCalled();
+  expect(request.staged).toHaveLength(1);
+  expect((request.staged[0].nextValue as Rule).values).toEqual(saved.values);
+});
+it.each([false, true])('rejects a new oversized expression before checking (edit=%s)', async isEdit => {
+  ipc.validateRegex.mockClear();
+  const request = args({ isEdit, base: isEdit ? base : undefined, conds: [{ t: 'domainRegex', v: 'a'.repeat(1025) }] });
+  await submitRule(request.a);
+  expect(ipc.validateRegex).not.toHaveBeenCalled();
+  expect(request.staged).toHaveLength(0);
 });

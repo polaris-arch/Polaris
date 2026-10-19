@@ -98,6 +98,7 @@ impl CheckIo for NativeIo {}
 #[derive(Default)]
 struct OutputCapture {
     max_bytes: Option<usize>,
+    strict_utf8: bool,
     stdout: Mutex<Vec<u8>>,
     stderr: Mutex<Vec<u8>>,
     errors: Mutex<Vec<String>>,
@@ -148,10 +149,10 @@ impl OutputCapture {
                 }
                 if overflow {
                     if let Ok(mut errors) = output.errors.lock() {
-                        errors.push("TLS capability output exceeds budget".into());
+                        errors.push("validation output exceeds retained-byte budget (remaining bytes drained)".into());
                     }
                 }
-                if output.max_bytes.is_some() && std::str::from_utf8(&bytes).is_err() {
+                if output.strict_utf8 && std::str::from_utf8(&bytes).is_err() {
                     if let Ok(mut errors) = output.errors.lock() {
                         errors.push("TLS capability output is not UTF-8".into());
                     }
@@ -810,7 +811,12 @@ impl CheckCustody {
             options.mode(0o600);
         }
         let output = Arc::new(OutputCapture {
-            max_bytes: config.is_none().then_some(64 * 1024),
+            max_bytes: Some(if config.is_none() {
+                64 * 1024
+            } else {
+                256 * 1024
+            }),
+            strict_utf8: config.is_none(),
             ..OutputCapture::default()
         });
         let run = CheckRun {

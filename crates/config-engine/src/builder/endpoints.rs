@@ -177,10 +177,10 @@ pub fn build_masque_endpoint(
         fragment: None,
         certificate_sha256: crate::user_config::tls_pin::cert_pins_for_kernel(
             tls.and_then(|t| t.certificate_sha256.as_deref()),
-        ),
+        )?,
         certificate_public_key_sha256: crate::user_config::tls_pin::cert_pins_for_kernel(
             tls.and_then(|t| t.certificate_public_key_sha256.as_deref()),
-        ),
+        )?,
     };
     if let Ok(v) = serde_json::to_value(tls) {
         extra.insert("tls".into(), v);

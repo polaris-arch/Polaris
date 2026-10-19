@@ -252,7 +252,8 @@ describe('覆盖提示', () => {
     ];
     expect(analyzeRuleCoverage(rules, domain('www.example.com')).firstId).toBe('domain');
     expect(analyzeRuleCoverage(rules, ip('1.1.1.1')).firstId).toBe('ip');
-    expect(analyzeRuleCoverage(rules, process('CURL')).firstId).toBe('proc');
+    expect(analyzeRuleCoverage(rules, process('CURL')).firstId).toBeNull();
+    expect(analyzeRuleCoverage(rules, process('curl')).firstId).toBe('proc');
   });
 
   it('跨维度 AND 信息不足时不谎报覆盖；更靠前的已知命中才算遮蔽', () => {
@@ -316,4 +317,10 @@ it('append refuses a stale picker snapshot after concurrent condition, metadata 
   expect(appendSubjectToRule({ ...original, values: ['other.example'] }, target, subject)).toBeNull();
   expect(appendSubjectToRule({ ...original, id: 'replacement' }, target, subject)).toBeNull();
   expect(appendSubjectToRule(original, ruleAppendTargets([original], subject)[0], subject)).not.toBeNull();
+});
+
+it('does not claim network-scoped or DNS-only rules shadow a connection', () => {
+  const scoped = rule({id:'scoped', networkProfileId:'unknown-network'});
+  const dnsOnly = rule({id:'dns', effects:{dns:{resolver:'proxy',answerMode:'real'}}});
+  expect(analyzeRuleCoverage([scoped, dnsOnly], domain('example.com')).firstId).toBeNull();
 });

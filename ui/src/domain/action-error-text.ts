@@ -9,7 +9,7 @@ export function helperActionErrorText(
 ): string {
   switch (code) {
     case 'cancelled': return t('helper.actionError.cancelled');
-    case 'authorizationUnavailable': return t('helper.actionError.authorizationUnavailable');
+    case 'authorizationIncomplete': return t('helper.actionError.authorizationIncomplete');
     case 'partialCleanup': return t('helper.actionError.partialCleanup');
     case 'proxyRunning': return t('helper.actionError.proxyRunning');
     case 'unsupported': return t('helper.actionError.unsupported');
@@ -51,8 +51,21 @@ export function serverSwitchErrorText(
   code: string | null | undefined,
   t: Translate,
 ): string {
+  if (code === 'SERVER_SWITCH_READBACK_FAILED') return t('autoSelect.error.SERVER_SWITCH_READBACK_FAILED');
+  if (code === 'serverIdentityAmbiguous') return t('identityRepair.ambiguous');
   if (code === 'OUTBOUND_INTERFACE_UNAVAILABLE') {
     return t('home.outboundInterfaceUnavailable');
   }
   return t('home.switchError');
+}
+
+/** Configuration validation failures use stable codes, never arbitrary backend messages. */
+export function configSaveErrorText(error: unknown, t: Translate): string {
+  const code = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
+  return t(code === 'DNS_DEPENDENCY_INVALID' ? 'errors.dnsDependencyInvalid' : 'common.saveFailed');
+}
+
+/** Read only structured codes; native diagnostics may contain private node details. */
+export function serverSwitchErrorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : undefined;
 }

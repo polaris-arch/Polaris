@@ -465,139 +465,43 @@ fn status_needs_repair_when_proto_below_min_usable() {
     assert!(status.needs_repair);
 }
 
-// ── W20：status_with_recovery（「装了但停着」分型拉起，Windows 手杀 helper 的自愈腿）──
-
-/// Win 分身：注册 + 二进制在 + token 在 + 停着 + ping 挂 → 拉起一次 + 复核 ready。
-/// 变异锁：删恢复腿 / 删 is_loaded 分型 / 拉起后不复核，本条或下两条之一必转红。
-/// （is_installed 2026-08-20 起按 Platform 键控证据集：Win 平台在任何宿主都走 SCM 单证据，
-/// 故本组测试宿主无关地驱动完整恢复逻辑。）
+// Passive status must never race an administrator transaction by restarting
+// a stopped service. All desktop platforms return repair-needed instead.
 #[test]
-fn recovery_pulls_up_stopped_service_and_becomes_ready() {
-    let paths = InstallPaths::win();
-    let start_calls = Arc::new(Mutex::new(Vec::new()));
-    let mut sysops = MockSysOps::default();
-    sysops
-        .registered_services
-        .insert(paths.service_label.to_owned());
-    sysops.start_calls = start_calls.clone();
-    let (m, _dir) = manager_with_token(Platform::Win, sysops);
-    // 第一次 ping 挂（broken 流）→ 拉起后复核 ping 通（pong 流）。
-    let connector = MockConnector {
-        streams: Arc::new(Mutex::new(vec![
-            MockStream::broken(std::io::ErrorKind::ConnectionAborted),
-            MockStream::with_response(current_pong_wire()),
-        ])),
-    };
-    let client = HelperClient::new(Box::new(connector), Platform::Win, "TOK");
-    let status = m.status_with_recovery_poll(&client, 3, Duration::from_millis(1));
-    assert_eq!(
-        *start_calls.lock().unwrap(),
-        vec![paths.service_label.to_owned()]
-    );
-    assert!(status.installed);
-    assert!(status.ready, "拉起后复核应就绪");
-    assert!(!status.needs_repair);
-    assert_eq!(
-        status.version,
-        Some(polaris_helper_proto::proto_version::CURRENT)
-    );
-}
-
-/// 分型：跑着（is_loaded）仍 ping 不通 = 结构性问题 → 不拉服务，交回修复流。
-#[test]
-fn recovery_skips_start_when_running_but_unreachable() {
-    let paths = InstallPaths::win();
-    let start_calls = Arc::new(Mutex::new(Vec::new()));
-    let mut sysops = MockSysOps::default();
-    sysops
-        .registered_services
-        .insert(paths.service_label.to_owned());
-    sysops.loaded = true;
-    sysops.start_calls = start_calls.clone();
-    let (m, _dir) = manager_with_token(Platform::Win, sysops);
-    let connector = MockConnector {
-        streams: Arc::new(Mutex::new(vec![MockStream::broken(
-            std::io::ErrorKind::ConnectionAborted,
-        )])),
-    };
-    let client = HelperClient::new(Box::new(connector), Platform::Win, "TOK");
-    let status = m.status_with_recovery_poll(&client, 2, Duration::from_millis(1));
-    assert!(
-        start_calls.lock().unwrap().is_empty(),
-        "跑着仍不通是结构问题，拉服务是误动作"
-    );
-    assert!(status.needs_repair);
-}
-
-/// 分型：token 缺失 → 拉起也过不了鉴权，不白拉。
-#[test]
-fn recovery_skips_start_when_token_missing() {
-    let paths = InstallPaths::win();
-    let start_calls = Arc::new(Mutex::new(Vec::new()));
-    let mut sysops = MockSysOps::default();
-    sysops
-        .registered_services
-        .insert(paths.service_label.to_owned());
-    sysops.start_calls = start_calls.clone();
-    let m = manager(Platform::Win, sysops); // 不写 token
-    let connector = MockConnector {
-        streams: Arc::new(Mutex::new(vec![MockStream::broken(
-            std::io::ErrorKind::ConnectionAborted,
-        )])),
-    };
-    let client = HelperClient::new(Box::new(connector), Platform::Win, "");
-    let status = m.status_with_recovery_poll(&client, 2, Duration::from_millis(1));
-    assert!(start_calls.lock().unwrap().is_empty(), "无 token 不白拉");
-    assert!(status.needs_repair);
-}
-
-/// 拉起失败（二进制被删 / DACL 无 SERVICE_START）→ 如实维持 needs_repair，不粉饰。
-///
-/// 预置一条 pong 流作「诱饵」：正确的失败路径**不该消费它**（start Err 即返，不轮询）；
-/// 若有人把 start 失败吞成 Ok（或删掉 MockSysOps 的失败旋钮），轮询会吃到 pong 变 ready，
-/// 本条转红——否则它会退化成与 never_binds 用例不可区分的弱断言（变异电池 M9 实证）。
-#[test]
-fn recovery_maintains_repair_when_start_fails() {
-    let paths = InstallPaths::win();
-    let start_calls = Arc::new(Mutex::new(Vec::new()));
-    let mut sysops = MockSysOps::default();
-    sysops
-        .registered_services
-        .insert(paths.service_label.to_owned());
-    sysops.start_fails = true;
-    sysops.start_calls = start_calls.clone();
-    let (m, _dir) = manager_with_token(Platform::Win, sysops);
-    let connector = MockConnector {
-        streams: Arc::new(Mutex::new(vec![
-            MockStream::broken(std::io::ErrorKind::ConnectionAborted),
-            MockStream::with_response(current_pong_wire()),
-        ])),
-    };
-    let client = HelperClient::new(Box::new(connector), Platform::Win, "TOK");
-    let status = m.status_with_recovery_poll(&client, 2, Duration::from_millis(1));
-    assert_eq!(start_calls.lock().unwrap().len(), 1, "确实试拉了一次");
-    assert!(status.needs_repair, "拉不起 = 真坏，该修不该粉饰");
-}
-
-/// 拉起成功但管道始终不绑（如起即崩）→ 轮询耗尽后维持 needs_repair。
-#[test]
-fn recovery_maintains_repair_when_service_never_binds() {
-    let paths = InstallPaths::win();
-    let mut sysops = MockSysOps::default();
-    sysops
-        .registered_services
-        .insert(paths.service_label.to_owned());
-    let (m, _dir) = manager_with_token(Platform::Win, sysops);
-    let connector = MockConnector {
-        streams: Arc::new(Mutex::new(vec![
-            MockStream::broken(std::io::ErrorKind::ConnectionAborted),
-            MockStream::broken(std::io::ErrorKind::ConnectionAborted),
-            MockStream::broken(std::io::ErrorKind::ConnectionAborted),
-        ])),
-    };
-    let client = HelperClient::new(Box::new(connector), Platform::Win, "TOK");
-    let status = m.status_with_recovery_poll(&client, 2, Duration::from_millis(1));
-    assert!(status.needs_repair, "复核仍不通 → 维持修复态");
+fn passive_status_never_starts_installed_stopped_or_unreachable_services() {
+    for platform in [Platform::Mac, Platform::Linux, Platform::Win] {
+        for loaded in [false, true] {
+            let paths = InstallPaths::for_platform(platform);
+            let start_calls = Arc::new(Mutex::new(Vec::new()));
+            let mut sysops = MockSysOps::default();
+            sysops.exists_paths.insert(paths.binary.clone());
+            if let Some(descriptor) = paths.descriptor {
+                sysops.exists_paths.insert(descriptor);
+            }
+            sysops
+                .registered_services
+                .insert(paths.service_label.to_owned());
+            sysops.loaded = loaded;
+            sysops.start_calls = start_calls.clone();
+            let (manager, _dir) = manager_with_token(platform, sysops);
+            for _ in 0..3 {
+                let connector = MockConnector {
+                    streams: Arc::new(Mutex::new(vec![MockStream::broken(
+                        std::io::ErrorKind::ConnectionAborted,
+                    )])),
+                };
+                let client = HelperClient::new(Box::new(connector), platform, "TOK");
+                let status = manager.compute_status_with_client(&client);
+                assert!(status.installed);
+                assert!(status.needs_repair);
+                assert!(!status.ready);
+            }
+            assert!(
+                start_calls.lock().unwrap().is_empty(),
+                "passive status started {platform:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -885,6 +789,7 @@ fn machine_service_never_contains_an_app_profile_or_a_flat_core() {
         &paths.binary.to_string_lossy(),
         &paths.core_dir.to_string_lossy(),
         MAC_SUPPORT_DIR,
+        false,
     );
     assert!(plist.contains("<key>KeepAlive</key><true/>"));
     assert!(plist.contains("<key>RunAtLoad</key><true/>"));
@@ -1008,7 +913,7 @@ fn windows_checks_native_exits_and_rolls_back_exact_old_service_command() {
     assert!(script.contains("$old.PathName -StartupType $startType"));
     assert!(script.contains("$snapshot.Backup -Destination $snapshot.Path"));
     assert!(script.contains("$keepRecovery = $true"));
-    assert!(script.contains("finally { $lock.Dispose() }"));
+    assert!(script.contains("finally { if ($null -ne $lock) { $lock.Dispose() } }"));
     assert!(script.contains("WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running"));
 }
 
@@ -1100,13 +1005,22 @@ fn generated_unix_install_scripts_are_valid_shell() {
 }
 
 #[test]
-fn uninstall_scripts_remove_service_and_files() {
-    let mac = build_mac_uninstall_script(&InstallPaths::mac());
-    assert!(mac.contains("launchctl bootout system \"$PLIST\""));
-    assert!(mac.contains("rm -rf '/Library/Application Support/Polaris'"));
-    let lin = build_linux_uninstall_script(&InstallPaths::linux());
-    assert!(lin.contains("systemctl disable --now polaris-helper.service"));
-    assert!(lin.contains("rm -rf '/usr/local/lib/polaris' '/var/lib/polaris' '/run/polaris'"));
+fn uninstall_scripts_preserve_stable_lease_and_platform_cleanup_contracts() {
+    let dir = tempfile::tempdir().unwrap();
+    let utility = maintenance_fixture(dir.path());
+    let mac = uninstall_unix::build_mac_uninstall_script(&InstallPaths::mac(), &utility);
+    assert!(mac.contains("admin migration-stop --journal"));
+    assert!(mac.contains("admin migration-recheck --journal"));
+    assert!(mac.contains("stopped-retired-data-preserved"));
+    assert!(!mac.contains("rm -rf \"$SUPPORT\""));
+    let lin = uninstall_unix::build_linux_uninstall_script(&InstallPaths::linux(), &utility);
+    assert!(lin.contains("systemctl --system disable --now \"$SERVICE\""));
+    assert!(lin.contains("rm -rf \"$INSTALLDIR\" \"$RUNTIMEDIR\""));
+    for script in [mac, lin] {
+        assert!(script.contains("admin lease-acquire --lock \"$LOCK\" --fd 9"));
+        assert!(!script.contains("rm -f \"$LOCK\""));
+        assert!(!script.contains("rm -rf \"$SUPPORT\""));
+    }
 }
 
 // ── install()/uninstall() 端到端（提权接线 + 落盘 + 清理）──
@@ -1214,7 +1128,10 @@ fn uninstall_clears_token_on_success() {
     );
     let script_dir = tempfile::tempdir().unwrap();
     let (exec, calls, _) = capturing((String::new(), 0));
-    let outcome = m.uninstall(script_dir.path(), &exec).unwrap();
+    let utility = maintenance_fixture(script_dir.path());
+    let outcome = m
+        .uninstall_with_maintenance(script_dir.path(), Some(&utility), &exec)
+        .unwrap();
     assert_eq!(outcome, EscalationOutcome::Success);
     assert!(!token_path.exists(), "卸载成功须清 app 侧 token");
     assert_eq!(calls.lock().unwrap()[0][0], "/usr/bin/pkexec");
@@ -1232,8 +1149,10 @@ fn uninstall_cancel_keeps_token() {
     );
     let script_dir = tempfile::tempdir().unwrap();
     let (exec, _, _) = capturing(("".into(), 126));
+    let utility = maintenance_fixture(script_dir.path());
     assert_eq!(
-        m.uninstall(script_dir.path(), &exec).unwrap(),
+        m.uninstall_with_maintenance(script_dir.path(), Some(&utility), &exec)
+            .unwrap(),
         EscalationOutcome::Cancelled
     );
     assert!(token_path.exists(), "取消不应清 token（helper 仍在）");
@@ -1674,6 +1593,387 @@ fn linux_lifecycle_label_matches_installed_unit_and_uninstall_target() {
     assert!(install.contains(&format!("SERVICE='{LINUX_SERVICE_NAME}'")));
     assert!(install.contains("systemctl enable \"$SERVICE\""));
     assert!(install.contains("systemctl restart \"$SERVICE\""));
-    let uninstall = build_linux_uninstall_script(&paths);
-    assert!(uninstall.contains(&format!("systemctl disable --now {LINUX_SERVICE_NAME}")));
+    let utility = MaintenanceUtility {
+        src_binary: PathBuf::from("/inert/polaris-helper"),
+        helper_sha256: "a".repeat(64),
+    };
+    let uninstall = uninstall_unix::build_linux_uninstall_script(&paths, &utility);
+    assert!(uninstall.contains(&format!("SERVICE='{LINUX_SERVICE_NAME}'")));
+}
+
+#[test]
+fn unix_rollback_stops_before_restoring_when_shutdown_is_unconfirmed() {
+    for script in unix_scripts() {
+        let rollback = script.find("rollback() {").unwrap();
+        let stop = script[rollback..].find("if ! stop_service; then").unwrap() + rollback;
+        let stop_error = script[stop..]
+            .find("HELPER_ROLLBACK_STOP_UNCONFIRMED")
+            .unwrap()
+            + stop;
+        let exit = script[stop_error..].find("exit 1").unwrap() + stop_error;
+        let restore = script[exit..].find("helper.rollback").unwrap() + exit;
+        assert!(stop < stop_error && stop_error < exit && exit < restore);
+        assert!(!script[rollback..].contains("stop_service || OK=0"));
+    }
+}
+
+#[test]
+fn unix_registration_changes_follow_readiness_or_admission_and_stop() {
+    for script in unix_scripts() {
+        let header_call = "\nregister_user\n";
+        let retained = script.find("retain-probe --support").unwrap();
+        let first_register = script.find(header_call).unwrap();
+        let admission = script.find("prepare-upgrade --support").unwrap();
+        let stop = script[admission..].find("then stop_service; fi").unwrap() + admission;
+        let next_register = script[stop..].find(header_call).unwrap() + stop;
+        assert!(retained < first_register && first_register < admission);
+        assert!(admission < stop && stop < next_register);
+        assert!(script.contains("snapshot_registration\nif ["));
+        assert!(script.contains("set_phase registration\n  REGISTRATION_CHANGED=1"));
+        assert!(script.contains("restore-user --support"));
+    }
+}
+
+#[test]
+fn explicit_migration_rejects_other_platforms_before_validation_token_or_elevation() {
+    for &platform in Platform::ALL {
+        assert!(InstallMode::Ordinary.supported_on(platform));
+        assert_eq!(
+            InstallMode::StopAndUpgrade.supported_on(platform),
+            platform == Platform::Mac
+        );
+        if platform == Platform::Mac {
+            continue;
+        }
+        let stage = tempfile::tempdir().unwrap();
+        let source = stage.path().join("helper");
+        let (manager, token_dir) = install_manager(platform, &source);
+        let mut params = install_params(stage.path().join("scripts"), source);
+        params.helper_sha256.clear(); // Invalid parameters must not mask the unsupported mode.
+        let (executor, calls, content) = capturing((String::new(), 0));
+        assert!(matches!(
+            manager.install_with_mode(&params, &executor, InstallMode::StopAndUpgrade),
+            Err(ManagerError::UnsupportedPlatform(p)) if p == platform
+        ));
+        assert!(
+            !manager.token_path.exists(),
+            "unsupported mode wrote a token"
+        );
+        assert_eq!(std::fs::read_dir(token_dir.path()).unwrap().count(), 0);
+        assert!(
+            !params.script_dir.exists(),
+            "unsupported mode created its script directory"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "unsupported mode escalated"
+        );
+        assert!(content.lock().unwrap().is_none());
+    }
+}
+
+#[test]
+fn mac_install_mode_selects_separate_scripts_without_fallback() {
+    assert_eq!(InstallMode::default(), InstallMode::Ordinary);
+    let stage = tempfile::tempdir().unwrap();
+    let source = stage.path().join("helper");
+    let (manager, _token_dir) = install_manager(Platform::Mac, &source);
+    let params = install_params(stage.path().join("scripts"), source);
+    let token = "a".repeat(64);
+    let ordinary = manager
+        .build_install_script(&params, &token, InstallMode::Ordinary)
+        .unwrap();
+    let migration = manager
+        .build_install_script(&params, &token, InstallMode::StopAndUpgrade)
+        .unwrap();
+    assert_eq!(
+        ordinary,
+        build_mac_install_script(&manager.paths, &params, &token)
+    );
+    assert_eq!(
+        migration,
+        build_mac_migration_script(&manager.paths, &params, &token)
+    );
+    assert_ne!(
+        ordinary, migration,
+        "explicit migration must not alias the ordinary transaction"
+    );
+}
+
+#[path = "linux_uninstall.rs"]
+mod linux_uninstall;
+
+fn maintenance_fixture(dir: &Path) -> MaintenanceUtility {
+    let src_binary = dir.join("bundled-helper-fixture");
+    std::fs::write(&src_binary, b"inert fixture, never executed").unwrap();
+    MaintenanceUtility {
+        src_binary,
+        helper_sha256: "a".repeat(64),
+    }
+}
+
+#[test]
+fn unix_uninstall_without_current_utility_never_escalates() {
+    let dir = tempfile::tempdir().unwrap();
+    let token_path = dir.path().join("token");
+    crate::token::write_token_content(&token_path, "TOK").unwrap();
+    let manager = HelperManager::new(
+        Platform::Linux,
+        token_path.clone(),
+        Box::new(MockSysOps::default()),
+    );
+    let (exec, calls, _) = capturing((String::new(), 0));
+    assert!(matches!(
+        manager.uninstall(dir.path(), &exec),
+        Err(ManagerError::InvalidInstallation(_))
+    ));
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(token_path.exists());
+}
+
+#[test]
+fn maintenance_identity_requires_absolute_source_and_actual_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut utility = maintenance_fixture(dir.path());
+    assert!(validate_maintenance_utility(&utility).is_ok());
+    utility.helper_sha256.clear();
+    assert!(validate_maintenance_utility(&utility).is_err());
+    utility.helper_sha256 = "a".repeat(64);
+    utility.src_binary = PathBuf::from("relative");
+    assert!(validate_maintenance_utility(&utility).is_err());
+}
+
+#[test]
+fn windows_registration_is_transactional_and_follows_admission_and_stop() {
+    let script = windows_script();
+    let admission = script.find("Invoke-Utility @('prepare-upgrade'").unwrap();
+    let stop = script
+        .find("  Stop-ServiceChecked\n  Delete-ServiceChecked")
+        .unwrap();
+    let registration = script.find("Invoke-Utility @('register-user'").unwrap();
+    let snapshot = script
+        .find("$registrationSnapshot = @{ Path = $registration;")
+        .unwrap();
+    assert!(snapshot < admission && admission < stop && stop < registration);
+    let restore = script
+        .find("Restore-Registration $registrationSnapshot")
+        .unwrap();
+    let restart = script
+        .find("New-Service -Name $service -BinaryPathName $old.PathName")
+        .unwrap();
+    assert!(restore < restart);
+    assert!(script.contains("$keepHelper -and $wasRunning -and $sameRegistration"));
+    assert!(script.contains("$registrationChanged = $true"));
+    assert!(script.contains("Remove-Item -LiteralPath $snapshot.Path -Force"));
+    assert!(!script.contains("polaris-helper-core-only-ok'; return"));
+}
+
+#[test]
+fn windows_reports_controlled_install_stages_without_stderr_handoff() {
+    let script = windows_script();
+    for stage in [75, 81, 82, 83, 84, 85, 86] {
+        assert!(script.contains(&format!("$failureStage = {stage}")));
+    }
+    assert!(script.contains("$exitCode = $failureStage"));
+    assert!(script.contains("$exitCode = 87"));
+    assert!(script.contains("$exitCode = 88"));
+    assert!(script.contains("exit $exitCode"));
+    assert!(!script.contains("Start-Transcript"));
+}
+
+#[test]
+fn windows_registration_rollback_proves_atomic_bytes_and_original_security() {
+    let script = windows_script();
+    assert!(script.contains("AccessControlSections]'Owner,Group,Access'"));
+    assert!(script.contains("registration.snapshot.json"));
+    assert!(script.contains("Check-Hash $registrationBackup $registrationSnapshot.Hash"));
+    assert!(script.contains("[IO.FileMode]::CreateNew"));
+    assert!(script.contains("$output.Flush($true)"));
+    assert!(script.contains("[IO.File]::Replace($temporary, $snapshot.Path, $null)"));
+    assert!(script.contains("[IO.File]::Move($temporary, $snapshot.Path)"));
+    assert!(script.contains(
+        "$security.SetSecurityDescriptorSddlForm($snapshot.Sddl, $registrationSections)"
+    ));
+    assert!(script.contains("(Registration-Sddl $snapshot.Path) -cne $snapshot.Sddl"));
+    assert!(script.contains("Check-Hash $snapshot.Path $snapshot.Hash"));
+    let restore = script
+        .split("function Restore-Registration")
+        .nth(1)
+        .unwrap()
+        .split("function Stop-ServiceChecked")
+        .next()
+        .unwrap();
+    assert!(!restore.contains("Seal-File $snapshot.Path"));
+}
+
+/// Runs the real restore function against synthetic files only. The existing
+/// Windows workspace test job executes this; no service, UAC or global ACL calls.
+#[cfg(windows)]
+#[test]
+fn windows_registration_rollback_native_fixture_faults() {
+    let script = windows_script();
+    let start = script
+        .find("# Preserve registration security exactly;")
+        .unwrap();
+    let end = script[start..]
+        .find("function Stop-ServiceChecked")
+        .unwrap()
+        + start;
+    let harness = include_str!("registration-rollback.ps1").replace(
+        "# PRODUCTION_REGISTRATION_ROLLBACK_FUNCTIONS",
+        &script[start..end],
+    );
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().join("registration rollback fixture.ps1");
+    let mut bytes = vec![0xef, 0xbb, 0xbf];
+    bytes.extend_from_slice(harness.as_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    let output =
+        std::process::Command::new(crate::windows_system::powershell_executable().unwrap())
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&path)
+            .output()
+            .expect("run Windows registration rollback fixture harness");
+    assert!(
+        output.status.success(),
+        "fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Passed 8 native fixture cases."));
+}
+
+#[test]
+fn windows_rejects_unsafe_registration_parents_before_reads_or_restore_eligibility() {
+    let script = windows_script();
+    let users = script
+        .find("  Assert-PrivateRegistrationDirectory $users")
+        .unwrap();
+    let identity = script
+        .find("  Assert-PrivateRegistrationDirectory (Join-Path $users $identity)")
+        .unwrap();
+    let read = script
+        .find("$sameRegistration = [IO.File]::ReadAllText")
+        .unwrap();
+    let changed = script.find("  $registrationChanged = $true").unwrap();
+    assert!(users < identity && identity < read && read < changed);
+    assert!(script.contains("untrusted registration parent owner"));
+    assert!(script.contains("NO_ACCESS_CONTROL"));
+    assert!(script.contains("registration parent grants nonprivileged access"));
+}
+
+#[test]
+fn unsupported_uninstall_never_prepares_or_escalates_maintenance() {
+    let dir = tempfile::tempdir().unwrap();
+    for platform in [Platform::Android, Platform::Ios, Platform::Other] {
+        let manager = HelperManager::new(
+            platform,
+            dir.path().join("token"),
+            Box::new(MockSysOps::default()),
+        );
+        let (exec, calls, _) = capturing((String::new(), 0));
+        assert!(
+            matches!(manager.uninstall_with_maintenance(dir.path(), None, &exec), Err(ManagerError::UnsupportedPlatform(p)) if p == platform)
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn missing_maintenance_binary_never_escalates_or_clears_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    crate::token::write_token_content(&token, "TOK").unwrap();
+    let manager = HelperManager::new(
+        Platform::Linux,
+        token.clone(),
+        Box::new(MockSysOps::default()),
+    );
+    let utility = MaintenanceUtility {
+        src_binary: dir.path().join("absent-helper"),
+        helper_sha256: "a".repeat(64),
+    };
+    let (exec, calls, _) = capturing((String::new(), 0));
+    assert!(matches!(
+        manager.uninstall_with_maintenance(dir.path(), Some(&utility), &exec),
+        Err(ManagerError::HelperBinaryMissing(_))
+    ));
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(token.exists());
+}
+
+#[test]
+fn migration_uses_real_closed_plist_renderer_before_candidate_start() {
+    let paths = InstallPaths::mac();
+    let params = install_params(PathBuf::from("/inert"), PathBuf::from("/inert/helper"));
+    let ordinary = build_mac_install_script(&paths, &params, &"a".repeat(64));
+    let migration = build_mac_migration_script(&paths, &params, &"a".repeat(64));
+    let descriptor = |script: &str, marker: &str| -> String {
+        script
+            .split(&format!("<<'{marker}'\n"))
+            .nth(1)
+            .unwrap()
+            .split(&format!("\n{marker}\n"))
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    let plain = render_mac_plist(
+        &paths.binary.to_string_lossy(),
+        &paths.core_dir.to_string_lossy(),
+        MAC_SUPPORT_DIR,
+        false,
+    );
+    let closed = render_mac_plist(
+        &paths.binary.to_string_lossy(),
+        &paths.core_dir.to_string_lossy(),
+        MAC_SUPPORT_DIR,
+        true,
+    );
+    assert_eq!(descriptor(&ordinary, "POLARIS_DESCRIPTOR_EOF"), plain);
+    assert_eq!(descriptor(&migration, "POLARIS_DESCRIPTOR_EOF"), plain);
+    assert_eq!(
+        descriptor(&migration, "POLARIS_CLOSED_DESCRIPTOR_EOF"),
+        closed
+    );
+    let arguments = |xml: &str| -> Vec<String> {
+        xml.split("<array>")
+            .nth(1)
+            .unwrap()
+            .split("</array>")
+            .next()
+            .unwrap()
+            .split("<string>")
+            .skip(1)
+            .map(|entry| entry.split("</string>").next().unwrap().to_owned())
+            .collect()
+    };
+    let expected = vec![
+        paths.binary.to_string_lossy().into_owned(),
+        "--support".into(),
+        MAC_SUPPORT_DIR.into(),
+        "--coredir".into(),
+        paths.core_dir.to_string_lossy().into_owned(),
+    ];
+    assert_eq!(arguments(&plain), expected);
+    let mut expected_closed = expected;
+    expected_closed.push("--upgrade-closed".into());
+    assert_eq!(arguments(&closed), expected_closed);
+    assert!(!ordinary.contains("POLARIS_CLOSED_DESCRIPTOR_EOF"));
+    let install_closed = migration
+        .find("install -o root -g \"$GROUP\" -m 0644 \"$TXDIR/descriptor.closed\"")
+        .unwrap();
+    let start = migration.find("set_phase candidate-starting").unwrap();
+    assert!(install_closed < start);
+}
+
+#[test]
+fn retained_windows_helper_requires_framing_before_service_or_registration_changes() {
+    let source = polaris_source_probe::crate_source!("manager/install_windows.rs");
+    let probe = source.find("Invoke-Utility @('admin-probe'").unwrap();
+    let registration = source.find("Invoke-Utility @('register-user'").unwrap();
+    let admission = source.find("Invoke-Utility @('prepare-upgrade'").unwrap();
+    assert!(probe < registration && probe < admission);
+    assert!(source.contains("retained newer helper capability unavailable while stopped"));
+    assert!(source.contains(".Hash.ToLowerInvariant() -cne '{helper_hash}'"));
 }

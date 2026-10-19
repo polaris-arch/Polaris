@@ -485,7 +485,7 @@ fn redact_url_strips_query_and_userinfo() {
     // userinfo 也是凭据。
     assert!(!redact_url("https://user:pass@sub.example.com/l?t=1").contains("pass"));
     // 非法 URL 兜底截断。
-    assert_eq!(redact_url("not a url?token=x"), "not a url?<redacted>");
+    assert_eq!(redact_url("not a url?token=x"), "<invalid-url>");
 }
 
 #[test]
@@ -534,4 +534,20 @@ fn default_ua_version_length_boundary_applies_to_both_products() {
         default_subscription_user_agent(&rejected, &rejected),
         "Polaris/unknown sing-box/unknown"
     );
+}
+
+#[tokio::test]
+async fn malformed_url_diagnostics_never_echo_unparsed_credentials() {
+    // Synthetic markers only; no real credential material belongs in a fixture.
+    for input in [
+        "https://fixture-user:fixture-marker@[invalid]/sub",
+        "https://fixture-user:fixture-marker@[invalid]/sub?fixture-query#fixture-fragment",
+        "not a url fixture-marker",
+    ] {
+        assert_eq!(redact_url(input), "<invalid-url>");
+        let client = MockFetch::new();
+        let error = fetch(&client, &MockLookup::public(), input).await.unwrap_err();
+        assert!(!error.message.contains("fixture-"));
+        assert!(client.seen.lock().unwrap().is_empty());
+    }
 }

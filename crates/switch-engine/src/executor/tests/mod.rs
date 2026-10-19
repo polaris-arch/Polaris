@@ -464,8 +464,21 @@ async fn execute_keeps_selected_order_and_best_effort_with_unordered_closes() {
         assert_eq!(state.active, 16);
     }
     api.release_all();
-    // 返回仍是筛选/尝试口径（含失败 ID），既不按 ACK 顺序，也不删除失败项。
-    assert_eq!(applied_ids(execution.await), selected_ids(40));
+    let HotSwitchOutcome::Applied {
+        disconnect: Some(result),
+    } = execution.await
+    else {
+        panic!("close failures must not roll back selector selection");
+    };
+    assert_eq!(result.selected_ids, selected_ids(40));
+    assert_eq!(result.failed_ids, vec!["selected-3".to_string()]);
+    assert_eq!(
+        result.closed_ids,
+        selected_ids(40)
+            .into_iter()
+            .filter(|id| id != "selected-3")
+            .collect::<Vec<_>>()
+    );
     let state = api.state.lock().unwrap();
     assert_same_ids(&state.attempted, &selected_ids(40));
     assert_same_ids(&state.completed, &selected_ids(40));
@@ -485,8 +498,15 @@ async fn execute_rechecks_received_api_gate_for_later_close_waves() {
     api.generation_valid.store(false, Ordering::SeqCst);
     api.release_all();
     // wrapper 已发出的第一波不能撤回；后续 24 条只能被 wrapper 拒绝。
-    // 上层仍负责按 generation 丢弃整个旧 outcome，此处不改历史返回口径。
-    assert_eq!(applied_ids(execution.await), selected_ids(40));
+    // Only the first wave actually received successful RPC acknowledgements.
+    let HotSwitchOutcome::Applied {
+        disconnect: Some(result),
+    } = execution.await
+    else {
+        panic!("expected applied selector outcome");
+    };
+    assert_eq!(result.closed_ids, selected_ids(16));
+    assert_eq!(result.failed_ids, selected_ids(40)[16..]);
     let state = api.state.lock().unwrap();
     assert_same_ids(&state.attempted, &selected_ids(40));
     assert_same_ids(&state.entered, &selected_ids(16));
@@ -597,3 +617,18 @@ async fn execute_skip_and_snapshot_failure_paths_never_start_close_futures() {
 }
 
 mod audit_regressions;
+
+#[tokio::test]
+async fn all_close_failures_remain_applied_but_never_count_as_acknowledged() {
+    let api = BlockingManagementApi::new(selected_snapshot(3));
+    api.generation_valid.store(false, Ordering::SeqCst);
+    let HotSwitchOutcome::Applied {
+        disconnect: Some(result),
+    } = SwitchExecutor.execute(&api, &global_plan(), true).await
+    else {
+        panic!("best-effort close failures must not undo a successful selector PUT");
+    };
+    assert!(result.closed_ids.is_empty());
+    assert_eq!(result.failed_ids, selected_ids(3));
+    assert_eq!(result.selected_ids, selected_ids(3));
+}

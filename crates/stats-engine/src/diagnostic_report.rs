@@ -209,6 +209,10 @@ pub struct DiagnosticReportSource {
     pub runtime: RuntimeSection,
     /// **原始** UserConfig（未脱敏）。
     pub user_config: Value,
+    /// Normalized custom keys captured from the exact applied UserConfig and bound to its emitted config.
+    pub running_secret_keys: std::collections::BTreeSet<String>,
+    /// Runtime bytes lack matched redaction declarations. Keep them for identity masking only.
+    pub unverified_runtime: bool,
     /// **原始**生成 sing-box 配置（未脱敏）。取不到时传 `Value::Null` 或错误说明对象。
     pub singbox_config: Value,
     /// #57 resolve-ahead 预解析出的节点 IP（不在 `config.servers` 里，需一并按节点身份打码）。
@@ -226,17 +230,21 @@ pub struct DiagnosticReportSource {
 pub fn assemble_diagnostic_report(src: &DiagnosticReportSource) -> String {
     // custom 协议的自定义密钥键：必须从 UserConfig 汇总后同时喂给两份配置的脱敏——
     // 生成配置里 customSettings 包装已被剥离，就地读不到 secretKeys（见 redact::collect_custom_secret_keys）。
-    let extra = crate::redact::collect_custom_secret_keys(&src.user_config);
+    let mut extra = crate::redact::collect_custom_secret_keys(&src.user_config);
+    extra.extend(src.running_secret_keys.iter().cloned());
     let input = DiagnosticReportInput {
         generated_at: src.generated_at.clone(),
         app: src.app.clone(),
         runtime: src.runtime.clone(),
         redacted_user_config: crate::redact::redact_deep(&src.user_config, &extra),
-        redacted_singbox_config: crate::redact::redact_deep(&src.singbox_config, &extra),
+        redacted_singbox_config: if src.unverified_runtime {
+            serde_json::json!({"error": "运行配置与脱敏元数据未能核对，已省略该段"})
+        } else { crate::redact::redact_deep(&src.singbox_config, &extra) },
         app_log_tail: src.app_log_tail.clone(),
         singbox_log_tail: src.singbox_log_tail.clone(),
-        node_identifiers: crate::redact::collect_node_identifiers(
+        node_identifiers: crate::redact::collect_report_node_identifiers(
             &src.user_config,
+            &src.singbox_config,
             &src.extra_addresses,
         ),
         hint: src.hint.clone(),

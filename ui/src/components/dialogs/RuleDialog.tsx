@@ -1,3 +1,4 @@
+import { useInputRequest } from '@/hooks/use-input-request';
 import { configCanonicalText } from '@/lib/staged-config';
 import { formatConditionValues } from './rule-cond';
 /**
@@ -102,7 +103,8 @@ interface RuleFormProps {
 /** footer 左侧「删除此规则」的原地二次确认 key（原型 :4095 `rule-del-dlg`）。 */
 const RULE_DEL_KEY = 'rule-del-dlg';
 
-function RuleForm({ instanceId, base, isEdit, preset, initialPlane = 'route', planeRuleIds = [] }: RuleFormProps) {
+function RuleForm({ instanceId, base: openingBase, isEdit, preset, initialPlane = 'route', planeRuleIds = [] }: RuleFormProps) {
+  const [base] = useState(() => openingBase);
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
   const closeInstance = useDialogStore((state) => state.closeInstance);
@@ -193,6 +195,10 @@ function RuleForm({ instanceId, base, isEdit, preset, initialPlane = 'route', pl
   /** 名称必填的提交后校验态（口径同 SubDialog:85 / AppAddDialog:65：提交才亮，输入即灭）。 */
   const [errName, setErrName] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+
+  const beginSubmit = useInputRequest(JSON.stringify([conds, name, networkProfileId,
+    logic, target, dnsAction, dnsFallbackAction, dnsResolver, dnsAnswerMode,
+    dnsPredefinedRcode, dnsPredefinedAnswer, dnsPredefinedNs, dnsPredefinedExtra]));
 
   const touch = () => setDirty(true);
 
@@ -310,8 +316,10 @@ function RuleForm({ instanceId, base, isEdit, preset, initialPlane = 'route', pl
 
   /* 校验 + route/DNS 二选一 effects 组装 + 暂存/落盘二选一——外提到 `rule-submit.ts`
      （route 与 DNS 的唯一耦合点即在那里：`effects.route`/`effects.dns` 二选一 + `collectionKey`）。 */
-  const handleSubmit = () =>
-    submitRule({
+  const handleSubmit = () => {
+    if (submitting) return;
+    return submitRule({
+      isCurrent: beginSubmit(),
       t,
       conds,
       name,
@@ -337,6 +345,7 @@ function RuleForm({ instanceId, base, isEdit, preset, initialPlane = 'route', pl
       loadConfig,
       setSubmitting,
     });
+  };
 
   return (
     <Modal
@@ -562,7 +571,7 @@ export function RuleDialog({
       instanceId={instanceId}
       key={formKey}
       base={base}
-      isEdit={base != null}
+      isEdit={ruleId !== undefined}
       preset={preset}
       initialPlane={plane}
       planeRuleIds={rules.map((r) => r.id)}

@@ -31,7 +31,7 @@ pub fn iface_allowed(s: &str) -> bool {
 /// 清洗（`normalize_path`）+ 小写前缀比对。
 #[must_use]
 pub fn cfg_allowed(cfg: &str, conf_dir: &str) -> bool {
-    if conf_dir.is_empty() {
+    if !ordinary_absolute_path(cfg) || !ordinary_absolute_path(conf_dir) {
         return false;
     }
     let clean = normalize_path(cfg);
@@ -43,6 +43,37 @@ pub fn cfg_allowed(cfg: &str, conf_dir: &str) -> bool {
     let clean_l = clean.to_ascii_lowercase();
     let base_l = base.to_ascii_lowercase();
     clean_l.starts_with(&base_l)
+}
+
+/// Accept only ordinary drive-absolute paths. This is an early syntax gate,
+/// not an object-confinement proof; production must also retain verified objects.
+fn ordinary_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+        || path.contains(['\0', '\r', '\n'])
+    {
+        return false;
+    }
+    path[3..]
+        .split(['\\', '/'])
+        .filter(|part| !part.is_empty())
+        .all(|part| {
+            if part == "."
+                || part == ".."
+                || part.ends_with(['.', ' '])
+                || part.contains([':', '*', '?', '"', '<', '>', '|'])
+            {
+                return false;
+            }
+            let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+            !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                && !(stem.len() == 4
+                    && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                    && stem.as_bytes()[3].is_ascii_digit())
+        })
 }
 
 /// 解析 freeport 的端口行（移植自 `helper.go:298-307` 的 port 校验）。
@@ -129,7 +160,7 @@ pub fn filepath_dir(p: &str) -> Option<&str> {
 ///
 /// Go `filepath.Clean` 做的事很多（`./` `../` 折叠、重复分隔符合并、去尾分隔符）。本协议 cfg 路径由客户端
 ///（Tauri 侧）下发，通常是绝对路径；本函数做最小必要清洗：合并重复分隔符 + 去尾分隔符，足以支撑
-/// [`cfg_allowed`] 的前缀比对。不折叠 `..`（客户端不应下发，纵深由前缀比对兜底 —— `..` 会让前缀失配）。
+/// [`cfg_allowed`] 的前缀比对。`cfg_allowed` 在归一化前明确拒绝 dot segments、设备路径和别名；归一化本身不是安全边界。
 #[must_use]
 pub fn normalize_path(p: &str) -> String {
     // 把正斜杠统一成反斜杠（Windows 接受两者，但前缀比对须一致），合并连续分隔符，去尾分隔符。

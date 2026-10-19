@@ -17,7 +17,7 @@ use tauri::State;
 use crate::response::ApiResponse;
 use crate::runtime::helper::{
     decide_uninstall_preflight, uninstall_preflight_stop, HelperActionErrorCode,
-    HelperActionResult, HelperStatusSnapshot, UninstallPreflight,
+    HelperActionResult, HelperInstallMode, HelperStatusSnapshot, UninstallPreflight,
 };
 use crate::runtime::uninstall::{stop_core_outcome, StepOutcome};
 use crate::runtime::AppRuntime;
@@ -66,10 +66,25 @@ pub async fn helper_get_status(
 #[tauri::command]
 pub async fn helper_install(
     state: State<'_, AppRuntime>,
+    mode: Option<HelperInstallMode>,
 ) -> Result<ApiResponse<HelperActionResult>, ()> {
-    let proxy_status = state.proxy().status();
+    let mode = mode.unwrap_or_default();
     let helper = state.helper.clone();
-    if helper_install_blocked_by_proxy(proxy_status.running, proxy_status.started_via_helper) {
+    // Reject forged explicit-mode requests before the guard can stop any local proxy.
+    if !mode.supported_on(helper.platform()) {
+        return Ok(ApiResponse::ok(HelperActionResult {
+            success: false,
+            error_code: Some(HelperActionErrorCode::Unsupported),
+            diagnostic: Some(
+                "explicit helper stop-and-upgrade is supported only on macOS".to_owned(),
+            ),
+            status: helper.status(),
+        }));
+    }
+    let proxy_status = state.proxy().status();
+    if mode == HelperInstallMode::Ordinary
+        && helper_install_blocked_by_proxy(proxy_status.running, proxy_status.started_via_helper)
+    {
         return Ok(ApiResponse::ok(HelperActionResult {
             success: false,
             error_code: Some(HelperActionErrorCode::ProxyRunning),
@@ -78,10 +93,11 @@ pub async fn helper_install(
         }));
     }
 
-    // 初始已运行的 TUN 明确拒绝；随后提权框可能停留数分钟，期间若用户又从托盘起了 TUN，
-    // 复用服务变更看门狗立即停掉，避免安装脚本重启 daemon 时留下 UI 仍报 running 的失真态。
+    // Ordinary installs still reject a running helper-managed proxy. Only the
+    // explicitly confirmed mode authorizes stopping it through the existing guard.
+    // The guard also covers starts racing the administrator authorization window.
     let outcome = with_helper_service_mutation_core_guard(&state, |_stop| async move {
-        tokio::task::spawn_blocking(move || helper.install()).await
+        tokio::task::spawn_blocking(move || helper.install_with_mode(mode)).await
     })
     .await;
     Ok(match outcome {
@@ -150,7 +166,8 @@ pub async fn helper_uninstall(
 /// 抄第二份必然漂移，而漂移的代价是孤儿 root 核 + 断网。故两条命令共用这一份。
 ///
 /// `body` 收到停核腿的 [`StepOutcome`]，**自行决定政策**：
-/// - [`helper_install`] 在进入外壳前拒绝已运行的 helper 核；外壳继续覆盖提权期间的竞态；
+/// - [`helper_install`] 普通模式先拒绝已运行的 helper 核；显式停止升级模式已获用户确认，
+///   两种模式的外壳都覆盖提权期间的竞态；
 /// - [`helper_uninstall`] 忽略它（停不掉也继续卸）；
 /// - `app_uninstall_all` 把它当作 fail-fast 的第一步（停不掉就一项都不删）。
 ///

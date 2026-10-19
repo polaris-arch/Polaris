@@ -124,6 +124,7 @@ fn parse_rule(v: &serde_json::Value) -> Rule {
         action,
         enabled: obj.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true),
         bypass_fakeip,
+        target_auto_select: obj.get("targetAutoSelect").cloned().and_then(|v| serde_json::from_value(v).ok()),
         target_server_id: obj
             .get("targetServerId")
             .and_then(|t| t.as_str())

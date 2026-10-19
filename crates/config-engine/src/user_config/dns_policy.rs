@@ -326,3 +326,6 @@ pub struct RoutePolicyDefaults {
 
 #[cfg(test)]
 mod tests;
+
+mod validation;
+pub use validation::validate_dns_dependencies;

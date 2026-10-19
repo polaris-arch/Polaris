@@ -1431,10 +1431,10 @@ body:has(.pending-bar.show) #toast-stack{
 .csel-menu .csel-opt > .csel-ico{ position:static; transform:none; width:15px; height:15px; flex:none; }
 /* 有前置图标后 label 不再是 `:first-child` ⇒ prototype.css:1540 的 `.csel-opt > span:first-child`
  * （flex:1 + 省略号）命不中它，长选项会撑爆菜单而不是截断。改钉在类上，与有无图标无关。 */
-.csel-menu .csel-opt > .csel-lbl{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.csel-menu .csel-opt > .csel-lbl{ flex:1; min-width:0; overflow-wrap:anywhere; white-space:normal; }
 .csel-menu .csel-opt > .csel-lbl.has-description{ display:flex; flex-direction:column; gap:2px; white-space:normal; }
-.csel-menu .csel-primary{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.csel-menu .csel-description{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:hsl(var(--fg-dim)); font-size:10.5px; font-weight:450; }
+.csel-menu .csel-primary{ min-width:0; white-space:normal; overflow-wrap:anywhere; }
+.csel-menu .csel-description{ min-width:0; white-space:normal; overflow-wrap:anywhere; color:hsl(var(--fg-dim)); font-size:10.5px; font-weight:450; }
 /* 托盘色点对齐基准 `.nm-latdot` 的 7px。比 tray-overlay.css 的 `.tray-menu .tray-node-dot`
  * 多一个类 ⇒ (0,3,0) 稳压 (0,2,0)，不依赖导入顺序。 */
 .tray-menu .tray-i .tray-node-dot{ width:7px; height:7px; }
@@ -1818,3 +1818,21 @@ body:has(.pending-bar.show) #toast-stack{
  * 而不是 `--warn` —— 收到文件是中性事件，不是需要警惕的事，摆成琥珀色会读成「出问题了」。 */
 .tdrop-badge{ margin-left:5px; padding:0 6px; border-radius:999px; font-size:10px;
   background:hsl(var(--flow)/0.16); color:hsl(var(--flow-hi)); }
+
+/* Bounded dropdowns wrap labels instead of hiding content at narrow card edges. */
+.csel-menu{ overflow-x:hidden; }
+.csel-menu .csel-opt, .csel-menu .csel-grp{ text-align:start; overflow-wrap:anywhere; white-space:normal; }
+
+/* Auto is an intent entry, outside node/test/bulk targets. Keep the mode switch beside its scope. */
+.auto-choice{min-width:0;overflow-wrap:anywhere;padding:10px 12px;border:1px solid hsl(var(--line));border-radius:10px;}
+.auto-choice.on{border-color:hsl(var(--flow));background:hsl(var(--flow)/0.08);}
+.auto-choice-head{display:flex;align-items:center;gap:12px;}
+.auto-choice-pick{display:flex;flex:1;min-width:0;flex-direction:column;align-items:flex-start;text-align:start;gap:4px;background:none;border:0;color:inherit;cursor:pointer;min-height:44px;}
+.auto-choice-pick:disabled{opacity:1;cursor:default;}
+.auto-choice-pick>span{color:hsl(var(--fg-dim));font-size:12px;overflow-wrap:anywhere;}
+.auto-choice-head>.swt{flex-shrink:0;}
+.auto-choice-row{margin:4px 8px;}
+.auto-choice-card{align-self:start;}
+.auto-choice-details{margin-top:8px;font-size:12px;}
+.auto-choice-details>summary{cursor:pointer;}
+.auto-choice-divider{border:0;border-top:1px solid hsl(var(--line));margin-block:8px;}

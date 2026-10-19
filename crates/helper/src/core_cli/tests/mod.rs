@@ -27,7 +27,15 @@ fn administrative_arguments_are_exact_and_allow_a_root_sealed_manifest() {
         "--manifest",
         r"C:\stage\core-manifest.json",
     ]);
-    assert!(InstallArgs::parse(&valid).is_ok());
+    assert!(!InstallArgs::parse(&valid).unwrap().preserve_existing);
+    let mut preserve = valid.clone();
+    preserve.push("--preserve-existing".into());
+    assert!(InstallArgs::parse(&preserve).unwrap().preserve_existing);
+    preserve.push("--preserve-existing".into());
+    assert!(InstallArgs::parse(&preserve).is_err());
+    let mut valued = valid.clone();
+    valued.push("--preserve-existing=true".into());
+    assert!(InstallArgs::parse(&valued).is_err());
     let mut sealed = valid.clone();
     #[cfg(unix)]
     {

@@ -36,7 +36,7 @@ use polaris_config_engine::user_config::protocol_settings::{
     TuicSettings, WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
-use polaris_config_engine::user_config::tls_pin::keep_valid_cert_pins;
+use polaris_config_engine::user_config::tls_pin::{preserve_cert_pins, keep_valid_cert_pins};
 use url::Url;
 
 /// 分享链接支持的 scheme 白名单。**与前端 `ui/src/shared/protocol-url-schemes.ts` 同源**
@@ -375,7 +375,7 @@ fn parse_tls_settings(params: &Params) -> TlsSettings {
     // :10-16 `sha256.Sum256(cert.Raw)`）⇒ `certificateSha256`。v2rayN 在 vless/trojan 等 query 里原样读它
     // （ServiceLib/Handler/Fmt/BaseFmt.cs @e1cb99c :211）。
     // ⚠️ 语义差同 mihomo：Xray 也接受命中链上 CA，sing-box 只比叶子 ⇒ 固定 CA 的链接导入后握手失败。
-    s.certificate_sha256 = params.get_ne("pcs").and_then(|v| keep_valid_cert_pins(&v));
+    s.certificate_sha256 = params.get_ne("pcs").and_then(|v| preserve_cert_pins(&v));
     s
 }
 
@@ -529,7 +529,7 @@ fn parse_hysteria2(
         tls.certificate_sha256 = b
             .params
             .get_ne("pinSHA256")
-            .and_then(|v| keep_valid_cert_pins(&v));
+            .and_then(|v| preserve_cert_pins(&v));
     }
     if tls.server_name.is_none() {
         // 必开 TLS：parse_tls_settings 没解析到 SNI 时兜底。
@@ -761,6 +761,7 @@ fn parse_shadowsocks(
     }));
 
     let params = Params::from_url(u);
+    let shadow_port = checked_shadow_tls_port(params.get("shadow-tls-port").as_deref())?;
     if let Some(plugin) = params.get_ne("plugin") {
         let mut parts = plugin.splitn(2, ';');
         let plugin_name = parts.next().unwrap_or("").to_string();
@@ -780,14 +781,10 @@ fn parse_shadowsocks(
                     utls_mode: None,
                     password: pw,
                     sni,
-                    fingerprint: normalize_token(
-                        &params.get_ne("shadow-tls-fp").unwrap_or("chrome".into()),
-                    ),
-                    port: params
-                        .get_ne("shadow-tls-port")
-                        .as_deref()
-                        .and_then(js_parse_int)
-                        .map(|p| p as u16),
+                    fingerprint: params
+                        .get_ne("shadow-tls-fp")
+                        .and_then(|fp| normalize_token(&fp)),
+                    port: shadow_port,
                 });
             }
         }
@@ -802,14 +799,10 @@ fn parse_shadowsocks(
                 utls_mode: None,
                 password: pw,
                 sni,
-                fingerprint: normalize_token(
-                    &params.get_ne("shadow-tls-fp").unwrap_or("chrome".into()),
-                ),
-                port: params
-                    .get_ne("shadow-tls-port")
-                    .as_deref()
-                    .and_then(js_parse_int)
-                    .map(|p| p as u16),
+                fingerprint: params
+                    .get_ne("shadow-tls-fp")
+                    .and_then(|fp| normalize_token(&fp)),
+                port: shadow_port,
             });
         }
     }
@@ -820,6 +813,10 @@ fn parse_shadowsocks(
             .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
         {
             Some(v) => {
+                let port = match v.get("port") {
+                    None => None,
+                    Some(value) => Some(value.as_u64().and_then(|p| u16::try_from(p).ok()).filter(|p| *p != 0).ok_or("ShadowTLS port must be an integer in 1..=65535")?),
+                };
                 let pw = v.get("password").and_then(|x| x.as_str());
                 let host = v.get("host").and_then(|x| x.as_str());
                 if let (Some(pw), Some(host)) = (pw, host) {
@@ -827,8 +824,9 @@ fn parse_shadowsocks(
                         utls_mode: None,
                         password: pw.to_string(),
                         sni: host.to_string(),
-                        fingerprint: Some("chrome".to_string()),
-                        port: v.get("port").and_then(json_num).map(|p| p as u16),
+                        fingerprint: json_str(v.get("fingerprint"))
+                            .and_then(|fp| normalize_token(&fp)),
+                        port,
                     });
                 }
             }
@@ -836,6 +834,11 @@ fn parse_shadowsocks(
         }
     }
     Ok(c)
+}
+
+fn checked_shadow_tls_port(value: Option<&str>) -> Result<Option<u16>, String> {
+    value.map(|raw| raw.parse::<u16>().ok().filter(|p| *p != 0)
+        .ok_or_else(|| "ShadowTLS port must be an integer in 1..=65535".to_string())).transpose()
 }
 
 /// ss userinfo → (method, password)。先试 base64（传统形态），失败落 SIP002 明文。
@@ -847,14 +850,12 @@ fn decode_ss_userinfo(
     // ① base64 形态：ss://base64(method:password)@server:port
     if let Ok(decoded_ui) = decode_uri_component(user_info) {
         if let Ok(decoded) = crate::subscription::base64_decode(&decoded_ui) {
-            // 解码结果须是可打印 ASCII（避免乱码被当成明文）且含 ':'。
-            let printable =
-                !decoded.is_empty() && decoded.bytes().all(|b| (0x20..=0x7E).contains(&b));
-            if printable {
+            // base64_decode already validates UTF-8. Password bytes, including whitespace, are credentials.
+            if !decoded.is_empty() {
                 if let Some((m, p)) = decoded.split_once(':') {
-                    let (m, p) = (m.trim().to_string(), p.trim().to_string());
-                    if m.is_empty() {
-                        return Err("加密方法为空".to_string());
+                    let (m, p) = (m.trim().to_string(), p.to_string());
+                    if m.is_empty() || !m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                        return Err("加密方法无效".to_string());
                     }
                     if p.is_empty() {
                         return Err("密码为空".to_string());
@@ -868,19 +869,19 @@ fn decode_ss_userinfo(
     let (method, password) = if let Some(up) = user_password {
         (
             decode_uri_component(user_info)?.trim().to_string(),
-            decode_uri_component(up)?.trim().to_string(),
+            decode_uri_component(up)?,
         )
     } else if let Some((a, b)) = user_info.split_once(':') {
         // 有些实现把 method:password 都放在 username 里。
         (
             decode_uri_component(a)?.trim().to_string(),
-            decode_uri_component(b)?.trim().to_string(),
+            decode_uri_component(b)?,
         )
     } else {
         return Err("无法解析加密方法和密码：既不是 Base64 编码，也不是明文格式".to_string());
     };
-    if method.is_empty() {
-        return Err("加密方法为空".to_string());
+    if method.is_empty() || !method.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("加密方法无效".to_string());
     }
     if password.is_empty() {
         return Err("密码为空".to_string());
@@ -1108,10 +1109,11 @@ fn parse_vmess(raw_url: &str, id_gen: &mut impl FnMut() -> String) -> Result<Ser
                     || v.get("insecure").and_then(|x| x.as_i64()) == Some(1)
                     || v.get("allowInsecure").and_then(|x| x.as_bool()) == Some(true),
             ),
-            fingerprint: normalize_token(&json_str(v.get("fp")).unwrap_or("chrome".into()))
-                .or_else(|| Some("chrome".to_string())),
+            fingerprint: json_str(v.get("fp")).and_then(|fp| normalize_token(&fp)),
             // vmess JSON 的 `pcs`：同 `parse_tls_settings` 的 `pcs`（v2rayN VmessFmt.cs @e1cb99c :147）。
-            certificate_sha256: json_str(v.get("pcs")).and_then(|p| keep_valid_cert_pins(&p)),
+            certificate_sha256: v.get("pcs")
+                .map(|value| json_str(Some(value)).unwrap_or_else(|| "invalid-pin-shape".into()))
+                .and_then(|p| preserve_cert_pins(&p)),
             ..Default::default()
         };
         // alpn 可能是逗号串或已是数组；两路都过 dedupe_trim（保序去重 + 丢空白项）。
@@ -1156,7 +1158,10 @@ pub fn parse_share_url(
             url.split("://").next().unwrap_or(url)
         ));
     }
-    parse_share_url_inner(url, id_gen, warn).map_err(|e| format!("URL 解析失败: {e}"))
+    let server = parse_share_url_inner(url, id_gen, warn).map_err(|e| format!("URL 解析失败: {e}"))?;
+    polaris_config_engine::user_config::tls_pin::validate_server_cert_pins(&server)
+        .map_err(str::to_owned)?;
+    Ok(server)
 }
 
 fn parse_share_url_inner(
@@ -1765,7 +1770,10 @@ fn encode_socks(c: &ServerConfig) -> String {
 fn encode_http(c: &ServerConfig) -> String {
     let is_https = c.security.as_ref().is_some_and(SecurityMode::is_tls);
     let scheme = if is_https { "https" } else { "http" };
-    let q = QueryString::new();
+    let mut q = QueryString::new();
+    if is_https {
+        if let Some(tls) = &c.tls_settings { push_tls_params(&mut q, tls); }
+    }
     let userinfo = encode_userinfo(c.username.as_deref(), c.password.as_deref());
     assemble(scheme, userinfo, &c.address, c.port, &q, &c.name)
 }
@@ -1783,6 +1791,7 @@ fn encode_naive(c: &ServerConfig) -> Result<String, String> {
         .ok_or("NaiveProxy 节点缺少密码")?;
     let mut q = QueryString::new();
     push_transport_params(&mut q, c);
+    if let Some(tls) = &c.tls_settings { push_tls_params(&mut q, tls); }
     let userinfo = format!(
         "{}:{}",
         percent_encode_component(username),

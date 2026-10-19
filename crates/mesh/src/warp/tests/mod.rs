@@ -245,11 +245,17 @@ fn classify_deregister_result_1020_overrides_403() {
 }
 
 #[test]
+fn classify_deregister_result_rate_limited_retries_without_1020() {
+    for body in [None, Some(""), Some("Too Many Requests")] {
+        assert_eq!(
+            classify_deregister_result(Some(429), body),
+            DeregisterResult::Retry
+        );
+    }
+}
+
+#[test]
 fn classify_deregister_result_unknown_4xx_drops() {
-    assert_eq!(
-        classify_deregister_result(Some(429), None),
-        DeregisterResult::Drop
-    );
     assert_eq!(
         classify_deregister_result(Some(410), None),
         DeregisterResult::Drop

@@ -65,6 +65,7 @@ export function useAppUpdate(includePrerelease: boolean) {
   const clearInFlight = useRef(false);
   const [clearingPortable, setClearingPortable] = useState(false);
   const [pendingPortable, setPendingPortable] = useState<VersionInfo['pendingPortableUpdate']>();
+  const [manualInstallerOpened, setManualInstallerOpened] = useState(false);
 
   useEffect(() => {
     void versionApi
@@ -121,10 +122,11 @@ export function useAppUpdate(includePrerelease: boolean) {
     clearInFlight.current = true;
     setClearingPortable(true);
     try {
-      await updateApi.clearPortableHandoff();
+      if (!manualInstallerOpened) await updateApi.clearPortableHandoff();
       // Clear local recovery only after the durable dismissal succeeded.
       setPendingPortable(undefined);
       setManualCompletionUnverified(false);
+      setManualInstallerOpened(false);
       await checkUpdate();
     } catch (error) {
       // Keep the manual card/positions available for retry after a write failure.
@@ -208,8 +210,9 @@ export function useAppUpdate(includePrerelease: boolean) {
     }
   }
 
-  function settleInstall(next: 'manual' | 'error', message: string, subject: InstallSubject) {
+  function settleInstall(next: 'manual' | 'error', message: string, subject: InstallSubject, manualInstallerOpened = false) {
     setUs(next);
+    setManualInstallerOpened(manualInstallerOpened);
     setManualCompletionUnverified(Boolean(subject.completionUnverified));
     setUpdateInfo(subject.info);
     setDownloadedPath(subject.path);
@@ -235,7 +238,7 @@ export function useAppUpdate(includePrerelease: boolean) {
         if (result.advisory === 'portableManualReplace') {
           settleInstall(
             'manual',
-            (subj.completionUnverified ? t('settings.update.portableCompletionUnverified') + '\n' : '') + t('settings.update.portableManualReplace', {
+            (result.requiresRedownload ? t('settings.update.updateTrustRequired') + '\n' : '') + (subj.completionUnverified ? t('settings.update.portableCompletionUnverified') + '\n' : '') + t('settings.update.portableManualReplace', {
               path: subj.path,
               dir: result.programDir ?? '',
             }),
@@ -256,6 +259,10 @@ export function useAppUpdate(includePrerelease: boolean) {
             },
           },
         });
+        return;
+      }
+      if (result.awaitingManualInstall) {
+        settleInstall('manual', t('settings.update.manualInstallerOpened'), subj, true);
         return;
       }
       if (result.handedToSystem || result.reason === 'form-mismatch') {
@@ -286,6 +293,7 @@ export function useAppUpdate(includePrerelease: boolean) {
     downloadIntegrity,
     installing,
     manualCompletionUnverified,
+    manualInstallerOpened,
     clearingPortable,
     discardPortableAndCheck,
     checkUpdate,

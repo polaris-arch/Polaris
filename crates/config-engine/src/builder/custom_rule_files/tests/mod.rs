@@ -21,6 +21,7 @@ fn rule_single(t: RuleType, values: &[&str]) -> Rule {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -92,6 +93,7 @@ fn plan_inline_when_has_geosite() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -133,6 +135,7 @@ fn plan_ext_or_group_mergeable() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -166,6 +169,7 @@ fn plan_ext_logical_when_cross_dimension_or() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -210,14 +214,14 @@ fn uses_fake_ip_default_true() {
 #[test]
 fn file_base_illegal_id_sha1() {
     // sha1("a/b") = 3ec69c85a4ff...；前 12 位十六进制。
-    assert_eq!(custom_rule_file_base("a/b"), "custom-rule-h3ec69c85a4ff");
+    assert_eq!(custom_rule_file_base("a/b"), "custom-rule-~3ec69c85a4ff96830024afeef2d4e512181c8f7b");
     // sha1("has space") = e42b2b98cbee...
     assert_eq!(
         custom_rule_file_base("has space"),
-        "custom-rule-he42b2b98cbee"
+        "custom-rule-~e42b2b98cbee79b7a787bd5df7bda64a289063ed"
     );
     // 空 id 也走 hash（`.+` 不匹配空）：sha1("") = da39a3ee5e6b...
-    assert_eq!(custom_rule_file_base(""), "custom-rule-hda39a3ee5e6b");
+    assert_eq!(custom_rule_file_base(""), "custom-rule-~da39a3ee5e6b4b0d3255bfef95601890afd80709");
 }
 
 #[test]
@@ -336,4 +340,19 @@ fn orphan_file_rejects() {
     assert!(!is_custom_rule_orphan_file("custom-rule-r1.json.")); // 空 seg 结尾
     assert!(!is_custom_rule_orphan_file("custom-rule-r1.json..tmp")); // 空 seg
     assert!(!is_custom_rule_orphan_file("r1.json"));
+}
+
+#[test]
+fn derived_names_cannot_alias_literal_rule_ids() {
+    let literal = "h3ec69c85a4ff";
+    assert_ne!(custom_rule_file_base("a/b"), custom_rule_file_base(literal));
+    let mut a = rule_single(RuleType::Domain, &["a.example"]);
+    let mut b = rule_single(RuleType::Domain, &["b.example"]);
+    a.id = "a/b".into(); b.id = literal.into();
+    let files = build_custom_rule_files(&user_config(ProxyMode::Smart, vec![a, b], Some(false)));
+    let a_name = format!("{}.json", custom_rule_file_base("a/b"));
+    let b_name = format!("{}.json", custom_rule_file_base(literal));
+    assert!(files[&a_name].contains("a.example"));
+    assert!(files[&b_name].contains("b.example"));
+    assert!(is_custom_rule_orphan_file(&a_name));
 }

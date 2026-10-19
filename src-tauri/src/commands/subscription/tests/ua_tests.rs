@@ -269,7 +269,7 @@ fn both_refresh_commit_branches_guard_identity_and_url_edits_drop_validators() {
     );
     assert!(source.contains("subscription_url_changed(&arr[idx], &subscription)"));
     let update =
-        crate::commands::guard_scan::top_level_fn_body(&source, "pub fn subscription_update(");
+        crate::commands::guard_scan::top_level_fn_body(&source, "fn subscription_update_core(");
     assert!(
         update.find("subscription_url_changed(").unwrap() < update.find("set_or_remove(").unwrap()
     );

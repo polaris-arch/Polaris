@@ -1055,3 +1055,54 @@ fn mutation_scope_releases_on_error_and_unwind() {
     assert!(unwound.is_err());
     let _next_scope = store.mutation_lock().unwrap();
 }
+
+#[test]
+fn migration_preserves_existing_payload_even_when_unverified() {
+    let (root, store, uid) = store();
+    let (source, manifest) = fixture("migration");
+    assert_eq!(
+        store
+            .install_preserving(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
+        InstallOutcome::Installed
+    );
+    let payload = root
+        .path()
+        .join("versions")
+        .join(&manifest.id)
+        .join("sing-box");
+    let receipt = root
+        .path()
+        .join("manifests")
+        .join(format!("{}.json", manifest.id));
+    let before = fs::read(&receipt).unwrap();
+    assert_eq!(
+        store
+            .install_preserving(&manifest, source.path(), Some(uid), None)
+            .unwrap(),
+        InstallOutcome::AlreadyPresent
+    );
+    fs::write(&payload, b"damaged old payload").unwrap();
+    assert!(store
+        .install_preserving(&manifest, source.path(), Some(uid), None)
+        .is_err());
+    assert_eq!(fs::read(&payload).unwrap(), b"damaged old payload");
+    assert_eq!(fs::read(&receipt).unwrap(), before);
+    assert_eq!(fs::read_dir(root.path().join(".trash")).unwrap().count(), 0);
+}
+
+#[test]
+fn migration_preserves_orphan_payload_without_manifest() {
+    let (root, store, uid) = store();
+    let (source, manifest) = fixture("migration-orphan");
+    let version = root.path().join("versions").join(&manifest.id);
+    fs::create_dir(&version).unwrap();
+    fs::write(version.join("sing-box"), b"original orphan").unwrap();
+    assert!(store
+        .install_preserving(&manifest, source.path(), Some(uid), None)
+        .is_err());
+    assert_eq!(
+        fs::read(version.join("sing-box")).unwrap(),
+        b"original orphan"
+    );
+}

@@ -1,8 +1,10 @@
+import { configuredExitId } from '@/domain/actual-exit';
+import { IdentityRecoveryEntry } from '@/domain/identity-repair/IdentityRecoveryEntry';
+import { useMobileFormStore } from '../forms/form-store';
 import { cancelMeasurementConsent } from '../MeasurementStartNotice';
 import { useQualifiedLatencies } from '../use-qualified-latencies';
+import { autoSelectTarget } from '@/domain/auto-select-target';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
-import { AutoSelectStatusPanel } from '../AutoSelectStatusPanel';
-import { useAutoSelectStatus } from '@/hooks/use-auto-select-status';
 import { runMobileSpeedTest, useMobileSpeedTestStore, mobileSpeedTestBusy } from '../use-mobile-speed-test';
 /**
  * 移动端「节点」屏的**接线层**：读 store、发 IPC、把结果整形成 `view-model.ts` 的 props。
@@ -104,9 +106,8 @@ import {
   speedTestBlockedMessage,
   speedTestErrorMessage,
 } from '@/components/screens/shared/speedtest-feedback';
-import { serverSwitchErrorText } from '@/domain/action-error-text';
+import { serverSwitchErrorCode, serverSwitchErrorText } from '@/domain/action-error-text';
 import { mobileSwitchReceiptFeedback } from '../mobile-switch-feedback';
-import { IpcError } from '@/ipc';
 import { initialNodesTab } from '@/components/screens/nodes/initial-tab';
 import { canCloneServer, meshSingletonConflict } from '@/domain/endpoint-routes';
 import { editRoute } from '@/lib/staged-config';
@@ -141,10 +142,11 @@ export function MobileNodesScreen(): ReactElement {
   const { t } = useTranslation();
   const config = useEffectiveConfig();
   const savedConfig = useAppStore((s) => s.config);
-  const autoSelectStatus = useAutoSelectStatus(savedConfig);
   const servers = useEffectiveServers();
   const diskServers = useAppStore((s) => s.servers);
   const selectedServerId = useAppStore((s) => s.selectedServerId);
+  const proxyStatus = useAppStore(s => s.proxyStatus);
+  const actualId = configuredExitId(proxyStatus, savedConfig);
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
   const startProxy = useAppStore((s) => s.startProxy);
   const invalidNodes = useAppStore((s) => s.invalidNodes);
@@ -165,12 +167,17 @@ export function MobileNodesScreen(): ReactElement {
     ? tab
     : tab !== null
       ? groups[0]?.id ?? ''
-      : initialNodesTab(groups, selectedServerId) ?? '';
+      : initialNodesTab(groups, actualId) ?? '';
   useEffect(() => {
     if (tab !== null && groups.length > 0 && !groups.some((group) => group.id === tab)) {
       setTab(groups[0].id);
     }
   }, [groups, tab]);
+  useEffect(() => {
+    if (savedConfig?.autoSelectEnabled && savedConfig.selectionIntent) return;
+    if (actualId) setTab(initialNodesTab(groups, actualId));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actualId, savedConfig?.autoSelectEnabled, savedConfig?.selectionIntent !== undefined]);
   const activeGroup = groups.find((g) => g.id === activeTab);
   const activeSub = subscriptions.find((s) => s.id === activeTab);
 
@@ -292,7 +299,7 @@ export function MobileNodesScreen(): ReactElement {
           } else if (feedback) setNotice({ tone: feedback.tone === 'warning' ? 'warn' : 'info', text: feedback.text });
           else if (receipt.status === 'notRunning') setNotice(undefined);
         },
-        (err) => serverSwitchErrorText(err instanceof IpcError ? err.code : undefined, t),
+        (err) => serverSwitchErrorText(serverSwitchErrorCode(err), t),
       );
     },
     [runWrite, switchServer, t],
@@ -509,7 +516,7 @@ export function MobileNodesScreen(): ReactElement {
   );
 
   // ── 安全注脚：TS 出口警示（IA 裁定 #3）──────────────────────────────────────
-  const selectedServer = servers.find((s) => s.id === selectedServerId);
+  const selectedServer = diskServers.find((s) => s.id === actualId);
   const tsId = selectedServer?.protocol?.toLowerCase() === 'tailscale' ? selectedServer.id : undefined;
   const tsLoggedIn = useAppStore((s) => (tsId ? !!s.tailscaleLoginStates[tsId] : false));
   const tsStatus = useAppStore((s) => (tsId ? s.tailscaleStatuses[tsId] : undefined));
@@ -570,7 +577,7 @@ export function MobileNodesScreen(): ReactElement {
         return {
           server,
           sourceLabel: source ? source.kind === 'subscription' ? source.name : t(`nodes.tab.${source.kind}`) : undefined,
-          isCurrent: server.id === selectedServerId,
+          isCurrent: server.id === actualId,
           isExit: mesh,
           lanOnly: mesh && !meshAllowsInternet(server),
           latencyMs: latencyMap[server.id],
@@ -597,6 +604,7 @@ export function MobileNodesScreen(): ReactElement {
       speedTestCaps,
       stagedOnly,
       selectedServerId,
+      actualId,
       latencyMap,
       testedAt,
       invalidIndex,
@@ -766,8 +774,10 @@ export function MobileNodesScreen(): ReactElement {
   return (
     <NodesScreenView
       t={t}
-      autoSelectStatus={<><SavedAutoSelectControls t={t} /><AutoSelectStatusPanel {...autoSelectStatus} t={t}
-        servers={savedConfig?.servers ?? []} subscriptions={savedConfig?.subscriptions ?? []} /></>}
+      autoSelectStatus={<>
+        <IdentityRecoveryEntry onOpen={() => useMobileFormStore.getState().open({ kind: 'identity-repair' })} />
+        {!batchMode && !!activeGroup?.servers.length ? <SavedAutoSelectControls t={t} target={autoSelectTarget(activeGroup)} variant="card" /> : undefined}
+      </>}
       groups={groupTabs}
       activeTab={activeTab}
       onSelectTab={(id) => {

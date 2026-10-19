@@ -4619,16 +4619,10 @@ async fn reassert_follows_latest_selection_across_retries() {
     );
 }
 
-/// **不变式④**：有 `targetServerId` 的规则 → PUT 其 rule-sel；无 `targetServerId` 的规则 → **跳过**
-/// （它们生成时 `default = proxy-selector`，嵌套跟随全局，不需要也不该被单独钉死）。
-///
-/// selector tag 取自 `switch_snapshot.rule_target`（生成侧真值），本例故意让 `r1` 的 tag 带撞名去重
-/// 后缀 `rule-sel-r1 (1)` —— 手拼 `format!("rule-sel-{id}")` 会 PUT 到一个不存在的 tag。
-///
-/// **变异锁**：① 把「无 target 就 continue」改成回落一个默认目标 → 序列里多出 `rule-sel-r2` → 转红；
-/// ② 把 `entry.selector_tag` 换成手拼模板 → 第一条断言的 `rule-sel-r1 (1)` 转红。
+/// Follow-default selectors are reasserted to proxy-selector so cached fixed
+/// choices cannot survive a new reference. Disabled rules are still untouched.
 #[tokio::test]
-async fn reassert_rule_selectors_skips_rules_without_target() {
+async fn reassert_rule_selectors_restores_follow_default_without_pinning_leaf() {
     let mut cfg = reassert_config("node-a");
     cfg["customRules"] = serde_json::json!([
         { "id": "r1", "type": "domain", "values": ["x.com"], "action": "proxy",
@@ -4680,10 +4674,10 @@ async fn reassert_rule_selectors_skips_rules_without_target() {
         vec![
             ("proxy-selector".to_string(), "A".to_string()),
             ("rule-sel-r1 (1)".to_string(), "B".to_string()),
+            ("rule-sel-r2".to_string(), "proxy-selector".to_string()),
             ("rule-sel-app-app1".to_string(), "A".to_string()),
         ],
-        "只 reassert 有 targetServerId 的启用 proxy 规则；无 target（r2）/ 禁用（r3）一律跳过，\
-             且 selector tag 必须取自生成侧真值（含撞名去重后缀）"
+        "restore enabled fixed and follow-default selectors using generated tags"
     );
 }
 

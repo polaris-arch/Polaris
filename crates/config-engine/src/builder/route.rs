@@ -296,7 +296,7 @@ pub fn build_route_config_with_report(
     // mesh 重叠提醒（layer-2 兜底，非阻断）。基准只取「本轮实际会发射 force-route」的节点（与块 0c 同 gate）。
     let mesh_cidrs_for_warn = engaged_mesh_forced_route_cidrs(
         &config.servers,
-        config.selected_server_id.as_deref(),
+        config.effective_selected_server_id(),
         &rule_targeted_server_ids,
         &deps.observed_tailnet_addresses,
     );
@@ -329,7 +329,7 @@ pub fn build_route_config_with_report(
 
     // 出口选中阻断哨兵（proxy-selector 的 default = block）。只用于管理面豁免判据，**不改 user_exit_tag**：
     // 阻断必须经由 selector 表达（改成直写 block 就退化成不可热切、且切出阻断也要重启）。
-    let exit_is_block = is_block_selection(config.selected_server_id.as_deref());
+    let exit_is_block = is_block_selection(config.effective_selected_server_id());
 
     // D4/D7：主节点是「关外网组网节点」时，「→代理」的用户出口整体回退 direct。
     let exit_fallback = mesh_selected_exit_falls_back_to_direct(config);
@@ -765,7 +765,7 @@ pub fn build_route_config_with_report(
         .collect();
     let custom_result = build_custom_rules(
         &custom_rules_for_build,
-        config.selected_server_id.as_deref(),
+        config.effective_selected_server_id(),
         id_to_tag_map,
         selected_server_tag,
         &config.rule_resources,
@@ -978,7 +978,7 @@ pub fn build_route_config_with_report(
             }
             if !should_force_route_subnets(
                 s,
-                config.selected_server_id.as_deref(),
+                config.effective_selected_server_id(),
                 &rule_targeted_server_ids,
             ) {
                 continue;
@@ -1195,7 +1195,7 @@ pub fn build_route_config_with_report(
                 let engaged_reason =
                     if crate::builder::endpoint_routes::mesh_always_routes_subnets(c.server) {
                         "alwaysRouteSubnets"
-                    } else if config.selected_server_id.as_deref() == Some(c.server.id.as_str()) {
+                    } else if config.effective_selected_server_id() == Some(c.server.id.as_str()) {
                         "selected"
                     } else {
                         "ruleTargeted"
@@ -1921,7 +1921,7 @@ pub(super) fn add_local_geo_rule_set(
 ///
 /// pub：hotswitch.rs planHotSwitch 的 route 投影 guard 复用（选中节点 mesh 退回 direct 翻转 → 重启）。
 pub fn mesh_selected_exit_falls_back_to_direct(config: &UserConfig) -> bool {
-    let selected_id = match config.selected_server_id.as_deref() {
+    let selected_id = match config.effective_selected_server_id() {
         Some(s) => s,
         None => return false,
     };
@@ -1940,8 +1940,8 @@ pub fn mesh_selected_exit_falls_back_to_direct(config: &UserConfig) -> bool {
 /// uses this same predicate to enforce `subscriptionProxyPolicy="proxy"` before sending bytes.
 pub fn subscription_update_route_uses_proxy(config: &UserConfig) -> bool {
     config.proxy_mode != ProxyMode::Direct
-        && !is_direct_selection(config.selected_server_id.as_deref())
-        && !is_block_selection(config.selected_server_id.as_deref())
+        && !is_direct_selection(config.effective_selected_server_id())
+        && !is_block_selection(config.effective_selected_server_id())
         && !config.servers.is_empty()
         && !mesh_selected_exit_falls_back_to_direct(config)
 }

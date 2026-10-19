@@ -17,7 +17,7 @@
  */
 export interface TopicPort<T> {
   /** 注册帧监听，返回同步的注销函数。 */
-  onFrame(cb: (data: T) => void): () => void;
+  onFrame(cb: (data: T) => void): (() => void) | Promise<() => void>;
   subscribe(): Promise<void>;
   unsubscribe(): Promise<void>;
 }
@@ -33,23 +33,41 @@ export function createTopicSubscription<T>(
   port: TopicPort<T>,
   onData: (data: T) => void
 ): TopicSubscription {
-  // 先挂监听（不变式 1）。
-  const off = port.onFrame(onData);
+  let off: (() => void) | null = null;
   let subscribed = false;
+  let wanted = false;
   let disposed = false;
 
-  const setWanted = (want: boolean) => {
-    if (disposed || want === subscribed) return;
-    subscribed = want; // 同步置位（不变式 2）
-    const p = want ? port.subscribe() : port.unsubscribe();
-    // IPC 失败不回滚本地态：订阅态以本地为准，dispose 仍会补退订。非 Tauri 环境直接吞。
+  const reconcile = () => {
+    if (disposed || !off || wanted === subscribed) return;
+    subscribed = wanted;
+    const p = subscribed ? port.subscribe() : port.unsubscribe();
     p.catch(() => {});
+  };
+  const registered = (unlisten: () => void) => {
+    if (disposed) { unlisten(); return; }
+    off = unlisten;
+    reconcile();
+  };
+  // A synchronous cleanup handle does not prove native listener readiness.
+  const registration = port.onFrame((data) => { if (!disposed) onData(data); });
+  if (typeof registration === 'function') registered(registration);
+  else void registration.then(registered).catch((error) => {
+    // Never start a producer after failed registration. Remount can retry.
+    if (!disposed) console.error('[stats] listener registration failed:', error);
+  });
+
+  const setWanted = (want: boolean) => {
+    if (disposed) return;
+    wanted = want;
+    reconcile();
   };
 
   const dispose = () => {
     if (disposed) return;
     disposed = true;
-    off();
+    off?.();
+    off = null;
     if (subscribed) {
       subscribed = false;
       port.unsubscribe().catch(() => {});

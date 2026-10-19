@@ -482,13 +482,14 @@ mod sys {
     impl DaemonServices {
         #[must_use]
         pub fn new(config: MacConfig) -> Arc<Self> {
+            let native = Arc::new(NativeCustody::with_upgrade_closed(config.upgrade_closed));
             Arc::new(Self {
                 token: FileTokenStore::new(&config.support_dir),
                 runner: SystemRunner::new(),
                 config,
                 command_mu: Mutex::new(()),
                 child: Mutex::new(None),
-                native: Arc::new(NativeCustody::default()),
+                native,
             })
         }
         #[must_use]

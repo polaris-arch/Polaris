@@ -50,6 +50,23 @@ class MainNativeAdmissionWiringTest {
         assertFalse(AndroidNativeMain.capabilities.contains(AndroidNativeProducer.MainClose))
     }
 
+    @Test fun nativeTerminalEventsCarryExactBirthAndUseTheOriginalStartChannel() {
+        assertTrue(plugin.contains("val lifecycleEvents: Channel? = null"))
+        assertTrue(plugin.contains("nativeTicket, args.lifecycleEvents)"))
+        val event = plugin.substringAfter("private fun lifecycleDeliveryLocked(").substringBefore("enum class StopAdmission")
+        assertTrue(event.contains("current.runId != attempt.runId"))
+        assertTrue(event.contains("current.nativeTicket != attempt.nativeTicket"))
+        assertTrue(event.contains("put(\"birthNonce\", attempt.birthNonce)"))
+        assertTrue(event.contains("Handler(Looper.getMainLooper()).post"))
+        val stop = service.substringAfter("private fun stopService(").substringBefore("private fun onAttemptClosed(")
+        assertTrue(stop.indexOf("!MainKernelAttemptRegistry.isCurrent(attempt)") < stop.indexOf("VpnBridge.publishLifecycle(attempt, \"unavailable\")"))
+        assertTrue(stop.contains("VpnBridge.publishLifecycle(attempt, \"unavailable\")"))
+        assertTrue(service.contains("VpnBridge.takeFinishStop(attempt = attempt)"))
+        val finish = plugin.substringAfter("fun takeFinishStop(").substringBefore("fun finishStop(")
+        assertTrue(finish.indexOf("val terminal = lifecycleDeliveryLocked") < finish.indexOf("request = null"))
+        assertTrue(finish.contains("if (error == null) \"closed\" else \"unavailable\""))
+    }
+
     @Test fun sealDuringPendingToAttemptTransferCannotCreateNativeServer() {
         val ledger = AndroidNativeAdmission("process-1").also { it.bootstrap(RequiredMarkerProof.Absent) }
         val pendingTicket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "run-1")

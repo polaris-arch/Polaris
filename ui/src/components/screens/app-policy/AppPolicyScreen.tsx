@@ -1,3 +1,6 @@
+import type { AutoSelectTarget } from '@/contracts/auto-select';
+import { autoSelectChoice, autoSelectTargetLabel } from '@/domain/auto-select-choice';
+import { autoSelectTarget } from '@/domain/auto-select-target';
 import { appRuleForPick, appRuleDisabled } from './app-policy-logic';
 /**
  * AppPolicyScreen —— 应用分流屏（1:1 提取自原型 polaris-prototype.html L1922-1963 #s-apppolicy）。
@@ -212,7 +215,7 @@ export function AppPolicyScreen() {
       const action = r?.enabled ? r.action : undefined;
       if (action === 'direct') direct++;
       else if (action === 'block') block++;
-      else if (action === 'proxy' && r?.targetServerId) node++;
+      else if (action === 'proxy' && (r?.targetServerId || r?.targetAutoSelect)) node++;
       else followGlobal++;
     });
     return { total: presets.length, followGlobal, node, direct, block };
@@ -257,7 +260,7 @@ export function AppPolicyScreen() {
   };
 
   /** 单一策略提交点（原型 nodeSelMenu onPick 同口径：一次调用把 action+targetServerId 一并落地）。 */
-  const setAppPolicy = (appId: string, action: RuleAction, targetServerId: string | undefined) => {
+  const setAppPolicy = (appId: string, action: RuleAction, targetServerId: string | AutoSelectTarget | undefined) => {
     void applyRule(appId, appRuleForPick(appId, action, targetServerId));
   };
 
@@ -683,7 +686,7 @@ function AppCard({
   subscriptions: SubscriptionConfig[];
   isCustom: boolean;
   removeConfirming: boolean;
-  onPick: (appId: string, action: RuleAction, targetServerId: string | undefined) => void;
+  onPick: (appId: string, action: RuleAction, targetServerId: string | AutoSelectTarget | undefined) => void;
   onRemove: (appId: string) => void;
 }) {
   const { t } = useTranslation();
@@ -700,6 +703,7 @@ function AppCard({
         action={rule?.action ?? 'proxy'}
         disabledRule={appRuleDisabled(rule)}
         targetServerId={rule?.targetServerId}
+        targetAutoSelect={rule?.targetAutoSelect}
         servers={servers}
         subscriptions={subscriptions}
         onPick={onPick}
@@ -742,7 +746,7 @@ function ApRow({
   subscriptions: SubscriptionConfig[];
   isCustom: boolean;
   removeConfirming: boolean;
-  onPick: (appId: string, action: RuleAction, targetServerId: string | undefined) => void;
+  onPick: (appId: string, action: RuleAction, targetServerId: string | AutoSelectTarget | undefined) => void;
   onRemove: (appId: string) => void;
 }) {
   const { t } = useTranslation();
@@ -761,6 +765,7 @@ function ApRow({
         action={rule?.action ?? 'proxy'}
         disabledRule={appRuleDisabled(rule)}
         targetServerId={rule?.targetServerId}
+        targetAutoSelect={rule?.targetAutoSelect}
         servers={servers}
         subscriptions={subscriptions}
         onPick={onPick}
@@ -830,6 +835,7 @@ export function PolicySelector({
   action,
   disabledRule,
   targetServerId,
+  targetAutoSelect,
   servers,
   subscriptions,
   onPick,
@@ -838,11 +844,13 @@ export function PolicySelector({
   action: RuleAction;
   disabledRule?: boolean;
   targetServerId?: string;
+  targetAutoSelect?: AutoSelectTarget;
   servers: ServerConfig[];
   subscriptions: SubscriptionConfig[];
-  onPick: (appId: string, action: RuleAction, targetServerId: string | undefined) => void;
+  onPick: (appId: string, action: RuleAction, targetServerId: string | AutoSelectTarget | undefined) => void;
 }) {
   const { t } = useTranslation();
+  const config = useEffectiveConfig();
   const [open, setOpen] = useState(false);
   const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
   const scheduleReveal = useRevealAfterCommit();
@@ -903,7 +911,7 @@ export function PolicySelector({
     });
   };
 
-  const pick = (nextAction: RuleAction, nextTarget: string | undefined) => {
+  const pick = (nextAction: RuleAction, nextTarget: string | AutoSelectTarget | undefined) => {
     onPick(appId, nextAction, nextTarget);
     setOpen(false);
     anchorRef.current?.focus();
@@ -911,8 +919,8 @@ export function PolicySelector({
 
   const view = disabledRule
     ? { cls: '', dot: '', label: t('rules.disabledBadge') }
-    : appPolicyView(action, targetServerId, servers, t);
-  const curKind: RuleAction | 'node' = action === 'proxy' && targetServerId ? 'node' : action;
+    : targetAutoSelect ? { cls: 'act-proxy', dot: '', label: autoSelectTargetLabel(config, targetAutoSelect, t) } : appPolicyView(action, targetServerId, servers, t);
+  const curKind: RuleAction | 'node' = action === 'proxy' && (targetServerId || targetAutoSelect) ? 'node' : action;
 
   return (
     <>
@@ -955,6 +963,7 @@ export function PolicySelector({
           {groups.length > 0 && (
             <>
               <div className="mm-sep" />
+              {config?.autoSelectEnabled && <button type="button" className="mi" role="menuitem" onClick={() => pick('proxy', { scope: 'global' })}>{autoSelectTargetLabel(config, { scope: 'global' }, t)}{targetAutoSelect?.scope === 'global' && <CheckMark />}</button>}
               <div className="mm-lbl">{t('appPolicy.summary.node')}</div>
               {groups.map((g) => {
                 const groupOpen = openGroups.has(g.id);
@@ -992,6 +1001,7 @@ export function PolicySelector({
                       <span>{groupLabel}</span>
                       <span className="ns-c">{g.servers.length}</span>
                     </button>
+                    {groupOpen && config?.autoSelectEnabled && g.servers.length > 0 && <button type="button" className="mi ns-node" role="menuitem" onClick={() => pick('proxy', autoSelectTarget(g))}>{t('autoSelect.auto')}{targetAutoSelect && autoSelectChoice(targetAutoSelect) === autoSelectChoice(autoSelectTarget(g)) && <CheckMark />}</button>}
                     {groupOpen &&
                       g.servers.map((s) => (
                         <button

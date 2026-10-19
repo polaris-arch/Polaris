@@ -4,6 +4,7 @@ fn custom_host_arrays_are_redacted_in_complete_report() {
     let report = crate::diagnostic_report::assemble_diagnostic_report(
         &crate::diagnostic_report::DiagnosticReportSource {
             user_config: config.clone(),
+            running_secret_keys: Default::default(),
             singbox_config: config,
             ..Default::default()
         },

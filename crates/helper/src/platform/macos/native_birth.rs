@@ -79,6 +79,16 @@ pub(super) struct NativeCustody {
 }
 
 impl NativeCustody {
+    /// Seed the existing admission fence before publishing services or opening a listener.
+    pub(super) fn with_upgrade_closed(upgrade_closed: bool) -> Self {
+        Self {
+            slot: Mutex::new(Slot {
+                closing: upgrade_closed,
+                ..Slot::default()
+            }),
+        }
+    }
+
     pub(super) fn caller_may_stop(&self, uid: Option<u32>, target: HelperBirthTarget) -> bool {
         let Some(uid) = uid else {
             return false;

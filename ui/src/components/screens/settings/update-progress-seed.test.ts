@@ -210,3 +210,46 @@ describe('退订原样透传（卸载后不得再写已卸载组件的 state）'
     expect(h.unsubscribed()).toBe(1);
   });
 });
+
+describe('asynchronous native registration', () => {
+  function pendingRegistration() {
+    let ready!: (off: () => void) => void;
+    let reject!: (error: Error) => void;
+    let emit!: (frame: UpdateProgress) => void;
+    let snapshot!: (frame: UpdateProgress) => void;
+    const calls: string[] = [];
+    const patches: UpdateCardPatch[] = [];
+    const dispose = wireUpdateProgress({
+      subscribe: (callback) => { emit = callback; return new Promise((resolve, fail) => { ready = resolve; reject = fail; }); },
+      readSnapshot: () => { calls.push('read'); return new Promise((resolve) => { snapshot = resolve; }); },
+      resetIntegrity: () => {},
+      applyPatch: (patch) => patches.push(patch),
+    });
+    return { calls, patches, dispose, emit: (frame: UpdateProgress) => emit(frame),
+      ready: () => ready(() => calls.push('off')), reject: () => reject(new Error('registration failed')),
+      snapshot: (frame: UpdateProgress) => snapshot(frame) };
+  }
+  it('awaits readiness before snapshot and preserves newer terminal event', async () => {
+    const h = pendingRegistration();
+    expect(h.calls).toEqual([]);
+    h.ready(); await Promise.resolve();
+    expect(h.calls).toEqual(['read']);
+    h.emit(DOWNLOADED); h.snapshot(DOWNLOADING_47); await Promise.resolve();
+    expect(h.patches.map((p) => p.us)).toEqual(['downloaded']);
+    h.dispose(); h.emit(DOWNLOADING_47);
+    expect(h.patches).toHaveLength(1);
+  });
+  it('disposal before readiness releases late listener without snapshot', async () => {
+    const h = pendingRegistration(); h.dispose(); h.ready(); await Promise.resolve();
+    expect(h.calls).toEqual(['off']); expect(h.patches).toEqual([]);
+  });
+  it('late snapshot cannot mutate disposed consumer', async () => {
+    const h = pendingRegistration(); h.ready(); await Promise.resolve();
+    h.dispose(); h.snapshot(DOWNLOADED); await Promise.resolve();
+    expect(h.patches).toEqual([]);
+  });
+  it('registration failure never reads an unprotected snapshot', async () => {
+    const h = pendingRegistration(); h.reject(); await Promise.resolve(); await Promise.resolve();
+    expect(h.calls).toEqual([]); h.dispose();
+  });
+});

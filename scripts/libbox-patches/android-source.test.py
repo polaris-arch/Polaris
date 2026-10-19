@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finite host fixtures: real provider/Git replay; tool, bind and JNI callees are stubs."""
+"""Historical receipt fixtures: provider/Git replay with stub tools; producer stays retired."""
 import ast
 import copy
 import importlib.util
@@ -51,6 +51,51 @@ def repository(path, files):
     git('add', '-A', cwd=path)
     git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@invalid', 'commit', '-qm', 'fixture', cwd=path)
     return git('rev-parse', 'HEAD', cwd=path)
+
+
+class RetiredAndroidProducerContract(unittest.TestCase):
+    def test_main_is_only_an_unconditional_refusal(self):
+        tree = ast.parse((HERE / 'build.py').read_text())
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        self.assertEqual(len(main.body), 1)
+        self.assertIsInstance(main.body[0], ast.Raise)
+        call = main.body[0].exc
+        self.assertIsInstance(call, ast.Call)
+        self.assertEqual(call.func.id, 'RuntimeError')
+        message = ast.literal_eval(call.args[0])
+        self.assertIn('retired', message)
+        self.assertIn('bash scripts/build-mobile-core.sh android', message)
+        self.assertIn('scripts/mobile-core/README.md', message)
+
+    def test_wrapper_refuses_without_delegating_or_accessing_source(self):
+        source = (ROOT / 'scripts/build-libbox.sh').read_text()
+        commands = [line for line in source.splitlines() if line and not line.startswith('#')]
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(commands[0], 'set -euo pipefail')
+        self.assertTrue(commands[1].startswith("printf '%s\\n' "))
+        self.assertTrue(commands[1].endswith(' >&2'))
+        self.assertIn('retired', commands[1])
+        self.assertIn('bash scripts/build-mobile-core.sh android', commands[1])
+        self.assertEqual(commands[2], 'exit 1')
+
+    def test_release_filter_verifier_and_uploaded_reports_cover_admitted_fixtures(self):
+        source = (ROOT / '.github/workflows/android.yml').read_text()
+        classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest',
+                   'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest',
+                   'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest',
+                   'MainNativeAdmissionWiringTest']
+        declared = re.search(r'^          classes = (\[[^\n]+\])$', source, re.M)
+        self.assertIsNotNone(declared)
+        self.assertEqual(ast.literal_eval(declared.group(1)), classes)
+        for name in classes:
+            self.assertEqual(source.count('--tests com.polaris2.app.vpn.' + name + ' '), 1)
+            report = 'src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.' + name + '.xml'
+            self.assertEqual(source.count(report), 1)
+            fixture = ROOT / 'src-tauri/gen/android/app/src/test/java/com/polaris2/app/vpn' / (name + '.kt')
+            methods = re.findall(r'^\s*@Test(?:\([^\n)]*\))?\s+fun\s+(\w+)\s*\(', fixture.read_text(), re.M)
+            self.assertTrue(methods, name)
+            self.assertEqual(len(methods), len(set(methods)), name)
+        self.assertNotIn('--tests com.polaris2.app.vpn.DebugTransientCloseTimeoutTest', source)
 
 
 class AndroidSourceFixture(unittest.TestCase):
@@ -231,7 +276,7 @@ class AndroidSourceFixture(unittest.TestCase):
         self.core['sourceBuild']['sourceReceiptFingerprint'] = None
         self.write_configuration()
         with patch.object(builder.android, 'tools', side_effect=AssertionError('tool accessed')), patch.object(builder, 'run', side_effect=AssertionError('repo/Go accessed')), patch.object(sys, 'argv', ['build.py']):
-            with self.assertRaisesRegex(RuntimeError, 'not frozen'):
+            with self.assertRaisesRegex(RuntimeError, 'retired'):
                 builder.main()
         with patch.object(verifier.android, 'tools', side_effect=AssertionError('tool/cache accessed')), patch.object(sys, 'argv', ['verify-receipt.py']):
             with self.assertRaisesRegex(RuntimeError, 'not frozen'):
@@ -267,7 +312,7 @@ class AndroidSourceFixture(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'provider hash'):
             android.admit()
 
-    def test_empty_dependency_graph_admits_replays_and_builds_without_module_sources(self):
+    def test_empty_dependency_graph_admits_replays_and_verifies_without_module_sources(self):
         self.use_empty_dependencies()
         self.assertEqual([row for row in self.calls if row[0] == 'provider-go-stub'], [], 'empty replay must not need Go')
         self.calls.clear()
@@ -308,21 +353,12 @@ class AndroidSourceFixture(unittest.TestCase):
         self.core['sourceBuild']['dependencyModules'] = []
         self.write_configuration()
         android.admit()
-        temporary = tempfile.TemporaryDirectory
-        def checkout_directory(**kwargs):
-            return temporary(prefix='actual-builder-checkout-', dir=self.root)
-        with patch.object(android, 'provider', return_value=self.shared), patch.object(android, 'tools', return_value=self.tool), patch.object(android, 'candidate', return_value=self.source['sourceCommit']), patch.object(builder, 'run', side_effect=self.callee), patch.object(builder.tempfile, 'TemporaryDirectory', side_effect=checkout_directory), patch.object(sys, 'argv', ['build.py', str(self.upstream)]):
-            builder.main()
-            built = json.loads((self.patches / 'build-receipt.json').read_bytes())
-            self.assertEqual(len([row for row in self.calls if row[0] == 'builder-callee-stub' and 'bind' in row[1]]), 1)
-            scratch = self.root / 'verify-empty'
-            scratch.mkdir()
-            builder.verify_component(self.app / 'src-tauri/gen/android/app/libs/libbox.aar', built, self.source, self.core,
-                                     self.policy, self.tool, self.identity, scratch)
+        aar, scratch, receipt = self.historical_component_fixture('empty')
+        with patch.object(android, 'provider', return_value=self.shared), patch.object(builder, 'run', side_effect=self.callee):
+            builder.verify_component(aar, receipt, self.source, self.core, self.policy, self.tool, self.identity, scratch)
         with patch.object(sys, 'argv', ['build.py', str(self.upstream), '']):
-            with self.assertRaises(SystemExit) as refused:
+            with self.assertRaisesRegex(RuntimeError, 'retired'):
                 builder.main()
-            self.assertEqual(refused.exception.code, 2)
 
     def test_source_receipt_scope_query_manifest_and_buildtree(self):
         android.admit()
@@ -443,31 +479,28 @@ class AndroidSourceFixture(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'SDK bootclasspath SHA'):
                 android.tools(self.source, policy, tool_callee)
 
-    def test_real_provider_to_original_tests_bind_and_shared_cache_predicate(self):
-        original_provision = self.shared.provision
-        def provision(*args):
-            self.calls.append(('actual-provider', args))
-            return original_provision(*args)
-        self.shared.provision = provision
-        temporary = tempfile.TemporaryDirectory
-        def checkout_directory(**kwargs):
-            return temporary(prefix='actual-builder-checkout-', dir=self.root)
-        with patch.object(android, 'provider', return_value=self.shared), patch.object(android, 'tools', return_value=self.tool), patch.object(android, 'candidate', return_value=self.source['sourceCommit']), patch.object(builder, 'run', side_effect=self.callee), patch.object(builder.tempfile, 'TemporaryDirectory', side_effect=checkout_directory), patch.object(sys, 'argv', ['build.py', str(self.upstream), *['--module-source=' + module + '=' + str(path) for module,path in self.repositories.items()]]):
-            builder.main()
-            receipt = json.loads((self.patches / 'build-receipt.json').read_bytes())
-            actual_provider = next(row for row in self.calls if row[0] == 'actual-provider')
-            checkout = actual_provider[1][2]
-            bind = [row for row in self.calls if row[0] == 'builder-callee-stub' and 'bind' in row[1]]
-            self.assertEqual(len(bind), 1)
-            self.assertEqual(bind[0][2], checkout)
-            self.assertEqual(bind[0][1][bind[0][1].index('-bootclasspath') + 1], str(self.tool['jar']))
-            self.assertIn(self.shared.source_linker_flag(self.source_receipt), bind[0][1][bind[0][1].index('-ldflags') + 1])
-            tests = [row for row in self.calls if row[0] == 'builder-callee-stub' and 'test' in row[1]]
-            self.assertEqual(len(tests), 7)
-            self.assertTrue(all(row[2] == checkout for row in tests))
-            scratch = self.root / 'verify'
-            scratch.mkdir()
-            aar = self.app / 'src-tauri/gen/android/app/libs/libbox.aar'
+    def historical_component_fixture(self, name):
+        # Assemble synthetic historical observations directly, never via a producer.
+        aar, scratch = self.root / (name + '.aar'), self.root / (name + '-inspection')
+        scratch.mkdir()
+        self.artifact(aar)
+        with patch.object(android, 'provider', return_value=self.shared), patch.object(builder, 'run', side_effect=self.callee):
+            observed = builder.inspect_aar(aar, scratch, self.source, self.core, self.policy, self.tool, self.source_receipt)
+            receipt = {'schema': 'polaris-android-libbox-receipt-v1',
+                       'componentProducerCandidate': self.source['sourceCommit'],
+                       'sourceCommit': self.source['sourceCommit'], 'officialTag': 'v' + self.core['bundledCoreVersion'],
+                       'version': self.core['sourceBuild']['version'], 'sourceReceipt': self.source_receipt,
+                       'androidInput': self.identity, 'linkerFlags': android.linker_flags(self.core, self.shared, self.source_receipt),
+                       'buildVCS': False, 'tests': 'synthetic historical fixture; no producer, SDK or native execution',
+                       'validationCleanupContract': {'version': 'polaris-validation-v1', 'constructedBoxCleanup': 'CleanupUnknown', 'exactCleanupEnabled': False},
+                       **observed}
+            receipt['aar']['path'] = 'src-tauri/gen/android/app/libs/libbox.aar'
+            receipt['outputFingerprint'] = android.digest(android.canonical(receipt))
+        return aar, scratch, receipt
+
+    def test_historical_shared_cache_predicate(self):
+        aar, scratch, receipt = self.historical_component_fixture('historical')
+        with patch.object(android, 'provider', return_value=self.shared), patch.object(builder, 'run', side_effect=self.callee):
             builder.verify_component(aar, receipt, self.source, self.core, self.policy, self.tool, self.identity, scratch)
             for field, value in [('schema',None),('androidInput',{'fingerprint':'stock'}),('sourceReceipt',{}),('outputFingerprint','0'*64)]:
                 wrong = copy.deepcopy(receipt)
@@ -493,29 +526,6 @@ class AndroidSourceFixture(unittest.TestCase):
             self.artifact(aar, alignment=4096)
             with self.assertRaisesRegex(RuntimeError, '16K'):
                 builder.verify_component(aar, receipt, self.source, self.core, self.policy, self.tool, self.identity, scratch)
-
-    def test_host_libbox_registry_tags_match_file_selection_and_test(self):
-        self.test_real_provider_to_original_tests_bind_and_shared_cache_predicate()
-        expected = ['with_tailscale', 'with_tailscale,with_ccm',
-                    'with_tailscale,with_ocm', 'with_tailscale,with_ccm,with_ocm']
-        calls = [row[1] for row in self.calls if row[0] == 'builder-callee-stub']
-        lists = [args for args in calls if args[1] == 'list' and './experimental/libbox' in args]
-        tests = [args for args in calls if args[1] == 'test' and
-                 any(str(value).endswith('/config_validation_test.go') for value in args)]
-        self.assertEqual(len(lists), 4)
-        self.assertEqual(len(tests), 4)
-        for commands in (lists, tests):
-            self.assertEqual([args[args.index('-tags') + 1] if '-tags' in args else ''
-                              for args in commands], expected)
-        for args in tests:
-            self.assertIn('-race', args)
-            self.assertIn('-ldflags=-checklinkname=0', args)
-            self.assertEqual(args[args.index('-count=1')], '-count=1')
-        ordinary = [args for args in calls if args[1] == 'test' and args not in tests]
-        self.assertEqual(len(ordinary), 3)
-        self.assertTrue(all('-tags' not in args for args in ordinary))
-        bind = next(args for args in calls if 'bind' in args)
-        self.assertEqual(bind[bind.index('-tags') + 1], ','.join(self.source['buildTags']))
 
     def test_host_libbox_tags_reject_missing_capability_and_unknown_optionals(self):
         self.assertEqual(builder.libbox_test_tags(self.source), 'with_tailscale')

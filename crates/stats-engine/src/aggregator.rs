@@ -801,16 +801,17 @@ impl StatsAggregator {
         let down_total = status.downlink_total.max(0) as u64;
 
         let (up_speed, down_speed) = match self.last_status {
-            Some((t0, u0, d0)) => {
-                // Δt 用**实测**毫秒差；下限 1ms 防除零（服务端 ticker 正常在秒级，落到这个下限
-                // 只可能是同一毫秒内的重复帧，此时差分也几乎恒为 0）。
-                let dt = ((at_ms.saturating_sub(t0)) as f64 / 1000.0).max(0.001);
+            Some((t0, u0, d0)) if at_ms > t0 => {
+                // The guard proves a positive observed interval; never invent one.
+                let dt = (at_ms - t0) as f64 / 1000.0;
                 (
                     (up_total.saturating_sub(u0) as f64 / dt).round() as u64,
                     (down_total.saturating_sub(d0) as f64 / dt).round() as u64,
                 )
             }
-            None => (0, 0),
+            // Equal/backwards observation times do not prove a rate window.
+            // Re-prime instead of manufacturing a 1ms interval and a spike.
+            _ => (0, 0),
         };
         self.last_status = Some((at_ms, up_total, down_total));
 

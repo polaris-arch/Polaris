@@ -183,6 +183,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     func settingsGeneration() -> UInt64 { lifecycle.currentGeneration() }
     func acceptsSettings(_ token: UInt64) -> Bool { lifecycle.accepts(token) }
+    func publishSettings(_ token: UInt64, publication: () -> Bool) -> Bool {
+        lifecycle.publishSettings(token, publication: publication)
+    }
     func settingsTimedOut(_ token: UInt64, error: Error) {
         lifecycle.settingsUncertain(token, error.localizedDescription)
         publishReport()

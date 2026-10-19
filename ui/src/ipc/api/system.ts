@@ -12,7 +12,7 @@ import type {
 /** Helper 安装/卸载的稳定业务失败码；与 Rust `HelperActionErrorCode` 对齐。 */
 export type HelperActionErrorCode =
   | 'cancelled'
-  | 'authorizationUnavailable'
+  | 'authorizationIncomplete'
   | 'partialCleanup'
   | 'proxyRunning'
   | 'unsupported'
@@ -27,6 +27,9 @@ export type HelperActionErrorCode =
   | 'upgradeDeferred'
   | 'failed';
 
+/** Only an explicit user confirmation may select the disruptive macOS mode. */
+export type HelperInstallMode = 'ordinary' | 'stopAndUpgrade';
+
 export interface HelperActionResult {
   success: boolean;
   errorCode?: HelperActionErrorCode;
@@ -40,7 +43,7 @@ export interface HelperActionResult {
 // ============================================================================
 
 export const autoStartApi = {
-  async set(enabled: boolean): Promise<boolean> {
+  async set(enabled: boolean): Promise<void> {
     return invoke(IPC_CHANNELS.AUTO_START_SET, { enabled });
   },
 
@@ -190,8 +193,9 @@ export const helperApi = {
   },
 
   /** 安装/修复 helper（弹一次管理员授权框）。 */
-  async install(): Promise<HelperActionResult> {
-    return invoke(IPC_CHANNELS.HELPER_INSTALL);
+  async install(mode?: HelperInstallMode): Promise<HelperActionResult> {
+    if (mode === undefined) return invoke(IPC_CHANNELS.HELPER_INSTALL);
+    return invoke(IPC_CHANNELS.HELPER_INSTALL, { mode });
   },
 
   /** 卸载 helper（弹一次管理员授权框）。 */

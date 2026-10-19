@@ -211,7 +211,7 @@ fn network_profile_ref_must_exist_in_the_config_being_written() {
 #[test]
 fn rule_writes_check_network_profile_ref_inside_the_transaction() {
     let src = crate_code("commands/rules/crud.rs");
-    for head in ["pub fn rules_add(", "pub fn rules_update("] {
+    for head in ["pub async fn rules_add(", "pub async fn rules_update("] {
         let body = top_level_fn_body(&src, head);
         let tx = body
             .find("state.config().update(|cfg|")
@@ -447,4 +447,119 @@ fn concurrent_guarded_edits_have_one_winner_under_the_real_config_writer_fence()
         expected["remarks"] = saved[0]["remarks"].clone();
         assert_eq!(saved[0], expected, "the winning edit changes only remarks");
     }
+}
+
+#[test]
+fn add_identity_retry_conflict_and_reorder_remain_unambiguous() {
+    let mut current = rules(&["one"]);
+    assert_eq!(admit_rule_add(&current, &current[0]), Ok(false));
+    let mut conflict = current[0].clone();
+    conflict["enabled"] = json!(false);
+    assert!(admit_rule_add(&current, &conflict).is_err());
+    let next = rules(&["two"]).remove(0);
+    assert_eq!(admit_rule_add(&current, &next), Ok(true));
+    current.push(next);
+    assert!(plan_reorder(&current, &want(&["two", "one"])).unwrap().is_some());
+    let dns = Vec::new();
+    assert_eq!(admit_rule_add(&dns, &current[0]), Ok(true));
+    current.push(current[0].clone());
+    assert!(admit_rule_add(&current, &current[0]).is_err());
+    assert!(plan_reorder(&current, &want(&["one", "two", "one"])).is_err());
+}
+
+#[test]
+fn same_id_concurrent_admissions_under_writer_fence_never_append_twice() {
+    let current = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut workers = Vec::new();
+    for enabled in [true, false] {
+        let current = current.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut incoming = rules(&["one"]).remove(0);
+            incoming["enabled"] = json!(enabled);
+            let mut guard = current.lock().unwrap();
+            let result = admit_rule_add(&guard, &incoming);
+            if result == Ok(true) {
+                guard.push(incoming);
+            }
+            result
+        }));
+    }
+    let outcomes: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+    assert_eq!(outcomes.iter().filter(|result| **result == Ok(true)).count(), 1);
+    assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(current.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn add_identity_admission_and_reorder_validation_are_inside_writer_transaction() {
+    let src = crate_code("commands/rules/crud.rs");
+    let add = top_level_fn_body(&src, "pub async fn rules_add(");
+    assert!(add.find("state.config().update(|cfg|").unwrap()
+        < add.find("admit_rule_add(&rules, &new_rule)").unwrap());
+    assert!(add.find("admit_rule_add(&rules, &new_rule)").unwrap()
+        < add.find("rules.push(new_rule)").unwrap());
+    assert!(add.contains("ERR_RULE_CONFLICT"));
+    let reorder = top_level_fn_body(&src, "pub fn rules_reorder(");
+    assert!(reorder.find("validate_rule_ids(&rules)").unwrap()
+        < reorder.find("let by_id:").unwrap());
+}
+
+#[test]
+fn syntax_admission_extracts_only_effective_regex_values_without_rewriting() {
+    let original = json!({"type":"domainRegex", "values":[r"\p{ASCII}", "[[:x]"]});
+    assert_eq!(regex_patterns(&original), vec![r"\p{ASCII}".to_string(), "[[:x]".to_string()]);
+    let multi = json!({"type":"domainRegex", "values":["ignored-mirror"],
+        "conditions":[{"type":"domain", "values":["example.com"]},
+                      {"type":"domainRegex", "values":[r"\Q[\E"]}]});
+    assert_eq!(regex_patterns(&multi), vec![r"\Q[\E".to_string()]);
+}
+#[test]
+fn syntax_admission_is_before_write_and_entity_check_is_after_await() {
+    let src = crate_code("commands/rules/crud.rs");
+    for head in ["pub async fn rules_add(", "pub async fn rules_update("] {
+        let body = top_level_fn_body(&src, head);
+        assert!(body.find("admit_patterns(").unwrap() < body.rfind("state.config().update(|cfg|").unwrap());
+    }
+    let body = top_level_fn_body(&src, "pub async fn rules_update(");
+    assert!(body.find(".await").unwrap() < body.find("rules[idx] != observed").unwrap());
+    assert!(body.contains("!old_patterns.contains(p)"));
+}
+
+#[test]
+fn delete_preserves_expected_fence_without_update_only_observed_binding() {
+    let src = crate_code("commands/rules/crud.rs");
+    let body = top_level_fn_body(&src, "pub fn rules_delete(");
+    assert!(!body.contains("observed"));
+    assert!(!body.contains("Decision::Skip(Err(("));
+    assert!(body.contains("expected_rule_matches("));
+    let update = top_level_fn_body(&src, "pub async fn rules_update(");
+    assert!(update.contains("rules[idx] != observed"));
+}
+#[test]
+fn legacy_long_regex_shape_and_unchanged_diff_remain_editable() {
+    let pattern = "a".repeat(1025);
+    let mut original = json!({"id":"legacy", "type":"domainRegex", "values":[pattern], "action":"direct", "enabled":true});
+    let old_patterns = regex_patterns(&original);
+    original["remarks"] = json!("renamed");
+    assert!(validate_rule_payload(&original).is_ok());
+    let changed: Vec<_> = regex_patterns(&original).into_iter().filter(|p| !old_patterns.contains(p)).collect();
+    assert!(changed.is_empty());
+
+}
+
+#[test]
+fn add_retry_preflight_skips_checker_but_final_admission_is_repeated() {
+    let src = crate_code("commands/rules/crud.rs");
+    let add = top_level_fn_body(&src, "pub async fn rules_add(");
+    let checker = add.find("admit_patterns(").unwrap();
+    let preflight = &add[..checker];
+    assert!(preflight.contains("state.config().update(|cfg|"));
+    assert!(preflight.contains("Decision::Skip(admit_rule_add(&rules, &new_rule))"));
+    assert!(!preflight.contains("Decision::Write"));
+    assert!(preflight.contains("Ok((Ok(false), None)) => return ApiResponse::ok(new_rule)"));
+    assert!(preflight.contains("Ok((Err(msg), None)) => return ApiResponse::err_with_code(msg, ERR_RULE_CONFLICT)"));
+    let final_admission = &add[checker..];
+    assert!(final_admission.find(".await").unwrap() < final_admission.find("state.config().update(|cfg|").unwrap());
+    assert!(final_admission.find("admit_rule_add(&rules, &new_rule)").unwrap() < final_admission.find("rules.push(new_rule)").unwrap());
+    assert_eq!(add.matches("admit_rule_add(&rules, &new_rule)").count(), 2);
 }

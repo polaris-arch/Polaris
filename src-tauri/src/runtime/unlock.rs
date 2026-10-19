@@ -193,6 +193,12 @@ struct InvalidatedPayload {
     exit_blocked: bool,
 }
 
+/// Proof that publication is inside this module's epoch commit fence. No public constructor;
+/// callers outside this module cannot invoke the committed sink hooks without admission.
+pub struct UnlockPublicationFence {
+    _private: (),
+}
+
 /// 解锁事件出口（注入抽象）。
 ///
 /// 生产实现 [`BroadcastSink`] 经 `AppHandle` 广播 Tauri 事件；测试实现记录到 `Vec` 供断言——
@@ -205,18 +211,32 @@ pub trait UnlockEventSink {
         true
     }
 
-    /// Runs only a short memory commit. Bound consumers hold their real main/config
+    /// Runs only a short memory commit / synchronous event enqueue. Bound consumers hold their real main/config
     /// fence here; default ordinary consumers retain the existing epoch contract.
     fn with_current_commit(&self, commit: &mut dyn FnMut() -> bool) -> bool {
         self.is_current() && commit()
     }
 
+    /// Committed callbacks below execute inside the short epoch publication fence. Their underlying
+    /// broadcasts must only enqueue: never block, await, or reenter UnlockRuntime. Scheduling stays outside.
     /// 单服务 settle 逐个点亮（`EVENT_UNLOCK_PROGRESS`）。
     fn progress(&self, service_id: &str, result: &UnlockResult);
     /// 一轮完成的完整终态快照（`EVENT_UNLOCK_UPDATED`）。
     fn updated(&self, snapshot: &UnlockSnapshot);
     /// 缓存失效（`EVENT_UNLOCK_INVALIDATED`）。
     fn invalidated(&self, running: bool, exit_blocked: bool);
+
+    /// Already admitted under `with_current_commit` and the detector epoch fence.
+    /// Bound sinks must enqueue directly without reacquiring producer/action locks.
+    fn progress_committed(&self, _fence: &UnlockPublicationFence, service_id: &str, result: &UnlockResult) {
+        self.progress(service_id, result);
+    }
+    fn updated_committed(&self, _fence: &UnlockPublicationFence, snapshot: &UnlockSnapshot) {
+        self.updated(snapshot);
+    }
+    fn invalidated_committed(&self, _fence: &UnlockPublicationFence, running: bool, exit_blocked: bool) {
+        self.invalidated(running, exit_blocked);
+    }
 
     /// **invalidate 后的主进程侧去抖自跑**（上游 `scheduleUnlockSelfRun`，`index.ts:1774-1789`）。
     ///
@@ -240,42 +260,55 @@ pub trait UnlockEventSink {
 }
 
 /// 生产事件出口：经 `AppHandle` 广播给所有 webview。
+enum UnlockEvent {
+    Progress(UnlockProgress),
+    Updated(UnlockSnapshot),
+    Invalidated(InvalidatedPayload),
+}
+
+#[derive(Default)]
+struct UnlockEventQueue {
+    sender: Option<tokio::sync::mpsc::UnboundedSender<UnlockEvent>>,
+    task: Option<tokio::task::AbortHandle>,
+    closed: bool,
+}
+
 pub struct BroadcastSink<'a> {
     handle: &'a AppHandle,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<UnlockEvent>>,
 }
 
 impl<'a> BroadcastSink<'a> {
     #[must_use]
     pub fn new(handle: &'a AppHandle) -> Self {
-        Self { handle }
+        use tauri::Manager;
+        let sender = handle.try_state::<crate::runtime::AppRuntime>()
+            .and_then(|runtime| runtime.unlock.event_sender(handle));
+        Self { handle, sender }
+    }
+}
+
+impl BroadcastSink<'_> {
+    fn enqueue(&self, event: UnlockEvent) {
+        // All unlock event kinds share one FIFO. Never invoke Tauri emit under producer locks:
+        // emit can synchronously invoke Rust listeners. No per-event spawn/reordering.
+        if let Some(sender) = &self.sender { let _ = sender.send(event); }
     }
 }
 
 impl UnlockEventSink for BroadcastSink<'_> {
     fn progress(&self, service_id: &str, result: &UnlockResult) {
-        broadcast(
-            self.handle,
-            EVENT_UNLOCK_PROGRESS,
-            UnlockProgress {
-                service_id: service_id.to_string(),
-                result: result.clone(),
-            },
-        );
+        self.enqueue(UnlockEvent::Progress(UnlockProgress {
+            service_id: service_id.to_string(), result: result.clone(),
+        }));
     }
 
     fn updated(&self, snapshot: &UnlockSnapshot) {
-        broadcast(self.handle, EVENT_UNLOCK_UPDATED, snapshot.clone());
+        self.enqueue(UnlockEvent::Updated(snapshot.clone()));
     }
 
     fn invalidated(&self, running: bool, exit_blocked: bool) {
-        broadcast(
-            self.handle,
-            EVENT_UNLOCK_INVALIDATED,
-            InvalidatedPayload {
-                running,
-                exit_blocked,
-            },
-        );
+        self.enqueue(UnlockEvent::Invalidated(InvalidatedPayload { running, exit_blocked }));
     }
 
     /// 生产实现：取得受管 runtime 的去抖 task 槽，先取消上一只 timer，再等
@@ -357,8 +390,9 @@ pub fn selected_exit_changed(old_selected: Option<&str>, new_selected: Option<&s
 ///
 /// 持有 epoch（归属 bracket）+ 快照缓存；每轮使用的出口 pin HTTP 由调用方显式注入 `run`。
 pub struct UnlockRuntime {
-    /// Serializes all detector commits with invalidate. Never held across await or events.
+    /// Serializes all detector commits with invalidate. Never held across await or actual event delivery; only FIFO enqueue is allowed.
     commit_lock: Mutex<()>,
+    event_queue: Mutex<UnlockEventQueue>,
     /// 归属世代：invalidate 递增，作废在飞轮的 commit（别把旧出口结果标给新出口）。
     epoch: AtomicU64,
     /// 最近一轮的终态快照（TTL 内 `unlock_get` 零网络水合）。
@@ -393,6 +427,7 @@ impl Default for UnlockRuntime {
     fn default() -> Self {
         Self {
             commit_lock: Mutex::new(()),
+            event_queue: Mutex::new(UnlockEventQueue::default()),
             epoch: AtomicU64::new(0),
             cache: Mutex::new(None),
             run_lock: tokio::sync::Mutex::new(()),
@@ -407,6 +442,7 @@ impl Default for UnlockRuntime {
 
 impl Drop for UnlockRuntime {
     fn drop(&mut self) {
+        self.shutdown_events();
         let slot = self
             .self_run_task
             .get_mut()
@@ -418,6 +454,42 @@ impl Drop for UnlockRuntime {
 }
 
 impl UnlockRuntime {
+    fn event_sender(&self, app: &AppHandle) -> Option<tokio::sync::mpsc::UnboundedSender<UnlockEvent>> {
+        let mut queue = self.event_queue.lock().ok()?;
+        if queue.closed { return None; }
+        if queue.sender.is_none() {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let app = app.clone();
+            let task = tauri::async_runtime::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    match event {
+                        UnlockEvent::Progress(payload) => broadcast(&app, EVENT_UNLOCK_PROGRESS, payload),
+                        UnlockEvent::Updated(payload) => broadcast(&app, EVENT_UNLOCK_UPDATED, payload),
+                        UnlockEvent::Invalidated(payload) => broadcast(&app, EVENT_UNLOCK_INVALIDATED, payload),
+                    }
+                }
+            });
+            queue.task = Some(task.inner().abort_handle());
+            queue.sender = Some(sender);
+        }
+        queue.sender.clone()
+    }
+
+    /// Final application exit discards pending UI notifications; no new dispatcher can be created.
+    /// Normal stop/reconnect does NOT close this queue: its invalidation must stay in FIFO order.
+    pub(crate) fn shutdown_events(&self) {
+        if let Ok(mut queue) = self.event_queue.lock() {
+            queue.closed = true;
+            queue.sender.take();
+            if let Some(task) = queue.task.take() { task.abort(); }
+        }
+    }
+
+    /// Command-level blocked results use the same epoch admission and ordered sink as detector results.
+    pub(crate) fn publish_terminal<S: UnlockEventSink>(&self, sink: &S, epoch: u64, snapshot: &UnlockSnapshot) -> bool {
+        self.commit_epoch(sink, epoch, |fence| sink.updated_committed(fence, snapshot))
+    }
+
     /// 安装最新自跑 timer，并 abort 被取代的任务。并发 schedule 可能乱序进入本方法，
     /// 因此同时核对原子真值源和槽内 token，旧代永远不能反向取消新代。
     fn install_self_run_task(&self, token: u64, task: tokio::task::AbortHandle) {
@@ -492,7 +564,7 @@ impl UnlockRuntime {
         &self,
         sink: &S,
         epoch: u64,
-        commit: impl FnOnce(),
+        commit: impl FnOnce(&UnlockPublicationFence),
     ) -> bool {
         let mut commit = Some(commit);
         sink.with_current_commit(&mut || {
@@ -503,7 +575,7 @@ impl UnlockRuntime {
                 return false;
             }
             if let Some(commit) = commit.take() {
-                commit();
+                commit(&UnlockPublicationFence { _private: () });
             }
             true
         })
@@ -557,9 +629,11 @@ impl UnlockRuntime {
                 .commit_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.invalidate_locked(false)
+            let token = self.invalidate_locked(false);
+            let fence = &UnlockPublicationFence { _private: () };
+            sink.invalidated_committed(fence, running, exit_blocked);
+            token
         };
-        sink.invalidated(running, exit_blocked);
         // 去抖自跑：先递增世代取 token，再交给 sink 排程。递增必须在 `schedule_self_run` **之前**——否则
         // 并发 invalidate 可能拿到相同 token，两轮都判「最新」而双跑。
         sink.schedule_self_run(token);
@@ -600,10 +674,10 @@ impl UnlockRuntime {
         epoch: u64,
     ) {
         let mut token = None;
-        if self.commit_epoch(sink, epoch, || {
+        if self.commit_epoch(sink, epoch, |fence| {
             token = Some(self.invalidate_locked(true));
+            sink.invalidated_committed(fence, running, exit_blocked);
         }) {
-            sink.invalidated(running, exit_blocked);
             sink.schedule_self_run(token.unwrap());
         }
     }
@@ -679,17 +753,39 @@ impl UnlockRuntime {
         H: UnlockHttp + ?Sized,
         S: UnlockEventSink,
     {
-        // ── item 7 单飞：串行化并发 run（第二者等第一者 commit 后走下方 TTL 快路，避免双网络往返）──
+        self.run_at_epoch_with_budget(http, sink, force, now, budget_ms, self.epoch()).await
+    }
+
+    /// Bind a transport captured by the caller to its original runtime epoch.
+    /// Never adopt a newer epoch after waiting for the single-flight lock.
+    pub async fn run_at_epoch<H, S>(
+        &self, http: &H, sink: &S, force: bool, now: impl Fn() -> u64, epoch: u64,
+    ) -> UnlockSnapshot
+    where H: UnlockHttp + ?Sized, S: UnlockEventSink,
+    {
+        self.run_at_epoch_with_budget(http, sink, force, now, TOTAL_DETECTION_BUDGET_MS, epoch).await
+    }
+
+    async fn run_at_epoch_with_budget<H, S>(
+        &self, http: &H, sink: &S, force: bool, now: impl Fn() -> u64,
+        budget_ms: u64, epoch0: u64,
+    ) -> UnlockSnapshot
+    where H: UnlockHttp + ?Sized, S: UnlockEventSink,
+    {
+        // Admission identity precedes the wait and covers every existing commit fence.
         let _run_guard = self.run_lock.lock().await;
-        if !sink.is_current() {
+        if self.epoch() != epoch0 || !sink.is_current() {
             return UnlockSnapshot::default();
         }
 
         // ── TTL 快路：非 force 且缓存未过期 → 直接返回（零网络），并广播 UPDATED 让新监听者点亮 ──
         if !force {
             if let Some(cached) = self.peek(now()) {
-                sink.updated(&cached);
-                return cached;
+                return if self.commit_epoch(sink, epoch0, |fence| sink.updated_committed(fence, &cached)) {
+                    cached
+                } else {
+                    UnlockSnapshot::default()
+                };
             }
         }
 
@@ -698,8 +794,11 @@ impl UnlockRuntime {
         if !force {
             if let Some(last) = self.last_snapshot() {
                 if last.not_ready == Some(true) {
-                    sink.updated(&last);
-                    return last;
+                    return if self.commit_epoch(sink, epoch0, |fence| sink.updated_committed(fence, &last)) {
+                        last
+                    } else {
+                        UnlockSnapshot::default()
+                    };
                 }
             }
         }
@@ -716,12 +815,13 @@ impl UnlockRuntime {
         if force && last_at != 0 && now().saturating_sub(last_at) < FORCE_MIN_MS {
             let last = self.last_snapshot();
             if let Some(snap) = &last {
-                sink.updated(snap);
+                if !self.commit_epoch(sink, epoch0, |fence| sink.updated_committed(fence, snap)) {
+                    return UnlockSnapshot::default();
+                }
             }
             return last.unwrap_or_default();
         }
 
-        let epoch0 = self.epoch();
         // 整轮 deadline 从此刻起算（gating/TTL/S-gate/force-min 四条早退路径是零网络的，不吃预算）。
         let deadline = tokio::time::Instant::now() + Duration::from_millis(budget_ms);
 
@@ -751,14 +851,14 @@ impl UnlockRuntime {
                     ..Default::default()
                 };
                 // 落定终态 → 漂移连击清零（本轮连 checker 都没跑，谈不上漂移；且已有终态收口，无自持循环）。
-                if !self.commit_epoch(sink, epoch0, || {
+                if !self.commit_epoch(sink, epoch0, |fence| {
                     self.last_run_at.store(ran_at, Ordering::SeqCst);
                     self.drift_streak.store(0, Ordering::SeqCst);
                     self.set_last_snapshot_locked(Some(snap.clone()));
+                    sink.updated_committed(fence, &snap);
                 }) {
                     return UnlockSnapshot::default();
                 }
-                sink.updated(&snap);
                 return snap;
             }
         };
@@ -767,7 +867,7 @@ impl UnlockRuntime {
             return UnlockSnapshot::default();
         }
         let ran_at = now();
-        if !self.commit_epoch(sink, epoch0, || {
+        if !self.commit_epoch(sink, epoch0, |_| {
             self.last_run_at.store(ran_at, Ordering::SeqCst)
         }) {
             return UnlockSnapshot::default();
@@ -778,9 +878,7 @@ impl UnlockRuntime {
 
         // ── item 3 checker 主轮（单 checker 截止点 = min(CHECKER_BUDGET_MS, 整轮剩余)）：逐 settle emit progress ──
         let mut results = run_checkers_budgeted(http, ServiceId::ALL, deadline, |id, r| {
-            if sink.is_current() {
-                sink.progress(id, r);
-            }
+            self.commit_epoch(sink, epoch0, |fence| sink.progress_committed(fence, id, r));
         })
         .await;
 
@@ -813,16 +911,16 @@ impl UnlockRuntime {
                 }
                 // 灰点翻回 checking（视觉诚实：补测中，非终态）。
                 for id in &timeout_ids {
-                    sink.progress(id.as_str(), &UnlockResult::new(UnlockStatus::Checking));
+                    self.commit_epoch(sink, epoch0, |fence| {
+                        sink.progress_committed(fence, id.as_str(), &UnlockResult::new(UnlockStatus::Checking));
+                    });
                 }
                 tokio::time::sleep(backoff).await;
                 if self.epoch() != epoch0 || !sink.is_current() {
                     break; // 退避期间被 invalidate → 放弃本轮补测
                 }
                 let fresh = run_checkers_budgeted(http, &timeout_ids, deadline, |id, r| {
-                    if sink.is_current() {
-                        sink.progress(id, r);
-                    }
+                    self.commit_epoch(sink, epoch0, |fence| sink.progress_committed(fence, id, r));
                 })
                 .await;
                 for (id, r) in fresh {
@@ -861,7 +959,7 @@ impl UnlockRuntime {
             // 只有「纯漂移」（epoch 未变）才计数：epoch 变那条腿本就有外部触发源，不会自持。
             if egress_moved && !epoch_changed {
                 let mut streak = 0;
-                if !self.commit_epoch(sink, epoch0, || {
+                if !self.commit_epoch(sink, epoch0, |_| {
                     streak = self.drift_streak.fetch_add(1, Ordering::SeqCst) + 1;
                 }) {
                     return UnlockSnapshot::default();
@@ -884,15 +982,15 @@ impl UnlockRuntime {
                         return UnlockSnapshot::default();
                     }
                     // 落定即清零：熔断掐断的是自持循环，不是把检测永久闩死。
-                    if !self.commit_epoch(sink, epoch0, || {
+                    if !self.commit_epoch(sink, epoch0, |fence| {
                         self.drift_streak.store(0, Ordering::SeqCst);
                         self.set_last_snapshot_locked(Some(snapshot.clone()));
+                        sink.updated_committed(fence, &snapshot);
                     }) {
                         return UnlockSnapshot::default();
                     }
                     // low_confidence 不入 TTL 缓存（沿用既有规则）→ 下一次真触发即重检。
                     // **必须 emit UPDATED**：这是 UI 脱离「检测中」的唯一出口（丢弃腿本身从不 emit 终态）。
-                    sink.updated(&snapshot);
                     return snapshot;
                 }
             }
@@ -937,12 +1035,13 @@ impl UnlockRuntime {
         };
         // low_confidence（全超瞬态、非受限）不写缓存：避免垃圾快照锁 30min（Polaris：未写 egressIp 缓存）。
         // 下一真触发即重检。仍返回 + emit UPDATED（UI 如实显、但不入缓存）。
-        if !self.commit_epoch(sink, epoch0, || {
+        if !self.commit_epoch(sink, epoch0, |fence| {
             self.drift_streak.store(0, Ordering::SeqCst);
             self.set_last_snapshot_locked(Some(snapshot.clone()));
             if !low_confidence {
                 self.store_locked(snapshot.clone(), checked_at, ttl);
             }
+            sink.updated_committed(fence, &snapshot);
         }) {
             return UnlockSnapshot::default();
         }
@@ -953,7 +1052,6 @@ impl UnlockRuntime {
             snapshot.results.len(),
             snapshot.egress.as_ref().map_or("-", |e| e.ip.as_str())
         );
-        sink.updated(&snapshot);
         snapshot
     }
 
@@ -1115,16 +1213,16 @@ impl UnlockRuntime {
         };
         // lastSnapshot 同步（补测复过的 timeout 已是可信终态，供 S-gate/force-min）；TTL cache 恒写（含 timeout
         // 由 R3 短 TTL 兜底，2min 后可再自然重检）。
-        if !self.commit_epoch(sink, epoch0, || {
+        if !self.commit_epoch(sink, epoch0, |fence| {
             self.set_last_snapshot_locked(Some(snapshot.clone()));
             self.store_locked(snapshot.clone(), t, ttl);
+            for (id, result) in &fresh {
+                sink.progress_committed(fence, id, result);
+            }
+            sink.updated_committed(fence, &snapshot);
         }) {
             return false;
         }
-        for (id, result) in &fresh {
-            sink.progress(id, result);
-        }
-        sink.updated(&snapshot);
         true
     }
 }

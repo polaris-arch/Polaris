@@ -9,7 +9,7 @@ use std::path::Path;
     deprecated,
     reason = "native fstat validates an untrusted inherited fd without borrowing an invalid Rust fd"
 )]
-fn apply(path: &Path, descriptor: i32, release: bool) -> io::Result<()> {
+pub(crate) fn apply(path: &Path, descriptor: i32, release: bool) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     if descriptor < 3 || !path.is_absolute() {
         return Err(io::Error::other("invalid inherited lease"));
@@ -52,7 +52,7 @@ fn apply(path: &Path, descriptor: i32, release: bool) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn apply(_path: &Path, _descriptor: i32, _release: bool) -> io::Result<()> {
+pub(crate) fn apply(_path: &Path, _descriptor: i32, _release: bool) -> io::Result<()> {
     Err(io::Error::other("Unix inherited lease unsupported"))
 }
 

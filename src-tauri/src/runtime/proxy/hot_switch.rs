@@ -213,8 +213,24 @@ pub(super) enum PendingSwitch {
     },
 }
 
+fn copy_selection_projection(destination: &mut Value, source: &Value) {
+    let Some(object) = destination.as_object_mut() else {
+        return;
+    };
+    for key in ["selectedServerId", "selectionIntent"] {
+        match source.get(key) {
+            Some(value) => {
+                object.insert(key.into(), value.clone());
+            }
+            None => {
+                object.remove(key);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SwitchApplyScope {
+pub(super) enum SwitchApplyScope {
     Full,
     SelectedOnly,
 }
@@ -276,6 +292,9 @@ pub(crate) struct TestPutSink {
     /// `None`（默认）= 读不到 → 自证本轮不判定，与生产「管理 API 读失败」同一条码路 —— 于是既有
     /// H3 用例不必逐个预置也不会凭空多出告警。要驱动「运行期与意图分叉」必须显式摆上快照。
     pub(super) groups: Mutex<Option<Vec<GroupSelection>>>,
+    /// Native snapshot including member/history metadata, using the same PUT harness.
+    pub(super) native_groups: Mutex<Option<Vec<polaris_singbox_grpc::daemon::Group>>>,
+    pub(super) fail_at: Mutex<BTreeSet<usize>>,
     /// 在 PUT 边界制造新用户意图或 stop 世代跃迁，验证旧回执不会提交/起核。
     pub(super) on_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 在运行期 group 读回边界制造 Full restart claim 或更新意图。
@@ -353,11 +372,24 @@ impl TestPutSink {
         if let Some(callback) = self.on_put.lock().unwrap().take() {
             callback();
         }
+        if self
+            .fail_at
+            .lock()
+            .unwrap()
+            .contains(&self.calls.lock().unwrap().len())
+        {
+            return Err("injected ordinal PUT failure".into());
+        }
         if self.fail_first.load(Ordering::SeqCst) > 0 {
             self.fail_first.fetch_sub(1, Ordering::SeqCst);
             return Err("单测注入：PUT 失败（管理 API 未就绪）".into());
         }
         if self.follow_puts.load(Ordering::SeqCst) {
+            if let Some(groups) = self.native_groups.lock().unwrap().as_mut() {
+                if let Some(group) = groups.iter_mut().find(|group| group.tag == selector_tag) {
+                    group.selected = member_tag.into();
+                }
+            }
             if let Some(groups) = self.groups.lock().unwrap().as_mut() {
                 if let Some(group) = groups.iter_mut().find(|g| g.tag == selector_tag) {
                     group.selected = member_tag.into();
@@ -901,7 +933,22 @@ impl ProxyRuntime {
             }
         }
         let wrappers: Vec<SrvLike> = user_config.servers.iter().map(SrvLike).collect();
-        let id_to_tag = build_id_to_tag_map(&wrappers);
+        let mut id_to_tag = build_id_to_tag_map(&wrappers);
+        // The input list also contains pruned/login-only mesh nodes. Only actual
+        // generated outbounds/endpoints are valid runtime selector or route evidence.
+        let emitted: BTreeSet<&str> = singbox_config
+            .outbounds
+            .iter()
+            .map(|outbound| outbound.tag.as_str())
+            .chain(
+                singbox_config
+                    .endpoints
+                    .iter()
+                    .flatten()
+                    .map(|endpoint| endpoint.tag.as_str()),
+            )
+            .collect();
+        id_to_tag.retain(|_, tag| emitted.contains(tag.as_str()));
 
         // ── 节点指纹（两张表，两个问题；公式单点在 runtime::node_fingerprints，见其模块文档）──
         // ① 全维：喂 switch-engine 重启判据 + pending_changes().modified。
@@ -1085,7 +1132,7 @@ impl ProxyRuntime {
     /// the final selected-only check and R commit together, so a completed PUT cannot publish
     /// an obsolete running projection after that restart has claimed ownership. No disk config
     /// is read under this lock (config writers acquire their lock before publishing intent).
-    fn with_selected_projection_claim(
+    pub(super) fn with_selected_projection_claim(
         self: &Arc<Self>,
         projected: &Value,
         generation: u64,
@@ -1261,6 +1308,16 @@ impl ProxyRuntime {
             "selectedServerId".to_string(),
             Value::String(server_id.to_string()),
         );
+        object.remove(polaris_store::SELECTION_INTENT_KEY);
+        // Pinning the already observed TCP leaf changes intent, not the transport.
+        // Retain dormant native groups until the next authorized structural reload.
+        if let Some(outcome) = self
+            .native_manual_exit(&projected, server_id, intent_generation)
+            .await
+        {
+            return Ok(Some(outcome));
+        }
+
         Ok(Some(
             self.switch_mode_locked(
                 projected,
@@ -1312,13 +1369,14 @@ impl ProxyRuntime {
             return Err("运行态配置不是对象".into());
         };
         object.insert("selectedServerId".into(), Value::String(selected.clone()));
+        object.remove(polaris_store::SELECTION_INTENT_KEY);
         let projected: UserConfig =
             serde_json::from_value(projected).map_err(|e| format!("运行态配置解析失败: {e}"))?;
         self.validate_required_bind_interfaces_blocking(&projected)
     }
 
     /// 调用方已持有 `switch_serial` 的执行半边。
-    async fn switch_mode_locked(
+    pub(super) async fn switch_mode_locked(
         self: &Arc<Self>,
         new_config: Value,
         defer_restart: bool,
@@ -1871,9 +1929,7 @@ impl ProxyRuntime {
                         self.selector_reconcile.clear_required();
                         // C5：热切换可能切换了全局出口节点（到/离 TS System 全隧道出口）→ 对齐出口路由。
                         // 重启腿的出口路由由重启后 start_inner 的就绪后 reconcile 覆盖，故仅热切腿需在此显式对齐。
-                        self.mesh
-                            .exit_route_reconcile(&new_cfg, new_cfg.enable_ipv6.unwrap_or(false))
-                            .await;
+                        self.reconcile_emitted_exit_route(switch_generation).await;
                         if let Some(error) = disconnect
                             .as_ref()
                             .and_then(|d| d.snapshot_error.as_deref())
@@ -1881,8 +1937,9 @@ impl ProxyRuntime {
                             log::warn!("热切换完成，但精准断连快照失败：{error}");
                         }
                         log::info!(
-                            "switchMode：热切换成功（核未重启），精准断连 {} 条",
-                            disconnect.map_or(0, |d| d.closed_ids.len())
+                            "switchMode：热切换成功（核未重启），断连请求已确认 {} 条，失败 {} 条",
+                            disconnect.as_ref().map_or(0, |d| d.closed_ids.len()),
+                            disconnect.as_ref().map_or(0, |d| d.failed_ids.len())
                         );
                         // M1（上游 `proxyManager.on('unlock-invalidate')`，`index.ts:2006-2008`）：**任何**热切换
                         // ——切全局节点 / 改规则目标节点 / 两者——都可能换掉解锁检测走的出口或分流，故一律失效重测。
@@ -2111,9 +2168,7 @@ impl ProxyRuntime {
             "selectedServerId".to_string(),
             Value::String(target_id.to_string()),
         );
-        let Ok(reconciled_user_config) =
-            serde_json::from_value::<UserConfig>(reconciled_runtime.clone())
-        else {
+        let Ok(_) = serde_json::from_value::<UserConfig>(reconciled_runtime.clone()) else {
             return SelectorReconcileOutcome::NotEligible;
         };
 
@@ -2144,12 +2199,7 @@ impl ProxyRuntime {
 
         self.commit_applied(&reconciled_runtime);
         self.selector_reconcile.clear_required();
-        self.mesh
-            .exit_route_reconcile(
-                &reconciled_user_config,
-                reconciled_user_config.enable_ipv6.unwrap_or(false),
-            )
-            .await;
+        self.reconcile_emitted_exit_route(generation).await;
         if !self.selector_operation_is_current(generation, intent_generation) {
             return SelectorReconcileOutcome::Superseded;
         }
@@ -2379,28 +2429,28 @@ impl ProxyRuntime {
 
     /// 显式选择只提交运行态投影。已排程的用户 Apply 快照保留全部获授权字段，
     /// 只将其 selectedServerId 刷到最新选择，不能被较窄的 R 投影整份覆盖。
-    fn commit_selected_projection(self: &Arc<Self>, projected: &Value, intent_generation: u64) {
+    pub(super) fn commit_selected_projection(
+        self: &Arc<Self>,
+        projected: &Value,
+        intent_generation: u64,
+    ) {
         self.commit_coex_current_config(projected.clone());
-        if let Some(selected) = projected.get("selectedServerId").cloned() {
-            if let Ok(mut pending) = self.pending_force_restart.write() {
-                if let Some((id, config, source)) = pending.as_mut() {
-                    if let Some(object) = config.as_object_mut() {
-                        object.insert("selectedServerId".into(), selected);
-                    }
-                    if matches!(source, super::ForceRestartSource::Selected { .. }) {
-                        // The new selection has now been strictly read back, so its predecessor's
-                        // selected-only restart is no longer needed. A degraded rule file is the
-                        // exception: the common tail below will schedule a fresh R projection.
-                        if !self.custom_rule_files_degraded() {
-                            let old_id = *id;
-                            *pending = None;
-                            self.debounced.invalidate_pending();
-                            if self.gate.pending().force_restart_id == Some(old_id) {
-                                self.gate.clear_force_restart();
-                            }
-                        } else {
-                            *source = super::ForceRestartSource::Selected { intent_generation };
+        if let Ok(mut pending) = self.pending_force_restart.write() {
+            if let Some((id, config, source)) = pending.as_mut() {
+                let pending_mode = config.get("autoSelectEnabled")
+                    != projected.get("autoSelectEnabled")
+                    || config.get("autoSelectPins") != projected.get("autoSelectPins");
+                copy_selection_projection(config, projected);
+                if matches!(source, super::ForceRestartSource::Selected { .. }) {
+                    if !pending_mode && !self.custom_rule_files_degraded() {
+                        let old_id = *id;
+                        *pending = None;
+                        self.debounced.invalidate_pending();
+                        if self.gate.pending().force_restart_id == Some(old_id) {
+                            self.gate.clear_force_restart();
                         }
+                    } else {
+                        *source = super::ForceRestartSource::Selected { intent_generation };
                     }
                 }
             }
@@ -2409,16 +2459,16 @@ impl ProxyRuntime {
 
     /// 热切 PUT/读回失败或选择引起结构性变化时，只重启运行态 R 的选择投影。
     /// pending_force_restart 若已经是用户明确 Apply 的完整 D，则保留它，只更新选择字段。
-    fn restart_selected_projection(
+    pub(super) fn restart_selected_projection(
         self: &Arc<Self>,
         projected: &Value,
         expected_generation: u64,
         intent_generation: u64,
     ) -> SwitchOutcome {
-        let Some(selected) = projected.get("selectedServerId").cloned() else {
-            self.defer_selected_switch("无法确定重启目标出口");
-            return SwitchOutcome::Deferred;
-        };
+        let selected = projected
+            .get("selectedServerId")
+            .cloned()
+            .unwrap_or(Value::Null);
         if let Ok(mut pending) = self.pending_force_restart.write() {
             let id = pending.as_ref().map_or_else(
                 || self.force_restart_seq.fetch_add(1, Ordering::SeqCst),
@@ -2429,7 +2479,8 @@ impl ProxyRuntime {
                 .replace_force_if_current(expected_generation, id)
             {
                 drop(pending);
-                if self.gate.is_busy()
+                if polaris_store::auto_select::target(projected).is_none()
+                    && self.gate.is_busy()
                     && self.selector_reconcile.intent_generation() == intent_generation
                 {
                     if let Some(server_id) = selected.as_str() {
@@ -2439,9 +2490,7 @@ impl ProxyRuntime {
                 return SwitchOutcome::Pending;
             }
             if let Some((_, config, source)) = pending.as_mut() {
-                if let Some(object) = config.as_object_mut() {
-                    object.insert("selectedServerId".into(), selected);
-                }
+                copy_selection_projection(config, projected);
                 if matches!(source, super::ForceRestartSource::Selected { .. }) {
                     *source = super::ForceRestartSource::Selected { intent_generation };
                 }
@@ -2465,6 +2514,14 @@ impl ProxyRuntime {
     }
 
     async fn strict_confirm_selected(&self, projected: &Value) -> bool {
+        if let Some(target) = polaris_store::auto_select::target(projected) {
+            let expected = polaris_config_engine::user_config::auto_select::wrapper_tag(&target);
+            return self.read_selector_groups().await.is_some_and(|groups| {
+                groups
+                    .iter()
+                    .any(|group| group.tag == PROXY_SELECTOR_TAG && group.selected == expected)
+            });
+        }
         let Some(server_id) = projected.get("selectedServerId").and_then(Value::as_str) else {
             return false;
         };
@@ -2504,7 +2561,7 @@ impl ProxyRuntime {
         })
     }
 
-    async fn execute_hot_switch_plan(
+    pub(super) async fn execute_hot_switch_plan(
         &self,
         plan: &polaris_config_engine::builder::hotswitch::HotSwitchPlan,
         interrupt: bool,
@@ -2840,7 +2897,13 @@ impl ProxyRuntime {
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
             let cur = latest.as_ref().unwrap_or(config);
             let target_id = cur.selected_server_id.clone().filter(|s| !s.is_empty());
-            let tag = if is_direct_selection(target_id.as_deref()) {
+            let native_target = cur
+                .selection_intent
+                .as_ref()
+                .filter(|intent| intent.mode == "auto");
+            let tag = if let Some(intent) = native_target {
+                Some(polaris_config_engine::user_config::auto_select::wrapper_tag(&intent.target))
+            } else if is_direct_selection(target_id.as_deref()) {
                 Some(DIRECT_TAG.to_string())
             } else {
                 target_id.as_deref().and_then(|id| {
@@ -2850,7 +2913,7 @@ impl ProxyRuntime {
                         .and_then(|g| g.as_ref().and_then(|s| s.id_to_tag.get(id).cloned()))
                 })
             };
-            if is_block_selection(target_id.as_deref()) {
+            if native_target.is_none() && is_block_selection(target_id.as_deref()) {
                 stage1 = Stage1Outcome::NoGlobalSelector;
                 break;
             }
@@ -2872,7 +2935,8 @@ impl ProxyRuntime {
             // 回退到 `config` 对象的语义一致。
             let null = Value::Null;
             let raw_ref = raw.as_ref().unwrap_or(&null);
-            let want_direct = self.login_fallback_eligible(cur, raw_ref)
+            let want_direct = native_target.is_none()
+                && self.login_fallback_eligible(cur, raw_ref)
                 && target_id.as_ref().is_some_and(|id| {
                     !self
                         .mesh
@@ -2971,43 +3035,76 @@ impl ProxyRuntime {
             .and_then(|v| serde_json::from_value(v).ok());
         let cur = latest.as_ref().unwrap_or(config);
 
-        for rule in &cur.custom_rules {
-            if !rule.enabled || rule.action != RuleAction::Proxy {
-                continue;
-            }
-            let Some(target) = rule.target_server_id.as_deref() else {
-                continue; // 无目标 → default=proxy-selector 嵌套跟随全局，无须校正
+        use polaris_config_engine::user_config::auto_select as native;
+        // Cache-selected overrides generator defaults, including a formerly frozen wrapper.
+        for target in native::referenced_targets(cur) {
+            let wrapper = native::wrapper_tag(&target);
+            let member = if cur.auto_select_enabled {
+                Some(native::urltest_tag(&target))
+            } else {
+                native::pin(cur, &target)
+                    .and_then(|id| snapshot.id_to_tag.get(id))
+                    .cloned()
             };
-            intents.extend(
-                self.reassert_one_rule_selector_locked(
-                    &snapshot,
-                    &format!("custom:{}", rule.id),
-                    target,
-                    my_gen,
-                    intent_generation,
-                    switch_guard,
-                )
-                .await?,
-            );
+            let Some(member) = member else {
+                return Err(());
+            };
+            if !self.selector_operation_is_current(my_gen, intent_generation) {
+                return Err(());
+            }
+            let _ = self
+                .hot_switch_selector_locked(switch_guard, &wrapper, &member)
+                .await;
+            intents.push((wrapper, member));
         }
-        for app_rule in &cur.app_rules {
-            if !app_rule.enabled || app_rule.action != RuleAction::Proxy {
-                continue;
+        let targets = cur
+            .effective_traffic_rules()
+            .into_iter()
+            .filter(|rule| rule.enabled && rule.route_action() == Some(RuleAction::Proxy))
+            .map(|rule| {
+                (
+                    format!("custom:{}", rule.id),
+                    rule.route_target_auto_select()
+                        .map(native::wrapper_tag)
+                        .or_else(|| {
+                            rule.route_target_server_id()
+                                .and_then(|id| snapshot.id_to_tag.get(id))
+                                .cloned()
+                        })
+                        .unwrap_or_else(|| PROXY_SELECTOR_TAG.into()),
+                )
+            })
+            .chain(
+                cur.app_rules
+                    .iter()
+                    .filter(|rule| rule.enabled && rule.action == RuleAction::Proxy)
+                    .map(|rule| {
+                        (
+                            format!("app:{}", rule.app_id),
+                            rule.target_auto_select
+                                .as_ref()
+                                .map(native::wrapper_tag)
+                                .or_else(|| {
+                                    rule.target_server_id
+                                        .as_ref()
+                                        .and_then(|id| snapshot.id_to_tag.get(id))
+                                        .cloned()
+                                })
+                                .unwrap_or_else(|| PROXY_SELECTOR_TAG.into()),
+                        )
+                    }),
+            );
+        for (key, member) in targets {
+            if !self.selector_operation_is_current(my_gen, intent_generation) {
+                return Err(());
             }
-            let Some(target) = app_rule.target_server_id.as_deref() else {
+            let Some(entry) = snapshot.rule_target.get(&key) else {
                 continue;
             };
-            intents.extend(
-                self.reassert_one_rule_selector_locked(
-                    &snapshot,
-                    &format!("app:{}", app_rule.app_id),
-                    target,
-                    my_gen,
-                    intent_generation,
-                    switch_guard,
-                )
-                .await?,
-            );
+            let _ = self
+                .hot_switch_selector_locked(switch_guard, &entry.selector_tag, &member)
+                .await;
+            intents.push((entry.selector_tag.clone(), member));
         }
         Ok(intents)
     }

@@ -38,15 +38,17 @@ const DEFAULT_SUPPORT_DIR: &str = "/Library/Application Support/Polaris";
 /// 纯逻辑，跨平台可测（本模块以 `cfg(any(target_os="macos", test))` 编入 → Linux CI 覆盖）。
 #[must_use]
 pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> MacConfig {
-    let m = crate::cli::parse_flags(argv, &[]);
-    MacConfig::new(
+    let m = crate::cli::parse_flags(argv, &["upgrade-closed"]);
+    let mut config = MacConfig::new(
         m.get("support")
             .cloned()
             .unwrap_or_else(|| DEFAULT_SUPPORT_DIR.to_owned()),
         m.get("coredir")
             .cloned()
             .unwrap_or_else(|| format!("{DEFAULT_SUPPORT_DIR}/core")),
-    )
+    );
+    config.upgrade_closed = m.get("upgrade-closed").is_some_and(|value| value == "true");
+    config
 }
 
 /// daemon 入口（binary `main()` 经 `cfg(target_os="macos")` 调此）。
@@ -56,7 +58,9 @@ pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> MacConfig {
 #[must_use]
 pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> std::process::ExitCode {
     let argv: Vec<_> = argv.collect();
-    if let Err(error) = crate::cli::validate_flags(&argv, &["support", "coredir"], &[]) {
+    if let Err(error) =
+        crate::cli::validate_flags(&argv, &["support", "coredir"], &["upgrade-closed"])
+    {
         eprintln!("polaris-helper: {error}");
         return std::process::ExitCode::FAILURE;
     }
@@ -76,12 +80,16 @@ pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> std::process::ExitCod
 #[cfg(target_os = "macos")]
 fn run(cfg: &MacConfig) -> std::process::ExitCode {
     use crate::platform::macos::server::{serve, DaemonServices};
-    if let Ok(store) = crate::core_store::CoreStore::open(
-        std::path::Path::new(&cfg.core_dir),
-        crate::core_store::OwnerPolicy::privileged(),
-    ) {
-        if let Err(error) = store.retire_flat_layout() {
-            log::warn!("legacy flat retirement retained: {error}");
+    // The explicit migration installer owns flat retirement while startup is
+    // fenced; it must retain legacy evidence until its durable commit succeeds.
+    if !cfg.upgrade_closed {
+        if let Ok(store) = crate::core_store::CoreStore::open(
+            std::path::Path::new(&cfg.core_dir),
+            crate::core_store::OwnerPolicy::privileged(),
+        ) {
+            if let Err(error) = store.retire_flat_layout() {
+                log::warn!("legacy flat retirement retained: {error}");
+            }
         }
     }
 

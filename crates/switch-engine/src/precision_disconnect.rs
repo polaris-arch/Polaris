@@ -121,8 +121,12 @@ pub struct ConnectionSnapshot {
 pub struct PrecisionDisconnectOutcome {
     /// A failed snapshot is not a successful empty connection table.
     pub snapshot_error: Option<String>,
-    /// 命中 pair、被关的连接 id 列表（Polaris closeOldNodeConnectionsAfterHotSwitch 累计的 closed）。
+    /// Selected IDs in snapshot order. Selection is not a close acknowledgement.
+    pub selected_ids: Vec<String>,
+    /// IDs whose close RPC returned Ok, in snapshot order (not proof of remote socket drain).
     pub closed_ids: Vec<String>,
+    /// IDs whose close RPC failed. Best-effort closure never rolls back selector selection.
+    pub failed_ids: Vec<String>,
 }
 
 impl PrecisionDisconnectOutcome {
@@ -138,7 +142,8 @@ impl PrecisionDisconnectOutcome {
 /// - 跳过 `closed_at > 0` 的死连接（重置帧幽灵历史环）。
 /// - 命中 [`connection_matches_switched_pairs`] 的活连接 → 加入关闭列表。
 ///
-/// 返回 [`PrecisionDisconnectOutcome`]（关闭的 id 列表）。调用方据此逐条 `CloseConnection`。
+/// 返回 [`PrecisionDisconnectOutcome`] 的 selected_ids；closed_ids/failed_ids 尚为空。
+/// 执行器随后逐条请求 `CloseConnection`，只把成功 ACK 放入 closed_ids。
 ///
 /// 纯函数：只决定「该关哪些」，不执行关——关连接的 I/O 由 [`crate::executor::ManagementApi`]
 /// trait 承担（测试 mock）。
@@ -146,19 +151,19 @@ pub fn select_connections_to_close(
     connections: &[ConnectionSnapshot],
     pairs: &[SwitchedMemberPair],
 ) -> PrecisionDisconnectOutcome {
-    let mut closed_ids = Vec::new();
+    let mut selected_ids = Vec::new();
     for c in connections {
         // 死连接（closed_at > 0）跳过——重置帧可能带历史已关连接的幽灵环。
         if c.closed_at > 0 {
             continue;
         }
         if connection_matches_switched_pairs(Some(&c.chains), pairs) {
-            closed_ids.push(c.id.clone());
+            selected_ids.push(c.id.clone());
         }
     }
     PrecisionDisconnectOutcome {
-        closed_ids,
-        snapshot_error: None,
+        selected_ids,
+        ..PrecisionDisconnectOutcome::default()
     }
 }
 

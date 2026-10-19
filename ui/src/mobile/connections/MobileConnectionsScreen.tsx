@@ -77,7 +77,7 @@ import {
 } from '@/contracts/types';
 import { cycleSortState, type SortState } from '@/components/screens/connections/sort-cycle';
 import { connectionRuleSubjects } from '@/components/screens/connections/connection-rule-subjects';
-import { maxLogId, mergeHydration, type LogRow } from '@/components/screens/logs/logs-buffer';
+import { maxLogId, mergeHydration, retainAfterClear, type LogRow } from '@/components/screens/logs/logs-buffer';
 import { runtimeLevelView } from '@/components/screens/logs/runtime-level';
 import {
   isUpwardLogScrollKey,
@@ -417,6 +417,7 @@ export function MobileConnectionsScreen(): ReactElement {
   followRef.current = follow;
   const pendingRef = useRef<LogRow[]>([]);
   const lastIdRef = useRef(-1);
+  const logReadEpoch = useRef(0);
   const lastUserScrollAtRef = useRef<number | null>(null);
   const displayedLogPageRef = useRef(0);
   const logViewRef = useRef<HTMLDivElement>(null);
@@ -496,12 +497,13 @@ export function MobileConnectionsScreen(): ReactElement {
         return;
       }
       setLogStreamReady(true);
+      const epoch = logReadEpoch.current;
       const batch = await api.logs.get(subscriptionId, MAX_BUFFERED_ROWS);
       if (!alive) {
         void api.logs.unsubscribe(subscriptionId);
         return;
       }
-      if (!Array.isArray(batch)) return;
+      if (epoch !== logReadEpoch.current || !Array.isArray(batch)) return;
       const snapshot = batch.slice(-MAX_BUFFERED_ROWS);
       const top = maxLogId(snapshot);
       if (top !== null && top > lastIdRef.current) lastIdRef.current = top;
@@ -530,11 +532,12 @@ export function MobileConnectionsScreen(): ReactElement {
     if (!logStreamReady) return;
     let alive = true;
     const key = logSearchKey;
+    const epoch = logReadEpoch.current;
     const timer = window.setTimeout(() => {
       void api.logs
         .search(logQuery, displayLevel, logSource, MAX_BUFFERED_ROWS)
         .then((batch) => {
-          if (!alive || !Array.isArray(batch)) return;
+          if (!alive || epoch !== logReadEpoch.current || !Array.isArray(batch)) return;
           setLogSnapshot((prev) => ({
             key,
             rows: mergeHydration(prev?.key === key ? prev.rows : [], batch, MAX_BUFFERED_ROWS),
@@ -810,11 +813,15 @@ export function MobileConnectionsScreen(): ReactElement {
 
   const onClearLogs = useCallback(() => {
     void runWrite('screen', 'logs.clearFailed', async () => {
-      await api.logs.clear();
-      setLogs([]);
-      setLogSnapshot(null);
-      pendingRef.current = [];
-      setPendingCount(0);
+      logReadEpoch.current += 1;
+      const boundary = await api.logs.clear();
+      retainAfterClear([], boundary); // Validate before changing visible state.
+      logReadEpoch.current += 1;
+      lastIdRef.current = Math.max(lastIdRef.current, boundary - 1);
+      setLogs(previous => retainAfterClear(previous, boundary));
+      setLogSnapshot(previous => previous ? { ...previous, rows: retainAfterClear(previous.rows, boundary) } : null);
+      pendingRef.current = retainAfterClear(pendingRef.current, boundary);
+      setPendingCount(pendingRef.current.length);
       return true;
     });
   }, [runWrite]);

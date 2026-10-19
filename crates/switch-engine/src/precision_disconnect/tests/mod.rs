@@ -187,8 +187,8 @@ fn dead_connections_skipped() {
     ];
     let pairs = vec![pair("proxy-selector", "节点A")];
     let outcome = select_connections_to_close(&conns, &pairs);
-    assert_eq!(outcome.closed_ids, vec!["alive".to_string()]);
-    assert_eq!(outcome.closed_count(), 1);
+    assert_eq!(outcome.selected_ids, vec!["alive".to_string()]);
+    assert_eq!(outcome.selected_ids.len(), 1);
 }
 
 #[test]
@@ -222,14 +222,14 @@ fn only_matching_alive_connections_closed() {
     let pairs = vec![pair("proxy-selector", "节点A")];
     let outcome = select_connections_to_close(&conns, &pairs);
     // 只关 old-global（跟全局走旧节点A的连接）。
-    assert_eq!(outcome.closed_ids, vec!["old-global".to_string()]);
+    assert_eq!(outcome.selected_ids, vec!["old-global".to_string()]);
 }
 
 #[test]
 fn empty_connections_yields_empty_outcome() {
     let pairs = vec![pair("proxy-selector", "节点A")];
     let outcome = select_connections_to_close(&[], &pairs);
-    assert_eq!(outcome.closed_count(), 0);
+    assert_eq!(outcome.selected_ids.len(), 0);
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn empty_pairs_yields_empty_outcome() {
         closed_at: 0,
     }];
     let outcome = select_connections_to_close(&conns, &[]);
-    assert_eq!(outcome.closed_count(), 0);
+    assert_eq!(outcome.selected_ids.len(), 0);
 }
 
 #[test]
@@ -261,7 +261,7 @@ fn closed_at_zero_or_negative_treated_as_alive() {
     let pairs = vec![pair("proxy-selector", "节点A")];
     let outcome = select_connections_to_close(&conns, &pairs);
     assert_eq!(
-        outcome.closed_ids,
+        outcome.selected_ids,
         vec!["zero".to_string(), "negative".into()]
     );
 }

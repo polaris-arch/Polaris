@@ -3286,7 +3286,7 @@ fn credential_index_preserves_order_missing_ids_and_duplicate_rejection() {
         let mut matched = json!({"servers": [{"id":"a", "protocol":"vmess"}]});
         let error =
             reconcile_tailscale_credentials(&duplicated, &mut matched, trusted).unwrap_err();
-        assert!(error.to_string().contains("credentialRevisionChanged"));
+        assert!(error.to_string().contains("serverIdentityAmbiguous"));
     }
     // All non-string IDs shared the absent-ID lookup key, including JSON null.
     for old in [json!([{}, {"id": null}]), json!([{"id": 1}, {"id": false}])] {
@@ -3322,4 +3322,61 @@ fn credential_index_keeps_each_nodes_own_secret_when_reordered() {
         incoming["servers"][1]["tailscaleSettings"]["authKey"],
         "key-a"
     );
+}
+
+
+#[test]
+fn managed_canonicalization_cannot_remove_active_server_after_raw_admission() {
+    let (dir, mgr, _, _) = managed_apply_cas_fixture();
+    let mut raw: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw["servers"] = serde_json::json!([{
+        "id": "ts-a", "name": "Active node", "protocol": "tailscale",
+        "tailscaleSettings": {"controlUrl": "https://control.example.test/path"}
+    }]);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
+    let current = mgr.load_full().unwrap();
+    let disk = std::fs::read(dir.join("config.json")).unwrap();
+    let marker = std::fs::read(dir.join(REQUIRED_MARKER_FILE)).unwrap();
+    for name in [serde_json::json!(""), serde_json::json!(42), Value::Null] {
+        let mut incoming = current.clone();
+        incoming["servers"][0]["name"] = name;
+        // This proves the regression occurs after the existing raw guard.
+        let mut admitted = incoming.clone();
+        mesh_guard::reconcile_untrusted(&current, &mut admitted).unwrap();
+        assert!(mgr.save_full(&incoming).is_err());
+        assert!(mgr.save_full_deferred_cleanup(&current, &incoming).is_err());
+        assert!(mgr.set_value("servers", incoming["servers"].clone()).is_err());
+        assert!(mgr.update(|config| {
+            config["servers"] = incoming["servers"].clone();
+            Decision::Write(())
+        }).is_err());
+        assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), disk);
+        assert_eq!(std::fs::read(dir.join(REQUIRED_MARKER_FILE)).unwrap(), marker);
+        assert_eq!(mgr.current().unwrap(), current);
+    }
+    let mut deleted = current.clone();
+    deleted["servers"] = serde_json::json!([]);
+    assert!(mgr.save_full(&deleted).is_err());
+    let mut renamed = current.clone();
+    renamed["servers"][0]["name"] = serde_json::json!("New display name");
+    mgr.save_full(&renamed).unwrap();
+    let saved = mgr.load_full().unwrap();
+    assert_eq!(saved["servers"][0]["name"], "New display name");
+    assert_eq!(saved[mesh_guard::STATE_KEY], current[mesh_guard::STATE_KEY]);
+}
+
+#[test]
+fn managed_load_rejects_sanitizer_removed_server_before_cache_or_persistence() {
+    let (dir, _, _, _) = managed_apply_cas_fixture();
+    let mut raw: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    raw["servers"] = serde_json::json!([{
+        "id": "ts-a", "name": "", "protocol": "tailscale",
+        "tailscaleSettings": {"controlUrl": "https://control.example.test/path"}
+    }]);
+    let bytes = serde_json::to_vec(&raw).unwrap();
+    std::fs::write(dir.join("config.json"), &bytes).unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    assert!(mgr.load_full().is_err());
+    assert!(mgr.cache.read().unwrap().is_none());
+    assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), bytes);
 }

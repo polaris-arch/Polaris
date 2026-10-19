@@ -27,7 +27,7 @@
 //! 不猜、不谎报。
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use crate::runtime::core_version_probe::CoreVersionProbe;
 use std::sync::Mutex;
 
 use polaris_updater::extract_version_token;
@@ -35,6 +35,9 @@ use polaris_updater::popup::{PopupSession, UpdatePopupState};
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::update_popup::TauriPopupTransport;
+
+pub(crate) mod custody;
+use custody::UpdateCustody;
 
 /// `core-manifest.json` 的编译期嵌入。
 ///
@@ -72,10 +75,10 @@ fn bundled_core_version() -> String {
 /// **桌面**补丁集标识：显式 `desktopSourceBuild` 或旧 `sourceBuild` 的 `patchedSourceTree`。
 /// 显式桌面块无效时返回 `None`，不会借用旧移动端图的标识。
 ///
-/// 只在清单被认作冻结清单时给出（与 [`bundled_core_version_from_manifest`] 取 `sourceBuild.version`
-/// 用同一个判据 [`frozen_source_build_version`]）：清单不完整时版本回落到上游基线，那时再给一个
-/// 补丁集标识等于为一个没被确认的构建背书。移动端（Android、iOS）的内核各走各的补丁队列，
-/// 不来自这份桌面源码清单，恒 `None`。
+/// 源码构建分支须通过 [`frozen_desktop_source_version`] 或 [`frozen_source_build_version`]
+/// 的冻结清单校验；清单不完整时不给补丁集标识，避免为未确认的构建背书。
+/// 配套内核版本另由 [`bundled_core_version`] 读取实际所选构建身份，不回退旧清单版本。
+/// 移动端（Android、iOS）的内核不来自这份桌面源码清单，恒 `None`。
 fn bundled_core_patch_set_from_manifest(raw: &str, mobile: bool) -> Option<String> {
     if mobile {
         return None;
@@ -401,6 +404,7 @@ impl UpdateStateFile {
 
 /// 更新运行时。
 pub struct UpdaterRuntime {
+    pub(crate) custody: UpdateCustody,
     /// 状态文件路径（`<config_dir>/update-state.json`）。
     state_path: PathBuf,
     /// 配套内核版本（编译期自 `core-manifest.json`）。
@@ -409,6 +413,8 @@ pub struct UpdaterRuntime {
     bundled_core_patch_set: Option<String>,
     /// 核二进制路径（**注入**；None = 未注入，版本读取如实报未知）。
     core_binary: Mutex<Option<PathBuf>>,
+    // Retain original process/readers when cleanup cannot yet be observed.
+    core_version_probe: CoreVersionProbe,
     /// mini 更新弹窗会话（None = 弹窗未开）。
     popup: Mutex<Option<PopupSession<TauriPopupTransport>>>,
     /// 本次进程发出的**最后一帧** App 更新进度（`update:progress` 的原样载荷）。
@@ -436,6 +442,7 @@ impl UpdaterRuntime {
         let state_path = config_dir.join("update-state.json");
         let state = load_state_file(&state_path);
         Self {
+            custody: UpdateCustody::default(),
             state_path,
             bundled_core_version: bundled_core_version(),
             bundled_core_patch_set: bundled_core_patch_set_from_manifest(
@@ -445,6 +452,7 @@ impl UpdaterRuntime {
             // 路径解析归 `proxy::resolve_core_binary` 一份实现，`lib.rs` 启动期经
             // `with_core_binary` 注入；这里不自己找。
             core_binary: Mutex::new(None),
+            core_version_probe: CoreVersionProbe::default(),
             popup: Mutex::new(None),
             last_progress: Mutex::new(None),
             state: Mutex::new(state),
@@ -481,25 +489,7 @@ impl UpdaterRuntime {
             // 未注入路径 = 探测不可能成功 → 空串（诚实失败，不猜）。
             return String::new();
         };
-        match crate::runtime::win_console::no_console_window(Command::new(&bin).arg("version"))
-            .output()
-        {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-                .split('\n')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-            // 非零退出 / spawn 失败 → 空串（**不回落基线**）。
-            Ok(out) => {
-                log::warn!("sing-box version 非零退出 {:?}：版本行置空", out.status);
-                String::new()
-            }
-            Err(e) => {
-                log::warn!("sing-box version spawn 失败 {e}：版本行置空");
-                String::new()
-            }
-        }
+        self.core_version_probe.first_line(&bin)
     }
 
     /// 读现役内核版本 token；**探测失败回落配套版本**。
@@ -533,15 +523,17 @@ impl UpdaterRuntime {
     ///
     /// # Errors
     ///
-    /// 落盘失败（磁盘满/权限）。**内存态已更新**（对齐上游 best-effort：落盘失败不回滚内存）。
+    /// 落盘失败时保留原内存态；成功落盘后才发布新状态。
     pub fn mutate_state<F: FnOnce(&mut UpdateStateFile)>(&self, f: F) -> Result<(), String> {
         let mut g = self
             .state
             .lock()
             .map_err(|e| format!("state 锁中毒: {e}"))?;
-        f(&mut g);
-        // 串行落盘，避免较旧快照在提示清除后重新覆盖状态文件。
-        save_state_file(&self.state_path, &g)
+        let mut next = g.clone();
+        f(&mut next);
+        save_state_file(&self.state_path, &next)?;
+        *g = next;
+        Ok(())
     }
 
     /// 显式清除便携版提示：落盘成功后才更新内存；不删除 ZIP 或宣称安装成功。

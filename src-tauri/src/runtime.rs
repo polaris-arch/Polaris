@@ -23,6 +23,7 @@ pub mod core_attest;
 pub(crate) mod core_identity;
 pub mod core_paths;
 pub(crate) mod core_version;
+pub(crate) mod core_version_probe;
 /// 路径型环境逃生门的信任级判定单点（`POLARIS_HELPER_PATH`）。
 pub(crate) mod env_trust;
 pub mod geo_seed;
@@ -44,6 +45,7 @@ pub mod startup_tasks;
 pub mod stats;
 pub mod subscription_create;
 pub mod subscription_parse;
+pub mod subscription_refresh;
 pub mod subscription_scheduler;
 pub mod taildrop;
 #[cfg(any(unix, windows, test))]
@@ -108,6 +110,8 @@ pub struct AppRuntime {
     pub subscription_create: Arc<subscription_create::SubscriptionCreateRuntime>,
     /// 订阅正文的固定容量 CPU executor；独立线程、逻辑取消、退出不 join。
     pub subscription_parse: Arc<subscription_parse::SubscriptionParseExecutor>,
+    /// Shared manual/scheduler refresh ownership, independent for each subscription.
+    pub subscription_refresh: subscription_refresh::SubscriptionRefreshAdmission,
 }
 
 impl AppRuntime {
@@ -182,6 +186,7 @@ impl AppRuntime {
             taildrop,
             subscription_create,
             subscription_parse,
+            subscription_refresh: subscription_refresh::SubscriptionRefreshAdmission::default(),
         })
     }
 

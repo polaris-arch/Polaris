@@ -2,6 +2,9 @@
 
 #![cfg_attr(windows, allow(unsafe_code))]
 
+#[cfg(any(windows, test))]
+mod frame;
+
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]

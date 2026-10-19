@@ -10,6 +10,8 @@
  */
 import type { RuleType, RuleResourceListItem, SystemProcessInfo } from '@/contracts/types';
 import { RULE_TYPES, validateRuleValue } from '@/domain/rules';
+import { isIpLiteral, cidrsOverlap } from '@/domain/ip-cidr';
+import { rulesApi } from '@/ipc/api/rules';
 import { geoTagOf } from '@/domain/rule-resource-refs';
 import { ruleSetRef } from './rule-set-pick';
 
@@ -282,45 +284,72 @@ export function matchRuleValueOptions(
 export type TestResult = 'empty' | 'hit' | 'miss' | 'untestable';
 
 /** 被测输入像不像 IP（v4 点分 / 含冒号的 v6，允许带掩码）。 */
-const looksLikeIp = (v: string): boolean =>
-  /^\d{1,3}(\.\d{1,3}){3}(\/\d+)?$/.test(v) || (/^[0-9a-f:]+(\/\d+)?$/i.test(v) && v.includes(':'));
-
-/**
- * 逐条件算命中，再按 AND/OR 合成 —— **值已拆好**的形态（规则实体 `RuleCondition[]` 的形状）。
- *
- * 「不适用」（域名轴的类型收到 IP 输入 / 反之 / 该类型压根没有 test）**不参与合成**，
- * 而不是记作未命中 —— 否则一条「域名 + 端口」的 AND 规则永远测不出命中（端口条件恒 false）。
- * 一条都不适用 ⇒ `untestable`。
- *
- * 为什么与 [`computeTestMatch`] 分成两层：草稿态的值是**一个多值串**（要 `splitVals`），而已落盘的
- * 规则值本来就是数组。让规则实体侧先 `join` 再被拆一次会踩到 `domainRegex` ——`^a{1,3}$` 里的逗号
- * 会被 `splitVals` 当成分隔符，一条正则被拆成两条乱码。合成逻辑只此一份，拆分只发生在草稿那一侧。
- */
+/** Tri-state composition: unavailable context is retained, not erased. */
+type PreviewCondition = { readonly type: RuleType; readonly values: readonly string[] };
+type KnownMatch = boolean | null;
+const MAX_CONDITIONS = 64;
+const MAX_VALUES = 256;
+function boundedConditions(conds: readonly PreviewCondition[], input: string): boolean {
+  return input.length <= 4096 && conds.length <= MAX_CONDITIONS &&
+    conds.reduce((n, c) => n + c.values.length, 0) <= MAX_VALUES &&
+    conds.every(c => c.values.every(v => v.length <= 1024));
+}
+function combineMatches(matches: KnownMatch[], logic: 'and' | 'or'): TestResult {
+  if (!matches.length) return 'untestable';
+  if (logic === 'and' && matches.includes(false)) return 'miss';
+  if (logic === 'or' && matches.includes(true)) return 'hit';
+  if (matches.includes(null)) return 'untestable';
+  return logic === 'and' ? 'hit' : 'miss';
+}
+function conditionMatch(c: PreviewCondition, raw: string): KnownMatch {
+  const tokens = c.values.map(s => s.trim().toLowerCase()).filter(Boolean);
+  const spec = RULE_TYPES[c.type]?.test;
+  if (!tokens.length || !spec || (spec.axis === 'ip') !== isIpLiteral(raw)) return null;
+  if (tokens.some(token => !validateRuleValue(c.type, token))) return null;
+  if (c.type === 'ipCidr' && tokens.some(token => !cidrsOverlap(token, token))) return null;
+  return spec.match(tokens, { raw, lower: raw.toLowerCase() });
+}
 export function matchConditionValues(
-  conds: readonly { readonly type: RuleType; readonly values: readonly string[] }[],
-  logic: 'and' | 'or',
-  input: string
+  conds: readonly PreviewCondition[], logic: 'and' | 'or', input: string
 ): TestResult {
   const raw = input.trim();
   if (!raw) return 'empty';
-  const probe = { raw, lower: raw.toLowerCase() };
-  const isIp = looksLikeIp(raw);
-  const applied: boolean[] = [];
-  for (const c of conds) {
-    const toks = c.values.map((s) => c.type === 'domainRegex' ? s.trim() : s.trim().toLowerCase()).filter(Boolean);
-    if (!toks.length) continue;
-    const spec = RULE_TYPES[c.type]?.test;
-    if (!spec) continue;
-    if ((spec.axis === 'ip') !== isIp) continue; // 轴不匹配 = 不适用，不是未命中
-    applied.push(spec.match(toks, probe));
-  }
-  if (!applied.length) return 'untestable';
-  const hit = logic === 'or' ? applied.some(Boolean) : applied.every(Boolean);
-  return hit ? 'hit' : 'miss';
+  if (!boundedConditions(conds, input)) return 'untestable';
+  return combineMatches(conds.map(c => conditionMatch(c, raw)), logic);
+}
+
+/** Native regex is a bounded subset preview, not a second routing engine.
+ * Missing source/port/process/resource context remains unknown in AND/OR.
+ * The UI owns debounce and stale-response cancellation. No kernel/network I/O.
+ */
+export async function computeTestMatchAsync(
+  conds: readonly Cond[], logic: 'and' | 'or', input: string,
+  previewRegex = rulesApi.previewRegex,
+): Promise<TestResult> {
+  const raw = input.trim();
+  if (!raw) return 'empty';
+  if (conds.length > MAX_CONDITIONS || input.length > 4096 || conds.some(c => c.v.length > 32768)) return 'untestable';
+  const values = conds.map(c => ({ type: c.t, values: parseConditionValues(c.t, c.v) }));
+  if (!boundedConditions(values, input)) return 'untestable';
+  const regexConditions = values.filter(c => c.type === 'domainRegex');
+  const patterns = regexConditions.flatMap(c => c.values);
+  if (!patterns.length || isIpLiteral(raw)) return matchConditionValues(values, logic, raw);
+  if (patterns.length > 32) return 'untestable';
+  let results: (boolean | null)[];
+  try { results = await previewRegex(patterns, raw); } catch { return 'untestable'; }
+  if (results.length !== patterns.length || results.some(x => x !== null && typeof x !== 'boolean')) return 'untestable';
+  let index = 0;
+  const matches = values.map(c => {
+    if (c.type !== 'domainRegex') return conditionMatch(c, raw);
+    const part = results.slice(index, index += c.values.length);
+    return part.includes(true) ? true : part.length === 0 || part.includes(null) ? null : false;
+  });
+  return combineMatches(matches, logic);
 }
 
 /** 草稿态（多值串）的「测试匹配」——拆值后交给 [`matchConditionValues`]，合成逻辑不重写第二份。 */
 export function computeTestMatch(conds: readonly Cond[], logic: 'and' | 'or', input: string): TestResult {
+  if (conds.length > MAX_CONDITIONS || input.length > 4096 || conds.some(c => c.v.length > 32768)) return 'untestable';
   return matchConditionValues(
     conds.map((c) => ({ type: c.t, values: parseConditionValues(c.t, c.v) })),
     logic,

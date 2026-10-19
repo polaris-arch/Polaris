@@ -350,7 +350,7 @@ fn production_handle_connection_goes_through_handle_frame() {
         .expect("handle_connection 之后的 read_frame 切点消失");
     let body = &code[at..end];
     // 切片自检：窗口确实盖住了读帧与写回。
-    assert!(body.contains("read_frame(h, &mut buf)"), "窗口没盖住读帧");
+    assert!(body.contains("read_frame(h, deadline)"), "窗口没盖住读帧");
     assert!(body.contains("cleanup_pipe(h)"), "窗口没盖住断开");
 
     assert_eq!(
@@ -372,7 +372,7 @@ fn production_handle_connection_goes_through_handle_frame() {
         auth_window.contains("return;"),
         "failed native peer capture cannot reach dispatch"
     );
-    assert!(body.find("read_frame(h, &mut buf)").unwrap() < peer_capture);
+    assert!(body.find("read_frame(h, deadline)").unwrap() < peer_capture);
     assert!(
         !body.contains("NativePeer {"),
         "service cannot manufacture a caller identity"

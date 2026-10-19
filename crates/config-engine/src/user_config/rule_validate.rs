@@ -150,16 +150,7 @@ pub fn validate_rule_value(rule_type: &str, value: &str) -> bool {
         // **不推广到 IPv4**：`1.2.3.4` 作关键词能命中 `1.2.3.4.nip.io` / `4.3.2.1.in-addr.arpa` 这类
         // 真实域名，拒掉会砍掉合法能力（详见本模块单测 `domain_keyword_*`）。
         "domainKeyword" => !v.contains(':'),
-        "domainRegex" => {
-            // RE2 拒 lookahead/lookbehind/反向引用；Rust 无 new RegExp，仅做 RE2 禁项粗检。
-            // 反向引用 \1..\9 全拒（TS `\\[1-9]`），非仅 \1。
-            if v.contains("(?=") || v.contains("(?!") || v.contains("(?<") {
-                return false;
-            }
-            !v.as_bytes()
-                .windows(2)
-                .any(|w| w[0] == b'\\' && w[1].is_ascii_digit() && w[1] != b'0')
-        }
+        "domainRegex" => !v.is_empty(),
         "ipCidr" | "sourceIpCidr" => is_valid_ip_cidr(v),
         "port" | "sourcePort" => is_valid_port_value(v),
         "sourceMac" => is_valid_mac_address(Some(v)),

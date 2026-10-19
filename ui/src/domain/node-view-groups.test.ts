@@ -18,7 +18,7 @@ describe('all view is a projection, not a second node or automatic group', () =>
     expect(all.sources?.a.name).toBe('Alpha'); expect(all.sources?.b.name).toBe('Beta');
     expect(groups.find(group => group.id === 'empty')?.servers).toEqual([]);
     expect(groupServersBySubscription(servers, subscriptions).some(group => group.isAll)).toBe(false);
-    expect(initialNodesTab(groups, 'a')).toBe('one'); expect(initialNodesTab(groups, undefined)).toBe('manual');
+    expect(initialNodesTab(groups, 'a')).toBe('one'); expect(initialNodesTab(groups, undefined)).toBe(all.id);
     expect(projectVisibleServers(all, 'beta', '', 'default', {})).toEqual([servers[1]]);
     expect(projectVisibleServers(all, '', '', 'lat', { a: 40, b: 10 }).map(server => server.id)).toEqual(['b','a','c']);
   });

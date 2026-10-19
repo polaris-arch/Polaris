@@ -77,6 +77,60 @@ function Invoke-Utility([string[]]$arguments) {{
   Assert-NativeExit ('helper ' + $arguments[0])
   return $result
 }}
+# Preserve registration security exactly; Seal-File is only for private backups.
+function Assert-PrivateRegistrationDirectory($path) {{
+  try {{ $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop }}
+  catch [System.Management.Automation.ItemNotFoundException] {{ return }}
+  if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{ throw 'invalid registration parent directory' }}
+  $security = Get-Acl -LiteralPath $path
+  $owner = $security.GetOwner([Security.Principal.SecurityIdentifier]).Value
+  if ($owner -ne 'S-1-5-18' -and $owner -ne 'S-1-5-32-544') {{ throw 'untrusted registration parent owner' }}
+  $dacl = $security.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+  if (-not $dacl.StartsWith('D:') -or $dacl.Contains('NO_ACCESS_CONTROL')) {{ throw 'untrusted registration parent DACL' }}
+  foreach ($rule in $security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {{
+    if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $rule.IdentityReference.Value -ne 'S-1-5-18' -and $rule.IdentityReference.Value -ne 'S-1-5-32-544') {{ throw 'registration parent grants nonprivileged access' }}
+  }}
+}}
+$registrationSections = [Security.AccessControl.AccessControlSections]'Owner,Group,Access'
+function Registration-Sddl($path) {{
+  return (Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm($registrationSections)
+}}
+function Restore-Registration($snapshot) {{
+  if (-not $snapshot.Present) {{
+    if (Test-Path -LiteralPath $snapshot.Path) {{ Assert-Regular $snapshot.Path; Remove-Item -LiteralPath $snapshot.Path -Force }}
+    if (Test-Path -LiteralPath $snapshot.Path) {{ throw 'registration absence restoration failed' }}
+    return
+  }}
+  Check-Hash $snapshot.Backup $snapshot.Hash
+  $temporary = Join-Path (Split-Path -Parent $snapshot.Path) ('registration.restore.' + [Guid]::NewGuid().ToString('N'))
+  # CreateNew refuses an existing destination; this private same-directory file
+  # is never published until its complete bytes have been flushed and verified.
+  $input = $null
+  $output = $null
+  try {{
+    $input = [IO.File]::OpenRead($snapshot.Backup)
+    $output = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $input.CopyTo($output)
+    $output.Flush($true)
+  }} finally {{
+    if ($null -ne $output) {{ $output.Dispose() }}
+    if ($null -ne $input) {{ $input.Dispose() }}
+  }}
+  Seal-File $temporary
+  Check-Hash $temporary $snapshot.Hash
+  if (Test-Path -LiteralPath $snapshot.Path) {{
+    Assert-Regular $snapshot.Path
+    [IO.File]::Replace($temporary, $snapshot.Path, $null)
+  }} else {{ [IO.File]::Move($temporary, $snapshot.Path) }}
+  # ReplaceFile preserves destination ACLs. Reapply the captured owner/group/
+  # DACL (including inheritance protection), then prove bytes AND security
+  # before the stopped old service may be restarted. Any failure retains TX.
+  $security = [Security.AccessControl.FileSecurity]::new()
+  $security.SetSecurityDescriptorSddlForm($snapshot.Sddl, $registrationSections)
+  Set-Acl -LiteralPath $snapshot.Path -AclObject $security
+  Check-Hash $snapshot.Path $snapshot.Hash
+  if ((Registration-Sddl $snapshot.Path) -cne $snapshot.Sddl) {{ throw 'registration security restoration differs' }}
+}}
 function Stop-ServiceChecked {{
   $current = Get-Service -Name $service -ErrorAction SilentlyContinue
   if ($null -ne $current -and $current.Status -ne 'Stopped') {{
@@ -101,17 +155,23 @@ function Configure-Service {{
   & $sc failure $service reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
   Assert-NativeExit 'SCM recovery'
 }}
-Secure-Directory $support $true
-$lockPath = Join-Path $support 'helper-install.lock'
-if (Test-Path -LiteralPath $lockPath) {{ Assert-Regular $lockPath }}
-$lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+$lock = $null
+$failureStage = 81
+$exitCode = 0
+$registrationChanged = $false
+$registrationSnapshot = $null
 $tx = $null
 $utility = $null
 $admitted = $false
 $mutated = $false
 $keepHelper = $false
 $keepRecovery = $false
+$coreOnlyReady = $false
 try {{
+  Secure-Directory $support $true
+  $lockPath = Join-Path $support 'helper-install.lock'
+  if (Test-Path -LiteralPath $lockPath) {{ Assert-Regular $lockPath }}
+  $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
   $tx = Join-Path $support ('helper-upgrade.' + [Guid]::NewGuid().ToString('N'))
   Secure-Directory $tx $false
   $utility = Join-Path $tx 'polaris-helper.exe'
@@ -133,19 +193,41 @@ try {{
   Seal-File $tokenFile
   Secure-Directory $coreDir $true
   $users = Join-Path $support 'users'
-  Secure-Directory $users $false
-  Secure-Directory (Join-Path $users $identity) $false
+  Assert-PrivateRegistrationDirectory $users
+  Assert-PrivateRegistrationDirectory (Join-Path $users $identity)
+  $failureStage = 82
   Invoke-Utility @('core-install', '--root', $coreDir, '--source', '{payload}', '--manifest', $manifest, '--source-owner', $identity) | Out-Null
-  Invoke-Utility @('register-user', '--support', $support, '--identity', $identity, '--confdir', '{config}', '--token-file', $tokenFile) | Out-Null
+  $failureStage = 84
   $policy = Invoke-Utility @('helper-policy', '--binary', $helperDst, '--metadata', $record)
   if ($policy -ceq 'helper-policy retain') {{ $keepHelper = $true }}
   if (-not $keepHelper -and $policy -cne 'helper-policy replace' -and $policy -cne 'helper-policy replace-legacy') {{ throw 'invalid installed helper policy' }}
   $old = Get-CimInstance -ClassName Win32_Service -Filter "Name='$service'" -ErrorAction Stop
   $wasRunning = $null -ne $old -and $old.State -ne 'Stopped'
-  if ($keepHelper -and $wasRunning) {{
-    & $utility 'retain-probe' '--support' $support '--id' '{core_id}' | Out-Null
-    if ($LASTEXITCODE -eq 0) {{ Write-Output 'polaris-helper-core-only-ok'; return }}
+  # Never overwrite a newer retained helper, or report an unusable retained
+  # service as successfully installed. This probe is read-only and its ordinary
+  # custody request requires a native message boundary before any bytes are sent.
+  if ($keepHelper) {{
+    if ($wasRunning) {{
+      Invoke-Utility @('admin-probe', '--support', $support) | Out-Null
+    }} elseif ((Get-FileHash -LiteralPath $helperDst -Algorithm SHA256).Hash.ToLowerInvariant() -cne '{helper_hash}') {{
+      throw 'retained newer helper capability unavailable while stopped; restart or update it explicitly'
+    }}
   }}
+  $registration = Join-Path (Join-Path $users $identity) 'registration'
+  $registrationPresent = Test-Path -LiteralPath $registration
+  $sameRegistration = $false
+  if ($registrationPresent) {{
+    Assert-Regular $registration
+    $expectedRegistration = $identity + "`n" + '{config}' + "`n" + '{token}' + "`n"
+    $sameRegistration = [IO.File]::ReadAllText($registration) -ceq $expectedRegistration
+  }}
+  # A content-only install may retain a busy helper only without changing its
+  # caller registration. Changed credentials require the normal admission gate.
+  if ($keepHelper -and $wasRunning -and $sameRegistration) {{
+    & $utility 'retain-probe' '--support' $support '--id' '{core_id}' | Out-Null
+    if ($LASTEXITCODE -eq 0) {{ $coreOnlyReady = $true }}
+  }}
+  if ($coreOnlyReady) {{ Write-Output 'polaris-helper-core-only-ok' }} else {{
   $snapshots = @()
   $replaceObjects = if ($keepHelper) {{ @() }} else {{ @($helperDst, $cleanerDst, $record) }}
   foreach ($path in $replaceObjects) {{
@@ -154,13 +236,37 @@ try {{
     if ($present) {{ Assert-Regular $path; Copy-Item -LiteralPath $path -Destination $backup; Seal-File $backup }}
     $snapshots += @{{ Path = $path; Backup = $backup; Present = $present }}
   }}
+  $registrationBackup = Join-Path $tx 'registration.rollback'
+  $registrationSnapshot = @{{ Path = $registration; Backup = $registrationBackup; Present = $registrationPresent; Hash = $null; Sddl = $null }}
+  if ($registrationPresent) {{
+    $registrationSnapshot.Sddl = Registration-Sddl $registration
+    $registrationSnapshot.Hash = (Get-FileHash -LiteralPath $registration -Algorithm SHA256).Hash.ToLowerInvariant()
+    Copy-Item -LiteralPath $registration -Destination $registrationBackup
+    Seal-File $registrationBackup
+    Check-Hash $registrationBackup $registrationSnapshot.Hash
+    Check-Hash $registration $registrationSnapshot.Hash
+    if ((Registration-Sddl $registration) -cne $registrationSnapshot.Sddl) {{ throw 'registration changed during snapshot' }}
+  }}
+  $registrationJournal = Join-Path $tx 'registration.snapshot.json'
+  [IO.File]::WriteAllText($registrationJournal, ($registrationSnapshot | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
+  Seal-File $registrationJournal
   if ($wasRunning) {{
+    $failureStage = 75
     Invoke-Utility @('prepare-upgrade', '--support', $support) | Out-Null
     $admitted = $true
   }}
+  $failureStage = 85
   $mutated = $true
   Stop-ServiceChecked
   Delete-ServiceChecked
+  # Registration cannot change until admission succeeded and SCM stop completed.
+  # Include a partially failed registration in rollback as well.
+  $failureStage = 83
+  $registrationChanged = $true
+  Secure-Directory $users $false
+  Secure-Directory (Join-Path $users $identity) $false
+  Invoke-Utility @('register-user', '--support', $support, '--identity', $identity, '--confdir', '{config}', '--token-file', $tokenFile) | Out-Null
+  $failureStage = 86
   if (-not $keepHelper) {{
   $copied = $false
   for ($i = 0; $i -lt 10 -and -not $copied; $i++) {{
@@ -180,8 +286,10 @@ try {{
   (Get-Service -Name $service).WaitForStatus([ServiceProcess.ServiceControllerStatus]::Running, [TimeSpan]::FromSeconds(15))
   $admitted = $false
   Write-Output 'polaris-helper-install-ok'
+  }}
 }} catch {{
   $failure = $_
+  $exitCode = $failureStage
   try {{
     if ($mutated) {{
       Stop-ServiceChecked
@@ -190,6 +298,7 @@ try {{
         if ($snapshot.Present) {{ Copy-Item -LiteralPath $snapshot.Backup -Destination $snapshot.Path -Force; Seal-File $snapshot.Path }}
         elseif (Test-Path -LiteralPath $snapshot.Path) {{ Remove-Item -LiteralPath $snapshot.Path -Force }}
       }}
+      if ($registrationChanged) {{ Restore-Registration $registrationSnapshot }}
       if ($null -ne $old) {{
         $startType = switch ($old.StartMode) {{ 'Disabled' {{ 'Disabled' }} 'Manual' {{ 'Manual' }} default {{ 'Automatic' }} }}
         New-Service -Name $service -BinaryPathName $old.PathName -StartupType $startType | Out-Null
@@ -199,13 +308,16 @@ try {{
     }} elseif ($admitted) {{ Invoke-Utility @('cancel-upgrade', '--support', $support) | Out-Null }}
   }} catch {{
     $keepRecovery = $true
+    $exitCode = 87
     Write-Error -ErrorAction Continue "helper rollback incomplete; recovery transaction retained: $tx; $($_.Exception.Message)"
   }}
-  throw $failure
+  Write-Error -ErrorAction Continue $failure
 }} finally {{
   try {{ if ($null -ne $tx -and -not $keepRecovery) {{ Remove-Item -LiteralPath $tx -Recurse -Force }} }}
-  finally {{ $lock.Dispose() }}
+  catch {{ $exitCode = 88 }}
+  finally {{ if ($null -ne $lock) {{ $lock.Dispose() }} }}
 }}
+exit $exitCode
 "#,
         support = ps_quote(WIN_SUPPORT_DIR),
         core = ps_quote(&paths.core_dir.to_string_lossy()),

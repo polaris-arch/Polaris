@@ -36,7 +36,7 @@
 //!
 //! 1. 纯逻辑：决策 + argv 构造，无 spawn。
 //! 2. `forbid(unsafe_code)`。
-//! 3. 错误码区分用户取消（126/127/-128）vs 脚本失败，对齐 上游 `runPkexecScript` / `runRootScript` 语义。
+//! 3. 错误码区分用户取消（Linux 126 / macOS -128）vs 脚本失败，对齐 上游 `runPkexecScript` / `runRootScript` 语义。
 
 use crate::ClientError;
 use std::process::{Command, ExitStatus};
@@ -176,6 +176,9 @@ pub fn uac_escalation(script_path: &str) -> Result<Escalation, ClientError> {
     // 跨平台纯逻辑测试用稳定的 Windows 绝对路径；生产 Windows 构建永远走上面的 OS API。
     #[cfg(not(windows))]
     let powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned();
+    // Start-Process joins ArgumentList elements into a native command line.
+    // PowerShell's single quotes delimit strings but do not survive that join;
+    // retain literal double quotes around the -File path for profiles with spaces.
     let argv = vec![
         powershell.clone(),
         "-NoProfile".to_owned(),
@@ -184,7 +187,7 @@ pub fn uac_escalation(script_path: &str) -> Result<Escalation, ClientError> {
             "$ErrorActionPreference = 'Stop'; \
              try {{ \
                $p = Start-Process -FilePath '{powershell}' \
-                 -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{path}' \
+                 -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{path}\"' \
                  -Verb RunAs -Wait -PassThru -ErrorAction Stop; \
                if ($p -and $p.HasExited) {{ exit $p.ExitCode }}; \
                [Console]::Error.WriteLine('elevated process exit code unavailable'); exit 1 \
@@ -216,7 +219,7 @@ pub fn uac_escalation(script_path: &str) -> Result<Escalation, ClientError> {
 /// 判定退出码是否为「用户取消授权」（对齐 Polaris 三套 runXxxScript 的取消判定）。
 ///
 /// - macOS osascript：退出码 -128 / stderr 含 "User canceled"（`HelperManager.ts:903-905`）
-/// - Linux pkexec：退出码 126 才是用户取消；127 表示当前会话没有认证代理，必须作为失败如实上报
+/// - Linux pkexec：退出码 126 才是用户取消；127 表示授权未完成或执行错误（包括无认证代理、认证失败或拒绝），保留 stderr 如实上报
 /// - Windows UAC：外层 PowerShell 以 `ERROR_CANCELLED` / HRESULT 产出稳定 marker；不解析系统语言文本
 #[must_use]
 pub fn is_user_cancelled(method: PrivilegeMethod, code: i32, stderr: &str) -> bool {

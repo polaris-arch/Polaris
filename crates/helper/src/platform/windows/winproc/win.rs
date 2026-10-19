@@ -11,8 +11,8 @@ use crate::platform::windows::logic::{
     local_port_from_net_order, AF_INET, AF_INET6, MIB_TCP_STATE_LISTEN,
     TCP_TABLE_OWNER_PID_LISTENER,
 };
-use crate::platform::windows::ops::NativeChildPoll;
 use crate::platform::windows::ops::{CoreStart, ManagedIdentity, NetTableOps, ProcOps};
+use crate::platform::windows::ops::{NativeChildPoll, ParentProcess};
 use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -68,6 +68,25 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
 };
+
+struct RetainedParent {
+    pid: u32,
+    handle: OwnedHandle,
+}
+#[allow(unsafe_code, reason = "wait only the owned parent process HANDLE")]
+impl ParentProcess for RetainedParent {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+    fn poll(&self) -> NativeChildPoll {
+        // SAFETY: the owned original process handle stays live through this call.
+        match unsafe { WaitForSingleObject(self.handle.as_raw_handle().cast(), 0) } {
+            WAIT_OBJECT_0 => NativeChildPoll::Exited,
+            WAIT_TIMEOUT => NativeChildPoll::Running,
+            _ => NativeChildPoll::Unknown,
+        }
+    }
+}
 
 /// IPv4 TCP owner PID 行（`winproc.go:259-266` `MIB_TCPROW_OWNER_PID`）。
 ///
@@ -170,6 +189,81 @@ unsafe impl Send for WinProcOps {}
     reason = "the mutexes serialize access to the thread-independent job and child HANDLEs"
 )]
 unsafe impl Sync for WinProcOps {}
+
+/// Lifetime ends only after CreateProcess has inherited the exact file and
+/// opened original CWD. Prefix handles deny rename while resolving descendants.
+struct ConfinedConfig {
+    file: File,
+    _directories: Vec<File>,
+}
+
+fn open_confined_config(
+    cfg: &str,
+    conf_dir: &str,
+    owner: &polaris_helper_proto::core_protocol::CallerIdentity,
+) -> std::io::Result<ConfinedConfig> {
+    use polaris_helper_proto::core_protocol::CallerIdentity;
+    if !crate::platform::windows::logic::cfg_allowed(cfg, conf_dir) {
+        return Err(std::io::Error::other("configuration path denied"));
+    }
+    let CallerIdentity::Windows(sid) = owner else {
+        return Err(std::io::Error::other("native Windows owner required"));
+    };
+    let normalized = crate::platform::windows::logic::normalize_path(cfg);
+    let registered = crate::platform::windows::logic::normalize_path(conf_dir);
+    let path = Path::new(&normalized);
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("config parent absent"))?;
+    let mut directories = Vec::new();
+    let mut cursor = PathBuf::new();
+    let mut checked_root = false;
+    for component in parent.components() {
+        match component {
+            Component::Prefix(prefix) if cursor.as_os_str().is_empty() => {
+                cursor.push(prefix.as_os_str())
+            }
+            Component::RootDir | Component::Normal(_) => {
+                cursor.push(component.as_os_str());
+                let held = open_directory_no_reparse(&cursor)?;
+                if cursor.to_string_lossy().eq_ignore_ascii_case(&registered) {
+                    if !coreacl::is_private_user_config(&file_security(&held)?, sid) {
+                        return Err(std::io::Error::other(
+                            "registered configuration owner changed",
+                        ));
+                    }
+                    checked_root = true;
+                }
+                directories.push(held);
+            }
+            _ => return Err(std::io::Error::other("configuration alias denied")),
+        }
+    }
+    if !checked_root {
+        return Err(std::io::Error::other("registered root not retained"));
+    }
+    // All absolute prefixes remain pinned; relative native open binds the final
+    // file to that same directory and does not traverse a replacement link.
+    let directory = crate::core_objects::PayloadDir::open(parent, None)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("invalid config file name"))?;
+    let (file, _) = directory.open_regular(name)?;
+    let info = file_information(&file)?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || info.nNumberOfLinks != 1
+        || !coreacl::is_private_user_config(&file_security(&file)?, sid)
+    {
+        return Err(std::io::Error::other(
+            "configuration object is not private regular data",
+        ));
+    }
+    Ok(ConfinedConfig {
+        file,
+        _directories: directories,
+    })
+}
 
 fn preopen_log_files(log_path: &str) -> std::io::Result<polaris_log_budget::PreopenedLogFiles> {
     let path = Path::new(log_path);
@@ -296,6 +390,7 @@ impl WinProcOps {
         log_path: &str,
         fwd: bool,
         birth: HelperBirthToken,
+        config: ConfinedConfig,
     ) -> std::io::Result<CoreStart> {
         let mut custody = self
             .managed
@@ -333,8 +428,13 @@ impl WinProcOps {
         cmd.env_clear()
             .env("SystemRoot", &system_root)
             .env("PATH", path);
-        cmd.args(["run", "-c", cfg])
-            .stdin(std::process::Stdio::null());
+        // The pinned fork already supports -c stdin. Pass the verified file
+        // object itself: child never reopens a mutable privileged path. Original
+        // App config can still be atomically replaced for a future Start.
+        // Bytes remain same-account mutable; this is not a frozen snapshot.
+        let ConfinedConfig { file, _directories } = config;
+        cmd.args(["run", "-c", "stdin"])
+            .stdin(std::process::Stdio::from(file));
         if !log_path.is_empty() {
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -526,8 +626,7 @@ impl WinProcOps {
 impl ProcOps for WinProcOps {
     fn process_alive(&self, ppid: u32) -> bool {
         // D3：问的若是**受管核**，用持有的句柄回答 —— 按 pid 现开句柄的老路答的是「这个号码上有
-        // 进程吗」，核死后号码被复用时它恒真。其余 pid（父死看护的 app ppid 等）仍走无状态自由函数
-        //（winproc.go:123-143 processAlive；watchParent 后台线程共用，不捕获 &self）。
+        // 进程吗」，核死后号码被复用时它恒真。其余旧查询仍走无状态自由函数；父死看护单独持有 ParentProcess HANDLE。
         self.managed_alive(ppid)
             .unwrap_or_else(|| process_alive_raw(ppid))
     }
@@ -646,8 +745,11 @@ impl ProcOps for WinProcOps {
         log: &str,
         fwd: bool,
         birth: HelperBirthToken,
+        conf_dir: &str,
+        owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
-        self.spawn_tracked(bin, cfg, log, fwd, birth)
+        let config = open_confined_config(cfg, conf_dir, owner)?;
+        self.spawn_tracked(bin, cfg, log, fwd, birth, config)
     }
 
     fn poll_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
@@ -773,33 +875,46 @@ impl ProcOps for WinProcOps {
             .status();
     }
 
+    fn capture_parent(&self, pid: u32) -> std::io::Result<Box<dyn ParentProcess>> {
+        // SAFETY: OpenProcess returns an owned handle to this exact process;
+        // retaining it makes later PID reuse irrelevant to wait semantics.
+        let raw =
+            unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+        if raw.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+        if process_created_ticks(handle.as_raw_handle().cast()).is_none() {
+            return Err(std::io::Error::other("parent process birth unavailable"));
+        }
+        Ok(Box::new(RetainedParent { pid, handle }))
+    }
+
     fn spawn_watch_parent(
         &self,
-        ppid: u32,
+        parent: Box<dyn ParentProcess>,
         child_pid: u32,
         is_current: Box<dyn Fn(u32) -> bool + Send>,
         on_parent_dead: Box<dyn Fn(u32) + Send>,
     ) {
-        // W15 修：接线父死看护（Go helper.go:131-159 `watchParent` + `go watchParent`）。此前
-        // parent_pid 被丢弃、看护零调用 → app 崩溃/taskkill（管道 stop 够不到）后 sing-box 成孤儿
-        //（Job 只兜「helper 自己死」，管不到「app≠helper 死、helper 仍活」）。
-        // 后台线程只捕获 pid + 闭包 + 无状态 process_alive_raw（不捕获 &self）。
-        std::thread::spawn(move || {
-            let interval = std::time::Duration::from_secs(1); // Go: time.NewTicker(time.Second)
-            loop {
-                std::thread::sleep(interval);
-                if !is_current(child_pid) {
-                    return; // 已被 stop/cleanup/新 start 摘除（Go: child != c）
-                }
-                // processAlive：仅「确定父已死」返回 false（宁漏勿误）。
-                if !process_alive_raw(ppid) {
-                    if !is_current(child_pid) {
-                        return; // 与 stop 竞态：他人已摘除则由他收割
+        std::thread::spawn(move || loop {
+            if !is_current(child_pid) {
+                return;
+            }
+            match parent.poll() {
+                NativeChildPoll::Exited => {
+                    if is_current(child_pid) {
+                        on_parent_dead(child_pid);
                     }
-                    on_parent_dead(child_pid);
                     return;
                 }
+                NativeChildPoll::Unknown => {
+                    log::error!("parent HANDLE wait failed; no fabricated exit or PID fallback");
+                    return;
+                }
+                NativeChildPoll::Running => {}
             }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         });
     }
 

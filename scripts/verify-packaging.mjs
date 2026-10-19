@@ -123,17 +123,9 @@ const CORE_TO_CONF = {
  *  - `resources`  —— `bundle.resources` 的**登记表**，集合恰等于（多一条 / 少一条都红）。
  *                    「不多」守的是不变量 E 那个方向（整目录递归铺进包）；「不少」守的是
  *                    许可文本这类**正面**义务 —— 只写否定式判据会被「什么都没发生」骗过。
- *  - `ciLeg`      —— 这份 conf 归哪条 CI 腿：`null`（本仓至今没有该平台的腿），或
- *                    `{ workflow, bind }` —— 腿所在的 workflow 文件名 + 它绑定这份 conf 的**逐字串**。
- *
- *                    判据是**双向且按文件枚举**的（见 [`checkPlatformConfRegistry`] ④e）：
- *                    `.github/workflows/` 下提到这个 conf 文件名的文件集合，必须**恰等于**
- *                    `ciLeg === null ? {} : { ciLeg.workflow }`，且非 null 时那个文件必须逐字含 `bind`。
- *
- *                    🔴 **为什么枚举整个 workflow 目录、而不是只看 package.yml**（2026-09-04 订正）：
- *                    原判据只 grep package.yml，于是「在**另一个** workflow 里加一条 Android 腿」
- *                    对它完全不可见 —— 而这正是 Android 腿实际的落点（`android.yml`，步骤面与桌面
- *                    打包腿不相交）。按 package.yml 一个文件写死的判据，会在它最该说话的那次静默判绿。
+ *  - `ciLeg` —— workflow 与显式配置绑定；直接调用登记 bind/invocation，
+ *    间接调用登记 entry 与逐跳 chain。源码绑定检查不等于原生构建成功证明。
+ *    workflow 枚举同时识别配置文件名和已登记入口，不能用未出现文件名推断无 CI。
  */
 const NON_CORE_CONFS = {
   'tauri.android.conf.json': {
@@ -184,15 +176,17 @@ const NON_CORE_CONFS = {
       // 照常编译，`resolve_bundled_data_dir()` 运行期就会找这个目录。与 android 同形。
       '../resources/data/',
     ],
-    // 🔴 `ciLeg: null` 不是「还没填」，它是一条**主动断言**：④e 的方向二按整个 `.github/workflows/`
-    // 目录枚举「提到 tauri.ios.conf.json 的文件集合」，null 时要求该集合**恰为空** ——
-    // 也就是逐字断言「本仓今天没有任何 workflow 跑在这份 conf 上」。
-    // 哪天有人加了 iOS 腿却没回来改本表，那条腿就会跑在一份没有「腿 ↔ conf 绑定」断言覆盖的 conf 上，
-    // 而这一格会替它自曝（多出来的 workflow 文件名会被打进错误信息）。
-    //
-    // 这也是本条与 android 那条的全部差别所在：iOS 产物本仓构不出（无 macOS/Xcode），
-    // 这份 conf 今天只在有人本机 `tauri ios build` 时被 Tauri 按平台名自动合并。
-    ciLeg: null,
+    // Apple CI 经 carrier → App builder → Rust builder 显式读取配置并传入 TAURI_CONFIG。
+    ciLeg: {
+      workflow: 'apple.yml',
+      entry: 'scripts/mobile-core/ci_apple.py carrier',
+      chain: [
+        ['scripts/mobile-core/ci_apple.py', "ROOT / 'scripts/mobile-core/build_apple_app.py'"],
+        ['scripts/mobile-core/build_apple_app.py', "ROOT / 'scripts/mobile-core/apple_rust.py', 'build'"],
+        ['scripts/mobile-core/apple_rust.py', "ios_config = json.loads((ROOT / 'src-tauri/tauri.ios.conf.json').read_bytes())"],
+        ['scripts/mobile-core/apple_rust.py', 'TAURI_CONFIG=json.dumps(ios_config)'],
+      ],
+    },
   },
 };
 
@@ -828,15 +822,10 @@ function checkPlatformConfRegistry(workflows) {
       }
     }
 
-    // ④e ciLeg 一致性：**双向**，且取材面是整个 `.github/workflows/` 目录。
-    //    方向一（登记 → 实况）：ciLeg 指名的那个 workflow 必须真提到这份 conf，且必须逐字含 `bind`
-    //      —— 「登记了一条不存在的绑定」与「绑定写成了会静默失效的隐式合并」都在这里红。
-    //    方向二（实况 → 登记）：**提到这份 conf 的 workflow 文件集合必须恰等于登记值**。
-    //      ciLeg=null 时该集合必须为空：哪天有人在任意一个 workflow 里加了腿却没回来更新本表，
-    //      那条腿就跑在一份没有腿 ↔ conf 绑定断言覆盖的 conf 上 —— 本条替它自曝。
+    // ④e 登记与实际源码绑定双向对拍：直接配置参数或已登记的间接调用链。
     if (workflows !== null) {
       const mentionedIn = [...workflows.entries()]
-        .filter(([, text]) => text.includes(name))
+        .filter(([, text]) => text.includes(name) || (spec.ciLeg?.entry && text.includes(spec.ciLeg.entry)))
         .map(([file]) => file)
         .sort();
       const wantIn = spec.ciLeg === null ? [] : [spec.ciLeg.workflow];
@@ -851,24 +840,34 @@ function checkPlatformConfRegistry(workflows) {
       }
       if (spec.ciLeg !== null) {
         const text = workflows.get(spec.ciLeg.workflow) ?? '';
-        const hits = text.split(spec.ciLeg.bind).length - 1;
-        // 期望值由**构建调用次数**推导，不写死。android.yml 今天有 unsigned 验证与 signed 发布
-        // 两条 release-profile 路径；写死次数的判据会在加腿那天以错误的理由红，而放宽成 `>= 1` 又会让
-        // 「新腿忘了传 conf」静默过门。两个失败方向都要堵，只能对拍。
-        const calls = text.split(spec.ciLeg.invocation).length - 1;
-        if (calls < 1) {
-          fail(
-            `.github/workflows/${spec.ciLeg.workflow}: 找不到构建调用 \`${spec.ciLeg.invocation}\` —— ` +
-              `取材面塌了（腿改了命令形态或整条腿没了），下面那条「每次调用都带 bind」的对拍会在 ` +
-              `0 == 0 上恒真。先确认腿还在，再改 NON_CORE_CONFS 里的 invocation`
-          );
-        } else if (hits !== calls) {
-          fail(
-            `.github/workflows/${spec.ciLeg.workflow}: \`${spec.ciLeg.invocation}\` 被调用 ${calls} 次，` +
-              `而 \`${spec.ciLeg.bind}\` 只出现 ${hits} 次 —— 有构建调用没显式传这份 conf。` +
-              `吃 Tauri 的按平台名自动合并的话，conf 一改名就静默停止合并（包里少掉全部资源、` +
-              `构建照绿）；显式传则改名即硬失败`
-          );
+        if (spec.ciLeg.chain) {
+          if (!text.includes(spec.ciLeg.entry)) fail(`.github/workflows/${spec.ciLeg.workflow}: 缺少已登记的 CI 构建入口 ${spec.ciLeg.entry}`);
+          for (const [path, binding] of spec.ciLeg.chain) {
+            let source;
+            try { source = readFileSync(join(ROOT, path), 'utf8'); }
+            catch (error) { fail(`${path}: 无法读取已登记的 CI 配置调用链：${error.message}`); continue; }
+            if (!source.includes(binding)) fail(`${path}: 缺少 ${name} 的已登记 CI 配置绑定 ${JSON.stringify(binding)}`);
+          }
+        } else {
+          const hits = text.split(spec.ciLeg.bind).length - 1;
+          // 期望值由**构建调用次数**推导，不写死。android.yml 今天有 unsigned 验证与 signed 发布
+          // 两条 release-profile 路径；写死次数的判据会在加腿那天以错误的理由红，而放宽成 `>= 1` 又会让
+          // 「新腿忘了传 conf」静默过门。两个失败方向都要堵，只能对拍。
+          const calls = text.split(spec.ciLeg.invocation).length - 1;
+          if (calls < 1) {
+            fail(
+              `.github/workflows/${spec.ciLeg.workflow}: 找不到构建调用 \`${spec.ciLeg.invocation}\` —— ` +
+                `取材面塌了（腿改了命令形态或整条腿没了），下面那条「每次调用都带 bind」的对拍会在 ` +
+                `0 == 0 上恒真。先确认腿还在，再改 NON_CORE_CONFS 里的 invocation`
+            );
+          } else if (hits !== calls) {
+            fail(
+              `.github/workflows/${spec.ciLeg.workflow}: \`${spec.ciLeg.invocation}\` 被调用 ${calls} 次，` +
+                `而 \`${spec.ciLeg.bind}\` 只出现 ${hits} 次 —— 有构建调用没显式传这份 conf。` +
+                `吃 Tauri 的按平台名自动合并的话，conf 一改名就静默停止合并（包里少掉全部资源、` +
+                `构建照绿）；显式传则改名即硬失败`
+            );
+          }
         }
       }
     }
@@ -1349,23 +1348,14 @@ const KNOWN_NSIS_INSTALL_MODES = ['currentUser', 'perMachine', 'both'];
 /**
  * Windows 装机形态必须**被显式声明**，且取值在 [`KNOWN_NSIS_INSTALL_MODES`] 内。
  *
- * # 守的是什么（根因）：缺键会静默回落，而这个默认值决定了一条提权链通不通
+ * # 守的是什么：App 安装位置与管理员权限需求必须是显式产品选择
  *
- * helper 的安装/升级脚本以提权身份 `Copy-Item $helperSrc → C:\ProgramData\Polaris\polaris-helper.exe`
- * 之后 `New-Service … LocalSystem`，拷贝前**没有**任何签名 / hash 校验（`crates/helper-client/src/manager.rs`
- * 的 `build_win_install_script`）。`$helperSrc` 是随包资源里的那份 `polaris-helper.exe`，它跟着 app 本体走，
- * 于是装机形态直接决定这条链的两端信任级：
- *
- * - `currentUser` → app 落 `%LOCALAPPDATA%\Polaris` ⇒ `$helperSrc` **同账户普通权限进程可写**
- *   ⇒ 攻击者在那一次 UAC 提权**发生之前**换掉它，受信安装就把攻击者的 exe 装成 SYSTEM 服务。
- * - `perMachine` → app 落 `%PROGRAMFILES%\Polaris`（Tauri NSIS 模板 `installer.nsi` 的
- *   `!if "${INSTALLMODE}" == "perMachine"` → `StrCpy $INSTDIR "$PROGRAMFILES64\${PRODUCTNAME}"`）
- *   ⇒ 该目录默认 ACL 对 Users 只读 ⇒ 上面那条链从结构上断开，**代价是安装必须有管理员**。
- *
- * 两者是**结构性互斥**的：模板给 per-machine 的落点只有 `$PROGRAMFILES64` / `$PROGRAMFILES` 两支，
- * 没有任何一支落在标准用户可写的位置 ⇒ 「装进只读目录」与「标准用户能自己装」不可能同时成立，
- * 不是配置能调和的。所以选哪一个是**产品决策**（2026-09-16：选 `currentUser`，因为标准用户必须能装），
- * 本门不替产品做这个决定。
+ * NSIS 安装 App 与运行期安装/升级 helper 是两条路径。currentUser 的 App 目录同账户可写；
+ * perMachine 默认落 Program Files、普通 Users 只读，但安装需要管理员权限。
+ * helper 的运行期安装路径另有私有暂存、提权后封存及 hash 校验、安装身份和现有服务状态准入，
+ * 见 crates/helper-client/src/manager/install_windows.rs；不能称为「拷贝前零校验」。
+ * 这些字节/状态校验不等于代码签名，也不证明同账户可写的整个 App 未被替换。
+ * 本门只要求 installMode 显式且合法，不替代 helper 的安装准入或决定产品的权限策略。
  *
  * # 本门钉的是**第三种**取值：没写
  *
@@ -1390,8 +1380,8 @@ function checkWindowsInstallMode(base) {
     fail(
       `tauri.conf.json: bundle.windows.nsis.installMode **缺失**。缺键会静默回落 Tauri 默认值 ` +
         `'currentUser'（tauri-utils 的 NSISInstallerMode 带 #[default]）⇒ 随包 polaris-helper.exe 落进 ` +
-        `%LOCALAPPDATA%（同账户普通权限进程可写），而 helper 安装脚本会以提权身份把它拷成 LocalSystem ` +
-        `服务且拷贝前零校验。这个默认值可以是对的选择，但它必须**被写下来**：产物一样，` +
+        `%LOCALAPPDATA%（同账户普通权限进程可写）。运行期 helper 安装另有提权、字节和状态准入；` +
+        `本门只检查 App 安装形态的显式选择，不能替代这些校验。这个默认值必须**被写下来**：产物一样，` +
         `「选过 currentUser」与「没人想过这件事」不一样。`
     );
   } else if (!KNOWN_NSIS_INSTALL_MODES.includes(declared)) {

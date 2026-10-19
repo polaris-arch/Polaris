@@ -21,6 +21,11 @@ pub enum StoreError {
     #[error("config validation failed: {0}")]
     Validation(String),
 
+    /// Explicit DNS dependency cannot be satisfied. Keep diagnostics internal;
+    /// IPC consumers use the stable code rather than displaying raw identifiers.
+    #[error("DNS dependency invalid: {0}")]
+    DnsDependency(String),
+
     /// 文件系统错误（读/写/创建目录）。运行时层填充，纯逻辑测试用 mock。
     #[error("io error: {0}")]
     Io(String),
@@ -33,6 +38,14 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    /// Stable, credential-free IPC classification. None retains existing behavior.
+    pub const fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::DnsDependency(_) => Some("DNS_DEPENDENCY_INVALID"),
+            _ => None,
+        }
+    }
+
     /// 构造一条校验错误（语义化便捷构造）。
     pub fn validation(msg: impl Into<String>) -> Self {
         StoreError::Validation(msg.into())

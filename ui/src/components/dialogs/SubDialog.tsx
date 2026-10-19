@@ -1,3 +1,4 @@
+import { useInputRequest } from '@/hooks/use-input-request';
 /**
  * SubDialog —— 添加/编辑订阅弹窗（原型 #sub-dialog :2550；subEdit 编辑态 :3745）。
  *
@@ -21,7 +22,7 @@
  *    `resolveSubscriptionViaProxy`）。提交把 `updateViaProxy` 写回 config；预检 viaProxy 用「策略 × 本开关实时值」求值。
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore, useEffectiveConfig } from '@/store/app-store';
 import { api } from '@/ipc';
@@ -173,7 +174,12 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
     externalCloseLocked: isEdit && submitting,
   });
 
+  const previewInput = JSON.stringify([url, ua, viaProxy, proxyPolicy]);
+  const beginPreview = useInputRequest(previewInput);
+  useEffect(() => { setPreviewMsg(null); setPreviewing(false); }, [previewInput]);
+
   const runPreview = async () => {
+    const isCurrent = beginPreview();
     if (!isSubscriptionUrl(url)) {
       setErrUrl(true);
       return;
@@ -185,6 +191,7 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
         viaProxy: previewViaProxy,
         userAgent: ua.trim() || undefined,
       });
+      if (!isCurrent()) return;
       if (r.ok) {
         setPreviewMsg({
           ok: true,
@@ -202,11 +209,12 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
         });
       }
     } catch (e) {
+      if (!isCurrent()) return;
       // IPC 原始诊断只进日志：预检提示须跨语言稳定，不能把 IpcError.message 直接塞进弹窗。
       console.error('[SubDialog] preview failed:', e);
       setPreviewMsg({ ok: false, text: t('sub.previewFail') });
     } finally {
-      setPreviewing(false);
+      if (isCurrent()) setPreviewing(false);
     }
   };
 

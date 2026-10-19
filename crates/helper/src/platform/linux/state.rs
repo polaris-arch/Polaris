@@ -292,6 +292,8 @@ impl ManagedChild {
 #[derive(Debug)]
 pub struct HandlerState {
     pub upgrade_closed: bool,
+    /// Monotonic daemon shutdown; administrative cancellation cannot reopen it.
+    pub shutting_down: bool,
     pub dns_owner: Option<u32>,
     /// Physical birth responsible for the DNS reservation or retained state.
     pub dns_birth: Option<CoreHandle>,
@@ -302,6 +304,16 @@ pub struct HandlerState {
 }
 
 impl HandlerState {
+    pub(crate) fn begin_shutdown(&mut self) -> Option<CoreHandle> {
+        self.shutting_down = true;
+        self.upgrade_closed = true;
+        let birth = self.child.as_ref().map(ManagedChild::handle).cloned();
+        if let Some(birth) = birth.as_ref() {
+            self.child = Some(ManagedChild::Stopping(birth.clone()));
+        }
+        birth
+    }
+
     /// Retire upper custody without discarding the DNS responsibility that the
     /// native reaper must discharge, including a synchronous Stop acknowledgement.
     pub(crate) fn retire_birth(&mut self, birth: &CoreHandle) {
@@ -327,6 +339,7 @@ impl HandlerState {
         Self {
             child: None,
             upgrade_closed: false,
+            shutting_down: false,
             dns_owner: None,
             dns_birth: None,
             dns_busy: false,

@@ -463,7 +463,11 @@ carrier verification, or sim-arm64 final verification when explicitly requested.
 are outside the current contract.
 
 `scripts/libbox-patches` and the old Apple six-patch declarations remain
-historical alpha8 compatibility inputs; their production build entry is retired.
+historical alpha8 compatibility inputs; their production build entries are retired.
+Both `scripts/build-libbox.sh` and direct `scripts/libbox-patches/build.py`
+refuse before source/tool/cache access or publication and point to
+`bash scripts/build-mobile-core.sh android` with the required arguments above.
+Historical read-only Android receipt predicates remain importable.
 Their raw receipts are not relabeled; the small
 `historical-ci-fragments.json` pins only retired caller fragments for existing
 negative tests. New formal source controls live in `test_inputs.py` and

@@ -11,19 +11,21 @@
 // （CreateNamedPipeW/ConnectNamedPipe/ConvertStringSecurityDescriptorToSecurityDescriptorW/
 // StartServiceCtrlDispatcherW/RegisterServiceCtrlHandlerExW/SetServiceStatus/...）必须 unsafe。
 // 每处 unsafe 块附 SAFETY 理由。
+use super::frame::{cancel_after_deadline, read_frame_until, MessageRead};
 use crate::platform::windows::helper::{FlushMode, WinHelper};
 use crate::platform::windows::logic;
 use crate::platform::windows::winproc::WinProcOps;
 use crate::platform::windows::{PIPE_NAME, PIPE_SDDL, SERVICE_NAME};
 use crate::token::FileTokenStore;
-use polaris_helper_proto::codec::MAX_FRAME_BYTES;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
-    ERROR_SERVICE_CANNOT_ACCEPT_CTRL, FALSE, HANDLE, INVALID_HANDLE_VALUE, NO_ERROR,
+    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_MORE_DATA, ERROR_NO_DATA,
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, FALSE, HANDLE,
+    INVALID_HANDLE_VALUE, NO_ERROR,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR};
@@ -33,7 +35,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, SetNamedPipeHandleState, PIPE_NOWAIT,
-    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
@@ -41,7 +43,8 @@ use windows_sys::Win32::System::Services::{
     SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED,
     SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
-use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
 
 #[cfg(test)]
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
@@ -213,7 +216,7 @@ const _: () = {
     assert!(logic::pipe_open_mode(false) == PIPE_ACCESS_DUPLEX);
 };
 
-/// 创建一个命名管道实例（SDDL 防护，字节流，PIPE_WAIT 阻塞）。
+/// 创建一个命名管道实例（SDDL 防护，message-framed，PIPE_WAIT 阻塞）。
 ///
 /// `first` 决定要不要带 `FILE_FLAG_FIRST_PIPE_INSTANCE` —— 见 [`logic::pipe_open_mode`]，
 /// 带错了会让**连接处理期间没有监听实例**。
@@ -244,13 +247,14 @@ fn create_pipe_instance(name_w: &[u16], sddl_w: &[u16], first: bool) -> std::io:
     // PIPE_ACCESS_INBOUND 只给服务端只读句柄，WriteFile 响应据 Win32 契约回 ERROR_ACCESS_DENIED →
     // 请求/响应回路断（client 收不到响应）。DUPLEX 让服务端可读请求 + 写响应（对齐 Go winio 默认双向）。
     // FILE_FLAG_FIRST_PIPE_INSTANCE **只给首个实例**（见 `logic::pipe_open_mode`）。
-    // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE（字节流）。
+    // Each request WriteFile is one native message; preserve that boundary.
+    // The client may retain byte-read mode for the single response line.
     // PIPE_WAIT 阻塞（ConnectNamedPipe 阻塞等连接）。PIPE_REJECT_REMOTE_CLIENTS 拒绝远程客户端。
     let h = unsafe {
         CreateNamedPipeW(
             name_w.as_ptr(),
             logic::pipe_open_mode(first),
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_INSTANCES,
             4096,
             4096,
@@ -278,7 +282,7 @@ fn create_pipe_instance(name_w: &[u16], sddl_w: &[u16], first: bool) -> std::io:
 /// nonzero success merely makes the pipe available to a future client.
 #[allow(unsafe_code, reason = "owned synchronous pipe mode and accept polling")]
 fn connect_pipe_until_stopped(h: HANDLE, mut stopped: impl FnMut() -> bool) -> bool {
-    let mode = PIPE_NOWAIT | PIPE_READMODE_BYTE;
+    let mode = PIPE_NOWAIT | PIPE_READMODE_MESSAGE;
     if unsafe { SetNamedPipeHandleState(h, &mode, std::ptr::null(), std::ptr::null()) } == 0 {
         return false;
     }
@@ -293,7 +297,7 @@ fn connect_pipe_until_stopped(h: HANDLE, mut stopped: impl FnMut() -> bool) -> b
                 if stopped() {
                     return false;
                 }
-                let blocking = PIPE_WAIT | PIPE_READMODE_BYTE;
+                let blocking = PIPE_WAIT | PIPE_READMODE_MESSAGE;
                 return unsafe {
                     SetNamedPipeHandleState(h, &blocking, std::ptr::null(), std::ptr::null())
                 } != 0;
@@ -336,27 +340,21 @@ where
     P: crate::platform::windows::ops::ProcOps + 'static,
     N: crate::platform::windows::ops::NetTableOps,
 {
-    // 读一个请求帧（≤ MAX_FRAME_BYTES，防超长帧耗尽内存）。
-    // W1 修：5s 读超时（镜像 Go `conn.SetReadDeadline(5s)`）——guard 在读结束时 drop（停看护 + join，
-    // 句柄仍开），随后才 cleanup 关句柄。超时（客户端连上不发数据）→ CancelIoEx 中断 → read 返 Err → 关连接。
-    let mut buf = vec![0u8; MAX_FRAME_BYTES];
-    let read_result = {
-        let _timeout = IoTimeoutGuard::arm(h, std::time::Duration::from_secs(IO_TIMEOUT_SECS));
-        read_frame(h, &mut buf)
-    };
-    let n = match read_result {
-        Ok(n) if n > 0 => n,
-        _ => {
+    // One absolute deadline covers every fragment. PIPE_NOWAIT reads cannot
+    // become stranded by a cancellation arriving just before an operation starts.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(IO_TIMEOUT_SECS);
+    let raw = match read_frame(h, deadline) {
+        Ok(raw) => raw,
+        Err(_) => {
             cleanup_pipe(h);
             return;
         }
     };
-    let raw = String::from_utf8_lossy(&buf[..n]);
     // 切行 → 验 token → 解码 → 分派 全在 `handle_frame`（跨平台、Linux 有门）；这里只管 IO。
     // 顺序与各腿的 flush 档位见该方法文档：token 不对时不看命令（已知/未知不可区分），
     // 已鉴权而命令未知的 `ERR unknown` 走 WaitPeer 可靠送达。
-    // SAFETY: this worker owns the connected pipe until cleanup below; timeout
-    // cancellation has ended and no other worker closes or replaces this handle.
+    // SAFETY: this worker owns the connected pipe until cleanup below; all reads
+    // have completed and no other worker closes or replaces this handle.
     let peer = match unsafe { crate::platform::windows::native_caller::from_pipe(h) } {
         Ok(peer) => peer,
         Err(_) => {
@@ -378,57 +376,80 @@ where
     }
 }
 
-/// 读一个请求帧（**单次 ReadFile**，对应 mod.rs「一次 ReadFile 取整个请求帧再切行」的设计）。
-///
-/// **W1 关键**：不可 loop-until-EOF —— 命名管道无半关，duplex 下 client 写完请求后**保持连接**等读响应
-/// （不会关写端使服务端读到 EOF）。若循环读到 EOF 会永久阻塞在第二次 ReadFile（由 5s 超时兜成失败），
-/// 响应永远发不出。故按帧一次读回：client 把整帧一次 WriteFile 发来（字节模式 ReadFile 一到即返回全帧），
-/// 服务端读回后切行 → 处理 → 写响应（同一 duplex 句柄）。
-///
-/// DESIGN-REVIEW(win-pipe-single-frame-read)：假设 client 把整帧单次 WriteFile 发送（本协议帧 < 1KB，
-/// 远小于 4KB 管道缓冲），单次 ReadFile 取全帧。分帧/跨多次 WriteFile 的 client 不支持——duplex 请求/响应
-/// 往返（含此假设）= 真机门（C6-4 生产 PipeConnector 须一次写全帧）。
-///
-/// 返回读到的字节数（0 = 客户端未发数据即关连接，视为无效）。
+/// Read exactly one native message. ERROR_MORE_DATA chunks are accumulated;
+/// only native message completion is a frame boundary. No short buffer, empty
+/// poll, complete-looking argument prefix, or split UTF-8 sequence is dispatched.
+/// Restore PIPE_WAIT only after the complete bounded request is validated, before
+/// the existing response/flush path uses this owned handle.
 #[allow(
     unsafe_code,
-    reason = "ReadFile synchronously borrows the live pipe HANDLE and bounded buffer"
+    reason = "polls the owned nonblocking message pipe and restores its wait mode"
 )]
-fn read_frame(h: HANDLE, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut got: u32 = 0;
-    // SAFETY: ReadFile 从管道读一帧。buf 是本函数拥有的缓冲。lpOverlapped=NULL → 同步阻塞
-    //（由 IoTimeoutGuard 的 CancelIoEx 兜 5s 超时 → 返 ERROR_OPERATION_ABORTED）。
-    let ok = unsafe {
-        ReadFile(
-            h,
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-            &mut got,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        if err == ERROR_BROKEN_PIPE {
-            return Ok(0); // 客户端未发数据即关（正常 EOF）→ 无效帧
-        }
-        // 其余（含超时 ERROR_OPERATION_ABORTED）→ 失败 → 上层关连接。
+fn read_frame(h: HANDLE, deadline: std::time::Instant) -> std::io::Result<String> {
+    let nonblocking = PIPE_NOWAIT | PIPE_READMODE_MESSAGE;
+    // SAFETY: this connection worker exclusively owns the live handle; no I/O is
+    // pending and no cancellation thread is involved in the read leg.
+    if unsafe { SetNamedPipeHandleState(h, &nonblocking, std::ptr::null(), std::ptr::null()) } == 0
+    {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(got as usize)
+    let raw = read_frame_until(
+        deadline,
+        |fragment| {
+            let mut got: u32 = 0;
+            // SAFETY: PIPE_NOWAIT makes this synchronous read nonblocking; the
+            // bounded fragment and byte count remain live through the call.
+            let ok = unsafe {
+                ReadFile(
+                    h,
+                    fragment.as_mut_ptr(),
+                    fragment.len() as u32,
+                    &mut got,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok != 0 {
+                return Ok(MessageRead {
+                    bytes: got as usize,
+                    complete: true,
+                });
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error().map(|code| code as u32) {
+                Some(ERROR_MORE_DATA) => Ok(MessageRead {
+                    bytes: got as usize,
+                    complete: false,
+                }),
+                Some(ERROR_NO_DATA) => Err(std::io::ErrorKind::WouldBlock.into()),
+                Some(ERROR_BROKEN_PIPE) => Err(std::io::ErrorKind::UnexpectedEof.into()),
+                _ => Err(error),
+            }
+        },
+        std::time::Instant::now,
+        std::thread::sleep,
+    )?;
+    if std::time::Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let blocking = PIPE_WAIT | PIPE_READMODE_MESSAGE;
+    if unsafe { SetNamedPipeHandleState(h, &blocking, std::ptr::null(), std::ptr::null()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    Ok(raw)
 }
 
-/// 同步 IO 超时看护（W1：镜像 Go `conn.SetReadDeadline(5s)`；**读腿与写腿共用**）。
+/// Response-only cancellation guard. The absolute deadline is captured by the
+/// connection worker before spawning the watchdog, not when that thread runs.
+/// After expiry it repeatedly cancels until joined, covering operation-start
+/// gaps between WriteFile and FlushFileBuffers. Native synchronous cancellation
+/// and flush behavior still require Windows fixtures; this is not a proof that
+/// every driver implements prompt cancellation.
 ///
-/// 命名管道的同步阻塞 IO 无原生 deadline —— 另起看护线程，超时后 `CancelIoEx` 中断在途操作
-///（返回 `ERROR_OPERATION_ABORTED` → 调用方视为失败 → 关连接）。防无 token 进程连上不发数据
-/// 耗尽句柄/线程（Go helper.go:163-165 同款动机）。
-///
-/// 写腿同样需要它：`FlushFileBuffers` 在命名管道服务端会**一直等到 client 把数据读走**，
-/// 「连上、发一帧、不读」即可无限期钉住一个连接线程 + 一个管道 HANDLE。
-///
-/// `drop` 时置 `done` + `unpark` + `join` 看护线程 —— 保证看护线程在句柄被 `CloseHandle` **前**退出，
-/// 绝不对已关/复用句柄调 `CancelIoEx`。
+/// The retained thread handle, not a pipe handle or numeric ID, is canceled.
+/// Drop sets done, unparks, and joins before unrelated work or pipe cleanup.
 struct IoTimeoutGuard {
     done: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -436,41 +457,51 @@ struct IoTimeoutGuard {
 
 #[allow(
     unsafe_code,
-    reason = "CancelIoEx is joined before the pipe HANDLE can be closed"
+    reason = "duplicates and retains the exact worker thread until synchronous cancellation is joined"
 )]
 impl IoTimeoutGuard {
-    fn arm(h: HANDLE, timeout: std::time::Duration) -> Self {
+    fn arm(deadline: std::time::Instant) -> std::io::Result<Self> {
+        let mut thread = std::ptr::null_mut();
+        // SAFETY: pseudo handles are resolved here on the connection worker,
+        // before spawning the watchdog. The duplicate identifies this exact
+        // thread, never a numeric thread ID or the watchdog's current thread.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentThread(),
+                GetCurrentProcess(),
+                &mut thread,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if duplicated == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: DuplicateHandle transferred one newly owned live handle. The
+        // spawned closure (or failed spawn's dropped closure) closes it once.
+        let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
         let done = Arc::new(AtomicBool::new(false));
         let done_t = done.clone();
-        // HANDLE 非 Send：包 SendHandle 移入看护线程（句柄仅用于 CancelIoEx，读线程与看护线程对同一
-        // 句柄的并发访问是 CancelIoEx 的设计用途——取消另一线程的在途同步 IO）。
-        let sh = SendHandle(h);
-        let join = std::thread::spawn(move || {
-            // sh.raw() 消费整个 SendHandle（Send）→ 拿回 HANDLE；避免 edition-2021 disjoint 捕获直接抓
-            // sh.0（`*mut c_void` 非 Send）导致闭包不 Send。
-            let h = sh.raw();
-            let deadline = std::time::Instant::now() + timeout;
-            loop {
-                if done_t.load(Ordering::SeqCst) {
-                    return; // 读已完成（guard 已 drop）
-                }
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                std::thread::park_timeout(deadline - now);
-            }
-            if done_t.load(Ordering::SeqCst) {
-                return;
-            }
-            // 超时且读未完成：中断在途同步 ReadFile。
-            // SAFETY: CancelIoEx(h, NULL) 取消本句柄全部在途 IO。h 未关（guard drop 前不 CloseHandle）。
-            unsafe { CancelIoEx(h, std::ptr::null()) };
-        });
-        Self {
+        let join = std::thread::Builder::new().spawn(move || {
+            cancel_after_deadline(
+                deadline,
+                || done_t.load(Ordering::SeqCst),
+                std::time::Instant::now,
+                std::thread::park_timeout,
+                || {
+                    // SAFETY: this retained handle names the initiating worker.
+                    // Only response I/O runs on that worker while this guard is
+                    // armed, and Drop joins before it can start unrelated work.
+                    unsafe { CancelSynchronousIo(thread.as_raw_handle()) };
+                },
+            );
+        })?;
+        Ok(Self {
             done,
             join: Some(join),
-        }
+        })
     }
 }
 
@@ -491,11 +522,17 @@ impl Drop for IoTimeoutGuard {
 )]
 fn write_response(h: HANDLE, data: &[u8], mode: FlushMode) {
     let mut written: u32 = 0;
-    // 写腿的取消守卫（读腿早有；此前写腿完全裸奔 —— 同连接内两腿不对齐）。WriteFile 与
-    // FlushFileBuffers 都是同步阻塞、且都由对端决定何时返回：前者在对端不读、缓冲写满时挂住，
-    // 后者按定义就是等对端读走。guard 在本函数返回时 drop（停看护 + join，句柄仍开），
-    // 随后调用方才 cleanup_pipe 关句柄 —— 绝不对已关句柄调 CancelIoEx。
-    let _timeout = IoTimeoutGuard::arm(h, std::time::Duration::from_secs(IO_TIMEOUT_SECS));
+    // The guard stays alive across WriteFile and the optional flush, and joins
+    // before cleanup. Deadline checks avoid intentionally starting a new step
+    // after expiry; repeated cancellation covers the remaining check/start race.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(IO_TIMEOUT_SECS);
+    let _timeout = match IoTimeoutGuard::arm(deadline) {
+        Ok(guard) => guard,
+        Err(_) => return, // no response I/O without an owned cancellation path
+    };
+    if std::time::Instant::now() >= deadline {
+        return;
+    }
     // SAFETY: WriteFile 写响应。lpOverlapped=NULL → 同步阻塞。命名管道服务端在
     // DisconnectNamedPipe 前必须 FlushFileBuffers：同步 WriteFile 只保证字节进内核缓冲，若随即
     // disconnect，尚未被 client 读走的响应会被丢弃，client 稳定收到 ERROR_PIPE_NOT_CONNECTED(233)。
@@ -510,7 +547,11 @@ fn write_response(h: HANDLE, data: &[u8], mode: FlushMode) {
             std::ptr::null_mut(),
         );
         // 未鉴权对端（FlushMode::NoWait）不走 flush：见 FlushMode 文档。
-        if ok != 0 && written == data.len() as u32 && mode == FlushMode::WaitPeer {
+        if ok != 0
+            && written == data.len() as u32
+            && mode == FlushMode::WaitPeer
+            && std::time::Instant::now() < deadline
+        {
             let _ = FlushFileBuffers(h);
         }
     }

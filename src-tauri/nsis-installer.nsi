@@ -38,17 +38,16 @@
 # per-user 安装到 `%LOCALAPPDATA%\Polaris`（`.207` 当前 Tauri 2 真机路径）：**不需要管理员就能装**，
 # 不污染 Program Files。helper 与 TUN 提权仍走运行期 UAC 弹窗（独立于安装动作），与上游一致。
 #
-# 选它是产品决策 ——「标准用户（无管理员权限）也必须能装上」。下面这条**已知残留**随之保留，
-# 如实登记而不是当作不存在：
-#   helper 安装脚本以提权身份把随包 `polaris-helper.exe` 拷进 `C:\ProgramData\Polaris` 并注册成
-#   LocalSystem 服务，**拷贝前零校验**（`crates/helper-client/src/manager.rs` 的
-#   `build_win_install_script`）。per-user 安装下那份源文件在 `%LOCALAPPDATA%\Polaris`
-#   ——同账户普通权限（Medium IL）进程可写——于是攻击者可以在那一次 UAC 发生**之前**替换它，
-#   让受信安装把攻击者的 exe 装成 SYSTEM 服务。本项目无代码签名（见上「不签名」一节），
-#   所以这条链当前**没有**被结构性堵住。
+# 选它是产品决策 ——「标准用户（无管理员权限）也必须能装上 App」。这不意味着无需管理员
+# 就能安装/升级 LocalSystem helper：后者由 App 的运行期 UAC 路径单独处理，不由 NSIS installMode 放行。
+# helper 安装参数包含私有暂存路径、实际 helper/manifest hash、core id 与原生用户身份；
+# 提权脚本先封存并核对字节，校验安装选择和现有 helper 策略，必要时经 prepare-upgrade 准入，
+# 再停止/替换服务（crates/helper-client/src/manager/install_windows.rs）。不能称为「拷贝前零校验」。
+# 这些校验不等于 Authenticode 签名，也不证明同账户可写的整个 App 未被替换；这仍是 per-user
+# App 目录的信任边界，不能把安装阶段的字节校验宣传为来源签名。
 #
 # 为什么不是「改 perMachine 就完了」：`perMachine` 会把 app 装进 `%PROGRAMFILES%\Polaris`
-# （默认 ACL 对 Users 只读 ⇒ 链断开），但模板给 per-machine 的落点**只有** `$PROGRAMFILES64` /
+# （默认 ACL 对 Users 只读，改变 App 目录的写入边界），但模板给 per-machine 的落点**只有** `$PROGRAMFILES64` /
 # `$PROGRAMFILES` 两支（tauri-cli 2.11.4 `installer.nsi` 的 `.onInit`），没有任何一支落在标准用户
 # 可写的位置，且它同时发 `RequestExecutionLevel admin`。于是**强制** per-machine 与「标准用户能自己装」
 # 结构性互斥 —— 而「标准用户必须能装上」是产品硬要求，所以强制 per-machine 出局。

@@ -149,18 +149,18 @@ pub async fn check_claude<H: UnlockHttp + ?Sized>(http: &H) -> UnlockResult {
     if !res.reachable() {
         return UnlockResult::with_region(UnlockStatus::Timeout, region); // 无响应 ≠ 封禁
     }
-    let chain = &res.redirect_chain;
-    let last = chain
-        .last()
-        .map(|h| h.location.as_str())
-        .unwrap_or(ClaudeEndpoints::HOME_URL);
-    // 去 query / fragment
-    let final_url = strip_query_fragment(last);
-
-    if final_url.contains(ClaudeEndpoints::BLOCK_MARKER) {
+    let mut final_url = url::Url::parse(ClaudeEndpoints::HOME_URL)
+        .expect("fixed Claude endpoint must be a valid URL");
+    for hop in &res.redirect_chain {
+        let Ok(next) = final_url.join(&hop.location) else {
+            return UnlockResult::with_region(UnlockStatus::Timeout, region);
+        };
+        final_url = next;
+    }
+    if final_url.path().contains(ClaudeEndpoints::BLOCK_MARKER) {
         return UnlockResult::with_region(UnlockStatus::Blocked, region);
     }
-    let host = hostname_of(&final_url);
+    let host = hostname_of(final_url.as_str());
     match host.as_deref() {
         // 停在 claude.ai 任意路径 → Ok，**命中挑战也算**。
         //
@@ -185,19 +185,10 @@ fn strip_query_fragment(url: &str) -> String {
     no_query.split('#').next().unwrap_or(no_query).to_string()
 }
 
-/// 取 URL 的 hostname。上游 `new URL(finalUrl).hostname`。非法 URL 返回 None。
 fn hostname_of(url: &str) -> Option<String> {
-    // 简化 host 解析：剥离 scheme，取 authority 首段（@ 前 userinfo 剥除），去 port。
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host_no_port = host.split(':').next().unwrap_or(host);
-    if host_no_port.is_empty() {
-        return None;
-    }
-    // 合法性：至少含一个 '.' 或为已知裸 host（如 localhost）；这里对齐 checker 用途（只比 == "claude.ai"）
-    Some(host_no_port.to_lowercase())
+    url::Url::parse(url).ok()?.host_str().map(str::to_owned)
 }
+
 
 // ===========================================================================
 // Gemini
