@@ -407,7 +407,7 @@ pub fn update_clear_portable_handoff(state: State<'_, AppRuntime>) -> ApiRespons
 /// 上游 `VERSION_GET_INFO`：版本信息（app + core 版本）。
 ///
 /// ✅ **已接线**：app 版本取自 Tauri `package_info`；core 版本经 `UpdaterRuntime` 双读法的**展示读法**
-/// （探测失败回落随包基线，= 上游 `getCoreVersion` 语义）；基线取自编译期嵌入的 `core-manifest.json`。
+/// （探测失败回落随包基线，= 上游 `getCoreVersion` 语义）；基线与默认 HTTP UA 共用实际所选随包构建身份。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"

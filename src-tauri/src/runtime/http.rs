@@ -46,14 +46,8 @@ use polaris_updater::traits::DownloadError;
 
 // ── 传输层常量（单点定义，各消费族不得自造第二份）───────────────────────────────
 
-/// 应用自标识 UA（= 上游 `APP_USER_AGENT`）。
-///
-/// **与订阅 UA 是两回事**：订阅走 `net_stack::subscription::default_subscription_user_agent`
-/// （中性 `Polaris/<ver>`，由调用方按订阅偏好覆盖）；本 UA 用于 GitHub API / 资源下载。
-/// **勿与 mesh 的 `WARP_USER_AGENT` 共用** —— 那个是伪装 okhttp 的特例。
-pub fn app_user_agent() -> String {
-    format!("Polaris/{}", env!("CARGO_PKG_VERSION"))
-}
+mod user_agent;
+pub use user_agent::app_user_agent;
 
 /// 响应头超时（连接 + 首字节）。= Polaris 下载链路 15s。
 /// **不是**整请求超时：大文件下载正常会超过 15s，整请求超时会把正常下载判死。

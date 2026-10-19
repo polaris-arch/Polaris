@@ -489,6 +489,49 @@ fn redact_url_strips_query_and_userinfo() {
 }
 
 #[test]
-fn default_ua_is_neutral() {
-    assert_eq!(default_subscription_user_agent("1.2.3"), "Polaris/1.2.3");
+fn default_ua_includes_app_and_kernel_versions() {
+    assert_eq!(
+        default_subscription_user_agent("1.2.3", "2.3.4-polaris.5+abc"),
+        "Polaris/1.2.3 sing-box/2.3.4-polaris.5+abc"
+    );
+}
+
+#[test]
+fn default_ua_rejects_missing_or_unsafe_version_tokens() {
+    for invalid in [
+        "",
+        " ",
+        "1.2.3\r\nInjected: yes",
+        "1\0",
+        "1\t2",
+        "版本",
+        "1/2",
+    ] {
+        assert_eq!(
+            default_subscription_user_agent("1.2.3", invalid),
+            "Polaris/1.2.3 sing-box/unknown"
+        );
+        assert_eq!(
+            default_subscription_user_agent(invalid, "2.3.4"),
+            "Polaris/unknown sing-box/2.3.4"
+        );
+    }
+    assert_eq!(
+        default_subscription_user_agent("1.2.3", &"1".repeat(129)),
+        "Polaris/1.2.3 sing-box/unknown"
+    );
+}
+
+#[test]
+fn default_ua_version_length_boundary_applies_to_both_products() {
+    let accepted = "1".repeat(128);
+    assert_eq!(
+        default_subscription_user_agent(&accepted, &accepted),
+        format!("Polaris/{accepted} sing-box/{accepted}")
+    );
+    let rejected = "1".repeat(129);
+    assert_eq!(
+        default_subscription_user_agent(&rejected, &rejected),
+        "Polaris/unknown sing-box/unknown"
+    );
 }

@@ -1,7 +1,7 @@
 //! 更新运行时：把 `polaris-updater` 纯逻辑 crate 装配为持有真实 I/O 的运行时实例。
 //!
 //! 装配内容：
-//!  - **随包内核清单**（`core-manifest.json`，编译期嵌入）：配套内核版本与补丁集标识。
+//!  - **随包内核版本**：与 HTTP UA 共用所选构建身份；旧清单仅用于补丁集标识。
 //!  - **现役内核版本双读法**（[`UpdaterRuntime::read_core_version_line`] /
 //!    [`UpdaterRuntime::read_core_version`]）—— 两者失败语义刻意不对称，见下。
 //!  - **应用更新状态持久化**（`update-state.json`，原子写 tmp+rename）。
@@ -47,6 +47,7 @@ const CORE_MANIFEST_JSON: &str = include_str!("../../core-manifest.json");
 struct CoreManifest {
     #[serde(rename = "bundledCoreVersion")]
     bundled_core_version: String,
+    #[cfg(test)]
     #[serde(rename = "windowsBuild")]
     windows_build: Option<WindowsBuild>,
     #[serde(rename = "sourceBuild")]
@@ -56,24 +57,15 @@ struct CoreManifest {
     extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Deserialize)]
 struct WindowsBuild {
     version: String,
 }
 
-/// 解析编译期嵌入的 `core-manifest.json`，取配套内核版本。
-///
-/// 解析失败 → 回落空串（**不 panic**：清单损坏不该让整个 App 起不来）。
+/// Selected bundled build identity, shared with default HTTP UA. No process probe.
 fn bundled_core_version() -> String {
-    bundled_core_version_from_manifest(
-        CORE_MANIFEST_JSON,
-        cfg!(target_os = "windows"),
-        cfg!(target_os = "android"),
-    )
-    .unwrap_or_else(|e| {
-        log::error!("core-manifest.json 解析失败 {e}：配套内核版本未知");
-        String::new()
-    })
+    crate::runtime::core_version::selected_bundled_version().to_owned()
 }
 
 /// **桌面**补丁集标识：显式 `desktopSourceBuild` 或旧 `sourceBuild` 的 `patchedSourceTree`。
@@ -275,6 +267,7 @@ fn frozen_desktop_source_version<'a>(
     frozen_source_build_version(source, upstream)
 }
 
+#[cfg(test)]
 fn bundled_core_version_from_manifest(
     raw: &str,
     windows: bool,
@@ -283,6 +276,7 @@ fn bundled_core_version_from_manifest(
     bundled_core_version_with_ios(raw, windows, android, cfg!(target_os = "ios"))
 }
 
+#[cfg(test)]
 fn bundled_core_version_with_ios(
     raw: &str,
     windows: bool,

@@ -205,9 +205,7 @@ fn refresh_identity_uses_resolved_ua_not_raw_preference_fields() {
     config["subscriptionUserAgent"] = json!("   ");
     config["subscriptions"][0]["userAgent"] = json!("   ");
     assert!(default.check_current(&config, "s").is_ok());
-    config["subscriptions"][0]["userAgent"] = json!(
-        polaris_net_stack::subscription::default_subscription_user_agent(env!("CARGO_PKG_VERSION"))
-    );
+    config["subscriptions"][0]["userAgent"] = json!(crate::runtime::http::app_user_agent());
     assert!(default.check_current(&config, "s").is_ok());
 }
 
@@ -274,5 +272,24 @@ fn both_refresh_commit_branches_guard_identity_and_url_edits_drop_validators() {
         crate::commands::guard_scan::top_level_fn_body(&source, "pub fn subscription_update(");
     assert!(
         update.find("subscription_url_changed(").unwrap() < update.find("set_or_remove(").unwrap()
+    );
+}
+
+#[test]
+fn fetch_identity_preserves_custom_ua_and_shares_default() {
+    use super::super::SubscriptionFetchIdentity;
+    let global = json!({"subscriptionUserAgent": "custom-global/1"});
+    let sub = json!({"userAgent": "custom-sub/2"});
+    assert_eq!(
+        SubscriptionFetchIdentity::new(&global, &sub).user_agent,
+        "custom-sub/2"
+    );
+    assert_eq!(
+        SubscriptionFetchIdentity::new(&global, &json!({})).user_agent,
+        "custom-global/1"
+    );
+    assert_eq!(
+        SubscriptionFetchIdentity::new(&json!({}), &json!({})).user_agent,
+        crate::runtime::http::app_user_agent()
     );
 }

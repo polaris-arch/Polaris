@@ -910,11 +910,8 @@ impl SubscriptionFetchIdentity {
     fn new(cfg: &Value, sub: &Value) -> Self {
         Self {
             url: sub.get("url").and_then(Value::as_str).map(str::to_owned),
-            user_agent: resolve_subscription_ua(cfg, sub).unwrap_or_else(|| {
-                polaris_net_stack::subscription::default_subscription_user_agent(env!(
-                    "CARGO_PKG_VERSION"
-                ))
-            }),
+            user_agent: resolve_subscription_ua(cfg, sub)
+                .unwrap_or_else(crate::runtime::http::app_user_agent),
         }
     }
 

@@ -228,7 +228,7 @@ export interface SubscriptionConfig {
   lastUpdated?: string;
   createdAt: string;
   // 拉取订阅时的 User-Agent 覆盖（per-sub）。优先级：subscription.userAgent ?? config.subscriptionUserAgent ?? 默认。
-  // 默认 `Polaris/<版本>`（纯中性）。订阅对话框「自定义 User-Agent」输入框可设置本字段。
+  // 默认 `Polaris/<版本> sing-box/<配套内核版本>`。订阅对话框「自定义 User-Agent」输入框可设置本字段。
   // 【后端行为差异（已登记）】Rust 侧 `resolve_subscription_ua` 用的是 falsy 语义而非 `??`：
   // 显式 `""`／纯空白**不会**胜出，而是继续回落到 config.subscriptionUserAgent → 默认。
   // 差异只在「显式存了空串」这一格（本对话框把空输入折成 undefined，故正常链路不可达；
@@ -687,7 +687,7 @@ export interface UserConfig {
   // 订阅经代理更新的【全局三态策略】（默认 'follow'）：'follow'=按各订阅 per-sub updateViaProxy 决定；
   // 'proxy'=所有订阅强制经代理（忽略 per-sub）；'direct'=所有订阅强制直连（忽略 per-sub）。求值见 shared/subscription-proxy。
   subscriptionProxyPolicy?: SubscriptionProxyPolicy;
-  // 全局订阅 UA（被 per-sub subscription.userAgent 覆盖；均缺省时用 `Polaris/<版本>`）。本期无 UI，手编生效。
+  // 全局订阅 UA（被 per-sub subscription.userAgent 覆盖；均缺省时用 `Polaris/<版本> sing-box/<配套内核版本>`）。本期无 UI，手编生效。
   subscriptionUserAgent?: string;
   // 更新链路（应用/资源/订阅/核心）是否经代理（默认 true=代理运行时经 update-in 借道，更新源多在 GitHub、
   // 墙内借道更可靠）；false=强制直连。经 shared/update-proxy#resolveMainSessionViaProxy 求值，Phase 1b 后

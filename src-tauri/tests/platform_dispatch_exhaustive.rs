@@ -3203,19 +3203,36 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersRight,
         "新增九处 Android 测速走 Android JNI 瞬态实例、drain 与 snapshot；iOS 没有该 Java 宿主，不能编 Android 腿。其错误继承桌面路径的事实在 not(android) 条目单独登记为债。",
     ),
+    // UA and version displays share the selected bundled identity. All four new
+    // sites put Android and iOS on the same side in release and debug; no debt
+    // verdict changes and no device-validation claim is made.
     (
-        "src-tauri/src/runtime/updater.rs",
-        "target_os = \"android\"",
+        "src-tauri/src/runtime/core_version.rs",
+        "any(target_os = \"android\", target_os = \"ios\", test)",
+        2,
+        IosSide::WithAndroid,
+        "移动端构建合同常量与纯版本解析器由 Android/iOS 共用，host test 仅验证取值；两移动平台 release/debug 均进入，不证明设备运行。",
+    ),
+    (
+        "src-tauri/src/runtime/core_version.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
         1,
-        IosSide::DiffersRight,
-        "core-manifest 的 Android resolver 标志选择 libbox 资源事实，iOS 不应借 Android 资源；未支持目标不因此获得核资源或更新能力。",
+        IosSide::WithAndroid,
+        "桌面版本读取复用实际 compiled selected_manifest 准入身份；Android/iOS 都排除该桌面路径，失败明确 unknown，不退回旧版本。",
+    ),
+    (
+        "src-tauri/src/runtime/core_version.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "Android/iOS 默认 UA 与随包版本展示读取各自构建共同消费的 mobile source-contract version，与 builder 链接 constant.Version 同源，不启动内核或改变更新策略。",
     ),
     (
         "src-tauri/src/runtime/updater.rs",
         "target_os = \"ios\"",
         1,
         IosSide::DiffersRight,
-        "既有 bundled_core_version_from_manifest 的 cfg!(ios) 只传递版本身份分派：iOS 为 true，跳过 desktopSourceBuild 并保留原 legacy/mobile 解析；Android 为 false，但在 android 早退先返回原 bundled 版本，桌面才可进入 desktopSourceBuild。只登记此既有资源身份隔离，不新增 iOS 更新/核功能，不代表 iOS 编译或设备验收。",
+        "旧 bundled_core_version_from_manifest 已仅供 cfg(test) 兼容夹具；生产文件扫描仍计入其内部 cfg!(ios)，谓词本身 iOS=true、Android=false。实际 UA/版本展示改用 core_version 的所选构建身份，本条不再宣称生产旧版本路径可达，也不新增更新能力或设备验收。",
     ),
     (
         "src-tauri/src/runtime/updater.rs",
@@ -4138,16 +4155,19 @@ fn cfg_axis_platform_dispatch_is_registered() {
 // cc681 actual missing sites: uninstall desktop +2; exact owned iOS Stop +1;
 // Android reconnect-status projection +1 retains its existing undecided group.
 // This adds one debt site; no existing iOS verdict is upgraded or erased.
+// UA identity: remove one obsolete updater Android-only site; add four
+// same-side selected-version sites. The test-only legacy cfg!(ios) remains
+// scanned in updater.rs; tests/ files are excluded. Existing debt is unchanged.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 331),
+    ("DiffersRight", 330),
     ("DiffersUndecided", 27),
     ("DiffersWrongToday", 142),
     // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1),
     // checked by eval_cfg for Android/iOS in both release/debug. No existing
     // verdict or debt site changes; this does not claim device validation.
-    ("WithAndroid", 126),
+    ("WithAndroid", 130),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

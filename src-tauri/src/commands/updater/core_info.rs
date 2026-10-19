@@ -12,7 +12,7 @@ use polaris_updater::extract_version_token;
 /// - `packagedVersion`：对**安装包里的内核文件**实跑一次 `version` 读到的版本 token；读不到即
 ///   空串，不回落清单版本（那会把「读不到」显示成「就是清单版本」）。它说的是那个文件，不是
 ///   此刻在跑的进程：经提权助手起核时执行的是助手目录里的副本，两者可能不同。
-/// - `bundledVersion`：随包清单（编译期嵌入的 `core-manifest.json`）声明的内核版本。
+/// - `bundledVersion`：实际所选随包构建的内核版本，与默认 HTTP UA 同源；不可得时为 `unknown`。
 /// - `patchSet`：桌面补丁集标识（清单 `sourceBuild.patchedSourceTree`）；移动端与清单不含时 `null`。
 ///
 /// 读版本要起一个子进程，故放到阻塞线程上，不占主线程。

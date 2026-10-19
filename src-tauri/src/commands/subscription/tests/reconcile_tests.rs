@@ -575,11 +575,11 @@ fn subscription_ua_precedence_per_sub_then_global_then_default() {
         resolve_subscription_ua(&json!({ "subscriptionUserAgent": "" }), &json!({})),
         None
     );
-    // ⑤ 默认 UA 形态（拉取层兜底）——与契约注释 `Polaris/<版本>` 一致。
+    // ⑤ 默认 UA 形态（拉取层兜底）——与契约注释 `Polaris/<版本> sing-box/<内核版本>` 一致。
     assert_eq!(
-        default_subscription_user_agent("9.9.9"),
-        "Polaris/9.9.9",
-        "默认 UA 须中性 Polaris/<ver>"
+        default_subscription_user_agent("9.9.9", "1.2.3"),
+        "Polaris/9.9.9 sing-box/1.2.3",
+        "默认 UA 须包含软件与内核版本"
     );
 }
 

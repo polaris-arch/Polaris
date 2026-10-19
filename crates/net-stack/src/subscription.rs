@@ -134,11 +134,27 @@ impl From<clash_parser::ClashDocumentError> for SubscriptionParseError {
     }
 }
 
-/// 默认订阅 UA：中性 `Polaris/<version>`（不带 clash.meta/mihomo 标识）。
-///
-/// **勿用于 GitHub API / 资源下载**：带版本号会泄漏客户端指纹，那条链路应使用应用自标识 UA。
-pub fn default_subscription_user_agent(version: &str) -> String {
-    format!("Polaris/{version}")
+/// Default application/subscription UA. The caller supplies the selected bundled
+/// kernel version; this pure crate never guesses a kernel version or probes a process.
+/// Custom subscription overrides bypass this formatter.
+pub fn default_subscription_user_agent(version: &str, core_version: &str) -> String {
+    fn safe_version(value: &str) -> &str {
+        if !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+        {
+            value
+        } else {
+            "unknown"
+        }
+    }
+    format!(
+        "Polaris/{} sing-box/{}",
+        safe_version(version),
+        safe_version(core_version)
+    )
 }
 
 /// 订阅流量/到期元数据（`Subscription-UserInfo` 响应头解析）。上游 `SubscriptionConfig['userInfo']`。
