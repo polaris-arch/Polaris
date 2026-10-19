@@ -148,7 +148,7 @@ pub fn interval_minutes(config: &UserConfig, target: &AutoSelectTarget) -> u64 {
             .servers
             .iter()
             .filter(|s| !is_mesh_node_unroutable(s) && mesh_node_carries_full_tunnel(s))
-            .map(|s| s.subscription_id.as_deref().map(&interval).unwrap_or(30))
+            .map(|s| s.subscription_id.as_deref().map(interval).unwrap_or(30))
             .min()
             .unwrap_or(30),
         _ => 30,

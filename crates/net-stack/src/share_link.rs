@@ -1019,15 +1019,6 @@ fn split_userinfo(u: &Url) -> Result<(Option<String>, Option<String>), String> {
     Ok((username, password))
 }
 
-/// serde_json 数值规整（数字或数字串）。
-fn json_num(v: &serde_json::Value) -> Option<i64> {
-    match v {
-        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
-        serde_json::Value::String(s) => js_parse_int(s),
-        _ => None,
-    }
-}
-
 /// serde_json 字符串规整（字符串或数字 → String）。
 fn json_str(v: Option<&serde_json::Value>) -> Option<String> {
     match v? {

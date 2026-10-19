@@ -33,9 +33,10 @@ fn cfg() -> Value {
         "routeRuleOrder": ["r1"],
         "dnsRuleOrder": ["r1"],
         "dnsServers": [
-            { "id": "builtin-domestic", "name": "Domestic", "enabled": true, "type": "https", "outbound": { "type": "direct" } },
-            { "id": "builtin-remote", "name": "Remote", "enabled": true, "type": "https", "outbound": { "type": "currentExit" } },
-            { "id": "dns-custom", "name": "Custom", "enabled": true, "type": "udp", "outbound": { "type": "direct" } }
+            { "id": "builtin-domestic", "name": "Domestic", "enabled": true, "type": "https", "endpoint": { "host": "doh.pub", "port": 443, "path": "/dns-query" }, "bootstrapServerId": "builtin-bootstrap", "outbound": { "type": "direct" } },
+            { "id": "builtin-remote", "name": "Remote", "enabled": true, "type": "https", "endpoint": { "host": "dns.google", "port": 443, "path": "/dns-query" }, "bootstrapServerId": "builtin-bootstrap", "outbound": { "type": "currentExit" } },
+            { "id": "dns-custom", "name": "Custom", "enabled": true, "type": "udp", "endpoint": { "host": "10.0.0.53", "port": 53 }, "outbound": { "type": "direct" } },
+            { "id": "builtin-bootstrap", "name": "Bootstrap", "enabled": true, "type": "https", "endpoint": { "host": "223.5.5.5", "port": 443, "path": "/dns-query" }, "outbound": { "type": "direct" } }
         ],
         "dnsServerGroups": [{ "id": "dns-group", "name": "Race", "enabled": true, "mode": "race", "members": ["dns-custom"] }],
         "dnsDefaults": { "directServerId": "builtin-domestic", "proxyServerId": "builtin-remote", "connectionResolution": "preserveDomain", "unmatchedAction": { "type": "fakeIp" } },
@@ -154,7 +155,7 @@ fn count_category_legacy_classes_and_absent_mesh_routing() {
         "rules(1) + ruleSets(1)"
     );
     assert_eq!(count_category(&c, C::AppRules), 1);
-    assert_eq!(count_category(&c, C::DnsResources), 4);
+    assert_eq!(count_category(&c, C::DnsResources), 5);
     assert_eq!(count_category(&c, C::MeshRouting), 0);
     assert_eq!(count_category(&c, C::GeneralSettings), 1, "恒 1 = 整组");
 }
@@ -341,7 +342,7 @@ fn dns_only_v4_backup_round_trips_without_shared_policy_projection() {
 #[test]
 fn pick_dns_resources_without_rules_is_supported() {
     let out = pick_categories(&cfg(), &[C::DnsResources]);
-    assert_eq!(out["dnsServers"].as_array().map(Vec::len), Some(3));
+    assert_eq!(out["dnsServers"].as_array().map(Vec::len), Some(4));
     assert_eq!(out["dnsServerGroups"].as_array().map(Vec::len), Some(1));
     assert!(out.get("dnsDefaults").is_some());
     assert!(out.get("policyRules").is_none());
@@ -1718,4 +1719,34 @@ fn verified_auto_pins_do_not_cross_backup_general_settings() {
     )
     .config;
     assert_eq!(merged["autoSelectPins"], json!([]));
+}
+
+#[test]
+fn modern_dns_restore_cannot_bypass_protected_resource_save_admission() {
+    use polaris_config_engine::user_config::dns_policy::builtin_dns_server_resources;
+    let current = crate::default_config();
+    let custom = json!({
+        "id":"custom", "name":"Custom", "enabled":true, "type":"udp",
+        "endpoint":{"host":"9.9.9.9","port":53}, "outbound":{"type":"direct"}
+    });
+    let mut backup = json!({
+        "configSchemaVersion":4,
+        "dnsServers":[custom.clone()], "dnsServerGroups":[],
+        "dnsDefaults":{
+            "directServerId":"custom", "proxyServerId":"custom",
+            "unmatchedAction":{"type":"server","serverId":"custom"},
+            "realQueryFallbackAction":{"type":"reject"}
+        }
+    });
+    let sparse = merge_categories(&current, &backup, &[C::DnsResources]);
+    assert!(sparse.conflicts.is_empty());
+    assert_eq!(sparse.config["dnsServers"], backup["dnsServers"]);
+    assert!(crate::ConfigStore::canonicalize_for_save(&sparse.config).is_err());
+    let mut complete = serde_json::to_value(builtin_dns_server_resources()).unwrap();
+    complete.as_array_mut().unwrap().push(custom);
+    backup["dnsServers"] = complete;
+    let valid = merge_categories(&current, &backup, &[C::DnsResources]);
+    assert!(valid.conflicts.is_empty());
+    assert!(crate::ConfigStore::canonicalize_for_save(&valid.config).is_ok());
+    assert_eq!(valid.config["dnsDefaults"]["directServerId"], "custom");
 }

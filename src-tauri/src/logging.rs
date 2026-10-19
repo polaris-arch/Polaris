@@ -288,7 +288,7 @@ fn push_ring(ts_ms: u128, level: Level, target: &str, message: String) {
         return;
     }
     if let Ok(mut r) = ring().lock() {
-        let Ok(seq) = LOG_SEQ.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+        let Ok(seq) = LOG_SEQ.try_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
             seq.checked_add(1)
         }) else {
             return; // Never wrap an old record ID back into the current stream.

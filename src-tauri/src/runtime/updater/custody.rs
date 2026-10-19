@@ -127,12 +127,14 @@ impl UpdateCustody {
         }
         let parent = path.parent().ok_or(REDOWNLOAD)?;
         let dir = parent.join(format!("polaris-install-{}", uuid::Uuid::new_v4()));
-        let mut builder = std::fs::DirBuilder::new();
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder
             .create(&dir)
             .map_err(|_| "Cannot create private update stage".to_string())?;

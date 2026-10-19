@@ -1077,20 +1077,26 @@ pub async fn auto_select_set_enabled(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     enabled: bool,
-) -> ApiResponse<NativeAutoReceipt> {
-    let result = state.proxy().native_auto_set_enabled(enabled).await;
-    emit_config_changed_signal(&app);
-    native_response(result, true)
+) -> Result<ApiResponse<NativeAutoReceipt>, ()> {
+    Ok(async {
+        let result = state.proxy.native_auto_set_enabled(enabled).await;
+        emit_config_changed_signal(&app);
+        native_response(result, true)
+    }
+    .await)
 }
 
 #[tauri::command]
 pub async fn auto_select_disable(
     app: AppHandle,
     state: State<'_, AppRuntime>,
-) -> ApiResponse<NativeAutoReceipt> {
-    let result = state.proxy().native_auto_set_enabled(false).await;
-    emit_config_changed_signal(&app);
-    native_response(result, true)
+) -> Result<ApiResponse<NativeAutoReceipt>, ()> {
+    Ok(async {
+        let result = state.proxy.native_auto_set_enabled(false).await;
+        emit_config_changed_signal(&app);
+        native_response(result, true)
+    }
+    .await)
 }
 
 /// Select only the default reference. Rules keep their independent references.
@@ -1100,39 +1106,47 @@ pub async fn auto_select_enable(
     state: State<'_, AppRuntime>,
     subscription_id: Option<String>,
     scope: Option<String>,
-) -> ApiResponse<NativeAutoReceipt> {
-    use polaris_config_engine::user_config::auto_select::AutoSelectTarget;
-    let scope = scope.as_deref().unwrap_or(if subscription_id.is_some() {
-        "subscription"
-    } else {
-        "global"
-    });
-    let mut value = json!({"scope":scope});
-    if let Some(id) = subscription_id {
-        value["subscriptionId"] = json!(id);
+) -> Result<ApiResponse<NativeAutoReceipt>, ()> {
+    Ok(async {
+        use polaris_config_engine::user_config::auto_select::AutoSelectTarget;
+        let scope = scope.as_deref().unwrap_or(if subscription_id.is_some() {
+            "subscription"
+        } else {
+            "global"
+        });
+        let mut value = json!({"scope":scope});
+        if let Some(id) = subscription_id {
+            value["subscriptionId"] = json!(id);
+        }
+        let target = match serde_json::from_value::<AutoSelectTarget>(value) {
+            Ok(target) if target.valid() => target,
+            _ => {
+                return ApiResponse::err_with_code(
+                    "无效的自动选择范围",
+                    "AUTO_SELECT_INVALID_SCOPE",
+                );
+            }
+        };
+        let result = state.proxy.native_auto_select_default(target).await;
+        emit_config_changed_signal(&app);
+        native_response(result, true)
     }
-    let target = match serde_json::from_value::<AutoSelectTarget>(value) {
-        Ok(target) if target.valid() => target,
-        _ => return ApiResponse::err_with_code("无效的自动选择范围", "AUTO_SELECT_INVALID_SCOPE"),
-    };
-    let result = state.proxy().native_auto_select_default(target).await;
-    emit_config_changed_signal(&app);
-    native_response(result, true)
+    .await)
 }
 
 /// Compatibility command: request a native measurement round, not an App-side winner.
 #[tauri::command]
 pub async fn auto_select_switch_now(
     state: State<'_, AppRuntime>,
-) -> ApiResponse<NativeAutoReceipt> {
-    native_response(state.proxy().native_auto_retest().await, false)
+) -> Result<ApiResponse<NativeAutoReceipt>, ()> {
+    Ok(async { native_response(state.proxy().native_auto_retest().await, false) }.await)
 }
 
 #[tauri::command]
 pub async fn auto_select_status(
     state: State<'_, AppRuntime>,
-) -> ApiResponse<crate::runtime::proxy::native_auto::NativeAutoStatus> {
-    ApiResponse::ok(state.proxy().native_auto_status().await)
+) -> Result<ApiResponse<crate::runtime::proxy::native_auto::NativeAutoStatus>, ()> {
+    Ok(async { ApiResponse::ok(state.proxy().native_auto_status().await) }.await)
 }
 
 /// 上游 `SERVER_GENERATE_URL`：节点 → 真实 share URL（`ProtocolParser.generateUrl` 等价）。
@@ -1389,7 +1403,7 @@ pub async fn tailscale_login(
             return Ok(ApiResponse::err_with_code(
                 "Cannot read the saved Tailscale node",
                 "TAILSCALE_LOGIN_FAILED",
-            ))
+            ));
         }
     };
     let (server, credential_transaction) =
@@ -1405,7 +1419,7 @@ pub async fn tailscale_login(
             return Ok(ApiResponse::err_with_code(
                 "invalidCredentialIntent",
                 "TAILSCALE_LOGIN_FAILED",
-            ))
+            ));
         }
     };
     let identity_epoch = match saved_tailscale_identity_epoch(&saved, &requested.id) {
@@ -1422,15 +1436,17 @@ pub async fn tailscale_login(
             .and_then(|path| tailscale_state_exists_at(&path, true));
         match existing_identity {
             Ok(false) => {}
-            Ok(true) => return Ok(ApiResponse::err_with_code(
-                "Retire the existing Tailscale identity before replacing its authentication key",
-                "TAILSCALE_IDENTITY_RETIREMENT_REQUIRED",
-            )),
+            Ok(true) => {
+                return Ok(ApiResponse::err_with_code(
+                    "Retire the existing Tailscale identity before replacing its authentication key",
+                    "TAILSCALE_IDENTITY_RETIREMENT_REQUIRED",
+                ));
+            }
             Err(_) => {
                 return Ok(ApiResponse::err_with_code(
                     "Cannot verify the existing Tailscale identity",
                     "TAILSCALE_STATE_QUERY_FAILED",
-                ))
+                ));
             }
         }
     }
@@ -1617,7 +1633,7 @@ pub async fn tailscale_logout(
                 return Ok(ApiResponse::err_with_code(
                     "Cannot read the saved Tailscale node",
                     "TAILSCALE_LOGOUT_FAILED",
-                ))
+                ));
             }
         };
         let id_valid = saved
@@ -1657,7 +1673,7 @@ pub async fn tailscale_logout(
             return Ok(ApiResponse::err_with_code(
                 "Cannot read the saved Tailscale node",
                 "TAILSCALE_LOGOUT_FAILED",
-            ))
+            ));
         }
     };
     match state
@@ -1728,7 +1744,7 @@ pub fn tailscale_state_exists(
                 return ApiResponse::err_with_code(
                     "Cannot verify Tailscale state",
                     "TAILSCALE_STATE_QUERY_FAILED",
-                )
+                );
             }
         };
         map.insert(id, Value::Bool(exists));

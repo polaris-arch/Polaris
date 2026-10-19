@@ -2409,3 +2409,58 @@ fn default_native_auto_does_not_validate_or_route_by_stale_concrete_seed() {
         assert!(!crate::builder::route::mesh_selected_exit_falls_back_to_direct(&config));
     }
 }
+
+#[test]
+fn every_full_generator_rejects_missing_protected_dns_without_synthesis() {
+    use crate::user_config::dns_policy::{
+        BUILTIN_BOOTSTRAP_DNS_ID, BUILTIN_DOMESTIC_DNS_ID, BUILTIN_REMOTE_DNS_ID,
+    };
+    for id in [
+        BUILTIN_DOMESTIC_DNS_ID,
+        BUILTIN_REMOTE_DNS_ID,
+        BUILTIN_BOOTSTRAP_DNS_ID,
+    ] {
+        let mut config = base_config();
+        config.dns_servers.retain(|server| server.id != id);
+        let before = serde_json::to_value(&config).unwrap();
+        let deps = deps_default();
+        assert!(generate_sing_box_config(&config, &BTreeMap::new(), &deps).is_err());
+        assert!(generate_sing_box_config_with_report(&config, &BTreeMap::new(), &deps).is_err());
+        assert!(generate_sing_box_config_with_report_and_runtime_bindings(
+            &config,
+            &BTreeMap::new(),
+            &deps,
+            &BTreeMap::new()
+        )
+        .is_err());
+        assert_eq!(serde_json::to_value(&config).unwrap(), before);
+    }
+}
+
+#[test]
+fn all_full_generators_accept_custom_defaults_and_unused_disabled_dns() {
+    let mut config = base_config();
+    config.dns_servers.extend(serde_json::from_value::<Vec<crate::user_config::dns_policy::DnsServerResource>>(serde_json::json!([
+        {"id":"custom","name":"Custom","enabled":true,"type":"udp",
+         "endpoint":{"host":"9.9.9.9","port":53},"outbound":{"type":"direct"}},
+        {"id":"unused","name":"Unused","enabled":false,"type":"udp","outbound":{"type":"direct"}}
+    ])).unwrap());
+    config.dns_defaults = Some(
+        serde_json::from_value(serde_json::json!({
+            "directServerId":"custom", "proxyServerId":"custom",
+            "unmatchedAction":{"type":"server","serverId":"custom"},
+            "realQueryFallbackAction":{"type":"server","serverId":"custom"}
+        }))
+        .unwrap(),
+    );
+    let deps = deps_default();
+    assert!(generate_sing_box_config(&config, &BTreeMap::new(), &deps).is_ok());
+    assert!(generate_sing_box_config_with_report(&config, &BTreeMap::new(), &deps).is_ok());
+    assert!(generate_sing_box_config_with_report_and_runtime_bindings(
+        &config,
+        &BTreeMap::new(),
+        &deps,
+        &BTreeMap::new()
+    )
+    .is_ok());
+}

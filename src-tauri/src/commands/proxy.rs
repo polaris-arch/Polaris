@@ -182,7 +182,7 @@ pub async fn proxy_stop(
             return Ok(ApiResponse::err_with_code(
                 error,
                 "PROXY_STOP_EXPECTATION_INVALID",
-            ))
+            ));
         }
     };
     let proxy = state.proxy.clone();
@@ -272,9 +272,14 @@ fn stop_expectation(
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub async fn proxy_get_status(state: State<'_, AppRuntime>) -> ApiResponse<ProxyStatus> {
-    state.proxy().native_auto_status().await;
-    ApiResponse::from_result(state.proxy().status_with_owned_stop_context())
+pub async fn proxy_get_status(
+    state: State<'_, AppRuntime>,
+) -> Result<ApiResponse<ProxyStatus>, ()> {
+    Ok(async {
+        state.proxy().native_auto_status().await;
+        ApiResponse::from_result(state.proxy().status_with_owned_stop_context())
+    }
+    .await)
 }
 
 /// `PROXY_GET_PENDING_CHANGES`：待应用节点差集（config 相对运行核起核快照）。
@@ -669,7 +674,7 @@ pub async fn kernel_probe_outbound(
             Err(e) => {
                 return Ok(ApiResponse::ok(
                     json!({ "ok": false, "error": format!("序列化探测配置失败: {e}") }),
-                ))
+                ));
             }
         };
         return Ok(ApiResponse::ok(probe_verdict(probe_check_from_gate(
@@ -693,7 +698,7 @@ pub async fn kernel_probe_outbound(
         Err(e) => {
             return Ok(ApiResponse::ok(
                 json!({ "ok": false, "error": format!("序列化探测配置失败: {e}") }),
-            ))
+            ));
         }
     };
     let verdict = match std::fs::write(&tmp, &bytes) {

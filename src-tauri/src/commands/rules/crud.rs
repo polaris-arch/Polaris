@@ -196,69 +196,75 @@ pub async fn rules_add(
     state: State<'_, AppRuntime>,
     rule: Value,
     plane: String,
-) -> ApiResponse<Value> {
-    let (collection_key, order_key) = match plane_keys(&plane) {
-        Ok(keys) => keys,
-        Err(message) => return ApiResponse::err(message),
-    };
-    let mut new_rule = rule;
-    let id = new_rule
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("rule_{}", new_uuid()));
-    if let Some(obj) = new_rule.as_object_mut() {
-        obj.insert("id".to_string(), json!(id));
-    }
-    // 提交门权威校验（Polaris assertValidRule）：非法规则不入盘。
-    if let Err(msg) = validate_rule_payload(&new_rule) {
-        return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
-    }
-    if let Err(msg) = validate_rule_plane(&new_rule, &plane) {
-        return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
-    }
-    // Identity-only preflight under the existing writer fence. Every branch skips
-    // persistence: exact retries and conflicts must not depend on checker availability.
-    // This is not cached authorization; admission repeats after the await below.
-    match state.config().update(|cfg| {
-        let rules = plane_rules(cfg, collection_key);
-        Decision::Skip(admit_rule_add(&rules, &new_rule))
-    }) {
-        Ok((Ok(false), None)) => return ApiResponse::ok(new_rule),
-        Ok((Err(msg), None)) => return ApiResponse::err_with_code(msg, ERR_RULE_CONFLICT),
-        Ok((Ok(true), None)) => {}
-        Ok(_) => unreachable!("rules_add identity preflight must never persist"),
-        Err(error) => return ApiResponse::err(error.to_string()),
-    }
-    if let Err(code) = admit_patterns(&state, &regex_patterns(&new_rule)).await {
-        return ApiResponse::err_with_code("Rule pattern check did not accept this change", code);
-    }
-    let created = new_rule.clone();
-    match state.config().update(|cfg| {
-        let mut rules = plane_rules(cfg, collection_key);
-        match admit_rule_add(&rules, &new_rule) {
-            Ok(false) => return Decision::Skip(Ok(())),
-            Err(msg) => return Decision::Skip(Err((msg, ERR_RULE_CONFLICT))),
-            Ok(true) => {}
+) -> Result<ApiResponse<Value>, ()> {
+    Ok(async {
+        let (collection_key, order_key) = match plane_keys(&plane) {
+            Ok(keys) => keys,
+            Err(message) => return ApiResponse::err(message),
+        };
+        let mut new_rule = rule;
+        let id = new_rule
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("rule_{}", new_uuid()));
+        if let Some(obj) = new_rule.as_object_mut() {
+            obj.insert("id".to_string(), json!(id));
         }
-        if let Some(msg) = network_profile_ref_error(cfg, &new_rule) {
-            return Decision::Skip(Err((msg, ERR_RULE_INVALID)));
+        // 提交门权威校验（Polaris assertValidRule）：非法规则不入盘。
+        if let Err(msg) = validate_rule_payload(&new_rule) {
+            return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
         }
-        rules.push(new_rule);
-        sync_plane_order(cfg, order_key, &rules);
-        write_plane_rules(cfg, collection_key, rules);
-        Decision::Write(Ok(()))
-    }) {
-        Ok((Ok(()), Some(cfg))) => {
-            broadcast_config_changed(&app, &cfg);
-            ApiResponse::ok(created)
+        if let Err(msg) = validate_rule_plane(&new_rule, &plane) {
+            return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
         }
-        Ok((Ok(()), None)) => ApiResponse::ok(created),
-        Ok((Err((msg, code)), None)) => ApiResponse::err_with_code(msg, code),
-        Ok(_) => unreachable!("rules_add decision and persistence must agree"),
-        Err(e) => ApiResponse::err(format!("{e}")),
+        // Identity-only preflight under the existing writer fence. Every branch skips
+        // persistence: exact retries and conflicts must not depend on checker availability.
+        // This is not cached authorization; admission repeats after the await below.
+        match state.config().update(|cfg| {
+            let rules = plane_rules(cfg, collection_key);
+            Decision::Skip(admit_rule_add(&rules, &new_rule))
+        }) {
+            Ok((Ok(false), None)) => return ApiResponse::ok(new_rule),
+            Ok((Err(msg), None)) => return ApiResponse::err_with_code(msg, ERR_RULE_CONFLICT),
+            Ok((Ok(true), None)) => {}
+            Ok(_) => unreachable!("rules_add identity preflight must never persist"),
+            Err(error) => return ApiResponse::err(error.to_string()),
+        }
+        if let Err(code) = admit_patterns(&state, &regex_patterns(&new_rule)).await {
+            return ApiResponse::err_with_code(
+                "Rule pattern check did not accept this change",
+                code,
+            );
+        }
+        let created = new_rule.clone();
+        match state.config().update(|cfg| {
+            let mut rules = plane_rules(cfg, collection_key);
+            match admit_rule_add(&rules, &new_rule) {
+                Ok(false) => return Decision::Skip(Ok(())),
+                Err(msg) => return Decision::Skip(Err((msg, ERR_RULE_CONFLICT))),
+                Ok(true) => {}
+            }
+            if let Some(msg) = network_profile_ref_error(cfg, &new_rule) {
+                return Decision::Skip(Err((msg, ERR_RULE_INVALID)));
+            }
+            rules.push(new_rule);
+            sync_plane_order(cfg, order_key, &rules);
+            write_plane_rules(cfg, collection_key, rules);
+            Decision::Write(Ok(()))
+        }) {
+            Ok((Ok(()), Some(cfg))) => {
+                broadcast_config_changed(&app, &cfg);
+                ApiResponse::ok(created)
+            }
+            Ok((Ok(()), None)) => ApiResponse::ok(created),
+            Ok((Err((msg, code)), None)) => ApiResponse::err_with_code(msg, code),
+            Ok(_) => unreachable!("rules_add decision and persistence must agree"),
+            Err(e) => ApiResponse::err(format!("{e}")),
+        }
     }
+    .await)
 }
 
 /// 上游 `RULES_UPDATE`：更新规则（按 id）。
@@ -274,89 +280,95 @@ pub async fn rules_update(
     plane: String,
     expected_rule: Option<Value>,
     require_expected: Option<bool>,
-) -> ApiResponse<()> {
-    let (collection_key, order_key) = match plane_keys(&plane) {
-        Ok(keys) => keys,
-        Err(message) => return ApiResponse::err(message),
-    };
-    let id = rule.get("id").and_then(Value::as_str).map(str::to_string);
-    let id = match id {
-        Some(i) => i,
-        None => return ApiResponse::err("rule.id required"),
-    };
-    // 提交门权威校验（Polaris assertValidRule）：非法规则不入盘。
-    if let Err(msg) = validate_rule_payload(&rule) {
-        return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
-    }
-    if let Err(msg) = validate_rule_plane(&rule, &plane) {
-        return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
-    }
-    let snapshot = match state.config().current() {
-        Ok(cfg) => cfg,
-        Err(error) => return ApiResponse::err(error.to_string()),
-    };
-    let observed = plane_rules(&snapshot, collection_key)
-        .into_iter()
-        .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()));
-    let Some(observed) = observed else {
-        return ApiResponse::err_with_code("Rule no longer exists", ERR_RULE_CONFLICT);
-    };
-    if !expected_rule_matches(
-        &observed,
-        expected_rule.as_ref(),
-        require_expected.unwrap_or(false),
-    ) {
-        return ApiResponse::err_with_code("Rule changed; reopen and retry", ERR_RULE_CONFLICT);
-    }
-    let old_patterns = regex_patterns(&observed);
-    let changed_patterns: Vec<String> = regex_patterns(&rule)
-        .into_iter()
-        .filter(|p| !old_patterns.contains(p))
-        .collect();
-    if let Err(code) = admit_patterns(&state, &changed_patterns).await {
-        return ApiResponse::err_with_code("Rule pattern check did not accept this change", code);
-    }
-    match state.config().update(|cfg| {
-        if let Some(msg) = network_profile_ref_error(cfg, &rule) {
-            return Decision::Skip(Err((msg, Some(ERR_RULE_INVALID))));
-        }
-        let mut rules = plane_rules(cfg, collection_key);
-        let Some(idx) = rules
-            .iter()
-            .position(|candidate| candidate.get("id").and_then(Value::as_str) == Some(&id))
-        else {
-            return Decision::Skip(Err((format!("Rule not found: {id}"), None)));
+) -> Result<ApiResponse<()>, ()> {
+    Ok(async {
+        let (collection_key, order_key) = match plane_keys(&plane) {
+            Ok(keys) => keys,
+            Err(message) => return ApiResponse::err(message),
         };
-        if rules[idx] != observed {
-            return Decision::Skip(Err((
-                "Rule changed during validation; retry".to_string(),
-                Some(ERR_RULE_CONFLICT),
-            )));
+        let id = rule.get("id").and_then(Value::as_str).map(str::to_string);
+        let id = match id {
+            Some(i) => i,
+            None => return ApiResponse::err("rule.id required"),
+        };
+        // 提交门权威校验（Polaris assertValidRule）：非法规则不入盘。
+        if let Err(msg) = validate_rule_payload(&rule) {
+            return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
         }
+        if let Err(msg) = validate_rule_plane(&rule, &plane) {
+            return ApiResponse::err_with_code(msg, ERR_RULE_INVALID);
+        }
+        let snapshot = match state.config().current() {
+            Ok(cfg) => cfg,
+            Err(error) => return ApiResponse::err(error.to_string()),
+        };
+        let observed = plane_rules(&snapshot, collection_key)
+            .into_iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()));
+        let Some(observed) = observed else {
+            return ApiResponse::err_with_code("Rule no longer exists", ERR_RULE_CONFLICT);
+        };
         if !expected_rule_matches(
-            &rules[idx],
+            &observed,
             expected_rule.as_ref(),
             require_expected.unwrap_or(false),
         ) {
-            return Decision::Skip(Err((
-                "Rule changed; reopen and retry".to_string(),
-                Some(ERR_RULE_CONFLICT),
-            )));
+            return ApiResponse::err_with_code("Rule changed; reopen and retry", ERR_RULE_CONFLICT);
         }
-        rules[idx] = rule;
-        sync_plane_order(cfg, order_key, &rules);
-        write_plane_rules(cfg, collection_key, rules);
-        Decision::Write(Ok(()))
-    }) {
-        Ok((Ok(()), Some(cfg))) => {
-            broadcast_config_changed(&app, &cfg);
-            ok_void()
+        let old_patterns = regex_patterns(&observed);
+        let changed_patterns: Vec<String> = regex_patterns(&rule)
+            .into_iter()
+            .filter(|p| !old_patterns.contains(p))
+            .collect();
+        if let Err(code) = admit_patterns(&state, &changed_patterns).await {
+            return ApiResponse::err_with_code(
+                "Rule pattern check did not accept this change",
+                code,
+            );
         }
-        Ok((Err((error, Some(code))), None)) => ApiResponse::err_with_code(error, code),
-        Ok((Err((error, None)), None)) => ApiResponse::err(error),
-        Ok(_) => unreachable!("rules_update decision and persistence must agree"),
-        Err(e) => ApiResponse::err(format!("{e}")),
+        match state.config().update(|cfg| {
+            if let Some(msg) = network_profile_ref_error(cfg, &rule) {
+                return Decision::Skip(Err((msg, Some(ERR_RULE_INVALID))));
+            }
+            let mut rules = plane_rules(cfg, collection_key);
+            let Some(idx) = rules
+                .iter()
+                .position(|candidate| candidate.get("id").and_then(Value::as_str) == Some(&id))
+            else {
+                return Decision::Skip(Err((format!("Rule not found: {id}"), None)));
+            };
+            if rules[idx] != observed {
+                return Decision::Skip(Err((
+                    "Rule changed during validation; retry".to_string(),
+                    Some(ERR_RULE_CONFLICT),
+                )));
+            }
+            if !expected_rule_matches(
+                &rules[idx],
+                expected_rule.as_ref(),
+                require_expected.unwrap_or(false),
+            ) {
+                return Decision::Skip(Err((
+                    "Rule changed; reopen and retry".to_string(),
+                    Some(ERR_RULE_CONFLICT),
+                )));
+            }
+            rules[idx] = rule;
+            sync_plane_order(cfg, order_key, &rules);
+            write_plane_rules(cfg, collection_key, rules);
+            Decision::Write(Ok(()))
+        }) {
+            Ok((Ok(()), Some(cfg))) => {
+                broadcast_config_changed(&app, &cfg);
+                ok_void()
+            }
+            Ok((Err((error, Some(code))), None)) => ApiResponse::err_with_code(error, code),
+            Ok((Err((error, None)), None)) => ApiResponse::err(error),
+            Ok(_) => unreachable!("rules_update decision and persistence must agree"),
+            Err(e) => ApiResponse::err(format!("{e}")),
+        }
     }
+    .await)
 }
 
 /// 上游 `RULES_DELETE`：删除规则（按 id）。

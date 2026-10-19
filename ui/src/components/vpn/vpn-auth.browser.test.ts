@@ -1,5 +1,5 @@
 import { resolveChromeBinary } from '@/styles/chrome-binary.test-support';
-import { chromium, type Browser } from '@playwright/test';
+import { chromium, expect as browserExpect, type Browser } from '@playwright/test';
 import { createServer, type ViteDevServer } from 'vite';
 import path from 'node:path';
 import { beforeAll, afterAll, expect, it } from 'vitest';
@@ -14,6 +14,7 @@ import { dismissTop } from '/src/mobile/back-stack';
 import { useMobileFormStore } from '/src/mobile/forms/form-store';
 import { useVpnStatusStore } from '/src/store/use-vpn-status-store';
 import { api } from '/src/ipc';
+import { useAppStore } from '/src/store/app-store';
 import i18n, { i18nReady } from '/src/i18n';
 import '/src/mobile/forms/forms.css';
 await i18nReady; await i18n.changeLanguage('en-US');
@@ -29,6 +30,7 @@ api.system.openExternal = async url => { test.url = url; };
 test.status = (protocol, serverId, challenge) => useVpnStatusStore.getState()[protocol === 'openvpn' ? 'setOpenVpn' : 'setOpenConnect']({ serverId, state: 'AUTH', stateText: '', [protocol === 'openvpn' ? 'challenge' : 'authChallenge']: challenge });
 test.open = (protocol, serverId, challenge) => { test.status(protocol, serverId, challenge); return forms.getState().open({ kind: 'vpn-auth', protocol, serverId }); };
 test.stack = () => forms.getState().stack;
+test.privacy = (locked) => useAppStore.getState().setPrivacyMode(locked);
 test.back = dismissTop;
 createRoot(document.getElementById('root')).render(desktop ? <DialogHost /> : <MobileFormHost />);
 `;
@@ -112,7 +114,11 @@ it('replacing hidden mobile endpoint A preserves the top endpoint B Back layer',
 it('replacing hidden desktop endpoint A preserves modal identity and focus in B', async () => {
   const page = await browser.newPage(); await page.goto(origin + '/__vpn?desktop'); await page.waitForFunction('window.__vpn?.open');
   await page.evaluate(`window.__vpn.open('openvpn', 'a', { id: 'a1', kind: 'secret', echo: false, deadline: 0 })`);
-  await page.locator('dialog').waitFor();
+  // Production starts locked. Prove this dialog stays hidden until an explicit unlock.
+  await browserExpect(page.locator('dialog')).toHaveCount(1);
+  await browserExpect(page.locator('dialog')).toBeHidden();
+  await page.evaluate('window.__vpn.privacy(false)');
+  await browserExpect(page.locator('dialog')).toBeVisible();
   await page.evaluate(`window.__vpn.open('openvpn', 'b', { id: 'b1', kind: 'secret', echo: false, deadline: 0 })`);
   await page.waitForFunction('document.querySelectorAll("dialog").length === 2');
   await page.locator('dialog').last().locator('input').focus();

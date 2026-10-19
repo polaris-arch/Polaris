@@ -88,7 +88,8 @@ impl Connector for UnixConnector {
                 .filter(|duration| !duration.is_zero())
                 .ok_or(io::ErrorKind::TimedOut)?;
             socket.connect_timeout(&address, remaining)?;
-            Ok(socket.into())
+            let fd: std::os::fd::OwnedFd = socket.into();
+            Ok(std::os::unix::net::UnixStream::from(fd))
         })();
         if Instant::now() >= deadline {
             return Err(ClientError::Timeout);

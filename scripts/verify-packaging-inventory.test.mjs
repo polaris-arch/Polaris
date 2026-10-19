@@ -62,7 +62,7 @@ function temporaryFixture(t, label, extra = [], mutate = () => {}) {
   // These inert inventory fixtures neither acquire nor execute a native payload.
   for (const path of [
     'scripts/verify-packaging.mjs', 'scripts/postprocess-appimage.mjs', 'scripts/release-assets.mjs',
-    ...['cronet-payload', 'cronet-contract', 'nsis-core-sweep', 'nsis-helper-cleanup', 'core-identity']
+    ...['cronet-payload', 'cronet-contract', 'nsis-core-sweep', 'nsis-helper-cleanup', 'core-identity', 'macos-open-guide']
       .map(name => `scripts/lib/${name}.mjs`),
     ...['source-graph', 'bundle', 'release-consumer', 'native-dns-candidate', 'upstream-release', 'validation-origin', 'native-dns-gates']
       .map(name => `scripts/desktop-core/${name}.mjs`),

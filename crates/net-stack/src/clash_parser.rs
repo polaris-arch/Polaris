@@ -237,20 +237,6 @@ fn bool_val(v: &Value) -> Option<bool> {
     }
 }
 
-/// ws-opts.headers 大小写不敏感取 Host。上游 `pickHostHeader`。
-fn pick_host_header(headers: &Value) -> Option<String> {
-    let m = headers.as_mapping()?;
-    for (k, v) in m {
-        if k.as_str()
-            .map(|s| s.eq_ignore_ascii_case("host"))
-            .unwrap_or(false)
-        {
-            return str(v);
-        }
-    }
-    None
-}
-
 /// alpn 接受字符串或数组，统一成 string[]：拆逗号 + dedupeTrim。
 /// 上游 `toAlpn`。空/纯空白返回 None。
 fn to_alpn(v: &Value) -> Option<Vec<String>> {
@@ -1134,7 +1120,7 @@ fn map_node(
         _ => {
             return NodeOutcome::Fail {
                 reason: "节点非对象".to_string(),
-            }
+            };
         }
     };
     let raw_type = m.get("type");

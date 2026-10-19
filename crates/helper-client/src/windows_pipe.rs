@@ -135,7 +135,9 @@ impl WinPipeStream {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let millis = remaining
                 .as_millis()
-                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+                .saturating_add(u128::from(
+                    !remaining.subsec_nanos().is_multiple_of(1_000_000),
+                ))
                 .min(u128::from(u32::MAX - 1)) as u32;
             // SAFETY: event is live, belongs to this outstanding operation only.
             let wait = unsafe { WaitForSingleObject(operation.hEvent, millis) };
@@ -192,7 +194,7 @@ impl ConnectionStream for WinPipeStream {
                         .raw_os_error()
                         .is_some_and(|code| is_peer_gone(code as u32)) =>
                 {
-                    return Ok(total)
+                    return Ok(total);
                 }
                 Err(error) => return Err(error),
             };

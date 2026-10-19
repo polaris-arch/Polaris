@@ -1149,7 +1149,7 @@ const QUIC_TLS_EXEMPT: Record<string, Exemption> = {
     cite: [
       {
         at: 'crates/config-engine/src/builder/outbound.rs',
-        needle: '!supports_tls_fragment(&protocol_lower, ob.tls.as_ref().and_then(|t| t.engine.as_deref()))',
+        needle: '!supports_tls_fragment(\n        &protocol_lower,\n        ob.tls.as_ref().and_then(|t| t.engine.as_deref()),\n    )',
       },
     ],
   },
@@ -1304,7 +1304,7 @@ const NODE_EXEMPT: Record<string, Record<string, Exemption>> = {
       cite: [
         {
           at: 'crates/config-engine/src/builder/outbound.rs',
-          needle: '!supports_tls_fragment(&protocol_lower, ob.tls.as_ref().and_then(|t| t.engine.as_deref()))',
+          needle: '!supports_tls_fragment(\n        &protocol_lower,\n        ob.tls.as_ref().and_then(|t| t.engine.as_deref()),\n    )',
         },
       ],
     },

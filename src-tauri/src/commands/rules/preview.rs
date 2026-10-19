@@ -142,11 +142,14 @@ mod tests {
 pub async fn rules_validate_regex(
     state: tauri::State<'_, crate::runtime::AppRuntime>,
     patterns: Vec<String>,
-) -> ApiResponse<Vec<Option<bool>>> {
-    if patterns.len() > 32 || patterns.iter().any(|p| p.is_empty() || p.len() > 1024) {
-        return ApiResponse::err("Rule syntax input exceeds its limit");
+) -> Result<ApiResponse<Vec<Option<bool>>>, ()> {
+    Ok(async {
+        if patterns.len() > 32 || patterns.iter().any(|p| p.is_empty() || p.len() > 1024) {
+            return ApiResponse::err("Rule syntax input exceeds its limit");
+        }
+        let verdict =
+            crate::commands::proxy::check_rule_patterns(state.config().dir(), &patterns).await;
+        ApiResponse::ok(vec![verdict; patterns.len()])
     }
-    let verdict =
-        crate::commands::proxy::check_rule_patterns(state.config().dir(), &patterns).await;
-    ApiResponse::ok(vec![verdict; patterns.len()])
+    .await)
 }

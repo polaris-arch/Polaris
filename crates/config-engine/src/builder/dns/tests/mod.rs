@@ -198,7 +198,7 @@ fn native_dns_and_conditions_share_one_rule_and_fakeip_is_native() {
 fn v2_hosts_first_emits_preferred_hosts_then_explicit_fallback_before_fakeip() {
     let mut config = base_config();
     config.config_schema_version = Some(2);
-    config.dns_servers = vec![DnsServerResource {
+    config.dns_servers.push(DnsServerResource {
         id: "hosts-corp".into(),
         name: "Corp hosts".into(),
         enabled: true,
@@ -206,7 +206,7 @@ fn v2_hosts_first_emits_preferred_hosts_then_explicit_fallback_before_fakeip() {
         paths: vec!["/etc/hosts".into(), "/opt/corp.hosts".into()],
         predefined: BTreeMap::from([("git.corp.example".into(), vec!["10.0.0.8".into()])]),
         ..Default::default()
-    }];
+    });
     config.dns_defaults = Some(DnsPolicyDefaults {
         direct_server_id: "builtin-domestic".into(),
         proxy_server_id: "builtin-remote".into(),
@@ -280,7 +280,7 @@ fn v2_hosts_first_emits_preferred_hosts_then_explicit_fallback_before_fakeip() {
 fn v2_race_group_uses_native_evaluate_respond_and_node_egress_is_preserved() {
     let mut config = base_config();
     config.config_schema_version = Some(2);
-    config.dns_servers = vec![DnsServerResource {
+    config.dns_servers.push(DnsServerResource {
         id: "node-dns".into(),
         name: "Node DNS".into(),
         enabled: true,
@@ -294,7 +294,7 @@ fn v2_race_group_uses_native_evaluate_respond_and_node_egress_is_preserved() {
             node_id: "s1".into(),
         },
         ..Default::default()
-    }];
+    });
     config.dns_server_groups = vec![DnsServerGroup {
         id: "fastest".into(),
         name: "Fastest".into(),
@@ -1112,14 +1112,14 @@ fn dns_and_preserves_same_type_conditions_and_actions_only_at_root() {
 #[test]
 fn dns_and_hosts_first_and_group_keep_matcher_children_headless() {
     let mut config = base_config();
-    config.dns_servers = vec![DnsServerResource {
+    config.dns_servers.push(DnsServerResource {
         id: "hosts".into(),
         name: "Hosts".into(),
         enabled: true,
         kind: DnsServerKind::Hosts,
         predefined: BTreeMap::from([("api.example.com".into(), vec!["10.0.0.8".into()])]),
         ..Default::default()
-    }];
+    });
     config.dns_server_groups = vec![DnsServerGroup {
         id: "race".into(),
         name: "Race".into(),
