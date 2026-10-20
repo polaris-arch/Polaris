@@ -1917,7 +1917,9 @@ fn windows_registration_rollback_proves_atomic_bytes_and_original_security() {
     assert!(script.contains("Check-Hash $registrationBackup $registrationSnapshot.Hash"));
     assert!(script.contains("[IO.FileMode]::CreateNew"));
     assert!(script.contains("$output.Flush($true)"));
-    assert!(script.contains("[IO.File]::Replace($temporary, $snapshot.Path, $null)"));
+    assert!(script.contains(
+        "[IO.File]::Replace($temporary, $snapshot.Path, [System.Management.Automation.Language.NullString]::Value)"
+    ));
     assert!(script.contains("[IO.File]::Move($temporary, $snapshot.Path)"));
     assert!(script.contains(
         "$security.SetSecurityDescriptorSddlForm($snapshot.Sddl, $registrationSections)"
@@ -1932,6 +1934,7 @@ fn windows_registration_rollback_proves_atomic_bytes_and_original_security() {
         .next()
         .unwrap();
     assert!(!restore.contains("Seal-File $snapshot.Path"));
+    assert!(!restore.contains("[IO.File]::Replace($temporary, $snapshot.Path, $null)"));
 }
 
 /// Runs the real restore function against synthetic files only. The existing

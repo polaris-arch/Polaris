@@ -477,11 +477,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Keep independent crates visible after one fails; failed dependencies still block consumers.
+      # The failure exit code, target selection and job budget are unchanged.
       - name: Clippy (deny warnings)
         env:
           # helper crate 平台特定：本平台 build 才编对应 crate（避免无平台头文件的 target 编不过）。
           RUSTFLAGS: "-D warnings"
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
 
       # rustdoc 文档约束门（2026-08-31 新增）：`///`/`//!` 里的链接若解不到真实符号、公开文档链接到
       # 私有项、冗余地重复显式目标，或 HTML 标签无效，发布的文档都会失真；这类问题在 `cargo build`/
@@ -715,14 +717,14 @@ jobs:
             # 射程就是这一条命令，读的人不必回头找它在哪里被改回去。
             extra=""
             [ "$t" = aarch64-linux-android ] && extra="$ANDROID_NDK_BIN:"
-            PATH="${extra}${PATH}" cargo clippy --target "$t" --all-targets "${TARGETS[@]}" -- -D warnings
+            PATH="${extra}${PATH}" cargo clippy --target "$t" --all-targets "${TARGETS[@]}" --keep-going -- -D warnings
             # `scope: "tests"` 那一档：同样的 `-D warnings`，只是不带 --all-targets。
             # 不写成「有就跑、没有就算了」的静默形态 —— 空集时打印一行说明，让「这一档这次没执行」可读。
             if [ "${#LIBONLY[@]}" -gt 0 ]; then
               LIB_ARGS=()
               for p in "${LIBONLY[@]}"; do LIB_ARGS+=("-p" "$p"); done
               echo "    · 仅 lib/bins：${LIBONLY[*]}"
-              PATH="${extra}${PATH}" cargo clippy --target "$t" "${LIB_ARGS[@]}" -- -D warnings
+              PATH="${extra}${PATH}" cargo clippy --target "$t" "${LIB_ARGS[@]}" --keep-going -- -D warnings
             else
               echo "    · 仅 lib/bins：本 target 无此档条目"
             fi
@@ -808,7 +810,7 @@ jobs:
           export PATH="$ANDROID_NDK_BIN:$PATH"
           for e in $(jq -r 'keys[]' scripts/cross-target-exempt.json); do
             for t in $(jq -r --arg e "$e" '.[$e].targets[]' scripts/cross-target-exempt.json); do
-              if cargo clippy --target "$t" --all-targets -p "$e" -- -D warnings >/dev/null 2>&1; then
+              if cargo clippy --target "$t" --all-targets -p "$e" --keep-going -- -D warnings >/dev/null 2>&1; then
                 echo "::error::豁免已腐烂：$e 现在能过 $t —— 从 scripts/cross-target-exempt.json 删掉它"
                 rot=1
               fi

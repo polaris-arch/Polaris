@@ -1164,9 +1164,15 @@ fn check_custody_starts_both_eof_readers_before_return() {
         .split_once("});letmuttasks=")
         .expect("reader registration must remain outside the read task")
         .0;
-    // The capability query retains at most 64 KiB per stream, while both
-    // actual pipes keep draining after that retention budget is exhausted.
-    assert!(compact.contains("max_bytes:config.is_none().then_some(64*1024),"));
+    // Capability output retains 64 KiB per stream; config-check diagnostics
+    // retain 256 KiB. Both modes keep draining after their retention budget.
+    assert_eq!(
+        compact
+            .matches("max_bytes:Some(ifconfig.is_none(){64*1024}else{256*1024}),")
+            .count(),
+        1,
+    );
+    assert_eq!(compact.matches("strict_utf8:config.is_none(),").count(), 1);
     for required in [
         "letmutchunk=[0_u8;8192];",
         "letmutoverflow=false;",

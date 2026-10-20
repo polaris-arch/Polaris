@@ -123,7 +123,7 @@ test('manual inputs remain opt-in while the committed default preserves the ordi
   for (const command of ['cargo build --workspace --verbose', 'cargo test --workspace --no-fail-fast'])
     assert.equal(workflow.split(`run: ${command}`).length - 1, 1, command);
   assert.ok(step('Test').includes('shell: node scripts/check-coex-runtime-export.mjs capture {0}'));
-  for (const command of ['cargo fmt --all -- --check', 'cargo clippy --workspace --all-targets -- -D warnings',
+  for (const command of ['cargo fmt --all -- --check', 'cargo clippy --workspace --all-targets --keep-going -- -D warnings',
     'cargo doc --no-deps --workspace --bins --lib --document-private-items', 'scripts/fetch-protoc.mjs',
     "NASM_VERSION: '3.02'", 'libwebkit2gtk-4.1-dev']) assert.ok(workflow.includes(command), command);
 });

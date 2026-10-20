@@ -383,8 +383,6 @@ pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
             )));
         }
     }
-    validate_real_query_fallback_reference(value)
-        .map_err(|error| crate::StoreError::DnsDependency(error.to_string()))?;
     // Project only the DNS-owned fields: unrelated optional node data must not make
     // this graph check a second whole-config deserializer. Absent collections retain
     // UserConfig's legacy defaults; explicit collections remain authoritative.
@@ -423,6 +421,11 @@ pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
             },
         )
         .collect();
+    // Use the same legacy-default view as the dependency graph. An absent collection
+    // inherits typed defaults; an explicit collection remains authoritative. This
+    // validation view never fills defaults into the caller's raw saved document.
+    validate_real_query_fallback_reference(value, &dns.dns_servers)
+        .map_err(|error| crate::StoreError::DnsDependency(error.to_string()))?;
     polaris_config_engine::user_config::dns_policy::validate_dns_dependencies(&dns)
         .map_err(crate::StoreError::DnsDependency)?;
     Ok(())
@@ -465,9 +468,12 @@ pub(crate) fn validate_raw_real_query_fallback_action(
     real_query_fallback_action(value).map(|_| ())
 }
 
-fn validate_real_query_fallback_reference(value: &Value) -> Result<(), crate::StoreError> {
+fn validate_real_query_fallback_reference(
+    value: &Value,
+    servers: &[polaris_config_engine::user_config::DnsServerResource],
+) -> Result<(), crate::StoreError> {
     use polaris_config_engine::user_config::{
-        DnsPolicyAction, DnsServerKind, DnsServerResource, BUILTIN_NETENV_DHCP_ID,
+        DnsPolicyAction, DnsServerKind, BUILTIN_NETENV_DHCP_ID,
     };
     let Some(DnsPolicyAction::Server { server_id }) = real_query_fallback_action(value)? else {
         return Ok(());
@@ -477,19 +483,9 @@ fn validate_real_query_fallback_reference(value: &Value) -> Result<(), crate::St
         return Ok(());
     }
     let exists = !server_id.trim().is_empty()
-        && value
-            .get("dnsServers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|resource| {
-                serde_json::from_value::<DnsServerResource>(resource.clone()).ok()
-            })
-            .any(|resource| {
-                resource.id == server_id
-                    && resource.enabled
-                    && resource.kind != DnsServerKind::Hosts
-            });
+        && servers.iter().any(|resource| {
+            resource.id == server_id && resource.enabled && resource.kind != DnsServerKind::Hosts
+        });
     if !exists {
         return Err(crate::StoreError::validation(format!(
             "dnsDefaults.realQueryFallbackAction: DNS server \"{server_id}\" is missing, disabled, or hosts-only"

@@ -294,9 +294,7 @@ impl<T: TokenStore, P: ProcOps + 'static, N: NetTableOps> WinHelper<T, P, N> {
             };
             let started = match self.proc.start_native_singbox(
                 core.directory.join("sing-box.exe").to_str().unwrap_or(""),
-                &p.cfg,
-                &p.log,
-                p.fwd,
+                p,
                 birth,
                 conf_dir,
                 &peer.identity,

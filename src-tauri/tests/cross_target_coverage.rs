@@ -112,9 +112,9 @@ fn cross_step_uses_clippy_not_check() {
         "ci.yml 不再安装交叉 target —— 平台特定代码在 Linux 腿上重新变成零检出"
     );
     assert!(
-        yml.contains(r#"cargo clippy --target "$t" --all-targets "${TARGETS[@]}" -- -D warnings"#),
+        yml.contains(r#"cargo clippy --target "$t" --all-targets "${TARGETS[@]}" --keep-going -- -D warnings"#),
         "ci.yml 主步不再是完整的 `cargo clippy --target \"$t\" --all-targets \"${{TARGETS[@]}}\" \
-         -- -D warnings` —— 交叉检查步骤被删了，或者退回了检出力为零的 `cargo check`\
+         --keep-going -- -D warnings` —— 交叉检查步骤被删了，或者退回了检出力为零的 `cargo check`\
          （见文件头实测：check 抓不到 clippy 才拒收的缺陷）。\
          注意判据是全行锚，不是拆成 `cargo clippy --target` / `-- -D warnings` 两条泛锚：\
          反腐烂步里也有这两个字面量，泛锚会被它喂饱，只回退主步时门会假绿（2026-08-30 变异实测）"

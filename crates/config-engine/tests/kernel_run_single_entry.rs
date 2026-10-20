@@ -134,9 +134,11 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
             5,
             5,
         ),
-        // Five socket/process controls and one config check do not run a core;
+        // Eight socket/process/diagnostic controls and one config check do not run
+        // a core. The three added WireGuard controls cover IPv4 lease ownership,
+        // bounded exact bind-conflict retry and failure receipt classification;
         // the WireGuard and MASQUE runtime tests still require both kernel gates.
-        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 8, 2),
+        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 11, 2),
         (
             "crates/config-engine/tests/subscription_update_guard_runtime.rs",
             2,

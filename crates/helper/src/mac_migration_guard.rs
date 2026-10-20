@@ -387,7 +387,7 @@ impl Journal {
             .mode(0o600)
             .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
             .open(&temporary)?;
-        file.write_all(&output)?;
+        file.write_all(output)?;
         file.sync_all()?;
         let temporary_guard = ProtectedPath::open(&temporary, false)?;
         private(&temporary_guard)?;

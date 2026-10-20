@@ -381,7 +381,32 @@ fn two_node_config_ports(mixed: u16, selected: &str, pa: u16, pb: u16) -> Value 
     // 安全硬约束：绝不可改成 tun/systemProxy（会破坏工作机网络）。
     obj.insert("proxyModeType".into(), serde_json::json!("manual"));
     obj.insert("mixedPort".into(), serde_json::json!(mixed));
+    // Every start/switch/restart snapshot uses the same authenticated management API.
+    obj.insert(
+        "clashApiSecret".into(),
+        serde_json::json!(FIXTURE_MANAGEMENT_SECRET),
+    );
     cfg
+}
+
+#[test]
+fn two_node_fixtures_keep_one_secret_across_selection_and_port_changes() {
+    let initial = two_node_config_ports(17890, "node-a", 18001, 18002);
+    let switched = two_node_config_ports(17890, "node-b", 18001, 18002);
+    let restarted = two_node_config_ports(17891, "node-b", 18001, 18002);
+    for config in [initial, switched, restarted] {
+        assert_eq!(config["clashApiSecret"], FIXTURE_MANAGEMENT_SECRET);
+        assert_eq!(
+            config["clashApiSecret"],
+            local_only_config(17890)["clashApiSecret"]
+        );
+        assert_eq!(config["proxyModeType"], "manual");
+        assert!(config["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["address"] == "127.0.0.1"));
+    }
 }
 
 /// 两节点 + 指定选中节点的本地安全配置（节点指向本地死端口，纯决策类测试用）。

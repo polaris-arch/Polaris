@@ -3962,6 +3962,56 @@ fn independent_check_admission_excludes_ios_ne_but_retains_desktop_gate() {
     assert!(code.contains("polaris_core_supervisor::settle_check_cleanup()"));
 }
 
+fn cfg_registry_counts(
+    rows: &[(&str, &str, usize, IosSide, &str)],
+) -> BTreeMap<(String, String), usize> {
+    let mut counts = BTreeMap::new();
+    for (path, pred, count, _, _) in rows {
+        *counts.entry((path.to_string(), fold(pred))).or_default() += count;
+    }
+    counts
+}
+
+fn claimed_cfg_side(side: IosSide) -> (bool, bool) {
+    match side {
+        IosSide::WithAndroid => (true, true),
+        IosSide::DiffersOnlyInDebug => (true, false),
+        IosSide::DiffersRight | IosSide::DiffersWrongToday | IosSide::DiffersUndecided => {
+            (false, false)
+        }
+    }
+}
+
+#[test]
+fn cfg_counts_keep_distinct_purpose_verdicts_without_accepting_the_wrong_side() {
+    let predicate = "not(target_os = \"android\")";
+    let rows = [
+        (
+            "owner.rs",
+            predicate,
+            1,
+            IosSide::DiffersRight,
+            "observation",
+        ),
+        ("owner.rs", predicate, 2, IosSide::DiffersUndecided, "lease"),
+    ];
+    assert_eq!(
+        cfg_registry_counts(&rows)[&("owner.rs".into(), fold(predicate))],
+        3
+    );
+    for (_, pred, _, side, _) in rows {
+        assert_eq!(cfg_side_profile(pred), Some(claimed_cfg_side(side)));
+    }
+    assert_ne!(
+        cfg_side_profile(predicate),
+        Some(claimed_cfg_side(IosSide::WithAndroid))
+    );
+    assert_ne!(
+        cfg_side_profile(predicate),
+        Some(claimed_cfg_side(IosSide::DiffersOnlyInDebug))
+    );
+}
+
 /// cfg 轴登记门：新增即红 / 腐烂即红 / **写错边即红**。
 #[test]
 fn cfg_axis_platform_dispatch_is_registered() {
@@ -4000,19 +4050,12 @@ fn cfg_axis_platform_dispatch_is_registered() {
         unknown_atoms.join("\n    ")
     );
 
-    let mut registered: BTreeMap<(String, String), (usize, IosSide, &str)> = BTreeMap::new();
-    for (path, pred, count, side, why) in CFG_REGISTRY {
-        let key = ((*path).to_owned(), fold(pred));
-        let slot = registered.entry(key).or_insert((0, *side, why));
-        slot.0 += *count;
-        assert_eq!(
-            slot.1, *side,
-            "{path} 的同一条谓词被登记成了两种 iOS 侧：{:?} / {side:?}",
-            slot.1
-        );
-    }
-
-    let reg_count = |key: &(String, String)| registered.get(key).map_or(0, |(c, _, _)| *c);
+    // Count source predicates independently of the per-purpose audit verdict.
+    // One predicate can guard both an understood observation and an unresolved
+    // lease owner. Each row still has its computed side checked below, and the
+    // independent census/debt ledger retains every semantic verdict unchanged.
+    let registered = cfg_registry_counts(CFG_REGISTRY);
+    let reg_count = |key: &(String, String)| registered.get(key).copied().unwrap_or(0);
     // 未登记项直接把**算出来的两侧**打进消息里：作者不必自己去推 iOS 落哪边，
     // 少一次「登记时就理解错了」的机会。
     let unregistered: Vec<String> = found
@@ -4026,26 +4069,20 @@ fn cfg_axis_platform_dispatch_is_registered() {
         .collect();
     let rotten: Vec<String> = registered
         .iter()
-        .filter(|(k, (n, _, _))| found.get(*k).copied().unwrap_or(0) < *n)
-        .map(|((p, s), (n, _, _))| {
+        .filter(|(k, n)| found.get(*k).copied().unwrap_or(0) < **n)
+        .map(|((p, s), n)| {
             let f = found.get(&(p.clone(), s.clone())).copied().unwrap_or(0);
             format!("{p}  （登记 {n} 次，实到 {f} 次）\n      {s}")
         })
         .collect();
 
     // 第四列的机器复核：登记的「iOS 落哪一侧」必须与求值结果一致。
-    let mislabeled: Vec<String> = registered
+    let mislabeled: Vec<String> = CFG_REGISTRY
         .iter()
-        .filter(|(k, _)| found.contains_key(*k))
-        .filter_map(|((p, s), (_, side, _))| {
+        .filter(|(p, s, _, _, _)| found.contains_key(&(p.to_string(), fold(s))))
+        .filter_map(|(p, s, _, side, _)| {
             let actual = cfg_side_profile(s).unwrap();
-            let claimed = match side {
-                IosSide::WithAndroid => (true, true),
-                IosSide::DiffersOnlyInDebug => (true, false),
-                IosSide::DiffersRight
-                | IosSide::DiffersWrongToday
-                | IosSide::DiffersUndecided => (false, false),
-            };
+            let claimed = claimed_cfg_side(*side);
             (actual != claimed).then(|| {
                 format!(
                     "{p}  （登记 {side:?}={claimed:?}，实算 release/debug 同侧={actual:?}）\n      {s}"
@@ -4057,8 +4094,8 @@ fn cfg_axis_platform_dispatch_is_registered() {
     // 切片自检 + 总账：把算出来的分布打出来。扫到 0 处也「没有未登记项」，那种绿没有信息量。
     let found_total: usize = found.values().sum();
     let mut by_side: BTreeMap<String, usize> = BTreeMap::new();
-    for ((p, s), n) in &found {
-        if let Some((_, side, _)) = registered.get(&(p.clone(), s.clone())) {
+    for (p, s, n, side, _) in CFG_REGISTRY {
+        if found.contains_key(&(p.to_string(), fold(s))) {
             *by_side.entry(format!("{side:?}")).or_default() += *n;
         }
     }

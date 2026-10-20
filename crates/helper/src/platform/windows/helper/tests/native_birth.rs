@@ -587,9 +587,12 @@ fn shutdown_cannot_guess_empty_from_missing_upper_entry_or_legacy_pid() {
     let birth = ops.mint_native_birth().unwrap();
     ops.start_native_singbox(
         "bin",
-        "cfg",
-        "",
-        false,
+        &StartParams {
+            cfg: "cfg".into(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        },
         birth,
         "conf",
         &polaris_helper_proto::core_protocol::CallerIdentity::Windows("S-1-5-21-1".into()),
@@ -840,6 +843,22 @@ fn lost_helper_record_with_retained_native_handle_blocks_replacement() {
 #[test]
 fn windows_native_config_uses_verified_object_without_path_reopen() {
     let source = polaris_source_probe::crate_source!("platform/windows/winproc/win.rs");
+    let source = polaris_source_probe::mask_comments(&source);
+    assert_eq!(source.matches("fn start_native_singbox(").count(), 1);
+    let native_start = source
+        .split("fn start_native_singbox(")
+        .nth(1)
+        .unwrap()
+        .split("fn poll_native_child(")
+        .next()
+        .unwrap();
+    let confined = native_start
+        .find("open_confined_config(&params.cfg, conf_dir, owner)?")
+        .unwrap();
+    let spawned = native_start
+        .find("self.spawn_tracked(bin, &params.cfg, &params.log, params.fwd, birth, config)")
+        .unwrap();
+    assert!(confined < spawned);
     let gate = source
         .split("fn open_confined_config(")
         .nth(1)

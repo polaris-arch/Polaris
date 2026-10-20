@@ -145,6 +145,16 @@ impl ConfigStore {
         crate::validate::validate_raw_tls_pins(config)?;
         crate::auto_select::validate_raw(config)?;
         crate::sanitize::validate_collection_shapes(config)?;
+        // Only truly absent legacy resources inherit defaults. A malformed explicit
+        // collection must not be erased by the tolerant load sanitizer on save.
+        if config
+            .get("dnsServers")
+            .is_some_and(|value| !value.is_array())
+        {
+            return Err(StoreError::DnsDependency(
+                "dnsServers must be an array".into(),
+            ));
+        }
         crate::mesh_guard::validate_raw(config)?;
         // 安全字段不能先 sanitize：显式坏策略若被改成 block 后再校验，写入者会误以为原值已生效。
         crate::validate::validate_raw_mesh_inbound_policies(config)?;

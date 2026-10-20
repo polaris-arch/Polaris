@@ -4465,9 +4465,9 @@ fn the_management_secret_has_a_single_reader() {
     const READERS: &[(&str, usize, usize, &str)] = &[
         (
             "commands/config.rs",
-            5,
+            3,
             0,
-            "secret 的生成与回填方：读它是为了判断要不要生成，另有后端独写键的名单，都不是取来用。",
+            "安全维护的两次存在性读取（加载快照、事务内 latest）和一次生成值插入；不是客户端取值。secret 不属于后端独写键，前端重置仍有写入权。",
         ),
         (
             "commands/server.rs",

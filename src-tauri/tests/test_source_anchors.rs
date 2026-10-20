@@ -359,6 +359,124 @@ fn declares_module(parent_source: &str, name: &str) -> bool {
     masked.contains(&needle)
 }
 
+/// Resolve only the named inline scope, never a sibling's `mod tests;`.
+/// Input has comments and literals masked, so braces are structural.
+fn declares_in_scope(masked: &str, inline: &[String], name: &str) -> bool {
+    let wanted = inline.first().map_or(name, String::as_str);
+    let needle = format!("mod {wanted}");
+    for (at, _) in masked.match_indices(&needle) {
+        if at > 0
+            && (masked.as_bytes()[at - 1].is_ascii_alphanumeric()
+                || masked.as_bytes()[at - 1] == b'_')
+        {
+            continue;
+        }
+        if masked[..at].matches('{').count() != masked[..at].matches('}').count() {
+            continue;
+        }
+        let rest = masked[at + needle.len()..].trim_start();
+        if inline.is_empty() {
+            if rest.starts_with(';') {
+                return true;
+            }
+            continue;
+        }
+        if !rest.starts_with('{') {
+            continue;
+        }
+        let mut depth = 0usize;
+        for (end, byte) in rest.bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if declares_in_scope(&rest[1..end], &inline[1..], name) {
+                            return true;
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn module_source_candidates(parent: &Path) -> Vec<PathBuf> {
+    if parent.file_name().is_some_and(|name| name == "src") {
+        vec![parent.join("lib.rs"), parent.join("main.rs")]
+    } else {
+        vec![parent.join("mod.rs"), parent.with_extension("rs")]
+    }
+}
+
+fn test_directory_wired(dir: &Path) -> (bool, Vec<PathBuf>) {
+    let mut parent = dir.parent().expect("tests directory has a parent");
+    let mut inline = Vec::new();
+    let mut searched = Vec::new();
+    loop {
+        for candidate in module_source_candidates(parent) {
+            let wired = std::fs::read_to_string(&candidate).is_ok_and(|source| {
+                declares_in_scope(
+                    &polaris_source_probe::mask_comments_and_strings(&source),
+                    &inline,
+                    "tests",
+                )
+            });
+            searched.push(candidate);
+            if wired {
+                return (true, searched);
+            }
+        }
+        if parent.file_name().is_some_and(|name| name == "src") {
+            return (false, searched);
+        }
+        let Some(name) = parent.file_name() else {
+            return (false, searched);
+        };
+        inline.insert(0, name.to_string_lossy().into_owned());
+        let Some(next) = parent.parent() else {
+            return (false, searched);
+        };
+        parent = next;
+    }
+}
+
+#[test]
+fn inline_test_wiring_requires_the_exact_scope_and_real_declaration() {
+    let inline = vec!["android".to_string()];
+    for (source, expected) in [
+        ("mod android { mod tests; } mod tests;", true),
+        ("mod android {} mod tests;", false),
+        ("mod other { mod tests; } mod tests;", false),
+        ("mod android_extra { mod tests; }", false),
+        ("mod android { /* mod tests; */ } mod tests;", false),
+        ("mod android { const TEXT: &str = \"mod tests;\"; }", false),
+        ("mod android { mod nested { mod tests; } }", false),
+    ] {
+        let masked = polaris_source_probe::mask_comments_and_strings(source);
+        assert_eq!(
+            declares_in_scope(&masked, &inline, "tests"),
+            expected,
+            "{source}"
+        );
+    }
+    let masked = "mod android { mod nested { mod tests; } }";
+    assert!(declares_in_scope(
+        masked,
+        &["android".into(), "nested".into()],
+        "tests"
+    ));
+    assert!(declares_in_scope("mod tests;", &[], "tests"));
+    assert!(!declares_in_scope(
+        "mod android { mod tests; }",
+        &[],
+        "tests"
+    ));
+}
+
 /// `<member>/src` 下所有 `tests` 目录（相对仓库根）。
 fn test_dirs() -> Vec<PathBuf> {
     let root = workspace_root();
@@ -409,26 +527,9 @@ fn every_test_directory_is_wired_into_its_parent_module() {
             .expect("目录不在仓库根内")
             .to_string_lossy()
             .replace('\\', "/");
-        let parent = dir.parent().expect("tests 目录必有父目录");
-        // 父模块的两种落点：`<parent>.rs`（同级兄弟文件）或 `<parent>/mod.rs`。
-        // `<member>/src/tests/` 的父是 crate 根，即 `lib.rs` / `main.rs`。
-        let candidates: Vec<PathBuf> = if parent.file_name().is_some_and(|n| n == "src") {
-            vec![parent.join("lib.rs"), parent.join("main.rs")]
-        } else {
-            let mut v = vec![parent.join("mod.rs")];
-            if let Some(name) = parent.file_name() {
-                v.push(
-                    parent
-                        .parent()
-                        .expect("模块目录必有父目录")
-                        .join(format!("{}.rs", name.to_string_lossy())),
-                );
-            }
-            v
-        };
-        let wired = candidates.iter().any(|candidate| {
-            std::fs::read_to_string(candidate).is_ok_and(|src| declares_module(&src, "tests"))
-        });
+        // A parent can be an inline module in an ancestor source file. Resolve
+        // its full scope before accepting the external `mod tests;` declaration.
+        let (wired, candidates) = test_directory_wired(dir);
         if !wired {
             orphans.push(format!(
                 "  {rel}  ← 找不到 `mod tests;` 声明（找过：{}）",

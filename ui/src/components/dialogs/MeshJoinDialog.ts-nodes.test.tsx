@@ -400,3 +400,13 @@ describe('隧道接入：MASQUE 入口', () => {
     expect(h.opened).toEqual([{ kind: 'node', initialProto: 'masque-client' }]);
   });
 });
+
+
+it('keeps the explanatory keyboard stop between managed-account and tunnel choices', () => {
+  const html = renderToStaticMarkup(<MeshJoinDialogView {...props}
+    servers={[tsNode('ts-a', 'Personal')]} tsStates={{ 'ts-a': true }} />);
+  expect(html).toContain('class="info-i" role="img" tabindex="0" aria-label="meshJoin.routesHint"');
+  const helpAt = html.indexOf('aria-label="meshJoin.routesHint"');
+  expect(helpAt).toBeGreaterThan(html.indexOf('meshJoin.tsAdd'));
+  expect(helpAt).toBeLessThan(html.indexOf('OpenConnect'));
+});

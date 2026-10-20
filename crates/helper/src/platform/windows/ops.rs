@@ -15,7 +15,7 @@
 
 use crate::platform::windows::coreacl::ObjectSecurity;
 use crate::platform::windows::logic::{self, ListenEntry};
-use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken, StartTiming};
+use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken, StartParams, StartTiming};
 
 /// Serialize optional native DNS worker creation with helper shutdown.
 /// The mutex is never held while waiting for the native cache call.
@@ -128,12 +128,13 @@ pub trait ProcOps: Send + Sync {
         ))
     }
     /// Publish the same owned process HANDLE and birth before returning.
+    /// Reuse the validated start request; caller identity, registered config root
+    /// and OS-minted birth remain separate from client-controlled arguments.
+    /// Parent custody is acquired by the caller before invoking this method.
     fn start_native_singbox(
         &self,
         _bin: &str,
-        _cfg: &str,
-        _log: &str,
-        _fwd: bool,
+        _params: &StartParams,
         _birth: HelperBirthToken,
         _conf_dir: &str,
         _owner: &polaris_helper_proto::core_protocol::CallerIdentity,
@@ -622,9 +623,7 @@ impl ProcOps for MockProcOps {
     fn start_native_singbox(
         &self,
         bin: &str,
-        cfg: &str,
-        log: &str,
-        fwd: bool,
+        params: &StartParams,
         birth: HelperBirthToken,
         _conf_dir: &str,
         _owner: &polaris_helper_proto::core_protocol::CallerIdentity,
@@ -633,7 +632,7 @@ impl ProcOps for MockProcOps {
             self.inner.native_target.lock().unwrap().is_none(),
             "mock owned object cannot be overwritten"
         );
-        let start = self.start_singbox(bin, cfg, log, fwd)?;
+        let start = self.start_singbox(bin, &params.cfg, &params.log, params.fwd)?;
         *self.inner.native_target.lock().unwrap() = Some(HelperBirthTarget {
             pid: std::num::NonZeroU32::new(start.pid).unwrap(),
             birth,

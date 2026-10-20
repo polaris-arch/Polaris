@@ -13,7 +13,7 @@ use crate::platform::windows::logic::{
 };
 use crate::platform::windows::ops::{CoreStart, ManagedIdentity, NetTableOps, ProcOps};
 use crate::platform::windows::ops::{NativeChildPoll, ParentProcess};
-use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
+use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken, StartParams};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::os::windows::ffi::OsStrExt;
@@ -741,15 +741,13 @@ impl ProcOps for WinProcOps {
     fn start_native_singbox(
         &self,
         bin: &str,
-        cfg: &str,
-        log: &str,
-        fwd: bool,
+        params: &StartParams,
         birth: HelperBirthToken,
         conf_dir: &str,
         owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
-        let config = open_confined_config(cfg, conf_dir, owner)?;
-        self.spawn_tracked(bin, cfg, log, fwd, birth, config)
+        let config = open_confined_config(&params.cfg, conf_dir, owner)?;
+        self.spawn_tracked(bin, &params.cfg, &params.log, params.fwd, birth, config)
     }
 
     fn poll_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {

@@ -3181,7 +3181,7 @@ fn switch_mode_serializes_before_reading_lifecycle_state() {
     );
     let helper = method_body(
         &module_code("runtime/proxy"),
-        "    async fn execute_hot_switch_plan(",
+        "    pub(super) async fn execute_hot_switch_plan(",
     );
     assert!(helper.contains("SwitchExecutor.execute(&guarded, plan, interrupt).await"));
 }
@@ -4123,9 +4123,12 @@ async fn real_core_hot_switch_keeps_pid() {
     // ── ③ SelectOutbound 真的经 gRPC 下发且被核接受 ──────────────────────────
     // 负向对照：核必须拒绝不存在的成员 tag。它会拒 ⇒ ② 里那次成功的 PUT 确实选中了真实成员，
     // 而不是「核照单全收、根本没校验」。没有这条，「PUT 返回 Ok」只能证明 RPC 通了。
-    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", st.clash_api_port), "")
-        .await
-        .expect("[③] 管理 API gRPC 连接应成功");
+    let client = SingBoxApiClient::connect(
+        Endpoint::new("127.0.0.1", st.clash_api_port),
+        FIXTURE_MANAGEMENT_SECRET,
+    )
+    .await
+    .expect("[③] 管理 API gRPC 连接应成功");
     let bogus = client
         .select_outbound("proxy-selector", "no-such-member-xyz")
         .await;

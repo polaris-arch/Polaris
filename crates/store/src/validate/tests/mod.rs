@@ -325,7 +325,74 @@ fn canonical_save_rejects_removed_or_disabled_protected_dns_resources() {
     // Absent collections keep legacy serde defaults; explicit valid resources work.
     let mut legacy = crate::default_config();
     legacy.as_object_mut().unwrap().remove("dnsServers");
-    assert!(crate::ConfigStore::canonicalize_for_save(&legacy).is_ok());
+    let before = legacy.clone();
+    let canonical = crate::ConfigStore::canonicalize_for_save(&legacy)
+        .expect("absent legacy resources share the dependency graph's typed defaults");
+    assert_eq!(legacy, before, "validation must not mutate the caller");
+    assert!(
+        canonical.get("dnsServers").is_none(),
+        "validation defaults must not leak into raw saves"
+    );
+    assert_eq!(canonical["dnsDefaults"], before["dnsDefaults"]);
     legacy["dnsServers"] = serde_json::to_value(builtin_dns_server_resources()).unwrap();
     assert!(crate::ConfigStore::canonicalize_for_save(&legacy).is_ok());
+}
+
+#[test]
+fn absent_dns_resources_do_not_authorize_unknown_fallbacks_or_explicit_empty_lists() {
+    for explicit_empty in [false, true] {
+        for id in ["builtin-remote", "unknown-resolver"] {
+            let mut raw = crate::default_config();
+            if explicit_empty {
+                raw["dnsServers"] = serde_json::json!([]);
+            } else {
+                raw.as_object_mut().unwrap().remove("dnsServers");
+            }
+            raw["dnsDefaults"]["realQueryFallbackAction"] =
+                serde_json::json!({"type": "server", "serverId": id});
+            let before = raw.clone();
+            let result = crate::ConfigStore::canonicalize_for_save(&raw);
+            assert_eq!(result.is_ok(), !explicit_empty && id == "builtin-remote");
+            if let Err(error) = result {
+                assert_eq!(error.code(), Some("DNS_DEPENDENCY_INVALID"));
+            }
+            assert_eq!(raw, before);
+        }
+    }
+}
+
+#[test]
+fn malformed_explicit_dns_collections_cannot_become_legacy_defaults_on_save() {
+    for collection in [
+        serde_json::Value::Null,
+        serde_json::json!({}),
+        serde_json::json!("invalid"),
+    ] {
+        let mut raw = crate::default_config();
+        raw["dnsServers"] = collection;
+        let before = raw.clone();
+        let error = crate::ConfigStore::canonicalize_for_save(&raw)
+            .expect_err("an explicit malformed collection is not an absent legacy field");
+        assert_eq!(error.code(), Some("DNS_DEPENDENCY_INVALID"));
+        assert_eq!(raw, before);
+        let path = std::path::Path::new("/data/config.json");
+        let write_fs = crate::MockFs::default();
+        assert!(crate::ConfigStore::save(&write_fs, path, &raw, "abcdef012345").is_err());
+        assert!(
+            write_fs.operations().is_empty(),
+            "rejected save must not touch disk"
+        );
+
+        // Reading an existing legacy file keeps the established tolerant migration.
+        let bytes = serde_json::to_string(&raw).unwrap();
+        let read_fs = crate::MockFs::default().with(path, bytes.clone());
+        let loaded = crate::ConfigStore::load(&read_fs, path);
+        assert!(loaded.loaded_from_disk);
+        assert!(loaded.error.is_none());
+        assert_eq!(
+            read_fs.snapshot(path),
+            Some(bytes),
+            "load must not rewrite the source"
+        );
+    }
 }

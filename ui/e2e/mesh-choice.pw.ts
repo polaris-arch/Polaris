@@ -68,10 +68,20 @@ for (const { width, language, state, columns } of scenarios) {
         }
         if (state === 'configured' && width === 1200) {
           const buttons = page.locator('.mesh-choice button');
-          await buttons.first().focus();
-          for (let i = 1; i < await buttons.count(); i++) {
+          const help = page.locator('.field-lbl-info .info-i');
+          await expect(help).toHaveCount(1);
+          await expect(help).toHaveAttribute('tabindex', '0');
+          // The help stop between grids is intentionally keyboard-accessible too.
+          const stops = page.locator('.mesh-choice button, .field-lbl-info .info-i');
+          await expect(stops).toHaveCount(await buttons.count() + 1);
+          await stops.first().focus();
+          for (let i = 1; i < await stops.count(); i++) {
             await page.keyboard.press('Tab');
-            await expect(buttons.nth(i)).toBeFocused();
+            await expect(stops.nth(i)).toBeFocused();
+          }
+          for (let i = await stops.count() - 2; i >= 0; i--) {
+            await page.keyboard.press('Shift+Tab');
+            await expect(stops.nth(i)).toBeFocused();
           }
         }
       });

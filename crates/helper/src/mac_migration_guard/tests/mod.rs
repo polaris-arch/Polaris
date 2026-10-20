@@ -193,7 +193,7 @@ fn journal_descriptor_binding_preserves_fixed_loaded_job_identity() {
     dictionary.insert("Label".into(), plist::Value::String(fixed.label.into()));
     dictionary.insert("KeepAlive".into(), plist::Value::Boolean(true));
     dictionary.insert("RunAtLoad".into(), plist::Value::Boolean(true));
-    let args = vec![
+    let args = [
         fixed.helper_path.display().to_string(),
         "--support".into(),
         fixed.support_path.display().to_string(),
