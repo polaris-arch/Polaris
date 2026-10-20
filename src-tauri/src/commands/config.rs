@@ -1234,7 +1234,7 @@ const BACKEND_AUTHORITATIVE_KEYS: [&str; 7] = [
     polaris_store::mesh_guard::STATE_KEY,
     // 选择意图（自动选择）。只由 `commands/server.rs` 的三处显式选择写：点节点清掉，点某订阅的
     // 「自动选择」置上。前端零写入权：全量保存与补丁带来的值一律以盘上为准，既冲不掉、也造不出
-    // 一个意图；指向的订阅被删掉时由保存前的清洗移除。
+    // 一个意图；指向的订阅在本次事务被删掉时，由权威字段回正边界一并清除。
     polaris_store::SELECTION_INTENT_KEY,
     polaris_store::auto_select::ENABLED_KEY,
     polaris_store::auto_select::PINS_KEY,
@@ -1278,6 +1278,23 @@ fn enforce_backend_authoritative_fields_from(current: &Value, incoming: &mut Val
             None => {
                 obj.remove(key);
             }
+        }
+    }
+    // A confirmed subscription deletion owns removal of its selection intent.
+    // Loading an already-empty native scope still keeps its explicit reference;
+    // a stale frontend snapshot cannot forge or clear an unrelated intent.
+    if let Some(id) = polaris_store::selection_intent_subscription(current) {
+        let contains = |value: Option<&Value>| {
+            value
+                .and_then(Value::as_array)
+                .is_some_and(|subscriptions| {
+                    subscriptions.iter().any(|subscription| {
+                        subscription.get("id").and_then(Value::as_str) == Some(id)
+                    })
+                })
+        };
+        if contains(current.get("subscriptions")) && !contains(obj.get("subscriptions")) {
+            obj.remove(polaris_store::SELECTION_INTENT_KEY);
         }
     }
 }
@@ -1371,9 +1388,15 @@ fn backfill_secret_and_privacy(config: &ConfigManager) -> Result<(), String> {
         .map_err(|_| "隐私锁状态不可用".to_string())?;
     let path = config.path();
     // 盘上旧明文密码：in-memory load 经 migrate 抹成 ""，故直读盘取明文（load 成功不落盘 → 盘上此刻仍留明文）。
-    let disk_plain: Option<String> = std::fs::read_to_string(path)
+    let disk_raw = std::fs::read_to_string(path)
         .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    if let Some(raw) = &disk_raw {
+        crate::runtime::config::validate_server_identities(raw)
+            .map_err(|error| error.to_string())?;
+    }
+    let disk_plain: Option<String> = disk_raw
+        .as_ref()
         .and_then(|v| {
             v.get(PRIVACY_PASSWORD_KEY)
                 .and_then(Value::as_str)
@@ -1918,22 +1941,3 @@ pub(crate) async fn apply_config_broadcast_core<F, C>(
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod dependency_error_response_tests {
-    use super::*;
-
-    #[test]
-    fn dependency_response_preserves_code_without_user_identifiers() {
-        let response: ApiResponse<()> =
-            config_store_error(polaris_store::StoreError::DnsDependency(
-                "https://user:secret@example.invalid/private".to_owned(),
-            ));
-        assert!(!response.success);
-        assert_eq!(response.code.as_deref(), Some("DNS_DEPENDENCY_INVALID"));
-        assert_eq!(
-            response.error.as_deref(),
-            Some("DNS dependency is invalid or still in use")
-        );
-    }
-}

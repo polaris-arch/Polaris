@@ -1095,8 +1095,22 @@ fn clash_tls_and_shadow_import_preserve_absence_or_explicit_profile() {
             let saved: ServerConfig =
                 serde_json::from_value(serde_json::to_value(&parsed.servers[0]).unwrap()).unwrap();
             let effective = effective_server(&saved, Some("follow")).unwrap();
+            if fingerprint == Some("none") {
+                for policy in [None, Some("default"), Some("firefox")] {
+                    let global = effective_server(&saved, policy).unwrap();
+                    let tls = global.tls_settings.as_ref().unwrap();
+                    assert!(
+                        node_utls(tls.utls_mode, tls.fingerprint.as_deref(), "chrome").is_none(),
+                        "explicit off must survive global override: {protocol}"
+                    );
+                }
+            }
             let tls = effective.tls_settings.as_ref();
-            assert_eq!(tls.and_then(|tls| tls.fingerprint.as_deref()), fingerprint);
+            assert_eq!(
+                tls.and_then(|tls| tls.fingerprint.as_deref()),
+                fingerprint,
+                "{protocol}"
+            );
             assert_eq!(
                 node_utls(
                     tls.and_then(|tls| tls.utls_mode),

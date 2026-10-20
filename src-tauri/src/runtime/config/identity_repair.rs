@@ -189,6 +189,9 @@ impl ConfigManager {
         let mut checked = incoming.clone();
         reconcile_tailscale_credentials(&incoming, &mut checked, None)?;
         mesh_guard::reconcile_untrusted(&raw, &mut checked)?;
+        // Apply the existing legacy read defaults to the validation view only.
+        // Missing old optional defaults must not block a narrow identity repair.
+        polaris_store::finalize_config(&mut checked)?;
         let canonical = ConfigStore::canonicalize_for_save(&checked)?;
         // Canonicalization is validation only here: a legacy raw document may omit
         // modern defaults. Persisting its normalized form would edit unrelated data.

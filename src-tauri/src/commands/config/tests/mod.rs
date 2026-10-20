@@ -14,6 +14,7 @@
 /// `undefined` 后走出一条静默错路。`newValue` 恰恰是「看着能用、其实不能用」的那类字段：它经
 /// `strip_privacy_secrets` 脱敏、也没走 `config_get` 那侧的 bypassLANList 补齐（见 `use-config.ts`）。
 mod config_changed_payload_tests;
+mod dependency_error_response_tests;
 
 mod privacy_tests;
 

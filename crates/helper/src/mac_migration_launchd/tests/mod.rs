@@ -25,7 +25,8 @@ fn legacy() -> Vec<String> {
     let mut args = modern();
     args.extend([
         "--singbox".into(),
-        expected().core_dir.join("sing-box").display().to_string(),
+        // These are macOS argv bytes even when the parser is tested on Windows.
+        format!("{}/sing-box", expected().core_dir.display()),
         "--confdir".into(),
         "/Users/example/Library/Application Support/com.example.app/config".into(),
     ]);
@@ -404,10 +405,14 @@ fn sanitized_full_observed_shape_is_supported() {
         .map(|i| old[i].clone())
         .collect();
     let facts = parse_plist(&xml(dictionary(args)), &expected()).unwrap();
-    let observed =
-        validate_loaded_print(include_str!("full-job-print.txt"), &facts, &expected()).unwrap();
+    let print = polaris_source_probe::crate_file!("src/mac_migration_launchd/full-job-print.txt");
+    let observed = validate_loaded_print(&print, &facts, &expected()).unwrap();
     assert_eq!(observed.pid, 321);
     assert_eq!(observed.exit_timeout_seconds, 5);
+    // Path equality on the test host must not normalize the observed argv.
+    let changed_argv = print.replace("/core/sing-box", r"/core\sing-box");
+    assert_ne!(changed_argv, print);
+    assert!(validate_loaded_print(&changed_argv, &facts, &expected()).is_err());
 }
 
 #[test]

@@ -4227,7 +4227,11 @@
                 "insecure": false,
                 "alpn": [
                   "http/1.1"
-                ]
+                ],
+                "utls": {
+                  "enabled": true,
+                  "fingerprint": "chrome"
+                }
               }
             },
             {
@@ -5020,7 +5024,11 @@
                 "insecure": false,
                 "alpn": [
                   "http/1.1"
-                ]
+                ],
+                "utls": {
+                  "enabled": true,
+                  "fingerprint": "chrome"
+                }
               }
             },
             {
@@ -5825,7 +5833,11 @@
                 "insecure": false,
                 "alpn": [
                   "http/1.1"
-                ]
+                ],
+                "utls": {
+                  "enabled": true,
+                  "fingerprint": "chrome"
+                }
               }
             },
             {

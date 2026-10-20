@@ -126,8 +126,8 @@ const GUARDED: &[Guarded] = &[
         anchor: "impl Executor for StdExecutor {",
         suppressor: "creation_flags(0x0800_0000)",
         self_check: "Command::new(",
-        window: 18,
-        before: None,
+        window: 0,
+        before: Some(&[".output()"]),
     },
 ];
 
@@ -492,7 +492,8 @@ fn version_probes_reach_the_guarded_shared_runner() {
     assert!(supervision.contains("version_probe.first_line(&expected)"));
     assert!(supervision.contains("version_probe.first_line(r)"));
     let probe = strip_comments(&read("src-tauri/src/runtime/core_version_probe.rs"));
-    let body = braced_block(&probe, "pub(crate) fn first_line(");
+    let owner = braced_block(&probe, "impl CoreVersionProbe {");
+    let body = braced_block(owner, "pub(crate) fn first_line(&self, bin: &Path)");
     assert!(body.contains("StdCommandRunner.run_observed("));
     assert!(body.contains("&Command::new(program, [\"version\"])"));
     for bypass in ["process::Command", ".spawn()", ".output()"] {

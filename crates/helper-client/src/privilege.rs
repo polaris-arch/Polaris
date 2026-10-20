@@ -303,7 +303,11 @@ impl Executor for StdExecutor {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
+            // A PS7 -> app -> Windows PowerShell launch inherits PS7 module
+            // paths without pwsh's direct-child compatibility cleanup. Rebuild
+            // the Windows PowerShell defaults in this child only; otherwise
+            // Start-Process/Get-Acl can resolve incompatible PS7 modules.
+            cmd.env_remove("PSModulePath").creation_flags(0x0800_0000);
         }
         let output = cmd
             .output()

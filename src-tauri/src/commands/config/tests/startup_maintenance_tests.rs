@@ -227,6 +227,21 @@ fn duplicate_identity_cold_recovery(plain_password: bool) {
     // config_get must remain fail-closed; the independent recovery projection is available.
     assert!(run_startup_maintenance(&mgr, &done).is_err());
     assert!(!done.load(Ordering::SeqCst));
+    let before_repair: Value = serde_json::from_slice(&std::fs::read(mgr.path()).unwrap()).unwrap();
+    assert_eq!(
+        before_repair, cfg,
+        "failed maintenance must not migrate the ambiguous document"
+    );
+    assert!(
+        !privacy_lock_path(&mgr).exists(),
+        "identity failure must precede privacy migration"
+    );
+    assert!(
+        mgr.load_full().is_err(),
+        "ordinary load cannot publish ambiguous identities"
+    );
+    let after_load: Value = serde_json::from_slice(&std::fs::read(mgr.path()).unwrap()).unwrap();
+    assert_eq!(after_load, cfg);
     let preview = serde_json::to_value(mgr.identity_conflicts().unwrap()).unwrap();
     assert_eq!(preview["groups"].as_array().unwrap().len(), 1);
     let mut expected = cfg.clone();

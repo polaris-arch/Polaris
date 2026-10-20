@@ -649,9 +649,11 @@ fn failed_state_publication_does_not_mutate_memory_or_disk() {
 
 #[test]
 fn version_reader_uses_shared_bounded_probe_without_changing_fallback_semantics() {
-    let source = include_str!("../../updater.rs");
-    let body =
-        crate::commands::guard_scan::top_level_fn_body(source, "pub fn read_core_version_line(");
+    let source = crate::test_support::crate_code("runtime/updater.rs");
+    let body = crate::commands::guard_scan::impl_method_body(
+        &source,
+        "    pub fn read_core_version_line(",
+    );
     assert!(body.contains("self.core_version_probe.first_line(&bin)"));
     assert!(!body.contains(".output()"));
 }

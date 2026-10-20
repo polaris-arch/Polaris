@@ -1688,6 +1688,9 @@ fn sparse_old_dns_backup_restores_protected_builtin_for_compatibility_fallback()
     let mut backup = pick_categories(&cfg(), &[C::DnsResources]);
     backup["dnsServers"] =
         json!([{"id":"custom","name":"Custom","type":"udp","endpoint":{"host":"192.0.2.53"}}]);
+    // This sparse backup has no groups. Keeping cfg()'s dns-custom group would
+    // introduce an independent dangling reference and correctly fail graph validation.
+    backup["dnsServerGroups"] = json!([]);
     let restored = merge_categories(&crate::default_config(), &backup, &[C::DnsResources]);
     assert_eq!(
         restored.config["dnsDefaults"]["realQueryFallbackAction"],
@@ -1699,6 +1702,18 @@ fn sparse_old_dns_backup_restores_protected_builtin_for_compatibility_fallback()
         .iter()
         .any(|server| server["id"] == "custom"));
     assert!(crate::ConfigStore::canonicalize_for_save(&restored.config).is_ok());
+    for id in ["builtin-domestic", "builtin-remote", "builtin-bootstrap"] {
+        assert!(restored.config["dnsServers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|server| server["id"] == id && server["enabled"] == true));
+    }
+    backup["dnsServerGroups"] = json!([{"id":"dangling","name":"Dangling","enabled":true,
+        "mode":"race","members":["missing"]}]);
+    let dangling = merge_categories(&crate::default_config(), &backup, &[C::DnsResources]);
+    assert!(crate::ConfigStore::canonicalize_for_save(&dangling.config).is_err());
+    backup["dnsServerGroups"] = json!([]);
     backup["dnsDefaults"]["realQueryFallbackAction"] =
         json!({"type":"server","serverId":"missing"});
     let explicit = merge_categories(&crate::default_config(), &backup, &[C::DnsResources]);

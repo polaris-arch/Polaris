@@ -1080,9 +1080,12 @@ async fn real_core_full_lifecycle() {
     println!("[①] ps -p {} → 进程存在 ✓", st.pid);
 
     // ── ② 管理 API 真的通（h2c gRPC unary RPC，非 clash REST）─────────────────
-    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", st.clash_api_port), "")
-        .await
-        .expect("[②] 管理 API gRPC 连接应成功");
+    let client = SingBoxApiClient::connect(
+        Endpoint::new("127.0.0.1", st.clash_api_port),
+        FIXTURE_MANAGEMENT_SECRET,
+    )
+    .await
+    .expect("[②] 管理 API gRPC 连接应成功");
     client
         .close_all_connections()
         .await

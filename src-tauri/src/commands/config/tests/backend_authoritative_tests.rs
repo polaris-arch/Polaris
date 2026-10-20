@@ -350,3 +350,42 @@ fn a_save_that_drops_the_subscription_drops_the_intent_with_it() {
     config_save_core(&mgr, &mut without_subscription, None, false).expect("save");
     assert!(mgr.load_full().unwrap().get("selectionIntent").is_none());
 }
+
+#[test]
+fn subscription_deletion_clears_only_its_owned_intent_on_save_and_patch() {
+    for patch in [false, true] {
+        for (scope, id, cleared) in [
+            ("subscription", Some("sub"), true),
+            ("subscription", Some("already-missing"), false),
+            ("global", None, false),
+            ("manual", None, false),
+            ("mesh", None, false),
+        ] {
+            let dir = temp_dir("selection-intent-deletion");
+            let mgr = ConfigManager::new(dir.clone());
+            let mut config = mgr.load_full().unwrap();
+            config["subscriptions"] =
+                json!([{ "id":"sub", "name":"S", "url":"https://a.example/x" }]);
+            let mut intent = json!({"mode":"auto", "scope":scope});
+            if let Some(id) = id {
+                intent["subscriptionId"] = json!(id);
+            }
+            config["selectionIntent"] = intent.clone();
+            mgr.save_full(&config).unwrap();
+            if patch {
+                let mut fields = serde_json::Map::new();
+                fields.insert("subscriptions".into(), json!([]));
+                config_patch_core(&mgr, fields).unwrap();
+            } else {
+                config["subscriptions"] = json!([]);
+                config_save_core(&mgr, &mut config, None, false).unwrap();
+            }
+            let saved = mgr.load_full().unwrap();
+            if cleared {
+                assert!(saved.get("selectionIntent").is_none());
+            } else {
+                assert_eq!(saved["selectionIntent"], intent);
+            }
+        }
+    }
+}

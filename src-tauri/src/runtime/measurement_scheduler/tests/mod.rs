@@ -2304,16 +2304,22 @@ fn leaving_reduction_through_unavailable_leaves_no_gap_without_data() {
 fn production_plan_reads_the_effective_intent_and_respects_the_platform_gate() {
     let mut config = json!({
         "selectionIntent": polaris_store::selection_intent_auto("sub"),
+        "autoSelectEnabled": false,
         "subscriptions": [{ "id": "sub", "periodicSpeedTest": false }],
-        "servers": [{ "id": "node", "subscriptionId": "sub" }],
+        "servers": [{ "id": "node", "name": "Node", "protocol": "http", "subscriptionId": "sub" }],
     });
+    // Retired App Auto does not create a competing HTTP measurement plan.
+    assert!(effective_plan(&config, Platform::Linux).is_empty());
+    assert!(effective_plan(&config, Platform::Ios).is_empty());
+    // Explicit periodic measurement still works independently of Auto intent.
+    config["subscriptions"][0]["periodicSpeedTest"] = json!(true);
     assert_eq!(
         effective_plan(&config, Platform::Linux),
         plan(&[("sub", 30, &["node"])])
     );
     let ios_plan = effective_plan(&config, Platform::Ios);
     assert_eq!(ios_plan, plan(&[("sub", 30, &["node"])]));
-    // A stored intent creates a plan, never native foreground proof.
+    // A periodic plan never supplies native foreground proof.
     let mut planner = Planner::new(Platform::Ios, at(0));
     for mono in [0, FIRST_ROUND_DELAY_MS] {
         let out = planner.tick(&input(at(mono), Some(1), &ios_plan));
@@ -2321,6 +2327,11 @@ fn production_plan_reads_the_effective_intent_and_respects_the_platform_gate() {
         assert!(!planner.signals().foreground);
     }
     config.as_object_mut().unwrap().remove("selectionIntent");
+    assert_eq!(
+        effective_plan(&config, Platform::Linux),
+        plan(&[("sub", 30, &["node"])])
+    );
+    config["subscriptions"][0]["periodicSpeedTest"] = json!(false);
     assert!(effective_plan(&config, Platform::Linux).is_empty());
     assert!(effective_plan(&config, Platform::Ios).is_empty());
 }

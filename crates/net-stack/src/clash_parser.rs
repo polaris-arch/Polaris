@@ -1549,6 +1549,7 @@ fn map_node(
                     if m.get("skip-cert-verify").and_then(bool_val) == Some(true) {
                         tls.allow_insecure = Some(true);
                     }
+                    tls.fingerprint = m.get("client-fingerprint").and_then(str);
                     tls.certificate_sha256 = clash_cert_pin(m);
                     config.tls_settings = Some(tls);
                 }

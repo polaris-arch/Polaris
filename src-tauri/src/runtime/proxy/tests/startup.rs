@@ -778,7 +778,8 @@ async fn main_start_rejects_final_system_endpoints_with_node_diagnostics() {
             // Test runtimes deny resolving a real binary, so a missing guard cannot spawn either.
             // The ownership code and node report prove this guard, rather than binary denial, fired.
             let config = serde_json::json!({"servers":[{"id":"vpn", "name":"System VPN", "protocol":protocol,
-                settings_key:settings}], "selectedServerId":"vpn", "proxyMode":"global", "proxyModeType":mode});
+                settings_key:settings}], "selectedServerId":"vpn", "proxyMode":"global", "proxyModeType":mode,
+                "clashApiSecret":FIXTURE_MANAGEMENT_SECRET});
             let error = rt.start(config).await.unwrap_err();
             assert_eq!(error.code, Some(code::SYSTEM_INTERFACE_REQUIRES_HELPER));
             assert!(error.message.contains("System VPN"));

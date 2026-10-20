@@ -156,7 +156,7 @@ fn migration_verbs_never_fall_through_to_daemon_arguments() {
 }
 #[test]
 fn source_keeps_mutation_after_durable_intent_and_does_not_signal() {
-    let source = include_str!("../../mac_migration_guard.rs");
+    let source = polaris_source_probe::crate_source!("mac_migration_guard.rs");
     let stop = source
         .split("fn stop(journal:")
         .nth(1)
@@ -218,7 +218,7 @@ fn journal_descriptor_binding_preserves_fixed_loaded_job_identity() {
         .unwrap();
     let facts = launchd::parse_plist(&bytes, &stored).unwrap();
     assert!(facts.upgrade_closed);
-    let fixture = include_str!("../../mac_migration_launchd/full-job-print.txt");
+    let fixture = polaris_source_probe::crate_file!("src/mac_migration_launchd/full-job-print.txt");
     let start = fixture.find("\targuments = {\n").unwrap();
     let end = start + fixture[start..].find("\t}\n").unwrap() + "\t}\n".len();
     let arguments: String = args.iter().map(|arg| format!("\t\t{arg}\n")).collect();
@@ -244,7 +244,7 @@ fn original_renames_require_same_device_before_any_disable() {
     for devices in [&[8, 9, 9][..], &[9, 8, 9][..], &[9, 9, 8][..]] {
         assert!(validate_rename_devices(9, devices).is_err());
     }
-    let source = include_str!("../../mac_migration_guard.rs");
+    let source = polaris_source_probe::crate_source!("mac_migration_guard.rs");
     let stop = source
         .split("fn stop(journal:")
         .nth(1)

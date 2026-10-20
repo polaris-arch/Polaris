@@ -1610,7 +1610,7 @@ async fn native_real_config_writer_invalidates_edited_pins_without_fabricating_r
 fn native_retest_requests_http_without_an_app_winner_write() {
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    pub(crate) async fn native_auto_retest(&self) -> Result<NativeAutoStatus,String> {",
+        "    pub(crate) async fn native_auto_retest(",
     );
     assert!(body.contains(".url_test("));
     assert!(!body.contains("native_put(") && !body.contains("auto_select_explicit"));

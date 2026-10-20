@@ -738,7 +738,7 @@ fn streaming_download_only_ever_touches_the_tmp_path() {
     // `update_install` 拿它去装。故反过来：**列出 dest 的全部合法用法**，
     // 出现次数钉死；新增任何一处对 dest 的引用都必须显式改这张表，并在改的时候回答
     // 「它会不会在落位之前碰 dest」。
-    const DEST_USES: [&str; 9] = [
+    const DEST_USES: [&str; 12] = [
         "let dest = dir.join(&file_name);",
         "let gate = download_gate(&dest);",
         "let dest = dest.clone();",
@@ -752,9 +752,14 @@ fn streaming_download_only_ever_touches_the_tmp_path() {
         // `cached_download_is_reusable` 已认下盘上那份完整包，落位腿在 `Landed` 臂内），
         // 且两处都只是**读**路径去拼事件载荷，一个字节都不写。
         "path: &dest,",
+        // Receipt creation reads already-complete bytes, after cache verification or
+        // successful landing. It records authority without writing payload bytes.
+        "std::fs::metadata(&dest)",
+        "custody.record(\n            &dest,",
+        ".record(&dest, &streamed.sha256_hex, streamed.bytes)",
     ];
     /// dest 在 `update_download` 里的**总出现次数**（含上表每一项各自的出现次数之和）。
-    const DEST_MENTIONS: usize = 13;
+    const DEST_MENTIONS: usize = 16;
     let total = body.matches("dest").count();
     let covered: usize = DEST_USES
         .iter()
@@ -2207,12 +2212,12 @@ fn skipped_version_write_points_all_go_through_the_normalizer() {
     ] {
         collect_skip_writes(std::path::Path::new(&root), &root, &mut writes);
     }
-    // 今天的构成：生产 2（update_skip / PopupAction::Skip）+ 测试与 doc 示例 11
-    // （本文件 8、runtime/updater.rs 测试 3）。任何**新增**命中——生产第三写点、新测试写
+    // 当前构成：生产 2（update_skip / PopupAction::Skip）+ 测试与 doc 示例 13
+    // （本文件 8、runtime/updater/tests/mod.rs 5，新增两次失败发布状态赋值）。任何**新增**命中——生产第三写点、新测试写
     // state、doc 示例串——都先红：红了就过目定性，属生产写点必须过 stored_skip_version
     // 并两处体内断言，其余 bump 常量登记。（常量自己就咬过一次：helper 头注里的示例串
     // 让首版钉 11 立刻红，正是「全响无哑」的实证。）
-    const PINNED_TOTAL: usize = 13;
+    const PINNED_TOTAL: usize = 15;
     let total: usize = writes.iter().map(|(_, n)| n).sum();
     let locations = writes
         .iter()
@@ -2930,9 +2935,14 @@ fn full_uninstall_prepares_all_desktop_owners_before_any_destructive_step() {
 fn portable_reminder_is_read_only_and_confirmed_install_requires_fresh_custody() {
     let body =
         crate::commands::guard_scan::top_level_fn_body(src(), "pub async fn update_install(");
-    let readonly = body
-        .find("if confirmed == Some(false) && os == \"windows\" && portable.is_some()")
-        .unwrap();
+    let readonly = body.find("if confirmed == Some(false)").unwrap();
+    let condition_end = body[readonly..].find('{').unwrap() + readonly;
+    let condition: String = body[readonly..condition_end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(condition,
+        "ifconfirmed==Some(false)&&os==\"windows\"&&portable.is_some()&&state.updater().custody.admits_install(&installer).is_err()");
     let authority = body[readonly..]
         .find("    if let Err(error) = state.updater().custody.admits_install")
         .unwrap()

@@ -1524,6 +1524,10 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    ("crates/config-engine/src/builder/outbound.rs", "if matches!( tls.get(\"engine\").and_then(serde_json::Value::as_str), Some(\"apple\" | \"windows\") ) && [\"fragment\", \"record_fragment\"] .iter() .any(|key| tls.get(*key).and_then(serde_json::Value::as_bool) == Some(true))", 1, "TLS native engine and fragmentation capabilities are incompatible; this is engine selection, not host OS dispatch."),
+    ("crates/config-engine/src/builder/outbound.rs", "if server .tls_settings .as_ref() .is_some_and(|t| t.fragment == Some(true)) && ob .tls .as_ref() .is_some_and(|tls| matches!(tls.engine.as_deref(), Some(\"apple\" | \"windows\")))", 1, "Explicit node fragment plus native engine is rejected consistently; unknown hosts do not gain native engine support."),
+    ("crates/config-engine/src/builder/outbound_helpers.rs", "!is_quic_managed_tls(protocol) && protocol != \"naive\" && !matches!(engine, Some(\"apple\" | \"windows\"))", 1, "TLS options follow protocol capability: QUIC, Naive and native engines do not receive incompatible uTLS/fragment options."),
+    ("src-tauri/src/commands/updater/app_update.rs", "if confirmed == Some(false) && os == \"windows\" && portable.is_some() && state.updater().custody.admits_install(&installer).is_err()", 1, "Only an unconfirmed stale Windows portable reminder receives read-only redownload guidance; confirmed installs and other platforms retain fresh custody checks."),
     (
         "crates/config-engine/src/user_config/utls.rs",
         "\"windows\" => \"win32\", \"macos\" => \"darwin\", other => other,",
@@ -2358,6 +2362,11 @@ enum IosSide {
 /// 加 40 个 iOS 答案而这一轴一句话都不说。
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
+    ("src-tauri/src/commands/proxy.rs", "target_os = \"android\"", 1, IosSide::DiffersRight, "Explicit rule-pattern admission uses Android CheckConfig; iOS has no isolated construction proof and cannot use JNI."),
+    ("src-tauri/src/commands/proxy.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "Rule-pattern admission explicitly reports unavailable on iOS; Android keeps its actual native checker."),
+    ("src-tauri/src/runtime/proxy/android_bridge.rs", "any(target_os = \"android\", test)", 1, IosSide::DiffersRight, "Android lifecycle_observation is shared by native consumption and host state tests; iOS keeps its own NE lifecycle, not Android observation types."),
+    ("src-tauri/src/runtime/proxy/lifecycle.rs", "target_os = \"android\"", 2, IosSide::DiffersRight, "Android core_running and writer_may_be_live add native-running observation and a conservative writer bit; iOS retains its existing NE/host status contract, not a new device proof."),
+    ("src-tauri/src/runtime/proxy/lifecycle.rs", "not(target_os = \"android\")", 1, IosSide::DiffersRight, "Non-Android core_running preserves the existing ready-state source; Android alone adds JNI observation, with no reclassification of existing iOS debts."),
     // Retained CLI-observation evidence, from the b84e correction batch.
     (
         "src-tauri/src/runtime/proxy/startup.rs",
@@ -4203,7 +4212,7 @@ fn cfg_axis_platform_dispatch_is_registered() {
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 330),
+    ("DiffersRight", 336),
     ("DiffersUndecided", 27),
     ("DiffersWrongToday", 142),
     // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1),

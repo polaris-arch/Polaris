@@ -280,8 +280,12 @@ pub fn finalize_config(value: &mut Value) -> Result<(), StoreError> {
             .or_insert_with(|| Value::Array(vec![]));
         obj.entry("dnsRuleOrder")
             .or_insert_with(|| Value::Array(vec![]));
-        obj.entry("dnsServers")
-            .or_insert_with(|| Value::Array(vec![]));
+        obj.entry("dnsServers").or_insert_with(|| {
+            serde_json::to_value(
+                polaris_config_engine::user_config::dns_policy::builtin_dns_server_resources(),
+            )
+            .expect("built-in DNS resources serialize")
+        });
         obj.entry("dnsServerGroups")
             .or_insert_with(|| Value::Array(vec![]));
         obj.entry("servers").or_insert_with(|| Value::Array(vec![]));

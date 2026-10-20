@@ -56,7 +56,7 @@ fn lost_return_anchor_resets_pending_reclaim_and_restoration_starts_fresh() {
 fn queued_automatic_transition_rechecks_actual_return_anchor_before_destruction() {
     // Source-only wiring fixture: the live tray lookup must remain inside the UI callback,
     // ahead of the shared destructive transition. A pre-queue snapshot is insufficient.
-    let source = include_str!("../../idle_lightweight.rs");
+    let source = crate::test_support::crate_code("idle_lightweight.rs");
     let callback = source
         .split_once("let post = app.run_on_main_thread(move || {")
         .unwrap()

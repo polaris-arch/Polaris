@@ -159,6 +159,7 @@ fn repair_preserves_legacy_raw_defaults_and_unrelated_tailscale_fields() {
     let (directory, manager, mut raw) = fixture();
     raw.as_object_mut().unwrap().remove("logLevel");
     raw.as_object_mut().unwrap().remove("dnsPolicy");
+    raw.as_object_mut().unwrap().remove("dnsServers");
     raw["legacyUnknown"] = json!({"keep":"unchanged"});
     raw["servers"].as_array_mut().unwrap().push(json!({
         "id":"ts-other","name":"TS","protocol":"tailscale",
@@ -179,6 +180,13 @@ fn repair_preserves_legacy_raw_defaults_and_unrelated_tailscale_fields() {
         serde_json::from_slice(&std::fs::read(directory.join("config.json")).unwrap()).unwrap();
     assert_eq!(disk, expected);
     assert_eq!(disk["servers"][3], raw["servers"][3]);
+    assert!(
+        disk.get("logLevel").is_none() && disk.get("dnsServers").is_none(),
+        "validation defaults must never enter the ID-only disk transaction"
+    );
+    let projected = manager.current().unwrap();
+    assert_eq!(projected["logLevel"], "info");
+    assert_eq!(projected["dnsServers"].as_array().unwrap().len(), 3);
 }
 
 #[test]

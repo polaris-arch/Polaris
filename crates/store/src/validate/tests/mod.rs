@@ -1,3 +1,4 @@
+mod rule_identity_tests;
 use super::*;
 
 #[test]
@@ -312,21 +313,19 @@ fn canonical_save_rejects_removed_or_disabled_protected_dns_resources() {
                 list.iter_mut().find(|server| server["id"] == id).unwrap()["enabled"] =
                     false.into();
             }
-            let raw = serde_json::json!({"dnsServers":servers});
+            let mut raw = crate::default_config();
+            raw["dnsServers"] = servers;
             let before = raw.clone();
-            assert!(
-                crate::ConfigStore::canonicalize_for_save(&raw).is_err(),
-                "{id}, remove={remove}"
-            );
+            let error = crate::ConfigStore::canonicalize_for_save(&raw)
+                .expect_err(&format!("{id}, remove={remove}"));
+            assert_eq!(error.code(), Some("DNS_DEPENDENCY_INVALID"));
             assert_eq!(raw, before, "rejected save must not synthesize resources");
         }
     }
     // Absent collections keep legacy serde defaults; explicit valid resources work.
-    assert!(crate::ConfigStore::canonicalize_for_save(&serde_json::json!({})).is_ok());
-    assert!(
-        crate::ConfigStore::canonicalize_for_save(&serde_json::json!({
-            "dnsServers":builtin_dns_server_resources()
-        }))
-        .is_ok()
-    );
+    let mut legacy = crate::default_config();
+    legacy.as_object_mut().unwrap().remove("dnsServers");
+    assert!(crate::ConfigStore::canonicalize_for_save(&legacy).is_ok());
+    legacy["dnsServers"] = serde_json::to_value(builtin_dns_server_resources()).unwrap();
+    assert!(crate::ConfigStore::canonicalize_for_save(&legacy).is_ok());
 }

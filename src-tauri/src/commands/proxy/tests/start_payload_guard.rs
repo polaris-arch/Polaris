@@ -28,14 +28,44 @@ use crate::test_support::crate_code;
 #[test]
 fn start_reads_the_config_from_disk_not_from_the_caller() {
     let src = crate_code("commands/proxy.rs");
-    let sig = "pub async fn proxy_start(";
-    let body = top_level_fn_body(&src, sig);
+    for (signature, delegation) in [
+        (
+            "pub async fn proxy_start(",
+            "proxy_start_with_admission(app, state, None).await",
+        ),
+        (
+            "pub(crate) async fn proxy_start_automatic(",
+            "proxy_start_with_admission(app, state, Some(admission)).await",
+        ),
+    ] {
+        let entry = top_level_fn_body(&src, signature);
+        assert!(
+            entry.contains(delegation),
+            "{signature} must use the shared admission path"
+        );
+        assert!(
+            !entry.contains("config: Value"),
+            "{signature} must not accept renderer config"
+        );
+    }
+    let body = top_level_fn_body(&src, "async fn proxy_start_with_admission(");
     assert!(
-        body.contains("state.config()"),
-        "{sig} 必须自己向 state.config() 取起核配置 —— 信调用方传的那份就是本缺陷"
+        body.contains("state.config().current()"),
+        "shared start must load backend config"
     );
+    let load = body.find("state.config().current()").unwrap();
+    for start in [
+        "proxy.start_automatic(config, admission).await",
+        "proxy.start(config).await",
+    ] {
+        assert!(
+            load < body
+                .find(start)
+                .expect("both admission variants must start the loaded config")
+        );
+    }
     assert!(
         !body.contains("config: Value"),
-        "{sig} 不得再收 `config: Value` 参数：留着它，渲染端的陈旧副本就还能被喂进来"
+        "shared start must not accept renderer config"
     );
 }

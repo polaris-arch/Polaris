@@ -306,12 +306,15 @@ fn guarded_mutation_is_inside_writer(body: &str, mutation: &str) -> bool {
 #[test]
 fn guarded_comparison_is_inside_both_writer_transactions_before_mutation() {
     let source = crate_code("commands/rules/crud.rs");
-    for (name, mutation) in [
-        ("rules_update", "rules[idx] = rule"),
-        ("rules_delete", "rules.remove(idx)"),
+    for (signature, mutation) in [
+        ("pub async fn rules_update(", "rules[idx] = rule"),
+        ("pub fn rules_delete(", "rules.remove(idx)"),
     ] {
-        let body = top_level_fn_body(&source, &format!("pub fn {name}("));
-        assert!(guarded_mutation_is_inside_writer(&body, mutation), "{name}");
+        let body = top_level_fn_body(&source, signature);
+        assert!(
+            guarded_mutation_is_inside_writer(&body, mutation),
+            "{signature}"
+        );
     }
 }
 

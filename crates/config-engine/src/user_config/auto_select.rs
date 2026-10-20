@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 pub const TAG_PREFIX: &str = "polaris-auto-";
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AutoSelectTarget {
     Global,
@@ -17,6 +17,30 @@ pub enum AutoSelectTarget {
         #[serde(rename = "subscriptionId")]
         subscription_id: String,
     },
+}
+
+// Internally tagged unit variants ignore their remaining map entries in serde.
+// Decode through empty struct variants so every scope has a strict field set.
+impl<'de> Deserialize<'de> for AutoSelectTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "scope", rename_all = "camelCase", deny_unknown_fields)]
+        enum WireTarget {
+            Global {},
+            Manual {},
+            Mesh {},
+            Subscription {
+                #[serde(rename = "subscriptionId")]
+                subscription_id: String,
+            },
+        }
+        Ok(match WireTarget::deserialize(deserializer)? {
+            WireTarget::Global {} => Self::Global,
+            WireTarget::Manual {} => Self::Manual,
+            WireTarget::Mesh {} => Self::Mesh,
+            WireTarget::Subscription { subscription_id } => Self::Subscription { subscription_id },
+        })
+    }
 }
 
 impl AutoSelectTarget {
@@ -216,74 +240,4 @@ pub fn deserialize_intent<'de, D: serde::Deserializer<'de>>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn target_namespace_is_injective_and_subscription_required() {
-        assert_ne!(
-            wrapper_tag(&AutoSelectTarget::Global),
-            wrapper_tag(&AutoSelectTarget::Subscription {
-                subscription_id: "global".into()
-            })
-        );
-        assert_ne!(
-            wrapper_tag(&AutoSelectTarget::Subscription {
-                subscription_id: "a/b".into()
-            }),
-            wrapper_tag(&AutoSelectTarget::Subscription {
-                subscription_id: "a-b".into()
-            })
-        );
-        assert!(serde_json::from_value::<AutoSelectTarget>(
-            serde_json::json!({"scope":"subscription"})
-        )
-        .is_err());
-        assert!(serde_json::from_value::<AutoSelectTarget>(
-            serde_json::json!({"scope":"global","subscriptionId":"sub"})
-        )
-        .is_err());
-    }
-    #[test]
-    fn feature_defaults_off_and_unknown_intent_does_not_break_projection() {
-        let config = UserConfig::default();
-        assert!(!config.auto_select_enabled);
-        let mut raw = serde_json::to_value(config).unwrap();
-        raw["selectionIntent"] = serde_json::json!({"mode":"future","scope":"future"});
-        let projected: UserConfig = serde_json::from_value(raw).unwrap();
-        assert!(projected.selection_intent.is_none());
-    }
-    #[test]
-    fn legacy_subscription_intent_remains_a_reference() {
-        let mut raw = serde_json::to_value(UserConfig::default()).unwrap();
-        raw["selectionIntent"] =
-            serde_json::json!({"mode":"auto","scope":"subscription","subscriptionId":"s"});
-        let projected: UserConfig = serde_json::from_value(raw).unwrap();
-        assert_eq!(
-            projected.selection_intent.unwrap().target,
-            AutoSelectTarget::Subscription {
-                subscription_id: "s".into()
-            }
-        );
-    }
-    #[test]
-    fn invalid_explicit_endpoint_is_rejected_without_substitution() {
-        let mut config = UserConfig::default();
-        for invalid in ["http://", "tcp://example.com", "https://example.com:99999"] {
-            config.speed_test_url = Some(invalid.into());
-            assert_eq!(test_url(&config), invalid);
-            assert_eq!(
-                validate_test_url(config.speed_test_url.as_deref()),
-                Err(SPEED_TEST_URL_INVALID)
-            );
-        }
-        for default in [None, Some(""), Some("  ")] {
-            assert!(validate_test_url(default).is_ok());
-            assert_eq!(
-                configured_test_url(default),
-                "http://www.gstatic.com/generate_204"
-            );
-        }
-        config.speed_test_url = Some("https://example.com/check".into());
-        assert_eq!(test_url(&config), "https://example.com/check");
-    }
-}
+mod tests;

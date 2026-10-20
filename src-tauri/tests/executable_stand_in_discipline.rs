@@ -56,8 +56,12 @@ enum Kind {
 
 /// 既有命中的逐文件登记：`(文件, 判据, 数量, 为什么它不是「落替身再执行」)`。
 const REGISTERED: &[(&str, Kind, usize, &str)] = &[
+    ("src-tauri/src/runtime/proxy/mesh_apply/artifact/tests/mod.rs", Kind::ExecBit, 1,
+        "FIFO replacement fixture sets only its private directory to 0700 before exercising the lstat/open boundary; no executable file is created"),
     ("src-tauri/src/runtime/core_identity/tests/mod.rs", Kind::ExecBit, 1,
         "FIFO fixture directory mode 0700 permits private traversal; no executable file is written"),
+    ("crates/helper/src/user_control/tests/mod.rs", Kind::ExecBit, 1,
+        "Only the private users/<identity> directory gets mode 0700; registration bytes stay nonexecutable and are only snapshotted/restored"),
     ("crates/helper/src/pinned_core/tests/mod.rs", Kind::ExecBit, 1,
         "Private root/source directories for inert content status fixtures"),
     ("crates/helper/src/core_objects/tests/mod.rs", Kind::ExecBit, 1,
@@ -85,8 +89,8 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
     (
         "crates/helper-client/src/manager/tests/mod.rs",
         Kind::ExecBit,
-        2,
-        "One private journal directory; one same-crate shared writer chmod after cp child closes target fd",
+        3,
+        "Private/unsafe journal directory modes for custody checks; one same-crate shared writer chmod after cp child closes target fd",
     ),
     (
         "crates/helper/src/platform/linux/handler/tests/mod.rs",

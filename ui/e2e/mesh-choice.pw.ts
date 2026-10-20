@@ -18,6 +18,8 @@ for (const { width, language, state, columns } of scenarios) {
         await page.goto(`/harness.html?mesh-choice-fixture=${state}`);
         const cards = page.locator('.mesh-choice > .mesh-col');
         await expect(cards).toHaveCount(state === 'empty' ? 6 : state === 'long' ? 8 : 7);
+        await expect(page.locator('.access-picker-dlg')).toBeVisible();
+        await expect(cards.first()).toBeVisible();
         const geometry = await page.locator('.mesh-choice-grid').evaluateAll(grids => grids.map(grid =>
           Array.from(grid.querySelectorAll('.mesh-choice')).map(choice => {
             const card = choice.querySelector('.mesh-col')!;
@@ -30,6 +32,7 @@ for (const { width, language, state, columns } of scenarios) {
             };
           })));
         const all = geometry.flat();
+        expect(all.every(card => card.width > 0 && card.height > 0)).toBe(true);
         const tunnelCards = geometry[1];
         expect(tunnelCards.filter(card => Math.abs(card.y - tunnelCards[0].y) < 1)).toHaveLength(columns);
         expect(all.every(card => Math.abs(card.width - all[0].width) < 1)).toBe(true);

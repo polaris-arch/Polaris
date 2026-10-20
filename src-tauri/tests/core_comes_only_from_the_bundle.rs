@@ -538,8 +538,8 @@ const CORE_PATH_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "commands/proxy.rs",
         "resolve_core_binary",
-        1,
-        "节点探测前的 `check` 用随包核",
+        2,
+        "节点探测与规则正则准入的 check 均使用 resolve_core_binary 给出的随包核",
     ),
     (
         "lib.rs",

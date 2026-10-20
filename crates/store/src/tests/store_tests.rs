@@ -638,7 +638,7 @@ fn dns_enable_toggle_rejects_referenced_resources_without_writing() {
             "action":{"type":"server","serverId":"private-dns"}}}
     }]);
     let fs = MockFs::default();
-    ConfigStore::save(&fs, Path::new(CFG), &original, "first").unwrap();
+    ConfigStore::save(&fs, Path::new(CFG), &original, "000000000001").unwrap();
     let before = fs.read_to_string(Path::new(CFG)).unwrap();
     let persisted: serde_json::Value = serde_json::from_str(&before).unwrap();
     assert_eq!(
@@ -648,7 +648,7 @@ fn dns_enable_toggle_rejects_referenced_resources_without_writing() {
     // Same shape as desktop/mobile resource enabled toggles: only enabled changes.
     let mut disabled = original.clone();
     disabled["dnsServers"][3]["enabled"] = serde_json::json!(false);
-    let error = ConfigStore::save(&fs, Path::new(CFG), &disabled, "second").unwrap_err();
+    let error = ConfigStore::save(&fs, Path::new(CFG), &disabled, "000000000002").unwrap_err();
     assert_eq!(error.code(), Some("DNS_DEPENDENCY_INVALID"));
     assert!(error.to_string().contains("private-rule"));
     assert!(error.to_string().contains("private-dns"));
@@ -666,7 +666,7 @@ fn dns_bootstrap_disable_and_cycles_are_rejected_before_write() {
             "outbound":{"type":"direct"}}),
     ]);
     let fs = MockFs::default();
-    ConfigStore::save(&fs, Path::new(CFG), &original, "first").unwrap();
+    ConfigStore::save(&fs, Path::new(CFG), &original, "000000000001").unwrap();
     let before = fs.read_to_string(Path::new(CFG)).unwrap();
     for cyclic in [false, true] {
         let mut invalid = original.clone();
@@ -676,7 +676,7 @@ fn dns_bootstrap_disable_and_cycles_are_rejected_before_write() {
         } else {
             invalid["dnsServers"][3]["enabled"] = serde_json::json!(false);
         }
-        assert!(ConfigStore::save(&fs, Path::new(CFG), &invalid, "invalid").is_err());
+        assert!(ConfigStore::save(&fs, Path::new(CFG), &invalid, "000000000003").is_err());
         assert_eq!(fs.read_to_string(Path::new(CFG)).unwrap(), before);
     }
 }
@@ -697,7 +697,7 @@ fn explicit_action_only_dns_policy_survives_save_and_rejects_bad_updates() {
         "effects":{"dns":{"action":{"type":"server","serverId":"action-only-dns"}}}
     }]);
     let fs = MockFs::default();
-    ConfigStore::save(&fs, Path::new(CFG), &original, "initial").unwrap();
+    ConfigStore::save(&fs, Path::new(CFG), &original, "000000000004").unwrap();
     let before = fs.read_to_string(Path::new(CFG)).unwrap();
     let persisted: serde_json::Value = serde_json::from_str(&before).unwrap();
     assert_eq!(
@@ -714,7 +714,7 @@ fn explicit_action_only_dns_policy_survives_save_and_rejects_bad_updates() {
     ] {
         let mut invalid = original.clone();
         invalid["dnsRules"][0]["effects"]["dns"]["action"] = action;
-        let error = ConfigStore::save(&fs, Path::new(CFG), &invalid, "invalid").unwrap_err();
+        let error = ConfigStore::save(&fs, Path::new(CFG), &invalid, "000000000003").unwrap_err();
         assert_eq!(error.code(), Some("DNS_DEPENDENCY_INVALID"));
         assert_eq!(fs.read_to_string(Path::new(CFG)).unwrap(), before);
     }
@@ -724,14 +724,14 @@ fn explicit_action_only_dns_policy_survives_save_and_rejects_bad_updates() {
         .unwrap()
         .last_mut()
         .unwrap()["enabled"] = serde_json::json!(false);
-    let error = ConfigStore::save(&fs, Path::new(CFG), &disabled, "disabled").unwrap_err();
+    let error = ConfigStore::save(&fs, Path::new(CFG), &disabled, "000000000005").unwrap_err();
     assert_eq!(error.code(), Some("DNS_DEPENDENCY_INVALID"));
     assert_eq!(fs.read_to_string(Path::new(CFG)).unwrap(), before);
 
     // A malformed sibling must not make the sanitizer erase the whole explicit policy.
     let mut malformed_rule = original.clone();
     malformed_rule["dnsRules"][0]["enabled"] = serde_json::json!("yes");
-    assert!(ConfigStore::save(&fs, Path::new(CFG), &malformed_rule, "malformed").is_err());
+    assert!(ConfigStore::save(&fs, Path::new(CFG), &malformed_rule, "000000000006").is_err());
     assert_eq!(fs.read_to_string(Path::new(CFG)).unwrap(), before);
 }
 

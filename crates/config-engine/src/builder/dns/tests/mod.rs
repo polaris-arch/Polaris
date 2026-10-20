@@ -1219,6 +1219,7 @@ mod real_query_fallback;
 #[test]
 fn reused_groups_have_unique_evaluate_occurrences_and_matching_responses() {
     let mut config = base_config();
+    config.config_schema_version = Some(2);
     config.dns_config = Some(UserDnsConfig {
         enable_fake_ip: Some(false),
         ..Default::default()
@@ -1267,7 +1268,7 @@ fn reused_groups_have_unique_evaluate_occurrences_and_matching_responses() {
     let rules = built.rules.unwrap();
     let evaluations: Vec<_> = rules
         .iter()
-        .filter(|r| r.action.as_deref() == Some("evaluate"))
+        .filter(|r| r.action.as_deref() == Some("evaluate") && r.resolver_policy.is_none())
         .collect();
     assert_eq!(
         evaluations.len(),

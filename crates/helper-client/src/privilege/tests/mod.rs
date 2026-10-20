@@ -62,6 +62,28 @@ fn uac_escalation_argv_structure() {
     assert!(esc.argv.iter().any(|a| a.contains("Start-Process")));
     assert!(esc.argv.iter().any(|a| a.contains("-Verb RunAs")));
     assert!(esc.argv.iter().any(|a| a.contains(r"C:\temp\install.ps1")));
+
+    // The native ACL fixture uses this same child-only cleanup. Keep the real
+    // UAC executor ordered before process creation, without changing global env.
+    let source = polaris_source_probe::crate_source!("privilege.rs");
+    let source = polaris_source_probe::mask_comments(&source);
+    let anchor = "impl Executor for StdExecutor {";
+    assert_eq!(source.matches(anchor).count(), 1);
+    // Column-zero close bounds this top-level impl, not an indented method.
+    let executor = source
+        .split_once(anchor)
+        .unwrap()
+        .1
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
+    let construct = executor.find("Command::new(&argv[0])").unwrap();
+    let windows = executor.find("#[cfg(windows)]").unwrap();
+    let isolate = executor.find("cmd.env_remove(\"PSModulePath\")").unwrap();
+    let spawn = executor.find(".output()").unwrap();
+    assert!(construct < windows && windows < isolate && isolate < spawn);
+    assert!(executor[isolate..spawn].contains("creation_flags(0x0800_0000)"));
+    assert!(!executor.contains("std::env::remove_var"));
 }
 
 #[test]
@@ -357,9 +379,9 @@ fn uac_argv_bypasses_execution_policy_and_returns_the_exit_code() {
     assert!(cmd.contains("UAC_ERROR_CANCELLED_1223"));
     assert!(cmd.contains("exit 1223"));
 
-    // ③ 路径仍被单引号包裹。
+    // ③ PS 单引号保护字面量；内层双引号必须保留到 native argv，空格不能拆路径。
     assert!(
-        cmd.contains("'-File','C:\\Users\\u\\AppData\\Roaming\\x\\ab-polaris-helper-install.ps1'")
+        cmd.contains(r#"'-File','"C:\Users\u\AppData\Roaming\x\ab-polaris-helper-install.ps1"'"#)
     );
 }
 
@@ -369,7 +391,7 @@ fn uac_argv_escapes_single_quotes_in_the_script_path() {
     let esc = uac_escalation(r"C:\Users\o'brien\x.ps1").unwrap();
     let cmd = &esc.argv[3];
     assert!(
-        cmd.contains(r"'C:\Users\o''brien\x.ps1'"),
+        cmd.contains(r#"'-File','"C:\Users\o''brien\x.ps1"'"#),
         "单引号未按 PS 规则加倍\n{cmd}"
     );
     // 反向：不得留下奇数个引号把命令拆断。

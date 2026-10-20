@@ -227,6 +227,22 @@ const TEXT_ONLY: &[Entry] = &[
         reason: "helper-client install_unix 的 Linux unit / Mac plist 共用 quoted descriptor heredoc 定界符；旧 UNIT_EOF / PLIST_EOF 随原生成器移除，不读取进程环境。",
     },
     Entry {
+        name: "POLARIS_CGROUP_CHILDREN",
+        reason: "linux_service_stop 的 heredoc 定界符，正文来自当前已验证 cgroup 父目录的有界子目录枚举；不是环境键读取。",
+    },
+    Entry {
+        name: "POLARIS_CGROUP_EVENTS",
+        reason: "linux_service_stop 的 heredoc 定界符，正文来自已验证 cgroup.events 文件；不是环境键读取。",
+    },
+    Entry {
+        name: "POLARIS_MOUNTINFO",
+        reason: "linux_service_stop 的 heredoc 定界符，正文来自 /proc/self/mountinfo；不是环境键读取。",
+    },
+    Entry {
+        name: "POLARIS_CLOSED_DESCRIPTOR_EOF",
+        reason: "install_unix 的 quoted heredoc 定界符，写出迁移期间关闭 admission 的 launchd descriptor；不是环境键读取。",
+    },
+    Entry {
         name: "POLARIS_ELEVATE",
         reason: "update_install 的 quoted installer heredoc 定界符，不读取进程环境。",
     },
@@ -2236,7 +2252,28 @@ fn current_unix_descriptor_delimiter_is_live_in_both_branches_and_retired_names_
         !owner.in_tests_dir && !owner.release_off_file,
         "live production generator cannot be swallowed by parent cfg"
     );
+    let closure =
+        polaris_source_probe::repo_file!("crates/helper-client/src/manager/linux_service_stop.rs");
+    for (name, input) in [
+        ("POLARIS_CGROUP_CHILDREN", "$CHILDREN"),
+        ("POLARIS_CGROUP_EVENTS", "$EVENTS"),
+        ("POLARIS_MOUNTINFO", "$MOUNTS"),
+    ] {
+        assert_eq!(closure.matches(name).count(), 2, "paired delimiter: {name}");
+        assert!(closure.contains(&format!("done <<{name}\n{input}\n{name}")));
+    }
+    assert_eq!(source.matches("POLARIS_CLOSED_DESCRIPTOR_EOF").count(), 2);
+    assert!(source.contains("<<'POLARIS_CLOSED_DESCRIPTOR_EOF'"));
     let observed = scan();
+    for name in [
+        "POLARIS_CGROUP_CHILDREN",
+        "POLARIS_CGROUP_EVENTS",
+        "POLARIS_MOUNTINFO",
+        "POLARIS_CLOSED_DESCRIPTOR_EOF",
+    ] {
+        assert!(observed.names.contains_key(name));
+        assert!(!observed.release_reads().contains_key(name));
+    }
     assert!(observed.names.contains_key("POLARIS_DESCRIPTOR_EOF"));
     assert!(!observed
         .release_reads()

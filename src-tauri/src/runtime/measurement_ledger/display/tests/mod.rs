@@ -256,6 +256,12 @@ fn actual_producer_identity_round_trips_to_the_renderer_golden_without_raw_crede
     assert_eq!(legacy, fixture["legacyFingerprint"]);
     let fingerprints = BTreeMap::from([("interop".to_owned(), legacy)]);
     let connections = node_fingerprints::measurement_table_json(&config);
+    // Default uTLS changes the actual connection while the subscription fingerprint stays raw.
+    let canonical_connection = r#"{"address":"example.test","network":"tcp","password":"fixture-secret","port":443,"protocol":"trojan","tlsSettings":{"fingerprint":"chrome","utlsMode":"profile"}}"#;
+    assert_eq!(
+        connections["interop"],
+        polaris_updater::sha256_hex(canonical_connection.as_bytes())
+    );
     let ledger = Box::leak(Box::new(MeasurementLedger::new()));
     let request = SpeedTestRequest {
         origin: SpeedTestOrigin::Manual,

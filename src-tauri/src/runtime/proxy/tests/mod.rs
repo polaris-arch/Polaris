@@ -565,6 +565,8 @@ fn free_port() -> u16 {
 }
 
 /// 真机验证用最小 config：manual 模式 + 全局直连 + 仅本地混合入站。
+const FIXTURE_MANAGEMENT_SECRET: &str = "fixture-management-secret";
+
 fn local_only_config(mixed: u16) -> Value {
     serde_json::json!({
         "servers": [],
@@ -572,6 +574,7 @@ fn local_only_config(mixed: u16) -> Value {
         "proxyMode": "direct",
         "proxyModeType": "manual",        // 安全：不接管系统代理、不建 TUN
         "mixedPort": mixed,
+        "clashApiSecret": FIXTURE_MANAGEMENT_SECRET,
     })
 }
 

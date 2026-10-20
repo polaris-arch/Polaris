@@ -839,7 +839,7 @@ fn lost_helper_record_with_retained_native_handle_blocks_replacement() {
 
 #[test]
 fn windows_native_config_uses_verified_object_without_path_reopen() {
-    let source = include_str!("../../winproc/win.rs");
+    let source = polaris_source_probe::crate_source!("platform/windows/winproc/win.rs");
     let gate = source
         .split("fn open_confined_config(")
         .nth(1)

@@ -7,8 +7,7 @@ fn linux_uninstall_requires_effective_unit_and_hierarchical_closure() {
     // Exercise the actual shared proof with inert stop/removal commands. Sealed
     // utility bootstrap and the maintenance lease are covered by uninstall_unix.
     let script = format!(
-        r#"#!/bin/sh
-set -eu
+        r#"set -eu
 SERVICE=polaris-helper.service
 DESCRIPTOR=/etc/systemd/system/polaris-helper.service
 {}
@@ -96,7 +95,6 @@ fn run_linux_proof_fixture(
     succeeds: bool,
     overrides: &[(&str, &str)],
 ) {
-    use std::os::unix::fs::PermissionsExt;
     let fixture = tempfile::tempdir().unwrap();
     let descriptor = fixture.path().join("helper.service");
     std::fs::write(&descriptor, "fixture").unwrap();
@@ -117,8 +115,7 @@ fn run_linux_proof_fixture(
         std::fs::remove_dir_all(&cgroup).unwrap();
     }
     let commands = [
-        ("systemctl", r#"#!/bin/sh
-[ "$1" != --system ] || shift
+        ("systemctl", r#"[ "$1" != --system ] || shift
 case "$1" in
   show)
 PROPERTY=${3#--property=}
@@ -153,9 +150,8 @@ esac;;
   *) exit 90;;
 esac
 "#),
-        ("stat", "#!/bin/sh\ncase \"$1:$2\" in -c:%u) echo \"$MOCK_OWNER\";; -c:%a) echo \"$MOCK_MODE\";; -f:-c) echo \"$MOCK_CGTYPE\";; *) exit 90;; esac\n"),
-        ("cat", r#"#!/bin/sh
-case "$1" in
+        ("stat", "case \"$1:$2\" in -c:%u) echo \"$MOCK_OWNER\";; -c:%a) echo \"$MOCK_MODE\";; -f:-c) echo \"$MOCK_CGTYPE\";; *) exit 90;; esac\n"),
+        ("cat", r#"case "$1" in
   /proc/1/comm) echo "$MOCK_MANAGER"; exit 0;;
   /proc/self/mountinfo)
 [ "$MOCK_MOUNT_READ_RC" = 0 ] || exit 1
@@ -168,27 +164,24 @@ esac
 [ "$MOCK_EVENT_READ_RC" = 0 ] || exit 1
 exec /bin/cat "$@"
 "#),
-        ("readlink", r#"#!/bin/sh
-[ "$MOCK_NAMESPACE_READ_RC" = 0 ] || exit 1
+        ("readlink", r#"[ "$MOCK_NAMESPACE_READ_RC" = 0 ] || exit 1
 case "$1" in
   /proc/self/ns/*) echo "namespace-${1##*/}";;
   /proc/1/ns/*) if [ "${1##*/}" = "$MOCK_NAMESPACE" ]; then echo different; else echo "namespace-${1##*/}"; fi;;
   *) exit 1;;
 esac
 "#),
-        ("find", r#"#!/bin/sh
-[ "$MOCK_FIND_RC" = 0 ] && [ "$MOCK_ABSENT_FIND_FAIL" = 0 ] || exit 1
+        ("find", r#"[ "$MOCK_FIND_RC" = 0 ] && [ "$MOCK_ABSENT_FIND_FAIL" = 0 ] || exit 1
 exec /usr/bin/find "$@"
 "#),
-        ("rm", "#!/bin/sh\necho remove >> \"$MOCK_TRACE\"\nexit \"$MOCK_RM_RC\"\n"),
+        ("rm", "echo remove >> \"$MOCK_TRACE\"\nexit \"$MOCK_RM_RC\"\n"),
     ];
     for (name, content) in commands {
         if name == "systemctl" && key == "MISSING_SYSTEMCTL" {
             continue;
         }
         let command = fixture.path().join(name);
-        std::fs::write(&command, content).unwrap();
-        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable_stand_in(&command, format!("#!/bin/sh\n{content}"));
     }
     let script = script
         .replace(
@@ -322,8 +315,7 @@ fn linux_install_inactive_snapshot_still_requires_production_closure() {
     // All lifecycle scaffolding is inert. The stop function, admission condition,
     // requirement value and service snapshot come from the production generator.
     let script = format!(
-        r#"#!/bin/sh
-set -eu
+        r#"set -eu
 SERVICE=polaris-helper.service
 DESCRIPTOR=/etc/systemd/system/polaris-helper.service
 WAS_ACTIVE=0

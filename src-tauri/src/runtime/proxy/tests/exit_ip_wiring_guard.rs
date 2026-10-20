@@ -39,7 +39,10 @@ const EXIT_IP_LEGS: &[&str] = &[REFRESH, MARK_BLOCKED, RECOVERY];
 ///（`reconcile_ts_exit_block` 的两条跨态腿）是 R2 补的：出口从有效变无效 / 从无效恢复，与前述点是
 /// **同一个物理事实**（当前出口换了），
 /// 只是下游动作分岔成「落终态」与「先修再探」。
-const KNOWN_TRIGGER_SITES: usize = 8;
+// Native group observation adds one owner: any group-selection change invalidates
+// unlock results, while only a changed, known default exit schedules its IP probe.
+// This intentionally preserves group-specific routing without redundant default probes.
+const KNOWN_TRIGGER_SITES: usize = 9;
 
 /// 出口 IP 腿的**调用点**总数 = 触发点数 + 1。
 ///

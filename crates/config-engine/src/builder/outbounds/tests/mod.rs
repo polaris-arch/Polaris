@@ -807,7 +807,7 @@ fn global_tls_fragment_still_reaches_custom_outbound_tls_block() {
     config.tls_fragment = Some(true);
     config.servers = vec![custom_node(
         "c1",
-        serde_json::json!({"type":"hysteria","server":"h.example.com",
+        serde_json::json!({"type":"trojan","server":"h.example.com",
             "tls":{"enabled":true,"server_name":"h.example.com","ca_str":"-----BEGIN..."}}),
         false,
     )];
@@ -822,10 +822,10 @@ fn global_tls_fragment_still_reaches_custom_outbound_tls_block() {
     );
 }
 
-/// QUIC 三协议（hysteria2/tuic/naive）即使走 custom 也不得被注入分片 —— 与建模腿同一条排除。
+/// QUIC / Cronet 协议即使走 custom 也不得被注入分片 —— 与建模腿同一条排除。
 #[test]
 fn global_tls_fragment_skips_quic_managed_custom_outbounds() {
-    for ty in ["hysteria2", "tuic", "naive"] {
+    for ty in ["hysteria", "hysteria2", "tuic", "naive"] {
         let mut config = UserConfig::default();
         config.tls_fragment = Some(true);
         config.servers = vec![custom_node(

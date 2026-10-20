@@ -10,6 +10,7 @@ const savedPolicy = (page: import('@playwright/test').Page) => page.evaluate(() 
   return config.servers.find((server) => server.id === 'mesh-ingress-ts')?.meshInboundPolicy ?? null;
 });
 const routing = async (page: import('@playwright/test').Page) => {
+  await expect(page.locator('#ts-settings-form-tab-routing')).toBeVisible();
   await page.locator('#ts-settings-form-tab-routing').click();
   await expect(page.locator('#ts-mesh-inbound-mode')).toBeVisible();
 };

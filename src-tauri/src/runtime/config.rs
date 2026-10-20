@@ -919,6 +919,12 @@ impl ConfigManager {
                 "mesh route migration is preparing; explicit recovery is required",
             ));
         }
+        // Identity recovery is a separate capability. Check disk identities before
+        // load-time sanitization or migration can rewrite the ambiguous document.
+        // Read/parse failures still belong to the existing load/fallback handling.
+        if let Ok(raw) = self.raw_disk_for_mesh_under_write_lock() {
+            validate_server_identities(&raw)?;
+        }
         let LoadResult {
             mut config,
             loaded_from_disk,

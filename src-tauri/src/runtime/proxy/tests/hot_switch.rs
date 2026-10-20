@@ -3164,7 +3164,7 @@ fn switch_mode_serializes_before_reading_lifecycle_state() {
 
     let body = method_body(
         &module_code("runtime/proxy"),
-        "    async fn switch_mode_locked(",
+        "    pub(super) async fn switch_mode_locked(",
     );
     let gate = body
         .find("if self.gate.is_busy()")
@@ -3516,7 +3516,7 @@ fn deferred_debt_is_cleared_where_the_startup_snapshot_is_written_and_cleared() 
 fn pending_changes_push_is_wired_on_both_sides_of_the_diff() {
     let src = module_code("runtime/proxy");
     // 分子侧（配置变了）。
-    let switched = method_body(&src, "    async fn switch_mode_locked(");
+    let switched = method_body(&src, "    pub(super) async fn switch_mode_locked(");
     assert!(
         switched.contains("self.push_pending_changes();"),
         "分子侧（落盘/切节点）必须推 —— 否则改完配置条根本不出现"

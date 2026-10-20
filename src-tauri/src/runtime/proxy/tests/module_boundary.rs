@@ -1,5 +1,115 @@
 use crate::test_support::module_files;
 
+/// Match only imports whose relative parent chain actually reaches the proxy facade.
+/// A nested domain's `super::Item` belongs to that domain, not to proxy.rs.
+fn facade_import_prefix(file: &str) -> Option<String> {
+    let relative = file.strip_prefix("runtime/proxy/")?;
+    let mut depth = relative.split('/').count();
+    if relative.ends_with("/mod.rs") {
+        depth -= 1;
+    }
+    Some(format!("use {}", "super::".repeat(depth)))
+}
+
+/// Small lexical scope census on the shared masked face, not a Rust parser.
+/// Only `mod IDENT {` adds a module; functions/impls/blocks and `mod name;` do not.
+fn inline_module_depth_at(masked: &str, offset: usize) -> usize {
+    let bytes = masked.as_bytes();
+    let mut stack = Vec::new();
+    let mut previous = "";
+    let mut before_previous = "";
+    let mut cursor = 0;
+    let mut depth = 0;
+    while cursor < offset {
+        let byte = bytes[cursor];
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = cursor;
+            cursor += 1;
+            while cursor < offset
+                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+            {
+                cursor += 1;
+            }
+            before_previous = previous;
+            previous = &masked[start..cursor];
+            continue;
+        }
+        match byte {
+            b'{' => {
+                let module = before_previous == "mod" && !previous.is_empty();
+                stack.push(module);
+                depth += usize::from(module);
+            }
+            b'}' => {
+                depth -= usize::from(stack.pop().expect("balanced masked source before import"));
+            }
+            _ => {}
+        }
+        if !byte.is_ascii_whitespace() {
+            previous = "";
+            before_previous = "";
+        }
+        cursor += 1;
+    }
+    depth
+}
+
+#[test]
+fn inline_scope_does_not_confuse_domain_imports_with_facade_imports() {
+    let source = r##"// mod fake {
+const NOTE: &str = r#"mod fake {"#;
+mod declared;
+mod handle {
+    fn callback() {
+        use super::AndroidExactTarget;
+        use super::super::PRIVATE_FACADE_ITEM;
+        use super::super::*;
+    }
+}
+use super::ProxyRuntime;
+"##;
+    let masked = polaris_source_probe::mask_comments_and_strings(source);
+    let prefix = facade_import_prefix("runtime/proxy/android_bridge.rs").unwrap();
+    for (statement, depth, reaches_facade) in [
+        ("use super::AndroidExactTarget;", 1, false),
+        ("use super::super::PRIVATE_FACADE_ITEM;", 1, true),
+        ("use super::super::*;", 1, true),
+        ("use super::ProxyRuntime;", 0, true),
+    ] {
+        let offset = masked.find(statement).unwrap();
+        assert_eq!(inline_module_depth_at(&masked, offset), depth);
+        let exact = format!("{prefix}{}", "super::".repeat(depth));
+        assert_eq!(statement.starts_with(&exact), reaches_facade);
+    }
+    let nested = facade_import_prefix("runtime/proxy/mesh_apply/candidate/check.rs").unwrap();
+    assert_eq!(nested, "use super::super::super::");
+    assert_eq!(
+        format!("{nested}{}", "super::".repeat(1)),
+        "use super::super::super::super::"
+    );
+}
+
+#[test]
+fn facade_import_scope_follows_the_actual_module_parent() {
+    assert_eq!(facade_import_prefix("runtime/proxy.rs"), None);
+    assert_eq!(
+        facade_import_prefix("runtime/proxy/startup.rs").as_deref(),
+        Some("use super::")
+    );
+    assert_eq!(
+        facade_import_prefix("runtime/proxy/android_bridge/mod.rs").as_deref(),
+        Some("use super::")
+    );
+    assert_eq!(
+        facade_import_prefix("runtime/proxy/android_bridge/lifecycle_observation.rs").as_deref(),
+        Some("use super::super::")
+    );
+    assert_eq!(
+        facade_import_prefix("runtime/proxy/a/b/c.rs").as_deref(),
+        Some("use super::super::super::")
+    );
+}
+
 /// **R7**：`proxy` 子模块不得回头 `use super::<私有项>` 把 façade 变成公共工具箱——正确方向是
 /// 被调用的域把项升到 `pub(super)`，调用方走 `crate::runtime::proxy::<域>::<项>`
 /// （即 `use super::<域>::<项>;`，多段路径，天然放行；本门只抓**单段**叶子导入）。
@@ -63,20 +173,32 @@ fn proxy_submodules_only_reach_back_for_whitelisted_facade_items() {
     assert!(files.iter().any(|(file, _)| file == "runtime/proxy.rs"));
     for (file, content) in files {
         // façade 根文件本身在 §A.5 判定表里是「定义 + 再导出」的一方，不受本门约束。
-        if file == "runtime/proxy.rs" {
+        let Some(import_prefix) = facade_import_prefix(&file) else {
             continue;
-        }
+        };
         // 先剥行注释再取材：判据看的是**代码**，注释里出现的 `use super::…` 不是导入。
-        let lines: Vec<String> = content
-            .lines()
-            .map(|l| l.split("//").next().unwrap_or("").trim_end().to_owned())
+        let masked = polaris_source_probe::mask_comments_and_strings(&content);
+        let lines: Vec<String> = masked.split('\n').map(str::to_owned).collect();
+        let mut byte_offset = 0;
+        let offsets: Vec<usize> = lines
+            .iter()
+            .map(|line| {
+                let start = byte_offset;
+                byte_offset += line.len() + 1;
+                start
+            })
             .collect();
         let mut cursor = 0usize;
         while cursor < lines.len() {
             let idx = cursor;
             let trimmed = lines[cursor].trim_start();
             cursor += 1;
-            let Some(first) = trimmed.strip_prefix("use super::") else {
+            if !trimmed.starts_with("use ") {
+                continue;
+            }
+            let inline_depth = inline_module_depth_at(&masked, offsets[idx]);
+            let exact_prefix = format!("{import_prefix}{}", "super::".repeat(inline_depth));
+            let Some(first) = trimmed.strip_prefix(&exact_prefix) else {
                 continue;
             };
             // 跨行拼接：`use super::{` + 若干行 + `};` 是 rustfmt 对长导入的既定折行形态，
@@ -118,6 +240,11 @@ fn proxy_submodules_only_reach_back_for_whitelisted_facade_items() {
             for leaf in leafs {
                 // `super::<mod>::<item>` —— 穿过一个子模块拿项，是 §B.1 #4 的正确方向，放行。
                 if leaf.contains("::") {
+                    assert!(
+                        !leaf.starts_with("super::"),
+                        "{file}:{}: remaining parent traversal is not a named facade domain",
+                        idx + 1
+                    );
                     continue;
                 }
                 // `as` 重命名只看被导入的原名。

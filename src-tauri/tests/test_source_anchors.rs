@@ -600,7 +600,7 @@ fn no_file_shaped_test_modules_anywhere() {
 /// | 命名空间 | 约定 | 为什么 |
 /// |---|---|---|
 /// | Rust 模块（`<member>/src/**`、`<member>/tests/**` 下的目录与 `.rs`） | `snake_case` | **语言强制**：`-` 不是合法标识符字符，`mod dns-race;` 编不过。想用 kebab 目录只能靠 `#[path]`，而本仓禁用 `#[path]` |
-/// | 精确登记的 mobile-core Python 导入模块 | `snake_case` | Python 模块标识符；目录仍为 kebab，新文件不自动豁免 |
+/// | 精确登记的 Python 导入模块 | `snake_case` | Python 模块标识符；目录仍为 kebab，新文件不自动豁免 |
 /// | 其它一切（crate 根、前端、脚本、资源、仓库根） | `kebab-case` | 仓库约定；Cargo 包名本身也是 kebab（`polaris-config-engine`） |
 ///
 /// 所以 `crates/config-engine/`（crate 根，kebab）里装着 `src/node_dns/`（模块，snake）是**对的**。
@@ -608,9 +608,12 @@ fn no_file_shaped_test_modules_anywhere() {
 /// 本门把「碰巧一致」变成「守得住」：两侧各自不许出现对方的分隔符。
 ///
 /// Importable Python modules use identifiers, not Cargo package/directory spelling.
-/// Register the existing mobile producer namespace precisely; siblings/new names
+/// Register the existing Python module paths precisely; siblings/new names
 /// still require an explicit decision and every entry must exist in the census.
 const PYTHON_MODULE_FILES: &[&str] = &[
+    // Shared VM evidence module: loaded by the regression suite and named in its
+    // own source-provenance inventory. Preserve that stable path, not a wildcard.
+    "scripts/vm-acceptance/evidence_guard.py",
     "scripts/mobile-core/test_producer.py",
     "scripts/mobile-core/apple_rust.py",
     "scripts/mobile-core/apple_tls_fingerprint.py",
@@ -647,6 +650,9 @@ fn registered_python_module(rel: &str) -> bool {
 #[test]
 fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
     assert!(registered_python_module(
+        "scripts/vm-acceptance/evidence_guard.py"
+    ));
+    assert!(registered_python_module(
         "scripts/mobile-core/test_native_inputs.py"
     ));
     for path in PYTHON_MODULE_FILES {
@@ -655,6 +661,8 @@ fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
         assert!(stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
     }
     for path in [
+        "scripts/vm-acceptance/evidence_guard_extra.py",
+        "scripts/other/evidence_guard.py",
         "scripts/mobile-core/unknown_module.py",
         "scripts/mobile-core/test_delivery_boundaries_extra.py",
         "scripts/mobile-core/nested/test_delivery_boundaries.py",
