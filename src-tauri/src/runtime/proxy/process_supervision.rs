@@ -33,6 +33,7 @@ use std::time::Duration;
 use polaris_core_supervisor::{scan_running_cores, stale_cores, CoreProcess, Signal, StaleCores};
 use tokio::process::Child;
 
+#[cfg(any(not(unix), test))]
 use polaris_helper_proto::Platform;
 
 use crate::runtime::helper::{HelperStopOps, HelperStopTarget};

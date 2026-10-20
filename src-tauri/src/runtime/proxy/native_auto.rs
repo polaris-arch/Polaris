@@ -639,7 +639,7 @@ impl ProxyRuntime {
             if targets
                 .iter()
                 .flat_map(|target| model::eligible_members(&typed, target))
-                .any(|id| old.get(&id).is_none() || old.get(&id) != new.get(&id))
+                .any(|id| !old.contains_key(&id) || old.get(&id) != new.get(&id))
             {
                 return Err("AUTO_SELECT_REQUIRES_APPLY".into());
             }

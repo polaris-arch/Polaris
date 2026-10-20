@@ -50,9 +50,7 @@ fn preview(patterns: &[String], input: &str) -> Result<Vec<Option<bool>>, &'stat
             // RE2 rejects repetition counts above 1000; Rust accepts larger counts.
             // Conservative lexical bound: extra rejection is unknown, never false parity.
             for fragment in pattern.split('{').skip(1) {
-                let Some(body) = fragment.split('}').next() else {
-                    return None;
-                };
+                let body = fragment.split('}').next()?;
                 for bound in body.split(',') {
                     if !bound.is_empty()
                         && bound.bytes().all(|c| c.is_ascii_digit())

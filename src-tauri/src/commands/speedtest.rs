@@ -2550,14 +2550,12 @@ pub async fn server_speed_test(
         .filter(|id| !native_results.contains_key(*id))
         .cloned()
         .collect();
-    let server_ids = Some(
-        requested_all
-            .iter()
-            .filter(|id| !native_owned.contains(*id))
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
-    if server_ids.as_ref().is_some_and(Vec::is_empty) {
+    let manual_requested = requested_all
+        .iter()
+        .filter(|id| !native_owned.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if manual_requested.is_empty() {
         let cancelled = guard.cancel().reason().is_some();
         let outcome = if native_pending.is_empty() && !cancelled {
             "completed"
@@ -2590,7 +2588,7 @@ pub async fn server_speed_test(
     // §15 主核探测池分波测速（池就绪 → 「批量比较多节点延迟选优」核心路径）：把请求的 N 个节点按 K 分波，
     // 逐波经 gRPC select_outbound 热切各槽到本波节点、经 probe-in-k 端口量 warm-TTFB。详见模块文档路径①。
     if let Some(targets) = proxy.speed_probe_targets() {
-        let requested: Vec<String> = server_ids.clone().unwrap_or_else(|| all.clone());
+        let requested = manual_requested.clone();
         // 波前预筛第三腿（dirty）的入参：起核快照指纹 vs **ConfigManager 最新** config 的当前指纹。
         // 当前侧取自 `config`（本函数开头刚读的最新配置），不取运行核的 config 镜像 —— 后者在「订阅 OFF
         // 自动刷新」这类不经 switch_mode 的路径上会滞后 ⇒ 漏判 dirty（对齐 上游 F-B 修正）。
@@ -2684,7 +2682,7 @@ pub async fn server_speed_test(
         return Ok(response);
     }
 
-    let fallback_requested = server_ids.clone().unwrap_or_else(|| all.clone());
+    let fallback_requested = manual_requested.clone();
     let fallback_skip_request = SpeedTestRequest {
         origin: SpeedTestOrigin::Manual,
         targets: fallback_requested.clone(),
@@ -2727,7 +2725,7 @@ pub async fn server_speed_test(
     // ── 回退：探测池未注入（端口分配失败/回滚）→ 仅当前活跃出口经 mixed 口可测 ──
     // 零可测的两条腿一律走**失败信封**（非 ok(empty)）：前端据此 throw → catch 复位 testing，
     // 且 code 让 UI 分得清「本层测不了」与「测了但失败」。详见模块文档「反伪造 + 反卡死」。
-    let (active, skipped) = match plan_speed_test(&active, server_ids.as_deref(), &all) {
+    let (active, skipped) = match plan_speed_test(&active, Some(&manual_requested), &all) {
         SpeedTestPlan::NoActiveExit => {
             return Ok(ApiResponse::err_with_code(
                 "当前出口为直连 / 未选节点，主混合代理无真实出站可测",
@@ -2783,7 +2781,7 @@ pub async fn server_speed_test(
     // 指纹快照（见模块文档「已知残留」）⇒ 节点指纹留空。
     let request = SpeedTestRequest {
         origin: SpeedTestOrigin::Manual,
-        targets: server_ids.unwrap_or(all),
+        targets: manual_requested,
         scope: None,
         path: MeasurePath::of_local_inbound(local_proxy.inbound),
         url: url.clone(),

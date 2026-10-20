@@ -590,9 +590,10 @@ fn free_port() -> u16 {
 }
 
 /// 真机验证用最小 config：manual 模式 + 全局直连 + 仅本地混合入站。
-const FIXTURE_MANAGEMENT_SECRET: &str = "fixture-management-secret";
+// Shared by the proxy and stats real-core fixtures; never compiled into production.
+pub(in crate::runtime) const FIXTURE_MANAGEMENT_SECRET: &str = "fixture-management-secret";
 
-fn local_only_config(mixed: u16) -> Value {
+pub(in crate::runtime) fn local_only_config(mixed: u16) -> Value {
     serde_json::json!({
         "servers": [],
         "selectedServerId": "__direct__", // DIRECT_SERVER_ID：全局直连，无真实节点

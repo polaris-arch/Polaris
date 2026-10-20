@@ -3,9 +3,9 @@ use super::super::*;
 use crate::runtime::config::ConfigManager;
 use crate::runtime::helper::HelperRuntime;
 use crate::runtime::mesh::MeshRuntime;
+use crate::runtime::proxy::tests::{local_only_config, FIXTURE_MANAGEMENT_SECRET};
 use crate::runtime::proxy::ProxyRuntime;
 use polaris_singbox_grpc::{Endpoint, SingBoxApiClient};
-use serde_json::Value;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,17 +16,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-/// 真机验证用最小 config：manual + 全局直连 + 仅本地混合入站。
-fn local_only_config(mixed: u16) -> Value {
-    serde_json::json!({
-        "servers": [],
-        "selectedServerId": "__direct__",
-        "proxyMode": "direct",
-        "proxyModeType": "manual",
-        "mixedPort": mixed,
-    })
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -110,9 +99,12 @@ async fn real_core_aggregate_relay_emits_real_frames() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // ── BUG-1：走 relay 的真实路径（snapshot → build_aggregate → signature_changed）──
-    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", st.clash_api_port), "")
-        .await
-        .expect("[BUG-1] 管理 API gRPC 连接应成功");
+    let client = SingBoxApiClient::connect(
+        Endpoint::new("127.0.0.1", st.clash_api_port),
+        FIXTURE_MANAGEMENT_SECRET,
+    )
+    .await
+    .expect("[BUG-1] 管理 API gRPC 连接应成功");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     let mut agg = None;
     while tokio::time::Instant::now() < deadline {
@@ -155,4 +147,56 @@ async fn real_core_aggregate_relay_emits_real_frames() {
     assert!(!proxy.status().running, "停核后 running 必须为 false");
     println!("[done] proxy.stop() → running=false（pid={pid} 已收割）");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn assert_shared_real_core_auth_wiring(source: &str) {
+    let code = polaris_source_probe::mask_comments_and_strings(source);
+    let compact: String = code.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(compact.contains(
+        "usecrate::runtime::proxy::tests::{local_only_config,FIXTURE_MANAGEMENT_SECRET};"
+    ));
+    assert!(
+        !compact.contains("fnlocal_only_config("),
+        "stats must not duplicate the shared fixture"
+    );
+    let body = crate::test_support::method_body(
+        &code,
+        "async fn real_core_aggregate_relay_emits_real_frames(",
+    );
+    let body: String = body.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(body.contains(".start(local_only_config(mixed))"));
+    assert!(body.contains(
+        "SingBoxApiClient::connect(Endpoint::new(,st.clash_api_port),FIXTURE_MANAGEMENT_SECRET,)"
+    ));
+}
+
+#[test]
+fn stats_real_core_uses_shared_authenticated_loopback_fixture() {
+    let config = local_only_config(17890);
+    assert_eq!(config["clashApiSecret"], FIXTURE_MANAGEMENT_SECRET);
+    assert!(!config["clashApiSecret"].as_str().unwrap().trim().is_empty());
+    assert_eq!(config["proxyModeType"], "manual");
+    assert_eq!(config["proxyMode"], "direct");
+    assert_eq!(config["selectedServerId"], "__direct__");
+    assert_eq!(config["mixedPort"], 17890);
+
+    let source = crate::test_support::crate_source("runtime/stats/tests/real_core_tests.rs");
+    assert_shared_real_core_auth_wiring(&source);
+    let code = polaris_source_probe::mask_comments_and_strings(&source);
+    for changed in [
+        code.replace(
+            ".start(local_only_config(mixed))",
+            ".start(unshared_config(mixed))",
+        ),
+        code.replace("FIXTURE_MANAGEMENT_SECRET,", "UNRELATED_SECRET,"),
+        format!("{code}\nfn local_only_config(mixed: u16) {{}}"),
+    ] {
+        assert_ne!(
+            changed, code,
+            "mutation must change the actual source surface"
+        );
+        assert!(
+            std::panic::catch_unwind(|| assert_shared_real_core_auth_wiring(&changed)).is_err()
+        );
+    }
 }

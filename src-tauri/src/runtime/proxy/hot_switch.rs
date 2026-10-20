@@ -3059,7 +3059,7 @@ impl ProxyRuntime {
         }
         let targets = cur
             .effective_traffic_rules()
-            .into_iter()
+            .iter()
             .filter(|rule| rule.enabled && rule.route_action() == Some(RuleAction::Proxy))
             .map(|rule| {
                 (

@@ -181,26 +181,28 @@ async fn cancelled_clear_waiter_cannot_clear_a_successor_marker() {
     let generation = gate.generation();
     let observed_gate = gate.clone();
     let controller = takeover.controller.clone();
-    let mut held = controller.lock().unwrap();
-    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
-    let mut cleanup = Box::pin(takeover.clear_when(None, move || {
-        let current = observed_gate.try_generation() == Some(generation);
-        let _ = checked_tx.send(current);
-        current
-    }));
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    assert!(std::future::Future::poll(cleanup.as_mut(), &mut cx).is_pending());
-    drop(cleanup); // spawn_blocking survives cancellation, while still behind controller lock.
-    gate.bump_generation();
-    // Model successor enable under the same controller mutex before the old worker obtains it.
-    held.enable_system_proxy(&ProxyEnableRequest {
-        address: "127.0.0.1".into(),
-        http_port: 7890,
-        socks_port: 7890,
-        bypass_list: vec![],
-    })
-    .unwrap();
-    drop(held);
+    let checked_rx = {
+        let mut held = controller.lock().unwrap();
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+        let mut cleanup = Box::pin(takeover.clear_when(None, move || {
+            let current = observed_gate.try_generation() == Some(generation);
+            let _ = checked_tx.send(current);
+            current
+        }));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(cleanup.as_mut(), &mut cx).is_pending());
+        drop(cleanup); // spawn_blocking survives cancellation, while still behind controller lock.
+        gate.bump_generation();
+        // Model successor enable under the same controller mutex before the old worker obtains it.
+        held.enable_system_proxy(&ProxyEnableRequest {
+            address: "127.0.0.1".into(),
+            http_port: 7890,
+            socks_port: 7890,
+            bypass_list: vec![],
+        })
+        .unwrap();
+        checked_rx
+    }; // Release the controller before any await; the cancelled worker remains fenced.
     assert!(!checked_rx.await.unwrap());
     // Acquiring the controller again proves no lock was leaked; zero old mutation occurred.
     drop(controller.lock().unwrap());

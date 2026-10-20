@@ -84,7 +84,7 @@ use super::ProxyRuntime;
     let nested = facade_import_prefix("runtime/proxy/mesh_apply/candidate/check.rs").unwrap();
     assert_eq!(nested, "use super::super::super::");
     assert_eq!(
-        format!("{nested}{}", "super::".repeat(1)),
+        format!("{nested}super::"),
         "use super::super::super::super::"
     );
 }

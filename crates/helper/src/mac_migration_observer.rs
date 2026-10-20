@@ -272,6 +272,8 @@ fn receipt_capture<'a>(
 /// and original object bindings. Does not recapture a now-absent helper. Every
 /// call freshly pins the held ORIGINAL executable paths, then runs the existing
 /// complete census and closure policy with before/after pin verification.
+// Match the sole caller module, mac_migration_guard; pure policy tests stay cross-platform.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn recheck_verified_receipt(target: Target<'_>, receipt: &ReceiptIdentities) -> Closure {
     if let Err(error) = validate_receipt_identities(target.helper_pid, receipt) {
         return Closure::Unknown(error);
@@ -317,6 +319,8 @@ fn reconcile_live_identity(
 
 /// Narrow live parent/shell birth binding: two full BSD records, no image read
 /// or process-census claim. Exits, zombies, INEXIT and changed identities fail.
+// Match the sole caller module, mac_migration_guard; pure policy tests stay cross-platform.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn live_identity(pid: u32) -> Result<ProcessIdentity, UnknownReason> {
     if pid <= 1 || pid > i32::MAX as u32 {
         return Err(UnknownReason::new(

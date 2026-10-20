@@ -10,29 +10,37 @@ fn fixture() -> (
     BTreeMap<String, String>,
     BTreeSet<String>,
 ) {
-    let mut config = UserConfig::default();
-    config.auto_select_enabled = true;
-    config.selection_intent = Some(model::SelectionIntent {
-        mode: "auto".into(),
-        target: AutoSelectTarget::Global,
-    });
-    config.servers = [("a", "one"), ("b", "two")]
-        .into_iter()
-        .map(|(id, sub)| ServerConfig {
-            id: id.into(),
-            name: id.into(),
-            subscription_id: Some(sub.into()),
-            ..ServerConfig::default()
-        })
-        .collect();
-    config.subscriptions = ["one", "two"]
-        .into_iter()
-        .map(|id| SubscriptionInterfacePolicy {
-            id: id.into(),
-            ..Default::default()
-        })
-        .collect();
-    config.app_rules=serde_json::from_value(json!([{"appId":"app","enabled":true,"action":"proxy","targetAutoSelect":{"scope":"subscription","subscriptionId":"two"}}])).unwrap();
+    let config = UserConfig {
+        auto_select_enabled: true,
+        selection_intent: Some(model::SelectionIntent {
+            mode: "auto".into(),
+            target: AutoSelectTarget::Global,
+        }),
+        servers: [("a", "one"), ("b", "two")]
+            .into_iter()
+            .map(|(id, sub)| ServerConfig {
+                id: id.into(),
+                name: id.into(),
+                subscription_id: Some(sub.into()),
+                ..ServerConfig::default()
+            })
+            .collect(),
+        subscriptions: ["one", "two"]
+            .into_iter()
+            .map(|id| SubscriptionInterfacePolicy {
+                id: id.into(),
+                ..Default::default()
+            })
+            .collect(),
+        app_rules: serde_json::from_value(json!([{
+            "appId": "app",
+            "enabled": true,
+            "action": "proxy",
+            "targetAutoSelect": {"scope": "subscription", "subscriptionId": "two"}
+        }]))
+        .unwrap(),
+        ..UserConfig::default()
+    };
     let sub = AutoSelectTarget::Subscription {
         subscription_id: "two".into(),
     };
