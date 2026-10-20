@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   ALL_PACKAGE_PLATFORMS,
+  ANDROID_IMPACT_SCOPES,
   NO_PACKAGE_IMPACT_SCOPES,
   classifyImpact,
   classifyNativeImpact,
@@ -494,4 +495,11 @@ test('workflow efficiency contract alone triggers all desktop installers without
   for (const path of ['scripts/ci-workflow-efficiency.test.mjs.bak', 'docs/ci-workflow-efficiency.test.mjs']) {
     assert.deepEqual(compact([path]), { kernel: false, platforms: [], preflight: false, hasPackage: false });
   }
+});
+
+test('Android lifecycle observations are explicitly registered for APK validation', () => {
+  const path = 'src-tauri/src/runtime/proxy/android_bridge/lifecycle_observation.rs';
+  assert(Object.hasOwn(ANDROID_IMPACT_SCOPES, path));
+  assert.match(ANDROID_IMPACT_SCOPES[path].why, /APK Rust cdylib/);
+  assert.equal(classifyImpact([path]).android, true);
 });

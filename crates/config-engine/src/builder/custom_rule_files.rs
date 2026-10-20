@@ -317,7 +317,7 @@ pub fn custom_rule_file_base(id: &str) -> String {
 /// 分家（写的是 hash 名、找的是裸名 ⇒ 文件永远"不存在" ⇒ 该腿 100% 不可达且无人报错）。
 ///
 /// Safe IDs retain their existing names. Derived names use `~`, which is not in
-/// the literal-ID alphabet; a user-supplied h<digest> cannot capture a derived file.
+/// the literal-ID alphabet; a user-supplied `h<digest>` cannot capture a derived file.
 /// Existing orphan reconciliation recognizes both old and new derived names.
 pub fn rule_file_base_with_prefix(prefix: &str, id: &str) -> String {
     if !id.is_empty()

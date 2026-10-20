@@ -23,10 +23,8 @@
 //!
 //! 门自身的源码含 `"async fn real_core_"` 这个针字面量。住在 `src/` 里就会扫到自己，
 //! 落进「针在注释/字符串里」的假阳性。放到 `src-tauri/tests/`（不在取材面内）后，
-//! 针只可能来自真实代码。
-//!
-//! 残余风险：`src/` 里若有注释或字符串恰好含 `async fn real_core_`，本门会误报。
-//! 那是**假红**（吵但可查），不是假绿，故不为它引入剥注释/剥字符串的取材面。
+//! 扫描前还会抹去注释与字符串，避免源码断言中的函数签名被当成真实定义。
+//! 抹除保持字节偏移，因此 256 字节的取锁窗口不变。
 
 /// 函数体开头多少字节内必须出现取锁语句。
 ///
@@ -76,12 +74,16 @@ fn owning_module(rel: &str) -> String {
 #[test]
 fn every_real_core_test_acquires_the_cross_module_lock() {
     let files = polaris_source_probe::module_files_with_tests!("");
+    assert_real_core_lock_wiring(&files);
+}
 
+fn assert_real_core_lock_wiring(files: &[(String, String)]) {
     let mut found: Vec<(String, String)> = Vec::new();
     let mut unlocked: Vec<String> = Vec::new();
 
-    for (rel, source) in &files {
-        let mut remaining = source.as_str();
+    for (rel, source) in files {
+        let code = polaris_source_probe::mask_comments_and_strings(source);
+        let mut remaining = code.as_str();
         while let Some(start) = remaining.find(NEEDLE) {
             let function = &remaining[start..];
             let name: String = function["async fn ".len()..]
@@ -142,4 +144,57 @@ fn the_scan_surface_includes_test_directories() {
          测试实体一外移，上面那条门就会在空集上恒真。实际文件数：{}",
         files.len()
     );
+}
+
+/// Signature text in a source probe is not another real-core test definition.
+#[test]
+fn signature_literals_and_comments_do_not_create_real_core_tests() {
+    let files = locked_fixture_files();
+    assert_real_core_lock_wiring(&files);
+}
+
+fn locked_fixture_files() -> Vec<(String, String)> {
+    MINIMUM_COVERAGE
+        .iter()
+        .map(|module| {
+            (
+                format!("{module}/tests/fixture.rs"),
+                r#"
+async fn real_core_fixture() {
+    let _real_core_guard = REAL_CORE_TEST_LOCK.lock().await;
+}
+fn source_probe() {
+    let signature = "async fn real_core_fixture(";
+    // async fn real_core_comment() { }
+    let raw_signature = r"async fn real_core_raw() { }";
+}
+fn unrelated() { do_something(); }
+"#
+                .to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn missing_lock_cannot_be_supplied_by_comments_or_strings() {
+    for replacement in [
+        "",
+        "// let _real_core_guard = REAL_CORE_TEST_LOCK.lock().await;",
+        r#"let decoy = "let _real_core_guard = REAL_CORE_TEST_LOCK.lock().await;";"#,
+    ] {
+        let mut files = locked_fixture_files();
+        files[0].1 = files[0].1.replace(
+            "let _real_core_guard = REAL_CORE_TEST_LOCK.lock().await;",
+            replacement,
+        );
+        assert!(std::panic::catch_unwind(|| assert_real_core_lock_wiring(&files)).is_err());
+    }
+}
+
+#[test]
+fn real_core_module_coverage_cannot_be_supplied_by_signature_text() {
+    let mut files = locked_fixture_files();
+    files[0].1 = r#"fn probe() { let signature = "async fn real_core_fixture("; }"#.to_owned();
+    assert!(std::panic::catch_unwind(|| assert_real_core_lock_wiring(&files)).is_err());
 }
