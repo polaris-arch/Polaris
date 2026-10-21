@@ -539,80 +539,106 @@ impl Network {
     }
 
     fn config(&self) -> Value {
-        let mut config = polaris_store::default_config();
-        config["proxyModeType"] = "manual".into();
-        config["proxyMode"] = "smart".into();
-        config["mixedPort"] = free_port().into();
-        config["controlPort"] = free_port().into();
-        config["clashApiSecret"] = FIXTURE_MANAGEMENT_SECRET.into();
-        config["selectedServerId"] = "node-a".into();
-        for key in [
-            "singboxDashboard",
-            "allowLan",
-            "bypassLAN",
-            "appRoutingEnabled",
-            "autoSelectEnabled",
-            "autoSwitchNode",
-            "autoCheckUpdate",
-            "autoUpdateSubscriptionOnStart",
-            "ruleResourceAutoUpdate",
-            "interruptConnectionsOnSwitch",
-            "enableIPv6",
-            "blockQuic",
-        ] {
-            config[key] = false.into();
-        }
-        for key in [
-            "customRules",
-            "policyRules",
-            "ruleResources",
-            "customRuleSets",
-            "appRules",
-            "networkProfiles",
-            "subscriptions",
-            "autoSelectPins",
-            "dnsServerGroups",
-        ] {
-            config[key] = json!([]);
-        }
-        config["servers"] = json!([
-            {"id":"node-a","name":"Loop A","protocol":"socks","address":"127.0.0.1","port":self.a.address.port()},
-            {"id":"node-b","name":"Loop B","protocol":"socks","address":"127.0.0.1","port":self.b.address.port()}
-        ]);
-        config["trafficRules"] = json!([{
-            "id":"loop-route","type":"domain","values":[DOMAIN],"action":"proxy",
-            "enabled":true,"targetServerId":"node-a",
-            "effects":{"route":{"enabled":true,"action":"proxy","targetServerId":"node-a"}}
-        }]);
-        config["dnsRules"] = json!([{
-            "id":"loop-dns","type":"domain","values":[DOMAIN],"action":"proxy","enabled":true,
-            "effects":{"dns":{"enabled":true,"action":{"type":"server","serverId":"loop-a"}}}
-        }]);
-        config["routeRuleOrder"] = json!(["loop-route"]);
-        config["dnsRuleOrder"] = json!(["loop-dns"]);
-        config["dnsServers"] = json!([
-            dns_resource("builtin-domestic", self.dns_a.address.port()),
-            dns_resource("builtin-remote", self.dns_a.address.port()),
-            dns_resource("builtin-bootstrap", self.dns_a.address.port()),
-            dns_resource("loop-a", self.dns_a.address.port()),
-            dns_resource("loop-b", self.dns_b.address.port())
-        ]);
-        config["dnsDefaults"] = json!({
-            "directServerId":"builtin-domestic", "proxyServerId":"builtin-remote",
-            "unmatchedAction":{"type":"reject","method":"drop"},
-            "realQueryFallbackAction":{"type":"reject","method":"drop"},
-            "connectionResolution":"dnsRules"
-        });
-        config["dnsConfig"] = json!({
-            "domesticDns":format!("udp://{}",self.dns_a.address),
-            "foreignDns":format!("udp://{}",self.dns_a.address),
-            "enableFakeIp":false,"optimisticCache":false,"takeoverSystemDns":false,
-            "resolveNodeDomainsAhead":false,"nodeResolverSingle":"loop-node",
-            "nodeResolverPool":["loop-node"],
-            "nodeResolverCustom":[{"id":"loop-node","spec":format!("udp://{}",self.dns_a.address)}]
-        });
-        config
+        let mixed = free_port();
+        let control = loop {
+            let port = free_port();
+            if port != mixed {
+                break port;
+            }
+        };
+        fixture_config(
+            [self.a.address, self.b.address],
+            [self.dns_a.address, self.dns_b.address],
+            mixed,
+            control,
+        )
     }
+}
+
+// Also used by ordinary admission tests with fixed, unopened loopback ports.
+fn fixture_config(
+    nodes: [SocketAddr; 2],
+    dns: [SocketAddr; 2],
+    mixed_port: u16,
+    control_port: u16,
+) -> Value {
+    let mut config = polaris_store::default_config();
+    config["proxyModeType"] = "manual".into();
+    config["proxyMode"] = "smart".into();
+    config["mixedPort"] = mixed_port.into();
+    config["controlPort"] = control_port.into();
+    config["clashApiSecret"] = FIXTURE_MANAGEMENT_SECRET.into();
+    config["selectedServerId"] = "node-a".into();
+    for key in [
+        "singboxDashboard",
+        "allowLan",
+        "bypassLAN",
+        "appRoutingEnabled",
+        "autoSelectEnabled",
+        "autoSwitchNode",
+        "autoCheckUpdate",
+        "autoUpdateSubscriptionOnStart",
+        "ruleResourceAutoUpdate",
+        "interruptConnectionsOnSwitch",
+        "enableIPv6",
+        "blockQuic",
+    ] {
+        config[key] = false.into();
+    }
+    for key in [
+        "ruleResources",
+        "customRuleSets",
+        "appRules",
+        "networkProfiles",
+        "subscriptions",
+        "autoSelectPins",
+        "dnsServerGroups",
+    ] {
+        config[key] = json!([]);
+    }
+    config["servers"] = json!([
+        {"id":"node-a","name":"Loop A","protocol":"socks","address":"127.0.0.1","port":nodes[0].port()},
+        {"id":"node-b","name":"Loop B","protocol":"socks","address":"127.0.0.1","port":nodes[1].port()}
+    ]);
+    config["trafficRules"] = json!([{
+        "id":"loop-route","type":"domain","values":[DOMAIN],"action":"proxy",
+        "enabled":true,"targetServerId":"node-a",
+        "effects":{"route":{"enabled":true,"action":"proxy","targetServerId":"node-a"}}
+    }]);
+    // Match the production route writers: legacy fields are exact traffic-only
+    // projections, not independent empty dependencies (commands/rules/crud.rs).
+    for key in ["policyRules", "customRules"] {
+        config[key] = config["trafficRules"].clone();
+    }
+    config["dnsRules"] = json!([{
+        "id":"loop-dns","type":"domain","values":[DOMAIN],"action":"proxy","enabled":true,
+        "effects":{"dns":{"enabled":true,"action":{"type":"server","serverId":"loop-a"}}}
+    }]);
+    config["routeRuleOrder"] = json!(["loop-route"]);
+    config["dnsRuleOrder"] = json!(["loop-dns"]);
+    config["dnsServers"] = json!([
+        dns_resource("builtin-domestic", dns[0].port()),
+        dns_resource("builtin-remote", dns[0].port()),
+        dns_resource("builtin-bootstrap", dns[0].port()),
+        dns_resource("loop-a", dns[0].port()),
+        dns_resource("loop-b", dns[1].port())
+    ]);
+    config["dnsDefaults"] = json!({
+        "directServerId":"builtin-domestic", "proxyServerId":"builtin-remote",
+        "unmatchedAction":{"type":"reject","method":"drop"},
+        "realQueryFallbackAction":{"type":"reject","method":"drop"},
+        "connectionResolution":"dnsRules"
+    });
+    config["dnsConfig"] = json!({
+        "domesticDns":format!("udp://{}",dns[0]),
+        "foreignDns":format!("udp://{}",dns[0]),
+        "enableFakeIp":false,"fakeIpToggleMigrated":true,"fakeIpTunAutoEnable":false,
+        "optimisticCache":false,"takeoverSystemDns":false,"nodeResolverMigrated":true,
+        "resolveNodeDomainsAhead":false,"nodeResolverSingle":"loop-node",
+        "nodeResolverPool":["loop-node"],
+        "nodeResolverCustom":[{"id":"loop-node","spec":format!("udp://{}",dns[0])}]
+    });
+    config
 }
 
 fn dns_resource(id: &str, port: u16) -> Value {
@@ -621,10 +647,18 @@ fn dns_resource(id: &str, port: u16) -> Value {
 }
 
 fn changed_graph(mut config: Value) -> Value {
-    config["trafficRules"][0]["targetServerId"] = "node-b".into();
-    config["trafficRules"][0]["effects"]["route"]["targetServerId"] = "node-b".into();
+    set_fixture_route_target(&mut config, "node-b");
     config["dnsRules"][0]["effects"]["dns"]["action"]["serverId"] = "loop-b".into();
     config
+}
+
+// Mutate each projection in place: never erase extra rules or hidden fields to
+// make admission pass. save_full sanitizes, but does not run load-time migration.
+fn set_fixture_route_target(config: &mut Value, target: &str) {
+    for key in ["trafficRules", "policyRules", "customRules"] {
+        config[key][0]["targetServerId"] = target.into();
+        config[key][0]["effects"]["route"]["targetServerId"] = target.into();
+    }
 }
 
 // This admission is deliberately specific to this two-node fixture. It is not a
@@ -633,12 +667,18 @@ fn canonical_fixture(config: &Value, requested: &Value) {
     for key in [
         "proxyModeType",
         "proxyMode",
+        "mixedPort",
+        "controlPort",
+        "clashApiSecret",
+        "logLevel",
         "servers",
         "selectedServerId",
         "dnsServers",
         "dnsConfig",
         "dnsDefaults",
         "trafficRules",
+        "policyRules",
+        "customRules",
         "dnsRules",
         "routeRuleOrder",
         "dnsRuleOrder",
@@ -669,8 +709,6 @@ fn canonical_fixture(config: &Value, requested: &Value) {
     for key in [
         "subscriptions",
         "autoSelectPins",
-        "customRules",
-        "policyRules",
         "ruleResources",
         "customRuleSets",
         "appRules",
@@ -698,16 +736,59 @@ fn canonical_fixture(config: &Value, requested: &Value) {
             .is_some_and(|p| p > 1024 && p <= 65535));
     }
     assert_eq!(config["dnsConfig"]["enableFakeIp"], false);
+    assert_eq!(config["dnsConfig"]["fakeIpToggleMigrated"], true);
+    assert_eq!(config["dnsConfig"]["fakeIpTunAutoEnable"], false);
+    assert_eq!(config["dnsConfig"]["nodeResolverMigrated"], true);
     assert_eq!(config["dnsConfig"]["optimisticCache"], false);
     assert_eq!(config["dnsConfig"]["takeoverSystemDns"], false);
     assert_eq!(config["dnsConfig"]["resolveNodeDomainsAhead"], false);
     assert_eq!(config["dnsDefaults"]["connectionResolution"], "dnsRules");
-    for key in ["trafficRules", "dnsRules"] {
-        let rules = config[key].as_array().unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0]["type"], "domain");
-        assert_eq!(rules[0]["values"], json!([DOMAIN]));
+    let target = requested["trafficRules"][0]["targetServerId"]
+        .as_str()
+        .unwrap();
+    let dns_target = match target {
+        "node-a" => "loop-a",
+        "node-b" => "loop-b",
+        _ => panic!("only owned fixture route targets"),
+    };
+    let traffic = json!([{
+        "id":"loop-route","type":"domain","values":[DOMAIN],"action":"proxy",
+        "enabled":true,"targetServerId":target,
+        "effects":{"route":{"enabled":true,"action":"proxy","targetServerId":target}}
+    }]);
+    for key in ["trafficRules", "policyRules", "customRules"] {
+        assert_eq!(config[key], traffic, "exact owned traffic projection {key}");
     }
+    assert_eq!(
+        config["dnsRules"],
+        json!([{
+            "id":"loop-dns","type":"domain","values":[DOMAIN],"action":"proxy","enabled":true,
+            "effects":{"dns":{"enabled":true,"action":{"type":"server","serverId":dns_target}}}
+        }]),
+        "exact paired owned DNS rule"
+    );
+    assert_eq!(config["routeRuleOrder"], json!(["loop-route"]));
+    assert_eq!(config["dnsRuleOrder"], json!(["loop-dns"]));
+}
+
+fn save_fixture_config(manager: &ConfigManager, requested: &Value) -> Value {
+    // Admit caller intent before the store can sanitize it, then check both the
+    // saved cache and actual App source. Never normalize input to pass this gate.
+    canonical_fixture(requested, requested);
+    manager.save_full(requested).expect("save admitted fixture");
+    saved_fixture_config(manager, requested)
+}
+
+fn saved_fixture_config(manager: &ConfigManager, requested: &Value) -> Value {
+    let saved = manager.current().unwrap();
+    canonical_fixture(&saved, requested);
+    let persisted: Value = serde_json::from_slice(&std::fs::read(manager.path()).unwrap()).unwrap();
+    assert_eq!(
+        persisted, saved,
+        "App desired cache must equal durable source"
+    );
+    canonical_fixture(&persisted, requested);
+    saved
 }
 
 fn strings(value: &Value) -> Vec<&str> {
@@ -955,7 +1036,174 @@ fn inspect_selectors(generated: &Value) -> Value {
     json!(projection)
 }
 
-// Pure admission tests: no ports, runtime, process, or management RPC is used.
+// Ordinary store checks use only private files and unopened fixed ports. They
+// exercise save (sanitize/validate) versus load (migration) without a ProxyRuntime.
+fn store_admission_fixture() -> Value {
+    let address = |port| SocketAddr::from(([127, 0, 0, 1], port));
+    fixture_config(
+        [address(31011), address(31012)],
+        [address(31013), address(31014)],
+        31015,
+        31016,
+    )
+}
+
+fn fixture_store_transition_admission() {
+    let directory = TestDir::new("polaris-fixture-store-admission-");
+    let manager = ConfigManager::new(directory.to_path_buf());
+    let initial = store_admission_fixture();
+    let saved = save_fixture_config(&manager, &initial);
+    let loaded = manager.load_full().unwrap();
+    canonical_fixture(&loaded, &saved);
+    saved_fixture_config(&manager, &saved);
+    assert_eq!(manager.load_full().unwrap(), loaded, "idempotent load");
+
+    // Isolate the old mirror transition. save_full preserves the empty
+    // mirrors; cold-start journal processing reloads and materializes mirror A.
+    let mut old_initial = initial.clone();
+    for key in ["policyRules", "customRules"] {
+        old_initial[key] = json!([]);
+    }
+    manager.save_full(&old_initial).unwrap();
+    let before_load = manager.current().unwrap();
+    for key in ["policyRules", "customRules"] {
+        assert_eq!(before_load[key], json!([]), "save is not migration");
+    }
+    let reloaded = manager.load_full().unwrap();
+    canonical_fixture(&reloaded, &initial);
+    saved_fixture_config(&manager, &initial);
+
+    let graph = changed_graph(reloaded.clone());
+    let mut log_only = reloaded.clone();
+    log_only["logLevel"] = "warn".into();
+    let mut structural = reloaded.clone();
+    structural["mixedPort"] = 31017.into();
+    for requested in [graph, log_only, structural] {
+        let saved = save_fixture_config(&manager, &requested);
+        // A second desired document must keep exactly the same owned mirrors;
+        // loading/persisting must not resurrect A after the graph changed to B.
+        assert_eq!(save_fixture_config(&manager, &saved), saved);
+        canonical_fixture(&manager.load_full().unwrap(), &requested);
+        saved_fixture_config(&manager, &requested);
+    }
+}
+
+fn fixture_projection_mutation_admission() {
+    let original = store_admission_fixture();
+    for (pointer, value) in [
+        ("/customRules", json!([])),
+        ("/policyRules", json!([])),
+        ("/customRules/0/values", json!(["external.test"])),
+        ("/policyRules/0/targetServerId", json!("node-b")),
+        (
+            "/customRules/0/effects/route/targetServerId",
+            json!("node-b"),
+        ),
+        ("/trafficRules/0/targetServerId", json!("node-b")),
+        ("/dnsRules/0/effects/dns/action/serverId", json!("loop-b")),
+        ("/routeRuleOrder", json!([])),
+        ("/dnsRuleOrder", json!([])),
+        ("/dnsConfig/fakeIpToggleMigrated", json!(false)),
+        ("/dnsConfig/fakeIpTunAutoEnable", json!(true)),
+        ("/dnsConfig/nodeResolverMigrated", Value::Null),
+    ] {
+        let mut mutated = original.clone();
+        *mutated.pointer_mut(pointer).unwrap() = value;
+        assert!(std::panic::catch_unwind(|| canonical_fixture(&mutated, &original)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| canonical_fixture(&mutated, &mutated)).is_err(),
+            "input must not attest its own unsafe projection: {pointer}"
+        );
+    }
+    for key in ["trafficRules", "policyRules", "customRules"] {
+        for hidden in [false, true] {
+            let mut mutated = original.clone();
+            if hidden {
+                mutated[key][0]["effects"]["dns"] = json!({"enabled":true});
+            } else {
+                let duplicate = mutated[key][0].clone();
+                mutated[key].as_array_mut().unwrap().push(duplicate);
+            }
+            // The fixture mutation changes targets in place, and cannot erase
+            // unexpected input to manufacture an admitted desired document.
+            let mutated = changed_graph(mutated);
+            assert!(std::panic::catch_unwind(|| canonical_fixture(&mutated, &mutated)).is_err());
+        }
+    }
+    for key in [
+        "subscriptions",
+        "autoSelectPins",
+        "ruleResources",
+        "customRuleSets",
+        "appRules",
+        "networkProfiles",
+        "dnsServerGroups",
+    ] {
+        let mut mutated = original.clone();
+        mutated[key] = json!([{"id":"unexpected"}]);
+        assert!(
+            std::panic::catch_unwind(|| canonical_fixture(&mutated, &mutated)).is_err(),
+            "{key}"
+        );
+    }
+
+    let directory = TestDir::new("polaris-fixture-stale-mirror-");
+    let manager = ConfigManager::new(directory.to_path_buf());
+    save_fixture_config(&manager, &original);
+    let mut stale = original.clone();
+    stale["trafficRules"][0]["targetServerId"] = "node-b".into();
+    stale["trafficRules"][0]["effects"]["route"]["targetServerId"] = "node-b".into();
+    stale["dnsRules"][0]["effects"]["dns"]["action"]["serverId"] = "loop-b".into();
+    manager.save_full(&stale).unwrap();
+    let saved = manager.current().unwrap();
+    assert_eq!(saved["trafficRules"], stale["trafficRules"]);
+    for key in ["policyRules", "customRules"] {
+        assert_eq!(
+            saved[key], original["trafficRules"],
+            "save preserves stale mirrors"
+        );
+    }
+    assert!(std::panic::catch_unwind(|| canonical_fixture(&saved, &stale)).is_err());
+
+    // Whole-object dnsConfig replacement also used to drop the production
+    // migration markers. In manual mode a later load would turn FakeIP back on.
+    let mut unmigrated = original.clone();
+    for key in [
+        "fakeIpToggleMigrated",
+        "fakeIpTunAutoEnable",
+        "nodeResolverMigrated",
+    ] {
+        unmigrated["dnsConfig"].as_object_mut().unwrap().remove(key);
+    }
+    manager.save_full(&unmigrated).unwrap();
+    assert_eq!(
+        manager.current().unwrap()["dnsConfig"]["enableFakeIp"],
+        false
+    );
+    let migrated = manager.load_full().unwrap();
+    assert_eq!(migrated["dnsConfig"]["enableFakeIp"], true);
+    assert!(std::panic::catch_unwind(|| canonical_fixture(&migrated, &migrated)).is_err());
+
+    // Invalid target remains a real store/dispatcher case in the ignored test.
+    // Here prove the fixture writer keeps it invalid in all three projections;
+    // if this store accepts it, it must not silently coerce it to an owned node.
+    let mut invalid = original.clone();
+    set_fixture_route_target(&mut invalid, "nonexistent-node");
+    assert!(std::panic::catch_unwind(|| canonical_fixture(&invalid, &invalid)).is_err());
+    let before = manager.current().unwrap();
+    let bytes = std::fs::read(manager.path()).unwrap();
+    if manager.save_full(&invalid).is_ok() {
+        let saved = manager.current().unwrap();
+        for key in ["trafficRules", "policyRules", "customRules"] {
+            assert_eq!(saved[key], invalid[key]);
+        }
+    } else {
+        assert_eq!(manager.current().unwrap(), before);
+        assert_eq!(std::fs::read(manager.path()).unwrap(), bytes);
+    }
+}
+
+// Pure selector admission: no ports, runtime, process, or management RPC is used.
 fn selector_admission_fixture() -> Value {
     json!({
         "inbounds":[{"type":"http","tag":"probe-in-0","listen":"127.0.0.1","listen_port":31001}],
@@ -980,6 +1228,7 @@ fn selector_admission_fixture() -> Value {
 
 #[test]
 fn private_probe_selector_admission_accepts_only_owned_slot_graph() {
+    fixture_store_transition_admission();
     let mut generated = selector_admission_fixture();
     assert_eq!(inspect_selectors(&generated).as_array().unwrap().len(), 3);
     let projection = json!({"route":generated["route"],"dns":generated["dns"],
@@ -1014,6 +1263,7 @@ fn private_probe_selector_admission_accepts_only_owned_slot_graph() {
 
 #[test]
 fn private_probe_selector_admission_rejects_policy_and_reachability_mutations() {
+    fixture_projection_mutation_admission();
     let original = selector_admission_fixture();
     let projection = json!({"route":original["route"],"dns":original["dns"],
         "selectors":inspect_selectors(&original)});
@@ -1220,7 +1470,14 @@ fn inspect_rule_sets(
             assert!(expected.len() >= 3);
             assert!(is_valid_srs_bytes(expected[..3].try_into().unwrap()));
             let actual = regular(&path, expected.len() as u64);
-            assert_eq!(actual, expected, "seeded SRS must equal checkout bytes");
+            assert!(
+                actual == expected,
+                "seeded SRS must equal checkout bytes: actual {} bytes/{}; expected {} bytes/{}",
+                actual.len(),
+                polaris_updater::sha256_hex(&actual),
+                expected.len(),
+                polaris_updater::sha256_hex(&expected)
+            );
             sources.push(json!({"tag":tag,"path":path,"source":source,
                 "size":actual.len(),"sha256":polaris_updater::sha256_hex(&actual)}));
             continue;
@@ -1784,12 +2041,7 @@ impl Running {
         let rt = test_runtime_in(directory.clone());
         let cleanup = RealCoreCleanupGuard::new(&rt);
         rt.inject_real_core_for_test(admission.binary.clone());
-        rt.config
-            .save_full(&config)
-            .expect("save real canonical App configuration");
-        let requested = config;
-        let config = rt.config.current().unwrap();
-        canonical_fixture(&config, &requested);
+        let config = save_fixture_config(&rt.config, &config);
         assert!(rt.management_api_stub.lock().unwrap().is_none());
         assert!(
             rt.error_emitter.get().is_none(),
@@ -1815,6 +2067,10 @@ impl Running {
             .expect("bounded real start")
             .expect("real App start");
         assert!(status.running && status.pid != 0 && ps_alive(status.pid));
+        // Cold start drains the deletion journal through a real store reload.
+        // Its compatibility projections must agree with the admitted start input.
+        saved_fixture_config(&rt.config, &config);
+        assert_eq!(rt.current_config_snapshot().as_ref(), Some(&config));
         let executable = std::fs::read_link(format!("/proc/{}/exe", status.pid)).unwrap();
         assert_eq!(
             executable, admission.binary,
@@ -1973,9 +2229,7 @@ async fn real_hot_dispatcher_apply_and_status() {
     assert_eq!(network.dns_b.count(), 0);
     let a_queries = network.dns_a.count();
     let requested = changed_graph(running.rt.config.current().unwrap());
-    running.rt.config.save_full(&requested).unwrap();
-    let desired = running.rt.config.current().unwrap();
-    canonical_fixture(&desired, &requested);
+    let desired = save_fixture_config(&running.rt.config, &requested);
     let desired_projection = preflight(&running.rt, &desired);
     evidence.record(json!({"phase":"preapply-safety","projection":desired_projection}));
     let result = running.rt.apply_pending_transaction(None).await;
@@ -2059,8 +2313,7 @@ async fn real_hot_dispatcher_persistence_retry() {
     std::fs::write(&path, &disturbed).unwrap();
     let mut desired = running.rt.config.current().unwrap();
     desired["logLevel"] = "warn".into();
-    running.rt.config.save_full(&desired).unwrap();
-    let desired = running.rt.config.current().unwrap();
+    let desired = save_fixture_config(&running.rt.config, &desired);
     let desired_projection = preflight(&running.rt, &desired);
     let result = running.rt.apply_pending_transaction(None).await;
     evidence.record(json!({"phase":"pending","appResult":result}));
@@ -2337,7 +2590,7 @@ async fn real_hot_dispatcher_rejections_preserve_runtime() {
         }
     };
     desired["mixedPort"] = port.into();
-    running.rt.config.save_full(&desired).unwrap();
+    let desired = save_fixture_config(&running.rt.config, &desired);
     let result = running.rt.apply_pending_transaction(None).await;
     assert_eq!(result.status, "restartRequired");
     assert!(result.restart_required && result.restart_confirmation.is_some());
@@ -2347,7 +2600,8 @@ async fn real_hot_dispatcher_rejections_preserve_runtime() {
         "no implicit restart source"
     );
     assert_eq!(running.rt.current_config_snapshot().unwrap(), snapshot);
-    assert_eq!(running.rt.config.current().unwrap()["mixedPort"], port);
+    assert_eq!(running.rt.config.current().unwrap(), desired);
+    assert_eq!(desired["mixedPort"], port);
     assert_eq!(
         std::fs::read(running.rt.runtime_config_path()).unwrap(),
         source
@@ -2358,8 +2612,7 @@ async fn real_hot_dispatcher_rejections_preserve_runtime() {
     );
     // The real store is allowed to reject an invalid reference before dispatcher.
     let mut invalid = snapshot.clone();
-    invalid["trafficRules"][0]["effects"]["route"]["targetServerId"] = "nonexistent-node".into();
-    invalid["trafficRules"][0]["targetServerId"] = "nonexistent-node".into();
+    set_fixture_route_target(&mut invalid, "nonexistent-node");
     let invalid_saved = running.rt.config.save_full(&invalid);
     let invalid_stage = if invalid_saved.is_err() {
         "store"
