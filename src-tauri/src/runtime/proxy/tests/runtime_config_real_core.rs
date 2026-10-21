@@ -982,6 +982,23 @@ fn selector_admission_fixture() -> Value {
 fn private_probe_selector_admission_accepts_only_owned_slot_graph() {
     let mut generated = selector_admission_fixture();
     assert_eq!(inspect_selectors(&generated).as_array().unwrap().len(), 3);
+    let projection = json!({"route":generated["route"],"dns":generated["dns"],
+        "selectors":inspect_selectors(&generated)});
+    let mut canonical = generated.clone();
+    for index in [2, 3] {
+        canonical["outbounds"][index]
+            .as_object_mut()
+            .unwrap()
+            .remove("interrupt_exist_connections");
+    }
+    assert!(std::panic::catch_unwind(|| inspect_selectors(&canonical)).is_err());
+    for rule in canonical["route"]["rules"].as_array_mut().unwrap() {
+        rule.as_object_mut().unwrap().remove("action");
+    }
+    canonical["route"]["rules"][0]["inbound"] = "probe-in-0".into();
+    canonical["route"]["rules"][1]["domain"] = DOMAIN.into();
+    let restored = restore_core_projection_forms(&canonical, &projection);
+    assert_eq!(inspect_selectors(&restored), projection["selectors"]);
     generated["outbounds"][3]["default"] = "Loop B".into();
     assert_eq!(inspect_selectors(&generated).as_array().unwrap().len(), 3);
     // An empty production pool is also legitimate after port allocation failure.
@@ -998,6 +1015,8 @@ fn private_probe_selector_admission_accepts_only_owned_slot_graph() {
 #[test]
 fn private_probe_selector_admission_rejects_policy_and_reachability_mutations() {
     let original = selector_admission_fixture();
+    let projection = json!({"route":original["route"],"dns":original["dns"],
+        "selectors":inspect_selectors(&original)});
     let replacements = [
         (
             "main preference",
@@ -1083,6 +1102,11 @@ fn private_probe_selector_admission_rejects_policy_and_reachability_mutations() 
             std::panic::catch_unwind(|| inspect_selectors(&mutated)).is_err(),
             "accepted {label}"
         );
+        let restored = restore_core_projection_forms(&mutated, &projection);
+        assert!(
+            std::panic::catch_unwind(|| inspect_selectors(&restored)).is_err(),
+            "canonical accepted {label}"
+        );
     }
     for (label, mutation) in [
         ("duplicate private route", 0),
@@ -1142,7 +1166,444 @@ fn private_probe_selector_admission_rejects_policy_and_reachability_mutations() 
             std::panic::catch_unwind(|| inspect_selectors(&mutated)).is_err(),
             "accepted {label}"
         );
+        let restored = restore_core_projection_forms(&mutated, &projection);
+        assert!(
+            std::panic::catch_unwind(|| inspect_selectors(&restored)).is_err(),
+            "canonical accepted {label}"
+        );
     }
+}
+
+// Use the same production seed source as start(), restricted to this checkout.
+fn fixture_bundled_rules_dir() -> PathBuf {
+    let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../resources/data")
+        .canonicalize()
+        .unwrap();
+    let actual = crate::runtime::geo_seed::resolve_bundled_data_dir()
+        .expect("admitted checkout must contain bundled rule sets")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(actual, expected, "no alternate bundled rule source");
+    actual
+}
+
+// Binary sets remain local in HOT's accepted configuration. Prove their exact
+// catalog ownership and bytes, rather than pretending the SRS contains DOMAIN.
+// Ordered terminal rules keep later geo matches off the fixture DOMAIN path.
+fn inspect_rule_sets(
+    config_dir: &Path,
+    custom_dir: &Path,
+    bundled_dir: &Path,
+    generated: &Value,
+    expected_dns: &str,
+) -> (Value, Vec<Value>) {
+    use polaris_config_engine::user_config::builtin_geo_rulesets::{
+        find_builtin, is_valid_srs_bytes,
+    };
+    let runtime_dir = config_dir.join("rules");
+    let mut route = generated["route"].clone();
+    let mut tags = std::collections::BTreeSet::new();
+    let mut sources = Vec::new();
+    for set in route["rule_set"].as_array_mut().unwrap() {
+        let tag = set["tag"].as_str().unwrap().to_string();
+        assert!(tags.insert(tag.clone()), "duplicate rule-set definition");
+        if let Some(entry) = find_builtin(&tag) {
+            let path = runtime_dir.join(entry.file_name);
+            assert_eq!(
+                *set,
+                json!({"tag":tag,"type":"local","format":"binary","path":path}),
+                "builtin rule sets require their exact private catalog path"
+            );
+            let source = bundled_dir.join(path.file_name().unwrap());
+            let expected = regular(&source, 1024 * 1024);
+            assert!(expected.len() >= 3);
+            assert!(is_valid_srs_bytes(expected[..3].try_into().unwrap()));
+            let actual = regular(&path, expected.len() as u64);
+            assert_eq!(actual, expected, "seeded SRS must equal checkout bytes");
+            sources.push(json!({"tag":tag,"path":path,"source":source,
+                "size":actual.len(),"sha256":polaris_updater::sha256_hex(&actual)}));
+            continue;
+        }
+        let rules = match set["type"].as_str().unwrap() {
+            "local" => {
+                assert_eq!(set["format"], "source");
+                let path = PathBuf::from(set["path"].as_str().unwrap());
+                assert_eq!(path.parent(), Some(custom_dir));
+                let content: Value = serde_json::from_slice(&regular(&path, 65536)).unwrap();
+                content["rules"].clone()
+            }
+            "inline" => set["rules"].clone(),
+            _ => panic!("no remote or unreviewed rule source"),
+        };
+        assert_eq!(
+            rules,
+            json!([{"domain":[DOMAIN]}]),
+            "only owned custom rules"
+        );
+        // Only custom source rules are embedded by the production HOT snapshot.
+        *set = json!({"tag":tag,"type":"inline","rules":rules});
+    }
+    for (rules, terminal) in [
+        (
+            &generated["route"]["rules"],
+            json!({"domain":[DOMAIN],"action":"route","outbound":"rule-sel-loop-route"}),
+        ),
+        (
+            &generated["dns"]["rules"],
+            json!({"domain":[DOMAIN],"action":"route","server":expected_dns}),
+        ),
+    ] {
+        let rules = rules.as_array().unwrap();
+        let positions: Vec<_> = rules
+            .iter()
+            .enumerate()
+            .filter_map(|(index, rule)| (rule == &terminal).then_some(index))
+            .collect();
+        assert_eq!(positions.len(), 1, "unique exact fixture terminal rule");
+        for (index, rule) in rules.iter().enumerate() {
+            assert!(rule["rules"].is_null(), "no unreviewed logical rule branch");
+            for tag in strings(&rule["rule_set"]) {
+                assert!(tags.contains(tag), "undefined rule-set reference: {tag}");
+                assert!(
+                    index > positions[0],
+                    "rule-set matching must follow the fixture terminal rule"
+                );
+            }
+        }
+    }
+    (route, sources)
+}
+
+fn fixture_cidr(value: &Value) -> Option<(std::net::IpAddr, u8)> {
+    let text = value.as_str()?;
+    let (address, prefix) = text
+        .split_once('/')
+        .map_or((text, None), |(a, p)| (a, Some(p)));
+    let address: std::net::IpAddr = address.parse().ok()?;
+    let width = if address.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix {
+        Some(prefix) => prefix.parse::<u8>().ok()?,
+        None => width,
+    };
+    (prefix <= width).then_some((address, prefix))
+}
+
+// Accepted-file inspection only: c76 option/{group,rule_action,rule_set}.go and
+// third_party/sing/.../badoption/{listable,netip}.go serialize these equivalent
+// forms. Restore only against an already admitted production projection. Never
+// use this on preflight/startup input: its explicit false policy remains required.
+fn restore_core_projection_forms(generated: &Value, expected: &Value) -> Value {
+    let mut restored = generated.clone();
+    for outbound in restored
+        .get_mut("outbounds")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if outbound["type"] == "selector"
+            && matches!(
+                outbound["tag"].as_str(),
+                Some("proxy-selector" | "rule-sel-loop-route")
+            )
+            && outbound.get("interrupt_exist_connections").is_none()
+            && expected["selectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["tag"] == outbound["tag"] && item["interrupt_exist_connections"] == false
+                })
+        {
+            outbound["interrupt_exist_connections"] = false.into();
+        }
+    }
+    for section in ["route", "dns"] {
+        let expected_rules = expected[section]["rules"].as_array().into_iter().flatten();
+        for (rule, template) in restored
+            .pointer_mut(&format!("/{section}/rules"))
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .zip(expected_rules)
+        {
+            if rule.get("action").is_none() && template["action"] == "route" {
+                rule["action"] = "route".into();
+            }
+            for key in [
+                "inbound",
+                "network",
+                "protocol",
+                "domain",
+                "domain_suffix",
+                "domain_keyword",
+                "domain_regex",
+                "ip_cidr",
+                "port",
+                "process_name",
+                "rule_set",
+                "query_type",
+            ] {
+                let Some(wanted) = template[key].as_array() else {
+                    continue;
+                };
+                if wanted.is_empty() {
+                    continue;
+                }
+                let Some(actual) = rule.get(key) else {
+                    continue;
+                };
+                let actual = actual
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_else(|| vec![actual.clone()]);
+                if actual.len() == wanted.len()
+                    && actual.iter().zip(wanted).all(|(a, b)| {
+                        a == b || (key == "ip_cidr"
+                            && fixture_cidr(a).is_some_and(|ip| Some(ip) == fixture_cidr(b)))
+                    })
+                {
+                    rule[key] = Value::Array(wanted.clone());
+                }
+            }
+        }
+    }
+    let expected_sets = expected["route"]["rule_set"].as_array().into_iter().flatten();
+    for (set, template) in restored
+        .pointer_mut("/route/rule_set")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .zip(expected_sets)
+    {
+        if set["tag"] != template["tag"] {
+            continue;
+        }
+        if template["type"] == "local"
+            && template["format"] == "binary"
+            && set["type"] == "local"
+            && set["path"] == template["path"]
+            && set.get("format").is_none()
+        {
+            set["format"] = "binary".into();
+        }
+        if template["type"] == "inline" {
+            if set["rules"] == json!([{"domain":DOMAIN}])
+                && template["rules"] == json!([{"domain":[DOMAIN]}])
+            {
+                set["rules"] = template["rules"].clone();
+            }
+            if set.get("type").is_none() && set["rules"] == template["rules"] {
+                set["type"] = "inline".into();
+            }
+        }
+    }
+    restored
+}
+
+fn rule_set_admission_fixture() -> (TestDir, Value) {
+    let directory = TestDir::new("polaris-rule-set-admission-");
+    for name in ["rules", "bundled", "custom"] {
+        std::fs::create_dir(directory.join(name)).unwrap();
+    }
+    // Deliberately larger than the custom JSON limit; no SRS decoder is claimed.
+    let mut bytes = vec![0u8; 70_000];
+    bytes[..3].copy_from_slice(b"SRS");
+    for name in ["rules", "bundled"] {
+        std::fs::write(directory.join(name).join("geosite-cn.srs"), &bytes).unwrap();
+    }
+    let custom = directory.join("custom/owned.json");
+    let content = json!({"version":3,"rules":[{"domain":[DOMAIN]}]});
+    std::fs::write(&custom, serde_json::to_vec(&content).unwrap()).unwrap();
+    let generated = json!({
+        "route":{"rule_set":[
+            {"tag":"geosite-cn","type":"local","format":"binary",
+                "path":directory.join("rules/geosite-cn.srs")},
+            {"tag":"owned","type":"local","format":"source","path":custom}
+        ],"rules":[
+            {"domain":[DOMAIN],"action":"route","outbound":"rule-sel-loop-route"},
+            {"rule_set":"geosite-cn","action":"route","outbound":"direct"},
+            {"ip_cidr":["127.0.0.1/32","::1/128","::ffff:a00:0/104"],
+                "action":"route","outbound":"direct"}
+        ]},
+        "dns":{"rules":[
+            {"domain":[DOMAIN],"action":"route","server":"dns-user-loop-a"},
+            {"rule_set":"geosite-cn","server":"dns-domestic"}
+        ]}
+    });
+    (directory, generated)
+}
+
+#[test]
+fn builtin_rule_set_admission_accepts_owned_sources_and_order() {
+    let (directory, generated) = rule_set_admission_fixture();
+    let inspect = |value: &Value| {
+        inspect_rule_sets(
+            &directory,
+            &directory.join("custom"),
+            &directory.join("bundled"),
+            value,
+            "dns-user-loop-a",
+        )
+    };
+    let (route, sources) = inspect(&generated);
+    assert_eq!(route["rule_set"][0], generated["route"]["rule_set"][0]);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["size"], 70_000);
+    let source = regular(&directory.join("bundled/geosite-cn.srs"), 1024 * 1024);
+    assert_eq!(sources[0]["sha256"], polaris_updater::sha256_hex(&source));
+    assert_eq!(
+        route["rule_set"][1],
+        json!({"tag":"owned","type":"inline","rules":[{"domain":[DOMAIN]}]})
+    );
+    let mut inline = generated.clone();
+    inline["route"]["rule_set"][1] = route["rule_set"][1].clone();
+    assert_eq!(inspect(&inline), (route.clone(), sources.clone()));
+    let projection = json!({"route":route,"dns":generated["dns"],"selectors":[]});
+    let mut canonical = inline.clone();
+    canonical["route"]["rule_set"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("format");
+    canonical["route"]["rule_set"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("type");
+    canonical["route"]["rule_set"][1]["rules"] = json!([{"domain":DOMAIN}]);
+    for section in ["route", "dns"] {
+        canonical[section]["rules"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("action");
+        canonical[section]["rules"][0]["domain"] = DOMAIN.into();
+    }
+    let addresses = json!(["127.0.0.1", "::1", "::ffff:10.0.0.0/104"]);
+    canonical["route"]["rules"][2]["ip_cidr"] = addresses;
+    let restored = restore_core_projection_forms(&canonical, &projection);
+    assert_eq!(inspect(&restored), (projection["route"].clone(), sources));
+}
+
+#[test]
+fn builtin_rule_set_admission_rejects_source_and_order_mutations() {
+    let (directory, generated) = rule_set_admission_fixture();
+    let inspect = |value: &Value| {
+        inspect_rule_sets(
+            &directory,
+            &directory.join("custom"),
+            &directory.join("bundled"),
+            value,
+            "dns-user-loop-a",
+        )
+    };
+    for (pointer, replacement) in [
+        ("/route/rule_set/0/tag", json!("geosite-cn-lookalike")),
+        ("/route/rule_set/0/type", json!("remote")),
+        ("/route/rule_set/0/format", json!("source")),
+        (
+            "/route/rule_set/0/path",
+            json!(directory.join("bundled/geosite-cn.srs")),
+        ),
+        (
+            "/route/rule_set/0/path",
+            json!(directory.join("rules/../rules/geosite-cn.srs")),
+        ),
+        ("/route/rule_set/0/path", json!("rules/geosite-cn.srs")),
+        (
+            "/route/rule_set/1/path",
+            json!(directory.join("bundled/owned.json")),
+        ),
+        ("/route/rule_set/1/format", json!("binary")),
+        ("/route/rules/0/outbound", json!("direct")),
+        ("/dns/rules/0/server", json!("dns-domestic")),
+        ("/route/rules/1/rule_set", json!("undefined")),
+        ("/dns/rules/1/rule_set", json!("undefined")),
+    ] {
+        let mut mutated = generated.clone();
+        *mutated.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            std::panic::catch_unwind(|| inspect(&mutated)).is_err(),
+            "{pointer}"
+        );
+    }
+    for section in ["route", "dns"] {
+        for kind in 0..3 {
+            let mut mutated = generated.clone();
+            let rules = mutated[section]["rules"].as_array_mut().unwrap();
+            match kind {
+                0 => rules.swap(0, 1),
+                1 => rules.push(rules[0].clone()),
+                2 => rules.push(json!({"type":"logical","mode":"or","rules":[
+                    {"rule_set":"geosite-cn"}
+                ]})),
+                _ => unreachable!(),
+            }
+            assert!(
+                std::panic::catch_unwind(|| inspect(&mutated)).is_err(),
+                "{section}/{kind}"
+            );
+        }
+    }
+    for kind in 0..4 {
+        let mut mutated = generated.clone();
+        let sets = mutated["route"]["rule_set"].as_array_mut().unwrap();
+        match kind {
+            0 => sets.push(sets[0].clone()),
+            1 => {
+                sets[0] = json!({
+                    "tag":"geosite-cn","type":"inline","rules":[{"domain":[DOMAIN]}]
+                });
+            }
+            2 => sets[0]["url"] = "https://unreviewed.invalid/rules.srs".into(),
+            3 => {
+                sets[1] = json!({
+                    "tag":"owned","type":"inline","rules":[{"domain":["other.test"]}]
+                });
+            }
+            _ => unreachable!(),
+        }
+        assert!(std::panic::catch_unwind(|| inspect(&mutated)).is_err());
+    }
+    let (route, _) = inspect(&generated);
+    let projection = json!({"route":route,"dns":generated["dns"],"selectors":[]});
+    for (pointer, value) in [
+        ("/route/rule_set/0/format", Value::Null),
+        ("/route/rules/0/action", Value::Null),
+        ("/route/rules/0/domain", json!("other.test")),
+        ("/dns/rules/0/domain", json!([DOMAIN, "other.test"])),
+        (
+            "/route/rules/2/ip_cidr",
+            json!(["127.0.0.1/24", "::1", "::ffff:10.0.0.0/104"]),
+        ),
+        (
+            "/route/rules/2/ip_cidr",
+            json!(["::1", "127.0.0.1", "::ffff:10.0.0.0/104"]),
+        ),
+        ("/route/rules/0/domain", json!(true)),
+        ("/route/rules/2/ip_cidr", json!("invalid/32")),
+    ] {
+        let mut mutated = generated.clone();
+        *mutated.pointer_mut(pointer).unwrap() = value;
+        let restored = restore_core_projection_forms(&mutated, &projection);
+        let result = std::panic::catch_unwind(|| inspect(&restored));
+        assert!(
+            result.is_err() || result.unwrap().0 != projection["route"],
+            "{pointer}"
+        );
+    }
+    let path = directory.join("rules/geosite-cn.srs");
+    let original = std::fs::read(&path).unwrap();
+    let mut changed = original.clone();
+    changed[3] = 1;
+    std::fs::write(&path, changed).unwrap();
+    assert!(std::panic::catch_unwind(|| inspect(&generated)).is_err());
+    std::fs::remove_file(&path).unwrap();
+    assert!(std::panic::catch_unwind(|| inspect(&generated)).is_err());
+    std::os::unix::fs::symlink(directory.join("bundled/geosite-cn.srs"), &path).unwrap();
+    assert!(std::panic::catch_unwind(|| inspect(&generated)).is_err());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"not SRS").unwrap();
+    std::fs::write(directory.join("bundled/geosite-cn.srs"), b"not SRS").unwrap();
+    assert!(std::panic::catch_unwind(|| inspect(&generated)).is_err());
 }
 
 fn inspect_generated(rt: &ProxyRuntime, config: &Value, generated: &Value) -> Value {
@@ -1206,27 +1667,22 @@ fn inspect_generated(rt: &ProxyRuntime, config: &Value, generated: &Value) -> Va
     }
     assert_eq!(physical.len(), 2);
     let selectors = inspect_selectors(generated);
-    let mut route = generated["route"].clone();
-    for set in route["rule_set"].as_array_mut().into_iter().flatten() {
-        let rules = match set["type"].as_str().unwrap() {
-            "local" => {
-                assert_eq!(set["format"], "source");
-                let path = PathBuf::from(set["path"].as_str().unwrap());
-                assert_eq!(path.parent(), Some(rt.custom_rules_dir().as_path()));
-                let content: Value = serde_json::from_slice(&regular(&path, 65536)).unwrap();
-                content["rules"].clone()
-            }
-            "inline" => set["rules"].clone(),
-            _ => panic!("no remote or unreviewed rule source"),
-        };
-        assert_eq!(
-            rules,
-            json!([{"domain":[DOMAIN]}]),
-            "only owned domain rule files"
-        );
-        // HOT's production snapshot embeds these exact owned source rules.
-        *set = json!({"tag":set["tag"],"type":"inline","rules":rules});
-    }
+    let expected_dns = polaris_config_engine::user_config::dns_policy::dns_server_tag(
+        config["dnsRules"][0]["effects"]["dns"]["action"]["serverId"]
+            .as_str()
+            .unwrap(),
+    );
+    let (route, rule_sources) = inspect_rule_sets(
+        rt.config.dir(),
+        &rt.custom_rules_dir(),
+        &fixture_bundled_rules_dir(),
+        generated,
+        &expected_dns,
+    );
+    assert!(
+        !rule_sources.is_empty(),
+        "production builtin seed must be present"
+    );
     let dns = &generated["dns"];
     let owned_dns_ports: Vec<_> = config["dnsServers"]
         .as_array()
@@ -1261,11 +1717,6 @@ fn inspect_generated(rt: &ProxyRuntime, config: &Value, generated: &Value) -> Va
             .as_str()
             .unwrap()
     ));
-    let expected_dns = polaris_config_engine::user_config::dns_policy::dns_server_tag(
-        config["dnsRules"][0]["effects"]["dns"]["action"]["serverId"]
-            .as_str()
-            .unwrap(),
-    );
     let mut explicit_domain_routes = Vec::new();
     for rule in dns["rules"].as_array().unwrap() {
         assert!(
@@ -1292,7 +1743,7 @@ fn inspect_generated(rt: &ProxyRuntime, config: &Value, generated: &Value) -> Va
     assert_ne!(dns["optimistic"], true);
     assert!(dns["fakeip"].is_null());
     json!({"listeners":listeners,"physicalOutbounds":physical,"selectors":selectors,"dns":dns,"route":route,
-        "unusedDnsDefinitions":unused_dns,"domain":DOMAIN,"onlyTrafficInbound":"mixed-in"})
+        "ruleSources":rule_sources,"unusedDnsDefinitions":unused_dns,"domain":DOMAIN,"onlyTrafficInbound":"mixed-in"})
 }
 
 fn preflight(rt: &ProxyRuntime, config: &Value) -> Value {
@@ -1343,6 +1794,14 @@ impl Running {
         // Ordinary externalization only, inside the owned temporary directory.
         rt.write_custom_rule_files(&serde_json::from_value(config.clone()).unwrap())
             .await;
+        // start() performs this same default seed before generating its graph.
+        // Admit its checkout source first so preflight observes the identical FS.
+        let _ = fixture_bundled_rules_dir();
+        crate::runtime::geo_seed::seed_builtin_rule_sets_into(
+            rt.config.dir(),
+            "real HOT fixture preflight",
+            &crate::runtime::geo_seed::SeedOptions::default(),
+        );
         let checked = preflight(&rt, &config);
         evidence.record(json!({"phase":"prestart-safety","projection":checked,
             "claim":"fixture-reachable closure only; unused production DNS definitions are statically excluded",
@@ -1538,6 +1997,7 @@ async fn real_hot_dispatcher_apply_and_status() {
     assert_eq!(status.durable_applied_digest, op.candidate_digest);
     let accepted: Value =
         serde_json::from_slice(&std::fs::read(running.rt.runtime_config_path()).unwrap()).unwrap();
+    let accepted = restore_core_projection_forms(&accepted, &desired_projection);
     assert_eq!(
         inspect_generated(&running.rt, &desired, &accepted),
         desired_projection
@@ -1655,6 +2115,7 @@ async fn real_hot_dispatcher_persistence_retry() {
     assert_ne!(accepted, original);
     let content: Value = serde_json::from_slice(&accepted).unwrap();
     assert_eq!(content["log"]["level"], "warn");
+    let content = restore_core_projection_forms(&content, &desired_projection);
     assert_eq!(
         inspect_generated(&running.rt, &desired, &content),
         desired_projection

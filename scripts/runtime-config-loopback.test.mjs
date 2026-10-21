@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { validateRequest, validatePin, expectedBuildVcs, recordBuildInfo, validateBuild, validateTestEvidence, requireSameAppSource, APP_SOURCE_CHECK, OFFICIAL_GO_SETUP, TESTS, REF, REPOSITORY, PROFILE, PROTO } from './runtime-config-loopback.mjs';
+import { validateRequest, validatePin, expectedBuildVcs, recordBuildInfo, validateBuild, validateTestEvidence, requireSameAppSource, APP_SOURCE_CHECK, OFFICIAL_GO_SETUP, RETAINED_CANDIDATE, retainVerifiedCandidate, withResultEvidence, ADMISSION_TESTS, TESTS, REF, REPOSITORY, PROFILE, PROTO } from './runtime-config-loopback.mjs';
 import { exactPass } from './run-native-dns-controlled-tests.mjs';
 
 // Pure data/source fixtures. Importing the runner must never execute its entrypoint.
@@ -362,4 +362,194 @@ print('Official Go archive fixtures passed')
 `;
   const result = execFileSync('python3', ['-I', '-c', fixture, OFFICIAL_GO_SETUP], { encoding: 'utf8', timeout: 20_000 });
   assert.match(result, /Official Go archive fixtures passed/);
+});
+
+function retainedFixture() {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'loopback-retention-')));
+  const evidence = join(directory, 'evidence'), bin = join(directory, 'bin');
+  mkdirSync(evidence, { mode: 0o700 }); mkdirSync(bin, { mode: 0o700 });
+  const binary = join(bin, 'sing-box'), receiptPath = join(evidence, 'candidate.json');
+  const body = Buffer.from('fixture bytes, never executed\n');
+  writeFileSync(binary, body, { mode: 0o755 }); chmodSync(binary, 0o755);
+  const receipt = { schema: 'polaris-runtime-loopback-candidate-v1', appCommit: app,
+    kernelCommit: kernel, kernelTree: 'c'.repeat(40), protoSha256: PROTO, profile: PROFILE,
+    implementationManifestDigest: null, sourceVerified: true, naiveIncluded: false, publicationEligible: false,
+    binary: { path: binary, bytes: body.length, sha256: createHash('sha256').update(body).digest('hex') } };
+  writeFileSync(receiptPath, JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
+  return { directory, evidence, binary, receiptPath, receipt, sourceVerified: true };
+}
+
+test('retention binds the unchanged original receipt and binary to a fixed portable tar', () => {
+  const request = retainedFixture();
+  try {
+    const original = readFileSync(request.receiptPath);
+    const retained = retainVerifiedCandidate(request);
+    assert.deepEqual(readFileSync(request.receiptPath), original);
+    assert.equal(retained.sourceBinaryPath, request.binary);
+    assert.equal(retained.members['sing-box'].sha256, request.receipt.binary.sha256);
+    assert.equal(retained.members['sing-box'].bytes, request.receipt.binary.bytes);
+    assert.equal(retained.members['sing-box'].mode, 0o755);
+    assert.equal(retained.members['candidate.json'].mode, 0o600);
+    assert.equal(retained.members['candidate.json'].sha256, createHash('sha256').update(original).digest('hex'));
+    assert.equal(retained.publicationEligible, false); assert.equal(retained.naiveIncluded, false);
+    assert.equal(retained.profile, PROFILE); assert.equal(retained.sourceVerified, true);
+    const archive = readFileSync(join(request.evidence, retained.archive.artifactMember));
+    assert.equal(retained.archive.bytes, archive.length);
+    assert.equal(retained.archive.sha256, createHash('sha256').update(archive).digest('hex'));
+    assert.throws(() => retainVerifiedCandidate(request), /FileExistsError/);
+  } finally { rmSync(request.directory, { recursive: true, force: true }); }
+});
+
+test('unverified candidates never produce a downloadable package', () => {
+  const request = retainedFixture();
+  try {
+    assert.throws(() => retainVerifiedCandidate({ ...request, sourceVerified: false }), /Only source-verified/);
+    assert.throws(() => retainVerifiedCandidate({ ...request, receipt: { ...request.receipt, sourceVerified: false } }), /Only source-verified/);
+    assert.equal(existsSync(join(request.evidence, 'kernel-candidate-linux-amd64.tar')), false);
+  } finally { rmSync(request.directory, { recursive: true, force: true }); }
+});
+
+test('actual failed-run finalizer retains a verified candidate without claiming runtime acceptance', async () => {
+  const request = retainedFixture();
+  try {
+    const result = { status: 'failed', sourceVerified: true, tests: [], admissionTests: [],
+      fullFeatureAcceptance: false, mobileAcceptance: false, publicationEligible: false };
+    await assert.rejects(withResultEvidence(request.evidence, result, async () => {
+      result.retainedCandidate = retainVerifiedCandidate(request);
+      throw Error('fixture App compilation or runtime failed');
+    }), /fixture App compilation or runtime failed/);
+    const saved = JSON.parse(readFileSync(join(request.evidence, 'result.json')));
+    assert.equal(saved.status, 'failed'); assert.equal(saved.failure, 'fixture App compilation or runtime failed');
+    assert.equal(saved.sourceVerified, true); assert.equal(saved.retainedCandidateVerified, true);
+    assert.deepEqual(saved.tests, []); assert.deepEqual(saved.admissionTests, []);
+    assert.equal(saved.fullFeatureAcceptance, false); assert.equal(saved.mobileAcceptance, false);
+    assert.equal(saved.publicationEligible, false);
+    assert.equal(existsSync(join(request.evidence, saved.retainedCandidate.archive.artifactMember)), true);
+  } finally { rmSync(request.directory, { recursive: true, force: true }); }
+});
+
+for (const earlierFailure of [false, true]) {
+  test(`archive drift forces failed final receipt and preserves original failure (${earlierFailure})`, async () => {
+    const request = retainedFixture();
+    try {
+      const result = { status: 'failed', tests: [], sourceVerified: true, publicationEligible: false };
+      await assert.rejects(withResultEvidence(request.evidence, result, async () => {
+        result.retainedCandidate = retainVerifiedCandidate(request); result.status = 'passed';
+        writeFileSync(join(request.evidence, result.retainedCandidate.archive.artifactMember), 'corrupted archive');
+        if (earlierFailure) throw Error('original runtime failure');
+      }));
+      const saved = JSON.parse(readFileSync(join(request.evidence, 'result.json')));
+      assert.equal(saved.status, 'failed'); assert.equal(saved.retainedCandidateVerified, false);
+      assert.ok(saved.retentionFailure); assert.ok(saved.failure);
+      if (earlierFailure) assert.equal(saved.failure, 'original runtime failure');
+      assert.equal(existsSync(join(request.evidence, 'kernel-candidate-linux-amd64.tar')), false);
+    } finally { rmSync(request.directory, { recursive: true, force: true }); }
+  });
+}
+
+test('candidate archive filesystem, mutation and member negatives execute without any product binary', () => {
+  const fixture = String.raw`import copy,hashlib,io,json,os,stat,subprocess,sys,tarfile,tempfile
+from pathlib import Path
+from unittest.mock import patch
+ns={'__name__':'fixture'};exec(compile(sys.argv[1],'<retention-fixture>','exec'),ns)
+def rejected(call):
+ try:call()
+ except (RuntimeError,OSError,ValueError,KeyError,tarfile.TarError):return
+ raise AssertionError('unsafe candidate retention accepted')
+def setup(root,name):
+ directory=root/name;directory.mkdir(mode=0o700);evidence=directory/'evidence';evidence.mkdir(mode=0o700)
+ binary_dir=directory/'bin';binary_dir.mkdir(mode=0o700);binary=binary_dir/'sing-box';binary.write_bytes(b'not an executable\n');binary.chmod(0o755)
+ receipt={'schema':'polaris-runtime-loopback-candidate-v1','sourceVerified':True,'profile':ns['PROFILE'],
+  'naiveIncluded':False,'publicationEligible':False,'binary':{'path':str(binary),'bytes':binary.stat().st_size,'sha256':hashlib.sha256(binary.read_bytes()).hexdigest()}}
+ receipt_path=evidence/'candidate.json';receipt_path.write_text(json.dumps(receipt)+'\n');receipt_path.chmod(0o600)
+ return directory,evidence,binary,receipt_path,receipt,True
+with patch.object(subprocess,'Popen',side_effect=AssertionError('fixture cannot execute tools')),tempfile.TemporaryDirectory() as temporary:
+ root=Path(temporary)
+ for index,kind in enumerate(['bytes','size','receipt','symlink','hardlink','directory','fifo','setuid','writable','redirected','existing','unverified','profile','formal','naive']):
+  args=list(setup(root,'negative-'+str(index)));directory,evidence,binary,receipt_path,receipt,_=args
+  if kind=='bytes':binary.write_bytes(b'different bytes!!')
+  elif kind=='size':receipt['binary']['bytes']+=1
+  elif kind=='receipt':receipt_path.write_text('{}')
+  elif kind=='symlink':binary.rename(directory/'other');binary.symlink_to(directory/'other')
+  elif kind=='hardlink':os.link(binary,directory/'other')
+  elif kind=='directory':binary.unlink();binary.mkdir()
+  elif kind=='fifo':binary.unlink();os.mkfifo(binary)
+  elif kind=='setuid':binary.chmod(0o4755)
+  elif kind=='writable':binary.chmod(0o777)
+  elif kind=='redirected':(directory/'bin').rename(directory/'other');(directory/'bin').symlink_to(directory/'other',target_is_directory=True)
+  elif kind=='existing':(evidence/ns['ARCHIVE']).write_bytes(b'previous');(evidence/ns['ARCHIVE']).chmod(0o600)
+  elif kind=='unverified':args[-1]=False
+  elif kind=='profile':receipt['profile']='formal-linux'
+  elif kind=='formal':receipt['publicationEligible']=True
+  elif kind=='naive':receipt['naiveIncluded']=True
+  rejected(lambda:ns['retain'](*args))
+  if kind=='existing':assert (evidence/ns['ARCHIVE']).read_bytes()==b'previous'
+  else:assert not (evidence/ns['ARCHIVE']).exists()
+ # Simulate actual source/copy mutation at precise production helper calls,
+ # with no test-only injection hook in the runner.
+ for index,target in enumerate(['source','copy','receipt','mode']):
+  args=setup(root,'drift-'+str(index));directory,evidence,binary,receipt_path,_,_=args
+  original=ns['regular'];changed=[False]
+  def drifting(path,limit):
+   data=original(path,limit)
+   if path==directory/'candidate-retention/sing-box' and not changed[0]:
+    changed[0]=True
+    if target=='source':binary.write_bytes(b'changed source')
+    elif target=='copy':path.write_bytes(b'changed copy')
+    elif target=='receipt':receipt_path.write_text('{}')
+    else:binary.chmod(0o700)
+   return data
+  ns['regular']=drifting
+  try:rejected(lambda:ns['retain'](*args));assert not (evidence/ns['ARCHIVE']).exists()
+  finally:ns['regular']=original
+ args=setup(root,'valid');retained=ns['retain'](*args);assert ns['verify'](args[1],retained)==retained
+ members=retained['members']
+ for index,kind in enumerate(['extra','duplicate','absolute','traversal','symlink','hardlink','directory','mode','bytes','reorder']):
+  path=root/('malformed-'+str(index)+'.tar')
+  entries=[('sing-box',args[2].read_bytes()),('candidate.json',args[3].read_bytes())]
+  if kind=='extra':entries.append(('config.json',b'secret sentinel'))
+  elif kind=='duplicate':entries.append(entries[0])
+  elif kind=='reorder':entries.reverse()
+  with tarfile.open(path,'w',format=tarfile.USTAR_FORMAT) as archive:
+   for position,(name,body) in enumerate(entries):
+    member=tarfile.TarInfo(name);member.mode=members.get(name,{'mode':0o600})['mode'];member.size=len(body)
+    if position==0:
+     if kind=='absolute':member.name='/sing-box'
+     elif kind=='traversal':member.name='../sing-box'
+     elif kind=='symlink':member.type=tarfile.SYMTYPE;member.linkname='/tmp/escape';member.size=0
+     elif kind=='hardlink':member.type=tarfile.LNKTYPE;member.linkname='candidate.json';member.size=0
+     elif kind=='directory':member.type=tarfile.DIRTYPE;member.size=0
+     elif kind=='mode':member.mode=0o644
+     elif kind=='bytes':body=b'x'*len(body)
+    archive.addfile(member,io.BytesIO(body))
+  path.chmod(0o600);rejected(lambda:ns['verify_members'](path,members))
+print('Candidate retention negative fixtures passed')
+`;
+  const output = execFileSync('python3', ['-I', '-c', fixture, RETAINED_CANDIDATE],
+    { encoding: 'utf8', timeout: 20_000 });
+  assert.match(output, /Candidate retention negative fixtures passed/);
+});
+
+test('ordinary selector/source admission fixtures execute separately before the four ignored real HOT tests', () => {
+  assert.deepEqual(ADMISSION_TESTS.map((name) => name.split('::').at(-1)), [
+    'private_probe_selector_admission_accepts_only_owned_slot_graph',
+    'private_probe_selector_admission_rejects_policy_and_reachability_mutations',
+    'builtin_rule_set_admission_accepts_owned_sources_and_order',
+    'builtin_rule_set_admission_rejects_source_and_order_mutations',
+  ]);
+  assert.equal(new Set([...ADMISSION_TESTS, ...TESTS]).size, 8);
+  const source = readFileSync(fileURLToPath(new URL('./runtime-config-loopback.mjs', import.meta.url)), 'utf8');
+  const start = source.indexOf('for (const name of ADMISSION_TESTS)');
+  const stop = source.indexOf('for (const name of TESTS)');
+  const admission = source.slice(start, stop);
+  assert.ok(start > source.indexOf('const selected = selectExecutable') && stop > start);
+  assert.match(admission, /program: selected\.executable/);
+  assert.match(admission, /args: \[name, '--exact', '--nocapture', '--test-threads=1'\]/);
+  assert.doesNotMatch(admission, /--ignored|result\.tests\.push/);
+  assert.match(admission, /result\.admissionTests\.push/);
+  assert.match(admission, /demand\(exactPass\(observed\),/);
+  assert.match(admission, /result\.admissionTests\.length === 4/);
+  assert.match(source.slice(stop), /result\.tests\.length === 4/);
+  assert.ok(source.indexOf('result.retainedCandidate = retainVerifiedCandidate') > source.indexOf('result.sourceVerified = true'));
+  assert.ok(source.indexOf('result.retainedCandidate = retainVerifiedCandidate') < source.indexOf("execute('app-test-build'"));
 });
