@@ -846,7 +846,10 @@ fn inspect_selectors(generated: &Value) -> Value {
                 "private probe slot policy: {tag}"
             );
             assert_eq!(outbound["default"], "direct");
-            assert_eq!(member_set, probe_members, "exact owned probe members: {tag}");
+            assert_eq!(
+                member_set, probe_members,
+                "exact owned probe members: {tag}"
+            );
             let inbound_tag = format!("probe-in-{slot}");
             let paired: Vec<_> = inbounds
                 .iter()
@@ -860,14 +863,20 @@ fn inspect_selectors(generated: &Value) -> Value {
                 .is_some_and(|port| port > 1024 && port <= 65535));
             let expected_route = json!({"inbound":[inbound_tag],"action":"route","outbound":tag});
             assert_eq!(
-                routes.iter().filter(|rule| **rule == expected_route).count(),
+                routes
+                    .iter()
+                    .filter(|rule| **rule == expected_route)
+                    .count(),
                 1,
                 "unique exact private probe route: {tag}"
             );
         }
         projection.push(outbound.clone());
     }
-    assert_eq!(users, BTreeSet::from(["proxy-selector", "rule-sel-loop-route"]));
+    assert_eq!(
+        users,
+        BTreeSet::from(["proxy-selector", "rule-sel-loop-route"])
+    );
     assert_eq!(
         slots,
         (0..slots.len()).collect::<BTreeSet<_>>(),
@@ -894,10 +903,11 @@ fn inspect_selectors(generated: &Value) -> Value {
     for rule in routes {
         if contains_probe_reference(rule, &probes) {
             assert!(
-                slots.iter().any(|slot| *rule == json!({
-                    "inbound":[format!("probe-in-{slot}")],"action":"route",
-                    "outbound":format!("probe-selector-{slot}")
-                })),
+                slots.iter().any(|slot| *rule
+                    == json!({
+                        "inbound":[format!("probe-in-{slot}")],"action":"route",
+                        "outbound":format!("probe-selector-{slot}")
+                    })),
                 "probe reference outside its exact private route"
             );
         }
@@ -977,7 +987,10 @@ fn private_probe_selector_admission_accepts_only_owned_slot_graph() {
     // An empty production pool is also legitimate after port allocation failure.
     generated["inbounds"] = json!([]);
     generated["outbounds"].as_array_mut().unwrap().pop();
-    generated["route"]["rules"].as_array_mut().unwrap().remove(0);
+    generated["route"]["rules"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
     generated["dns"]["servers"] = json!([]);
     assert_eq!(inspect_selectors(&generated).as_array().unwrap().len(), 2);
 }
@@ -1021,11 +1034,7 @@ fn private_probe_selector_admission_rejects_policy_and_reachability_mutations() 
             "/outbounds/5/tag",
             json!("probe-selector-1"),
         ),
-        (
-            "unpaired inbound",
-            "/inbounds/0/tag",
-            json!("probe-in-1"),
-        ),
+        ("unpaired inbound", "/inbounds/0/tag", json!("probe-in-1")),
         ("public inbound", "/inbounds/0/listen", json!("0.0.0.0")),
         ("wrong inbound type", "/inbounds/0/type", json!("mixed")),
         (
@@ -1048,7 +1057,7 @@ fn private_probe_selector_admission_rejects_policy_and_reachability_mutations() 
         (
             "mixed ingress",
             "/route/rules/0/inbound",
-            json!(["probe-in-0","mixed-in"]),
+            json!(["probe-in-0", "mixed-in"]),
         ),
         (
             "nonexclusive route",
@@ -1095,25 +1104,37 @@ fn private_probe_selector_admission_rejects_policy_and_reachability_mutations() 
                 let inbound = mutated["inbounds"][0].clone();
                 mutated["inbounds"].as_array_mut().unwrap().push(inbound);
             }
-            2 => mutated["route"]["rules"].as_array_mut().unwrap().push(json!({
-                "type":"logical","mode":"or","rules":[{"domain":[DOMAIN]}],
-                "action":"route","outbound":"probe-selector-0"
-            })),
+            2 => mutated["route"]["rules"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "type":"logical","mode":"or","rules":[{"domain":[DOMAIN]}],
+                    "action":"route","outbound":"probe-selector-0"
+                })),
             3 => mutated["outbounds"][0]["detour"] = "probe-selector-0".into(),
-            4 => mutated["dns"]["servers"].as_array_mut().unwrap().push(json!({
-                "tag":"dns-user","detour":"probe-selector-0"
-            })),
+            4 => mutated["dns"]["servers"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "tag":"dns-user","detour":"probe-selector-0"
+                })),
             5 => mutated["inbounds"].as_array_mut().unwrap().push(json!({
                 "type":"http","tag":"probe-in-00","listen":"127.0.0.1","listen_port":31002
             })),
-            6 => mutated["route"]["rules"].as_array_mut().unwrap().push(json!({
-                "type":"logical","mode":"or","rules":[{
-                    "domain":[DOMAIN],"outbound":"probe-selector-0"
-                }],"action":"route","outbound":"direct"
-            })),
+            6 => mutated["route"]["rules"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "type":"logical","mode":"or","rules":[{
+                        "domain":[DOMAIN],"outbound":"probe-selector-0"
+                    }],"action":"route","outbound":"direct"
+                })),
             7 => {
                 let server = mutated["dns"]["servers"][0].clone();
-                mutated["dns"]["servers"].as_array_mut().unwrap().push(server);
+                mutated["dns"]["servers"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(server);
             }
             _ => unreachable!(),
         }
