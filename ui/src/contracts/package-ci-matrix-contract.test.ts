@@ -1735,8 +1735,11 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
           expect(previous, `${name} ${job}：「${next}」排到了它前一步之前`).toBeLessThan(index);
           previous = index;
         }
-        // 这一步自己不能被关掉：没有步级 if / continue-on-error（发行路径上它是「环境里没有覆盖」的唯一检查）。
-        expect(step).not.toMatch(/^ {8}(?:if|continue-on-error):/m);
+        // 发行路径上这一步不能被关掉或忽略失败；Android 只允许隔离显式候选的原样条件。
+        expect(step).not.toMatch(/^ {8}continue-on-error:/m);
+        // 连同缩进续行一起取值，避免首行原样、下一行 `|| true` / `&& false` 绕过精确条件。
+        expect(step.match(/^ {8}if:.*(?:\n(?: {9,}.*|[ \t]*)$)*/gm) ?? []).toEqual(leg === ANDROID
+          ? ["        if: (inputs.hot_consumer_candidate || '') == ''"] : []);
       }
       expect(count(executable(source)), `${name}：CARGO_PROFILE_ 出现在各 job 的构建权重步之外`).toBe(inSteps);
     }
@@ -1767,7 +1770,8 @@ describe('Android frozen arm64 diagnostic consumer routing', () => {
         expect(evaluate(expression, selected, publish)).toBe(!publish || !!selected);
         for (const name of ['Build unsigned release-profile validation APK',
           'Verify S5 Android network observation and admission unit tests',
-          'Prepare formal mobile source and isolated tools', 'Setup Rust cache']) {
+          'Prepare formal mobile source and isolated tools',
+          'Select APK build weight (release profile vs risk-gate light)', 'Setup Rust cache']) {
           const guard = stepBlock(check, name).match(/^ {8}if: (.+)$/m)?.[1];
           expect(guard).toBe("(inputs.hot_consumer_candidate || '') == ''");
           if (typeof guard !== 'string') throw new Error('Exact Android isolation guard missing');
