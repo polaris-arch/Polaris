@@ -3,6 +3,7 @@ import { createServer, type ViteDevServer } from 'vite';
 import path from 'node:path';
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
+import enUS from '@/i18n/locales/en-US.json';
 
 // The real UI consumers run against deferred, synthetic API receipts. No native mutation/network.
 const root = path.resolve(import.meta.dirname, '../../..');
@@ -170,8 +171,23 @@ if (mode === 'desktop-warp' || mode === 'mobile-warp' || mode === 'mobile-ts') {
       if (test.logoutCalls.length === 1) throw { code: 'TAILSCALE_LOGOUT_MAIN_CORE' };
     };
     api.server.tailscaleStateExists = async () => ({ ts: true });
-    api.server.tailscaleGetStatus = async () => ({ connected: true, statuses: [{ serverId: 'other-node', peers: [] }] });
+    const preflightHold = query.get('preflightHold') ?? 'notHeld';
+    // STATUS membership is not custody proof. Bind this preflight to the Ready run;
+    // native logout remains the final gate even when that snapshot excludes the target.
+    api.server.tailscaleGetStatus = async () => ({
+      connected: true, statuses: [{ serverId: 'other-node', peers: [] }],
+      mainCoreHold: preflightHold === 'unknown' ? undefined : {
+        mainGeneration: running.mainGeneration,
+        serverIds: preflightHold === 'held' ? ['ts'] : ['other-node'],
+      },
+    });
     test.mobileStack = () => useMobileFormStore.getState().stack.map(({ instanceId, kind }) => ({ instanceId, kind }));
+    test.mobileSelection = () => useAppStore.getState().selectedServerId;
+    test.mobileConfirmation = () => {
+      const confirmation = useMobileFormStore.getState().stack.at(-1);
+      if (confirmation?.kind !== 'confirm') throw new Error('Expected real mobile confirmation');
+      return { instanceId: confirmation.instanceId, title: confirmation.payload.title, message: confirmation.payload.message };
+    };
     // Invoke the real consumer-created confirmation payload, not a helper substitute.
     test.confirmMobile = async () => {
       const confirmation = useMobileFormStore.getState().stack.at(-1);
@@ -570,15 +586,44 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     { selectedServerId: null, intent: 6, outcome: 'stopped' },
     { selectedServerId: 'other-node', intent: 0, outcome: 'changed' },
     { selectedServerId: null, intent: 6, outcome: 'changed' },
-  ])('mobile logout transparently forwards exact selection ownership: %j', async ({ selectedServerId, intent, outcome }) => {
+  ].flatMap(owner => ['notHeld', 'unknown', 'held'].map(preflightHold => ({ ...owner, preflightHold }))))(
+    'mobile logout transparently forwards exact selection ownership: %j', async ({ selectedServerId, intent, outcome, preflightHold }) => {
     const page = await browser.newPage();
-    await page.goto(origin + '/__transactions?mode=mobile-ts&ownedStop=' + outcome + '&intent=' + intent + (selectedServerId === null ? '&nullSelection' : ''));
+    await page.goto(origin + '/__transactions?mode=mobile-ts&ownedStop=' + outcome + '&intent=' + intent + '&preflightHold=' + preflightHold + (selectedServerId === null ? '&nullSelection' : ''));
     await page.locator('.m-form-btn.danger').click();
+    const settings = await page.evaluate('window.__transactions.mobileStack()[0]');
+    const initialConfirm = await page.evaluate('window.__transactions.mobileConfirmation()');
+    expect(initialConfirm.title).toBe(enUS.ts.logout);
+    let previousConfirm = initialConfirm;
     await page.evaluate('window.__transactions.confirmMobile()');
-    // The first refusal created the actual second, owned-Stop confirmation.
+    if (preflightHold !== 'notHeld') {
+      // Held or unproven custody requires a separate notice before any native mutation.
+      const notice = await page.evaluate('window.__transactions.mobileConfirmation()');
+      expect(notice.instanceId).not.toBe(initialConfirm.instanceId);
+      expect(notice.title).toBe(enUS.ts.logoutStopTitle);
+      expect(notice.message).toBe(preflightHold === 'unknown' ? enUS.ts.logoutStopUnsureMessage : enUS.ts.logoutStopMessage);
+      expect(await page.evaluate('window.__transactions.mobileStack()')).toEqual([
+        settings, { instanceId: notice.instanceId, kind: 'confirm' },
+      ]);
+      expect(await page.evaluate('window.__transactions.logoutCalls')).toEqual([]);
+      expect(await page.evaluate('window.__transactions.stopCalls')).toEqual([]);
+      expect(await page.evaluate('window.__transactions.unconditionalStops')).toBe(0);
+      previousConfirm = notice;
+      await page.evaluate('window.__transactions.confirmMobile()');
+    }
+    // The native refusal creates its own owned-Stop confirmation after the preflight.
     expect(await page.evaluate('window.__transactions.logoutCalls')).toEqual(['ts']);
     expect(await page.evaluate('window.__transactions.stopCalls')).toEqual([]);
+    expect(await page.evaluate('window.__transactions.unconditionalStops')).toBe(0);
     expect(await page.evaluate('window.__transactions.mobileStack().at(-1).kind')).toBe('confirm');
+    const ownedConfirm = await page.evaluate('window.__transactions.mobileConfirmation()');
+    expect(ownedConfirm.instanceId).not.toBe(initialConfirm.instanceId);
+    expect(ownedConfirm.instanceId).not.toBe(previousConfirm.instanceId);
+    expect(ownedConfirm.title).toBe(enUS.ts.logoutStopTitle);
+    expect(ownedConfirm.message).toBe(enUS.ts.logoutStopMessage);
+    expect(await page.evaluate('window.__transactions.mobileStack()')).toEqual([
+      settings, { instanceId: ownedConfirm.instanceId, kind: 'confirm' },
+    ]);
     await page.evaluate('window.__transactions.confirmMobile()');
     expect(await page.evaluate('window.__transactions.stopCalls')).toEqual([{
       expectedMainGeneration: 7,
@@ -588,6 +633,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await page.evaluate('window.__transactions.unconditionalStops')).toBe(0);
     expect(await page.evaluate('window.__transactions.logoutCalls')).toEqual(outcome === 'stopped' ? ['ts', 'ts'] : ['ts']);
     expect(await page.evaluate('window.__transactions.mobileStack().map(entry => entry.kind)')).toEqual(outcome === 'stopped' ? [] : ['ts-settings']);
+    expect(await page.evaluate('window.__transactions.mobileStack()')).toEqual(outcome === 'stopped' ? [] : [settings]);
+    expect(await page.evaluate('window.__transactions.mobileSelection()')).toBe(selectedServerId);
     await page.close();
   });
   it('selects a disjoint same-size visible set and preserves hidden choices', async () => {
