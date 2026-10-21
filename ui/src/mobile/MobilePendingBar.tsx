@@ -275,7 +275,7 @@ export function MobilePendingBar(): ReactElement | null {
         mainGeneration: result.runtimeGeneration ?? initial.mainGeneration,
         reconciling: !request.cancelled && reconcileOwnerKnown && !!result.transactionId && (result.status === 'hotDurabilityPending' || result.status === 'unconfirmed') };
       if (outcome.phase === 'applying') {
-        if (!Number.isSafeInteger(result.applyId) || (result.applyId ?? 0) <= 0) {
+        if (typeof result.applyId !== 'number' || !Number.isSafeInteger(result.applyId) || result.applyId <= 0) {
           next = { phase: 'failed', reason: null };
         } else {
           next.applyId = result.applyId;
