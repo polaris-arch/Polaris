@@ -1,5 +1,11 @@
 import type { PendingApplyResult } from '@/contracts/types';
 
+/** Shared decision data; platform-specific shells own presentation and dismissal. */
+export interface RestartPrompt {
+  token: string;
+  reasons: NonNullable<PendingApplyResult['reasons']>;
+}
+
 /** Render only trusted translations; never show arbitrary kernel messages or path values. */
 export function restartReasonKeys(reasons: PendingApplyResult['reasons']): string[] {
   const keys = new Set<string>();

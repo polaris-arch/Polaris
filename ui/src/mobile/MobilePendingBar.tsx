@@ -43,7 +43,8 @@ import { useTranslation } from 'react-i18next';
 
 import { api } from '@/ipc';
 import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
-import { RestartApplyDialog, type RestartPrompt } from '@/components/dialogs/RestartApplyDialog';
+import { restartReasonKeys, type RestartPrompt } from '@/components/dialogs/restart-apply-reasons';
+import { FormSheet } from './forms/FormSheet';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import type { ProxyLifecycleEvent } from '@/contracts/types';
 import { useConfirmTwice } from '@/lib/confirm-twice';
@@ -360,9 +361,18 @@ export function MobilePendingBar(): ReactElement | null {
         })}
       </div>
       {restartPrompt !== null && (
-        <RestartApplyDialog prompt={restartPrompt}
-          onDismiss={() => setRestartPrompt(null)}
-          onConfirm={() => void onApply(restartPrompt.token)} />
+        <FormSheet
+          compact
+          title={t('home.restartApplyTitle')}
+          onRequestClose={() => setRestartPrompt(null)}
+          closeLabel={t('common.close')}
+          cancelLabel={t('home.restartApplyKeepConnection')}
+          submitLabel={t('home.restartApplyConfirm')}
+          onSubmit={() => void onApply(restartPrompt.token)}
+        >
+          <p className="m-form-msg">{t('home.restartApplyDescription')}</p>
+          <ul>{restartReasonKeys(restartPrompt.reasons).map((key) => <li key={key}>{t(key)}</li>)}</ul>
+        </FormSheet>
       )}
     </div>
   );

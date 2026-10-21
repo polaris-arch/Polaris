@@ -21,8 +21,9 @@ import { fileURLToPath } from 'node:url';
 
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
-/** Parse the real handler and follow one block's applyNow result into the committed phase.
- * Comments, unrelated result.status expressions and unused applyOutcome calls cannot satisfy it.
+/** Follow the real onApply receipt through applyOutcome into committed state and its toast.
+ * HOT persistence retries normalize a second awaited receipt with saved: true. Both conditional
+ * branches must be owned; comments, unused calls and a valid branch beside an unrelated one fail.
  */
 type FlowNode = { type: string; [key: string]: unknown };
 const flowNode = (value: unknown): value is FlowNode =>
@@ -39,49 +40,152 @@ const member = (value: unknown, name: string): value is FlowNode =>
   && identifier(value.property, name);
 const identifierName = (value: unknown): string | null =>
   flowNode(value) && value.type === 'Identifier' && typeof value.name === 'string' ? value.name : null;
+const ownedMember = (value: unknown, owner: string, name: string): boolean =>
+  member(value, name) && identifier(value.object, owner);
+const stringLiteral = (value: unknown, text: string): boolean =>
+  flowNode(value) && value.type === 'StringLiteral' && value.value === text;
+const nullLiteral = (value: unknown): boolean => flowNode(value) && value.type === 'NullLiteral';
+const outcomeToastMember = (value: unknown, owner: string, name: string): boolean =>
+  member(value, name) && ownedMember(value.object, owner, 'toast');
+const translatedToastKey = (value: unknown, owner: string): boolean =>
+  flowNode(value) && value.type === 'CallExpression' && identifier(value.callee, 't')
+  && Array.isArray(value.arguments) && value.arguments.length === 1
+  && outcomeToastMember(value.arguments[0], owner, 'key');
+function writesOwner(value: unknown, name: string): boolean {
+  if (identifier(value, name)) return true;
+  return flowNode(value) && value.type === 'MemberExpression' && writesOwner(value.object, name);
+}
+function stableBinding(scoped: FlowNode[], name: string): boolean {
+  return scoped.filter(node => node.type === 'VariableDeclarator' && identifier(node.id, name)).length === 1
+    && !scoped.some(node => (node.type === 'AssignmentExpression' && writesOwner(node.left, name))
+      || (node.type === 'UpdateExpression' && writesOwner(node.argument, name)));
+}
+function awaitedApplyNow(value: unknown): boolean {
+  if (!flowNode(value) || value.type !== 'AwaitExpression') return false;
+  const call = value.argument;
+  if (!flowNode(call) || call.type !== 'CallExpression' || !member(call.callee, 'applyNow')) return false;
+  const state = call.callee.object;
+  return flowNode(state) && state.type === 'CallExpression' && member(state.callee, 'getState')
+    && identifier(state.callee.object, 'useStagedConfigStore')
+    && Array.isArray(state.arguments) && state.arguments.length === 0;
+}
+function ownedApplyReceipt(value: unknown, handler: FlowNode): boolean {
+  if (awaitedApplyNow(value)) return true;
+  if (!flowNode(value) || value.type !== 'ConditionalExpression' || !flowNode(value.test)
+    || value.test.type !== 'BinaryExpression' || value.test.operator !== '==='
+    || !identifier(value.test.right, 'undefined') || !awaitedApplyNow(value.consequent)) return false;
+  const retryName = identifierName(value.test.left);
+  if (!retryName || !Array.isArray(handler.params) || !handler.params.some(param => identifier(param, retryName))) return false;
+  // The retry selector must remain the handler parameter, not a shadowed or overwritten value.
+  if (flowNodes(handler).some(node => (node.type === 'VariableDeclarator' && identifier(node.id, retryName))
+    || (node.type === 'AssignmentExpression' && writesOwner(node.left, retryName))
+    || (node.type === 'UpdateExpression' && writesOwner(node.argument, retryName)))) return false;
+  const retry = value.alternate;
+  if (!flowNode(retry) || retry.type !== 'ObjectExpression' || !Array.isArray(retry.properties)
+    || retry.properties.length !== 2) return false;
+  const [spread, saved] = retry.properties;
+  if (!flowNode(spread) || spread.type !== 'SpreadElement' || !flowNode(spread.argument)
+    || spread.argument.type !== 'AwaitExpression' || !flowNode(saved) || saved.type !== 'ObjectProperty'
+    || saved.computed !== false || !identifier(saved.key, 'saved')
+    || !flowNode(saved.value) || saved.value.type !== 'BooleanLiteral' || saved.value.value !== true) return false;
+  const call = spread.argument.argument;
+  return flowNode(call) && call.type === 'CallExpression' && member(call.callee, 'retryRuntimePersistence')
+    && member(call.callee.object, 'proxy') && identifier(call.callee.object.object, 'api')
+    && Array.isArray(call.arguments) && call.arguments.length === 1 && identifier(call.arguments[0], retryName);
+}
+function ownedFailureReason(value: unknown, owner: string): boolean {
+  if (!flowNode(value) || value.type !== 'ConditionalExpression' || !flowNode(value.test)
+    || value.test.type !== 'LogicalExpression' || value.test.operator !== '&&') return false;
+  const phase = value.test.left;
+  return flowNode(phase) && phase.type === 'BinaryExpression' && phase.operator === '==='
+    && ownedMember(phase.left, owner, 'phase') && stringLiteral(phase.right, 'failed')
+    && ownedMember(value.test.right, owner, 'toast') && translatedToastKey(value.consequent, owner)
+    && nullLiteral(value.alternate);
+}
+function ownedToastGuard(value: unknown, result: string, outcome: string): boolean {
+  if (!flowNode(value)) return false;
+  if (value.type === 'BinaryExpression') {
+    return value.operator === '!==' && ownedMember(value.left, outcome, 'toast') && nullLiteral(value.right);
+  }
+  // Mobile additionally suppresses the skipped toast. The extra gate must use this same receipt.
+  const skip = value.right;
+  return value.type === 'LogicalExpression' && value.operator === '&&'
+    && ownedToastGuard(value.left, result, outcome) && flowNode(skip) && skip.type === 'BinaryExpression'
+    && skip.operator === '!==' && ownedMember(skip.left, result, 'status') && stringLiteral(skip.right, 'skipped');
+}
+function ownedToastStatement(value: unknown, owner: string): boolean {
+  if (!flowNode(value)) return false;
+  if (value.type === 'BlockStatement' && Array.isArray(value.body) && value.body.length === 1) {
+    return ownedToastStatement(value.body[0], owner);
+  }
+  if (value.type !== 'ExpressionStatement' || !flowNode(value.expression)) return false;
+  const call = value.expression;
+  return call.type === 'CallExpression' && flowNode(call.callee) && call.callee.type === 'MemberExpression'
+    && call.callee.computed === true && identifier(call.callee.object, 'toast')
+    && outcomeToastMember(call.callee.property, owner, 'kind')
+    && Array.isArray(call.arguments) && call.arguments.length === 1 && translatedToastKey(call.arguments[0], owner);
+}
 function ownsApplyOutcome(source: string): boolean {
   const ast = parse(source, { sourceType: 'module', plugins: ['typescript', 'jsx'] });
   const handlers = flowNodes(ast).filter(node => node.type === 'VariableDeclarator' && identifier(node.id, 'onApply'));
   if (handlers.length !== 1 || !flowNode(handlers[0].init)) return false;
   const handler = handlers[0].init;
-  for (const attempt of flowNodes(handler).filter(node => node.type === 'TryStatement')) {
-    if (!flowNode(attempt.block) || !Array.isArray(attempt.block.body)) continue;
+  if ((handler.type !== 'ArrowFunctionExpression' && handler.type !== 'FunctionExpression')
+    || !flowNode(handler.body) || handler.body.type !== 'BlockStatement' || !Array.isArray(handler.body.body)) return false;
+  const handlerStatements = handler.body.body.filter(flowNode);
+  const exits = (node: FlowNode) => node.type === 'ReturnStatement' || node.type === 'ThrowStatement';
+  // A try hidden in an uncalled callback or a dead conditional is not the onApply execution path.
+  for (const [attemptAt, attempt] of handlerStatements.entries()) {
+    if (attempt.type !== 'TryStatement' || handlerStatements.slice(0, attemptAt).some(exits)
+      || !flowNode(attempt.block) || !Array.isArray(attempt.block.body)) continue;
     const statements = attempt.block.body.filter(flowNode);
     const declarations = statements.filter(node => node.type === 'VariableDeclaration')
       .flatMap(node => Array.isArray(node.declarations) ? node.declarations.filter(flowNode) : []);
+    const scoped = flowNodes(attempt.block);
     for (const result of declarations) {
       const resultName = identifierName(result.id);
-      if (!resultName || !flowNode(result.init) || result.init.type !== 'AwaitExpression') continue;
-      const call = result.init.argument;
-      if (!flowNode(call) || call.type !== 'CallExpression' || !member(call.callee, 'applyNow')) continue;
-      const state = call.callee.object;
-      if (!flowNode(state) || state.type !== 'CallExpression' || !member(state.callee, 'getState')
-        || !identifier(state.callee.object, 'useStagedConfigStore')) continue;
+      if (!resultName || !ownedApplyReceipt(result.init, handler) || !stableBinding(scoped, resultName)) continue;
       for (const outcome of declarations) {
         const outcomeName = identifierName(outcome.id);
         const init = outcome.init;
         if (!outcomeName || !flowNode(init) || init.type !== 'CallExpression'
-          || !identifier(init.callee, 'applyOutcome') || !Array.isArray(init.arguments) || init.arguments.length !== 1
-          || !member(init.arguments[0], 'status') || !identifier(init.arguments[0].object, resultName)) continue;
-        const scoped = flowNodes(attempt.block);
-        // Both bindings must be unique and unreassigned inside this handler's try scope.
-        if ([resultName, outcomeName].some(name =>
-          scoped.filter(node => node.type === 'VariableDeclarator' && identifier(node.id, name)).length !== 1
-          || scoped.some(node => node.type === 'AssignmentExpression' && identifier(node.left, name)))) continue;
+          || !identifier(init.callee, 'applyOutcome') || !Array.isArray(init.arguments) || init.arguments.length !== 2
+          || !ownedMember(init.arguments[0], resultName, 'status') || !ownedMember(init.arguments[1], resultName, 'reasons')
+          || !stableBinding(scoped, outcomeName)) continue;
         for (const next of declarations) {
           const nextName = identifierName(next.id);
           if (!nextName || !flowNode(next.init) || next.init.type !== 'ObjectExpression'
-            || !Array.isArray(next.init.properties)) continue;
-          const phase = next.init.properties.find(value => flowNode(value) && value.type === 'ObjectProperty'
+            || !Array.isArray(next.init.properties)
+            || scoped.filter(node => node.type === 'VariableDeclarator' && identifier(node.id, nextName)).length !== 1) continue;
+          const properties = next.init.properties;
+          const phase = properties.filter(value => flowNode(value) && value.type === 'ObjectProperty'
             && identifier(value.key, 'phase'));
-          if (!flowNode(phase) || !member(phase.value, 'phase') || !identifier(phase.value.object, outcomeName)) continue;
+          const reason = properties.filter(value => flowNode(value) && value.type === 'ObjectProperty'
+            && identifier(value.key, 'reason'));
+          if (phase.length !== 1 || reason.length !== 1 || !flowNode(phase[0]) || !flowNode(reason[0])
+            || !ownedMember(phase[0].value, outcomeName, 'phase') || !ownedFailureReason(reason[0].value, outcomeName)) continue;
+          // A later spread or computed key could silently replace the phase/reason we just followed.
+          if (properties.some((value, index) => flowNode(value) && (value.computed === true
+            || (value.type === 'SpreadElement' && index > Math.min(properties.indexOf(phase[0]), properties.indexOf(reason[0])))))) continue;
           const ordered = declarations.indexOf(result) < declarations.indexOf(outcome)
             && declarations.indexOf(outcome) < declarations.indexOf(next);
-          const commit = statements.some(node => node.type === 'ExpressionStatement' && flowNode(node.expression)
+          const nextAt = statements.findIndex(node => Array.isArray(node.declarations) && node.declarations.includes(next));
+          const commitAt = statements.findIndex(node => node.type === 'ExpressionStatement' && flowNode(node.expression)
             && node.expression.type === 'CallExpression' && identifier(node.expression.callee, 'setApply')
             && Array.isArray(node.expression.arguments) && node.expression.arguments.length === 1
             && identifier(node.expression.arguments[0], nextName));
-          if (ordered && commit) return true;
+          // Restart lifecycle reconciliation may update next only inside outcome.phase === 'applying'.
+          // HOT outcomes must reach the commit without an intervening state/phase/reason overwrite.
+          const restartUpdates = statements.filter((node, index) => index > nextAt && index < commitAt
+            && node.type === 'IfStatement' && flowNode(node.test) && node.test.type === 'BinaryExpression'
+            && node.test.operator === '===' && ownedMember(node.test.left, outcomeName, 'phase')
+            && stringLiteral(node.test.right, 'applying')).flatMap(node => flowNodes(node.consequent));
+          const disconnectedWrite = scoped.some(node => ((node.type === 'AssignmentExpression' && writesOwner(node.left, nextName))
+            || (node.type === 'UpdateExpression' && writesOwner(node.argument, nextName))) && !restartUpdates.includes(node));
+          const toastAfterCommit = statements.some((node, index) => index > commitAt && node.type === 'IfStatement'
+            && !statements.slice(0, index).some(exits)
+            && ownedToastGuard(node.test, resultName, outcomeName) && ownedToastStatement(node.consequent, outcomeName));
+          if (ordered && commitAt > nextAt && !disconnectedWrite && toastAfterCommit) return true;
         }
       }
     }
@@ -474,7 +578,7 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
     expect(bar, '.err 又变回死 CSS').toMatch(/cn\('pending-bar show',\s*view\.err && 'err'\)/);
     // P4：红态判据搬进纯函数 `composeBarView`（§2.4 那张表的一列），组件只消费它。
     // 变异对照：在组件里另写一个 `applyFailed` 布尔来点红 → 与表分叉、转红。
-    // 「红 ↔ toast 同源」那一半改由 `pending-bar-logic.test.ts` 的行为断言守（比正则更有牙）。
+    // AST 守 receipt → outcome → state/reason/toast 的实际消费；状态映射由 pending-bar-logic 行为断言守。
     expect(ownsApplyOutcome(read('../components/layout/PendingChangesBar.tsx'))).toBe(true);
     expect(ownsApplyOutcome(read('../mobile/MobilePendingBar.tsx'))).toBe(true);
   });
@@ -482,14 +586,80 @@ describe('pending-bar docked 全局位（P2）：搬家后必然踩的四个坑'
   it('Apply result ownership AST rejects disconnected and comment-only lookalikes on both surfaces', () => {
     for (const path of ['../components/layout/PendingChangesBar.tsx', '../mobile/MobilePendingBar.tsx']) {
       const source = read(path);
-      // Binding names may evolve; identity and consumption may not.
-      expect(ownsApplyOutcome(source.replaceAll('result', 'reply'))).toBe(true);
+      const outcomeCall = 'applyOutcome(result.status, result.reasons)';
+      const reason = "reason: outcome.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null";
+      const toastCall = 'toast[outcome.toast.kind](t(outcome.toast.key))';
+      const retrySpread = '...await api.proxy.retryRuntimePersistence(persistenceTransactionId)';
+      // Binding names and comments may evolve; receipt identity and consumption may not.
       for (const [before, after] of [
-        ['applyOutcome(result.status)', 'applyOutcome(other.status)'],
-        ['applyOutcome(result.status)', "applyOutcome('applied')"],
+        ['result', 'reply'], ['outcome', 'decision'], ['next', 'committed'],
+        ['persistenceTransactionId', 'retryToken'],
+      ]) {
+        expect(ownsApplyOutcome(source.replaceAll(before, after)), `${path}: rename ${before}`).toBe(true);
+      }
+      expect(ownsApplyOutcome(source.replace(outcomeCall,
+        'applyOutcome(/* receipt status */ result.status, /* receipt reasons */ result.reasons)'))).toBe(true);
+      // Retain the original direct-await shape as a positive control alongside the real HOT branch.
+      const receipt = `persistenceTransactionId === undefined
+        ? await useStagedConfigStore.getState().applyNow(restartConfirmation)
+        : { ${retrySpread}, saved: true }`;
+      expect(source).toContain(receipt);
+      expect(ownsApplyOutcome(source.replace(receipt,
+        'await useStagedConfigStore.getState().applyNow(restartConfirmation)'))).toBe(true);
+      const tryStart = source.indexOf('    try {', source.indexOf('const onApply ='));
+      const tryEnd = source.indexOf('\n  };', tryStart);
+      const catchStart = source.indexOf('    } catch (error) {', tryStart);
+      expect(tryStart).toBeGreaterThan(-1);
+      expect(catchStart).toBeGreaterThan(tryStart);
+      expect(tryEnd).toBeGreaterThan(catchStart);
+      const attempt = source.slice(tryStart, tryEnd);
+      const attemptBody = source.slice(tryStart + '    try {'.length, catchStart);
+      for (const fragment of [attempt, attemptBody]) {
+        for (const wrapper of ['const unusedApply = async () => {', 'if (false) {']) {
+          expect(ownsApplyOutcome(source.replace(fragment, `${wrapper}\n${fragment}\n};`)),
+            `${path}: unreachable ${wrapper}`).toBe(false);
+        }
+      }
+      for (const [before, after] of [
+        [outcomeCall, 'applyOutcome(other.status, result.reasons)'],
+        [outcomeCall, 'applyOutcome(result.status, other.reasons)'],
+        [outcomeCall, "applyOutcome('applied', result.reasons)"],
+        [outcomeCall, 'applyOutcome(result.status)'],
+        [outcomeCall, `unrelated(result.status, result.reasons) /* ${outcomeCall} */`],
+        [outcomeCall, `unrelated(result.status, result.reasons); const unusedOutcome = ${outcomeCall}`],
         ['phase: outcome.phase', "phase: 'idle'"],
-        ['setApply(next);', 'setApply(initial);'],
-        ['applyOutcome(result.status)', "unrelated(result.status) /* applyOutcome(result.status) */"],
+        [reason, 'reason: null'],
+        [reason, "reason: other.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null"],
+        [reason, "reason: outcome.phase === 'failed' && outcome.toast ? t(other.toast.key) : null"],
+        ['setApply(initial);', 'setApply(initial); return;'],
+        ['const outcome =', 'return; const outcome ='],
+        ['const outcome =', "throw new Error('interrupted'); const outcome ="],
+        ['setApply(next);', 'return; setApply(next);'],
+        ["if (outcome.toast !== null", "return; if (outcome.toast !== null"],
+        ['setApply(next);', 'setApply(initial); /* setApply(next); */'],
+        ['setApply(next);', 'next = initial; setApply(next);'],
+        ['setApply(next);', "next.phase = 'idle'; setApply(next);"],
+        ['setApply(next);', 'next.reason = null; setApply(next);'],
+        ["if (outcome.phase === 'applying')", "if (other.phase === 'applying')"],
+        [toastCall, 'toast[other.toast.kind](t(outcome.toast.key))'],
+        [toastCall, 'toast[outcome.toast.kind](t(other.toast.key))'],
+        [toastCall, `unrelated[outcome.toast.kind](t(outcome.toast.key)) /* ${toastCall} */`],
+        [toastCall, `(() => ${toastCall})`],
+        ["if (outcome.toast !== null", "if (other.toast !== null"],
+        ['const result = persistenceTransactionId === undefined', 'const result = persistenceTransactionId !== undefined'],
+        ['const result = persistenceTransactionId === undefined', 'const result = otherTransactionId === undefined'],
+        ['? await useStagedConfigStore.getState().applyNow(restartConfirmation)', '? await otherStore.getState().applyNow(restartConfirmation)'],
+        [retrySpread, '...await api.proxy.retryRuntimePersistence(otherTransactionId)'],
+        [retrySpread, '...await api.proxy.unrelated(persistenceTransactionId)'],
+        [retrySpread, '...api.proxy.retryRuntimePersistence(persistenceTransactionId)'],
+        [`${retrySpread}, saved: true`, `${retrySpread}, saved: false`],
+        [`${retrySpread}, saved: true`, `${retrySpread}, saved: true, status: 'hotApplied'`],
+        ['let next: ApplyState =', "result.status = 'hotApplied'; let next: ApplyState ="],
+        ['let next: ApplyState =', "outcome.phase = 'idle'; let next: ApplyState ="],
+        ['let next: ApplyState =', 'result = other; let next: ApplyState ='],
+        ['let next: ApplyState =', 'outcome = other; let next: ApplyState ='],
+        ['let next: ApplyState =', '{ const result = other; } let next: ApplyState ='],
+        ['let next: ApplyState =', '{ const outcome = other; } let next: ApplyState ='],
       ]) {
         expect(source, before).toContain(before);
         expect(ownsApplyOutcome(source.replace(before, after)), `${path}: ${after}`).toBe(false);

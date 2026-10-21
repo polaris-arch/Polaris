@@ -5,10 +5,12 @@ import fixture from './coex-runtime.rust.fixture.json';
 import { decodeCoexRuntimeState } from './coex-runtime';
 const latest = () => structuredClone(fixture.states.latest);
 describe('historical actual Rust export and current source boundary', () => {
-  it('pins the historical export and partitions the complete current nine-source graph', () => {
+  it('pins the historical export and partitions its original nine-file source footprint', () => {
     const compatibility = fixture.sourceCompatibility;
     expect(compatibility.newSerializerExecution).toBe(false);
     expect(compatibility.currentStatesReexported).toBe(false);
+    expect(compatibility.originalStatesCanonicalSha256)
+      .toBe('285de8e6e9ff31d6a499e4e606f36661d8bda0a2b0866c3c13c06e52cf63d874');
     // Preserve original historical identity; a source refresh is never a serializer run.
     expect(createHash('sha256').update(JSON.stringify(fixture.producer)).digest('hex'))
       .toBe('eed3e1a21b6913fb5cc8f1525b0a15bf13119518960b42fd7767d29448135fd7');
@@ -38,6 +40,33 @@ describe('historical actual Rust export and current source boundary', () => {
     }
     for (const [path, sha] of Object.entries(compatibility.sourceSha256)) {
       expect(createHash('sha256').update(readFileSync(new URL('../../../' + path, import.meta.url))).digest('hex'), path).toBe(sha);
+    }
+  });
+  it('pins the separate HOT proxy supplement without relabeling it as historical or execution evidence', () => {
+    const integration = fixture.sourceCompatibility.hotProxyIntegration;
+    const paths = [
+      'src-tauri/src/runtime/proxy/mesh_route_report.rs',
+      'src-tauri/src/runtime/proxy/native_auto.rs',
+      'src-tauri/src/runtime/proxy/pending_changes.rs',
+      'src-tauri/src/runtime/proxy/runtime_config.rs',
+      'src-tauri/src/runtime/proxy/tests/hot_switch.rs',
+      'src-tauri/src/runtime/proxy/tests/hot_switch/auto_select.rs',
+      'src-tauri/src/runtime/proxy/tests/lifecycle.rs',
+      'src-tauri/src/runtime/proxy/tests/mesh_route_report.rs',
+    ].sort();
+    expect(integration.newSerializerExecution).toBe(false);
+    expect(integration.currentStatesReexported).toBe(false);
+    expect(Object.keys(integration.sourceSha256).sort()).toEqual(paths);
+    expect(Object.keys(integration.sourceReview).sort()).toEqual(paths);
+    expect(integration.addedSources).toEqual(['src-tauri/src/runtime/proxy/runtime_config.rs']);
+    const classified = [...integration.addedSources, ...integration.changedSources];
+    expect(classified).toHaveLength(paths.length);
+    expect(new Set(classified).size).toBe(paths.length);
+    expect(classified.sort()).toEqual(paths);
+    for (const path of paths) expect(Object.keys(fixture.producer.sourceSha256)).not.toContain(path);
+    for (const [path, sha] of Object.entries(integration.sourceSha256)) {
+      expect(createHash('sha256').update(readFileSync(new URL('../../../' + path, import.meta.url))).digest('hex'), path).toBe(sha);
+      expect(integration.sourceReview[path as keyof typeof integration.sourceReview].length).toBeGreaterThan(0);
     }
   });
   it.each(Object.entries(fixture.states))('decodes actual %s state without changing inner trust', (_name, state) => {

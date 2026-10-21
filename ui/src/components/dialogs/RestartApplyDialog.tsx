@@ -1,14 +1,10 @@
 import { useTranslation } from 'react-i18next';
-import type { PendingApplyResult } from '@/contracts/types';
 import { Modal } from './Modal';
-import { restartReasonKeys } from './restart-apply-reasons';
+import { restartReasonKeys, type RestartPrompt } from './restart-apply-reasons';
 
-export interface RestartPrompt {
-  token: string;
-  reasons: NonNullable<PendingApplyResult['reasons']>;
-}
+export type { RestartPrompt } from './restart-apply-reasons';
 
-/** Shared desktop/mobile decision. Dismissal never calls Apply or saves a candidate. */
+/** Desktop presentation of the shared restart decision. Dismissal never applies or saves. */
 export function RestartApplyDialog({ prompt, onDismiss, onConfirm }: {
   prompt: RestartPrompt;
   onDismiss: () => void;
