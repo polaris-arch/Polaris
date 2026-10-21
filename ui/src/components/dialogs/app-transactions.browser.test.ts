@@ -589,16 +589,26 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
   ].flatMap(owner => ['notHeld', 'unknown', 'held'].map(preflightHold => ({ ...owner, preflightHold }))))(
     'mobile logout transparently forwards exact selection ownership: %j', async ({ selectedServerId, intent, outcome, preflightHold }) => {
     const page = await browser.newPage();
+    const readMobileConfirmation = async () => {
+      const confirmation: unknown = await page.evaluate('window.__transactions.mobileConfirmation()');
+      if (typeof confirmation !== 'object' || confirmation === null
+        || !('instanceId' in confirmation) || typeof confirmation.instanceId !== 'string'
+        || !('title' in confirmation) || typeof confirmation.title !== 'string'
+        || !('message' in confirmation) || typeof confirmation.message !== 'string') {
+        throw new Error('Expected a mobile confirmation with string instanceId, title, and message');
+      }
+      return { instanceId: confirmation.instanceId, title: confirmation.title, message: confirmation.message };
+    };
     await page.goto(origin + '/__transactions?mode=mobile-ts&ownedStop=' + outcome + '&intent=' + intent + '&preflightHold=' + preflightHold + (selectedServerId === null ? '&nullSelection' : ''));
     await page.locator('.m-form-btn.danger').click();
     const settings = await page.evaluate('window.__transactions.mobileStack()[0]');
-    const initialConfirm = await page.evaluate('window.__transactions.mobileConfirmation()');
+    const initialConfirm = await readMobileConfirmation();
     expect(initialConfirm.title).toBe(enUS.ts.logout);
     let previousConfirm = initialConfirm;
     await page.evaluate('window.__transactions.confirmMobile()');
     if (preflightHold !== 'notHeld') {
       // Held or unproven custody requires a separate notice before any native mutation.
-      const notice = await page.evaluate('window.__transactions.mobileConfirmation()');
+      const notice = await readMobileConfirmation();
       expect(notice.instanceId).not.toBe(initialConfirm.instanceId);
       expect(notice.title).toBe(enUS.ts.logoutStopTitle);
       expect(notice.message).toBe(preflightHold === 'unknown' ? enUS.ts.logoutStopUnsureMessage : enUS.ts.logoutStopMessage);
@@ -616,7 +626,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     expect(await page.evaluate('window.__transactions.stopCalls')).toEqual([]);
     expect(await page.evaluate('window.__transactions.unconditionalStops')).toBe(0);
     expect(await page.evaluate('window.__transactions.mobileStack().at(-1).kind')).toBe('confirm');
-    const ownedConfirm = await page.evaluate('window.__transactions.mobileConfirmation()');
+    const ownedConfirm = await readMobileConfirmation();
     expect(ownedConfirm.instanceId).not.toBe(initialConfirm.instanceId);
     expect(ownedConfirm.instanceId).not.toBe(previousConfirm.instanceId);
     expect(ownedConfirm.title).toBe(enUS.ts.logoutStopTitle);
