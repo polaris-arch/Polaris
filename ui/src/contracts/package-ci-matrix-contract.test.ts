@@ -276,22 +276,26 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
 
     // The cheap formatter is a required predecessor, never a best-effort probe.
     // It runs for every normal gate event, including non-Linux dispatches.
-    // Only launcher diagnosis without a SYSTEM request selects a separate job.
-    // A conflicting SYSTEM request must reach admission and fail, never skip it.
+    // Explicit source-only dispatch has its own failing admission job. Otherwise,
+    // launcher diagnosis and conflicting SYSTEM requests retain the original routing.
     const requireCheapFormat = (block: string) => {
       expect(block).not.toMatch(/^ {4}(?:needs|continue-on-error):/m);
       const conditions = [...block.matchAll(/^ {4}if: \$\{\{ (.*) \}\}$/gm)];
       expect(block.match(/^ {4}if:/gm) ?? []).toHaveLength(1);
       expect(conditions).toHaveLength(1);
-      expect(conditions[0][1]).toBe("github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != ''");
+      expect(conditions[0][1]).toBe("(github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '')");
       for (const event of ['pull_request', 'push', 'merge_group', 'workflow_call', 'workflow_dispatch']) {
-        for (const selected of [undefined, false, true]) {
-          for (const candidate of [undefined, '', 'a'.repeat(40), 'malformed']) {
-            expect(runInNewContext(conditions[0][1], {
-              github: { event_name: event }, inputs: {
-                windows_launcher_diagnostics: selected, windows_system_candidate: candidate,
-              },
-            })).toBe(event !== 'workflow_dispatch' || selected !== true || !!candidate);
+        for (const sourceOnly of [undefined, false, true]) {
+          for (const selected of [undefined, false, true]) {
+            for (const candidate of [undefined, '', 'a'.repeat(40), 'malformed']) {
+              expect(runInNewContext(conditions[0][1], {
+                github: { event_name: event }, inputs: {
+                  runtime_config_source_only: sourceOnly,
+                  windows_launcher_diagnostics: selected, windows_system_candidate: candidate,
+                },
+              })).toBe((event !== 'workflow_dispatch' || sourceOnly !== true)
+                && (event !== 'workflow_dispatch' || selected !== true || !!candidate));
+            }
           }
         }
       }
@@ -354,6 +358,87 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     expect(cross).toContain(
       "- name: Cross-target exemptions must still be necessary\n        if: github.event_name != 'pull_request'\n",
     );
+  });
+
+  it('RuntimeConfig source-only dispatch schedules exactly its admission/test job; defaults retain all seven job decisions', () => {
+    const ci = workflow('ci.yml');
+    const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
+    const source = executable(jobBlock(ci, 'runtime_config_source_tests'));
+    const defaults = { runtime_config_source_only: false, windows_launcher_diagnostics: false,
+      native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
+      windows_directory_candidate_source: '', os: 'all' };
+    type Selection = Partial<typeof defaults>;
+    const conflicts: Selection[] = [{ windows_launcher_diagnostics: true }, { native_dns_candidate: 'a'.repeat(40) },
+      { windows_system_candidate: 'a'.repeat(40) }, { windows_directory_mode: 'candidate' },
+      { windows_directory_candidate_source: 'a'.repeat(40) }, { os: 'windows-2022' }, { os: 'macos-14' },
+      { windows_launcher_diagnostics: true, windows_system_candidate: 'a'.repeat(40) }];
+    // Compile each actual expression once; exhaustive truth tables should not
+    // create thousands of VM contexts or depend on a relaxed test timeout.
+    const conditions = Object.fromEntries(jobs.map((name) => {
+      const block = executable(jobBlock(ci, name));
+      const line = /^ {4}if: \$\{\{ (.+) \}\}$/m.exec(block)?.[1];
+      const expression = line ?? foldedJobIf(block, name).replace(/^\$\{\{ | \}\}$/g, '');
+      return [name, { needs: /^ {4}needs: (\w+)$/m.exec(block)?.[1],
+        allows: runInNewContext(`(inputs, github, needs) => (${expression})`) }];
+    }));
+    const decision = (name: string, event: string, selection: Selection, nativeRequired = 'true', formal = 'true') => {
+      const inputs = { ...defaults, ...selection };
+      return Boolean(conditions[name].allows(inputs,
+        { event_name: event, repository: 'polaris-arch/Polaris',
+          ref: 'refs/heads/collab/dots-audit-remediation-20261017', workflow_ref: 'ordinary CI',
+          event: { inputs: { ...inputs, runtime_config_source_only: 'true' } } },
+        { cheap_format: { outputs: { native_required: nativeRequired, native_dns_formal: formal,
+          native_dns_candidate: '', native_dns_formal_app: 'a'.repeat(40) } } },
+      ));
+    };
+    const scheduled = (event: string, selection: Selection, nativeRequired = 'true', formal = 'true') => {
+      const started = new Set<string>();
+      for (const name of jobs) {
+        const needs = conditions[name].needs;
+        if ((!needs || started.has(needs)) && decision(name, event, selection, nativeRequired, formal)) started.add(name);
+      }
+      return [...started];
+    };
+    for (const name of ['native_dns_candidate_gates', 'lint', 'cross', 'test']) {
+      const header = executable(jobBlock(ci, name)).split('    steps:')[0];
+      expect(header).toMatch(/^ {4}needs: cheap_format$/m);
+      expect(header).not.toMatch(/always\(|cancelled\(|success\(|failure\(|continue-on-error/);
+    }
+    expect(source).not.toMatch(/^ {4}needs:|continue-on-error|fetch-core|sudo/m);
+    expect(source).toContain('runs-on: ubuntu-22.04');
+    expect(source).toContain('RuntimeConfig source only (not full CI/native/HOT acceptance)');
+    expect(source).toContain('This job is not full CI, native or HOT acceptance.');
+    expect(source).toContain('run: node scripts/fetch-protoc.mjs');
+    expect(source.match(/^ {8}run: cargo .+$/gm)).toEqual(['        run: cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
+    const input = ci.split('  workflow_dispatch:\n')[1].split('  workflow_call:')[0];
+    expect(input).toMatch(/runtime_config_source_only:\n {8}description: .+\n {8}type: boolean\n {8}default: false/);
+    expect(ci.split('  workflow_call:\n')[1].split('\nconcurrency:')[0]).not.toContain('runtime_config_source_only');
+    const admission = stepBlock(source, 'Admit isolated RuntimeConfig source-only selection');
+    expect(admission).toContain("if: github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true");
+    expect(source.indexOf(admission)).toBeLessThan(source.indexOf('      - name: Install Rust toolchain'));
+    const script = /<<'NODE'\n([\s\S]*?)\n {10}NODE/.exec(admission)![1].replace(/^ {10}/gm, '');
+    const admit = (selection: Selection) => runInNewContext(script, { process: { env: {
+      GITHUB_EVENT_NAME: 'workflow_dispatch', RUNTIME_CONFIG_SOURCE_INPUTS: JSON.stringify({ ...defaults,
+        runtime_config_source_only: true, ...selection }),
+    } } });
+    for (const selection of [{}, { os: 'ubuntu-22.04' }, ...conflicts])
+      expect(scheduled('workflow_dispatch', { ...selection, runtime_config_source_only: true })).toEqual(['runtime_config_source_tests']);
+    expect(() => admit({})).not.toThrow();
+    expect(() => admit({ os: 'ubuntu-22.04' })).not.toThrow();
+    for (const selection of conflicts) expect(() => admit(selection)).toThrow(/cannot combine/);
+    for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
+      for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
+        for (const diagnostic of [false, true]) for (const system of ['', 'a'.repeat(40)])
+          for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-14'])
+            for (const nativeRequired of ['', 'true', 'false']) for (const formal of ['', 'true']) {
+              const ordinary = event !== 'workflow_dispatch' || !diagnostic || system !== '';
+              const native = ordinary && nativeRequired !== 'false';
+              const expected = [ordinary && 'cheap_format', native && formal === 'true' && 'native_dns_candidate_gates',
+                native && 'lint', native && (event !== 'workflow_dispatch' || ['', 'all', 'ubuntu-22.04'].includes(os)) && 'cross',
+                native && 'test', ordinary && 'runtime_config_source_tests', !ordinary && 'windows_launcher_diagnostics'].filter(Boolean);
+              expect(scheduled(event, { runtime_config_source_only: sourceOnly, windows_launcher_diagnostics: diagnostic,
+                windows_system_candidate: system, os }, nativeRequired, formal)).toEqual(expected);
+            }
   });
 
   it('Rust 缓存键：每个 job 恰一个 rust-cache，键各自独立且是稳定字面量', () => {

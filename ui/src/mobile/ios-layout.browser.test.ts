@@ -26,7 +26,7 @@ beforeAll(async () => {
   const chain = await cssChain('mobile');
   css = chain.map((unit) => unit.css).join('\n');
   cssInputs = chain.map((unit) => ({ file: unit.file, compiledSha256: sha256(unit.css) }));
-  browser = await chromium.launch({ executablePath: resolveChromeBinary(), headless: true });
+  browser = await chromium.launch({ chromiumSandbox: true, executablePath: resolveChromeBinary(), headless: true });
 });
 afterAll(async () => {
   await browser?.close();

@@ -8,9 +8,12 @@ export default defineConfig({
     browserName: 'chromium',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
-    launchOptions: process.env.POLARIS_TEST_CHROMIUM_PATH
-      ? { executablePath: process.env.POLARIS_TEST_CHROMIUM_PATH }
-      : undefined,
+    launchOptions: {
+      chromiumSandbox: true,
+      ...(process.env.POLARIS_TEST_CHROMIUM_PATH
+        ? { executablePath: process.env.POLARIS_TEST_CHROMIUM_PATH }
+        : {}),
+    },
   },
   webServer: {
     command: 'pnpm exec vite --host 127.0.0.1 --port 4177 --strictPort',

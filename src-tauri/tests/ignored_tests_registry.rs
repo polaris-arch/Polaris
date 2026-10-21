@@ -126,7 +126,7 @@ const REGISTRY: &[Entry] = &[
     },
     Entry {
         file: "src-tauri/src/runtime/proxy/tests/hot_switch.rs",
-        test: "real_core_hot_switch_failure_falls_back_to_restart",
+        test: "real_core_hot_switch_failure_waits_for_explicit_restart_confirmation",
         class: Class::RealCore,
     },
     Entry {

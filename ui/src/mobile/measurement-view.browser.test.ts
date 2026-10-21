@@ -157,7 +157,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
     await server.listen(); const address = server.httpServer!.address();
     if (!address || typeof address !== 'object') throw Error('fixture did not bind');
     origin = 'http://127.0.0.1:' + address.port;
-    browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
+    browser = await chromium.launch({ chromiumSandbox: true, headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
     // Vite module/CSS/i18n preparation belongs to this bounded setup phase, not
     // the first behavior case's 5000ms allowance. Readiness comes from actual
     // production React commit; each later page must independently reach it.

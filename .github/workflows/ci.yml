@@ -68,6 +68,10 @@ on:
     types: [checks_requested]
   workflow_dispatch:
     inputs:
+      runtime_config_source_only:
+        description: 'RuntimeConfig source/mock tests only on Ubuntu; not full CI, native or HOT acceptance'
+        type: boolean
+        default: false
       native_dns_candidate:
         description: 'Optional exact App SHA on the fixed native-DNS branch; validation only'
         type: string
@@ -135,8 +139,9 @@ concurrency:
 
 jobs:
   cheap_format:
-    # Only an explicit manual diagnostic selection skips the ordinary gate DAG.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '' }}
+    # Explicit source-only dispatch runs its own admission in runtime_config_source_tests.
+    # All native descendants retain this required predecessor and implicit success().
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '') }}
     name: Cheap Rust formatting gate
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -1138,7 +1143,7 @@ jobs:
             runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop
             runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid
             runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt
-            runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_falls_back_to_restart
+            runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation
             runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames
           )
           node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"
@@ -1457,7 +1462,7 @@ jobs:
             'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',
             'runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid',
             'runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt',
-            'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_falls_back_to_restart',
+            'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation',
           ];
           const statusPath = `${directory}/runtime-status.txt`;
           const statuses = existsSync(statusPath) ? readFileSync(statusPath, 'utf8').split('\n') : [];
@@ -1522,9 +1527,11 @@ jobs:
   # Independent additive API check: generated Rust bindings plus loopback mocks.
   # No kernel payload, App build, mobile callback or live-TUN acceptance is implied.
   # The existing full-workspace, wire, native payload and release gates remain intact.
+  # The opt-in dispatch route must reach this job even with conflicting inputs:
+  # admission fails here, rather than reporting an all-skipped successful run.
   runtime_config_source_tests:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '' }}
-    name: RuntimeConfig mock and source tests
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true) || github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '' }}
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true && 'RuntimeConfig source only (not full CI/native/HOT acceptance)' || 'RuntimeConfig mock and source tests' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
@@ -1537,6 +1544,24 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: '26'
+      - name: Admit isolated RuntimeConfig source-only selection
+        if: github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true
+        shell: bash
+        env:
+          RUNTIME_CONFIG_SOURCE_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          node --input-type=module - <<'NODE'
+          const selected = JSON.parse(process.env.RUNTIME_CONFIG_SOURCE_INPUTS);
+          if (process.env.GITHUB_EVENT_NAME !== 'workflow_dispatch' || selected.runtime_config_source_only !== true)
+            throw Error('RuntimeConfig source-only mode requires an explicit manual boolean selection');
+          if (selected.windows_launcher_diagnostics === true
+              || (selected.native_dns_candidate || '') !== ''
+              || (selected.windows_system_candidate || '') !== ''
+              || (selected.windows_directory_candidate_source || '') !== ''
+              || (selected.windows_directory_mode || 'formal') !== 'formal'
+              || !['all', 'ubuntu-22.04'].includes(selected.os || 'all'))
+            throw Error('RuntimeConfig source-only mode cannot combine diagnostic, candidate or non-Ubuntu selections');
+          NODE
       - name: Install Rust toolchain (preinstalled rustup)
         shell: bash
         run: |
@@ -1565,12 +1590,12 @@ jobs:
       - name: State validation scope
         shell: bash
         run: |
-          printf '%s\n' 'RuntimeConfig: generated Rust bindings and loopback mock/source tests only. No built-kernel wire/service, App transaction, mobile callback, live-TUN or publication acceptance.' >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' 'RuntimeConfig: generated Rust bindings and loopback mock/source tests only. This job is not full CI, native or HOT acceptance. No built-kernel wire/service, App transaction, mobile callback, live-TUN or publication acceptance.' >> "$GITHUB_STEP_SUMMARY"
 
   windows_launcher_diagnostics:
     name: Windows launcher diagnosis (not PR acceptance)
     if: >-
-      ${{ github.event_name == 'workflow_dispatch' && inputs.windows_launcher_diagnostics == true && (inputs.windows_system_candidate || '') == ''
+      ${{ github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only != true && inputs.windows_launcher_diagnostics == true && (inputs.windows_system_candidate || '') == ''
           && github.repository == 'polaris-arch/Polaris'
           && github.ref == 'refs/heads/collab/dots-audit-remediation-20261017' }}
     runs-on: windows-2022

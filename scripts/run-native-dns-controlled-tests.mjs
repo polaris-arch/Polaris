@@ -13,7 +13,7 @@ export const TESTS = Object.freeze([
   'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',
   'runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid',
   'runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt',
-  'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_falls_back_to_restart',
+  'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation',
   'runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames',
 ]);
 const demand = (ok, message) => { if (!ok) throw Error(message); };

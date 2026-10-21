@@ -248,7 +248,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     const address = server.httpServer!.address();
     if (!address || typeof address === 'string') throw new Error('No fixture listener');
     origin = `http://127.0.0.1:${address.port}`;
-    browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
+    browser = await chromium.launch({ chromiumSandbox: true, headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
   }, 30_000);
   afterAll(async () => { await browser?.close(); await server?.close(); });
 

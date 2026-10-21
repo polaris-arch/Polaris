@@ -92,7 +92,7 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 | `real_core_lifecycle_race_start_then_immediate_stop` | `src-tauri/src/runtime/proxy/tests/lifecycle.rs` | RealCore |
 | `real_core_hot_switch_keeps_pid` | `src-tauri/src/runtime/proxy/tests/hot_switch.rs` | RealCore |
 | `real_core_auto_failover_attests_without_applying_saved_debt` | `src-tauri/src/runtime/proxy/tests/hot_switch.rs` | RealCore |
-| `real_core_hot_switch_failure_falls_back_to_restart` | `src-tauri/src/runtime/proxy/tests/hot_switch.rs` | RealCore |
+| `real_core_hot_switch_failure_waits_for_explicit_restart_confirmation` | `src-tauri/src/runtime/proxy/tests/hot_switch.rs` | RealCore |
 | `real_core_crash_triggers_auto_restart` | `src-tauri/src/runtime/proxy/tests/recovery.rs` | RealCore |
 | `real_core_crash_feeds_diagnostic_restart_axis` | `src-tauri/src/runtime/proxy/tests/recovery.rs` | RealCore |
 | `real_core_intentional_stop_does_not_restart` | `src-tauri/src/runtime/proxy/tests/recovery.rs` | RealCore |

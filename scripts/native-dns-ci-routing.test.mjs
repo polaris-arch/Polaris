@@ -115,6 +115,137 @@ test('RuntimeConfig source mocks remain independent of payload admission and use
   assert.deepEqual(commands, ['cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
 });
 
+const runtimeSourceDefaults = { runtime_config_source_only: false, windows_launcher_diagnostics: false,
+  native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
+  windows_directory_candidate_source: '', os: 'all', preserve_run: false };
+const runtimeSourceConflicts = [
+  { windows_launcher_diagnostics: true }, { native_dns_candidate: sha },
+  { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' },
+  { windows_directory_candidate_source: sha }, { os: 'windows-2022' }, { os: 'macos-14' },
+  { windows_launcher_diagnostics: true, windows_system_candidate: sha },
+];
+function ciJobSection(source, name) {
+  const start = source.indexOf('\njobs:\n');
+  assert.notEqual(start, -1, 'Missing jobs map');
+  return section(source.slice(start), name);
+}
+function ciJobCondition(source, name) {
+  const header = ciJobSection(source, name).split('    steps:')[0];
+  const match = /^    if: >-\n((?:      .*\n)+)/m.exec(header)
+    ?? /^    if: (.+)$/m.exec(header);
+  assert.ok(match, `${name} must retain an explicit job condition`);
+  return match[1].trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
+}
+function ciSchedule(source, names) {
+  const jobs = names.map((name) => ({ name,
+    needs: /^    needs: (\w+)$/m.exec(ciJobSection(source, name))?.[1],
+    allows: new Function('github', 'inputs', 'needs', `return (${ciJobCondition(source, name)});`),
+  }));
+  return (event, inputs, outputs = {}) => {
+    const github = { event_name: event, repository: 'polaris-arch/Polaris',
+      ref: 'refs/heads/collab/dots-audit-remediation-20261017', workflow_ref: base.GITHUB_WORKFLOW_REF,
+      // Inherited caller event payloads must never activate the dispatch-only typed input.
+      event: { inputs: { ...inputs, runtime_config_source_only: 'true' } } };
+    const started = new Set();
+    for (const job of jobs)
+      if ((!job.needs || started.has(job.needs)) && job.allows(github, inputs, { cheap_format: { outputs } }))
+        started.add(job.name);
+    return [...started];
+  };
+}
+function runtimeSourceRoutingContract(source = workflow) {
+  const dispatch = section(source, 'workflow_dispatch'), call = section(source, 'workflow_call');
+  assert.match(dispatch, /^      runtime_config_source_only:\n        description: .*\n        type: boolean\n        default: false$/m);
+  assert.doesNotMatch(call, /runtime_config_source_only/);
+  assert.doesNotMatch(source, /github\.event\.inputs\.runtime_config_source_only/);
+  const names = [...source.slice(source.indexOf('\njobs:\n')).matchAll(/^  (\w+):$/gm)].map((m) => m[1]);
+  assert.deepEqual(names, ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test',
+    'runtime_config_source_tests', 'windows_launcher_diagnostics']);
+  for (const name of ['native_dns_candidate_gates', 'lint', 'cross', 'test']) {
+    const header = ciJobSection(source, name).split('    steps:')[0];
+    assert.match(header, /^    needs: cheap_format$/m);
+    assert.doesNotMatch(header, /always\(|cancelled\(|success\(|failure\(|continue-on-error/,
+      'required predecessor must retain implicit success() so a skipped formatter skips native descendants');
+  }
+  const sourceJob = ciJobSection(source, 'runtime_config_source_tests');
+  assert.doesNotMatch(sourceJob, /^    needs:|continue-on-error|fetch-core|prepare-core-identity|sudo|--ignored|--release/m);
+  assert.match(sourceJob, /^    runs-on: ubuntu-22\.04$/m);
+  assert.match(sourceJob, /^    permissions:\n      contents: read$/m);
+  assert.match(sourceJob, /RuntimeConfig source only \(not full CI\/native\/HOT acceptance\)/);
+  assert.match(sourceJob, /This job is not full CI, native or HOT acceptance\./);
+  assert.match(sourceJob, /^        run: node scripts\/fetch-protoc\.mjs$/m);
+  assert.match(sourceJob, /\[ "\$got" = "\$PROTOC_EXPECT" \] \|\| \{/);
+  assert.deepEqual([...sourceJob.matchAll(/^        run: (cargo .+)$/gm)].map((m) => m[1]),
+    ['cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
+  const admission = '      - name: Admit isolated RuntimeConfig source-only selection\n';
+  assert.ok(sourceJob.indexOf(admission) > sourceJob.indexOf('      - name: Setup Node\n'));
+  assert.ok(sourceJob.indexOf(admission) < sourceJob.indexOf('      - name: Install Rust toolchain'));
+  const admissionStep = sourceJob.split(admission)[1].split('\n      - ')[0];
+  assert.match(admissionStep, /^        if: github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true$/m);
+  assert.match(admissionStep, /RUNTIME_CONFIG_SOURCE_INPUTS: \$\{\{ toJSON\(inputs\) \}\}/);
+  assert.doesNotMatch(admissionStep.split('        run: |\n')[1], /\$\{\{/,
+    'input data must not be interpolated into executable shell/JavaScript');
+  const scheduled = ciSchedule(source, names);
+  for (const selection of [{}, { os: 'ubuntu-22.04' }, { preserve_run: true }, ...runtimeSourceConflicts]) {
+    const inputs = { ...runtimeSourceDefaults, ...selection, runtime_config_source_only: true };
+    assert.deepEqual(scheduled('workflow_dispatch', inputs,
+      { native_required: 'true', native_dns_formal: 'true', native_dns_formal_app: sha }),
+    ['runtime_config_source_tests'], JSON.stringify(selection));
+  }
+  // Every job decision must equal the old DAG on default entries, including
+  // a manual caller with a source-only event payload but no declared input.
+  for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
+    for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
+      for (const diagnostic of [undefined, false, true])
+        for (const system of ['', sha]) for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-14'])
+          for (const nativeRequired of ['', 'true', 'unknown', 'false']) for (const formal of ['', 'true']) {
+            const inputs = { ...runtimeSourceDefaults, runtime_config_source_only: sourceOnly,
+              windows_launcher_diagnostics: diagnostic, windows_system_candidate: system, os };
+            const ordinary = event !== 'workflow_dispatch' || diagnostic !== true || system !== '';
+            const native = ordinary && nativeRequired !== 'false';
+            const expected = [ordinary && 'cheap_format', native && formal === 'true' && 'native_dns_candidate_gates',
+              native && 'lint', native && (event !== 'workflow_dispatch' || ['', 'all', 'ubuntu-22.04'].includes(os)) && 'cross',
+              native && 'test', ordinary && 'runtime_config_source_tests', !ordinary && 'windows_launcher_diagnostics'].filter(Boolean);
+            assert.deepEqual(scheduled(event, inputs, { native_required: nativeRequired, native_dns_formal: formal,
+              native_dns_candidate: '', native_dns_formal_app: sha }), expected);
+          }
+}
+
+test('explicit RuntimeConfig-only dispatch isolates the real source job without changing the default DAG', () => {
+  runtimeSourceRoutingContract();
+  const cheap = ciJobSection(workflow, 'cheap_format'), sourceJob = ciJobSection(workflow, 'runtime_config_source_tests');
+  const diagnostic = ciJobSection(workflow, 'windows_launcher_diagnostics');
+  for (const [before, after] of [
+    [cheap, cheap.replace("(github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && ", '')],
+    [sourceJob, sourceJob.replace("(github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true) || ", '')],
+    [diagnostic, diagnostic.replace('inputs.runtime_config_source_only != true && ', '')],
+    [sourceJob, `    needs: cheap_format\n${sourceJob}`],
+    [sourceJob, sourceJob.replace('cargo test --locked -p polaris-singbox-grpc --test runtime_config',
+      'cargo test --locked -p polaris-singbox-grpc --test runtime_config || true')],
+    [sourceJob, sourceJob.replace('node scripts/fetch-protoc.mjs', 'echo omitted')],
+  ]) {
+    assert.notEqual(before, after);
+    assert.throws(() => runtimeSourceRoutingContract(workflow.replace(before, after)));
+  }
+});
+
+test('conflicting RuntimeConfig-only requests fail in the scheduled source job before Rust or protoc setup', () => {
+  const script = nodeScript('Admit isolated RuntimeConfig source-only selection');
+  const admit = (selection = {}, event = 'workflow_dispatch') => new Function('process', script)({ env: {
+    GITHUB_EVENT_NAME: event,
+    RUNTIME_CONFIG_SOURCE_INPUTS: JSON.stringify({ ...runtimeSourceDefaults,
+      runtime_config_source_only: true, ...selection }),
+  } });
+  for (const selection of [{}, { os: 'ubuntu-22.04' }, { preserve_run: true }]) assert.doesNotThrow(() => admit(selection));
+  for (const selection of [...runtimeSourceConflicts, { native_dns_candidate: 'malformed' },
+    { windows_directory_candidate_source: ' ' }, { windows_directory_mode: 'unknown' }, { os: 'unknown' }])
+    assert.throws(() => admit(selection), /cannot combine diagnostic, candidate or non-Ubuntu selections/);
+  for (const value of [false, 'true', '', null])
+    assert.throws(() => admit({ runtime_config_source_only: value }), /explicit manual boolean selection/);
+  for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call'])
+    assert.throws(() => admit({}, event), /explicit manual boolean selection/);
+});
+
 test('manual inputs remain opt-in while the committed default preserves the ordinary DAG, matrix and exact workspace commands', () => {
   assert.equal((workflow.match(/^      native_dns_candidate:\n/gm) ?? []).length, 2);
   for (const entry of workflow.matchAll(/^      native_dns_candidate:\n([\s\S]*?)(?=^      \w|^\S)/gm))
