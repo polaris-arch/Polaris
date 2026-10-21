@@ -53,6 +53,31 @@ class RuntimePersistenceSourceTest {
         assertTrue(system.contains("output.fd.sync()"))
         assertTrue(system.contains("Os.rename(tmp.path, target.path)"))
         assertTrue(system.contains("Os.fsync(fd)"))
+        val write = system.substringAfter("private fun writeDurably(").substringBefore("fun forget(")
+        val fileSync = write.indexOf("output.fd.sync()")
+        val rename = write.indexOf("Os.rename(tmp.path, target.path)")
+        val directorySync = write.indexOf("syncDirectory(parent)")
+        assertTrue(fileSync >= 0 && fileSync < rename && rename < directorySync)
+    }
+
+    @Test fun directorySyncUsesPublicApi24AndChecksTheOpenedDescriptor() {
+        val sync = source("SystemStart").substringAfter("private fun syncDirectory(directory: File) {")
+            .substringBefore("private fun writeDurably(")
+        val open = sync.indexOf("val fd = Os.open(directory.path,")
+        val directoryCheck = sync.indexOf("check(OsConstants.S_ISDIR(Os.fstat(fd).st_mode))")
+        val fsync = sync.indexOf("Os.fsync(fd)")
+        val closeFinally = sync.indexOf("} finally {")
+        val close = sync.indexOf("Os.close(fd)")
+        assertTrue(open >= 0 && open < directoryCheck && directoryCheck < fsync && fsync < closeFinally && closeFinally < close)
+        assertTrue(sync.contains("OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW or OsConstants.O_NONBLOCK, 0)"))
+        assertFalse(sync.contains("O_DIRECTORY"))
+        assertFalse(sync.contains("O_CLOEXEC")) // Public only from API27; minSdk is 24.
+        assertFalse(sync.contains("directory.isDirectory")) // The FD, not just the path, proves type.
+        assertFalse(sync.contains("runCatching"))
+        assertTrue(sync.contains("failure = error\n            throw error"))
+        assertTrue(sync.contains("val primary = failure"))
+        assertTrue(sync.contains("if (primary != null) primary.addSuppressed(closeFailure) else throw closeFailure"))
+        assertEquals(1, Regex("Os\\.close\\(fd\\)").findAll(sync).count())
     }
 
     @Test fun bridgePublicationKeepsOriginalRequestIdentityAndRejectsStop() {

@@ -161,8 +161,25 @@ internal object SystemStart {
     }
 
     private fun syncDirectory(directory: File) {
-        val fd = Os.open(directory.path, OsConstants.O_RDONLY or OsConstants.O_DIRECTORY, 0)
-        try { Os.fsync(fd) } finally { Os.close(fd) }
+        // Public API21 flags: do not follow a replaced final symlink or block on a FIFO.
+        // Validate the opened descriptor itself before syncing, not a racy path lookup.
+        val fd = Os.open(directory.path,
+            OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW or OsConstants.O_NONBLOCK, 0)
+        var failure: Throwable? = null
+        try {
+            check(OsConstants.S_ISDIR(Os.fstat(fd).st_mode)) { "runtime persistence path is not a directory" }
+            Os.fsync(fd)
+        } catch (error: Throwable) {
+            failure = error
+            throw error
+        } finally {
+            try {
+                Os.close(fd)
+            } catch (closeFailure: Throwable) {
+                val primary = failure
+                if (primary != null) primary.addSuppressed(closeFailure) else throw closeFailure
+            }
+        }
     }
 
     private fun writeDurably(target: File, content: String) {
