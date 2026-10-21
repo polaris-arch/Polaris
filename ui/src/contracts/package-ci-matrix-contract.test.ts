@@ -1535,14 +1535,14 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       android.slice(android.indexOf('\n  workflow_dispatch:'), android.indexOf('\npermissions:')),
     );
     expect(androidDispatch).toMatch(/\n {6}preserve_run:\n {8}type: boolean\n {8}default: false/);
-    expect([...androidDispatch.matchAll(/^ {6}([a-z_]+):$/gm)].map((match) => match[1])).toEqual(['preserve_run']);
+    expect([...androidDispatch.matchAll(/^ {6}([a-z_]+):$/gm)].map((match) => match[1])).toEqual(['preserve_run', 'hot_consumer_candidate']);
     expect(androidDispatch).not.toMatch(/light_build:|publish_release:|release_tag:/);
     expect(androidExecutable).toMatch(/\n {6}light_build:\n(?: {8}(?!default:).*\n)* {8}default: false\n/);
     // 签名发布腿只在 publish_release 为真时跑 ⇒ 在它身上「轻量」必然是 ('1','1') 那一格。
     expect(executable(jobBlock(android, 'release-apk'))).toMatch(/^ {4}if: inputs\.publish_release$/m);
-    // Three distinct evidence allowlists: R8/S5, fixed-root NDK observations, and formal SDK/receipts.
+    // Three formal evidence allowlists remain; the isolated candidate adds only JSON/log evidence.
     const releaseCheck = jobBlock(android, 'release_check');
-    expect(executable(releaseCheck).match(/uses: actions\/upload-artifact@/g) ?? []).toHaveLength(3);
+    expect(executable(releaseCheck).match(/uses: actions\/upload-artifact@/g) ?? []).toHaveLength(4);
     const uploaded = executable(stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）'))
       .split('\n')
       .filter((line) => line.startsWith(' '.repeat(12)))
@@ -1561,7 +1561,8 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(stage1).toContain('stage1_log="$RUNNER_TEMP/release-stage1.log"');
     expect(stage1).toContain('>"$stage1_log" 2>&1');
     const validationEvidence = stepBlock(releaseCheck, '留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）');
-    expect(executable(validationEvidence)).toMatch(/^ {8}if: always\(\)$/m);
+    expect(executable(validationEvidence).match(/^ {8}if: (.+)$/m)?.[1])
+      .toBe("always() && (inputs.hot_consumer_candidate || '') == ''");
     const formalEvidence = [
       '${{ steps.libbox_input.outputs.work }}/polaris-box-*.aar',
       '${{ steps.libbox_input.outputs.work }}/staging/stage.aar',
@@ -1595,16 +1596,19 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       const evidence = executable(stepBlock(jobBlock(android, job), 'Retain actual formal mobile component and original receipts'));
       const paths = evidence.split('\n').filter(line => line.startsWith(' '.repeat(12))).map(line => line.trim());
       expect(paths, `${job}: exact formal evidence whitelist`).toEqual(formalEvidence);
-      expect(evidence).toContain("if: always() && steps.libbox_input.outcome == 'success'");
+      expect(evidence.match(/^ {8}if: (.+)$/m)?.[1]).toBe(job === 'release_check'
+        ? "always() && steps.libbox_input.outcome == 'success' && (inputs.hot_consumer_candidate || '') == ''"
+        : "always() && steps.libbox_input.outcome == 'success'");
       expect(evidence).toContain('if-no-files-found: error');
       expect(evidence).not.toMatch(/\bgh\s+release\b/);
       expect(paths.filter(isApkOrSoPayload), `${job}: no APK/SO payload in evidence upload`).toEqual([]);
       const block = jobBlock(android, job);
-      expect(executable(block).match(/uses: actions\/upload-artifact@/g) ?? [], `${job}: three evidence artifacts`).toHaveLength(3);
+      expect(executable(block).match(/uses: actions\/upload-artifact@/g) ?? [], `${job}: exact evidence artifacts`).toHaveLength(job === 'release_check' ? 4 : 3);
       const observations = executable(stepBlock(block, 'Retain actual NDK input observations even on prepare failure'));
       const observedPaths = observations.split('\n').filter(line => line.startsWith(' '.repeat(12))).map(line => line.trim());
       expect(observedPaths, `${job}: exact failure-reachable NDK evidence whitelist`).toEqual(ndkObservations);
-      expect(observations).toMatch(/^ {8}if: always\(\)$/m);
+      expect(observations.match(/^ {8}if: (.+)$/m)?.[1]).toBe(job === 'release_check'
+        ? "always() && (inputs.hot_consumer_candidate || '') == ''" : 'always()');
       expect(observations).not.toMatch(/libbox_input|outputs\.|\bgh\s+release\b/);
       expect(observations).toContain('name: formal-mobile-ndk-input-${{ github.job }}');
       expect(observations).toContain('if-no-files-found: error');
@@ -1701,5 +1705,49 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     expect(cargoConfig).toContain('[target.x86_64-pc-windows-msvc]');
     expect(cargoConfig, '.cargo/config.toml 出现了 [profile.*] —— 它会改写发行构型而 Cargo.toml 一字不动')
       .not.toMatch(/^\s*\[profile[.\]]/m);
+  });
+});
+
+describe('Android frozen arm64 diagnostic consumer routing', () => {
+  it('nonempty selectors reach admission, while empty defaults keep release routing', () => {
+    const android = workflow('android.yml');
+    const check = jobBlock(android, 'release_check');
+    const expression = check.match(/^ {4}if: (.+)$/m)?.[1];
+    expect(expression).toBe("inputs.publish_release != true || (inputs.hot_consumer_candidate || '') != ''");
+    if (typeof expression !== 'string') throw new Error('Android candidate job condition missing');
+    const evaluate = (source: string, selected: string | undefined, publish: boolean): boolean => {
+      const result: unknown = runInNewContext(source, {
+        inputs: { hot_consumer_candidate: selected, publish_release: publish },
+      });
+      if (typeof result !== 'boolean') throw new Error('Android route did not return a boolean');
+      return result;
+    };
+    for (const selected of [undefined, '', 'bad', ' ', 'a'.repeat(40)]) {
+      for (const publish of [false, true]) {
+        expect(evaluate(expression, selected, publish)).toBe(!publish || !!selected);
+        for (const name of ['Build unsigned release-profile validation APK',
+          'Verify S5 Android network observation and admission unit tests',
+          'Prepare formal mobile source and isolated tools', 'Setup Rust cache']) {
+          const guard = stepBlock(check, name).match(/^ {8}if: (.+)$/m)?.[1];
+          expect(guard).toBe("(inputs.hot_consumer_candidate || '') == ''");
+          if (typeof guard !== 'string') throw new Error('Exact Android isolation guard missing');
+          expect(evaluate(guard, selected, publish)).toBe(!selected);
+        }
+      }
+    }
+    const admission = stepBlock(check, 'Admit exact Android consumer candidate');
+    expect(admission).toContain('HOT_CONSUMER_INPUTS: ${{ toJSON(inputs) }}');
+    expect(admission).toContain('run: python3 scripts/mobile-core/ci-hot-candidate.py admit');
+    expect(check.indexOf(admission)).toBeLessThan(check.indexOf('uses: actions/setup-node@v7'));
+    expect(check).toContain('run: python3 scripts/mobile-core/test-ci-hot-candidate.py');
+    expect(android).not.toContain('github.event.inputs.hot_consumer_candidate');
+    expect(android).not.toContain('steps.hot_candidate.outputs.mode');
+    const publish = jobBlock(android, 'release-apk');
+    expect(publish).not.toContain('ci-hot-candidate.py build');
+    expect(publish).toContain('ci-hot-candidate.py admit');
+    const evidence = stepBlock(check, 'Retain Android candidate evidence only');
+    expect(evidence).toContain("if: always() && (inputs.hot_consumer_candidate || '') != '' && steps.hot_candidate.outcome == 'success'");
+    expect(evidence).not.toMatch(/\.(aar|apk|aab|jks)\b/);
+    expect(evidence).toContain('if-no-files-found: error');
   });
 });
