@@ -1947,6 +1947,31 @@ impl ConfigManager {
         Ok(f(&cfg))
     }
 
+    /// Attest the exact saved desired document without allowing a writer between
+    /// disk verification and the bounded owner acknowledgement. Call only from a
+    /// blocking worker; the closure must not reenter configuration or emit events.
+    pub(crate) fn with_durable_runtime_owner<T>(
+        &self,
+        expected: &Value,
+        acknowledge: impl FnOnce(String, String) -> T,
+    ) -> Result<T, StoreError> {
+        deny_inside_projection("with_durable_runtime_owner");
+        let _writer = self.write_lock.lock()
+            .map_err(|_| StoreError::validation("runtime owner writer unavailable"))?;
+        let cache = self.cache.read()
+            .map_err(|_| StoreError::validation("runtime owner cache unavailable"))?;
+        if cache.as_ref() != Some(expected) {
+            return Err(StoreError::validation("runtime desired owner superseded"));
+        }
+        let bytes = std::fs::read(&self.path).map_err(|error| StoreError::Io(error.to_string()))?;
+        let persisted: Value = serde_json::from_slice(&bytes).map_err(StoreError::from_parse)?;
+        if &persisted != expected {
+            return Err(StoreError::validation("runtime durable desired owner superseded"));
+        }
+        let _probe = ReentrancyProbe::enter();
+        Ok(acknowledge(polaris_updater::sha256_hex(&bytes), config_version(expected)))
+    }
+
     /// Warm saved-state commit fence. This shares the real writer mutex, never loads or
     /// migrates from disk, and fails immediately while a writer is active. The callback
     /// must only commit memory and must not reenter configuration or emit events.
@@ -2347,12 +2372,33 @@ impl ConfigManager {
         self.save_deferred_deletions_locked(&journal)
     }
 
+    /// Capture only journal identities removed by this exact candidate, while
+    /// saved D still matches its owner. Never widen this set after Plan.
+    pub(crate) fn runtime_deletion_scope(&self, desired: &Value, before: &Value, candidate: &Value) -> Result<Vec<DeferredConfigDeletion>, StoreError> {
+        deny_inside_projection("runtime_deletion_scope");
+        let _writer = self.write_lock.lock().map_err(|_| StoreError::validation("deletion scope unavailable"))?;
+        let _deletions = self.deferred_delete_lock.lock().map_err(|_| StoreError::validation("deletion scope unavailable"))?;
+        if self.cache.read().ok().and_then(|value| value.clone()).as_ref() != Some(desired) {
+            return Err(StoreError::validation("deletion scope desired owner changed"));
+        }
+        Ok(self.load_deferred_deletions_locked()?.entries.into_iter()
+            .filter(|entry| deferred_deletion_is_cancelled(entry, before) && !deferred_deletion_is_cancelled(entry, candidate)).collect())
+    }
+
     /// Apply / 冷启动消费延迟删除。每条先按最新配置复核；执行失败保留在日志中，下一次 Apply/启动重试。
     pub(crate) fn process_deferred_deletions(
         &self,
+        apply: impl FnMut(&DeferredConfigDeletion, &Value) -> Result<(), String>,
+    ) -> Result<DeferredDeletionSummary, StoreError> {
+        self.process_deferred_deletions_scoped(None, apply)
+    }
+
+    pub(crate) fn process_deferred_deletions_scoped(
+        &self,
+        scope: Option<&[DeferredConfigDeletion]>,
         mut apply: impl FnMut(&DeferredConfigDeletion, &Value) -> Result<(), String>,
     ) -> Result<DeferredDeletionSummary, StoreError> {
-        deny_inside_projection("process_deferred_deletions");
+        deny_inside_projection("process_deferred_deletions_scoped");
         // 锁序与保存腿保持一致：write → deferred-delete。消费期间配置不能被重新加入/删除；否则
         // “复核未取消 → 执行删除”之间仍有竞态。此前反向先拿 deletion 再 cold-current 拿 write，
         // 还会与 save 的 write→deletion 构成冷启动死锁。
@@ -2370,6 +2416,10 @@ impl ConfigManager {
         let mut summary = DeferredDeletionSummary::default();
         let mut remaining = Vec::new();
         for entry in journal.entries {
+            if scope.is_some_and(|scope| !scope.contains(&entry)) {
+                remaining.push(entry);
+                continue;
+            }
             if mesh_guard::has_managed_fields(&current)
                 && matches!(
                     &entry,

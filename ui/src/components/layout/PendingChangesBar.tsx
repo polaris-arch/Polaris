@@ -1,3 +1,4 @@
+// HOT receipts settle directly; only explicit restart scheduling uses the existing attributed lifecycle path.
 /**
  * 全局待应用/待保存操作条（原型 `.pending-bar`：CSS prototype.css:551-564 / markup L2447-2455 / 行为 L3277-3310）。
  *
@@ -41,6 +42,8 @@ import { useStagedConfigStore } from '@/store/staged-config-store';
 import { StagedConflictDialog } from '@/components/dialogs/StagedConflictDialog';
 import { replay } from '@/lib/staged-config';
 import { api } from '@/ipc';
+import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
+import { RestartApplyDialog, type RestartPrompt } from '@/components/dialogs/RestartApplyDialog';
 import { toast } from '@/lib/error-handler';
 import { cn } from '@/lib/utils';
 import { useConfirmTwice } from '@/lib/confirm-twice';
@@ -49,6 +52,7 @@ import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import {
   APPLY_CONFIRM_TIMEOUT_MS,
   applyOutcome,
+  runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
   composeBarView,
   hasPendingWork,
@@ -66,10 +70,11 @@ const ACTION_LABEL: Record<BarActionId, string> = {
   retryApply: 'home.pendingRetryBtn',
   dismissApply: 'home.pendingIgnoreBtn',
   retrySave: 'home.pendingRetrySaveBtn',
+  retryPersistence: 'home.pendingRetryPersistenceBtn',
 };
 
 /** `btn flow`（主）vs `btn ghost`（次）。断流的那颗永远是主按钮，与今天的单按钮形态一致。 */
-const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply', 'retryApply']);
+const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply', 'retryApply', 'retryPersistence']);
 
 /**
  * 「重置」的原地二次确认 key（原型 :4070 `reset-pending` → `confirmTwice(t,'放弃全部待应用改动？',…)`）。
@@ -83,7 +88,7 @@ const RESET_KEY = 'reset-pending';
 export default function PendingChangesBar() {
   const { t } = useTranslation();
   const pending = useAppStore((s) => s.pendingChanges);
-  /** 「立即应用」= 保存 + 强制重启核；核没在跑时后半句无对象，故那颗整颗不渲染（见 BarInput.coreRunning）。 */
+  /** 「立即应用」保存后请求 HOT；仅确认重启时允许中断连接。核没在跑时没有应用对象，故那颗整颗不渲染（见 BarInput.coreRunning）。 */
   const coreRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
   const servers = useAppStore((s) => s.servers);
   /** **裸磁盘 config**（不是 `effectiveConfig`）：下面 FR-9 那轮 `classifyStaged` 问的是
@@ -98,8 +103,11 @@ export default function PendingChangesBar() {
     phase: 'idle',
     reason: null,
   });
+  const [restartPrompt, setRestartPrompt] = useState<RestartPrompt | null>(null);
   const applyRequest = useRef<{
     awaitingReply: boolean;
+    cancelled: boolean;
+    intentGeneration: number | undefined;
     early: ProxyLifecycleEvent[];
     earlyGeneration: number | undefined;
     earlyStopped: boolean;
@@ -112,7 +120,7 @@ export default function PendingChangesBar() {
   translateRef.current = simpleT;
   /** 明细 popover 开合（原型 `.pd-pop`）。 */
   const [detailOpen, setDetailOpen] = useState(false);
-  /** staged 条目 id → 「保存后仍需应用」（FR-9）。当前 Apply 会重启核；缺 key = 尚未判出，不猜。 */
+  /** staged 条目 id → 「保存后仍需应用」（FR-9）。pendingApply 与是否真正需要重启独立；缺 key = 尚未判出，不猜。 */
   const [effects, setEffects] = useState<Record<string, boolean>>({});
   const { armed, confirmTwice } = useConfirmTwice();
   const barRef = useRef<HTMLDivElement>(null);
@@ -135,6 +143,8 @@ export default function PendingChangesBar() {
     };
   }, [detailOpen]);
 
+  useRuntimeApplyReconciliation(apply, setApply, applyRequest, simpleT);
+
   // Await actual listener registration before issuing Apply; plain start/error broadcasts have
   // no action ownership and therefore must not decide this request's outcome.
   useEffect(() => {
@@ -143,6 +153,12 @@ export default function PendingChangesBar() {
     const ready = api.proxy.onLifecycleReady((data) => {
       const request = applyRequest.current;
       if (!request) return;
+      if (data.kind === 'stop' && data.terminal === true && data.phase === 'stopped'
+          && Number.isSafeInteger(data.mainGeneration)
+          && data.mainGeneration >= (request.earlyGeneration ?? Number.POSITIVE_INFINITY)) {
+        request.cancelled = true;
+        setApply((state) => state.reconciling ? { ...state, reconciling: false } : state);
+      }
       if (request.awaitingReply) {
         // Payload retention is bounded, but generation knowledge must never be evicted.
         // Observe explicit Stop against the floor at arrival, before raising it: replaying
@@ -197,7 +213,7 @@ export default function PendingChangesBar() {
       stagedEntries.map(async (e) => {
         // 单条重放后问：拿到的是「只有这一条时保存后是否还待应用」。
         const c = await api.config.classifyStaged(replay(config, [e])).catch(() => null);
-        return [e.id, c === null ? null : c.restartRequired] as const;
+        return [e.id, typeof c?.pendingApply === 'boolean' ? c.pendingApply : null] as const;
       })
     ).then((rows) => {
       if (!alive) return;
@@ -217,6 +233,9 @@ export default function PendingChangesBar() {
     pendingCount: n,
     applyError: apply.reason,
     coreRunning,
+    persistenceRetryAvailable: !!apply.transactionId,
+    persistenceOnly: apply.persistenceOnly,
+    persistenceRecoveryEnded: apply.persistenceRecoveryEnded,
   });
   /* 冲突弹窗（Q8-b 第 4 步）。挂在条上而不是 DialogHost 栈里：它的生命周期完全由 store 的
      `conflict` 字段决定（保存那一步开、裁决/取消关），走命令式 push/pop 会多出一个能与该字段
@@ -231,7 +250,7 @@ export default function PendingChangesBar() {
         onDismiss={() => useStagedConfigStore.getState().dismissConflict()}
       />
     );
-  if (!view.visible) return conflictDialog;
+  if (!view.visible && restartPrompt === null) return conflictDialog;
 
   /** n===0 而差集腿仍有活 ⇒ 唯一可能是 `restartDeferred`：明细里没有 id 可列，给一行说明。 */
   const configOnly = n === 0 && hasPendingWork(pending);
@@ -240,12 +259,16 @@ export default function PendingChangesBar() {
     await useStagedConfigStore.getState().save();
   };
 
-  const onApply = async () => {
+  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string) => {
     if (applyRequest.current?.awaitingReply || apply.phase === 'applying') return;
+    setRestartPrompt(null);
     const generation = useAppStore.getState().proxyStatus?.mainGeneration;
     const initial: ApplyState = { phase: 'applying', reason: null,
+      persistenceOnly: persistenceTransactionId !== undefined, transactionId: persistenceTransactionId,
       ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) };
-    const request = { awaitingReply: true, early: [] as ProxyLifecycleEvent[],
+    const request = { awaitingReply: true, cancelled: false,
+      intentGeneration: undefined as number | undefined,
+      early: [] as ProxyLifecycleEvent[],
       earlyGeneration: initial.mainGeneration, earlyStopped: false };
     applyRequest.current = request;
     setApply(initial);
@@ -253,15 +276,50 @@ export default function PendingChangesBar() {
       if (!lifecycleReady.current) throw new Error('APPLY_LIFECYCLE_LISTENER_UNAVAILABLE');
       await lifecycleReady.current;
       if (applyRequest.current !== request) return;
-      const result = await useStagedConfigStore.getState().applyNow();
+      const result = persistenceTransactionId === undefined
+        ? await useStagedConfigStore.getState().applyNow(restartConfirmation)
+        : { ...await api.proxy.retryRuntimePersistence(persistenceTransactionId), saved: true };
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       if (!result.saved) {
         setApply({ phase: 'idle', reason: null });
         return;
       }
-      const outcome = applyOutcome(result.status);
-      let next: ApplyState = { ...initial, phase: outcome.phase };
+      if ((result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'unconfirmed')
+          && (request.cancelled || (request.earlyGeneration ?? 0) > (initial.mainGeneration ?? 0))) {
+        request.early = [];
+        setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+        return;
+      }
+      if (persistenceTransactionId !== undefined
+          && (result.transactionId !== persistenceTransactionId
+            || !['hotApplied', 'hotDurabilityPending', 'conflict', 'rejected', 'unconfirmed'].includes(result.status ?? ''))) {
+        request.early = [];
+        setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+        return;
+      }
+      if (result.status === 'restartRequired') {
+        request.early = [];
+        // Missing/empty token must never turn into implicit restart permission.
+        if (!result.restartConfirmation) {
+          setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+          return;
+        }
+        setRestartPrompt({ token: result.restartConfirmation, reasons: result.reasons ?? [] });
+        setApply({ phase: 'idle', reason: null });
+        return;
+      }
+      const reconcileOwnerKnown = Number.isSafeInteger(result.runtimeGeneration) && (result.runtimeGeneration ?? 0) > 0
+        && Number.isSafeInteger(result.selectionIntentGeneration) && (result.selectionIntentGeneration ?? -1) >= 0;
+      request.intentGeneration = result.selectionIntentGeneration;
+      const outcome = applyOutcome(result.status, result.reasons);
+      let next: ApplyState = { ...initial, phase: outcome.phase,
+        reason: outcome.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null,
+        transactionId: result.transactionId,
+        persistenceRecoveryEnded: persistenceTransactionId !== undefined
+          && runtimePersistenceRecoveryEnded(result.status, result.reasons),
+        mainGeneration: result.runtimeGeneration ?? initial.mainGeneration,
+        reconciling: !request.cancelled && reconcileOwnerKnown && !!result.transactionId && (result.status === 'hotDurabilityPending' || result.status === 'unconfirmed') };
       if (outcome.phase === 'applying') {
         if (!Number.isSafeInteger(result.applyId) || (result.applyId ?? 0) <= 0) {
           next = { phase: 'failed', reason: null };
@@ -284,7 +342,7 @@ export default function PendingChangesBar() {
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       request.early = [];
-      setApply({ phase: 'failed', reason: null });
+      setApply({ ...initial, phase: 'failed', reason: null });
       console.error('[PendingChangesBar] Apply failed:', error);
     }
   };
@@ -302,6 +360,9 @@ export default function PendingChangesBar() {
       case 'apply':
       case 'retryApply':
         void onApply();
+        return;
+      case 'retryPersistence':
+        if (apply.transactionId) void onApply(undefined, apply.transactionId);
         return;
       case 'dismissApply':
         setApply({ phase: 'idle', reason: null });
@@ -369,7 +430,7 @@ export default function PendingChangesBar() {
               onClick={() => runAction(a.id)}
             >
               {spins(a.id) && <span className="spinner" />}
-              {arming ? t('home.pendingResetConfirm') : t(ACTION_LABEL[a.id])}
+              {arming ? t('home.pendingResetConfirm') : t(a.id === 'dismissApply' && apply.persistenceRecoveryEnded ? 'home.pendingExitPersistenceRecoveryBtn' : ACTION_LABEL[a.id])}
             </button>
           );
         })}
@@ -442,6 +503,11 @@ export default function PendingChangesBar() {
         </div>
       )}
       {conflictDialog}
+      {restartPrompt !== null && (
+        <RestartApplyDialog prompt={restartPrompt}
+          onDismiss={() => setRestartPrompt(null)}
+          onConfirm={() => void onApply(restartPrompt.token)} />
+      )}
     </div>
   );
 }

@@ -58,6 +58,11 @@ api.rules.update = async () => { test.writes++; };
 api.vpn.submitOpenVpn = async () => new Promise(resolve => { test.release = resolve; });
 api.vpn.cancelOpenVpn = async () => {};
 test.applyCalls = 0;
+test.stagePersistenceDraft = () => {
+  api.config.save = async candidate => { test.writes++; return { status: 'saved', config: candidate, version: 'synthetic' }; };
+  useStagedConfigStore.getState().stage({ id: 'setting:mixedPort', kind: 'setting', label: 'Unrelated draft', entityPath: ['mixedPort'], nextValue: 12345 });
+};
+test.draftCount = () => useStagedConfigStore.getState().entries.length;
 api.proxy.onStarted = listener => { test.unownedStarted = listener; return () => { test.unownedStarted = null; }; };
 api.proxy.onError = listener => { test.unownedError = listener; return () => { test.unownedError = null; }; };
 api.proxy.onLifecycleReady = async listener => {
@@ -67,7 +72,9 @@ api.proxy.onLifecycleReady = async listener => {
   test.events = listener;
   return () => { test.events = null; };
 };
-api.proxy.applyPendingChanges = async () => { test.applyCalls++; return new Promise(resolve => { test.receipt = resolve; }); };
+api.proxy.applyPendingChanges = async token => { test.applyTokens = [...(test.applyTokens ?? []), token]; test.applyCalls++; return new Promise(resolve => { test.receipt = resolve; }); };
+api.proxy.retryRuntimePersistence = async transactionId => { test.persistenceTransactions = [...(test.persistenceTransactions ?? []), transactionId]; return new Promise((resolve, reject) => { test.retryReceipt = resolve; test.retryReject = reject; }); };
+api.proxy.runtimeApplyStatus = async transactionId => { test.runtimeStatusReads = (test.runtimeStatusReads ?? 0) + 1; test.runtimeTransactions = [...(test.runtimeTransactions ?? []), transactionId]; return new Promise(resolve => { test.statusReceipt = resolve; }); };
 api.proxy.getStatus = async () => { test.statusReads = (test.statusReads ?? 0) + 1; return { running: true, mainGeneration: 99, ownedStopContext: { selectedServerId: useAppStore.getState().selectedServerId, selectionIntentGeneration: 0 } }; };
 test.stack = () => useDialogStore.getState().stack.map(({ instanceId, kind, serverId }) => ({ instanceId, kind, serverId }));
 test.openVpn = (serverId, challengeId = serverId + '-challenge') => {
@@ -281,6 +288,153 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     { mode: 'apply', button: '.pending-bar .btn.flow', errorBar: '.pending-bar.err' },
     { mode: 'mobile-apply', button: '.m-pending .m-pending-primary', errorBar: '.m-pending.m-pending-err' },
   ])('attributed Apply consumer: $mode', ({ mode, button, errorBar }) => {
+    it('reconciles persistence through the original status token without replay', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ ok:true,status:"hotDurabilityPending",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+      await page.waitForFunction('typeof window.__transactions.statusReceipt === "function"');
+      expect(await page.evaluate('window.__transactions.runtimeTransactions')).toEqual(['original']);
+      await page.evaluate('window.__transactions.statusReceipt({ ok:true,status:"hotApplied",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+      await page.waitForFunction(() => !document.body.textContent?.includes('Applied at runtime; persistence is still pending.'));
+      expect(await page.getByText('Applied at runtime; persistence is still pending.', {exact:true}).count()).toBe(0);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      await page.close();
+    });
+    it('retries only persistence for the original receipt, without a second Apply', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ ok:true,status:"hotDurabilityPending",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+      await page.waitForFunction('typeof window.__transactions.statusReceipt === "function"');
+      await page.getByRole('button', { name: 'Retry persistence', exact: true }).click();
+      await page.waitForFunction('typeof window.__transactions.retryReceipt === "function"');
+      expect(await page.evaluate('window.__transactions.persistenceTransactions')).toEqual(['original']);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      // The old poll may finish first; its consumer is replaced, so the exact
+      // terminal Retry receipt must still settle this new attempt.
+      await page.evaluate('window.__transactions.statusReceipt({ ok:true,status:"hotApplied",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+      await page.evaluate('window.__transactions.retryReceipt({ ok:true,status:"hotApplied",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+      await page.waitForFunction(() => Array.from(document.querySelectorAll('button'))
+        .some(button => button.textContent?.trim() === 'Apply now' && !button.disabled));
+      expect(await page.locator(errorBar).count()).toBe(0);
+      expect(await page.getByRole('button', { name: 'Retry persistence', exact: true }).count()).toBe(0);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      await page.close();
+    });
+    it.each(['unconfirmed', 'ipc', 'wrong-receipt'] as const)('keeps failed persistence retry isolated from drafts: %s', async (failure) => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ ok:true,status:"hotDurabilityPending",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+      await page.getByRole('button', { name: 'Retry persistence', exact: true }).waitFor();
+      await page.evaluate('window.__transactions.stagePersistenceDraft()');
+      await page.getByRole('button', { name: 'Retry persistence', exact: true }).click();
+      await page.waitForFunction('typeof window.__transactions.retryReceipt === "function"');
+      await page.evaluate(value => {
+        const test = (window as any).__transactions;
+        if (value === 'ipc') test.retryReject(new Error('synthetic IPC error'));
+        else test.retryReceipt({ ok:false, status:'unconfirmed', transactionId: value === 'wrong-receipt' ? 'other' : 'original', runtimeGeneration:10, selectionIntentGeneration:0 });
+      }, failure);
+      await page.locator(errorBar).waitFor();
+      await page.getByRole('button', { name: 'Retry persistence', exact: true }).click();
+      await page.waitForFunction('window.__transactions.persistenceTransactions?.length === 2');
+      expect(await page.evaluate('window.__transactions.persistenceTransactions')).toEqual(['original', 'original']);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      expect(await page.evaluate('window.__transactions.writes')).toBe(0);
+      expect(await page.evaluate('window.__transactions.draftCount()')).toBe(1);
+      await page.evaluate('window.__transactions.retryReceipt({ ok:true,status:"hotApplied",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+      await page.waitForFunction(() => Array.from(document.querySelectorAll('button'))
+        .some(button => button.textContent?.trim() === 'Apply now' && !button.disabled));
+      expect(await page.locator(errorBar).count()).toBe(0);
+      expect(await page.getByRole('button', { name: 'Retry persistence', exact: true }).count()).toBe(0);
+      expect(await page.evaluate('window.__transactions.writes')).toBe(0);
+      expect(await page.evaluate('window.__transactions.draftCount()')).toBe(1);
+      await page.close();
+    });
+    it.each(['reply', 'poll'] as const)('exits confirmed obsolete recovery from %s before separately applying drafts', async (source) => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ ok:true,status:"hotDurabilityPending",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+      await page.getByRole('button', { name: 'Retry persistence', exact: true }).waitFor();
+      await page.waitForFunction('window.__transactions.runtimeStatusReads >= 1');
+      await page.evaluate('window.__transactions.stagePersistenceDraft()');
+      await page.getByRole('button', { name: 'Retry persistence', exact: true }).click();
+      await page.waitForFunction('typeof window.__transactions.retryReceipt === "function"');
+      if (source === 'poll') {
+        await page.evaluate('window.__transactions.retryReceipt({ ok:false,status:"unconfirmed",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+        await page.waitForFunction('window.__transactions.runtimeStatusReads >= 2');
+        await page.evaluate('window.__transactions.statusReceipt({ ok:false,status:"conflict",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0,reasons:[{code:"OWNER_STATE_SUPERSEDED",path:"desired"}] });');
+      } else {
+        await page.evaluate('window.__transactions.retryReceipt({ ok:false,status:"conflict",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0,reasons:[{code:"OWNER_STATE_SUPERSEDED",path:"desired"}] });');
+      }
+      await page.getByRole('button', { name: 'Exit recovery', exact: true }).click();
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      expect(await page.evaluate('window.__transactions.writes')).toBe(0);
+      expect(await page.evaluate('window.__transactions.draftCount()')).toBe(1);
+      await page.getByRole('button', { name: 'Apply now', exact: true }).click();
+      await page.waitForFunction('window.__transactions.applyCalls === 2');
+      expect(await page.evaluate('window.__transactions.writes')).toBe(1);
+      expect(await page.evaluate('window.__transactions.persistenceTransactions')).toEqual(['original']);
+      await page.close();
+    });
+    it('ignores a late successful read after an attributed stop'   , async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ ok:true,status:"hotDurabilityPending",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0 });');
+      await page.waitForFunction('typeof window.__transactions.statusReceipt === "function"');
+      await page.evaluate('window.__transactions.events({phase:"stopped",kind:"stop",terminal:true,mainGeneration:11}); window.__transactions.statusReceipt({ok:true,status:"hotApplied",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0});');
+      await page.getByText('Applied at runtime; persistence is still pending.', {exact:true}).waitFor();
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      await page.close();
+    });
+    it('asks before restart, decline preserves pending, and stale confirmation stays failed', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate('window.__transactions.receipt({ ok: false, status: "restartRequired", restartConfirmation: "bound-1", reasons: [{code:"unsupportedCore",path:"secret-never-render"}], pendingApply:true, restartRequired:true });');
+      await page.getByRole('dialog').waitFor();
+      expect(await page.getByRole('dialog').textContent()).not.toContain('secret-never-render');
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      await page.getByRole('button', { name: 'Keep current connection', exact: true }).click();
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      await page.locator(button).click();
+      await page.waitForFunction('window.__transactions.applyCalls === 2');
+      await page.evaluate('window.__transactions.receipt({ ok: false, status: "restartRequired", restartConfirmation: "bound-2", reasons: [{code:"structuralChange",path:"tun"}] });');
+      await page.getByRole('button', { name: 'Restart and apply', exact: true }).click();
+      await page.waitForFunction('window.__transactions.applyCalls === 3');
+      expect(await page.evaluate('window.__transactions.applyTokens[2]')).toBe('bound-2');
+      await page.evaluate('window.__transactions.receipt({ ok:false, status:"conflict", pendingApply:true });');
+      await page.locator(errorBar).waitFor();
+      expect(await page.locator(button).isDisabled()).toBe(false);
+      await page.close();
+    });
+    it.each(['hotApplied', 'hotDurabilityPending', 'unconfirmed'] as const)('renders %s without fabricating restart evidence', async (status) => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode);
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      await page.evaluate(value => (window as any).__transactions.receipt({ok:true,status:value}), status);
+      if (status === 'hotDurabilityPending') {
+        await page.getByText('Applied at runtime; persistence is still pending.', {exact:true}).waitFor();
+        expect(await page.locator(button).count()).toBe(0);
+      } else if (status === 'unconfirmed') {
+        await page.locator(errorBar).waitFor();
+      } else {
+        await page.waitForFunction(selector => (document.querySelector(selector) as HTMLButtonElement | null)?.disabled === false, button);
+        expect(await page.locator(errorBar).count()).toBe(0);
+      }
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      await page.close();
+    });
     it.each(['ready', 'failed'])('binds an early intermediate restart and then owned %s', async (phase) => {
       const page = await browser.newPage();
       await page.goto(origin + '/__transactions?mode=' + mode);

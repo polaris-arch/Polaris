@@ -4,6 +4,7 @@ import {
   pendingChangesCount,
   hasPendingWork,
   applyOutcome,
+  runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
   isRestartFailureCode,
   composeBarView,
@@ -76,6 +77,17 @@ describe('pendingChangesCount', () => {
         typeof pendingChangesCount
       >[0])
     ).toBe(1);
+  });
+});
+
+describe('runtimePersistenceRecoveryEnded', () => {
+  const superseded = [{ code: 'OWNER_STATE_SUPERSEDED', path: 'desired' }];
+  it('ends only a confirmed superseded desired-owner recovery', () => {
+    expect(runtimePersistenceRecoveryEnded('conflict', superseded)).toBe(true);
+    expect(runtimePersistenceRecoveryEnded('unconfirmed', superseded)).toBe(false);
+    expect(runtimePersistenceRecoveryEnded('conflict', [{ code: 'OWNER_STATE_SUPERSEDED', path: 'active' }])).toBe(false);
+    expect(runtimePersistenceRecoveryEnded('conflict', [{ code: 'CONFLICT', path: 'desired' }])).toBe(false);
+    expect(runtimePersistenceRecoveryEnded('conflict')).toBe(false);
   });
 });
 
@@ -534,5 +546,55 @@ describe('A/B 不混同 —— 停核（只动 B）不得产出「未保存」�
       composeBarView(barInput({ stagedPhase: 'clean', pendingPhase: 'none', coreRunning: false }))
         .visible
     ).toBe(false);
+  });
+});
+
+
+describe('HOT receipt outcomes', () => {
+  it('completes a committed receipt without waiting for a process lifecycle event', () => {
+    expect(applyOutcome('hotApplied').phase).toBe('idle');
+    expect(applyOutcome('applied').phase).toBe('applying');
+  });
+  it('keeps persistence pending visible without offering a second Apply', () => {
+    const outcome = applyOutcome('hotDurabilityPending');
+    expect(outcome).toEqual({ phase: 'durabilityPending', toast: null });
+    const view = composeBarView(barInput({ pendingPhase: pendingPhaseOf(outcome.phase, PENDING_NONE) }));
+    expect(view.visible).toBe(true);
+    expect(view.titleKey).toBe('home.pendingHotDurabilityPending');
+    expect(view.actions).toEqual([]);
+  });
+  it('offers only persistence recovery when an original receipt is available', () => {
+    const input = barInput({ pendingPhase: 'durabilityPending', persistenceRetryAvailable: true });
+    expect(composeBarView(input).actions).toEqual([{ id: 'retryPersistence', disabled: false }]);
+    expect(composeBarView({ ...input, coreRunning: false }).actions).toEqual([]);
+  });
+  it.each(['clean', 'staged'] as const)('preserves persistence-only retry after failure with %s drafts', (stagedPhase) => {
+    const view = composeBarView(barInput({ stagedPhase, pendingPhase: 'applyFailed', persistenceOnly: true,
+      persistenceRetryAvailable: true }));
+    expect(view.actions).toEqual([{ id: 'retryPersistence', disabled: false }]);
+    expect(view.err).toBe(true);
+  });
+  it('requires a separate exit action after confirmed owner supersession', () => {
+    const view = composeBarView(barInput({ stagedPhase: 'staged', pendingPhase: 'applyFailed', persistenceOnly: true,
+      persistenceRetryAvailable: true, persistenceRecoveryEnded: true }));
+    expect(view.actions).toEqual([{ id: 'dismissApply', disabled: false }]);
+    expect(view.err).toBe(true);
+  });
+  it.each(['conflict', 'rejected', 'unconfirmed'] as const)('%s is never success', (status) => {
+    expect(applyOutcome(status).phase).toBe('failed');
+    expect(applyOutcome(status).toast?.kind).toBe('error');
+  });
+  it('restartRequired does not start or claim a restart', () => {
+    expect(applyOutcome('restartRequired')).toEqual({ phase: 'idle', toast: null });
+  });
+});
+
+describe('durable desired owner conflicts', () => {
+  it('explains newer saved settings only for the trusted reason and path', () => {
+    expect(applyOutcome('conflict', [{ code: 'OWNER_STATE_SUPERSEDED', path: 'desired' }]))
+      .toEqual({ phase: 'failed', toast: { kind: 'error', key: 'home.pendingHotOwnerSuperseded' } });
+    for (const reasons of [undefined, [{ code: 'OWNER_STATE_SUPERSEDED', path: 'other' }], [{ code: 'arbitrary kernel message', path: 'desired' }]]) {
+      expect(applyOutcome('conflict', reasons).toast?.key).toBe('home.pendingHotConflict');
+    }
   });
 });

@@ -19,7 +19,7 @@ const saveMock = vi.fn(
   })
 );
 const getMock = vi.fn(async (): Promise<UserConfig> => CONFIG);
-const applyMock = vi.fn(async () => ({ ok: true, status: 'applied' as const }));
+const applyMock = vi.fn(async (_token?: string): Promise<import('@/contracts/types').PendingApplyResult> => ({ ok: true, status: 'applied' }));
 /** Q1-b ④：「上次是不是正常退出」。默认假 = 强杀/重载/没退过 ⇒ 照常恢复（旧行为）。 */
 const cleanExitMock = vi.fn(async () => false);
 const stagedPendingMock = vi.fn(async (_pending: boolean) => undefined);
@@ -30,7 +30,7 @@ vi.mock('@/ipc', () => ({
       save: (c: unknown, d?: boolean, b?: string) => saveMock(c, d, b),
       setStagedPending: (pending: boolean) => stagedPendingMock(pending),
     },
-    proxy: { applyPendingChanges: () => applyMock() },
+    proxy: { applyPendingChanges: (token?: string) => applyMock(token) },
     window: { takeCleanExitFlag: () => cleanExitMock() },
   },
 }));
@@ -522,6 +522,27 @@ describe('save —— 落盘但不排重启（FR-5）', () => {
 });
 
 describe('applyNow —— 保存 + force-restart（FR-6）', () => {
+  it('confirmed restart forwards exact token without saving newer staged edits', async () => {
+    seedStaged();
+    const before = useStagedConfigStore.getState().entries;
+    applyMock.mockResolvedValueOnce({ ok: false, status: 'conflict', pendingApply: true, restartRequired: false });
+    await expect(useStagedConfigStore.getState().applyNow('candidate-bound-token')).resolves.toEqual({
+      saved: true, status: 'conflict', pendingApply: true, restartRequired: false,
+    });
+    expect(applyMock).toHaveBeenCalledWith('candidate-bound-token');
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(getMock).not.toHaveBeenCalled();
+    expect(useStagedConfigStore.getState().entries).toEqual(before);
+  });
+
+  it('returns the restart prompt token and trusted structured reasons unchanged', async () => {
+    const reasons = [{ code: 'unsupportedCore', path: '' }];
+    applyMock.mockResolvedValueOnce({ ok: false, status: 'restartRequired', restartConfirmation: 'token', reasons, pendingApply: true, restartRequired: true });
+    await expect(useStagedConfigStore.getState().applyNow()).resolves.toEqual({
+      saved: true, status: 'restartRequired', restartConfirmation: 'token', reasons, pendingApply: true, restartRequired: true,
+    });
+  });
+
   it('保存过关 ⇒ 调 applyPendingChanges 并回传排程结果', async () => {
     seedStaged();
     await expect(useStagedConfigStore.getState().applyNow()).resolves.toEqual({

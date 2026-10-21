@@ -297,19 +297,31 @@ pub fn proxy_get_pending_changes(
     ApiResponse::ok(state.proxy().pending_changes())
 }
 
-/// 上游 `PROXY_APPLY_PENDING_CHANGES`：立即应用待应用变更（force-restart）。
+/// Apply saved changes through HOT negotiation; restart requires its bound confirmation token.
 ///
 /// 返回 `{ ok, status }`，status ∈ `applied | deferred | skipped`（对齐 上游 proxy-handlers.ts:122-127）。
 /// status 由**真实运行态 + lifecycle 在飞判定**得出（此前硬编码 `"applied"` → UI 误报成功）。
 #[tauri::command]
 pub async fn proxy_apply_pending_changes(
     state: State<'_, AppRuntime>,
+    restart_confirmation: Option<String>,
+    retry_persistence_transaction_id: Option<String>,
 ) -> Result<ApiResponse<Value>, ()> {
-    let proxy = state.proxy.clone();
-    let (status, apply_id) = proxy.apply_pending_owned().await;
-    Ok(ApiResponse::ok(
-        json!({ "ok": status != "skipped", "status": status, "applyId": apply_id }),
-    ))
+    // The explicit retry selector is mutually exclusive with restart permission.
+    if restart_confirmation.is_some() && retry_persistence_transaction_id.is_some() { return Err(()); }
+    let result = if let Some(transaction_id) = retry_persistence_transaction_id {
+        state.proxy.retry_runtime_persistence(transaction_id).await
+    } else {
+        state.proxy.clone().apply_pending_transaction(restart_confirmation).await
+    };
+    Ok(ApiResponse::ok(serde_json::to_value(result).map_err(|_| ())?))
+}
+
+/// Observe an existing HOT transaction without resubmission or restart.
+#[tauri::command]
+pub async fn proxy_runtime_apply_status(state: State<'_, AppRuntime>, transaction_id: String) -> Result<ApiResponse<Value>, ()> {
+    let result = state.proxy.runtime_apply_status(transaction_id).await;
+    Ok(ApiResponse::ok(serde_json::to_value(result).map_err(|_| ())?))
 }
 
 // ── C10：自定义协议兼容性 probe（上游 `ProxyManager.probeOutbound`，:3749-3818）─────────────

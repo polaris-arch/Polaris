@@ -1118,7 +1118,7 @@ function blankStrings(src) {
 /** A13a 的判定本体（抽出来给自检复用）。返回 null = 通过，否则是失败原因。 */
 function a13aVerdict(startKernelBody) {
   if (!startKernelBody) return '切不出 BoxService.startKernel 的函数体';
-  const passed = /startOrReloadService\(\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(startKernelBody);
+  const passed = /startOrReloadService(?:With(?:Retryable)?RuntimePersistence)?\(\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(startKernelBody);
   if (!passed) return 'startKernel 里没有 startOrReloadService(<变量>, …) 调用';
   const v = passed[1];
   const decl = new RegExp(`val\\s+${v}\\s*=\\s*([^\\n]+)`).exec(startKernelBody);
@@ -1138,6 +1138,7 @@ function a13SelfCheck() {
     code('private fun startKernel() {\n val b = VpnBridge.currentConfig()\n val config = b ?: SystemStart.load(service)\n server.startOrReloadService(config, o)\n}'),
     'startKernel'
   );
+  const goodPersistence = good.replace('startOrReloadService(', 'startOrReloadServiceWithRetryableRuntimePersistence(');
   const inComment = kotlinFnBody(
     code('private fun startKernel() {\n // val config = b ?: SystemStart.load(service)\n val config = VpnBridge.currentConfig() ?: error("x")\n server.startOrReloadService(config, o)\n}'),
     'startKernel'
@@ -1147,6 +1148,7 @@ function a13SelfCheck() {
     'startKernel'
   );
   if (a13aVerdict(good) !== null) hardFail(`A13 自检：合成的正确形态没被认出来（${a13aVerdict(good)}）—— 判据塌了`);
+  if (a13aVerdict(goodPersistence) !== null) hardFail('A13 self-check: authoritative persistence start lost its original config source guard');
   if (a13aVerdict(inComment) === null) hardFail('A13 自检：注释里的 `?: SystemStart.load(` 喂饱了判据 —— 剥注释失效');
   if (a13aVerdict(inString) === null) hardFail('A13 自检：字符串里的 `?: SystemStart.load(` 喂饱了判据 —— 抹字符串失效');
 }
@@ -1244,7 +1246,7 @@ a13SelfCheck();
     }
   }
   const startCalls = [...(startKernel ?? '').matchAll(/SystemStart\.requireLegacyAllowed\(/g)].map((m) => m.index);
-  const nativeStartAt = (startKernel ?? '').indexOf('server.startOrReloadService(');
+  const nativeStartAt = /server\.startOrReloadService(?:With(?:Retryable)?RuntimePersistence)?\(/.exec(startKernel ?? '')?.index ?? -1;
   if (startCalls.length < 2 || nativeStartAt < 0 || !startCalls.some((at) => at < nativeStartAt) ||
       !startCalls.some((at) => at > nativeStartAt)) {
     fail('A13f BoxService 系统/legacy 起核没有在 native Start 前后复查 marker');

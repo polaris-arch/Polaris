@@ -11,7 +11,7 @@ export type MeshNodeRouteBadge =
 
 function applied(report: MeshRouteReport): boolean {
   return report.snapshot.scope === 'applied'
-    && report.snapshot.loadEvidence === 'startupReady'
+    && (report.snapshot.loadEvidence === 'startupReady' || report.snapshot.loadEvidence === 'runtimeCommitted')
     && !report.snapshot.snapshotStale;
 }
 

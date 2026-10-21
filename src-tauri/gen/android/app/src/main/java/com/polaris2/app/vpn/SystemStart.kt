@@ -128,6 +128,57 @@ internal object SystemStart {
         Log.i(TAG, "已记下本次起核配置，系统发起的起核可用")
     }
 
+    /** Commit the actual restart source, never a diagnostic snapshot. Caller owns BoxService. */
+    @Synchronized
+    fun persistRuntime(context: Context, config: String, expectedDigest: String,
+                       expectedGeneration: Long, allowed: () -> Boolean, publish: () -> Unit) {
+        check(disconnectGeneration == expectedGeneration && allowed()) { "runtime persistence owner expired" }
+        requireLegacyAllowed(context)
+        check(config.isNotEmpty() && sha256(config.toByteArray(Charsets.UTF_8)) == expectedDigest) {
+            "runtime persistence digest mismatch"
+        }
+        val admission = digestFile(context)
+        // Two files cannot be renamed atomically together. Missing/mismatched digest
+        // denies restart throughout the update, including a crash between renames.
+        fun invalidate() {
+            check(!admission.exists() || admission.delete()) { "cannot revoke runtime restart admission" }
+            syncDirectory(context.noBackupFilesDir)
+        }
+        invalidate()
+        try {
+            writeDurably(runtimeConfig(context), config)
+            check(disconnectGeneration == expectedGeneration && allowed()) { "runtime persistence owner expired" }
+            requireLegacyAllowed(context)
+            writeDurably(admission, expectedDigest)
+            requireLegacyAllowed(context)
+            check(disconnectGeneration == expectedGeneration && allowed()) { "runtime persistence owner expired" }
+            publish()
+        } catch (failure: Throwable) {
+            // Never roll a published graph back, or restore stale restart permission.
+            try { invalidate() } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
+            throw failure
+        }
+    }
+
+    private fun syncDirectory(directory: File) {
+        val fd = Os.open(directory.path, OsConstants.O_RDONLY or OsConstants.O_DIRECTORY, 0)
+        try { Os.fsync(fd) } finally { Os.close(fd) }
+    }
+
+    private fun writeDurably(target: File, content: String) {
+        val parent = checkNotNull(target.parentFile)
+        check(parent.isDirectory) { "runtime persistence directory missing" }
+        val tmp = File(parent, ".${target.name}.${java.util.UUID.randomUUID()}.tmp")
+        try {
+            java.io.FileOutputStream(tmp).use { output ->
+                output.write(content.toByteArray(Charsets.UTF_8))
+                output.fd.sync()
+            }
+            Os.rename(tmp.path, target.path)
+            syncDirectory(parent)
+        } finally { tmp.delete() }
+    }
+
     /** 用户主动断开（或其它「不应再自启」的时刻）：删摘要。幂等。 */
     @Synchronized
     fun forget(context: Context, why: String) {

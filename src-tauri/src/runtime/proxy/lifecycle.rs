@@ -1481,6 +1481,7 @@ impl ProxyRuntime {
         if let Ok(mut snap) = self.startup_snapshot.write() {
             *snap = None;
         }
+        self.clear_runtime_config_baseline();
         if let Ok(mut ready) = self.ready_main.write() {
             *ready = None;
         }
@@ -2039,7 +2040,7 @@ impl ProxyRuntime {
                 return None;
             }
         };
-        self.selector_reconcile.with_intent_claim(|current_intent| {
+        self.config.try_with_saved_commit(|desired| self.selector_reconcile.with_intent_claim(|current_intent| {
             let mut pending = self
                 .pending_force_restart
                 .write()
@@ -2049,7 +2050,13 @@ impl ProxyRuntime {
             }
             let snapshot = match (force_id, pending.as_ref()) {
                 (Some(want), Some((id, value, source))) if want == *id => {
-                    if let super::ForceRestartSource::Selected { intent_generation } = source {
+                    if matches!(source, super::ForceRestartSource::Confirmed { .. }) && value != desired {
+                        *pending = None;
+                        self.gate.clear_force_restart();
+                        return None;
+                    }
+                    if let super::ForceRestartSource::Selected { intent_generation }
+                        | super::ForceRestartSource::Confirmed { intent_generation } = source {
                         if *intent_generation != current_intent {
                             *pending = None;
                             if self.gate.pending().force_restart_id == Some(want) {
@@ -2080,7 +2087,7 @@ impl ProxyRuntime {
                 *pending = None;
             }
             Some((snapshot, generation, legacy_lease))
-        })
+        })).ok().flatten()
     }
 
     /// 置错误态（起核失败）。

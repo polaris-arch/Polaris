@@ -574,7 +574,9 @@ export type StagedDecision = 'hotSwitch' | 'noOp' | 'defer' | 'restart';
 
 export interface StagedClassification {
   decision: StagedDecision;
-  /** 恒等式：`restartRequired === decision ∈ {defer, restart}`。是 `decision` 的投影，不是第二个判据。 */
+  /** Saved desired state still differs from the accepted running state. */
+  pendingApply: boolean;
+  /** A restart is actually required; independent of pendingApply. */
   restartRequired: boolean;
 }
 
@@ -831,4 +833,20 @@ export interface UserConfig {
   helperDisabledPromptDismissed?: boolean;
 
   uiTheme?: 'light' | 'dark' | 'system';
+}
+
+/** Receipt-based HOT outcomes and legacy explicitly confirmed restart scheduling. */
+export interface PendingApplyResult {
+  persistenceMode?: string;
+  transactionId?: string;
+  runtimeGeneration?: number;
+  selectionIntentGeneration?: number;
+  ok: boolean;
+  status: 'applied' | 'deferred' | 'skipped' | 'hotApplied' | 'hotDurabilityPending'
+    | 'restartRequired' | 'conflict' | 'rejected' | 'unconfirmed';
+  applyId?: number | null;
+  restartConfirmation?: string;
+  reasons?: { code: string; path: string }[];
+  pendingApply?: boolean;
+  restartRequired?: boolean;
 }

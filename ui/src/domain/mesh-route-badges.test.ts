@@ -30,6 +30,19 @@ describe('S2 badge projections preserve unknown without assigning ownership', ()
     expect(meshNodeRouteBadge(report, 'c')).toEqual({ kind: 'unknown' });
   });
 
+  it('accepts committed runtime loading while retaining scope and stale guards', () => {
+    const report = applied();
+    report.snapshot.loadEvidence = 'runtimeCommitted';
+    expect(meshNodeRouteBadge(report, 'a')).toEqual({ kind: 'clear' });
+    expect(ruleMeshRouteEvidence(report, rule('10.20.1.7'), rule('10.20.1.7'))).toBe('overlap');
+    report.snapshot.snapshotStale = true;
+    expect(meshNodeRouteBadge(report, 'a')).toEqual({ kind: 'unknown' });
+    expect(ruleMeshRouteEvidence(report, rule('10.20.1.7'), rule('10.20.1.7'))).toBe('unknown');
+    report.snapshot.snapshotStale = false;
+    report.snapshot.scope = 'persistedUnknown';
+    expect(meshNodeRouteBadge(report, 'a')).toEqual({ kind: 'unknown' });
+  });
+
   it('unconfirmed scope, missing report, omitted node, and unconfirmed blocker stay unknown', () => {
     expect(meshNodeRouteBadge(fixture, 'b')).toEqual({ kind: 'unknown' });
     expect(meshNodeRouteBadge(null, 'b')).toEqual({ kind: 'unknown' });

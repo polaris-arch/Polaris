@@ -48,13 +48,14 @@ const ALL_WORKFLOWS = ['ci.yml', 'ui.yml', 'package.yml', 'release-risk.yml'] as
 // Strict native Package setup also checks out the exact candidate and uses Node 26
 // to validate its published contract before admitting the matrix.
 const NODE_JOBS = [
-  ['ci.yml', 4], ['ui.yml', 1], ['package.yml', 5], ['release-risk.yml', 3],
+  ['ci.yml', 5], ['ui.yml', 1], ['package.yml', 5], ['release-risk.yml', 3],
 ] as const;
 // cheap_format adds one conditional Node 26 setup for exact candidate admission;
 // the reusable candidate call has no local checkout or Node steps. Windows native acceptance
 // leg adds an exact kernel checkout and uses Go, not a second Node installation.
 // The manual-only launcher diagnostic independently checks out the same two sources.
-const CHECKOUT_COUNTS = { 'ci.yml': 7, 'ui.yml': 1, 'package.yml': 5, 'release-risk.yml': 3 } as const;
+// The additive RuntimeConfig source/mock job adds one independent checkout and Node setup.
+const CHECKOUT_COUNTS = { 'ci.yml': 8, 'ui.yml': 1, 'package.yml': 5, 'release-risk.yml': 3 } as const;
 const CHECKOUT_TOTAL = Object.values(CHECKOUT_COUNTS).reduce((sum, count) => sum + count, 0);
 const NODE_JOBS_TOTAL = NODE_JOBS.reduce((sum, [, count]) => sum + count, 0);
 
@@ -124,10 +125,10 @@ describe('CI 工具链钉扎守门', () => {
   it('CI 非 Node checkout 有独立且精确的职责，不掩盖任一 Rust job 丢失 Node', () => {
     const ci = read('ci.yml').replace(/^\s*#.*$/gm, '');
     const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
-    expect(jobs).toEqual(['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'windows_launcher_diagnostics']);
+    expect(jobs).toEqual(['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_source_tests', 'windows_launcher_diagnostics']);
     const job = (name: string) => ci.split(`\n  ${name}:\n`)[1].split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
     for (const [name, checkouts, nodes] of [
-      ['cheap_format', 1, 1], ['native_dns_candidate_gates', 0, 0], ['lint', 1, 1], ['cross', 1, 1], ['test', 2, 1], ['windows_launcher_diagnostics', 2, 0],
+      ['cheap_format', 1, 1], ['native_dns_candidate_gates', 0, 0], ['lint', 1, 1], ['cross', 1, 1], ['test', 2, 1], ['runtime_config_source_tests', 1, 1], ['windows_launcher_diagnostics', 2, 0],
     ] as const) {
       const block = job(name);
       expect(block.match(/uses: actions\/checkout@v7/g) ?? [], name).toHaveLength(checkouts);

@@ -44,6 +44,7 @@ mod tls_capabilities;
 pub(crate) mod core_log;
 mod dns_takeover;
 mod hot_switch;
+mod runtime_config;
 mod lifecycle;
 mod login_fallback;
 mod management_api;
@@ -1338,6 +1339,8 @@ pub struct SpeedProbeTargets {
 /// 持有 config / helper / mesh 引用（跨运行时协作：启动需读 config + 可能经 helper 提权 + mesh exit route）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForceRestartSource {
+    /// Exact snapshot approved by the restart dialog; never refreshed by later edits.
+    Confirmed { intent_generation: u64 },
     /// An explicit Apply or full-config operation owns the snapshot; later selector intents only
     /// update its selected id and must not revoke the authorized full restart.
     Full,
@@ -1492,6 +1495,8 @@ pub struct ProxyRuntime {
     /// 表现为最后一次点击被盖回、继而由错误快照触发多余重启。Tokio Mutex 按等待顺序放行，且锁只护
     /// 配置入核流水线，不与同步 [`LifecycleGate`] / 配置写锁混用。
     switch_serial: AsyncMutex<()>,
+    runtime_config_baseline: RwLock<Option<runtime_config::RuntimeConfigBaseline>>,
+    runtime_config_apply: Mutex<runtime_config::RuntimeConfigApplyState>,
     native_observation: Mutex<native_auto::NativeObservation>,
     /// selector 意图代次、强制重申脏位与后台单飞交接的唯一 owner。
     /// 它与 `switch_serial` 正交：前者给出跨 await 的所有权事实，后者仍串行真实入核 I/O。
@@ -1851,6 +1856,8 @@ impl ProxyRuntime {
             pending_switch: RwLock::new(None),
             switch_seq: AtomicU64::new(1),
             switch_serial: AsyncMutex::new(()),
+            runtime_config_baseline: RwLock::new(None),
+            runtime_config_apply: Mutex::new(runtime_config::RuntimeConfigApplyState::default()),
             native_observation: Mutex::new(native_auto::NativeObservation::default()),
             selector_reconcile: Arc::new(SelectorReconcileOwner::default()),
             auto_select: std::sync::Mutex::default(),

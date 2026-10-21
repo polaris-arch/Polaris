@@ -183,7 +183,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const ci = workflow('ci.yml');
     const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
     expect(jobs, 'ci.yml 的 job 集合变了 —— 新 job 要有人过目：它的缓存键、它能不能被关掉').toEqual([
-      'cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'windows_launcher_diagnostics',
+      'cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_source_tests', 'windows_launcher_diagnostics',
     ]);
 
     // Manual candidate and committed formal validation reuse the same App commit; ordinary gates remain mandatory.
@@ -362,16 +362,16 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const keysOf = (block: string) =>
       [...block.matchAll(/uses: Swatinem\/rust-cache@v2\n {8}with:\n(?: {10}.*\n)*? {10}key: (.+)\n/g)].map((m) => m[1]);
     const ci = workflow('ci.yml');
-    const ciKeys = ['lint', 'cross', 'test'].map((name) => {
+    const ciKeys = ['lint', 'cross', 'test', 'runtime_config_source_tests'].map((name) => {
       const block = executable(jobBlock(ci, name));
       expect(block.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], `${name} job 的 rust-cache 步数`).toHaveLength(1);
       const keys = keysOf(block);
       expect(keys, `${name} job 的 rust-cache 没有显式 key`).toHaveLength(1);
       return keys[0];
     });
-    // 逐字钉住：键是字面量（不含 run_id / sha 之类每次都变的东西 ⇒ 稳定），且三者互不相同。
-    expect(ciKeys).toEqual(['lint', 'cross', 'test']);
-    expect(ci.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], 'ci.yml 有不属于这三个 job 的 rust-cache').toHaveLength(3);
+    // 逐字钉住：键是字面量（不含 run_id / sha 之类每次都变的东西 ⇒ 稳定），且四者互不相同。
+    expect(ciKeys).toEqual(['lint', 'cross', 'test', 'runtime-config-source']);
+    expect(ci.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], 'ci.yml 有不属于这四个 job 的 rust-cache').toHaveLength(4);
 
     const pkg = workflow('package.yml');
     const pkgKeys = keysOf(executable(jobBlock(pkg, 'package')));
@@ -1457,7 +1457,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
       ...['mapping.txt', 'usage.txt', 'seeds.txt', 'configuration.txt'].map(
         (name) => `src-tauri/gen/android/app/build/outputs/mapping/arm64Release/${name}`,
       ),
-      ...['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest'].map(
+      ...['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest'].map(
         (name) => `src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.${name}.xml`,
       ),
       '${{ runner.temp }}/s5-android-unit-results.json',
@@ -1522,7 +1522,7 @@ describe('风险门轻量构型：只在 release-risk 路径生效，发行构�
     const s5Units = executable(stepBlock(releaseCheck, 'Verify S5 Android network observation and admission unit tests'));
     expect(s5Units).toContain('bash src-tauri/gen/android/gradlew --project-dir src-tauri/gen/android');
     expect(s5Units).toContain(':app:cleanTestArm64ReleaseUnitTest :app:testArm64ReleaseUnitTest');
-    for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest']) {
+    for (const name of ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest']) {
       expect(s5Units).toContain(`--tests com.polaris2.app.vpn.${name}`);
     }
     expect(s5Units).toContain('python3 -I -');

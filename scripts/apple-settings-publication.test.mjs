@@ -45,3 +45,41 @@ test('apply preserves the existing timeout quarantine and never publishes by its
   assert.match(apply, /provider\.settingsTimedOut\(token, error: error\)/);
   assert.match(apply, /guard provider\.acceptsSettings\(token\)/);
 });
+
+test('runtime receipt retains the exact owner without pretending memory is crash durability', () => {
+  const owner = provider.slice(provider.indexOf('private final class TunnelRuntimeRestartOwner'));
+  assert.match(owner, /func runtimePersistenceMode\(\) -> String \{ "app_authoritative_regeneration" \}/);
+  assert.match(owner, /digest\(configContent\) == effectiveDigest/);
+  assert.match(owner, /guard !revoked, self\.incarnation == nil \|\| self\.incarnation == incarnation/);
+  assert.match(owner, /revision >= self\.revision/);
+  assert.match(owner, /lifecycle\.publishSettings\(token, publication:/);
+  assert.doesNotMatch(owner, /\.sync\s*\{|startOrReloadService|write\(to:|saveToPreferences/);
+  const start = section(provider, '    private func startRuntimeOwnedService(', '    private func sharedDirectory()');
+  assert.ok(start.indexOf('runtimeRestartOwner?.revoke()') < start.indexOf('let owner = TunnelRuntimeRestartOwner'));
+  assert.match(start, /server\.startOrReloadServiceWithRetryableRuntimePersistence\(config, options: LibboxOverrideOptions\(\), handler: owner\)/);
+  assert.match(start, /catch \{\s*owner\.revoke\(\)/);
+  assert.match(provider, /let config = self\.runtimeRestartOwner\?\.snapshot\(\)/);
+});
+
+test('managed bootstrap preserves digest and directory admission before the new owner start', () => {
+  const managed = section(provider, '    private func handleManagedBootstrap(', '    override func sleep(');
+  const digest = managed.indexOf('digest(config) == identity.configDigest');
+  const activate = managed.indexOf('server.activateTailscaleDirectoryDomain(pending.ownerNonce, expectedSourceIdentity: expectedSource)');
+  const start = managed.indexOf('startRuntimeOwnedService(server, config: config, token: pending.token)');
+  assert.ok(digest >= 0 && digest < activate && activate < start);
+  assert.match(managed, /capability\["sourceIdentity"\] as\? String == expectedSource/);
+  assert.match(managed, /lifecycle\.accepts\(pending\.token\)/);
+});
+
+
+test('reload invalidates the previous callback generation before reading its retained source', () => {
+  const reload = section(provider, '    func enqueueReload()', '    func publishSettings(');
+  const claim = reload.indexOf('let token = try lifecycle.reload()');
+  const snapshot = reload.indexOf('self.runtimeRestartOwner?.snapshot()');
+  assert.ok(claim >= 0 && claim < snapshot);
+  const gate = section(lifecycle, '    func reload()', '    func prepareStop(');
+  assert.match(gate, /lock\.lock\(\); defer \{ lock\.unlock\(\) \}/);
+  assert.match(gate, /generation \+= 1/);
+  const owner = provider.slice(provider.indexOf('private final class TunnelRuntimeRestartOwner'));
+  assert.match(owner, /lifecycle\.publishSettings\(token, publication:/);
+});

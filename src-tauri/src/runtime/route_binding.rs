@@ -126,6 +126,17 @@ pub fn automatic_runtime_binding_root_ids(config: &UserConfig) -> BTreeSet<Strin
     .collect()
 }
 
+/// Pure reuse guard for daily graph edits while TUN owns system routes. Protocol
+/// credentials/transport edits retain the route fact; a changed automatic target
+/// host or uncovered physical root cannot reuse an old destination decision.
+pub(crate) fn runtime_binding_targets_reusable(old: &UserConfig, new: &UserConfig, plan: &RuntimeBindingPlan) -> bool {
+    let previous: BTreeMap<_, _> = hot_switch_runtime_binding_candidates(Platform::current(), old)
+        .into_iter().map(|candidate| (candidate.server_id, candidate.host)).collect();
+    runtime_binding_candidates_for_roots(Platform::current(), new, active_physical_root_ids(new))
+        .into_iter().all(|candidate| plan.covered_roots.contains(&candidate.server_id)
+            && previous.get(&candidate.server_id) == Some(&candidate.host))
+}
+
 /// 在 TUN 接管系统路由之前生成会话级绑定。任何单目标失败都 fail-open：该节点继续使用 sing-box
 /// `auto_detect_interface`；其余成功节点不受影响。整轮有硬预算，不能把坏 DNS/路由工具拖进冷启动关键路径。
 pub async fn plan_runtime_bindings(config: &UserConfig) -> RuntimeBindingPlan {

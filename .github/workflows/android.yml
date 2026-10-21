@@ -514,13 +514,15 @@ jobs:
             --tests com.polaris2.app.vpn.AndroidNativeAdmissionTest \
             --tests com.polaris2.app.vpn.AndroidNativeMainControlsTest \
             --tests com.polaris2.app.vpn.MainNativeAdmissionWiringTest \
+            --tests com.polaris2.app.vpn.DualModeEndpointWiringTest \
+            --tests com.polaris2.app.vpn.RuntimePersistenceSourceTest \
             -PpolarisAllowUnsigned=true -x :app:rustBuildArm64Release --max-workers=2 --no-daemon
           python3 -I - "$RUNNER_TEMP/s5-android-unit-results.json" <<'PYRESULT'
           import hashlib, json, re, subprocess, sys
           from pathlib import Path
           from xml.etree import ElementTree as ET
           base = Path('src-tauri/gen/android/app')
-          classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest']
+          classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest']
           rows = []
           for name in classes:
               source = base / 'src/test/java/com/polaris2/app/vpn' / (name + '.kt')
@@ -579,6 +581,8 @@ jobs:
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidNativeAdmissionTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidNativeMainControlsTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.MainNativeAdmissionWiringTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.DualModeEndpointWiringTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimePersistenceSourceTest.xml
             ${{ runner.temp }}/s5-android-unit-results.json
             ${{ runner.temp }}/release-stage1.log
           # Preserve original Rust/Tauri/frontend/first-Gradle stage1 output even on failure.

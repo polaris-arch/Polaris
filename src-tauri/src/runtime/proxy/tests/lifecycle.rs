@@ -122,7 +122,7 @@ async fn stop_terminal_discards_pending_switch() {
 }
 
 #[tokio::test]
-async fn apply_during_a_restart_stop_wait_keeps_its_exact_snapshot() {
+async fn apply_during_a_restart_stop_wait_conflicts_without_creating_a_force_snapshot() {
     let (rt, _dir) = test_runtime();
     let disk = two_node_config(7891, "node-b");
     rt.config.save_full(&disk).unwrap();
@@ -141,21 +141,14 @@ async fn apply_during_a_restart_stop_wait_keeps_its_exact_snapshot() {
         rt.gate.is_busy(),
         "restart must own its outer lifecycle while stop waits"
     );
-    assert_eq!(rt.apply_pending().await, "deferred");
-    let (id, saved, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
-    assert_eq!(saved, rt.config.current().unwrap());
-    assert_eq!(source, ForceRestartSource::Full);
+    let before = rt.config.current().unwrap();
+    assert_eq!(rt.apply_pending().await, "conflict");
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(rt.config.current().unwrap(), before);
     drop(held);
-    let _ = restart.await.unwrap(); // synthetic bad start may fail; the pending Apply must survive.
-    assert_eq!(
-        rt.pending_force_restart
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|(next, _, _)| *next),
-        Some(id),
-        "the transient stop leg must not clear an Apply received during its await"
-    );
+    let _ = restart.await.unwrap(); // synthetic bad start may fail; no Apply was authorized.
+    assert!(rt.pending_force_restart.read().unwrap().is_none(),
+        "a busy Apply must not leave an implicit restart behind");
     rt.gate.bump_generation();
 }
 
@@ -278,9 +271,17 @@ fn running_effective_proxy_mode_type_tracks_the_running_snapshot_only() {
 #[tokio::test]
 async fn stop_terminal_discards_pending_force_restart() {
     let (rt, _dir) = test_runtime();
+    let running = two_node_config(7891, "node-a");
+    rt.config.save_full(&running).unwrap();
+    mark_running(&rt);
+    *rt.current_config.write().unwrap() = Some(rt.config.current().unwrap());
+    let (status, id) = rt.apply_confirmed_for_test().await;
+    assert_eq!(status, "applied");
+    let (queued_id, saved, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+    assert_eq!(Some(queued_id), id);
+    assert_eq!(saved, rt.config.current().unwrap());
+    assert!(matches!(source, ForceRestartSource::Confirmed { .. }));
     rt.gate.begin();
-    let _ = rt.apply_pending().await; // deferred，置下 pending
-    assert!(rt.pending_force_restart.read().unwrap().is_some());
 
     // 收尾为 Stop → 丢弃全部 pending，且本层的专用快照同步清空。
     rt.finish_lifecycle(LifecycleKind::Stop);
@@ -1201,9 +1202,9 @@ async fn real_core_full_lifecycle() {
         "[③] Status 必须是真实运行数据"
     );
 
-    // ── ⑤ apply_pending 真实状态（运行中 + 非在飞 → applied）──────────────────
-    let ap = rt.apply_pending().await;
-    println!("[⑤] apply_pending（运行中）→ {ap}");
+    // ── ⑤ explicitly confirmed restart scheduling, not implicit HOT success ──
+    let (ap, _) = rt.apply_confirmed_for_test().await;
+    println!("[⑤] explicitly confirmed restart scheduling → {ap}");
     assert_eq!(ap, "applied");
 
     // ── ④ 停核干净、无孤儿 ──────────────────────────────────────────────────
@@ -2268,7 +2269,8 @@ async fn dispatched_apply_early_failures_emit_one_owned_terminal_without_teardow
                 std::fs::write(&marker, b"injected invalid admission marker").unwrap();
             }
         }));
-        let (status, id) = rt.apply_pending_owned().await;
+        *rt.current_config.write().unwrap() = Some(rt.config.current().unwrap());
+        let (status, id) = rt.apply_confirmed_for_test().await;
         assert_eq!(status, "applied");
         let id = id.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -2313,7 +2315,8 @@ async fn dispatched_apply_superseded_after_claim_does_not_publish_failure() {
         weak.upgrade().unwrap().bump_generation();
         signal.store(true, Ordering::SeqCst);
     }));
-    assert_eq!(rt.apply_pending_owned().await.0, "applied");
+    *rt.current_config.write().unwrap() = Some(rt.config.current().unwrap());
+    assert_eq!(rt.apply_confirmed_for_test().await.0, "applied");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if seen.load(Ordering::SeqCst) && !rt.gate.is_busy() {

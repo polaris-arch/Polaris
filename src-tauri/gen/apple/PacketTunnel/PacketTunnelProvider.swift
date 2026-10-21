@@ -13,7 +13,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     // These handles and config bytes are only accessed on worker.
     private var commandServer: LibboxCommandServer?
     private var commandIdentity: TunnelIdentity?
-    private var configContent: String?
+    private var runtimeRestartOwner: TunnelRuntimeRestartOwner?
     private var managedBootstrap: (identity: TunnelIdentity, token: UInt64, ownerNonce: String, completion: TunnelCompletion<Error?>)?
     private var reportURL: URL?
     private let reportLock = NSLock()
@@ -80,9 +80,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         return
                     }
                     guard let supplied else { throw tunnelError("Tunnel configuration is absent") }
-                    try server.startOrReloadService(supplied, options: LibboxOverrideOptions())
+                    try self.startRuntimeOwnedService(server, config: supplied, token: token)
                     guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel start finished after cancellation/timeout") }
-                    self.configContent = supplied
                     self.lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: identity)
                     self.lifecycle.retainTailscaleDirectoryScope(server.exportTailscaleDirectoryRetirement(), identity: identity)
                     self.lifecycle.complete(token, phase: "running", stopped: false)
@@ -127,6 +126,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             managedBootstrap = nil
             pending.completion.finish(tunnelError("Managed bootstrap was stopped before activation"))
         }
+        runtimeRestartOwner?.revoke()
         if let commandServer {
             do { try commandServer.closeService() } catch {
                 failure = error.localizedDescription
@@ -143,7 +143,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         commandServer = nil
         commandIdentity = nil
-        configContent = nil
+        runtimeRestartOwner = nil
         platform.reset()
         return failure
     }
@@ -161,11 +161,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         worker.async {
             do {
-                guard self.lifecycle.accepts(token), let config = self.configContent,
+                guard self.lifecycle.accepts(token), let config = self.runtimeRestartOwner?.snapshot(),
                       let server = self.commandServer else { throw tunnelError("Tunnel reload was superseded") }
                 self.reasserting = true
                 defer { self.reasserting = false }
-                try server.startOrReloadService(config, options: LibboxOverrideOptions())
+                try self.startRuntimeOwnedService(server, config: config, token: token)
                 if let commandIdentity = self.commandIdentity {
                     self.lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: commandIdentity)
                     self.lifecycle.retainTailscaleDirectoryScope(server.exportTailscaleDirectoryRetirement(), identity: commandIdentity)
@@ -291,9 +291,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         do {
             try server.activateTailscaleDirectoryDomain(pending.ownerNonce, expectedSourceIdentity: expectedSource)
             guard lifecycle.accepts(pending.token) else { throw tunnelError("Managed activation was superseded") }
-            try server.startOrReloadService(config, options: LibboxOverrideOptions())
+            try startRuntimeOwnedService(server, config: config, token: pending.token)
             guard lifecycle.accepts(pending.token) else { throw tunnelError("Managed activation returned after timeout/Stop") }
-            configContent = config
             lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: identity)
             lifecycle.retainTailscaleDirectoryScope(server.exportTailscaleDirectoryRetirement(), identity: identity)
             guard lifecycle.complete(pending.token, phase: "running", stopped: false),
@@ -332,6 +331,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// One callback owner per native instance. Never dispatch-sync a Go callback
+    /// onto worker: Close on worker joins that same persistence callback.
+    private func startRuntimeOwnedService(_ server: LibboxCommandServer, config: String, token: UInt64) throws {
+        runtimeRestartOwner?.revoke()
+        let owner = TunnelRuntimeRestartOwner(config: config, lifecycle: lifecycle, token: token)
+        runtimeRestartOwner = owner
+        do {
+            try server.startOrReloadServiceWithRetryableRuntimePersistence(config, options: LibboxOverrideOptions(), handler: owner)
+        } catch {
+            owner.revoke()
+            throw error
+        }
+    }
+
     private func sharedDirectory() throws -> URL {
         guard let group = Bundle.main.object(forInfoDictionaryKey: "PolarisAppGroup") as? String,
               let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
@@ -367,4 +380,55 @@ private func digest(_ config: String) -> String {
 }
 func tunnelError(_ message: String) -> NSError {
     NSError(domain: "PolarisPacketTunnel", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+}
+
+/// This acknowledges the current provider's reload source only. The kernel keeps
+/// regeneration persistence pending until Rust separately proves authoritative D.
+/// No shared-profile file or byte-exact crash-replay guarantee is introduced.
+private final class TunnelRuntimeRestartOwner: NSObject, LibboxRuntimePersistenceHandlerProtocol {
+    private let lock = NSLock()
+    private let lifecycle: TunnelLifecycle
+    private let token: UInt64
+    private var content: String
+    private var revoked = false
+    private var incarnation: String?
+    private var revision: Int64 = -1
+    private var effectiveDigest: String?
+
+    init(config: String, lifecycle: TunnelLifecycle, token: UInt64) {
+        self.content = config
+        self.lifecycle = lifecycle
+        self.token = token
+    }
+
+    func runtimePersistenceMode() -> String { "app_authoritative_regeneration" }
+
+    func snapshot() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return revoked ? nil : content
+    }
+
+    func revoke() { lock.lock(); revoked = true; lock.unlock() }
+
+    func persistRuntimeConfiguration(_ incarnation: String?, revision: Int64,
+                                     effectiveDigest: String?, configContent: String?) throws {
+        guard let incarnation, !incarnation.isEmpty, revision >= 0,
+              let effectiveDigest, let configContent, !configContent.isEmpty,
+              digest(configContent) == effectiveDigest else {
+            throw tunnelError("Runtime reload receipt identity is invalid")
+        }
+        lock.lock(); defer { lock.unlock() }
+        guard !revoked, self.incarnation == nil || self.incarnation == incarnation,
+              revision >= self.revision,
+              revision != self.revision || self.effectiveDigest == effectiveDigest else {
+            throw tunnelError("Runtime reload receipt belongs to a stale owner")
+        }
+        guard lifecycle.publishSettings(token, publication: {
+            self.incarnation = incarnation
+            self.revision = revision
+            self.effectiveDigest = effectiveDigest
+            self.content = configContent
+            return true
+        }) else { throw tunnelError("Runtime reload owner was superseded") }
+    }
 }

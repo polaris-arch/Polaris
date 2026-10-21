@@ -243,8 +243,8 @@ const WRITES: &[(&str, &[Site])] = &[
                 "reconcile_persisted_selector_with_api",
                 "对账用的运行态副本",
             ),
-            // commit_selected_projection/restart_selected_projection now publish an
-            // already prepared whole config; neither writes the selectedServerId key.
+            // commit_selected_projection publishes a prepared whole config;
+            // defer_selected_projection only marks pending. Neither writes this key.
             // The constructing write sites above remain registered independently.
         ],
     ),

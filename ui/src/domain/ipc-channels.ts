@@ -22,6 +22,7 @@ export const IPC_CHANNELS = {
   PROXY_GET_PENDING_CHANGES: 'proxy_get_pending_changes',
   // §2 动作条「立即应用」：把 Rust 侧最新 config force-restart 入核（复用 F11 applyConfigForcingRestart，绕 P2-A/B defer）。
   PROXY_APPLY_PENDING_CHANGES: 'proxy_apply_pending_changes',
+  PROXY_RUNTIME_APPLY_STATUS: 'proxy_runtime_apply_status',
   KERNEL_PROBE_OUTBOUND: 'kernel_probe_outbound', // 自定义协议兼容性 probe（当前内核 sing-box check）
 
   // 配置管理

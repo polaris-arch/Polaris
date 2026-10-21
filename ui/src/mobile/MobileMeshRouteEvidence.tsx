@@ -24,7 +24,7 @@ export function asMeshRouteReport(value: unknown): MeshRouteReport | null {
     ['declared', 'observed', 'retained', 'bootstrap', 'opaque'].includes(String(item.source));
   if (!['preview', 'applied', 'persistedUnknown'].includes(String(snapshot.scope)) ||
       !['draft', 'running', 'persisted'].includes(String(snapshot.configSource)) ||
-      !['startupReady', 'fileWrittenUnacknowledged', 'loadFailed', 'unknown'].includes(String(snapshot.loadEvidence)) ||
+      !['startupReady', 'runtimeCommitted', 'fileWrittenUnacknowledged', 'loadFailed', 'unknown'].includes(String(snapshot.loadEvidence)) ||
       !Array.isArray(snapshot.candidates) || !strings(snapshot.precedingExceptions) ||
       typeof snapshot.snapshotStale !== 'boolean' || !finite(snapshot.sampledAtMs) ||
       !(snapshot.dnsOwnerServerId === null || typeof snapshot.dnsOwnerServerId === 'string') ||
@@ -64,7 +64,7 @@ export function meshRouteIsApplied(report: MeshRouteReport): boolean {
   return s.scope === 'applied' && s.configSource === 'running' &&
     typeof s.configVersion === 'string' && s.configVersion.length > 0 &&
     typeof s.runGeneration === 'number' && Number.isFinite(s.runGeneration) &&
-    s.loadEvidence === 'startupReady' && !s.snapshotStale;
+    (s.loadEvidence === 'startupReady' || s.loadEvidence === 'runtimeCommitted') && !s.snapshotStale;
 }
 
 export function meshRouteState(report: MeshRouteReport | null, serverId?: string, previous = false, legacy = false,

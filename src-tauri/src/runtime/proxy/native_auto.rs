@@ -577,16 +577,23 @@ impl ProxyRuntime {
         });
     }
 
-    async fn restore_native_wrappers(&self, generation: u64, previous: &[(String, String)]) {
+    async fn restore_native_wrappers(
+        &self,
+        generation: u64,
+        intent: u64,
+        previous: &[(String, String)],
+    ) {
         let api = self.management_api().await;
         for (wrapper, selected) in previous {
-            if self.core_generation() != generation || !self.core_running() {
+            // Compensation belongs to this operation too. A newer selection or
+            // lifecycle owner must never be overwritten by an old rollback.
+            if !self.selector_operation_is_current(generation, intent) || self.gate.is_busy() {
                 break;
             }
             let _ = self.native_put(&api, wrapper, selected).await;
         }
         self.selector_reconcile.mark_required();
-        if self.core_generation() == generation {
+        if self.selector_operation_is_current(generation, intent) && !self.gate.is_busy() {
             let revision = self.native_observation_revision();
             if let Ok(groups) = self.native_read_groups(&api).await {
                 self.publish_native_groups(generation, revision, groups);
@@ -595,8 +602,11 @@ impl ProxyRuntime {
         }
     }
 
-    /// OFF pins all referenced wrappers before persistence. A failed/partial runtime
-    /// operation never commits OFF; the returned error leaves reconciliation visible.
+    /// OFF freezes each scope's last verified TCP winner through its outer
+    /// selector. This is independent per-scope control, not a simultaneous global
+    /// snapshot: native URLTest may advance between observation and PUT. Every
+    /// wrapper must read back correctly before OFF is persisted. Failed/partial
+    /// operations remain visible; compensation never authorizes a restart.
     pub(crate) async fn native_auto_set_enabled(
         self: &Arc<Self>,
         enabled: bool,
@@ -612,6 +622,8 @@ impl ProxyRuntime {
         let typed: UserConfig =
             serde_json::from_value(original.clone()).map_err(|_| "AUTO_SELECT_INVALID_CONFIG")?;
         let targets = model::referenced_targets(&typed);
+        let default_target = polaris_store::auto_select::target(&original);
+        let mut frozen_default = None;
         if enabled
             && targets
                 .iter()
@@ -626,6 +638,7 @@ impl ProxyRuntime {
             let runtime: UserConfig = serde_json::from_value(running.clone())
                 .map_err(|_| "AUTO_SELECT_INVALID_CONFIG")?;
             if model::referenced_targets(&runtime) != targets
+                || polaris_store::auto_select::target(&running) != default_target
                 || (!targets.is_empty() && model::test_url(&runtime) != model::test_url(&typed))
                 || targets.iter().any(|target| {
                     model::eligible_members(&runtime, target)
@@ -646,6 +659,9 @@ impl ProxyRuntime {
         }
         let mut next = original.clone();
         next["autoSelectEnabled"] = json!(enabled);
+        if running && !self.runtime_physical_targets_ready(&next) {
+            return Err("AUTO_SELECT_REQUIRES_APPLY".into());
+        }
         let mut pins = typed.auto_select_pins.clone();
         let mut previous = Vec::new();
         let mut puts = Vec::new();
@@ -670,9 +686,29 @@ impl ProxyRuntime {
                         .find(|group| group.tag == wrapper)
                         .expect("preflight group");
                     previous.push((wrapper.clone(), group.selected.clone()));
+                    if default_target.as_ref() == Some(&pin.target) {
+                        frozen_default = Some(pin.server_id.clone());
+                    }
                     pins.retain(|old| old.target != pin.target);
                     pins.push(pin);
                     puts.push((wrapper, tag));
+                }
+                if let Some(target) = &default_target {
+                    let actual = frozen_default.as_ref().ok_or("AUTO_SELECT_NO_ACTUAL_EXIT")?;
+                    let tag = nodes.get(actual).ok_or("AUTO_SELECT_NO_ACTUAL_EXIT")?;
+                    let proxy = groups.iter().find(|group| {
+                        group.tag == "proxy-selector"
+                            && group.selected == model::wrapper_tag(target)
+                            && group.items.iter().any(|item| &item.tag == tag)
+                    }).ok_or("AUTO_SELECT_NO_ACTUAL_EXIT")?;
+                    // OFF is a mode change, not a user exit switch: detach the
+                    // default from Auto at the same frozen leaf, without closes.
+                    // Otherwise enabling a shared rule wrapper would rebind it.
+                    previous.push(("proxy-selector".into(), proxy.selected.clone()));
+                    puts.push(("proxy-selector".into(), tag.clone()));
+                    next.as_object_mut().ok_or("AUTO_SELECT_INVALID_CONFIG")?
+                        .remove(polaris_store::SELECTION_INTENT_KEY);
+                    next["selectedServerId"] = json!(actual);
                 }
             } else {
                 for target in &targets {
@@ -691,6 +727,10 @@ impl ProxyRuntime {
                     puts.push((wrapper, native));
                 }
             }
+            next["autoSelectPins"] = serde_json::to_value(&pins).map_err(|error| error.to_string())?;
+            if !self.runtime_physical_targets_ready(&next) {
+                return Err("AUTO_SELECT_REQUIRES_APPLY".into());
+            }
             if !self.selector_operation_is_current(generation, intent_generation)
                 || self
                     .config
@@ -708,7 +748,7 @@ impl ProxyRuntime {
                             .unwrap_or(true)
                         || self.native_put(&api, wrapper, member).await.is_err()
                     {
-                        self.restore_native_wrappers(generation, &previous).await;
+                        self.restore_native_wrappers(generation, intent_generation, &previous).await;
                         return Err("AUTO_SELECT_SWITCH_FAILED".into());
                     }
                 }
@@ -726,10 +766,13 @@ impl ProxyRuntime {
                         .as_ref()
                         .is_ok_and(|groups| updates_attested(groups, &puts))
                 {
-                    self.restore_native_wrappers(generation, &previous).await;
+                    self.restore_native_wrappers(generation, intent_generation, &previous).await;
                     return Err("AUTO_SELECT_SWITCH_FAILED".into());
                 }
-                self.publish_native_groups(generation, revision, groups.unwrap());
+                if self.publish_native_groups(generation, revision, groups.unwrap()).is_none() {
+                    self.restore_native_wrappers(generation, intent_generation, &previous).await;
+                    return Err("AUTO_SELECT_SWITCH_FAILED".into());
+                }
             }
         } else if !enabled {
             for target in &targets {
@@ -743,8 +786,18 @@ impl ProxyRuntime {
                     return Err("AUTO_SELECT_NO_ACTUAL_EXIT".into());
                 }
             }
+            if let Some(target) = &default_target {
+                let pin = model::pin(&typed, target).ok_or("AUTO_SELECT_NO_ACTUAL_EXIT")?;
+                frozen_default = Some(pin.to_owned());
+                next.as_object_mut().ok_or("AUTO_SELECT_INVALID_CONFIG")?
+                    .remove(polaris_store::SELECTION_INTENT_KEY);
+                next["selectedServerId"] = json!(pin);
+            }
         }
         next["autoSelectPins"] = serde_json::to_value(pins).map_err(|error| error.to_string())?;
+        // The writer registers its intent before persistence; retain that token
+        // even if disk persistence fails so compensation cannot use a newer owner.
+        let mut written_intent = None;
         let saved = self.config.update(|latest| {
             if *latest != original
                 || self.core_generation() != generation
@@ -754,13 +807,17 @@ impl ProxyRuntime {
                 return Decision::Skip(None);
             }
             *latest = next.clone();
-            Decision::Write(Some(self.register_selector_intent()))
+            let intent = self.register_selector_intent();
+            written_intent = Some(intent);
+            Decision::Write(Some(intent))
         });
         let new_intent = match saved {
             Ok((Some(intent), _)) => intent,
             _ => {
                 if !previous.is_empty() && !needs_restart {
-                    self.restore_native_wrappers(generation, &previous).await;
+                    self.restore_native_wrappers(
+                        generation, written_intent.unwrap_or(intent_generation), &previous,
+                    ).await;
                 }
                 return Err("AUTO_SELECT_SWITCH_FAILED".into());
             }
@@ -772,6 +829,11 @@ impl ProxyRuntime {
                 .ok_or("AUTO_SELECT_NO_ACTUAL_EXIT")?;
             projected["autoSelectEnabled"] = json!(enabled);
             projected["autoSelectPins"] = next["autoSelectPins"].clone();
+            if let Some(actual) = &frozen_default {
+                projected.as_object_mut().ok_or("AUTO_SELECT_INVALID_CONFIG")?
+                    .remove(polaris_store::SELECTION_INTENT_KEY);
+                projected["selectedServerId"] = json!(actual);
+            }
             let outcome = self.commit_native_mode_projection(
                 &projected,
                 generation,
@@ -790,7 +852,7 @@ impl ProxyRuntime {
                         Decision::Skip(())
                     }
                 });
-                self.restore_native_wrappers(generation, &previous).await;
+                self.restore_native_wrappers(generation, new_intent, &previous).await;
                 return Err("AUTO_SELECT_SWITCH_FAILED".into());
             }
             apply_outcome = match outcome.expect("claimed mode projection") {
@@ -844,6 +906,10 @@ impl ProxyRuntime {
         intent: u64,
         restart: bool,
     ) -> Option<super::SwitchOutcome> {
+        let freezes_default = projected.get("autoSelectEnabled").and_then(Value::as_bool) == Some(false)
+            && polaris_store::auto_select::target(projected).is_none()
+            && self.current_config_snapshot().as_ref()
+                .is_some_and(|running| polaris_store::auto_select::target(running).is_some());
         let mut existing = None;
         let current = self.with_native_projection_claim(generation, intent, || {
             let mut pending = self
@@ -851,8 +917,14 @@ impl ProxyRuntime {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             existing = pending.as_mut().map(|(id, config, source)| {
+                if matches!(source, super::ForceRestartSource::Confirmed { .. }) { return *id; }
                 config["autoSelectEnabled"] = projected["autoSelectEnabled"].clone();
                 config["autoSelectPins"] = projected["autoSelectPins"].clone();
+                // OFF also makes the default concrete. Do not let a queued,
+                // unconfirmed projection resurrect its removed Auto reference.
+                if freezes_default {
+                    super::hot_switch::copy_selection_projection(config, projected);
+                }
                 if matches!(source, super::ForceRestartSource::Selected { .. }) {
                     *source = super::ForceRestartSource::Selected {
                         intent_generation: intent,
@@ -865,19 +937,14 @@ impl ProxyRuntime {
                 self.commit_coex_current_config(projected.clone());
             }
         });
-        if !current {
+        if !current || (!restart && self.current_config_snapshot().as_ref() != Some(projected)) {
             return None;
         }
         if restart {
-            if let Some(id) = existing {
-                return Some(if self.debounced.replace_force_if_current(generation, id) {
-                    self.schedule_restart_for_generation(generation);
-                    super::SwitchOutcome::Restarting
-                } else {
-                    super::SwitchOutcome::Pending
-                });
-            }
-            return Some(self.restart_selected_projection(projected, generation, intent));
+            // Reusing an old queued identifier is not authorization for this
+            // new Auto projection to restart the core.
+            let _ = existing;
+            return Some(self.defer_selected_projection(projected, generation, intent));
         }
         Some(super::SwitchOutcome::HotSwitched)
     }
@@ -886,6 +953,8 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         target: AutoSelectTarget,
     ) -> Result<NativeAutoStatus, String> {
+        use polaris_config_engine::builder::hotswitch::{HotSwitchKind, HotSwitchPlan, HotSwitchPut};
+        use polaris_switch_engine::HotSwitchOutcome;
         let serial = self.switch_serial.lock().await;
         if self.gate.is_busy() {
             return Err("AUTO_SELECT_BUSY".into());
@@ -903,6 +972,13 @@ impl ProxyRuntime {
             return Err("AUTO_SELECT_SCOPE_EMPTY".into());
         }
         let mut projected = self.current_config_snapshot();
+        // A user selecting Auto from a concrete node changes the logical exit,
+        // even when URLTest currently resolves to that same physical node.
+        // Keep Auto feature ON/OFF and Auto-to-Auto scope changes unchanged.
+        let interrupt_manual_exit = typed.interrupt_connections_on_switch == Some(true)
+            && projected.as_ref().is_some_and(|running| {
+                polaris_store::auto_select::target(running).is_none()
+            });
         if self.core_running() {
             let runtime: UserConfig =
                 serde_json::from_value(projected.clone().ok_or("AUTO_SELECT_NO_ACTUAL_EXIT")?)
@@ -940,6 +1016,14 @@ impl ProxyRuntime {
             None
         };
         let intent = polaris_store::auto_select::intent(&target);
+        if self.core_running() {
+            let mut target_projection = projected.clone().ok_or("AUTO_SELECT_NO_ACTUAL_EXIT")?;
+            target_projection[polaris_store::SELECTION_INTENT_KEY] = intent.clone();
+            target_projection["autoSelectEnabled"] = json!(true);
+            if !self.runtime_physical_targets_ready(&target_projection) {
+                return Err("AUTO_SELECT_REQUIRES_APPLY".into());
+            }
+        }
         let (generation, _) = self
             .config
             .update(|latest| {
@@ -1006,16 +1090,42 @@ impl ProxyRuntime {
                     .filter(|group| updates.iter().any(|(tag, _)| tag == &group.tag))
                     .map(|group| (group.tag.clone(), group.selected.clone()))
                     .collect();
+                let mut pending_disconnect = None;
                 if !aligned {
-                    for (tag, member) in &updates {
-                        if !self.selector_operation_is_current(core_generation, generation)
-                            || self.native_put(&api, tag, member).await.is_err()
-                        {
-                            self.restore_native_wrappers(core_generation, &previous)
-                                .await;
-                            return Err("AUTO_SELECT_SWITCH_FAILED".into());
-                        }
+                    let plan = HotSwitchPlan {
+                        kind: HotSwitchKind::Global,
+                        must_restart: false,
+                        puts: updates
+                            .iter()
+                            .map(|(tag, member)| HotSwitchPut {
+                                selector_tag: tag.clone(),
+                                member_tag: member.clone(),
+                                // Only the default logical exit is being replaced.
+                                // Never acquire the independent rule wrapper's scope.
+                                old_member_tag: if tag == "proxy-selector" {
+                                    previous
+                                        .iter()
+                                        .find(|(old, _)| old == tag)
+                                        .map(|(_, member)| member.clone())
+                                } else {
+                                    None
+                                },
+                            })
+                            .collect(),
+                    };
+                    let (outcome, captured) = self
+                        .execute_hot_switch_plan_with_pre_switch_snapshot(
+                            &plan,
+                            interrupt_manual_exit,
+                            core_generation,
+                            generation,
+                        )
+                        .await;
+                    if !matches!(outcome, HotSwitchOutcome::Applied { .. }) {
+                        self.restore_native_wrappers(core_generation, generation, &previous).await;
+                        return Err("AUTO_SELECT_SWITCH_FAILED".into());
                     }
+                    pending_disconnect = Some(captured);
                 }
                 let revision = self.native_observation_revision();
                 let groups = self.native_read_groups(&api).await;
@@ -1024,31 +1134,37 @@ impl ProxyRuntime {
                         .as_ref()
                         .is_ok_and(|groups| updates_attested(groups, &updates))
                 {
-                    self.restore_native_wrappers(core_generation, &previous)
+                    self.restore_native_wrappers(core_generation, generation, &previous)
                         .await;
                     return Err("AUTO_SELECT_SWITCH_FAILED".into());
                 }
-                let groups = groups.unwrap();
+                if self.publish_native_groups(core_generation, revision, groups.unwrap()).is_none() {
+                    self.restore_native_wrappers(core_generation, generation, &previous).await;
+                    return Err("AUTO_SELECT_SWITCH_FAILED".into());
+                }
                 if !self.with_native_projection_claim(core_generation, generation, || {
                     self.commit_selected_projection(projected, generation)
-                }) {
-                    self.restore_native_wrappers(core_generation, &previous)
+                }) || self.current_config_snapshot().as_ref() != Some(&*projected) {
+                    self.restore_native_wrappers(core_generation, generation, &previous)
                         .await;
                     return Err("AUTO_SELECT_SWITCH_FAILED".into());
                 }
-                self.publish_native_groups(core_generation, revision, groups);
+                if let Some(captured) = pending_disconnect {
+                    self.finish_logical_exit_disconnect(captured, core_generation, generation)
+                        .await;
+                }
                 self.reconcile_emitted_exit_route(core_generation).await;
             } else {
-                // New reference adds native outbounds. Only the authorized R projection
-                // is queued; unrelated saved D rules/DNS/TUN edits stay pending.
-                self.restart_selected_projection(projected, core_generation, generation);
+                // New reference adds native outbounds. Keep it pending for explicit
+                // graph Apply; never consume unrelated saved D or restart implicitly.
+                self.defer_selected_projection(projected, core_generation, generation);
             }
             let _ = &serial;
         }
         Ok(self.native_auto_status().await)
     }
-    /// Pin a clean existing node through the existing hot-switch executor. Equal
-    /// TCP leaves change intent only; different leaves retain precision disconnect.
+    /// Pin a clean existing node through the existing hot-switch executor.
+    /// Auto and a concrete node are different logical exits, including equal TCP leaves.
     pub(super) async fn native_manual_exit(
         self: &Arc<Self>,
         projected: &Value,
@@ -1068,6 +1184,9 @@ impl ProxyRuntime {
         if selected_mode(&typed) != NORMAL {
             return None;
         }
+        if !self.runtime_physical_targets_ready(projected) {
+            return Some(SwitchOutcome::Deferred);
+        }
         let generation = self.core_generation();
         let api = self.management_api().await;
         let groups = self.native_read_groups(&api).await.ok()?;
@@ -1076,12 +1195,11 @@ impl ProxyRuntime {
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().map(|snapshot| snapshot.id_to_tag.clone()))?;
-        let actual = tcp_leaf("proxy-selector", &groups, &nodes)?;
+        tcp_leaf("proxy-selector", &groups, &nodes)?;
         let tag = nodes.get(server_id)?;
         let proxy = groups.iter().find(|group| {
             group.tag == "proxy-selector" && group.items.iter().any(|item| &item.tag == tag)
         })?;
-        let same = actual == server_id;
         let plan = HotSwitchPlan {
             kind: HotSwitchKind::Global,
             must_restart: false,
@@ -1091,16 +1209,15 @@ impl ProxyRuntime {
                 old_member_tag: Some(proxy.selected.clone()),
             }],
         };
-        if !matches!(
-            self.execute_hot_switch_plan(
+        let (outcome, captured) = self
+            .execute_hot_switch_plan_with_pre_switch_snapshot(
                 &plan,
-                !same && typed.interrupt_connections_on_switch == Some(true),
+                typed.interrupt_connections_on_switch == Some(true),
                 generation,
                 intent
             )
-            .await,
-            HotSwitchOutcome::Applied { .. }
-        ) {
+            .await;
+        if !matches!(outcome, HotSwitchOutcome::Applied { .. }) {
             self.selector_reconcile.mark_required();
             self.reconcile_emitted_exit_route(generation).await;
             return Some(SwitchOutcome::Pending);
@@ -1114,28 +1231,29 @@ impl ProxyRuntime {
         {
             self.restore_native_wrappers(
                 generation,
+                intent,
                 &[("proxy-selector".into(), proxy.selected.clone())],
             )
             .await;
             return Some(SwitchOutcome::Pending);
         }
-        if !self.with_selected_projection_claim(projected, generation, intent, || {
-            self.commit_selected_projection(projected, intent)
-        }) {
+        if self.publish_native_groups(generation, revision, groups.unwrap()).is_none()
+            || !self.with_selected_projection_claim(projected, generation, intent, || {
+                self.commit_selected_projection(projected, intent)
+            })
+            || self.current_config_snapshot().as_ref() != Some(projected)
+        {
             self.restore_native_wrappers(
                 generation,
+                intent,
                 &[("proxy-selector".into(), proxy.selected.clone())],
             )
             .await;
             return Some(SwitchOutcome::Pending);
         }
-        self.publish_native_groups(generation, revision, groups.unwrap());
+        self.finish_logical_exit_disconnect(captured, generation, intent).await;
         self.reconcile_emitted_exit_route(generation).await;
-        Some(if same {
-            SwitchOutcome::NoOp
-        } else {
-            SwitchOutcome::HotSwitched
-        })
+        Some(SwitchOutcome::HotSwitched)
     }
 
     /// Existing daemon URLTest is asynchronous: acknowledgement is not a winner

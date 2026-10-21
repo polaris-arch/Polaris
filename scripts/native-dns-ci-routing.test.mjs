@@ -107,12 +107,20 @@ function reusableContract(caller = workflow, callee = candidateWorkflow) {
   assert.doesNotMatch(callee, /secrets:|secrets\.|contents: write|actions: write|id-token:|cargo (?:build|test) --workspace|run: pnpm/);
 }
 
+test('RuntimeConfig source mocks remain independent of payload admission and use the exact package test', () => {
+  const job = section(workflow, 'runtime_config_source_tests');
+  assert.doesNotMatch(job, /^    needs:/m);
+  assert.doesNotMatch(job, /fetch-core|prepare-core-identity|POLARIS_REQUIRE_KERNEL_GATE|POLARIS_NATIVE_DNS_CANDIDATE|--release|continue-on-error/);
+  const commands = [...job.matchAll(/^        run: (cargo .+)$/gm)].map((match) => match[1]);
+  assert.deepEqual(commands, ['cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
+});
+
 test('manual inputs remain opt-in while the committed default preserves the ordinary DAG, matrix and exact workspace commands', () => {
   assert.equal((workflow.match(/^      native_dns_candidate:\n/gm) ?? []).length, 2);
   for (const entry of workflow.matchAll(/^      native_dns_candidate:\n([\s\S]*?)(?=^      \w|^\S)/gm))
     assert.match(entry[1], /type: string\n        default: ''/);
   assert.deepEqual([...workflow.matchAll(/^  (\w+):\n/gm)].filter((m) => m.index > workflow.indexOf('\njobs:\n')).map((m) => m[1]),
-    ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'windows_launcher_diagnostics']);
+    ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_source_tests', 'windows_launcher_diagnostics']);
   for (const job of ['lint', 'cross', 'test']) assert.ok(workflow.includes(`  ${job}:\n    needs: cheap_format\n`));
   const testJobHeader = workflow.slice(workflow.indexOf('  test:\n')).split('    strategy:')[0];
   assert.match(testJobHeader, /    permissions:\n      contents: read\n$/);

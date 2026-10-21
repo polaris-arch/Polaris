@@ -1519,6 +1519,54 @@ jobs:
           retention-days: 14
 
 
+  # Independent additive API check: generated Rust bindings plus loopback mocks.
+  # No kernel payload, App build, mobile callback or live-TUN acceptance is implied.
+  # The existing full-workspace, wire, native payload and release gates remain intact.
+  runtime_config_source_tests:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '' }}
+    name: RuntimeConfig mock and source tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Install Rust toolchain (preinstalled rustup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: runtime-config-source
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+      - name: Assert pinned protoc resolves on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "protoc → $(command -v protoc)"
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
+      - name: Test additive RuntimeConfig client against loopback mocks
+        run: cargo test --locked -p polaris-singbox-grpc --test runtime_config
+      - name: State validation scope
+        shell: bash
+        run: |
+          printf '%s\n' 'RuntimeConfig: generated Rust bindings and loopback mock/source tests only. No built-kernel wire/service, App transaction, mobile callback, live-TUN or publication acceptance.' >> "$GITHUB_STEP_SUMMARY"
+
   windows_launcher_diagnostics:
     name: Windows launcher diagnosis (not PR acceptance)
     if: >-
