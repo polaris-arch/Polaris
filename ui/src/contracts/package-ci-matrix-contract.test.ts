@@ -183,7 +183,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const ci = workflow('ci.yml');
     const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
     expect(jobs, 'ci.yml 的 job 集合变了 —— 新 job 要有人过目：它的缓存键、它能不能被关掉').toEqual([
-      'cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_source_tests', 'windows_launcher_diagnostics',
+      'cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics',
     ]);
 
     // Manual candidate and committed formal validation reuse the same App commit; ordinary gates remain mandatory.
@@ -265,8 +265,8 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     for (const [name, block] of [['lint', lint], ['test', test]] as const) {
       const condition = foldedJobIf(block, name);
       expect(condition).toBe(name === 'lint'
-        ? "needs.cheap_format.outputs.app_native_compile_only != 'true' && needs.cheap_format.outputs.native_required != 'false'"
-        : "needs.cheap_format.outputs.native_required != 'false'");
+        ? "needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && needs.cheap_format.outputs.app_native_compile_only != 'true' && needs.cheap_format.outputs.native_required != 'false'"
+        : "needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && needs.cheap_format.outputs.native_required != 'false'");
       for (const value of ['', 'true', 'unknown', 'false'])
         expect(evaluateActions(condition, CI_ENTRIES[0], value)).toBe(value !== 'false');
       expect(block).toMatch(/^ {4}runs-on: \$\{\{ matrix\.os \}\}$/m);
@@ -285,7 +285,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       const conditions = [...block.matchAll(/^ {4}if: \$\{\{ (.*) \}\}$/gm)];
       expect(block.match(/^ {4}if:/gm) ?? []).toHaveLength(1);
       expect(conditions).toHaveLength(1);
-      expect(conditions[0][1]).toBe("(github.event_name == 'workflow_dispatch' && (inputs.app_native_compile_candidate || '') != '') || (github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '')");
+      expect(conditions[0][1]).toBe("(github.event_name == 'workflow_dispatch' && ((inputs.runtime_config_loopback_candidate || '') != '' || (inputs.app_native_compile_candidate || '') != '')) || (github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '')");
       for (const event of ['pull_request', 'push', 'merge_group', 'workflow_call', 'workflow_dispatch']) {
         for (const sourceOnly of [undefined, false, true]) {
           for (const selected of [undefined, false, true]) {
@@ -362,13 +362,13 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     );
   });
 
-  it('RuntimeConfig source-only dispatch schedules exactly its admission/test job; defaults retain all seven job decisions', () => {
+  it('RuntimeConfig isolated source and real-loopback dispatches preserve the original default job decisions', () => {
     const ci = workflow('ci.yml');
     const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
     const source = executable(jobBlock(ci, 'runtime_config_source_tests'));
-    const defaults = { app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
+    const defaults = { runtime_config_loopback_candidate: '', app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
       native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
-      windows_directory_candidate_source: '', os: 'all' };
+      windows_directory_candidate_source: '', os: 'all', preserve_run: false };
     type Selection = Partial<typeof defaults>;
     const conflicts: Selection[] = [{ windows_launcher_diagnostics: true }, { native_dns_candidate: 'a'.repeat(40) },
       { windows_system_candidate: 'a'.repeat(40) }, { windows_directory_mode: 'candidate' },
@@ -378,30 +378,31 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     // create thousands of VM contexts or depend on a relaxed test timeout.
     const conditions = Object.fromEntries(jobs.map((name) => {
       const block = executable(jobBlock(ci, name));
-      const line = /^ {4}if: \$\{\{ (.+) \}\}$/m.exec(block)?.[1];
+      const line = /^ {4}if: (?!>-)(.+)$/m.exec(block)?.[1].replace(/^\$\{\{ | \}\}$/g, '');
       const expression = line ?? foldedJobIf(block, name).replace(/^\$\{\{ | \}\}$/g, '');
       return [name, { needs: /^ {4}needs: (\w+)$/m.exec(block)?.[1],
         allows: runInNewContext(`(inputs, github, needs) => (${expression})`) }];
     }));
-    const decision = (name: string, event: string, selection: Selection, nativeRequired = 'true', formal = 'true') => {
+    const decision = (name: string, event: string, selection: Selection, nativeRequired = 'true', formal = 'true', loopbackOutput = '') => {
       const inputs = { ...defaults, ...selection };
       return Boolean(conditions[name].allows(inputs,
         { event_name: event, repository: 'polaris-arch/Polaris',
           ref: 'refs/heads/collab/dots-audit-remediation-20261017', workflow_ref: 'ordinary CI',
           event: { inputs: { ...inputs, runtime_config_source_only: 'true' } } },
         { cheap_format: { outputs: { native_required: nativeRequired, native_dns_formal: formal,
-          native_dns_candidate: '', native_dns_formal_app: 'a'.repeat(40) } } },
+          native_dns_candidate: '', native_dns_formal_app: 'a'.repeat(40), runtime_config_loopback_only: loopbackOutput } } },
       ));
     };
-    const scheduled = (event: string, selection: Selection, nativeRequired = 'true', formal = 'true') => {
+    const scheduled = (event: string, selection: Selection, nativeRequired = 'true', formal = 'true', loopbackOutput = '', cheapResult = 'success') => {
       const started = new Set<string>();
       for (const name of jobs) {
         const needs = conditions[name].needs;
-        if ((!needs || started.has(needs)) && decision(name, event, selection, nativeRequired, formal)) started.add(name);
+        if ((!needs || (started.has(needs) && cheapResult === 'success'))
+          && decision(name, event, selection, nativeRequired, formal, loopbackOutput)) started.add(name);
       }
       return [...started];
     };
-    for (const name of ['native_dns_candidate_gates', 'lint', 'cross', 'test']) {
+    for (const name of ['native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback']) {
       const header = executable(jobBlock(ci, name)).split('    steps:')[0];
       expect(header).toMatch(/^ {4}needs: cheap_format$/m);
       expect(header).not.toMatch(/always\(|cancelled\(|success\(|failure\(|continue-on-error/);
@@ -413,6 +414,44 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       expect(decision('runtime_config_source_tests', 'workflow_dispatch', selection)).toBe(false);
       expect(decision('windows_launcher_diagnostics', 'workflow_dispatch', selection)).toBe(false);
     }
+    const loopback = executable(jobBlock(ci, 'runtime_config_loopback'));
+    const loopbackOnly = { ...defaults, runtime_config_loopback_candidate: 'a'.repeat(40), os: 'ubuntu-22.04', preserve_run: true };
+    expect(scheduled('workflow_dispatch', loopbackOnly, 'true', 'true', 'true'))
+      .toEqual(['cheap_format', 'runtime_config_loopback']);
+    for (const output of ['', 'false', 'unknown', 'TRUE']) {
+      expect(scheduled('workflow_dispatch', loopbackOnly, 'true', 'true', output))
+        .toEqual(['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test']);
+      expect(decision('runtime_config_loopback', 'workflow_dispatch', loopbackOnly, 'true', 'true', output)).toBe(false);
+    }
+    for (const selection of [{}, ...conflicts, { runtime_config_source_only: true },
+      { app_native_compile_candidate: 'a'.repeat(40) }, { runtime_config_loopback_candidate: 'malformed' },
+      { runtime_config_loopback_candidate: ' ' },
+      { app_native_compile_candidate: 'a'.repeat(40), runtime_config_source_only: true, windows_launcher_diagnostics: true }]) {
+      const selected = { ...loopbackOnly, ...selection };
+      expect(decision('cheap_format', 'workflow_dispatch', selected)).toBe(true);
+      expect(decision('runtime_config_source_tests', 'workflow_dispatch', selected)).toBe(false);
+      expect(decision('windows_launcher_diagnostics', 'workflow_dispatch', selected)).toBe(false);
+      for (const outcome of ['failure', 'cancelled', 'skipped'])
+        expect(scheduled('workflow_dispatch', selected, 'true', 'true', 'true', outcome)).toEqual(['cheap_format']);
+    }
+    expect(loopback).toContain("if: needs.cheap_format.outputs.runtime_config_loopback_only == 'true'");
+    expect(loopback).toContain('runs-on: ubuntu-22.04');
+    expect(loopback).toContain('permissions:\n      contents: read');
+    expect(loopback).not.toMatch(/strategy:|Swatinem\/rust-cache@|actions\/cache@|fetch-core|prepare-core-identity|continue-on-error|contents: write|actions: write|id-token:|secrets:/);
+    const loopbackAdmission = stepBlock(loopback, 'Admit execution runner for real HOT loopback');
+    expect(loopbackAdmission).toContain('RUNTIME_CONFIG_LOOPBACK_INPUTS: ${{ toJSON(inputs) }}');
+    expect(loopbackAdmission).toContain('run: node scripts/runtime-config-loopback.mjs admit');
+    expect(loopback.indexOf(loopbackAdmission)).toBeLessThan(loopback.indexOf('      - name: Install Rust toolchain'));
+    expect(stepBlock(loopback, 'Run exact real App to paired kernel HOT loopback tests'))
+      .toContain('run: node scripts/runtime-config-loopback.mjs run');
+    const dispatch = ci.split('\n  workflow_dispatch:\n')[1].split('\n  workflow_call:\n')[0];
+    expect([...dispatch.matchAll(/^ {6}([a-z][a-z0-9_]*):$/gm)].map((match) => match[1])).toEqual([
+      'runtime_config_loopback_candidate', 'app_native_compile_candidate', 'runtime_config_source_only',
+      'native_dns_candidate', 'windows_system_candidate', 'windows_launcher_diagnostics', 'windows_directory_mode',
+      'windows_directory_candidate_source', 'preserve_run', 'os',
+    ]);
+    expect(dispatch).toMatch(/runtime_config_loopback_candidate:\n {8}description:.*\n {8}type: string\n {8}default: ''/);
+    expect(ci.split('\n  workflow_call:\n')[1].split('\njobs:\n')[0]).not.toContain('runtime_config_loopback_candidate');
     expect(source).not.toMatch(/^ {4}needs:|continue-on-error|fetch-core|sudo/m);
     expect(source).toContain('runs-on: ubuntu-22.04');
     expect(source).toContain('RuntimeConfig source only (not full CI/native/HOT acceptance)');
@@ -434,7 +473,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       expect(scheduled('workflow_dispatch', { ...selection, runtime_config_source_only: true })).toEqual(['runtime_config_source_tests']);
     expect(() => admit({})).not.toThrow();
     expect(() => admit({ os: 'ubuntu-22.04' })).not.toThrow();
-    for (const selection of [...conflicts, { app_native_compile_candidate: 'a'.repeat(40) }]) expect(() => admit(selection)).toThrow(/cannot combine/);
+    for (const selection of [...conflicts, { app_native_compile_candidate: 'a'.repeat(40) }, { runtime_config_loopback_candidate: 'a'.repeat(40) }]) expect(() => admit(selection)).toThrow(/cannot combine/);
     for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
       for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
         for (const diagnostic of [false, true]) for (const system of ['', 'a'.repeat(40)])
@@ -456,6 +495,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const keysOf = (block: string) =>
       [...block.matchAll(/uses: Swatinem\/rust-cache@v2\n {8}with:\n(?: {10}.*\n)*? {10}key: (.+)\n/g)].map((m) => m[1]);
     const ci = workflow('ci.yml');
+    expect(executable(jobBlock(ci, 'runtime_config_loopback'))).not.toMatch(/Swatinem\/rust-cache@|actions\/cache@/);
     const ciKeys = ['lint', 'cross', 'test', 'runtime_config_source_tests'].map((name) => {
       const block = executable(jobBlock(ci, name));
       expect(block.match(/uses: Swatinem\/rust-cache@v2/g) ?? [], `${name} job 的 rust-cache 步数`).toHaveLength(1);

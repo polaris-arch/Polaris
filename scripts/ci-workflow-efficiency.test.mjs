@@ -448,9 +448,9 @@ test('helper target/path controls reject old split-target mode, host drift and i
 });
 
 function assertLauncherDiagnosticJob(source) {
-  const job = source.split('\n  windows_launcher_diagnostics:\n')[1];
+  const job = source.split('\n  windows_launcher_diagnostics:\n')[1]?.split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
   assert.ok(job, 'independent diagnostic job');
-  const cheap = source.split('\n  cheap_format:\n')[1].split('\n  lint:\n')[0];
+  const cheap = source.split('\n  cheap_format:\n')[1].split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
   const cheapExpression = cheap.match(/^    if: \$\{\{ (.*) \}\}$/m)?.[1];
   const diagnosticExpression = job.match(/if: >-\s*\$\{\{([\s\S]*?)\}\}/)?.[1];
   assert.ok(cheapExpression && diagnosticExpression);
@@ -464,13 +464,14 @@ function assertLauncherDiagnosticJob(source) {
           assert.equal(runInNewContext(diagnosticExpression, context), event === 'workflow_dispatch' && selected === true && system === ''
             && repository === 'polaris-arch/Polaris' && ref === 'refs/heads/collab/dots-audit-remediation-20261017');
         }
-  for (const appCandidate of ['a'.repeat(40), 'malformed']) {
+  for (const candidateKey of ['app_native_compile_candidate', 'runtime_config_loopback_candidate'])
+    for (const appCandidate of ['a'.repeat(40), 'malformed', ' ']) {
     const context = { github: { event_name: 'workflow_dispatch', repository: 'polaris-arch/Polaris',
       ref: 'refs/heads/collab/dots-audit-remediation-20261017' }, inputs: {
-      app_native_compile_candidate: appCandidate, runtime_config_source_only: true,
+      [candidateKey]: appCandidate, runtime_config_source_only: true,
       windows_launcher_diagnostics: true, windows_system_candidate: '' } };
     assert.equal(runInNewContext(cheapExpression, context), true, 'conflicts must reach a failing admission');
-    assert.equal(runInNewContext(diagnosticExpression, context), false, 'compile conflicts must never start Windows diagnosis');
+    assert.equal(runInNewContext(diagnosticExpression, context), false, 'compile/loopback conflicts must never start Windows diagnosis');
   }
   assert.match(source, /windows_launcher_diagnostics:\n\s+description:.*\n\s+type: boolean\n\s+default: false/);
   for (const name of ['lint', 'cross', 'test']) {
@@ -494,7 +495,14 @@ function assertLauncherDiagnosticJob(source) {
   assert.match(job, /if: \$\{\{ always\(\) \}\}\n        uses: actions\/upload-artifact@v7/);
   assert.match(job, /if-no-files-found: error/);
 }
-test('manual fixed-source launcher diagnosis has no ordinary Rust prerequisite or PR/SYSTEM bypass', () => assertLauncherDiagnosticJob(yaml('ci')));
+test('manual fixed-source launcher diagnosis has no ordinary Rust prerequisite or PR/SYSTEM bypass', () => {
+  const source = yaml('ci');
+  assertLauncherDiagnosticJob(source);
+  // A new later job must not contaminate the diagnostic checkout/command inventory.
+  assertLauncherDiagnosticJob(source + '\n  scanner_sibling_fixture:\n    steps:\n'
+    + '      - uses: actions/checkout@v7\n        with:\n          persist-credentials: false\n'
+    + '      - run: cargo test --ignored\n');
+});
 for (const [label, before, after] of [
   ['PR heavy gate skipped', "github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true", 'false'],
   ['diagnostic admits PR', "github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only != true && inputs.windows_launcher_diagnostics == true", "github.event_name == 'pull_request' && inputs.runtime_config_source_only != true && inputs.windows_launcher_diagnostics == true"],

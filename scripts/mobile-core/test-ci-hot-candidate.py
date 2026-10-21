@@ -96,6 +96,30 @@ def projected_defaults(source, name):
 
 
 class PureFixtures(unittest.TestCase):
+    def test_explicit_source_identity_keeps_android_defaults(self):
+        before = hot.source_identity()
+        self.assertEqual(before['commit'], hot.KERNEL_COMMIT)
+        self.assertEqual(before['vendors'], hot.VENDORS)
+        desktop = copy.deepcopy(before)
+        desktop['commit'] = 'a' * 40
+        desktop['tree'] = 'b' * 40
+        self.assertEqual(hot.source_identity(desktop), desktop)
+        self.assertEqual(hot.source_identity(), before)
+
+    def test_explicit_source_identity_rejects_wrong_repository_proto_and_vendor(self):
+        value = copy.deepcopy(hot.source_identity())
+        for key, changed in [('repository', 'sagernet/sing-box'), ('repositoryId', 1),
+                             ('commit', 'main'), ('tree', None)]:
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                hot.source_identity(dict(value, **{key: changed}))
+        for changed in [{}, {'go.mod': 'a' * 64}, dict(value['files'], **{'../escape': 'a' * 64}),
+                        dict(value['files'], **{'daemon/runtime_config.proto': 'a' * 64})]:
+            with self.assertRaises(RuntimeError):
+                hot.source_identity(dict(value, files=changed))
+        for changed in [{}, dict(value['vendors'], **{'foreign/module': ['other', 'a' * 40, 1]})]:
+            with self.assertRaises(RuntimeError):
+                hot.source_identity(dict(value, vendors=changed))
+
     def setUp(self):
         # Any accidental external execution in these fixtures is a test failure.
         self.guards = [patch('subprocess.Popen', side_effect=AssertionError('fixture may not execute tools')),

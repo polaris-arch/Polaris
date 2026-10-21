@@ -14,10 +14,204 @@ use polaris_singbox_grpc::{daemon, Endpoint, RuntimeConfigError, SingBoxApiClien
 use serde::Serialize;
 use serde_json::Value;
 
+// The protocol is an authenticated observation of a previously byte/source-admitted
+// core. Its manifest digest is metadata, NOT a signature or substitute for that
+// admission. A concrete expected build digest must come from the reviewed receipt.
+const RUNTIME_PROTOCOL_METHODS: [&str; 6] = [
+    "GetRuntimeCapabilities",
+    "PlanRuntimeConfig",
+    "ApplyRuntimeConfig",
+    "GetRuntimeConfigStatus",
+    "RetryRuntimePersistence",
+    "AcknowledgeRuntimePersistence",
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct RuntimePairing {
+    protocol: daemon::RuntimeFieldCapability,
+    implementation_manifest_digest: String,
+    // A successfully started legacy unsupported graph has no runtime coordinator.
+    // None is retained as None; a later coordinator cannot join this old baseline.
+    incarnation: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(super) enum RuntimePairingError {
+    Starting,
+    Invalid,
+}
+
+fn runtime_platform_build() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "x86" => "386",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{os}/{arch}")
+}
+
+fn sha256_metadata(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Pure protocol/instance validation; never creates provenance from an RPC.
+/// Full-schema support, optional build features and unbound persistence are not
+/// admission gates. Only the explicit started-unsupported marker proves that a
+/// legacy graph finished Start; eligibility errors alone do not prove readiness.
+pub(super) fn observe_runtime_pairing(
+    capabilities: &daemon::RuntimeCapabilities,
+) -> Result<RuntimePairing, RuntimePairingError> {
+    let invalid = RuntimePairingError::Invalid;
+    if capabilities.contract_version != 1
+        || !sha256_metadata(&capabilities.implementation_manifest_digest)
+    {
+        return Err(invalid);
+    }
+    let mut protocols = capabilities
+        .fields
+        .iter()
+        .filter(|field| field.effective_path == "runtime.protocol");
+    let Some(protocol) = protocols.next() else {
+        return Err(invalid);
+    };
+    if protocols.next().is_some()
+        || protocol.variant != "polaris-daily-runtime-v1"
+        || protocol.adapter_version != "1"
+        || protocol.platform_build != runtime_platform_build()
+        || protocol.update_class != 0 // frozen RUNTIME_UPDATE_UNSPECIFIED
+        || !protocol
+            .conditions
+            .iter()
+            .map(String::as_str)
+            .eq(RUNTIME_PROTOCOL_METHODS)
+    {
+        return Err(invalid);
+    }
+    let instances: Vec<_> = capabilities
+        .fields
+        .iter()
+        .filter(|field| field.effective_path == "runtime.instance")
+        .collect();
+    if instances.iter().any(|field| {
+        field.conditions.len() != 1
+            || field.conditions[0].trim().is_empty()
+            || (field.variant == "PENDING_ADAPTER" && field.conditions[0] == "runtime")
+            || (matches!(
+                field.variant.as_str(),
+                "RUNTIME_STARTING" | "RUNTIME_STARTED_UNSUPPORTED"
+            ) && field.conditions[0] != "runtime")
+            || (field.variant == "OWNER_PERSISTENCE_UNBOUND"
+                && field.conditions[0] != "runtime.persistence")
+            || matches!(
+                field.variant.as_str(),
+                "RUNTIME_STOPPED" | "RUNTIME_GRAPH_UNAVAILABLE" | "INITIAL_CONFIG_ENCODING_FAILED"
+            )
+    }) {
+        return Err(invalid);
+    }
+    let starting = instances
+        .iter()
+        .any(|field| field.variant == "RUNTIME_STARTING");
+    let unsupported_markers = instances
+        .iter()
+        .filter(|field| field.variant == "RUNTIME_STARTED_UNSUPPORTED")
+        .count();
+    if unsupported_markers > 1 {
+        return Err(invalid);
+    }
+    let unsupported = unsupported_markers == 1
+        && instances.iter().any(|field| {
+            field.variant == "RUNTIME_STARTED_UNSUPPORTED" && field.conditions[0] == "runtime"
+        });
+    if starting {
+        return Err(if capabilities.connected_hot_enabled
+            || unsupported
+            || instances.iter().any(|field| {
+                !matches!(
+                    field.variant.as_str(),
+                    "RUNTIME_STARTING" | "PENDING_ADAPTER" | "OWNER_PERSISTENCE_UNBOUND"
+                )
+            })
+        {
+            invalid
+        } else {
+            RuntimePairingError::Starting
+        });
+    }
+    let incarnation = if capabilities.connected_hot_enabled {
+        if unsupported
+            || instances
+                .iter()
+                .any(|field| field.variant != "OWNER_PERSISTENCE_UNBOUND")
+        {
+            return Err(invalid);
+        }
+        let Some(active) = capabilities.active.as_ref().filter(|active| {
+            !active.incarnation.trim().is_empty()
+                && active.incarnation.len() <= 256
+                && active.applied_revision != 0
+                && sha256_metadata(&active.effective_digest)
+        }) else {
+            return Err(invalid);
+        };
+        Some(active.incarnation.clone())
+    } else {
+        if !unsupported
+            || unsupported_runtime_paths(capabilities).is_empty()
+            || instances.iter().any(|field| {
+                !matches!(
+                    field.variant.as_str(),
+                    "RUNTIME_STARTED_UNSUPPORTED" | "PENDING_ADAPTER" | "OWNER_PERSISTENCE_UNBOUND"
+                )
+            })
+            || capabilities.active.as_ref().is_some_and(|active| {
+                !active.incarnation.is_empty()
+                    || active.applied_revision != 0
+                    || !active.effective_digest.is_empty()
+            })
+        {
+            return Err(invalid);
+        }
+        None
+    };
+    Ok(RuntimePairing {
+        protocol: protocol.clone(),
+        implementation_manifest_digest: capabilities.implementation_manifest_digest.clone(),
+        incarnation,
+    })
+}
+
+fn runtime_pairing_matches(
+    pairing: &RuntimePairing,
+    capabilities: &daemon::RuntimeCapabilities,
+) -> bool {
+    observe_runtime_pairing(capabilities).as_ref() == Ok(pairing)
+}
+
+fn unsupported_runtime_paths(capabilities: &daemon::RuntimeCapabilities) -> Vec<String> {
+    capabilities
+        .fields
+        .iter()
+        .filter(|field| {
+            field.effective_path == "runtime.instance" && field.variant == "PENDING_ADAPTER"
+        })
+        .flat_map(|field| field.conditions.clone())
+        .collect()
+}
+
 #[derive(Clone)]
 pub(super) struct RuntimeConfigBaseline {
     generation: u64,
     committed_transaction: Option<String>,
+    pairing: RuntimePairing,
     physical_route_config: UserConfig,
     deps: GenerateConfigDeps,
     generated: SingBoxConfig,
@@ -69,6 +263,26 @@ impl RuntimeApplyResult {
     }
 }
 
+fn runtime_pairing_mismatch() -> RuntimeApplyResult {
+    let mut result = RuntimeApplyResult::status("unconfirmed");
+    result.reasons.push(RuntimeApplyReason {
+        code: "CORE_BUNDLE_MISMATCH",
+        path: "runtime.protocol".into(),
+    });
+    result
+}
+
+async fn paired_runtime_capabilities(
+    client: &SingBoxApiClient,
+    pairing: &RuntimePairing,
+) -> Result<daemon::RuntimeCapabilities, RuntimeApplyResult> {
+    match client.get_runtime_capabilities().await {
+        Ok(value) if runtime_pairing_matches(pairing, &value) => Ok(value),
+        Ok(_) => Err(runtime_pairing_mismatch()),
+        Err(_) => Err(RuntimeApplyResult::status("unconfirmed")),
+    }
+}
+
 #[derive(Clone)]
 struct RestartChoice {
     token: String,
@@ -79,6 +293,7 @@ struct RestartChoice {
 }
 #[derive(Clone)]
 struct PendingOperation {
+    pairing: RuntimePairing,
     desired: Value,
     deletion_scope: Vec<crate::runtime::config::DeferredConfigDeletion>,
     physical_route_config: UserConfig,
@@ -300,6 +515,38 @@ fn selector_intents(
 }
 
 impl ProxyRuntime {
+    /// A cached transaction result is historical; it cannot prove that the
+    /// current endpoint still belongs to this startup, including native reloads.
+    async fn verify_cached_runtime_pairing(&self, generation: u64) -> Result<(), RuntimeApplyResult> {
+        let baseline = self
+            .runtime_config_baseline
+            .read()
+            .ok()
+            .and_then(|value| value.clone());
+        let Some(baseline) = baseline.filter(|value| value.generation == generation) else {
+            return Err(RuntimeApplyResult::status("unconfirmed"));
+        };
+        let Some(service) = baseline
+            .generated
+            .services
+            .as_ref()
+            .and_then(|services| services.iter().find(|service| service.type_field == "api"))
+        else {
+            return Err(RuntimeApplyResult::status("unconfirmed"));
+        };
+        let client = SingBoxApiClient::connect(
+            Endpoint::new("127.0.0.1", service.listen_port),
+            service.secret.clone().unwrap_or_default(),
+        )
+        .await
+        .map_err(|_| RuntimeApplyResult::status("unconfirmed"))?;
+        paired_runtime_capabilities(&client, &baseline.pairing).await?;
+        if self.gate.generation() != generation || self.gate.is_busy() || !self.core_running() {
+            return Err(RuntimeApplyResult::status("conflict"));
+        }
+        Ok(())
+    }
+
     pub(super) fn runtime_physical_targets_ready(&self, candidate: &Value) -> bool {
         let Ok(new) = serde_json::from_value::<UserConfig>(candidate.clone()) else {
             return false;
@@ -350,11 +597,13 @@ impl ProxyRuntime {
         deps: GenerateConfigDeps,
         generated: SingBoxConfig,
         physical_route_config: UserConfig,
+        pairing: RuntimePairing,
     ) {
         if let Ok(mut baseline) = self.runtime_config_baseline.write() {
             *baseline = Some(RuntimeConfigBaseline {
                 generation,
                 committed_transaction: None,
+                pairing,
                 physical_route_config,
                 deps,
                 generated,
@@ -391,17 +640,15 @@ impl ProxyRuntime {
         candidate: &Value,
         code: &'static str,
         paths: Vec<String>,
+        generation: u64,
+        intent: u64,
     ) -> RuntimeApplyResult {
+        if self.gate.is_busy() || !self.selector_operation_is_current(generation, intent) {
+            return RuntimeApplyResult::status("conflict");
+        }
         let Some(running) = self.current_config_snapshot() else {
             return RuntimeApplyResult::status("unconfirmed");
         };
-        if running == *candidate && code == "unsupportedCore" {
-            // Old kernels cannot attest external source identity. Do not turn an
-            // unchanged desired projection into permission to restart.
-            return RuntimeApplyResult::status("unconfirmed");
-        }
-        let generation = self.gate.generation();
-        let intent = self.selector_reconcile.intent_generation();
         let token = format!(
             "{}:{}:{}",
             generation,
@@ -479,6 +726,33 @@ impl ProxyRuntime {
                 return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
             }
         };
+        let capabilities = match paired_runtime_capabilities(&client, &baseline.pairing).await {
+            Ok(value) => value,
+            // Missing RPC/authentication/protocol/manifest/incarnation never grants
+            // a same-core restart token. The old baseline must not adopt this peer.
+            Err(result) => {
+                if let Ok(mut state) = self.runtime_config_apply.lock() {
+                    state.restart = None;
+                }
+                return self.remember_runtime_result(result);
+            }
+        };
+        if self.gate.is_busy() || !self.selector_operation_is_current(generation, intent) {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
+        if !capabilities.connected_hot_enabled {
+            if self.current_config_snapshot().as_ref() == Some(&candidate) {
+                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            }
+            let result = self.restart_choice(
+                &candidate,
+                "structuralChange",
+                unsupported_runtime_paths(&capabilities),
+                generation,
+                intent,
+            );
+            return self.remember_runtime_result(result);
+        }
         // An ambiguous previous Apply is reconciled by its original transaction ID.
         // Never send it again or replace it with a newer candidate blindly.
         let pending = self
@@ -508,20 +782,6 @@ impl ProxyRuntime {
                     return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
                 }
             };
-        }
-        let capabilities = match client.get_runtime_capabilities().await {
-            Ok(value) => value,
-            Err(RuntimeConfigError::Unsupported(_)) => {
-                let result = self.restart_choice(&candidate, "unsupportedCore", vec![]);
-                return self.remember_runtime_result(result);
-            }
-            Err(_) => {
-                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"))
-            }
-        };
-        if capabilities.contract_version != 1 || !capabilities.connected_hot_enabled {
-            let result = self.restart_choice(&candidate, "unsupportedCore", vec![]);
-            return self.remember_runtime_result(result);
         }
         if !self.selector_operation_is_current(generation, intent) {
             return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
@@ -568,6 +828,8 @@ impl ProxyRuntime {
                     &candidate,
                     "structuralChange",
                     vec!["outbounds.physical_route_binding".into()],
+                    generation,
+                    intent,
                 );
                 return self.remember_runtime_result(result);
             }
@@ -587,6 +849,8 @@ impl ProxyRuntime {
                 &candidate,
                 "structuralChange",
                 vec!["inbounds.network-canary.listen_port".into()],
+                generation,
+                intent,
             );
             return self.remember_runtime_result(result);
         }
@@ -721,7 +985,7 @@ impl ProxyRuntime {
             let result = if paths.is_empty() {
                 RuntimeApplyResult::status("rejected")
             } else {
-                self.restart_choice(&candidate, "structuralChange", paths)
+                self.restart_choice(&candidate, "structuralChange", paths, generation, intent)
             };
             return self.remember_runtime_result(result);
         }
@@ -734,6 +998,7 @@ impl ProxyRuntime {
             return self.remember_runtime_result(RuntimeApplyResult::status("rejected"));
         }
         let pending = PendingOperation {
+            pairing: baseline.pairing.clone(),
             desired,
             deletion_scope,
             physical_route_config: baseline.physical_route_config.clone(),
@@ -769,10 +1034,10 @@ impl ProxyRuntime {
         let transaction_id = pending.plan.transaction_id.clone();
         let mut result = match result {
             Ok(operation) => {
-                let operation = self
-                    .acknowledge_regeneration_owner(&pending, operation)
-                    .await;
-                self.settle_runtime_operation(&pending, operation)
+                match self.acknowledge_regeneration_owner(&pending, operation).await {
+                    Ok(operation) => self.settle_runtime_operation(&pending, operation),
+                    Err(error) => error,
+                }
             }
             Err(_) => self.reconcile_runtime_operation(&client, pending).await,
         };
@@ -787,6 +1052,9 @@ impl ProxyRuntime {
         client: &SingBoxApiClient,
         pending: PendingOperation,
     ) -> RuntimeApplyResult {
+        if let Err(result) = paired_runtime_capabilities(client, &pending.pairing).await {
+            return result;
+        }
         let Some(identity) = pending.plan.expected.as_ref() else {
             return RuntimeApplyResult::status("unconfirmed");
         };
@@ -800,14 +1068,17 @@ impl ProxyRuntime {
         {
             Ok(status)
                 if status.contract_version == 1
-                    && status.lookup_state == daemon::RuntimeLookupState::Found as i32 =>
+                    && status.lookup_state == daemon::RuntimeLookupState::Found as i32
+                    && status.active.as_ref().is_some_and(|active| {
+                        pending.pairing.incarnation.as_deref() == Some(active.incarnation.as_str())
+                    }) =>
             {
                 match status.operation {
                     Some(operation) => {
-                        let operation = self
-                            .acknowledge_regeneration_owner(&pending, operation)
-                            .await;
-                        self.settle_runtime_operation(&pending, operation)
+                        match self.acknowledge_regeneration_owner(&pending, operation).await {
+                            Ok(operation) => self.settle_runtime_operation(&pending, operation),
+                            Err(error) => error,
+                        }
                     }
                     None => RuntimeApplyResult::status("unconfirmed"),
                 }
@@ -827,7 +1098,7 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         pending: &PendingOperation,
         operation: daemon::RuntimeConfigOperation,
-    ) -> daemon::RuntimeConfigOperation {
+    ) -> Result<daemon::RuntimeConfigOperation, RuntimeApplyResult> {
         if operation.persistence_mode != "app_authoritative_regeneration"
             || !operation.owner_reload_acknowledged
             || operation.durable
@@ -836,14 +1107,13 @@ impl ProxyRuntime {
             || operation.candidate_digest != pending.plan.candidate_digest
             || !identity_equal(operation.before.as_ref(), pending.plan.expected.as_ref())
         {
-            return operation;
+            return Ok(operation);
         }
-        let Some(active) = operation
-            .active
-            .clone()
-            .filter(|active| active.effective_digest == pending.plan.candidate_digest)
-        else {
-            return operation;
+        let Some(active) = operation.active.clone().filter(|active| {
+            active.effective_digest == pending.plan.candidate_digest
+                && pending.pairing.incarnation.as_deref() == Some(active.incarnation.as_str())
+        }) else {
+            return Ok(operation);
         };
         let Some(service) = pending
             .generated
@@ -851,7 +1121,7 @@ impl ProxyRuntime {
             .as_ref()
             .and_then(|services| services.iter().find(|service| service.type_field == "api"))
         else {
-            return operation;
+            return Ok(operation);
         };
         let endpoint = (
             service.listen_port,
@@ -863,13 +1133,15 @@ impl ProxyRuntime {
         let control_revision = operation.control_revision;
         let handle = tokio::runtime::Handle::current();
         let acknowledged = tokio::task::spawn_blocking(move || {
-            let client = handle
-                .block_on(SingBoxApiClient::connect(
-                    Endpoint::new("127.0.0.1", endpoint.0),
-                    endpoint.1,
-                ))
-                .ok()?;
-            me.config
+            let client = match handle.block_on(SingBoxApiClient::connect(
+                Endpoint::new("127.0.0.1", endpoint.0),
+                endpoint.1,
+            )) {
+                Ok(client) => client,
+                Err(_) => return Ok(None),
+            };
+            handle.block_on(paired_runtime_capabilities(&client, &pending.pairing))?;
+            Ok(me.config
                 .with_durable_runtime_owner(&pending.desired, |digest, revision| {
                     me.selector_reconcile.with_intent_claim(|intent| {
                         if intent != pending.intent
@@ -903,12 +1175,14 @@ impl ProxyRuntime {
                     })
                 })
                 .ok()
-                .flatten()
+                .flatten())
         })
-        .await
-        .ok()
-        .flatten();
-        acknowledged.unwrap_or(operation)
+        .await;
+        match acknowledged {
+            Ok(Ok(value)) => Ok(value.unwrap_or(operation)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(operation),
+        }
     }
 
     fn settle_runtime_operation(
@@ -945,7 +1219,8 @@ impl ProxyRuntime {
         let Some(before) = operation.before.as_ref() else {
             return RuntimeApplyResult::status("unconfirmed");
         };
-        if active.incarnation != before.incarnation
+        if pending.pairing.incarnation.as_deref() != Some(active.incarnation.as_str())
+            || active.incarnation != before.incarnation
             || active.effective_digest != pending.plan.candidate_digest
             || active.applied_revision < before.applied_revision
             || operation.control_revision < pending.plan.expected_control_revision
@@ -1010,6 +1285,11 @@ impl ProxyRuntime {
                 let Ok(mut baseline) = self.runtime_config_baseline.write() else {
                     return false;
                 };
+                if !baseline.as_ref().is_some_and(|baseline| {
+                    baseline.generation == pending.generation && baseline.pairing == pending.pairing
+                }) {
+                    return false;
+                }
                 let Ok(mut binding_state) = self.runtime_binding_state.lock() else {
                     return false;
                 };
@@ -1024,6 +1304,7 @@ impl ProxyRuntime {
                 *baseline = Some(RuntimeConfigBaseline {
                     generation: pending.generation,
                     committed_transaction: Some(pending.plan.transaction_id.clone()),
+                    pairing: pending.pairing.clone(),
                     physical_route_config: pending.physical_route_config.clone(),
                     deps: pending.deps.clone(),
                     generated: pending.generated.clone(),
@@ -1115,6 +1396,7 @@ impl ProxyRuntime {
     ) {
         let me = Arc::clone(self);
         let generation = pending.generation;
+        let pairing = pending.pairing.clone();
         let transaction_id = pending.plan.transaction_id.clone();
         let Some(expected) = pending.plan.expected.clone() else {
             return;
@@ -1145,6 +1427,9 @@ impl ProxyRuntime {
                 }
                 if retirement == "DRAINED" {
                     let _serial = me.switch_serial.lock().await;
+                    if me.verify_cached_runtime_pairing(generation).await.is_err() {
+                        return;
+                    }
                     if me.gate.generation() == generation
                         && me.core_running()
                         && me.current_config_snapshot().as_ref() == Some(&candidate)
@@ -1155,6 +1440,7 @@ impl ProxyRuntime {
                             .and_then(|baseline| {
                                 baseline
                                     .as_ref()
+                                    .filter(|baseline| baseline.pairing == pairing)
                                     .and_then(|baseline| baseline.committed_transaction.clone())
                             })
                             .as_deref()
@@ -1180,6 +1466,9 @@ impl ProxyRuntime {
                 else {
                     continue;
                 };
+                if paired_runtime_capabilities(&client, &pairing).await.is_err() {
+                    continue;
+                }
                 match client
                     .get_runtime_config_status(daemon::RuntimeConfigStatusRequest {
                         contract_version: 1,
@@ -1190,7 +1479,10 @@ impl ProxyRuntime {
                 {
                     Ok(status)
                         if status.contract_version == 1
-                            && status.lookup_state == daemon::RuntimeLookupState::Found as i32 =>
+                            && status.lookup_state == daemon::RuntimeLookupState::Found as i32
+                            && status.active.as_ref().is_some_and(|active| {
+                                active.incarnation == expected.incarnation
+                            }) =>
                     {
                         let Some(operation) = status.operation else {
                             return;
@@ -1227,46 +1519,35 @@ impl ProxyRuntime {
             let Some(choice) = choice.filter(|choice| choice.token == token) else {
                 return RuntimeApplyResult::status("conflict");
             };
-            let candidate_current = self
-                .config
-                .with_current(|value| value == &choice.candidate)
-                .unwrap_or(false);
-            if !candidate_current
-                || self.current_config_snapshot().as_ref() != Some(&choice.running)
-                || !self.selector_operation_is_current(choice.generation, choice.intent)
-                || self.gate.is_busy()
-            {
-                return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+            let baseline = self
+                .runtime_config_baseline
+                .read()
+                .ok()
+                .and_then(|value| value.clone());
+            let Some(baseline) = baseline.filter(|value| value.generation == choice.generation)
+            else {
+                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            };
+            let Some(service) = baseline
+                .generated
+                .services
+                .as_ref()
+                .and_then(|services| services.iter().find(|service| service.type_field == "api"))
+            else {
+                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            };
+            let client = SingBoxApiClient::connect(
+                Endpoint::new("127.0.0.1", service.listen_port),
+                service.secret.clone().unwrap_or_default(),
+            )
+            .await;
+            let Ok(client) = client else {
+                return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
+            };
+            if let Err(result) = paired_runtime_capabilities(&client, &baseline.pairing).await {
+                return self.remember_runtime_result(result);
             }
-            let id = self.force_restart_seq.fetch_add(1, Ordering::SeqCst);
-            let accepted = self.selector_reconcile.with_intent_claim(|intent| {
-                if intent != choice.intent
-                    || self.gate.generation() != choice.generation
-                    || self.gate.is_busy()
-                {
-                    return false;
-                }
-                let Ok(mut pending) = self.pending_force_restart.write() else {
-                    return false;
-                };
-                self.debounced.invalidate_pending();
-                *pending = Some((
-                    id,
-                    choice.candidate,
-                    super::ForceRestartSource::Confirmed {
-                        intent_generation: choice.intent,
-                    },
-                ));
-                self.gate.set_force_restart(id);
-                true
-            });
-            if !accepted {
-                return RuntimeApplyResult::status("conflict");
-            }
-            self.schedule_restart_for_generation(choice.generation);
-            let mut result = RuntimeApplyResult::status("applied");
-            result.apply_id = Some(id);
-            return result;
+            return self.commit_confirmed_runtime_restart(choice);
         }
         let candidate = match self.config.current() {
             Ok(candidate) => candidate,
@@ -1275,13 +1556,88 @@ impl ProxyRuntime {
         self.apply_runtime_candidate(candidate).await
     }
 
+    // The local D/R/generation/intent checks occur AFTER the protocol await too.
+    // Caller holds switch_serial; this retains the existing atomic dispatch claim.
+    fn commit_confirmed_runtime_restart(
+        self: &Arc<Self>,
+        choice: RestartChoice,
+    ) -> RuntimeApplyResult {
+        let candidate_current = self
+            .config
+            .with_current(|value| value == &choice.candidate)
+            .unwrap_or(false);
+        if !candidate_current
+            || self.current_config_snapshot().as_ref() != Some(&choice.running)
+            || !self.selector_operation_is_current(choice.generation, choice.intent)
+            || self.gate.is_busy()
+        {
+            return self.remember_runtime_result(RuntimeApplyResult::status("conflict"));
+        }
+        let id = self.force_restart_seq.fetch_add(1, Ordering::SeqCst);
+        let accepted = self.selector_reconcile.with_intent_claim(|intent| {
+            if intent != choice.intent
+                || self.gate.generation() != choice.generation
+                || self.gate.is_busy()
+            {
+                return false;
+            }
+            let Ok(mut pending) = self.pending_force_restart.write() else {
+                return false;
+            };
+            self.debounced.invalidate_pending();
+            *pending = Some((
+                id,
+                choice.candidate,
+                super::ForceRestartSource::Confirmed {
+                    intent_generation: choice.intent,
+                },
+            ));
+            self.gate.set_force_restart(id);
+            true
+        });
+        if !accepted {
+            return RuntimeApplyResult::status("conflict");
+        }
+        self.schedule_restart_for_generation(choice.generation);
+        let mut result = RuntimeApplyResult::status("applied");
+        result.apply_id = Some(id);
+        result
+    }
+
     #[cfg(test)]
     pub(super) async fn apply_confirmed_for_test(self: &Arc<Self>) -> (&'static str, Option<u64>) {
         let candidate = self.config.current().expect("test desired configuration");
-        let choice = self.restart_choice(&candidate, "structuralChange", vec!["inbounds".into()]);
-        let result = match choice.restart_confirmation {
-            Some(token) => self.apply_pending_transaction(Some(token)).await,
-            None => choice,
+        let result = self.restart_choice(
+            &candidate,
+            "structuralChange",
+            vec!["inbounds".into()],
+            self.gate.generation(),
+            self.selector_reconcile.intent_generation(),
+        );
+        let result = if self
+            .core_binary_override
+            .lock()
+            .ok()
+            .is_some_and(|value| value.is_none())
+        {
+            // Lifecycle unit fixtures have no executable or RPC peer. Exercise
+            // their local claim directly; actual injected cores always take the
+            // production authenticated confirmation path below.
+            let _serial = self.switch_serial.lock().await;
+            let choice = self
+                .runtime_config_apply
+                .lock()
+                .ok()
+                .and_then(|mut state| state.restart.take());
+            match choice {
+                Some(choice) => self.commit_confirmed_runtime_restart(choice),
+                None => result,
+            }
+        } else {
+            match result.restart_confirmation.clone() {
+                Some(token) => self.apply_pending_transaction(Some(token)).await,
+                None => result,
+            }
         };
         (result.status, result.apply_id)
     }
@@ -1311,6 +1667,15 @@ impl ProxyRuntime {
                         self.selector_reconcile.intent_generation(),
                     )
                 }) {
+                    let Some(generation) = result.runtime_generation else {
+                        return RuntimeApplyResult::status("unconfirmed");
+                    };
+                    if let Err(error) = self
+                        .verify_cached_runtime_pairing(generation)
+                        .await
+                    {
+                        return error;
+                    }
                     return result;
                 }
             }
@@ -1357,6 +1722,9 @@ impl ProxyRuntime {
         else {
             return RuntimeApplyResult::status("unconfirmed");
         };
+        if let Err(result) = paired_runtime_capabilities(&client, &pending.pairing).await {
+            return result;
+        }
         let Some(expected) = pending.plan.expected.as_ref() else {
             return RuntimeApplyResult::status("unconfirmed");
         };
@@ -1411,10 +1779,10 @@ impl ProxyRuntime {
         {
             return RuntimeApplyResult::status("unconfirmed");
         }
-        let operation = self
-            .acknowledge_regeneration_owner(pending, operation)
-            .await;
-        self.settle_runtime_operation(pending, operation)
+        match self.acknowledge_regeneration_owner(pending, operation).await {
+            Ok(operation) => self.settle_runtime_operation(pending, operation),
+            Err(error) => error,
+        }
     }
 
     /// Read-only reconciliation of the original transaction. Never replans or
@@ -1444,13 +1812,23 @@ impl ProxyRuntime {
             .ok()
             .and_then(|state| state.pending.clone());
         let Some(pending) = pending else {
-            return self
+            let generation = self.gate.generation();
+            let cached = self
                 .runtime_config_apply
                 .lock()
                 .ok()
                 .and_then(|state| state.last.clone())
-                .filter(|result| result.transaction_id.as_deref() == Some(transaction_id.as_str()))
-                .unwrap_or_else(|| RuntimeApplyResult::status("conflict"));
+                .filter(|result| {
+                    result.transaction_id.as_deref() == Some(transaction_id.as_str())
+                        && result.runtime_generation == Some(generation)
+                });
+            let Some(cached) = cached else {
+                return RuntimeApplyResult::status("conflict");
+            };
+            if let Err(error) = self.verify_cached_runtime_pairing(generation).await {
+                return error;
+            }
+            return cached;
         };
         if pending.plan.transaction_id != transaction_id
             || pending.generation != self.gate.generation()
@@ -1512,6 +1890,266 @@ pub(super) fn structural_runtime_change(old: &Value, new: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    fn paired_capabilities() -> daemon::RuntimeCapabilities {
+        daemon::RuntimeCapabilities {
+            contract_version: 1,
+            connected_hot_enabled: true,
+            implementation_manifest_digest: "a".repeat(64),
+            active: Some(daemon::RuntimeIdentity {
+                incarnation: "owned-incarnation".into(),
+                applied_revision: 1,
+                effective_digest: "c".repeat(64),
+            }),
+            fields: vec![daemon::RuntimeFieldCapability {
+                effective_path: "runtime.protocol".into(),
+                variant: "polaris-daily-runtime-v1".into(),
+                platform_build: runtime_platform_build(),
+                update_class: 0,
+                adapter_version: "1".into(),
+                conditions: RUNTIME_PROTOCOL_METHODS
+                    .iter()
+                    .map(|value| (*value).into())
+                    .collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn instance_reason(variant: &str, path: &str) -> daemon::RuntimeFieldCapability {
+        daemon::RuntimeFieldCapability {
+            effective_path: "runtime.instance".into(),
+            variant: variant.into(),
+            conditions: vec![path.into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn paired_runtime_requires_exact_protocol_not_only_a_capability_switch() {
+        let valid = paired_capabilities();
+        assert!(observe_runtime_pairing(&valid).is_ok());
+        for change in 0..8 {
+            let mut value = valid.clone();
+            match change {
+                0 => value.contract_version = 2,
+                1 => value.fields.clear(),
+                2 => value.fields.push(value.fields[0].clone()),
+                3 => value.fields[0].variant = "foreign-runtime".into(),
+                4 => value.fields[0].adapter_version = "2".into(),
+                5 => value.fields[0].platform_build = "foreign/target".into(),
+                6 => value.fields[0].conditions.swap(0, 1),
+                _ => value.implementation_manifest_digest.clear(),
+            }
+            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        }
+    }
+
+    #[test]
+    fn paired_runtime_preserves_partial_support_and_unbound_owner_warning() {
+        let mut value = paired_capabilities();
+        assert!(!value.full_effective_schema_supported);
+        value.fields.push(instance_reason(
+            "OWNER_PERSISTENCE_UNBOUND",
+            "runtime.persistence",
+        ));
+        value.fields.push(daemon::RuntimeFieldCapability {
+            effective_path: "runtime.build".into(),
+            variant: "with_naive_outbound".into(),
+            conditions: vec!["state=unknown".into()],
+            ..Default::default()
+        });
+        assert!(observe_runtime_pairing(&value).is_ok());
+    }
+
+    #[test]
+    fn paired_runtime_binds_incarnation_and_manifest_but_not_mutable_revisions() {
+        let mut value = paired_capabilities();
+        let pairing = observe_runtime_pairing(&value).unwrap();
+        value.active.as_mut().unwrap().applied_revision += 1;
+        value.active.as_mut().unwrap().effective_digest = "d".repeat(64);
+        value.control_revision += 1;
+        assert!(runtime_pairing_matches(&pairing, &value));
+        value.active.as_mut().unwrap().incarnation = "replacement".into();
+        assert!(!runtime_pairing_matches(&pairing, &value));
+        value.active.as_mut().unwrap().incarnation = "owned-incarnation".into();
+        value.implementation_manifest_digest = "b".repeat(64);
+        assert!(!runtime_pairing_matches(&pairing, &value));
+    }
+
+    #[test]
+    fn paired_runtime_rejects_missing_or_zero_started_identity() {
+        for change in 0..4 {
+            let mut value = paired_capabilities();
+            match change {
+                0 => value.active = None,
+                1 => value.active.as_mut().unwrap().incarnation.clear(),
+                2 => value.active.as_mut().unwrap().applied_revision = 0,
+                _ => value.active.as_mut().unwrap().effective_digest.clear(),
+            }
+            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        }
+    }
+
+    #[test]
+    fn paired_runtime_only_waits_for_noncontradictory_starting_state() {
+        let mut value = paired_capabilities();
+        value.fields.push(instance_reason("RUNTIME_STARTING", "runtime"));
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value.connected_hot_enabled = false;
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Starting));
+        value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+    }
+
+    #[test]
+    fn paired_runtime_never_admits_stopped_or_unavailable_graph() {
+        for reason in [
+            "RUNTIME_STOPPED",
+            "RUNTIME_GRAPH_UNAVAILABLE",
+            "INITIAL_CONFIG_ENCODING_FAILED",
+        ] {
+            let mut value = paired_capabilities();
+            value.fields.push(instance_reason(reason, "runtime"));
+            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+            value.connected_hot_enabled = false;
+            value.active = None;
+            value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        }
+    }
+
+    #[test]
+    fn unsupported_graph_needs_completed_start_and_cannot_adopt_an_incarnation() {
+        let mut value = paired_capabilities();
+        value.connected_hot_enabled = false;
+        value.active = None;
+        value.fields.push(instance_reason("PENDING_ADAPTER", "services"));
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+        let pairing = observe_runtime_pairing(&value).unwrap();
+        assert_eq!(pairing.incarnation, None);
+        assert_eq!(unsupported_runtime_paths(&value), ["services"]);
+        let supported = paired_capabilities();
+        assert!(!runtime_pairing_matches(&pairing, &supported));
+    }
+
+    #[test]
+    fn malformed_or_contradictory_dynamic_records_are_not_admission() {
+        let mut value = paired_capabilities();
+        value.fields.push(instance_reason("OWNER_PERSISTENCE_UNBOUND", "wrong.path"));
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value.fields.pop();
+        value.fields.push(instance_reason("PENDING_ADAPTER", "services"));
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value.connected_hot_enabled = false;
+        value.active = None;
+        value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+        assert!(observe_runtime_pairing(&value).is_ok());
+        value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value.fields.pop();
+        value.fields[1].conditions.clear();
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value.fields.remove(1);
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+    }
+
+    #[test]
+    fn startup_pairing_precedes_running_and_uses_original_remaining_deadline() {
+        let source = crate::test_support::crate_code("runtime/proxy/startup.rs");
+        let gate = source
+            .find(".confirm_startup_runtime_pairing(&singbox_config, my_gen, ready_deadline)")
+            .unwrap();
+        assert!(gate < source.find("let new_status = ProxyStatus {").unwrap());
+        assert!(gate < source.find("self.capture_runtime_config_baseline(").unwrap());
+        assert!(source.contains("t_ready + Duration::from_millis(ready_budget_ms)"));
+        let body = crate::commands::guard_scan::impl_method_body(
+            &source,
+            "    async fn confirm_startup_runtime_pairing(",
+        );
+        let compact: String = body.split_whitespace().collect();
+        assert!(compact.contains("client.get_runtime_capabilities().await"));
+        assert!(body.contains("tokio::time::timeout_at("));
+        assert!(body.contains("self.gate.generation() != generation"));
+        assert!(!body.contains("cfg(test)"));
+    }
+
+    #[test]
+    fn unverified_peers_never_receive_a_compatibility_restart_choice() {
+        let source = crate::test_support::crate_code("runtime/proxy/runtime_config.rs");
+        let body = crate::commands::guard_scan::impl_method_body(
+            &source,
+            "    pub(super) async fn apply_runtime_candidate(",
+        );
+        assert!(body.contains("paired_runtime_capabilities(&client, &baseline.pairing)"));
+        assert!(!body.contains("unsupportedCore"));
+        assert!(!body.contains("RuntimeConfigError::Unsupported"));
+    }
+
+    #[test]
+    fn pairing_mismatch_is_explicit_without_authorizing_restart() {
+        let result = runtime_pairing_mismatch();
+        assert_eq!(result.status, "unconfirmed");
+        assert_eq!(result.reasons[0].code, "CORE_BUNDLE_MISMATCH");
+        assert_eq!(result.reasons[0].path, "runtime.protocol");
+        assert!(!result.ok);
+        assert!(!result.restart_required);
+        assert!(result.restart_confirmation.is_none());
+    }
+
+    #[test]
+    fn runtime_instance_text_must_be_concrete_and_bounded() {
+        for incarnation in ["   ".into(), "x".repeat(257)] {
+            let mut value = paired_capabilities();
+            value.active.as_mut().unwrap().incarnation = incarnation;
+            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        }
+        for path in ["", "   ", "runtime"] {
+            let mut value = paired_capabilities();
+            value.connected_hot_enabled = false;
+            value.active = None;
+            value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+            value.fields.push(instance_reason("PENDING_ADAPTER", path));
+            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        }
+        let mut value = paired_capabilities();
+        value.connected_hot_enabled = false;
+        value.fields.push(instance_reason("RUNTIME_STARTING", "wrong.path"));
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value.fields.last_mut().unwrap().conditions = vec!["runtime".into()];
+        value.fields.push(instance_reason("UNKNOWN_FAILURE", "runtime"));
+        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+    }
+
+    #[test]
+    fn cached_results_owner_ack_and_retirement_revalidate_current_pairing() {
+        let source = crate::test_support::crate_code("runtime/proxy/runtime_config.rs");
+        for head in [
+            "    pub(crate) async fn retry_runtime_persistence(",
+            "    async fn runtime_apply_status_inner(",
+            "    fn spawn_runtime_retirement_reconcile(",
+        ] {
+            let body = crate::commands::guard_scan::impl_method_body(&source, head);
+            assert!(body.contains("verify_cached_runtime_pairing("), "{head}");
+        }
+        for head in [
+            "    async fn acknowledge_regeneration_owner(",
+            "    fn spawn_runtime_retirement_reconcile(",
+        ] {
+            let body = crate::commands::guard_scan::impl_method_body(&source, head);
+            assert!(body.contains("paired_runtime_capabilities("), "{head}");
+        }
+    }
+
+    #[test]
+    fn restart_choice_keeps_the_original_observation_generation_and_intent() {
+        let source = crate::test_support::crate_code("runtime/proxy/runtime_config.rs");
+        let body = crate::commands::guard_scan::impl_method_body(&source, "    fn restart_choice(");
+        assert!(body.contains("selector_operation_is_current(generation, intent)"));
+        assert!(!body.contains("let generation = self.gate.generation()"));
+        assert!(!body.contains("let intent = self.selector_reconcile.intent_generation()"));
+    }
+
     fn group(tag: &str, selected: &str, members: &[&str]) -> daemon::Group {
         daemon::Group {
             tag: tag.into(),

@@ -100,7 +100,9 @@ export function applyOutcome(status: ApplyStatus | null | undefined, reasons?: P
     case 'rejected':
       return { phase: 'failed', toast: { kind: 'error', key: 'home.pendingHotRejected' } };
     case 'unconfirmed':
-      return { phase: 'failed', toast: { kind: 'error', key: 'home.pendingHotUnconfirmed' } };
+      return { phase: 'failed', toast: { kind: 'error', key:
+        reasons?.some(reason => reason.code === 'CORE_BUNDLE_MISMATCH' && reason.path === 'runtime.protocol')
+          ? 'errors.coreBundleMismatch' : 'home.pendingHotUnconfirmed' } };
     case 'skipped':
       return { phase: 'idle', toast: { kind: 'info', key: 'home.pendingSkippedNotRunning' } };
     default:

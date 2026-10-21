@@ -3,6 +3,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { TESTS as LOOPBACK_TESTS } from './runtime-config-loopback.mjs';
 
 // gate-rust.sh 与 ci.yml 的 Rust 门必须逐字一致——起因见 gate-rust.sh 头注：本机手跑门用的
 // 命令曾比 CI 弱，且这个仓已经被「判据取材面吃到注释里的同名字样」打脸过三次，这里不能再来一次。
@@ -34,14 +35,14 @@ function stripComments(text) {
     .join('\n');
 }
 
-/** 抠出 ci.yml 里 `- name: <stepName>` 到下一个同缩进 `- name:` 之间的整段（已剥注释）。 */
+/** Read one named step, bounded by every sibling step or the end of its job. */
 function extractCiStepBlock(strippedYaml, stepName) {
   const lines = strippedYaml.split('\n');
   const startIdx = lines.findIndex((l) => l.trim() === `- name: ${stepName}`);
   assert.ok(startIdx !== -1, `ci.yml 里找不到步骤 "- name: ${stepName}"`);
   let endIdx = lines.length;
   for (let i = startIdx + 1; i < lines.length; i++) {
-    if (/^\s{6}- name:/.test(lines[i])) {
+    if (/^ {6}- |^ {0,4}\S/.test(lines[i])) {
       endIdx = i;
       break;
     }
@@ -153,6 +154,7 @@ const ANDROID_FACE_STEP = 'Android impact face must be registered (dep-info 对�
 // scope and commands below; native-dns-ci-routing.test.mjs checks admission,
 // payload identity, exact Rust namespaces and failure/evidence routing.
 const CI_ONLY_SOURCE_STEP = 'Test additive RuntimeConfig client against loopback mocks';
+const CI_ONLY_LOOPBACK_STEP = 'Run exact real App to paired kernel HOT loopback tests';
 const CI_ONLY_COMPILE_STEP = 'Compile native consumer test binaries without execution';
 const CANDIDATE_BUILD_STEP = 'Build actual candidate helper bytes and freeze the separate App identity';
 const CANDIDATE_RUNTIME_STEP = 'Run exact controlled App lifecycle hot-switch and stats tests';
@@ -374,8 +376,7 @@ test('切片自检：android-face 块的抠取不吃块外/注释里的同名 ca
  * 没有这条断言，CI 新增一个 Rust 门时本机脚本会静默落后 —— 覆盖面就由夹具（GATES 这张写死的表）
  * 决定，而不是由判据（ci.yml 里实际有哪些 cargo 门）决定。本仓踩过这个形状，故钉死。
  */
-test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字镜像名单里', () => {
-  const { ci } = loadStripped();
+function assertCargoStepCoverage(ci) {
   const lines = ci.split('\n');
   const cargoSteps = [];
   for (let i = 0; i < lines.length; i++) {
@@ -399,12 +400,13 @@ test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字�
     });
     // The controlled step delegates its single Cargo build to this exact runner;
     // assertCandidateOnlySteps above pins both the call and the runner's selectors.
-    const delegatedGate = body.includes('node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"');
+    const delegatedGate = body.includes('node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"')
+      || /\bnode scripts\/runtime-config-loopback\.mjs run\b/.test(body);
     if (isGate || delegatedGate) cargoSteps.push(m[1]);
   }
   assert.ok(cargoSteps.length > 0, '一个跑 cargo 的步骤都没抠到 —— 取材面是空的，本断言恒真');
 
-  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP]);
+  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP]);
   const orphans = cargoSteps.filter((n) => !covered.has(n));
   assert.deepEqual(
     orphans,
@@ -414,8 +416,18 @@ test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字�
       '要么（多行 shell 块，抠不出单行）加进 MIRRORED_BUT_NOT_VERBATIM 并为它补一条针对性对拍。'
   );
 
-  const stale = MIRRORED_BUT_NOT_VERBATIM.filter((n) => !cargoSteps.includes(n));
+  const stale = [...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP].filter((n) => !cargoSteps.includes(n));
   assert.deepEqual(stale, [], `非逐字镜像名单里有 ci.yml 已经没有的步骤（名单陈旧）：${JSON.stringify(stale)}`);
+}
+
+test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字镜像名单里', () => {
+  const { ci } = loadStripped();
+  assertCargoStepCoverage(ci);
+  for (const command of ['cargo deny check', 'node scripts/runtime-config-loopback.mjs run']) {
+    const added = ci + `\n  orphan_fixture:\n    steps:\n      - name: Unregistered native gate\n        run: ${command}\n`;
+    assert.throws(() => assertCargoStepCoverage(added), /Unregistered native gate/);
+  }
+  assert.throws(() => assertCargoStepCoverage(ci.replace('run: node scripts/runtime-config-loopback.mjs run', 'run: echo omitted')), /名单陈旧/);
 });
 
 for (const gate of GATES) {
@@ -508,8 +520,81 @@ test('existing RuntimeConfig CI-only command has an explicit narrow registration
   const { ci } = loadStripped();
   const block = extractCiStepBlock(ci, CI_ONLY_SOURCE_STEP);
   assert.equal(extractRunCommand(block, CI_ONLY_SOURCE_STEP), 'cargo test --locked -p polaris-singbox-grpc --test runtime_config');
-  const source = ci.split('  runtime_config_source_tests:')[1].split('  windows_launcher_diagnostics:')[0];
+  const source = extractCiJobBlock(ci, 'runtime_config_source_tests');
   assert.ok(source.includes(block));
   assert.doesNotMatch(source, /fetch-core|prepare-core-identity|sudo|--ignored|--release|continue-on-error/);
   assert.match(source, /This job is not full CI, native or HOT acceptance/);
+});
+
+
+function extractCiJobBlock(ci, name) {
+  const tail = ci.split(`\n  ${name}:\n`)[1];
+  assert.ok(tail, `Missing CI job ${name}`);
+  return tail.split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
+}
+
+function assertLoopbackOnlyStep(ci, sh, runner) {
+  const job = extractCiJobBlock(ci, 'runtime_config_loopback');
+  const block = extractCiStepBlock(job, CI_ONLY_LOOPBACK_STEP);
+  assert.equal(extractRunCommand(block, CI_ONLY_LOOPBACK_STEP), 'node scripts/runtime-config-loopback.mjs run');
+  assert.match(block, /RUNTIME_CONFIG_LOOPBACK_INPUTS: \$\{\{ toJSON\(inputs\) \}\}/);
+  assert.match(job, /^    needs: cheap_format$/m);
+  assert.match(job, /^    if: needs\.cheap_format\.outputs\.runtime_config_loopback_only == 'true'$/m);
+  assert.doesNotMatch(job, /continue-on-error|fetch-core|prepare-core-identity|Swatinem\/rust-cache|\|\| true/);
+  assert.doesNotMatch(sh, /runtime-config-loopback|real_hot_dispatcher|real_hot_public_rpc/);
+  assert.match(runner, /import \{ exactPass, runtimeEnvironment, selectExecutable \} from '\.\/run-native-dns-controlled-tests\.mjs'/);
+  const cargoCalls = [...runner.matchAll(/(?:capture|execute)\([^;\n]*?'cargo', (\[[^\]]+\])/g)].map((match) => match[1]);
+  assert.deepEqual(cargoCalls, [
+    "['metadata', '--locked', '--no-deps', '--format-version=1']",
+    "['test', '--locked', '-p', 'polaris', '--lib', '--no-run', '--message-format=json']",
+  ]);
+  const names = [...runner.matchAll(/'(runtime::proxy::tests::runtime_config_real_core::[a-z_]+)'/g)].map((match) => match[1]);
+  assert.deepEqual(names, [
+    'runtime::proxy::tests::runtime_config_real_core::real_hot_dispatcher_apply_and_status',
+    'runtime::proxy::tests::runtime_config_real_core::real_hot_dispatcher_persistence_retry',
+    'runtime::proxy::tests::runtime_config_real_core::real_hot_public_rpc_contract',
+    'runtime::proxy::tests::runtime_config_real_core::real_hot_dispatcher_rejections_preserve_runtime',
+  ]);
+  assert.deepEqual(LOOPBACK_TESTS, names);
+  assert.match(runner, /for \(const name of TESTS\)/);
+  assert.match(runner, /program: selected\.executable,/);
+  assert.match(runner, /args: \[name, '--exact', '--ignored', '--nocapture', '--test-threads=1'\]/);
+  assert.match(runner, /selectExecutable\(messages, metadata, ROOT\)/);
+  assert.match(runner, /demand\(exactPass\(observed\),/);
+  assert.match(runner, /demand\(result\.tests\.length === 4,/);
+  assert.doesNotMatch(runner, /cargo test[^\n]*--ignored|--test-threads=0|--include-ignored/);
+}
+
+test('real HOT delegated runner is explicitly CI-only with exact compile and four libtest selectors', () => {
+  const { ci, sh } = loadStripped();
+  const runner = readFileSync(join(ROOT, 'scripts/runtime-config-loopback.mjs'), 'utf8');
+  assertLoopbackOnlyStep(ci, sh, runner);
+  for (const [before, after] of [
+    ["'--lib', '--no-run'", "'--lib'"],
+    ["'-p', 'polaris', '--lib'", "'--workspace'"],
+    ["args: [name, '--exact', '--ignored'", "args: [name, '--ignored'"],
+    ['demand(exactPass(observed),', 'demand(true,'],
+    ['demand(result.tests.length === 4,', 'demand(result.tests.length >= 0,'],
+    ['real_hot_public_rpc_contract', 'other_ignored_test'],
+  ]) {
+    assert.ok(runner.includes(before), before);
+    assert.throws(() => assertLoopbackOnlyStep(ci, sh, runner.replaceAll(before, after)), before);
+  }
+  for (const [before, after] of [
+    ["if: needs.cheap_format.outputs.runtime_config_loopback_only == 'true'", 'if: true'],
+    ['run: node scripts/runtime-config-loopback.mjs run', 'run: node scripts/runtime-config-loopback.mjs run --all'],
+  ]) assert.throws(() => assertLoopbackOnlyStep(ci.replace(before, after), sh, runner));
+});
+
+test('CI step and source-job scanners stop at sibling jobs and unnamed steps', () => {
+  const fixture = '  first:\n    steps:\n      - name: Exact\n        run: cargo check --locked\n'
+    + '      - uses: actions/checkout@v7\n        with:\n          persist-credentials: false\n'
+    + '  second:\n    steps:\n      - name: Other\n        run: cargo deny check\n';
+  assert.equal(extractRunCommand(extractCiStepBlock(fixture, 'Exact'), 'Exact'), 'cargo check --locked');
+  assert.doesNotMatch(extractCiStepBlock(fixture, 'Exact'), /checkout|second|cargo deny/);
+  const last = fixture.replace('      - uses: actions/checkout@v7\n        with:\n          persist-credentials: false\n', '');
+  assert.doesNotMatch(extractCiStepBlock(last, 'Exact'), /second|cargo deny/);
+  const { ci } = loadStripped();
+  const added = ci.replace('\n  windows_launcher_diagnostics:\n', '\n  sibling_fixture:\n    steps:\n      - run: sudo cargo test --ignored\n\n  windows_launcher_diagnostics:\n');
+  assert.doesNotMatch(extractCiJobBlock(added, 'runtime_config_source_tests'), /sudo|--ignored|sibling_fixture/);
 });

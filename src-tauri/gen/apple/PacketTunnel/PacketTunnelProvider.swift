@@ -84,7 +84,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel start finished after cancellation/timeout") }
                     self.lifecycle.retainTailscaleStoreScope(server.exportTailscaleStoreRetirement(), identity: identity)
                     self.lifecycle.retainTailscaleDirectoryScope(server.exportTailscaleDirectoryRetirement(), identity: identity)
-                    self.lifecycle.complete(token, phase: "running", stopped: false)
+                    guard self.lifecycle.complete(token, phase: "running", stopped: false) else {
+                        throw tunnelError("Tunnel ready publication was superseded")
+                    }
                     self.publishReport()
                     completion.finish(nil)
                 } catch {
@@ -171,12 +173,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.lifecycle.retainTailscaleDirectoryScope(server.exportTailscaleDirectoryRetirement(), identity: commandIdentity)
                 }
                 guard self.lifecycle.accepts(token) else { throw tunnelError("Tunnel reload finished after cancellation/timeout") }
-                self.lifecycle.complete(token, phase: "running", stopped: false)
+                guard self.lifecycle.complete(token, phase: "running", stopped: false) else {
+                    throw tunnelError("Tunnel reload ready publication was superseded")
+                }
                 self.publishReport()
             } catch {
-                self.lifecycle.complete(token, phase: "failed", stopped: nil, error: error.localizedDescription)
-                self.publishReport()
-                self.cancelTunnelWithError(error)
+                // Stop/timeout may already own the generation. Never cancel a successor.
+                if self.lifecycle.complete(token, phase: "failed", stopped: nil, error: error.localizedDescription) {
+                    self.publishReport()
+                    self.cancelTunnelWithError(error)
+                }
             }
         }
     }
@@ -339,6 +345,29 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         runtimeRestartOwner = owner
         do {
             try server.startOrReloadServiceWithRetryableRuntimePersistence(config, options: LibboxOverrideOptions(), handler: owner)
+            guard lifecycle.accepts(token), commandServer === server, runtimeRestartOwner === owner else {
+                throw tunnelError("Runtime protocol query lost its native owner")
+            }
+            // Go (string, error) follows the generated nonnull NSString + NSErrorPointer
+            // convention used by readSystemSSHHostKey. Exact runtimeCapabilities header
+            // and Swift import must also be checked in the matching component build.
+            var capabilityError: NSError?
+            let document = server.runtimeCapabilities(&capabilityError)
+            if let capabilityError { throw capabilityError }
+            let platformBuild: String
+            #if arch(arm64)
+            platformBuild = "ios/arm64"
+            #else
+            throw tunnelError("Unsupported iOS runtime build target")
+            #endif
+            let admission = try TunnelRuntimeAdmission.decode(document, platform: platformBuild)
+            guard lifecycle.accepts(token), commandServer === server, runtimeRestartOwner === owner else {
+                throw tunnelError("Runtime protocol response lost its native owner")
+            }
+            try owner.bindRuntimeAdmission(admission)
+            guard lifecycle.admitRuntimeProtocol(token, admission: admission) else {
+                throw tunnelError("Runtime protocol admission was superseded")
+            }
         } catch {
             owner.revoke()
             throw error
@@ -392,6 +421,7 @@ private final class TunnelRuntimeRestartOwner: NSObject, LibboxRuntimePersistenc
     private var content: String
     private var revoked = false
     private var incarnation: String?
+    private var admittedIncarnation: String?
     private var revision: Int64 = -1
     private var effectiveDigest: String?
 
@@ -410,6 +440,12 @@ private final class TunnelRuntimeRestartOwner: NSObject, LibboxRuntimePersistenc
 
     func revoke() { lock.lock(); revoked = true; lock.unlock() }
 
+    func bindRuntimeAdmission(_ admission: TunnelRuntimeAdmission) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard !revoked, lifecycle.accepts(token) else { throw tunnelError("Runtime admission owner was superseded") }
+        admittedIncarnation = admission.identity?.incarnation
+    }
+
     func persistRuntimeConfiguration(_ incarnation: String?, revision: Int64,
                                      effectiveDigest: String?, configContent: String?) throws {
         guard let incarnation, !incarnation.isEmpty, revision >= 0,
@@ -419,7 +455,7 @@ private final class TunnelRuntimeRestartOwner: NSObject, LibboxRuntimePersistenc
         }
         lock.lock(); defer { lock.unlock() }
         guard !revoked, self.incarnation == nil || self.incarnation == incarnation,
-              revision >= self.revision,
+              admittedIncarnation == incarnation, revision >= self.revision,
               revision != self.revision || self.effectiveDigest == effectiveDigest else {
             throw tunnelError("Runtime reload receipt belongs to a stale owner")
         }

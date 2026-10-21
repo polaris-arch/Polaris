@@ -105,6 +105,26 @@ struct Entry {
 const REGISTRY: &[Entry] = &[
     // ── RealCore：需要真实 sing-box ──
     Entry {
+        file: "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs",
+        test: "real_hot_dispatcher_apply_and_status",
+        class: Class::RealCore,
+    },
+    Entry {
+        file: "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs",
+        test: "real_hot_dispatcher_persistence_retry",
+        class: Class::RealCore,
+    },
+    Entry {
+        file: "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs",
+        test: "real_hot_public_rpc_contract",
+        class: Class::RealCore,
+    },
+    Entry {
+        file: "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs",
+        test: "real_hot_dispatcher_rejections_preserve_runtime",
+        class: Class::RealCore,
+    },
+    Entry {
         file: "src-tauri/src/runtime/proxy/tests/lifecycle.rs",
         test: "real_core_full_lifecycle",
         class: Class::RealCore,
@@ -520,8 +540,8 @@ fn registry_and_source_agree_exactly() {
     );
     assert_eq!(
         sites.len(),
-        26,
-        "默认不跑的测试数从 26 变成了 {} —— 这不是自动放行的事：\
+        30,
+        "默认不跑的测试数从 30 变成了 {} —— 这不是自动放行的事：\
          增加意味着又有一块行为退出了默认覆盖，减少意味着有测试被接回默认门（好事，但要同步改这个数）。",
         sites.len()
     );

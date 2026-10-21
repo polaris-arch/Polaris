@@ -92,6 +92,15 @@ describe('runtimePersistenceRecoveryEnded', () => {
 });
 
 describe('applyOutcome（spec §2.5 Q8：applied 不再报成功）', () => {
+  it('paired-core protocol mismatch stays failed and uses the existing localized core error', () => {
+    expect(applyOutcome('unconfirmed', [{ code: 'CORE_BUNDLE_MISMATCH', path: 'runtime.protocol' }]))
+      .toEqual({ phase: 'failed', toast: { kind: 'error', key: 'errors.coreBundleMismatch' } });
+    for (const reasons of [undefined, [], [{ code: 'CORE_BUNDLE_MISMATCH', path: 'other' }],
+      [{ code: 'UNAVAILABLE', path: 'runtime.protocol' }]]) {
+      expect(applyOutcome('unconfirmed', reasons))
+        .toEqual({ phase: 'failed', toast: { kind: 'error', key: 'home.pendingHotUnconfirmed' } });
+    }
+  });
   // C-8：`applied` 只意味着 schedule_restart() 已排程，重启成没成走 proxyStarted/proxyError。
   // 变异对照：把 applied 腿改回 `{phase:'idle', toast:{kind:'success',…}}` → 本条转红。
   // 这正是 Q8 表第三行点名的洞：「排程了但核没起来」时旧实现会报「已应用」。

@@ -81,13 +81,17 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 
 ---
 
-## 完整清单（26 条）
+## 完整清单（30 条）
 
 `src-tauri/tests/ignored_tests_registry.rs` 的 `REGISTRY` 是真值源；本表由它逐条对应，
 **每个测试名都必须在本文档里逐字出现**（那道门会逐条核对，前缀兜底已被去掉——它会让 2/3 的条目失守）。
 
 | 测试 | 文件 | 类别 |
 |---|---|---|
+| `real_hot_dispatcher_apply_and_status` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
+| `real_hot_dispatcher_persistence_retry` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
+| `real_hot_public_rpc_contract` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
+| `real_hot_dispatcher_rejections_preserve_runtime` | `src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs` | RealCore（仅专用 GitHub 候选 lane） |
 | `real_core_full_lifecycle` | `src-tauri/src/runtime/proxy/tests/lifecycle.rs` | RealCore |
 | `real_core_lifecycle_race_start_then_immediate_stop` | `src-tauri/src/runtime/proxy/tests/lifecycle.rs` | RealCore |
 | `real_core_hot_switch_keeps_pid` | `src-tauri/src/runtime/proxy/tests/hot_switch.rs` | RealCore |
@@ -136,7 +140,7 @@ POLARIS_SINGBOX_PATH=/绝对路径/sing-box cargo test -p polaris-singbox-grpc -
 
 ## 平台差异：`ignored` 的数字是平台相关的
 
-源码登记共 26 条。exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
+源码登记共 30 条。exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
 
 
 ## NativeWindowsInterop 与 PrivilegedWindowsInterop 的执行边界
@@ -176,3 +180,56 @@ POLARIS_SINGBOX_PATH=/绝对路径/sing-box cargo test -p polaris-singbox-grpc -
 ```
 
 本次源码结构修复没有运行上述四条测试，没有创建 SYSTEM 任务，也不签署 Windows 原生互操作能力。
+
+
+## Exact-source GitHub RuntimeConfig loopback lane (four RealCore tests)
+
+These tests are Linux amd64 only and require the dedicated `ci.yml` manual
+`runtime_config_loopback_candidate` lane on the reviewed HOT branch. They are not
+local manual commands: `POLARIS_SINGBOX_PATH` alone is insufficient. The runner
+must supply a regular absolute `POLARIS_RUNTIME_LOOPBACK_RECEIPT` with exact App
+and kernel commit/tree/proto identity, verified source closure and binary hash,
+plus the matching `POLARIS_SINGBOX_PATH`. Each test verifies the real GitHub
+context and bytes before using the existing test-only binary injection.
+
+| Exact function | Class | Evidence |
+|---|---|---|
+| `real_hot_dispatcher_apply_and_status` | RealCore | Production App Plan/Apply/Status; retained A TCP stream, new B stream and TTL0 owned DNS address change; same PID/incarnation |
+| `real_hot_dispatcher_persistence_retry` | RealCore | Real CLI source-byte mismatch, pending durability, read-only polling and original-transaction retry |
+| `real_hot_public_rpc_contract` | RealCore | Actual six-method authentication, Plan/Apply/Status/Retry positives, idempotence/conflict and honest CLI negative regeneration Ack |
+| `real_hot_dispatcher_rejections_preserve_runtime` | RealCore | Structural restart choice without confirmation and invalid-reference rejection, preserving the live graph |
+
+The runner compiles `cargo test --locked -p polaris --lib --no-run
+--message-format=json`, discovers the actual `polaris_lib` test executable and
+runs each full name with `--exact --ignored --nocapture --test-threads=1`. The full
+name is `runtime::proxy::tests::runtime_config_real_core::` followed by the exact
+function above. Exactly one passed test per invocation is required; missing
+receipts, wrong files, zero matches and unavailable public HOT support are hard
+failures, never skipped success.
+
+The current lane is `linux-amd64-purego-no-naive`: this is partial-profile
+noTUN evidence, not the complete paired Linux feature profile, full-schema HOT,
+mobile/device, installed-package or publication acceptance. Positive regeneration
+Ack belongs to companion evidence from the kernel's actual libbox owner handler.
+No fake CLI acknowledgement or forced capability enablement is permitted.
+
+Before starting the core, each test checks the canonical fixture allowlist and
+runs the ordinary production generator. It admits only noTUN loopback listeners,
+two owned numeric SOCKS endpoints, owned source rule files, and the fixture's
+reachable DNS dependency closure. The actual generated file must match that
+safety projection. Production's unused node/local/LAN/mDNS/probe DNS definitions
+remain present; the claim is not that every definition is a loopback address.
+Only `runtime-loopback.test` is sent through `mixed-in`; explicit auto-switch and
+auto-selection switches are off, no probe emitter is attached, and there are no
+mesh endpoints, network profiles, URLTest outbounds or remote rule downloads.
+
+The durability test distinguishes committed live App R from durable CLI source:
+R already describes the committed graph while persistence is pending, status
+polls change neither R nor source bytes, and explicit retry changes only the
+restart source/durability receipt without another graph publication.
+
+Each test writes sanitized actual capabilities/manifest, operation and data-plane
+observations to `<test-name>.json` beside the runner receipt. Secrets and full
+generated configuration are not included. Only owned loopback listeners and
+owned temporary configuration files are used; no TUN, system proxy, host DNS,
+routes, firewall, helper/device installation or privileged core execution.

@@ -1,4 +1,6 @@
 pub(crate) mod real_core_cleanup;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod runtime_config_real_core;
 use real_core_cleanup::RealCoreCleanupGuard;
 
 use super::core_log::*;

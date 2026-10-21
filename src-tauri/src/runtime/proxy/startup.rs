@@ -775,6 +775,59 @@ where
 }
 
 impl ProxyRuntime {
+    async fn confirm_startup_runtime_pairing(
+        &self,
+        generated: &SingBoxConfig,
+        generation: u64,
+        deadline: std::time::Instant,
+    ) -> Result<super::runtime_config::RuntimePairing, String> {
+        use super::runtime_config::{observe_runtime_pairing, RuntimePairingError};
+        let failure = || "CORE_BUNDLE_MISMATCH: 配套内核运行协议或实例未确认".to_owned();
+        let service = generated
+            .services
+            .as_ref()
+            .and_then(|services| services.iter().find(|service| service.type_field == "api"))
+            .ok_or_else(failure)?;
+        let secret = service
+            .secret
+            .as_deref()
+            .filter(|secret| !secret.is_empty())
+            .ok_or_else(failure)?;
+        let admission = async {
+            let client = SingBoxApiClient::connect(
+                ManagementEndpoint::new("127.0.0.1", service.listen_port),
+                secret.to_owned(),
+            )
+            .await
+            .map_err(|_| failure())?;
+            loop {
+                if self.gate.generation() != generation {
+                    return Err(failure());
+                }
+                let capabilities = client
+                    .get_runtime_capabilities()
+                    .await
+                    .map_err(|_| failure())?;
+                match observe_runtime_pairing(&capabilities) {
+                    Ok(pairing) => return Ok(pairing),
+                    Err(RuntimePairingError::Starting) => {
+                        sleep_unless_superseded_on(
+                            &self.gate,
+                            &self.gen_changed,
+                            generation,
+                            Duration::from_millis(CORE_READY_POLL_MS),
+                        )
+                        .await;
+                    }
+                    Err(RuntimePairingError::Invalid) => return Err(failure()),
+                }
+            }
+        };
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), admission)
+            .await
+            .map_err(|_| failure())?
+    }
+
     /// 本次起核要 spawn 的核二进制（生产）= [`resolve_core_binary`] 逐字不变。
     #[cfg(not(test))]
     pub(super) fn core_binary_for_start(&self) -> Result<PathBuf, String> {
@@ -1148,6 +1201,62 @@ impl ProxyRuntime {
         .map_err(|error| StartError::from(error.to_string()))?
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(super) fn capture_direct_startup_cli_proof(
+        &self,
+        binary: &Path,
+        proof: Option<&crate::runtime::tls_fingerprints::CliObservation>,
+        generation: u64,
+        identity: &super::process_supervision::RunIdentity,
+    ) -> Result<(), String> {
+        let mut captured = self
+            .captured_cli_run
+            .lock()
+            .map_err(|_| "Core byte proof custody is unavailable".to_owned())?;
+        let proof = require_direct_startup_cli_proof(binary, proof)?;
+        *captured = Some((generation, identity.clone(), proof.clone()));
+        Ok(())
+    }
+
+    /// Spawn has already returned and installed the Child. A rejected proof
+    /// cannot turn that birth into a no-writer result or drop its custody.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    async fn reject_direct_startup_cli_proof(
+        &self,
+        generation: u64,
+        identity: &super::process_supervision::RunIdentity,
+        ts_gate: &tokio::sync::MutexGuard<'_, ()>,
+        reason: String,
+    ) -> Result<ProxyStatus, StartError> {
+        if self.gate.generation() != generation {
+            return Ok(self.status());
+        }
+        let original_child = self
+            .child
+            .lock()
+            .map(|slot| slot.running_matches(identity))
+            .unwrap_or(false);
+        if !original_child {
+            return Err(StartError::coded(
+                format!("{reason}; original direct Child custody is unavailable"),
+                code::CORE_BUNDLE_MISMATCH,
+            ));
+        }
+        // The caller still holds the original TS gate: no successor main Start
+        // can replace this Child between the identity check and Stop booking.
+        // Concurrent Stop can only claim this same birth; its existing nonce
+        // exclusion preserves custody if cleanup cannot be confirmed.
+        let message = match self.kill_core_and_release_main(ts_gate).await {
+            Ok(()) => reason,
+            Err(error) => format!("{reason}; direct core cleanup unconfirmed: {error}"),
+        };
+        if self.gate.generation() != generation {
+            return Ok(self.status());
+        }
+        self.set_error(&message, code::CORE_BUNDLE_MISMATCH);
+        Err(StartError::coded(message, code::CORE_BUNDLE_MISMATCH))
+    }
+
     pub(super) async fn start_inner(
         self: &Arc<Self>,
         config: Value,
@@ -1408,6 +1517,7 @@ impl ProxyRuntime {
             binary,
             effective_user_config,
             mesh_route_prepared,
+            ready_deadline,
         ) = loop {
             attempt += 1;
             // 轮首让位：退避已可中断，但被唤醒的腿仍会走到这里 —— 在**重新生成配置 / 写盘 / 重解析端口**
@@ -1694,9 +1804,10 @@ impl ProxyRuntime {
             let t_spawn = std::time::Instant::now();
             let main_claim_token = main_reservation.claim_token();
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            if startup_cli_proof
-                .as_ref()
-                .is_some_and(|entry| !entry.still_current())
+            if via_helper
+                && startup_cli_proof
+                    .as_ref()
+                    .is_some_and(|entry| !entry.still_current())
             {
                 return Err(StartError::from(
                     "Core bytes changed after preflight; retry startup".to_owned(),
@@ -1885,6 +1996,16 @@ impl ProxyRuntime {
                     }
                 }
             } else {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if let Err(message) =
+                    require_direct_startup_cli_proof(&binary, startup_cli_proof.as_ref())
+                {
+                    if self.gate.generation() != my_gen {
+                        return Ok(self.status());
+                    }
+                    self.set_error(&message, code::CORE_BUNDLE_MISMATCH);
+                    return Err(StartError::coded(message, code::CORE_BUNDLE_MISMATCH));
+                }
                 // ── 直起临界区（与 stop 的「取 child」互斥）──
                 // 竞态不变式：stop() 先 bump 世代、再取 child 锁；本处在**持锁期间**判世代。
                 //   · 本判定先于 stop 的 bump → 本腿 spawn 并存 child；stop 随后取到 child 并杀 → 无孤儿。
@@ -1927,10 +2048,26 @@ impl ProxyRuntime {
                 // spawn and bind it to the opaque identity returned for that Child.
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 let launch_tls = startup_cli_proof.clone();
+                let direct_proof_rejected = std::cell::Cell::new(false);
                 let direct_spawn = self.spawn_direct_native(
                     native_producer.as_ref(),
                     my_gen,
-                    || TokioSpawner::new().spawn(req).map(|spawned| spawned.child),
+                    || {
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        if let Err(message) =
+                            require_direct_startup_cli_proof(&binary, launch_tls.as_ref())
+                        {
+                            direct_proof_rejected.set(true);
+                            return Err(polaris_core_supervisor::SpawnError::Spawn {
+                                bin: binary.clone(),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    message,
+                                ),
+                            });
+                        }
+                        TokioSpawner::new().spawn(req).map(|spawned| spawned.child)
+                    },
                     main_claim_token.clone(),
                     || main_reservation.arm_external_start(),
                 );
@@ -1942,16 +2079,28 @@ impl ProxyRuntime {
                 match direct_spawn {
                     Ok(Some((pid, identity))) => {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                        if let Ok(mut proof) = self.captured_cli_run.lock() {
-                            *proof = launch_tls
-                                .filter(|entry| entry.still_current())
-                                .map(|entry| (my_gen, identity.clone(), entry));
+                        if let Err(reason) = self.capture_direct_startup_cli_proof(
+                            &binary,
+                            launch_tls.as_ref(),
+                            my_gen,
+                            &identity,
+                        ) {
+                            return self
+                                .reject_direct_startup_cli_proof(my_gen, &identity, ts_gate, reason)
+                                .await;
                         }
                         log_pipe_handoff = Some(handoff);
                         direct_run_identity = Some(identity);
                         pid
                     }
                     Ok(None) => return Ok(self.status()),
+                    Err(error) if direct_proof_rejected.get() => {
+                        if self.gate.generation() != my_gen {
+                            return Ok(self.status());
+                        }
+                        self.set_error(&error.message, code::CORE_BUNDLE_MISMATCH);
+                        return Err(StartError::coded(error.message, code::CORE_BUNDLE_MISMATCH));
+                    }
                     Err(error) if error.admission_denied => return Err(error),
                     Err(error) => {
                         let msg = error.message;
@@ -2053,6 +2202,7 @@ impl ProxyRuntime {
                             // 三处按 id 反算 tag 时，算的是运行核里真实存在的那套 tag。
                             effective_user_config,
                             mesh_route_prepared,
+                            t_ready + Duration::from_millis(ready_budget_ms),
                         );
                     }
                     // 探测最长 3s，期间可能被接管 → 与 Dead/Timeout 两腿同款复查：世代变了就静默让位
@@ -2180,6 +2330,27 @@ impl ProxyRuntime {
         // 就绪后再判一次世代：轮询末次判定与本处之间仍有窗口，接管方可能已拆核。
         if self.gate.generation() != my_gen {
             log::info!("起核就绪后被接管（世代 {my_gen}）→ 让位");
+            return Ok(self.status());
+        }
+
+        // TCP readiness is not protocol admission. Query the authenticated API
+        // of this exact start before publishing any running/baseline state. This
+        // consumes the remaining existing ready budget, never a fresh retry budget.
+        let runtime_pairing = match self
+            .confirm_startup_runtime_pairing(&singbox_config, my_gen, ready_deadline)
+            .await
+        {
+            Ok(pairing) => pairing,
+            Err(msg) => {
+                if self.gate.generation() != my_gen {
+                    return Ok(self.status());
+                }
+                self.kill_core_and_release_main(ts_gate).await?;
+                self.set_error(&msg, code::CORE_BUNDLE_MISMATCH);
+                return Err(StartError::coded(msg, code::CORE_BUNDLE_MISMATCH));
+            }
+        };
+        if self.gate.generation() != my_gen {
             return Ok(self.status());
         }
 
@@ -2317,6 +2488,7 @@ impl ProxyRuntime {
             deps.clone(),
             singbox_config.clone(),
             user_config.clone(),
+            runtime_pairing,
         );
         self.commit_coex_current_config(config.clone());
         // The final endpoint set was claimed before native/libbox startup. Keep that claim
@@ -4154,6 +4326,21 @@ impl ProxyRuntime {
             .ok()
             .is_some_and(|core| cronet_lib_exists_beside_core(&core, std::env::consts::OS))
     }
+}
+
+/// Every direct Start, including injected test candidates, needs an actual
+/// retained file observation. A missing TLS document is allowed; missing bytes
+/// are not. Script fixtures retain a file hash without executing a TLS query.
+/// These checks detect observed replacement; pathname-based execution still has
+/// a hash-to-exec window. They are not a cross-platform immutable-image claim.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(super) fn require_direct_startup_cli_proof<'a>(
+    binary: &Path,
+    proof: Option<&'a crate::runtime::tls_fingerprints::CliObservation>,
+) -> Result<&'a crate::runtime::tls_fingerprints::CliObservation, String> {
+    proof
+        .filter(|proof| proof.snapshot.binary_sha256.is_some() && proof.matches(binary))
+        .ok_or_else(|| "Core byte proof is missing or changed during direct startup".to_owned())
 }
 
 /// Validate this gate's retained query proof, including after a peel/check await.

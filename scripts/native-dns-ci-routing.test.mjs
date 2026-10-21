@@ -7,6 +7,7 @@ import test, { after } from 'node:test';
 import { candidateContext, loadCandidate, hasTemporaryDesktop, loadTemporaryDesktopSelection, selectedCandidateContext } from './desktop-core/native-dns-candidate.mjs';
 import { regularPath } from './desktop-core/release-consumer.mjs';
 import { releaseGoVersion } from './desktop-core/source-graph.mjs';
+import { validateRequest as validateLoopbackRequest } from './runtime-config-loopback.mjs';
 import { TARGETS, loadFormalGateSelection, formalGateContext } from './desktop-core/native-dns-gates.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -115,7 +116,7 @@ test('RuntimeConfig source mocks remain independent of payload admission and use
   assert.deepEqual(commands, ['cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
 });
 
-const runtimeSourceDefaults = { app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
+const runtimeSourceDefaults = { runtime_config_loopback_candidate: '', app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
   native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
   windows_directory_candidate_source: '', os: 'all', preserve_run: false };
 const runtimeSourceConflicts = [
@@ -141,14 +142,14 @@ function ciSchedule(source, names) {
     needs: /^    needs: (\w+)$/m.exec(ciJobSection(source, name))?.[1],
     allows: new Function('github', 'inputs', 'needs', `return (${ciJobCondition(source, name)});`),
   }));
-  return (event, inputs, outputs = {}) => {
+  return (event, inputs, outputs = {}, cheapResult = 'success') => {
     const github = { event_name: event, repository: 'polaris-arch/Polaris',
       ref: 'refs/heads/collab/dots-audit-remediation-20261017', workflow_ref: base.GITHUB_WORKFLOW_REF,
       // Inherited caller event payloads must never activate the dispatch-only typed input.
       event: { inputs: { ...inputs, runtime_config_source_only: 'true' } } };
     const started = new Set();
     for (const job of jobs)
-      if ((!job.needs || started.has(job.needs)) && job.allows(github, inputs, { cheap_format: { outputs } }))
+      if ((!job.needs || (started.has(job.needs) && cheapResult === 'success')) && job.allows(github, inputs, { cheap_format: { outputs } }))
         started.add(job.name);
     return [...started];
   };
@@ -159,7 +160,7 @@ function runtimeSourceRoutingContract(source = workflow) {
   assert.doesNotMatch(call, /runtime_config_source_only/);
   assert.doesNotMatch(source, /github\.event\.inputs\.runtime_config_source_only/);
   const names = [...source.slice(source.indexOf('\njobs:\n')).matchAll(/^  (\w+):$/gm)].map((m) => m[1]);
-  assert.deepEqual(names, ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test',
+  assert.deepEqual(names, ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback',
     'runtime_config_source_tests', 'windows_launcher_diagnostics']);
   for (const name of ['native_dns_candidate_gates', 'lint', 'cross', 'test']) {
     const header = ciJobSection(source, name).split('    steps:')[0];
@@ -237,7 +238,7 @@ test('conflicting RuntimeConfig-only requests fail in the scheduled source job b
       runtime_config_source_only: true, ...selection }),
   } });
   for (const selection of [{}, { os: 'ubuntu-22.04' }, { preserve_run: true }]) assert.doesNotThrow(() => admit(selection));
-  for (const selection of [...runtimeSourceConflicts, { app_native_compile_candidate: sha }, { native_dns_candidate: 'malformed' },
+  for (const selection of [...runtimeSourceConflicts, { app_native_compile_candidate: sha }, { runtime_config_loopback_candidate: sha }, { native_dns_candidate: 'malformed' },
     { windows_directory_candidate_source: ' ' }, { windows_directory_mode: 'unknown' }, { os: 'unknown' }])
     assert.throws(() => admit(selection), /cannot combine diagnostic, candidate or non-Ubuntu selections/);
   for (const value of [false, 'true', '', null])
@@ -251,7 +252,7 @@ test('manual inputs remain opt-in while the committed default preserves the ordi
   for (const entry of workflow.matchAll(/^      native_dns_candidate:\n([\s\S]*?)(?=^      \w|^\S)/gm))
     assert.match(entry[1], /type: string\n        default: ''/);
   assert.deepEqual([...workflow.matchAll(/^  (\w+):\n/gm)].filter((m) => m.index > workflow.indexOf('\njobs:\n')).map((m) => m[1]),
-    ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_source_tests', 'windows_launcher_diagnostics']);
+    ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics']);
   for (const job of ['lint', 'cross', 'test']) assert.ok(workflow.includes(`  ${job}:\n    needs: cheap_format\n`));
   const testJobHeader = workflow.slice(workflow.indexOf('  test:\n')).split('    strategy:')[0];
   assert.match(testJobHeader, /    permissions:\n      contents: read\n$/);
@@ -739,7 +740,7 @@ test('exact App compile-only admission is read-only, Ubuntu-only and rejects eve
   assert.deepEqual(compileAdmission().writes, [{ path: 'output', value: 'compile_only=true\n' }]);
   for (const candidate of ['', ' ', 'false', false, true, 'A'.repeat(40), 'b'.repeat(40), null])
     assert.throws(() => compileAdmission({ ...compileInputs, app_native_compile_candidate: candidate }));
-  const conflicts = [{ os: '' }, { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { os: 'other' },
+  const conflicts = [{ runtime_config_loopback_candidate: sha }, { runtime_config_loopback_candidate: ' ' }, { os: '' }, { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { os: 'other' },
     { runtime_config_source_only: true }, { windows_launcher_diagnostics: true }, { native_dns_candidate: sha },
     { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' }, { windows_directory_candidate_source: sha },
     { native_dns_candidate: ' ' }, { windows_directory_candidate_source: ' ' }];
@@ -758,7 +759,7 @@ test('exact App compile-only admission is read-only, Ubuntu-only and rejects eve
 });
 
 function compileRoutingContract(source = workflow) {
-  const names = ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test',
+  const names = ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback',
     'runtime_config_source_tests', 'windows_launcher_diagnostics'];
   const scheduled = ciSchedule(source, names);
   const outputs = { native_required: 'true', app_native_compile_only: 'true', native_dns_formal: 'true', native_dns_formal_app: sha };
@@ -793,7 +794,7 @@ function compileRoutingContract(source = workflow) {
 
   for (const name of ['Admit exact final candidate SYSTEM request', 'Admit explicit native DNS ordinary CI selection']) {
     const block = cheap.split(`      - name: ${name}\n`)[1].split('      - name:')[0];
-    assert.match(block, /if: steps\.app_native_compile_admission\.outputs\.compile_only != 'true'/);
+    assert.match(block, /if: steps\.runtime_config_loopback_admission\.outputs\.loopback_only != 'true' && steps\.app_native_compile_admission\.outputs\.compile_only != 'true'/);
   }
   const job = ciJobSection(source, 'test');
   assert.match(job, /needs: cheap_format/);
@@ -824,8 +825,8 @@ function compileRoutingContract(source = workflow) {
 test('compile-only runs the actual CI route contracts and only current native compiler commands', () => {
   compileRoutingContract();
   for (const [before, after] of [
-    ["if: steps.app_native_compile_admission.outputs.compile_only != 'true'", 'if: true'],
-    ["if: needs.cheap_format.outputs.app_native_compile_only != 'true'", 'if: true'],
+    ["steps.app_native_compile_admission.outputs.compile_only != 'true'", 'true'],
+    ["needs.cheap_format.outputs.app_native_compile_only != 'true'", 'true'],
     ['run: cargo test --locked --workspace --no-run', 'run: cargo test --locked --workspace'],
     ['run: node --test scripts/native-dns-ci-routing.test.mjs scripts/windows-token-owner.test.mjs scripts/gate-rust-ci-parity.test.mjs', 'run: echo omitted'],
   ]) assert.throws(() => compileRoutingContract(workflow.replaceAll(before, after)), before);
@@ -845,4 +846,128 @@ test('filtered launcher route execution rejects zero/missing/duplicate/failed TA
   assert.match(block, /set -euo pipefail/); // runner/tee nonzero exits cannot be replaced by a parser's zero.
   assert.ok(block.indexOf('| tee "$LAUNCHER_CONTRACT_TAP"') < block.indexOf("node --input-type=module - <<'NODE'"));
   assert.doesNotMatch(block, /continue-on-error|\|\| true|set \+e/);
+});
+
+const loopbackInputs = { ...runtimeSourceDefaults, runtime_config_loopback_candidate: sha,
+  os: 'ubuntu-22.04', preserve_run: true };
+const loopbackConflicts = [{ app_native_compile_candidate: sha }, { runtime_config_source_only: true },
+  { native_dns_candidate: sha }, { windows_system_candidate: sha }, { windows_launcher_diagnostics: true },
+  { windows_directory_mode: 'candidate' }, { windows_directory_candidate_source: sha },
+  { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { preserve_run: false },
+  { app_native_compile_candidate: ' ' }, { native_dns_candidate: ' ' }, { windows_directory_candidate_source: ' ' },
+  { runtime_config_source_only: true, windows_launcher_diagnostics: true, app_native_compile_candidate: sha }];
+function loopbackAdmission(inputs = loopbackInputs, extra = {}) {
+  const ref = 'refs/heads/hot/app-runtime-consumer-20261020';
+  return validateLoopbackRequest({ ...base, GITHUB_REF: ref,
+    GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/ci.yml@${ref}`,
+    GITHUB_WORKFLOW_SHA: sha, GITHUB_JOB: 'cheap_format', RUNNER_OS: 'Linux', RUNNER_ARCH: 'X64', ...extra },
+  inputs, { ref, repository: { full_name: 'polaris-arch/Polaris', id: 1347028220 },
+    inputs: Object.fromEntries(Object.entries(inputs).map(([key, value]) => [key, String(value)])) });
+}
+function loopbackRoutingContract(source = workflow) {
+  const jobs = [...source.slice(source.indexOf('\njobs:\n')).matchAll(/^  (\w+):$/gm)].map((m) => m[1]);
+  assert.deepEqual(jobs, ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test',
+    'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics']);
+  const dispatch = section(source, 'workflow_dispatch');
+  assert.deepEqual([...dispatch.matchAll(/^      (\w+):$/gm)].map((m) => m[1]), [
+    'runtime_config_loopback_candidate', 'app_native_compile_candidate', 'runtime_config_source_only',
+    'native_dns_candidate', 'windows_system_candidate', 'windows_launcher_diagnostics', 'windows_directory_mode',
+    'windows_directory_candidate_source', 'preserve_run', 'os',
+  ]);
+  assert.match(dispatch, /^      runtime_config_loopback_candidate:\n        description: .*\n        type: string\n        default: ''$/m);
+  assert.doesNotMatch(section(source, 'workflow_call'), /runtime_config_loopback_candidate/);
+  assert.doesNotMatch(source, /github\.event\.inputs\.runtime_config_loopback_candidate/);
+  const cheap = ciJobSection(source, 'cheap_format'), job = ciJobSection(source, 'runtime_config_loopback');
+  assert.match(cheap, /^      runtime_config_loopback_only: \$\{\{ steps\.runtime_config_loopback_admission\.outputs\.loopback_only \}\}$/m);
+  const admission = cheap.split('      - name: Admit exact real HOT loopback request\n')[1]?.split('\n      - ')[0];
+  assert.ok(admission);
+  assert.match(admission, /^        if: \$\{\{ github\.event_name == 'workflow_dispatch' && \(inputs\.runtime_config_loopback_candidate \|\| ''\) != '' \}\}$/m);
+  assert.match(admission, /^        env:\n          RUNTIME_CONFIG_LOOPBACK_INPUTS: \$\{\{ toJSON\(inputs\) \}\}$/m);
+  assert.match(admission, /^        run: node scripts\/runtime-config-loopback\.mjs admit$/m);
+  assert.ok(cheap.indexOf('Admit exact real HOT loopback request') < cheap.indexOf('Admit exact App native compile-only request'));
+  assert.ok(cheap.indexOf('Admit exact real HOT loopback request') < cheap.indexOf('Install existing Rust formatting toolchain'));
+  for (const name of ['native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback']) {
+    const header = ciJobSection(source, name).split('    steps:')[0];
+    assert.match(header, /^    needs: cheap_format$/m);
+    assert.doesNotMatch(header, /always\(|cancelled\(|success\(|failure\(|continue-on-error/);
+  }
+  assert.equal(ciJobCondition(source, 'runtime_config_loopback'), "needs.cheap_format.outputs.runtime_config_loopback_only == 'true'");
+  assert.match(job, /^    runs-on: ubuntu-22\.04$/m);
+  assert.match(job, /^    permissions:\n      contents: read$/m);
+  assert.match(job, /^    timeout-minutes: 60$/m);
+  assert.doesNotMatch(job, /contents: write|actions: write|id-token:|secrets:|secrets\.|continue-on-error|fetch-core|prepare-core-identity|Swatinem\/rust-cache|actions\/cache|self-hosted/);
+  assert.equal((job.match(/persist-credentials: false/g) ?? []).length, 1);
+  assert.ok(job.indexOf('Admit execution runner for real HOT loopback') < job.indexOf('Install Rust toolchain'));
+  assert.ok(job.indexOf('Test real HOT loopback admission and routing contracts') < job.indexOf('Install Rust toolchain'));
+  assert.match(job, /run: node --test scripts\/runtime-config-loopback\.test\.mjs scripts\/native-dns-ci-routing\.test\.mjs scripts\/gate-rust-ci-parity\.test\.mjs/);
+  assert.deepEqual([...job.matchAll(/^        run: node scripts\/runtime-config-loopback\.mjs (.+)$/gm)].map((m) => m[1]), ['admit', 'run']);
+  const scheduled = ciSchedule(source, jobs);
+  const outputs = { native_required: 'true', native_dns_formal: 'true', native_dns_formal_app: sha,
+    runtime_config_loopback_only: 'true' };
+  assert.deepEqual(scheduled('workflow_dispatch', loopbackInputs, outputs), ['cheap_format', 'runtime_config_loopback']);
+  for (const value of [undefined, '', 'false', 'unknown', 'TRUE']) {
+    const fallback = { ...outputs, runtime_config_loopback_only: value };
+    assert.deepEqual(scheduled('workflow_dispatch', loopbackInputs, fallback),
+      ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test']);
+    assert.deepEqual(scheduled('push', runtimeSourceDefaults, fallback),
+      ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_source_tests']);
+  }
+  for (const request of [loopbackInputs, ...loopbackConflicts.map((selection) => ({ ...loopbackInputs, ...selection })),
+    ...['malformed', ' ', 'A'.repeat(40)].map((runtime_config_loopback_candidate) => ({ ...loopbackInputs, runtime_config_loopback_candidate }))]) {
+    for (const outcome of ['failure', 'cancelled', 'skipped'])
+      assert.deepEqual(scheduled('workflow_dispatch', request, outputs, outcome), ['cheap_format'],
+        'every raw request reaches admission and failed admission blocks every native descendant');
+    for (const name of ['runtime_config_source_tests', 'windows_launcher_diagnostics'])
+      assert.ok(!scheduled('workflow_dispatch', request, outputs).includes(name), `${name} must be independently suppressed`);
+  }
+}
+
+test('real HOT loopback uses exact manual input, admitted output and failing required DAG before native setup', () => {
+  loopbackRoutingContract();
+  for (const [before, after] of [
+    ["((inputs.runtime_config_loopback_candidate || '') != '' || (inputs.app_native_compile_candidate || '') != '')", "(inputs.app_native_compile_candidate || '') != ''"],
+    ["needs.cheap_format.outputs.runtime_config_loopback_only == 'true'", "(inputs.runtime_config_loopback_candidate || '') != ''"],
+    ["needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && ", ''],
+    ["(inputs.runtime_config_loopback_candidate || '') != '' || ", ''],
+    ['runtime_config_loopback:\n    needs: cheap_format', 'runtime_config_loopback:'],
+    ['run: node scripts/runtime-config-loopback.mjs admit', 'run: echo skipped'],
+  ]) {
+    assert.ok(workflow.includes(before), before);
+    assert.throws(() => loopbackRoutingContract(workflow.replaceAll(before, after)), before);
+  }
+});
+
+test('real HOT raw conflicting or malformed requests fail actual read-only admission, never a second lane', () => {
+  assert.equal(loopbackAdmission(), sha);
+  assert.equal(loopbackAdmission(loopbackInputs, { GITHUB_JOB: 'runtime_config_loopback' }), sha);
+  for (const conflict of loopbackConflicts) assert.throws(() => loopbackAdmission({ ...loopbackInputs, ...conflict }), /cannot combine/);
+  for (const candidate of ['', ' ', 'malformed', 'A'.repeat(40), 'b'.repeat(40)])
+    assert.throws(() => loopbackAdmission({ ...loopbackInputs, runtime_config_loopback_candidate: candidate }));
+  for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call'])
+    assert.throws(() => loopbackAdmission(loopbackInputs, { GITHUB_EVENT_NAME: event }), /context required/);
+  assert.throws(() => compileAdmission({ ...compileInputs, runtime_config_loopback_candidate: sha }), /requires Ubuntu/);
+});
+
+test('HOT format repair retains the failed gate and exports only complete known Rust text', () => {
+  const cheap = ciJobSection(workflow, 'cheap_format');
+  const check = cheap.split('      - name: Check workspace formatting before native compilation\n')[1].split('\n      - ')[0];
+  assert.match(check, /id: workspace_format/);
+  assert.match(check, /run: cargo fmt --all -- --check/);
+  assert.doesNotMatch(check, /continue-on-error/);
+  const repair = cheap.split('      - name: Collect exact HOT formatting repair after failed gate\n')[1].split('\n      - ')[0];
+  assert.match(repair, /if: \$\{\{ failure\(\) && steps\.workspace_format\.outcome == 'failure' && steps\.runtime_config_loopback_admission\.outputs\.loopback_only == 'true' \}\}/);
+  const sourcePaths = [...repair.matchAll(/^              '(src-tauri\/[^']+[.]rs)',$/gm)].map(match => match[1]);
+  assert.equal(sourcePaths.length, 13);
+  assert.equal(new Set(sourcePaths).size, 13);
+  assert.ok(sourcePaths.includes('src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs'));
+  for (const required of ["not set(changed) <= set(paths)", "'--no-ext-diff', '--no-color', '--binary', '--', *paths",
+    "'formatGatePassed': False", "'before': before[path], 'after': digest(path)", "'patchBytes': len(patch)",
+    "['cargo', 'fmt', '--all', '--', '--check']", "'cargoFmt': ['cargo', 'fmt', '--version']"])
+    assert.ok(repair.includes(required), required);
+  assert.doesNotMatch(repair, /sudo|secrets[.]|git.*(?:commit|push)|continue-on-error/);
+  const artifact = cheap.split('      - name: Retain complete HOT format repair for independent replay\n')[1];
+  assert.match(artifact, /always\(\) && steps\.hot_format_patch\.outcome == 'success'/);
+  assert.match(artifact, /path: \$\{\{ steps\.hot_format_patch\.outputs\.directory \}\}/);
+  assert.match(artifact, /retention-days: 3/);
+  assert.match(artifact, /if-no-files-found: error/);
 });

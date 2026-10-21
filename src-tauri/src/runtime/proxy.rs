@@ -418,15 +418,8 @@ pub mod code {
     /// 实际默认出口，与用户落盘的 `selectedServerId` 对账（见 [`attest_effective_exit`](super::startup::attest_effective_exit)）。
     /// 非终态（核在跑），同走 `set_nonfatal_error`。这是「用户以为走代理、实则明文直连」的唯一告警通道。
     pub const EXIT_MISMATCH: &str = "EXIT_MISMATCH";
-    /// **内核自证**：核已就绪，但**实际跑起来的那个二进制**不是本次期望的核——「提权助手里的内核与本应用不配套」轴。
-    ///
-    /// 与 [`EXIT_MISMATCH`] 的判据形态**刻意相反**：那一条是纯静态对账（两个输入都源自「意图」），
-    /// 本条只吃**事实**——`running` 取自内核对该 pid 的记账（linux `/proc/<pid>/exe`、mac `ps -o comm=`），
-    /// 版本取自**对那个文件真跑一次 `sing-box version`**。理由是血证：TUN 提权路径上
-    /// 「app 请求 bin=A、helper 实跑 bin=B」持续一天多而全链零告警（p101，A=1.14.0-beta.3、
-    /// B=1.14.0-alpha.45），静态对账在此天然瞎——两侧根本不共享同一个「意图」。
-    ///
-    /// 非终态（核确在跑，只是版本不对），同走 `set_nonfatal_error`。
+    /// Nonfatal diagnostic mismatch, separate from byte/source startup admission.
+    /// Cached or PID-derived pathnames are never executed to produce this verdict.
     pub const CORE_BINARY_MISMATCH: &str = "CORE_BINARY_MISMATCH";
     /// The pinned Start/status receipt differs from the selected immutable CoreID.
     /// Runtime version strings are diagnostic and never establish this verdict.
@@ -1464,8 +1457,6 @@ pub struct ProxyRuntime {
     /// helper stop（child 恒 None）+ 崩溃监测/就绪门改用 pid 探活（helper 核无本地 [`tokio::process::Child`] 句柄）。
     /// 起核提交时置、停核/直起时清。
     core_via_helper: Arc<AtomicBool>,
-    /// Bounded diagnostic probe owns its original pending child/readers across generations.
-    core_version_probe: Arc<crate::runtime::core_version_probe::CoreVersionProbe>,
     /// H-1 强制重启专用配置快照（`(id, config, source)`）。
     ///
     /// **不可用 currentConfig 替代**：in-flight start 腿会覆盖 currentConfig，drain 必须读本字段
@@ -1846,9 +1837,6 @@ impl ProxyRuntime {
             android_main_token: Mutex::new(None),
             pid: Arc::new(Mutex::new(None)),
             core_via_helper: Arc::new(AtomicBool::new(false)),
-            core_version_probe: Arc::new(
-                crate::runtime::core_version_probe::CoreVersionProbe::default(),
-            ),
             pending_force_restart: RwLock::new(None),
             force_restart_seq: AtomicU64::new(1),
             current_config: RwLock::new(None),

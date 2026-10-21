@@ -329,19 +329,55 @@ def tracked_mirror(source):
     return {'leaves': len(rows), 'gitlinks': gitlinks, 'inventorySha256': sha(canonical(rows))}
 
 
-def source_facts(source, generated=False):
-    require(git(source, 'rev-parse', 'HEAD') == KERNEL_COMMIT and git(source, 'rev-parse', 'HEAD^{tree}') == KERNEL_TREE,
+def source_identity(identity=None):
+    """Reuse the byte/graph verifier with an explicit reviewed desktop identity.
+
+    Android callers omit the argument and keep their original frozen identity.
+    This is input validation only; it grants no build, runtime or release access.
+    """
+    if identity is None:
+        return {'repository': KERNEL_REPOSITORY, 'repositoryId': KERNEL_REPOSITORY_ID,
+                'commit': KERNEL_COMMIT, 'tree': KERNEL_TREE, 'files': SOURCE_HASHES,
+                'vendors': VENDORS}
+    require(isinstance(identity, dict) and set(identity) ==
+            {'repository', 'repositoryId', 'commit', 'tree', 'files', 'vendors'},
+            'exact source identity fields required')
+    require(identity['repository'] == KERNEL_REPOSITORY and identity['repositoryId'] == KERNEL_REPOSITORY_ID,
+            'only the paired Polaris kernel repository is allowed')
+    require(all(isinstance(identity[k], str) and re.fullmatch('[0-9a-f]{40}', identity[k])
+                for k in ('commit', 'tree')), 'exact kernel commit/tree required')
+    files = identity['files']
+    require(isinstance(files, dict) and {'go.mod', 'go.sum', 'daemon/runtime_config.proto'} <= set(files)
+            and 3 <= len(files) <= 64, 'bounded kernel source files required')
+    for name, digest in files.items():
+        require(isinstance(name, str) and not PurePosixPath(name).is_absolute()
+                and '..' not in PurePosixPath(name).parts and str(PurePosixPath(name)) == name
+                and isinstance(digest, str) and re.fullmatch('[0-9a-f]{64}', digest),
+                'invalid kernel source file pin')
+    require(files['daemon/runtime_config.proto'] == PROTO, 'paired runtime protocol bytes differ')
+    vendors = identity['vendors']
+    require(isinstance(vendors, dict) and set(vendors) == set(VENDORS), 'exact nine vendor names required')
+    for name, row in vendors.items():
+        require(isinstance(row, (list, tuple)) and len(row) == 3 and row[0] == VENDORS[name][0]
+                and isinstance(row[1], str) and re.fullmatch('[0-9a-f]{40}', row[1])
+                and type(row[2]) is int and 0 < row[2] <= 65536, 'invalid kernel vendor pin')
+    return identity
+
+
+def source_facts(source, generated=False, *, identity=None):
+    selected = source_identity(identity)
+    require(git(source, 'rev-parse', 'HEAD') == selected['commit'] and git(source, 'rev-parse', 'HEAD^{tree}') == selected['tree'],
             'kernel commit/tree differs')
     clean(source, generated=generated)
-    for name, digest in SOURCE_HASHES.items():
+    for name, digest in selected['files'].items():
         require(file_pin(source / name)['sha256'] == digest, 'kernel file differs: ' + name)
     from source_policy import source_module_declarations
     directives, dependencies, replacements = source_module_declarations((source / 'go.mod').read_bytes())
     require(directives == {'module': 'github.com/sagernet/sing-box', 'go': '1.27.0', 'toolchain': 'go1.27.2'}, 'kernel Go directives differ')
     local = {key: target[0] for key, (version, target) in replacements.items() if len(target) == 1 and not version}
-    require(local == {key: './third_party/' + row[0] for key, row in VENDORS.items()}, 'exact nine local replacements required')
+    require(local == {key: './third_party/' + row[0] for key, row in selected['vendors'].items()}, 'exact nine local replacements required')
     vendors = {}
-    for name, (directory, tree, count) in VENDORS.items():
+    for name, (directory, tree, count) in selected['vendors'].items():
         prefix = 'third_party/' + directory
         require(git(source, 'rev-parse', 'HEAD:' + prefix) == tree, 'vendor subtree differs')
         rows = git(source, 'ls-tree', '-r', 'HEAD', '--', prefix).splitlines()
@@ -360,16 +396,17 @@ def source_facts(source, generated=False):
             require(kind == 'blob' and hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == blob, 'vendor bytes differ')
         vendors[name] = {'path': './' + prefix, 'tree': tree, 'files': count}
     return {'repository': KERNEL_REPOSITORY, 'repositoryId': KERNEL_REPOSITORY_ID,
-            'commit': KERNEL_COMMIT, 'tree': KERNEL_TREE, 'files': SOURCE_HASHES, 'vendors': vendors,
+            'commit': selected['commit'], 'tree': selected['tree'], 'files': selected['files'], 'vendors': vendors,
             'trackedMirror': tracked_mirror(source)}
 
 
-def graph_facts(graph, source):
+def graph_facts(graph, source, *, identity=None):
+    selected = source_identity(identity)
     require(len(graph) == len({row['Path'] for row in graph}), 'duplicate module graph row')
     local = {r['Path']: r for r in graph if r.get('Replace') and not r['Replace'].get('Version')}
-    require(set(local) == set(VENDORS), 'actual graph replacements differ')
+    require(set(local) == set(selected['vendors']), 'actual graph replacements differ')
     for name, row in local.items():
-        replacement = row['Replace']; expected = './third_party/' + VENDORS[name][0]
+        replacement = row['Replace']; expected = './third_party/' + selected['vendors'][name][0]
         require(replacement['Path'] == expected and Path(replacement['Dir']).resolve(strict=True) == (source / expected).resolve(strict=True), 'local graph path differs')
         require(not row.get('Sum') and not replacement.get('Sum') and not replacement.get('Version'), 'local replacement must not invent h1/version')
     return graph

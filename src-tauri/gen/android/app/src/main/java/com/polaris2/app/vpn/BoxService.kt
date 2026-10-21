@@ -89,6 +89,8 @@ class BoxService(
     @Volatile private var mainAttempt: MainKernelAttempt<CommandServer>? = null
     private var receiverRegistered = false
     private var runtimePersistenceEpoch = 0L
+    // Replaced only after this exact server/epoch passes the post-Start protocol gate.
+    private var runtimeAdmission: RuntimeProtocolAdmission? = null
 
     private val stopReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -269,6 +271,7 @@ class BoxService(
                             server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(),
                                 runtimePersistenceHandler(attempt, server))
                         }
+                        admitRuntimeProtocol(attempt, server) { isStarting(attempt) }
                         SystemStart.requireLegacyAllowed(service)
                     }
                 }
@@ -276,6 +279,7 @@ class BoxService(
             val acknowledged = synchronized(this) {
                 // stopService 持同一把锁：停核已接管时不可重新放开命令流。
                 check(mainAttempt === attempt && !attempt.revoked && state == ServiceState.Starting) { "起核已被停核接管" }
+                check(runtimeAdmission != null) { "runtime protocol was not admitted" }
                 attempt.acknowledgeStart()
                 if (bridgeConfig != null) NativeReconnectNotice.clear(service)
                 state = ServiceState.Started
@@ -404,6 +408,14 @@ class BoxService(
                 observeNativeInput(attempt, server, config, { isReloadCurrent(attempt, server) }) {
                     server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(), persistence)
                 }
+                try {
+                    admitRuntimeProtocol(attempt, server) { isReloadCurrent(attempt, server) }
+                } catch (failure: Throwable) {
+                    // The replacement returned but cannot be published as a paired live core.
+                    // Exact-attempt Stop queues Close behind this same operationLock.
+                    stopService(attempt)
+                    throw failure
+                }
                 SystemStart.requireLegacyAllowed(service)
             },
             setError = { server, error -> setReloadError(server, error) },
@@ -413,6 +425,30 @@ class BoxService(
             },
             logFailure = { Log.e(TAG, "重载失败 type=${it.javaClass.simpleName}") },
         )
+    }
+
+    /** Native starts (including OS always-on) cannot bypass protocol admission in Rust. */
+    private fun admitRuntimeProtocol(
+        attempt: MainKernelAttempt<CommandServer>, server: CommandServer, current: () -> Boolean,
+    ) {
+        check(Thread.holdsLock(attempt.operationLock)) { "runtime admission requires the native operation owner" }
+        val epoch = synchronized(this) {
+            check(current() && mainAttempt === attempt && commandServer === server &&
+                !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt)) { "runtime admission owner expired" }
+            runtimePersistenceEpoch
+        }
+        val is64Bit = android.os.Process.is64Bit()
+        val processAbis = if (is64Bit) Build.SUPPORTED_64_BIT_ABIS else Build.SUPPORTED_32_BIT_ABIS
+        val platform = RuntimeProtocolAdmission.androidPlatform(BuildConfig.FLAVOR, is64Bit, processAbis.toList())
+        // Real generated Java bridge; a missing method/query error is a startup failure.
+        // JNI stays outside BoxService's short monitor so persistence/Stop cannot deadlock.
+        val admission = RuntimeProtocolAdmission.decode(server.runtimeCapabilities(), platform)
+        synchronized(this) {
+            check(current() && mainAttempt === attempt && commandServer === server &&
+                runtimePersistenceEpoch == epoch && !attempt.revoked &&
+                MainKernelAttemptRegistry.isCurrent(attempt)) { "runtime admission receipt was superseded" }
+            runtimeAdmission = admission
+        }
     }
 
     /** New native incarnation gets a fresh epoch; never hold this lock across Go. */
@@ -427,6 +463,7 @@ class BoxService(
                 val currentConfig = VpnBridge.currentConfig() ?: SystemStart.load(service)
                 check(currentConfig == expectedReloadConfig) { "runtime reload source superseded by committed configuration" }
             }
+            runtimeAdmission = null
             ++runtimePersistenceEpoch
         }
         return object : RuntimePersistenceHandler {
@@ -443,6 +480,7 @@ class BoxService(
                         MainKernelAttemptRegistry.isCurrent(attempt)
                     check(current()) { "runtime persistence owner expired" }
                     check(runtimeIncarnation.isNotEmpty() && revision >= 0 &&
+                        runtimeAdmission?.identity?.incarnation == runtimeIncarnation &&
                         (incarnation == null || incarnation == runtimeIncarnation) &&
                         revision >= lastRevision && (revision != lastRevision || lastDigest == effectiveDigest)) {
                         "runtime persistence receipt is stale"
@@ -719,6 +757,7 @@ class BoxService(
             check(MainKernelAttemptRegistry.completeAfterClose(attempt) {
                 deliverStop = VpnBridge.takeFinishStop(attempt = attempt)
                 commandServer = null
+                runtimeAdmission = null
                 mainAttempt = null
                 state = ServiceState.Stopped
                 closeFailed = false
