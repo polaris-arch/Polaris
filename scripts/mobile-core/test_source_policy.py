@@ -56,6 +56,8 @@ def future_mobile_fixture():
         value[key] = policy[key]
     for platform in ('android', 'apple'):
         value[platform]['outputName'] = value[platform]['outputName'].replace('1.15.0-alpha.12', value['version'])
+    value['android'].update(ndkRevision='30.0.16248370', ndkSourceRevision='30.0.16248370',
+                            ndkPackage='android-ndk-r30', ndkArchivePath='scripts/mobile-core/ndk-r30-linux.json')
     declaration = value['declaredTagsSource']['path']
     files[declaration] = b'synthetic source-owned tags declaration\n'
     value['declaredTagsSource']['sha256'] = sha(files[declaration])

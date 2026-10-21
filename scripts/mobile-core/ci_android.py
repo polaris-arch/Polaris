@@ -53,6 +53,12 @@ def prepare():
     value = load()  # Fail before tool, repository or cache mutation.
     producer_identity = producer_code()
     root = location()
+    sdk = Path(os.environ.get('ANDROID_SDK_ROOT', os.environ.get('ANDROID_HOME', ''))).resolve(strict=True)
+    if os.environ.get('ANDROID_HOME'):
+        require(Path(os.environ['ANDROID_HOME']).resolve(strict=True) == sdk, 'conflicting Android SDK roots')
+    installer = [sys.executable, ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py',
+                 '--profile', ROOT / value['android']['ndkArchivePath'], '--sdk', sdk]
+    run(installer + ['--check-license-only'])
     tools = private_dir(root / 'tools')
     go = run(['which', 'go']).strip()
     require(run([go, 'version']).startswith('go version go' + value['goVersion'] + ' '), 'actual Go differs')
@@ -66,12 +72,11 @@ def prepare():
     print(json.dumps({'phase': 'android-tool-prepare-capacity', 'capacity': capacity}), flush=True)
     run([go, 'install', 'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
          'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']], env=env)
-    ndk = run([sys.executable, ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py', root]).strip()
+    ndk = run(installer + [root]).strip()
     require(Path(ndk).is_dir(), 'actual NDK preparation failed')
     from android_sdk import observe_ndk_input
     observe_ndk_input(root, ndk, value['android'])
     jdk = Path(os.environ['JAVA_HOME_17_X64']).resolve(strict=True)
-    sdk = Path(os.environ.get('ANDROID_SDK_ROOT', os.environ.get('ANDROID_HOME', ''))).resolve(strict=True)
     paths = {'go': go, 'gomobile': str(tools / 'gomobile'), 'gobind': str(tools / 'gobind'),
              'ndk': ndk, 'jdk': str(jdk), 'sdk': str(sdk), 'work': str(private_dir(root / 'android-work')),
              'cache': str(private_dir(root / 'android-cache')), 'source': str(root / 'fork-source')}

@@ -80,7 +80,7 @@
     "contractSha256": "f99daa91345df468b18e9c61451cc6465ffdce137fb1adc33829053ab2b194f3",
     "originalIndexSha256": "458b3b5b08194ad7ad13127d31768b8b0bfed7a278fe9db4816963c0dbf705e3",
     "mobileSourceContractPath": "scripts/mobile-core/source-contract.json",
-    "mobileSourceContractSha256": "139780a725a46694e783e458d2ab8666d6fbb2d7a5c00eed7958828948a1df4d",
+    "mobileSourceContractSha256": "d2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0",
     "required": [
       "existing desktop full App/final carrier/native/package/sealed lifecycle validation against this exact selected contract",
       "new matching App mobile producer/native input/ABI/tool receipts and separate SDK/device acceptance; desktop evidence cannot substitute"

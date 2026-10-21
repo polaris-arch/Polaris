@@ -77,8 +77,10 @@ def validate(value):
             android['minimumAPI'] == 24 and android['minimumLoadAlignment'] == 16384 and
             android['javaMajor'] == 17 and android['legacyAPI21Enabled'] is False,
             'formal Android requires one API24/four-ABI AAR and no legacy variant')
-    require(android['ndkRevision'] == '30.0.16138531' and
-            android.get('ndkSourceRevision') == '30.0.16138531-beta3' and android['ndkPackage'] == 'android-ndk-r30-beta3',
+    ndk = ('30.0.16138531', '30.0.16138531-beta3', 'android-ndk-r30-beta3',
+           'scripts/libbox-patches/ndk-linux-archive.json') if historical else (
+           '30.0.16248370', '30.0.16248370', 'android-ndk-r30', 'scripts/mobile-core/ndk-r30-linux.json')
+    require(tuple(android.get(key) for key in ('ndkRevision', 'ndkSourceRevision', 'ndkPackage', 'ndkArchivePath')) == ndk,
             'formal Android NDK differs')
     require(apple['targets'] == APPLE_TARGETS and
             apple['slices'] == ['ios-arm64', 'ios-arm64-simulator'] and

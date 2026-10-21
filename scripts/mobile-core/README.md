@@ -47,7 +47,7 @@ the old nonempty patch list or a CLI source receipt.
 Formal binding plans are explicit:
 
 - Android: one API24 AAR, `arm64-v8a, armeabi-v7a, x86, x86_64`, 16KiB PT_LOAD
-  requirement, Java17 and pinned r30-beta3 NDK. The producer uses a private SDK
+  requirement, Java17 and pinned stable r30 NDK. The producer uses a private SDK
   view containing only that NDK; ambient installed NDK28 cannot win a fallback
   lookup. It does not invoke the helper that also builds API21/no-Naive legacy.
 - Apple: exactly `ios/arm64, iossimulator/arm64`, one static XCFramework
@@ -68,15 +68,29 @@ Formal binding plans are explicit:
 - Version is passed through fixed ldflags. `ReadTag`/`git describe`, an upstream
   cache tag, or a reused CLI BuildID cannot provide formal mobile identity.
 
-The NDK input distinguishes the unchanged numeric SDK-view directory
-`ndkRevision=30.0.16138531` from the archive's exact
-`ndkSourceRevision=30.0.16138531-beta3`. Admission checks the complete
-`Pkg.Revision`, `Pkg.BaseRevision` and `Pkg.ReleaseName`; it strips property key
-spacing and rejects duplicate keys, never drops the preview suffix. The new
-required source-contract field enters the existing source/tool fingerprints and
-cache key; older receipts/cache entries cannot be relabeled. The hosted entry
-retains the original small properties bytes and their pinned observation even
-if a later producer step fails. Historical manifests/archive pins are unchanged.
+The formal Android NDK is stable r30, with both `ndkRevision` and
+`ndkSourceRevision` exactly `30.0.16248370`. The explicit
+`ndk-r30-linux.json` profile binds the official Linux archive size, SHA1/SHA256,
+root and exact 107-byte source.properties hash. Admission also checks the full
+`Pkg.Revision`, `Pkg.BaseRevision` and `Pkg.ReleaseName`, rejecting duplicate
+keys and mixed preview/stable declarations. This profile and the installer enter
+the producer source inventory, tool/cache fingerprints and receipt identity.
+Older receipts/cache entries cannot be relabeled as this input.
+
+Both formal hosted SDK paths check the already-accepted standard Android SDK
+license read-only before SDK installation, with stdin closed for package installs.
+The NDK installer repeats that check before any download or extraction. Missing
+acceptance stops the build; no license is accepted or written automatically.
+The explicitly selected installer uses a separate private versioned stable slot
+and refuses retained slots without deleting them. Legacy no-flags installer
+behavior, beta manifests, archive pins and historical fixtures stay unchanged.
+The hosted entry retains source.properties and its pinned observation even if a
+later producer step fails. Rust keeps its separate NDK 27.3.13750724.
+
+This is a toolchain-only declaration change. Source a4d085 and alpha.12 remain
+pinned; that source does not include the new App's Retry method. A stable NDK
+profile does not establish new-App compatibility, four-ABI production results,
+APK/device acceptance or publication eligibility.
 
 
 `plan.py` verifies the input and prints a bind plan. It never executes a build,

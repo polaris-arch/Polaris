@@ -39,10 +39,10 @@
     "minimumAPI": 24,
     "minimumLoadAlignment": 16384,
     "javaMajor": 17,
-    "ndkRevision": "30.0.16138531",
-    "ndkSourceRevision": "30.0.16138531-beta3",
-    "ndkPackage": "android-ndk-r30-beta3",
-    "ndkArchivePath": "scripts/libbox-patches/ndk-linux-archive.json",
+    "ndkRevision": "30.0.16248370",
+    "ndkSourceRevision": "30.0.16248370",
+    "ndkPackage": "android-ndk-r30",
+    "ndkArchivePath": "scripts/mobile-core/ndk-r30-linux.json",
     "bootclasspath": {
       "platform": "android-36",
       "sha256": "d9eb9da824d9e247a352f570f01e1169e725b2954bca9e283a71786c59b59f9a"

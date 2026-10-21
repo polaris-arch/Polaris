@@ -702,7 +702,9 @@ class FormalOutputs(unittest.TestCase):
                 prepare_view(work, sdk, ndk, profile)
 
     def test_prepare_refusal_retains_ndk_inputs_without_success_outputs(self):
-        properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16138531-beta3\nPkg.BaseRevision = 30.0.16138531\nPkg.ReleaseName = r30-beta3\n'
+        from fork_input import load
+        value = load()
+        properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\nPkg.BaseRevision = 30.0.16248370\nPkg.ReleaseName = r30\n'
         # Execute the real prepare/observe path, with all external tool operations
         # controlled. Both admission refusal and a later source refusal happen
         # before emit_outputs, so the work output cannot be the evidence root.
@@ -710,7 +712,7 @@ class FormalOutputs(unittest.TestCase):
             with self.subTest(admission_refuses=admission_refuses), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 ndk = root / 'ndk'; ndk.mkdir()
-                raw = properties.replace(b'-beta3', b'-beta2') if admission_refuses else properties
+                raw = properties.replace(b'30.0.16248370', b'30.0.16138531-beta3') if admission_refuses else properties
                 (ndk / 'source.properties').write_bytes(raw)
                 jdk = root / 'jdk'; jdk.mkdir()
                 sdk = root / 'sdk'; sdk.mkdir()
@@ -721,19 +723,23 @@ class FormalOutputs(unittest.TestCase):
                     if command == ['which', 'go']:
                         return '/controlled/go'
                     if command == ['/controlled/go', 'version']:
-                        return 'go version go' + self.value['goVersion'] + ' linux/amd64'
+                        return 'go version go' + value['goVersion'] + ' linux/amd64'
                     if command == ['/controlled/go', 'install',
-                            'github.com/sagernet/gomobile/cmd/gomobile@' + self.value['gomobileVersion'],
-                            'github.com/sagernet/gomobile/cmd/gobind@' + self.value['gobindVersion']]:
+                            'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
+                            'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']]:
                         return ''
-                    if len(command) == 3 and command[1:] == [str(ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py'), str(root)]:
+                    installer = [str(ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py'), '--profile',
+                                 str(ROOT / value['android']['ndkArchivePath']), '--sdk', str(sdk)]
+                    if command[1:] == installer + ['--check-license-only']:
+                        return ''
+                    if command[1:] == installer + [str(root)]:
                         return str(ndk)
                     self.fail('unexpected external operation: ' + repr(command))
 
                 reason = 'revision/base/release differs' if admission_refuses else 'controlled source refusal'
                 with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'JAVA_HOME_17_X64': str(jdk),
                         'ANDROID_SDK_ROOT': str(sdk), 'GITHUB_OUTPUT': str(output), 'GITHUB_ENV': str(environment)}, clear=True), \
-                        patch('ci_android.load', return_value=self.value), \
+                        patch('ci_android.load', return_value=value), \
                         patch('ci_android.location', return_value=root), \
                         patch('ci_android.producer_code', return_value={'files': []}), \
                         patch('ci_android.native_capacity', return_value=
@@ -756,7 +762,7 @@ class FormalOutputs(unittest.TestCase):
                 observation = json.loads((root / 'sdk-input-observation.json').read_bytes())
                 self.assertEqual(observation['sourceProperties']['sha256'], sha(raw))
                 self.assertEqual(observation['revision'], revision_from_properties(raw.decode()))
-                self.assertEqual(observation['requiredRevision'], self.value['android']['ndkSourceRevision'])
+                self.assertEqual(observation['requiredRevision'], value['android']['ndkSourceRevision'])
                 self.assertFalse(observation['devicePassed'])
                 self.assertFalse(observation['publicationEligible'])
 

@@ -405,18 +405,18 @@ jobs:
             src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
           [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
           echo "compileSdk=$compile_sdk"
-          yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          python3 scripts/libbox-patches/prepare-ndk-linux.py --profile scripts/mobile-core/ndk-r30-linux.json --sdk "$ANDROID_HOME" --check-license-only
           libbox_platform="$(node -p 'require("./scripts/libbox-patches/android-source-policy.json").sdkBootclasspath.platform')"
-          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform"
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform" </dev/null
 
           # ── NDK：两个用途、两条不同约束 ──
           #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
-          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前 r30 beta3）；
+          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前稳定 r30 / 30.0.16248370）；
           #     Cronet 预编译归档不兼容 Rust 所用的 r27，不能混用或摘掉功能标签。
           rust_ndk_version="$(cat scripts/android-rust-ndk.version)"
           rust_ndk="$ANDROID_HOME/ndk/$rust_ndk_version"
           if [ ! -f "$rust_ndk/source.properties" ]; then
-            "$sdkmanager" "ndk;$rust_ndk_version"
+            "$sdkmanager" "ndk;$rust_ndk_version" </dev/null
           fi
           [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
@@ -985,18 +985,18 @@ jobs:
             src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
           [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
           echo "compileSdk=$compile_sdk"
-          yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          python3 scripts/libbox-patches/prepare-ndk-linux.py --profile scripts/mobile-core/ndk-r30-linux.json --sdk "$ANDROID_HOME" --check-license-only
           libbox_platform="$(node -p 'require("./scripts/libbox-patches/android-source-policy.json").sdkBootclasspath.platform')"
-          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform"
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform" </dev/null
 
           # ── NDK：两个用途、两条不同约束 ──
           #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
-          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前 r30 beta3）；
+          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前稳定 r30 / 30.0.16248370）；
           #     Cronet 预编译归档不兼容 Rust 所用的 r27，不能混用或摘掉功能标签。
           rust_ndk_version="$(cat scripts/android-rust-ndk.version)"
           rust_ndk="$ANDROID_HOME/ndk/$rust_ndk_version"
           if [ ! -f "$rust_ndk/source.properties" ]; then
-            "$sdkmanager" "ndk;$rust_ndk_version"
+            "$sdkmanager" "ndk;$rust_ndk_version" </dev/null
           fi
           [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"

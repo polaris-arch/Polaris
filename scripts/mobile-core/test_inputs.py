@@ -1,8 +1,16 @@
 """Authored formal source/target controls; no Go, SDK, bind or native tool executes."""
 from copy import deepcopy
+import hashlib
+import importlib.util
+import io
 import json
+import os
 from pathlib import Path
+import sys
+import tempfile
 import unittest
+from unittest.mock import patch
+import zipfile
 
 from fork_input import CONTRACT, bind_command, tool_environment, validate, verify_source, sha
 
@@ -397,6 +405,197 @@ class SourceStatusOpenRace(unittest.TestCase):
             self.assertEqual(observed['reason'], 'metadata-error')
             self.assertEqual(observed['hashBytesRead'], 0)
             self.assertNotIn('NEVER_EXPORT_SYMLINK_TARGET', json.dumps(observed))
+
+
+class FormalStableNdk(unittest.TestCase):
+    """Installer/source data only. Commands are mocked and native execution forbidden."""
+    @classmethod
+    def setUpClass(cls):
+        cls.root = Path(__file__).resolve().parents[2]
+        spec = importlib.util.spec_from_file_location('formal_ndk_fixture', cls.root / 'scripts/libbox-patches/prepare-ndk-linux.py')
+        cls.installer = importlib.util.module_from_spec(spec); spec.loader.exec_module(cls.installer)
+        cls.profile = cls.installer.formal_profile(cls.installer.FORMAL_PROFILE)
+        cls.properties = (b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\n'
+                          b'Pkg.BaseRevision = 30.0.16248370\nPkg.ReleaseName = r30\n')
+
+    def setUp(self):
+        guard = patch('subprocess.Popen', side_effect=AssertionError('fixture may not execute tools'))
+        guard.start(); self.addCleanup(guard.stop)
+
+    def sdk(self, root):
+        home = root / 'sdk'; (home / 'licenses').mkdir(parents=True)
+        accepted = home / 'licenses/android-sdk-license'
+        accepted.write_text(self.profile['licenseSha1'] + '\n')
+        return home, accepted
+
+    def archive(self, names=None, properties=None):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, 'w') as bundle:
+            for name in names or ['android-ndk-r30/source.properties']:
+                bundle.writestr(name, self.properties if properties is None else properties)
+        raw = stream.getvalue(); profile = deepcopy(self.profile)
+        profile['archive'].update(bytes=len(raw), sha1=hashlib.sha1(raw).hexdigest(), sha256=sha(raw))
+        return raw, profile
+
+    def test_current_and_historical_profiles_are_exact_and_cannot_mix(self):
+        from fork_input import load
+        current = load()
+        legacy = validate(json.loads((Path(__file__).with_name('fixtures') / 'legacy-source-contract.json').read_bytes()))
+        keys = ('ndkRevision', 'ndkSourceRevision', 'ndkPackage', 'ndkArchivePath')
+        self.assertEqual(tuple(current['android'][key] for key in keys),
+                         ('30.0.16248370', '30.0.16248370', 'android-ndk-r30', 'scripts/mobile-core/ndk-r30-linux.json'))
+        for key in keys:
+            for original, other in ((current, legacy), (legacy, current)):
+                changed = deepcopy(original); changed['android'][key] = other['android'][key]
+                with self.subTest(key=key, repository=original['repository']), self.assertRaisesRegex(RuntimeError, 'formal Android NDK differs'):
+                    validate(changed)
+        self.assertEqual(current['sourceCommit'], 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae')
+        self.assertEqual((self.root / 'scripts/android-rust-ndk.version').read_text().strip(), '27.3.13750724')
+
+    def test_exact_reviewed_profile_rejects_alternate_path_bytes_keys_and_types(self):
+        profile = self.profile
+        self.assertEqual(profile['archive'], {'url': 'https://dl.google.com/android/repository/android-ndk-r30-linux.zip',
+            'bytes': 738633529, 'sha1': '5107f898313790e449e87eee2183d9a20602dee9',
+            'sha256': '753611f410d002cfcd3f3dc2ef49aad532089d3180b436c060a90bf0fcb64df2', 'archiveRoot': 'android-ndk-r30'})
+        self.assertEqual(profile['licenseId'], 'android-sdk-license')
+        self.assertEqual(profile['licenseSha1'], '24333f8a63b6825ea9c5514f83c2829b004d1fee')
+        self.assertEqual(len(self.properties), profile['sourcePropertiesBytes'])
+        self.assertEqual(sha(self.properties), profile['sourcePropertiesSha256'])
+        raw = self.installer.FORMAL_PROFILE.read_bytes()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'profile.json'; path.write_bytes(raw)
+            with self.assertRaisesRegex(ValueError, 'exact reviewed formal NDK profile'):
+                self.installer.formal_profile(path)
+            with patch.object(self.installer, 'FORMAL_PROFILE', path):
+                self.assertEqual(self.installer.formal_profile(path), profile)
+                for changed in [raw + b' ', raw.replace(b'738633529', b'"738633529"'),
+                                raw.replace(b'738633529', b'NaN'), raw.replace(b'{', b'{"extra":1,', 1),
+                                raw.replace(b'{', b'{"ndkRevision":"30.0.16248370",', 1)]:
+                    path.write_bytes(changed)
+                    with self.subTest(raw=changed[:30]), self.assertRaisesRegex(ValueError, 'profile bytes differ'):
+                        self.installer.formal_profile(path)
+
+    def test_license_gate_is_read_only_and_stops_before_download_or_slot_creation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); home, accepted = self.sdk(root)
+            original = accepted.read_bytes()
+            self.installer.accepted_formal_license(home, self.profile)
+            self.assertEqual(accepted.read_bytes(), original)
+            for bad in ['0' * 40 + '\n', ' ' + self.profile['licenseSha1'] + '\n', self.profile['licenseSha1'] + '\u2028']:
+                accepted.write_text(bad)
+                with patch.object(self.installer.subprocess, 'run') as run, self.assertRaisesRegex(ValueError, 'not already accepted'):
+                    self.installer.prepare_formal(root, home, self.installer.FORMAL_PROFILE)
+                run.assert_not_called(); self.assertEqual(accepted.read_text(), bad)
+                self.assertFalse((root / 'polaris-mobile-ndk-30.0.16248370').exists())
+            accepted.unlink()
+            with self.assertRaisesRegex(ValueError, 'not already accepted'):
+                self.installer.accepted_formal_license(home, self.profile)
+            outside = root / 'accepted'; outside.write_bytes(original); accepted.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, 'redirected'):
+                self.installer.accepted_formal_license(home, self.profile)
+
+    def test_retained_nonprivate_and_redirected_slots_are_refused_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); home, _ = self.sdk(root)
+            target = root / 'polaris-mobile-ndk-30.0.16248370'; target.mkdir(mode=0o700)
+            marker = target / 'keep'; marker.write_text('preserve retained slot')
+            with self.assertRaisesRegex(ValueError, 'retained formal NDK slot'):
+                self.installer.prepare_formal(root, home, self.installer.FORMAL_PROFILE)
+            self.assertEqual(marker.read_text(), 'preserve retained slot')
+            link = root / 'redirected'; link.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'redirected'):
+                self.installer.prepare_formal(link, home, self.installer.FORMAL_PROFILE)
+            root.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, 'current-user private'):
+                self.installer.prepare_formal(root, home, self.installer.FORMAL_PROFILE)
+            root.chmod(0o700)
+
+    def test_archive_hashes_inventory_and_actual_properties_all_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); download = root / 'ndk.zip'
+            raw, profile = self.archive(); download.write_bytes(raw)
+            self.installer.verify_formal_archive(download, profile)
+            for key, bad in [('bytes', len(raw) + 1), ('sha1', '0' * 40), ('sha256', '0' * 64)]:
+                changed = deepcopy(profile); changed['archive'][key] = bad
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    self.installer.verify_formal_archive(download, changed)
+            for names in [['other/file'], ['/android-ndk-r30/file'], ['android-ndk-r30/../file'],
+                          ['android-ndk-r30/dir\\file'], ['android-ndk-r30/file', 'android-ndk-r30/file']]:
+                raw, profile = self.archive(names); download.write_bytes(raw)
+                with self.subTest(names=names), self.assertRaises(ValueError):
+                    self.installer.verify_formal_archive(download, profile)
+            properties = root / 'source.properties'; properties.write_bytes(self.properties)
+            self.installer.verify_formal_properties(root, self.profile)
+            for old, new in [(b'Pkg.Revision = 30.0.16248370', b'Pkg.Revision = 30.0.16138531-beta3'),
+                             (b'Pkg.BaseRevision = 30.0.16248370', b'Pkg.BaseRevision = 30.0.0'),
+                             (b'Pkg.ReleaseName = r30', b'Pkg.ReleaseName = r30-rc1')]:
+                properties.write_bytes(self.properties.replace(old, new))
+                with self.assertRaisesRegex(ValueError, 'source.properties bytes differ'):
+                    self.installer.verify_formal_properties(root, self.profile)
+            properties.unlink(); properties.symlink_to(download)
+            with self.assertRaisesRegex(ValueError, 'redirected'):
+                self.installer.verify_formal_properties(root, self.profile)
+
+    def test_fresh_formal_install_is_explicit_isolated_and_preserves_legacy_slot(self):
+        raw, profile = self.archive(); calls = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); home, accepted = self.sdk(root); original = accepted.read_bytes()
+            legacy = root / 'polaris-libbox-ndk'; legacy.mkdir(); (legacy / 'keep').write_text('legacy bytes')
+            def fake_run(args, **kwargs):
+                calls.append(args)
+                if args[0] == 'curl':
+                    self.assertEqual(args[-1], profile['archive']['url']); self.assertNotIn('-L', args)
+                    self.assertEqual(args[1], '--disable'); Path(args[args.index('-o') + 1]).write_bytes(raw)
+                elif args[0] == 'unzip':
+                    with zipfile.ZipFile(args[2]) as bundle: bundle.extractall(args[4])
+                else: self.fail('unexpected external operation')
+            with patch.object(self.installer, 'formal_profile', return_value=profile), \
+                    patch.object(self.installer.subprocess, 'run', side_effect=fake_run):
+                ndk = self.installer.prepare_formal(root, home, self.installer.FORMAL_PROFILE)
+                self.assertEqual(ndk, root / 'polaris-mobile-ndk-30.0.16248370/android-ndk-r30')
+                self.assertEqual((ndk / 'source.properties').read_bytes(), self.properties)
+                with self.assertRaisesRegex(ValueError, 'retained formal NDK slot'):
+                    self.installer.prepare_formal(root, home, self.installer.FORMAL_PROFILE)
+            self.assertEqual([args[0] for args in calls], ['curl', 'unzip'])
+            self.assertEqual((legacy / 'keep').read_text(), 'legacy bytes'); self.assertEqual(accepted.read_bytes(), original)
+            self.assertEqual(list(ndk.parent.iterdir()), [ndk])
+
+    def test_cli_default_stays_legacy_and_license_only_never_installs(self):
+        with patch.object(sys, 'argv', ['prepare-ndk-linux.py', '/legacy/temporary']), \
+                patch.object(self.installer, 'legacy_main') as legacy, patch.object(self.installer, 'prepare_formal') as formal:
+            self.installer.main(); legacy.assert_called_once(); formal.assert_not_called()
+        with tempfile.TemporaryDirectory() as temporary:
+            home, accepted = self.sdk(Path(temporary)); before = accepted.read_bytes()
+            with patch.object(sys, 'argv', ['prepare-ndk-linux.py', '--profile', str(self.installer.FORMAL_PROFILE),
+                    '--sdk', str(home), '--check-license-only']), patch.object(self.installer, 'prepare_formal') as formal:
+                self.installer.main(); formal.assert_not_called()
+            self.assertEqual(accepted.read_bytes(), before)
+
+    def test_formal_workflow_license_gate_precedes_all_noninteractive_package_installs(self):
+        source = (self.root / '.github/workflows/android.yml').read_text()
+        gate = 'python3 scripts/libbox-patches/prepare-ndk-linux.py --profile scripts/mobile-core/ndk-r30-linux.json --sdk "$ANDROID_HOME" --check-license-only'
+        self.assertEqual(source.count(gate), 2)
+        self.assertNotIn('--licenses', source)
+        for block in source.split(gate)[1:]:
+            installs = [line.strip() for line in block.splitlines()[:20] if line.strip().startswith('"$sdkmanager" ')]
+            self.assertEqual(len(installs), 2)
+            self.assertTrue(all(line.endswith(' </dev/null') for line in installs))
+            self.assertFalse(any('yes' in line or '|| true' in line for line in installs))
+
+    def test_hosted_prepare_checks_license_before_tool_install(self):
+        import ci_android
+        from fork_input import load
+        value = load()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); home, _ = self.sdk(root)
+            expected = [sys.executable, self.root / 'scripts/libbox-patches/prepare-ndk-linux.py',
+                        '--profile', self.root / value['android']['ndkArchivePath'], '--sdk', home, '--check-license-only']
+            with patch.dict(os.environ, {'ANDROID_HOME': str(home)}, clear=True), \
+                    patch.object(ci_android, 'producer_code', return_value={}), patch.object(ci_android, 'location', return_value=root), \
+                    patch.object(ci_android, 'run', side_effect=ValueError('unaccepted license')) as run:
+                with self.assertRaisesRegex(ValueError, 'unaccepted license'): ci_android.prepare()
+            run.assert_called_once_with(expected)
+            self.assertFalse((root / 'tools').exists())
 
 
 if __name__ == '__main__':

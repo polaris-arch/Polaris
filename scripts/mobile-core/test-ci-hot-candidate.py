@@ -31,9 +31,9 @@ CANDIDATE_STEPS = {'actions/checkout@v7', 'Admit exact Android consumer candidat
     'Install protoc (pinned URL + sha256)', 'Read pinned libbox Go version', 'actions/setup-go@v6',
     'Pin libbox JDK 17', 'Verify preinstalled candidate SDK and licenses',
     'Build frozen Android arm64 diagnostic consumer', 'Retain Android candidate evidence only'}
-# Baseline executable step blocks from public App 6923dbb6, before this change.
-# Removing only the exact empty-input gates/added steps must recover these bytes.
-DEFAULT_DIGESTS = {'release_check': '389b87f5a18c383ff96deb197678d598cd82c2c3acde7608506138eba2c9d659', 'release-apk': 'be7be28aad17304fd2e7cb5e2464431bca7fde18c232d0f7f05bea5140e8b4b5'}
+# Exact default executable steps after the reviewed stable-r30 read-only license gate.
+# Candidate routing projection still binds every remaining command/condition/path.
+DEFAULT_DIGESTS = {'release_check': '2600e275ee5973d1f67ffa40a25b48d2a6678ffece1caed65a71a5668e5bcd93', 'release-apk': 'e507797072b2960a340a35bbbe87c8d7293f95c2db92c7634ceb7a817d6b2083'}
 
 
 def job(source, name):

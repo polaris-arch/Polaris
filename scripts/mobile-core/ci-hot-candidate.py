@@ -69,7 +69,7 @@ ANDROID = {'ndkRevision': '30.0.16248370', 'ndkSourceRevision': '30.0.16248370',
            'bootclasspath': {'platform': 'android-36', 'sha256': 'd9eb9da824d9e247a352f570f01e1169e725b2954bca9e283a71786c59b59f9a'}}
 BUILD = ['bash', 'scripts/build-android-apk.sh', '--debug', '--apk', '--split-per-abi',
          '--target', 'aarch64', '--ci', '--config', 'src-tauri/tauri.android.conf.json']
-FORMAL_HASH = '139780a725a46694e783e458d2ab8666d6fbb2d7a5c00eed7958828948a1df4d'
+FORMAL_HASH = 'd2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0'
 OVERRIDES = set(('GOFLAGS GOENV GOWORK GOTOOLCHAIN GOOS GOARCH GOARM GOARM64 GOEXPERIMENT '
                  'GOBIN GOMODCACHE GOCACHE GONOSUMDB GOPRIVATE GONOPROXY GOPROXY GOSUMDB GOINSECURE CC CXX CPP AR LD CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH '
                  'LIBRARY_PATH COMPILER_PATH GCC_EXEC_PREFIX JAVA_TOOL_OPTIONS _JAVA_OPTIONS '
@@ -196,7 +196,7 @@ def accepted_licenses(xml, package, home):
 
 
 def ndk_archive_contract():
-    # Candidate-owned stable r30 profile; formal archive/source pins stay intact.
+    # Candidate-owned stable r30 profile; formal source identity stays separate.
     return dict(ANDROID['archive'])
 
 
