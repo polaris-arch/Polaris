@@ -2040,54 +2040,62 @@ impl ProxyRuntime {
                 return None;
             }
         };
-        self.config.try_with_saved_commit(|desired| self.selector_reconcile.with_intent_claim(|current_intent| {
-            let mut pending = self
-                .pending_force_restart
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !self.debounced.is_current_ticket(ticket) {
-                return None;
-            }
-            let snapshot = match (force_id, pending.as_ref()) {
-                (Some(want), Some((id, value, source))) if want == *id => {
-                    if matches!(source, super::ForceRestartSource::Confirmed { .. }) && value != desired {
-                        *pending = None;
-                        self.gate.clear_force_restart();
+        self.config
+            .try_with_saved_commit(|desired| {
+                self.selector_reconcile.with_intent_claim(|current_intent| {
+                    let mut pending = self
+                        .pending_force_restart
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !self.debounced.is_current_ticket(ticket) {
                         return None;
                     }
-                    if let super::ForceRestartSource::Selected { intent_generation }
-                        | super::ForceRestartSource::Confirmed { intent_generation } = source {
-                        if *intent_generation != current_intent {
-                            *pending = None;
-                            if self.gate.pending().force_restart_id == Some(want) {
+                    let snapshot = match (force_id, pending.as_ref()) {
+                        (Some(want), Some((id, value, source))) if want == *id => {
+                            if matches!(source, super::ForceRestartSource::Confirmed { .. })
+                                && value != desired
+                            {
+                                *pending = None;
                                 self.gate.clear_force_restart();
+                                return None;
                             }
-                            return None;
+                            if let super::ForceRestartSource::Selected { intent_generation }
+                            | super::ForceRestartSource::Confirmed { intent_generation } = source
+                            {
+                                if *intent_generation != current_intent {
+                                    *pending = None;
+                                    if self.gate.pending().force_restart_id == Some(want) {
+                                        self.gate.clear_force_restart();
+                                    }
+                                    return None;
+                                }
+                            }
+                            Some(value.clone())
                         }
+                        (None, None) => None,
+                        // A newer Apply replaced the snapshot after the timer decided, or a force
+                        // snapshot appeared after a plain timer decided. Leave the new owner intact.
+                        _ => return None,
+                    };
+                    let generation = self
+                        .gate
+                        .try_begin_restart(scheduled_generation, force_id)?;
+                    // This successful claim precedes the AlreadyClaimed stop leg and every cleanup await.
+                    self.coex.claim(generation, false);
+                    starts.book_restart(
+                        Arc::clone(&self.stop_domain),
+                        scheduled_generation,
+                        Some(generation),
+                    );
+                    self.gen_changed.notify_waiters();
+                    if force_id.is_some() {
+                        *pending = None;
                     }
-                    Some(value.clone())
-                }
-                (None, None) => None,
-                // A newer Apply replaced the snapshot after the timer decided, or a force
-                // snapshot appeared after a plain timer decided. Leave the new owner intact.
-                _ => return None,
-            };
-            let generation = self
-                .gate
-                .try_begin_restart(scheduled_generation, force_id)?;
-            // This successful claim precedes the AlreadyClaimed stop leg and every cleanup await.
-            self.coex.claim(generation, false);
-            starts.book_restart(
-                Arc::clone(&self.stop_domain),
-                scheduled_generation,
-                Some(generation),
-            );
-            self.gen_changed.notify_waiters();
-            if force_id.is_some() {
-                *pending = None;
-            }
-            Some((snapshot, generation, legacy_lease))
-        })).ok().flatten()
+                    Some((snapshot, generation, legacy_lease))
+                })
+            })
+            .ok()
+            .flatten()
     }
 
     /// 置错误态（起核失败）。

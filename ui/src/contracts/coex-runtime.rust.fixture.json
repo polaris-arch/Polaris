@@ -797,10 +797,10 @@
     "sourceSha256": {
       "src-tauri/src/runtime/proxy/coex_observer.rs": "f3590eadebb44c3fc7f83aad3e2b645636b4751283cfe02c3df918353d6661b3",
       "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "2cb6b20848a62a6cd61c7d8357bbbb32ba2690a417e71e8a15af64d7eec0e814",
-      "src-tauri/src/runtime/proxy.rs": "d2b92e6a36e971e9f3661c5611e1215acd6207642b40d6149edde353cb190116",
-      "src-tauri/src/runtime/proxy/lifecycle.rs": "7bb1fb61f4dc66298418c9f7a944b4a937a3ca4948535db7f1030724ecf4242a",
-      "src-tauri/src/runtime/proxy/startup.rs": "2a8f4fdbff5b7e8bc889cb35806f3643ca11926a6733e08ef9c5ed161d55ee02",
-      "src-tauri/src/runtime/proxy/hot_switch.rs": "b6ab26378c6d80ad12f64d69fb3f2a155eb8d3377e8450ea09ce7227dc899b5c",
+      "src-tauri/src/runtime/proxy.rs": "9402a20809ae97954f370cf444ce10f20b98a911c84dd41fdb4801bb1c6203f2",
+      "src-tauri/src/runtime/proxy/lifecycle.rs": "3e6238309243e149a8368889d3bb37bb34feebd0ab646883ae0661fcb1c063b9",
+      "src-tauri/src/runtime/proxy/startup.rs": "bee6f142bcf0405b8016b1c509189bf7fada59d5e775ed2e43b2b5090e855458",
+      "src-tauri/src/runtime/proxy/hot_switch.rs": "377fc0de7017b290bd1ee7efaea119aea554af28f0e8e3d1c317f31498919e63",
       "src-tauri/src/runtime/proxy/recovery.rs": "4f9a9b11d902db65d472efdeea2a530114f6b95cee03fe661c5401cc8a61d659",
       "src-tauri/src/runtime/proxy/network_monitor.rs": "a69d5d92271f42172a63ff4739ec0d79615d3d538cc628cf0b38af7d16df1e71",
       "src-tauri/src/commands/coexistence_snapshot.rs": "8415766265c51972da7aac5cc38fd17811703c64dd2fe9f8e439955752455a4b"
@@ -839,14 +839,14 @@
     "hotProxyIntegration": {
       "scope": "All eight changed or added proxy-namespace files in this HOT integration outside the original nine-file producer footprint; the four changed original-footprint files remain in sourceSha256. This supplement is not the complete App, native platform, RPC or transitive dependency graph.",
       "sourceSha256": {
-        "src-tauri/src/runtime/proxy/mesh_route_report.rs": "4c5ff0e714d642c45a13c318b1aaa8f764446f3a262d1019cf7cc5e1e95c98f7",
-        "src-tauri/src/runtime/proxy/native_auto.rs": "270fd05e250ebc129949d9d656bea89d83867ce279c14ae9be1d78c12cf9099a",
-        "src-tauri/src/runtime/proxy/pending_changes.rs": "fd14f89b96f69d60d3ce9965172dcb9b1af888f80513e114155842a67bfb7dd1",
-        "src-tauri/src/runtime/proxy/runtime_config.rs": "5e614592f530f68000d96674ba29ee50b7252be1855e8b4d14bd582e9286d2b7",
-        "src-tauri/src/runtime/proxy/tests/hot_switch.rs": "b85dbe45502f7358406ddd9a382f8ab1c3309cec34f040668007d228292a5b1e",
-        "src-tauri/src/runtime/proxy/tests/hot_switch/auto_select.rs": "0b12ae611b467f3dc5d258bb41a066672c280e0d45224b068c94ae427b46def5",
-        "src-tauri/src/runtime/proxy/tests/lifecycle.rs": "92b37fae16053c1da0654a7c568b83ceb1ac9f570e4f5cc075e3838c542b9645",
-        "src-tauri/src/runtime/proxy/tests/mesh_route_report.rs": "702ff4a04a4036f30e7967ca4c251ca98b37d585f4039281029dcf2442b2df88"
+        "src-tauri/src/runtime/proxy/mesh_route_report.rs": "fb168a0ddc538c85e076b5b4848f828444876cf00bc1732688f2591deffabd55",
+        "src-tauri/src/runtime/proxy/native_auto.rs": "d72c853dea69ef9d26b0fec55280b1895af24a0f5bf76f8da0fa722acb6408e5",
+        "src-tauri/src/runtime/proxy/pending_changes.rs": "f7b22aca7f8c21b532f53091218cf10b897193529df72ca027c953320466b384",
+        "src-tauri/src/runtime/proxy/runtime_config.rs": "f847bf9145f39fb010567c17a9876bc60297250a409a351ea9bf33ec9b6a8a5b",
+        "src-tauri/src/runtime/proxy/tests/hot_switch.rs": "e627c7d2fb20aaaff8d3ccc912eba6ee8d763c6f2b741aff139b79ca3a0f4376",
+        "src-tauri/src/runtime/proxy/tests/hot_switch/auto_select.rs": "fb1422b70e42e6872ab0d4831512a527a1e0f8ffcdc58b35a5ef9b2f4f827385",
+        "src-tauri/src/runtime/proxy/tests/lifecycle.rs": "11d1b9685ca2d8901705398b67533cd43e2465d67c75e49e2edccac1d6916b24",
+        "src-tauri/src/runtime/proxy/tests/mesh_route_report.rs": "ac50089fcf54c22fc1cb82aa53a91c96511ddd6ec9edb626785a0539c03d00ab"
       },
       "addedSources": [
         "src-tauri/src/runtime/proxy/runtime_config.rs"

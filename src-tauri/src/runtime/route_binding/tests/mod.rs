@@ -354,7 +354,6 @@ async fn live_route_planner_returns_a_real_interface() {
     }
 }
 
-
 // This guard uses Platform::current; unsupported mobile platforms deliberately
 // have no inferred route candidates, so exercise substantive roots on desktops.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -380,8 +379,10 @@ fn runtime_reuse_allows_same_host_credentials_without_mutating_accepted_facts() 
     assert!(runtime_binding_targets_reusable(&old, &next, &plan));
     assert_eq!(plan, accepted, "reuse must retain the accepted route facts");
     next.servers[0].address = "2.2.2.2".into();
-    assert!(!runtime_binding_targets_reusable(&old, &next, &plan),
-        "the same server ID does not attest a changed route target");
+    assert!(
+        !runtime_binding_targets_reusable(&old, &next, &plan),
+        "the same server ID does not attest a changed route target"
+    );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -401,22 +402,32 @@ fn runtime_reuse_rejects_new_or_preexisting_uncovered_active_roots() {
     next.selected_server_id = Some("node-b".into());
     assert!(!runtime_binding_targets_reusable(&old, &next, &plan));
     plan.covered_roots.insert("node-b".into());
-    assert!(runtime_binding_targets_reusable(&old, &next, &plan),
-        "positive control: an unchanged already covered target is reusable");
+    assert!(
+        runtime_binding_targets_reusable(&old, &next, &plan),
+        "positive control: an unchanged already covered target is reusable"
+    );
     let mut inactive_edit = old.clone();
     inactive_edit.servers[1].address = "4.4.4.4".into();
-    assert!(runtime_binding_targets_reusable(&old, &inactive_edit, &plan),
-        "an inactive host edit need not consume an old route fact yet");
+    assert!(
+        runtime_binding_targets_reusable(&old, &inactive_edit, &plan),
+        "an inactive host edit need not consume an old route fact yet"
+    );
     let mut activated = inactive_edit.clone();
     activated.selected_server_id = Some("node-b".into());
-    assert!(!runtime_binding_targets_reusable(&old, &activated, &plan),
-        "activation must compare against trusted startup host, not later HOT runtime content");
-    assert!(runtime_binding_targets_reusable(&inactive_edit, &activated, &plan),
-        "negative baseline control: using edited R would incorrectly appear reusable");
+    assert!(
+        !runtime_binding_targets_reusable(&old, &activated, &plan),
+        "activation must compare against trusted startup host, not later HOT runtime content"
+    );
+    assert!(
+        runtime_binding_targets_reusable(&inactive_edit, &activated, &plan),
+        "negative baseline control: using edited R would incorrectly appear reusable"
+    );
     next.servers.push(server("new-root", "3.3.3.3"));
     next.selected_server_id = Some("new-root".into());
     assert!(!runtime_binding_targets_reusable(&old, &next, &plan));
     plan.covered_roots.insert("new-root".into());
-    assert!(!runtime_binding_targets_reusable(&old, &next, &plan),
-        "coverage alone cannot invent a previous accepted route target");
+    assert!(
+        !runtime_binding_targets_reusable(&old, &next, &plan),
+        "coverage alone cannot invent a previous accepted route target"
+    );
 }

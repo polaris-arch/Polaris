@@ -147,8 +147,10 @@ async fn apply_during_a_restart_stop_wait_conflicts_without_creating_a_force_sna
     assert_eq!(rt.config.current().unwrap(), before);
     drop(held);
     let _ = restart.await.unwrap(); // synthetic bad start may fail; no Apply was authorized.
-    assert!(rt.pending_force_restart.read().unwrap().is_none(),
-        "a busy Apply must not leave an implicit restart behind");
+    assert!(
+        rt.pending_force_restart.read().unwrap().is_none(),
+        "a busy Apply must not leave an implicit restart behind"
+    );
     rt.gate.bump_generation();
 }
 

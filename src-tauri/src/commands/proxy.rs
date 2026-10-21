@@ -308,20 +308,33 @@ pub async fn proxy_apply_pending_changes(
     retry_persistence_transaction_id: Option<String>,
 ) -> Result<ApiResponse<Value>, ()> {
     // The explicit retry selector is mutually exclusive with restart permission.
-    if restart_confirmation.is_some() && retry_persistence_transaction_id.is_some() { return Err(()); }
+    if restart_confirmation.is_some() && retry_persistence_transaction_id.is_some() {
+        return Err(());
+    }
     let result = if let Some(transaction_id) = retry_persistence_transaction_id {
         state.proxy.retry_runtime_persistence(transaction_id).await
     } else {
-        state.proxy.clone().apply_pending_transaction(restart_confirmation).await
+        state
+            .proxy
+            .clone()
+            .apply_pending_transaction(restart_confirmation)
+            .await
     };
-    Ok(ApiResponse::ok(serde_json::to_value(result).map_err(|_| ())?))
+    Ok(ApiResponse::ok(
+        serde_json::to_value(result).map_err(|_| ())?,
+    ))
 }
 
 /// Observe an existing HOT transaction without resubmission or restart.
 #[tauri::command]
-pub async fn proxy_runtime_apply_status(state: State<'_, AppRuntime>, transaction_id: String) -> Result<ApiResponse<Value>, ()> {
+pub async fn proxy_runtime_apply_status(
+    state: State<'_, AppRuntime>,
+    transaction_id: String,
+) -> Result<ApiResponse<Value>, ()> {
     let result = state.proxy.runtime_apply_status(transaction_id).await;
-    Ok(ApiResponse::ok(serde_json::to_value(result).map_err(|_| ())?))
+    Ok(ApiResponse::ok(
+        serde_json::to_value(result).map_err(|_| ())?,
+    ))
 }
 
 // ── C10：自定义协议兼容性 probe（上游 `ProxyManager.probeOutbound`，:3749-3818）─────────────

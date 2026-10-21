@@ -191,9 +191,19 @@ impl ProxyRuntime {
         core_config_json: &str,
         run_generation: u64,
     ) -> MeshRouteRunEvidence {
-        self.prepare_mesh_route_run_with_receipt(candidates, total_candidate_count, diagnostics_limited,
-            dns_owner_server_id, invalid_nodes, original_config, core_config, core_config_path,
-            core_config_json, run_generation, false)
+        self.prepare_mesh_route_run_with_receipt(
+            candidates,
+            total_candidate_count,
+            diagnostics_limited,
+            dns_owner_server_id,
+            invalid_nodes,
+            original_config,
+            core_config,
+            core_config_path,
+            core_config_json,
+            run_generation,
+            false,
+        )
     }
 
     /// Candidate evidence from submitted bytes; only a verified committed receipt
@@ -438,12 +448,22 @@ impl ProxyRuntime {
     /// source baselines without pretending the startup file was rewritten.
     pub(super) fn publish_mesh_route_runtime_receipt(&self, mut evidence: MeshRouteRunEvidence) {
         let epoch = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
-        let stable = evidence.eligible_for_ack && epoch == evidence.write_epoch && epoch.is_multiple_of(2)
-            && evidence.file_baselines.iter().all(|(path, baseline)| read_bounded(path, MAX_RULE_FILE_BYTES).as_deref() == Ok(baseline.as_str()));
-        evidence.load_evidence = if stable { MeshRouteLoadEvidence::RuntimeCommitted } else { MeshRouteLoadEvidence::FileWrittenUnacknowledged };
+        let stable = evidence.eligible_for_ack
+            && epoch == evidence.write_epoch
+            && epoch.is_multiple_of(2)
+            && evidence.file_baselines.iter().all(|(path, baseline)| {
+                read_bounded(path, MAX_RULE_FILE_BYTES).as_deref() == Ok(baseline.as_str())
+            });
+        evidence.load_evidence = if stable {
+            MeshRouteLoadEvidence::RuntimeCommitted
+        } else {
+            MeshRouteLoadEvidence::FileWrittenUnacknowledged
+        };
         evidence.ready_at_ms = self.status().start_time;
         if let Ok(mut slot) = self.mesh_route_run.write() {
-            if self.gate.generation() == evidence.run_generation { *slot = Some(evidence); }
+            if self.gate.generation() == evidence.run_generation {
+                *slot = Some(evidence);
+            }
         }
     }
 
@@ -454,7 +474,10 @@ impl ProxyRuntime {
         evidence: &MeshRouteRunEvidence,
         snapshot: &mut MeshRouteSnapshot,
     ) {
-        if !matches!(snapshot.load_evidence, MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted) {
+        if !matches!(
+            snapshot.load_evidence,
+            MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted
+        ) {
             return;
         }
         let current = self.mesh_route_run.read().ok().and_then(|slot| {
@@ -468,7 +491,8 @@ impl ProxyRuntime {
             })
         });
         match current {
-            Some(MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted) => {}
+            Some(MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted) => {
+            }
             Some(revoked) => {
                 snapshot.load_evidence = revoked;
                 snapshot.scope = MeshRouteScope::PersistedUnknown;
@@ -570,12 +594,14 @@ impl ProxyRuntime {
             .map(|item| item.candidate)
             .collect();
         let after = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
-        let core_config_read = if evidence.load_evidence == MeshRouteLoadEvidence::RuntimeCommitted {
+        let core_config_read = if evidence.load_evidence == MeshRouteLoadEvidence::RuntimeCommitted
+        {
             evidence.core_config_sha256.as_ref().map(|_| Ok(true))
         } else {
             evidence.core_config_sha256.as_ref().map(|expected| {
-                read_bounded(&evidence.core_config_path, MAX_CORE_CONFIG_BYTES)
-                    .map(|content| polaris_updater::verify::sha256_hex(content.as_bytes()) == *expected)
+                read_bounded(&evidence.core_config_path, MAX_CORE_CONFIG_BYTES).map(|content| {
+                    polaris_updater::verify::sha256_hex(content.as_bytes()) == *expected
+                })
             })
         };
         let observed_invalidation = if file_failed
@@ -604,7 +630,11 @@ impl ProxyRuntime {
                         && current.core_config_sha256 == evidence.core_config_sha256
                         && current.file_baselines == evidence.file_baselines
                         && current.write_epoch == evidence.write_epoch
-                        && matches!(current.load_evidence, MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted)
+                        && matches!(
+                            current.load_evidence,
+                            MeshRouteLoadEvidence::StartupReady
+                                | MeshRouteLoadEvidence::RuntimeCommitted
+                        )
                     {
                         current.load_evidence = invalidated;
                         current.eligible_for_ack = false;
@@ -616,7 +646,10 @@ impl ProxyRuntime {
         if status.running
             && !status.starting
             && status.start_time == evidence.ready_at_ms
-            && matches!(snapshot.load_evidence, MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted)
+            && matches!(
+                snapshot.load_evidence,
+                MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted
+            )
         {
             snapshot.scope = MeshRouteScope::Applied;
         }

@@ -2312,7 +2312,12 @@ impl ProxyRuntime {
                 &deps,
             ));
         }
-        self.capture_runtime_config_baseline(my_gen, deps.clone(), singbox_config.clone(), user_config.clone());
+        self.capture_runtime_config_baseline(
+            my_gen,
+            deps.clone(),
+            singbox_config.clone(),
+            user_config.clone(),
+        );
         self.commit_coex_current_config(config.clone());
         // The final endpoint set was claimed before native/libbox startup. Keep that claim
         // continuously through readiness; releasing and re-reserving here opens a takeover gap.

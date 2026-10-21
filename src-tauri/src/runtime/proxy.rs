@@ -44,10 +44,10 @@ mod tls_capabilities;
 pub(crate) mod core_log;
 mod dns_takeover;
 mod hot_switch;
-mod runtime_config;
 mod lifecycle;
 mod login_fallback;
 mod management_api;
+mod runtime_config;
 // S4 journal, artifact, and guarded CAS contract. The managed coordinator is
 // deliberately not wired until core ownership and platform receipts exist.
 pub(crate) mod coex_observer;

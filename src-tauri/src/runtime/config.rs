@@ -1956,9 +1956,13 @@ impl ConfigManager {
         acknowledge: impl FnOnce(String, String) -> T,
     ) -> Result<T, StoreError> {
         deny_inside_projection("with_durable_runtime_owner");
-        let _writer = self.write_lock.lock()
+        let _writer = self
+            .write_lock
+            .lock()
             .map_err(|_| StoreError::validation("runtime owner writer unavailable"))?;
-        let cache = self.cache.read()
+        let cache = self
+            .cache
+            .read()
             .map_err(|_| StoreError::validation("runtime owner cache unavailable"))?;
         if cache.as_ref() != Some(expected) {
             return Err(StoreError::validation("runtime desired owner superseded"));
@@ -1966,10 +1970,15 @@ impl ConfigManager {
         let bytes = std::fs::read(&self.path).map_err(|error| StoreError::Io(error.to_string()))?;
         let persisted: Value = serde_json::from_slice(&bytes).map_err(StoreError::from_parse)?;
         if &persisted != expected {
-            return Err(StoreError::validation("runtime durable desired owner superseded"));
+            return Err(StoreError::validation(
+                "runtime durable desired owner superseded",
+            ));
         }
         let _probe = ReentrancyProbe::enter();
-        Ok(acknowledge(polaris_updater::sha256_hex(&bytes), config_version(expected)))
+        Ok(acknowledge(
+            polaris_updater::sha256_hex(&bytes),
+            config_version(expected),
+        ))
     }
 
     /// Warm saved-state commit fence. This shares the real writer mutex, never loads or
@@ -2374,15 +2383,42 @@ impl ConfigManager {
 
     /// Capture only journal identities removed by this exact candidate, while
     /// saved D still matches its owner. Never widen this set after Plan.
-    pub(crate) fn runtime_deletion_scope(&self, desired: &Value, before: &Value, candidate: &Value) -> Result<Vec<DeferredConfigDeletion>, StoreError> {
+    pub(crate) fn runtime_deletion_scope(
+        &self,
+        desired: &Value,
+        before: &Value,
+        candidate: &Value,
+    ) -> Result<Vec<DeferredConfigDeletion>, StoreError> {
         deny_inside_projection("runtime_deletion_scope");
-        let _writer = self.write_lock.lock().map_err(|_| StoreError::validation("deletion scope unavailable"))?;
-        let _deletions = self.deferred_delete_lock.lock().map_err(|_| StoreError::validation("deletion scope unavailable"))?;
-        if self.cache.read().ok().and_then(|value| value.clone()).as_ref() != Some(desired) {
-            return Err(StoreError::validation("deletion scope desired owner changed"));
+        let _writer = self
+            .write_lock
+            .lock()
+            .map_err(|_| StoreError::validation("deletion scope unavailable"))?;
+        let _deletions = self
+            .deferred_delete_lock
+            .lock()
+            .map_err(|_| StoreError::validation("deletion scope unavailable"))?;
+        if self
+            .cache
+            .read()
+            .ok()
+            .and_then(|value| value.clone())
+            .as_ref()
+            != Some(desired)
+        {
+            return Err(StoreError::validation(
+                "deletion scope desired owner changed",
+            ));
         }
-        Ok(self.load_deferred_deletions_locked()?.entries.into_iter()
-            .filter(|entry| deferred_deletion_is_cancelled(entry, before) && !deferred_deletion_is_cancelled(entry, candidate)).collect())
+        Ok(self
+            .load_deferred_deletions_locked()?
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                deferred_deletion_is_cancelled(entry, before)
+                    && !deferred_deletion_is_cancelled(entry, candidate)
+            })
+            .collect())
     }
 
     /// Apply / 冷启动消费延迟删除。每条先按最新配置复核；执行失败保留在日志中，下一次 Apply/启动重试。

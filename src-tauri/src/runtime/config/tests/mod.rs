@@ -14,12 +14,14 @@ fn durable_runtime_owner_attests_exact_disk_bytes_and_saved_version() {
     let saved = config.current().unwrap();
     let bytes = std::fs::read(directory.join("config.json")).unwrap();
     let called = std::cell::Cell::new(false);
-    let receipt = config.with_durable_runtime_owner(&saved, |digest, revision| {
-        called.set(true);
-        assert_eq!(digest, polaris_updater::sha256_hex(&bytes));
-        assert_eq!(revision, config_version(&saved));
-        (digest, revision)
-    }).unwrap();
+    let receipt = config
+        .with_durable_runtime_owner(&saved, |digest, revision| {
+            called.set(true);
+            assert_eq!(digest, polaris_updater::sha256_hex(&bytes));
+            assert_eq!(revision, config_version(&saved));
+            (digest, revision)
+        })
+        .unwrap();
     assert!(called.get());
     assert!(!receipt.0.is_empty() && !receipt.1.is_empty());
 }
@@ -35,7 +37,9 @@ fn durable_runtime_owner_rejects_newer_desired_without_acknowledgement() {
     newer["logLevel"] = serde_json::json!("debug");
     config.save_full(&newer).unwrap();
     let called = std::cell::Cell::new(false);
-    assert!(config.with_durable_runtime_owner(&saved, |_, _| called.set(true)).is_err());
+    assert!(config
+        .with_durable_runtime_owner(&saved, |_, _| called.set(true))
+        .is_err());
     assert!(!called.get());
     assert_eq!(config.current().unwrap()["logLevel"], "debug");
 }
@@ -50,13 +54,22 @@ fn durable_runtime_owner_rejects_mismatched_or_unreadable_disk_without_acknowled
         let saved = config.current().unwrap();
         let mut changed = saved.clone();
         changed["logLevel"] = serde_json::json!("debug");
-        let bytes = if corrupt { b"not-json".to_vec() } else { serde_json::to_vec(&changed).unwrap() };
+        let bytes = if corrupt {
+            b"not-json".to_vec()
+        } else {
+            serde_json::to_vec(&changed).unwrap()
+        };
         std::fs::write(directory.join("config.json"), &bytes).unwrap();
         let called = std::cell::Cell::new(false);
-        assert!(config.with_durable_runtime_owner(&saved, |_, _| called.set(true)).is_err());
+        assert!(config
+            .with_durable_runtime_owner(&saved, |_, _| called.set(true))
+            .is_err());
         assert!(!called.get());
-        assert_eq!(std::fs::read(directory.join("config.json")).unwrap(), bytes,
-            "attestation must not repair or rewrite a mismatched durable owner");
+        assert_eq!(
+            std::fs::read(directory.join("config.json")).unwrap(),
+            bytes,
+            "attestation must not repair or rewrite a mismatched durable owner"
+        );
     }
 }
 
@@ -2992,33 +3005,62 @@ fn runtime_deletion_scope_never_consumes_or_drops_later_queued_entries() {
     first["ruleResources"] = serde_json::json!([]);
     mgr.save_full_deferred_cleanup(&initial, &first).unwrap();
     let first = mgr.current().unwrap();
-    let scope = mgr.runtime_deletion_scope(&first, &initial, &first).unwrap();
-    assert!(mgr.runtime_deletion_scope(&first, &first, &first).unwrap().is_empty(),
-        "a later no-op cannot acquire the earlier undrained removal");
-    assert_eq!(scope.len(), 1, "only the original rule resource removal is captured");
+    let scope = mgr
+        .runtime_deletion_scope(&first, &initial, &first)
+        .unwrap();
+    assert!(
+        mgr.runtime_deletion_scope(&first, &first, &first)
+            .unwrap()
+            .is_empty(),
+        "a later no-op cannot acquire the earlier undrained removal"
+    );
+    assert_eq!(
+        scope.len(),
+        1,
+        "only the original rule resource removal is captured"
+    );
 
     let mut later = first.clone();
     later["customAppPresets"] = serde_json::json!([]);
     mgr.save_full_deferred_cleanup(&first, &later).unwrap();
     let queued = mgr.load_deferred_deletions_locked().unwrap().entries;
-    let later_entries: Vec<_> = queued.into_iter().filter(|entry| !scope.contains(entry)).collect();
-    assert_eq!(later_entries.len(), 1, "a later icon deletion must really be queued");
+    let later_entries: Vec<_> = queued
+        .into_iter()
+        .filter(|entry| !scope.contains(entry))
+        .collect();
+    assert_eq!(
+        later_entries.len(),
+        1,
+        "a later icon deletion must really be queued"
+    );
     let mut calls = Vec::new();
-    let summary = mgr.process_deferred_deletions_scoped(Some(&scope), |entry, _| {
-        calls.push(entry.clone());
-        Ok(())
-    }).unwrap();
-    assert_eq!(calls, scope, "the old receipt cannot execute a later deletion");
+    let summary = mgr
+        .process_deferred_deletions_scoped(Some(&scope), |entry, _| {
+            calls.push(entry.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        calls, scope,
+        "the old receipt cannot execute a later deletion"
+    );
     assert_eq!(summary.applied, 1);
-    assert_eq!(mgr.load_deferred_deletions_locked().unwrap().entries, later_entries,
-        "out-of-scope work must survive journal rewriting unchanged");
+    assert_eq!(
+        mgr.load_deferred_deletions_locked().unwrap().entries,
+        later_entries,
+        "out-of-scope work must survive journal rewriting unchanged"
+    );
 
     let mut remaining_calls = Vec::new();
     mgr.process_deferred_deletions(|entry, _| {
         remaining_calls.push(entry.clone());
         Ok(())
-    }).unwrap();
-    assert_eq!(remaining_calls, later_entries, "the later owner still has its cleanup work");
+    })
+    .unwrap();
+    assert_eq!(
+        remaining_calls, later_entries,
+        "the later owner still has its cleanup work"
+    );
 }
 
 #[test]

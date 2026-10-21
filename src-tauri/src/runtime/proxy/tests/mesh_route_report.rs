@@ -722,16 +722,29 @@ fn hot_receipt_proves_runtime_without_claiming_old_disk_artifact() {
     let original = super::super::tailnet_rules::tailnet_rule_file_json(&["10.1.0.0/16".into()]);
     std::fs::write(&core_path, "old startup artifact").unwrap();
     std::fs::write(&rule_path, &original).unwrap();
-    *rt.status.write().unwrap() = ProxyStatus { running: true, start_time: Some(7), ..Default::default() };
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        start_time: Some(7),
+        ..Default::default()
+    };
     let evidence = ready_evidence(&rt, &core_path, &rule_path, &original);
     rt.publish_mesh_route_runtime_receipt(evidence);
     let applied = rt.mesh_route_report(Some("receipt-version".into()));
     assert_eq!(applied.snapshot.scope, MeshRouteScope::Applied);
-    assert_eq!(applied.snapshot.load_evidence, MeshRouteLoadEvidence::RuntimeCommitted);
-    assert_eq!(std::fs::read_to_string(&core_path).unwrap(), "old startup artifact");
+    assert_eq!(
+        applied.snapshot.load_evidence,
+        MeshRouteLoadEvidence::RuntimeCommitted
+    );
+    assert_eq!(
+        std::fs::read_to_string(&core_path).unwrap(),
+        "old startup artifact"
+    );
     let changed = super::super::tailnet_rules::tailnet_rule_file_json(&["10.2.0.0/16".into()]);
     std::fs::write(&rule_path, changed).unwrap();
     let unknown = rt.mesh_route_report(Some("receipt-version".into()));
     assert_eq!(unknown.snapshot.scope, MeshRouteScope::PersistedUnknown);
-    assert_ne!(unknown.snapshot.load_evidence, MeshRouteLoadEvidence::RuntimeCommitted);
+    assert_ne!(
+        unknown.snapshot.load_evidence,
+        MeshRouteLoadEvidence::RuntimeCommitted
+    );
 }

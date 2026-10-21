@@ -208,10 +208,15 @@ impl ProxyRuntime {
             .as_ref()
             .and_then(|runtime| non_node_runtime_debt(runtime, &current))
             .unwrap_or_else(|| self.restart_deferred.load(Ordering::SeqCst));
-        let pending_apply = !added.is_empty() || !modified.is_empty() || !removed.is_empty()
-            || non_node_pending || selected_pending || self.has_uncommitted_rule_content();
-        let restart_required = applied.as_ref().is_some_and(|runtime|
-            super::runtime_config::structural_runtime_change(runtime, &current));
+        let pending_apply = !added.is_empty()
+            || !modified.is_empty()
+            || !removed.is_empty()
+            || non_node_pending
+            || selected_pending
+            || self.has_uncommitted_rule_content();
+        let restart_required = applied.as_ref().is_some_and(|runtime| {
+            super::runtime_config::structural_runtime_change(runtime, &current)
+        });
         PendingChangesSummary {
             pending_apply,
             restart_required,
@@ -291,111 +296,119 @@ impl ProxyRuntime {
         #[cfg(any(target_os = "ios", windows))]
         let mut directory_leases = Vec::new();
         let config_dir = self.config.dir().to_path_buf();
-        let result = self.config.process_deferred_deletions_scoped(scope, |entry, current| {
-            if cfg!(target_os = "ios")
-                && !matches!(entry, DeferredConfigDeletion::TailscaleDirectory { .. })
-            {
-                // Scoped TS proof does not relax the existing guard for rule files,
-                // WARP state, icons, or legacy unbound TS directory records.
-                return Err(
-                    "CleanupUnknown: no admitted cleanup contract for this resource".into(),
-                );
-            }
-            match entry {
-                DeferredConfigDeletion::RuleResource { file_name } => {
-                    if crate::commands::rules::rule_resource_file_is_referenced(current, file_name)
-                    {
-                        Ok(())
-                    } else {
-                        crate::commands::rules::remove_rule_resource_file(&config_dir, file_name)
-                    }
+        let result = self
+            .config
+            .process_deferred_deletions_scoped(scope, |entry, current| {
+                if cfg!(target_os = "ios")
+                    && !matches!(entry, DeferredConfigDeletion::TailscaleDirectory { .. })
+                {
+                    // Scoped TS proof does not relax the existing guard for rule files,
+                    // WARP state, icons, or legacy unbound TS directory records.
+                    return Err(
+                        "CleanupUnknown: no admitted cleanup contract for this resource".into(),
+                    );
                 }
-                DeferredConfigDeletion::BuiltinRuleResource { file_name, .. } => {
-                    crate::commands::rules::remove_builtin_rule_resource_files(
-                        &config_dir,
-                        file_name,
-                    )
-                }
-                DeferredConfigDeletion::AppIcon { app_id } => crate::icon_cache::remove_app_icon(
-                    &crate::icon_cache::icons_dir(&config_dir),
-                    app_id,
-                ),
-                DeferredConfigDeletion::TailscaleState { server_id } => {
-                    if cfg!(any(target_os = "ios", windows)) {
-                        return Err("CleanupUnknown: unbound legacy directory intent".into());
+                match entry {
+                    DeferredConfigDeletion::RuleResource { file_name } => {
+                        if crate::commands::rules::rule_resource_file_is_referenced(
+                            current, file_name,
+                        ) {
+                            Ok(())
+                        } else {
+                            crate::commands::rules::remove_rule_resource_file(
+                                &config_dir,
+                                file_name,
+                            )
+                        }
                     }
-                    match self.mesh.tailscale_logout_under_gate(
-                        server_id,
-                        gate,
-                        self.tailscale_writer_alive(),
-                    ) {
-                        Ok(()) => Ok(()),
-                        // 旧版恶意/损坏配置可能把不安全 id 留进 journal；它不可能对应受管目录，
-                        // 安全丢弃该删除意图，避免每次启动永久重试。
-                        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-                            log::warn!(
+                    DeferredConfigDeletion::BuiltinRuleResource { file_name, .. } => {
+                        crate::commands::rules::remove_builtin_rule_resource_files(
+                            &config_dir,
+                            file_name,
+                        )
+                    }
+                    DeferredConfigDeletion::AppIcon { app_id } => {
+                        crate::icon_cache::remove_app_icon(
+                            &crate::icon_cache::icons_dir(&config_dir),
+                            app_id,
+                        )
+                    }
+                    DeferredConfigDeletion::TailscaleState { server_id } => {
+                        if cfg!(any(target_os = "ios", windows)) {
+                            return Err("CleanupUnknown: unbound legacy directory intent".into());
+                        }
+                        match self.mesh.tailscale_logout_under_gate(
+                            server_id,
+                            gate,
+                            self.tailscale_writer_alive(),
+                        ) {
+                            Ok(()) => Ok(()),
+                            // 旧版恶意/损坏配置可能把不安全 id 留进 journal；它不可能对应受管目录，
+                            // 安全丢弃该删除意图，避免每次启动永久重试。
+                            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                                log::warn!(
                                 "忽略不安全的 Tailscale state 删除意图（server_id={server_id:?}）"
                             );
+                                Ok(())
+                            }
+                            Err(error) => Err(format!("清理 Tailscale state 失败: {error}")),
+                        }
+                    }
+                    DeferredConfigDeletion::TailscaleDirectory { intent } => {
+                        #[cfg(target_os = "ios")]
+                        {
+                            let mut lease = self
+                                .mesh
+                                .delete_original_tailscale_directory_under_gate(
+                                    intent,
+                                    directory_receipt,
+                                    gate,
+                                    self.tailscale_writer_alive(),
+                                    current,
+                                )
+                                .map_err(|error| {
+                                    format!("CleanupUnknown: directory commit retained: {error}")
+                                })?;
+                            lease.release_admission_after_commit();
+                            directory_leases.push(lease);
                             Ok(())
                         }
-                        Err(error) => Err(format!("清理 Tailscale state 失败: {error}")),
-                    }
-                }
-                DeferredConfigDeletion::TailscaleDirectory { intent } => {
-                    #[cfg(target_os = "ios")]
-                    {
-                        let mut lease = self
-                            .mesh
-                            .delete_original_tailscale_directory_under_gate(
-                                intent,
-                                directory_receipt,
-                                gate,
-                                self.tailscale_writer_alive(),
-                                current,
-                            )
-                            .map_err(|error| {
+                        #[cfg(windows)]
+                        {
+                            if self
+                                .mesh
+                                .directory_in_use(&intent.server_id, self.tailscale_writer_alive())
+                            {
+                                return Err("CleanupUnknown: directory is still in use".into());
+                            }
+                            let mut lease =
+                                crate::runtime::windows_directory::DirectoryLease::acquire_intent(
+                                    &config_dir,
+                                    intent,
+                                )
+                                .map_err(|error| {
+                                    format!("CleanupUnknown: directory custody retained: {error}")
+                                })?;
+                            lease.commit(intent, current).map_err(|error| {
                                 format!("CleanupUnknown: directory commit retained: {error}")
                             })?;
-                        lease.release_admission_after_commit();
-                        directory_leases.push(lease);
-                        Ok(())
-                    }
-                    #[cfg(windows)]
-                    {
-                        if self
-                            .mesh
-                            .directory_in_use(&intent.server_id, self.tailscale_writer_alive())
-                        {
-                            return Err("CleanupUnknown: directory is still in use".into());
+                            directory_leases.push(lease);
+                            Ok(())
                         }
-                        let mut lease =
-                            crate::runtime::windows_directory::DirectoryLease::acquire_intent(
-                                &config_dir,
-                                intent,
-                            )
-                            .map_err(|error| {
-                                format!("CleanupUnknown: directory custody retained: {error}")
-                            })?;
-                        lease.commit(intent, current).map_err(|error| {
-                            format!("CleanupUnknown: directory commit retained: {error}")
-                        })?;
-                        directory_leases.push(lease);
-                        Ok(())
-                    }
-                    #[cfg(not(any(target_os = "ios", windows)))]
-                    {
-                        let _ = intent;
-                        Err(
+                        #[cfg(not(any(target_os = "ios", windows)))]
+                        {
+                            let _ = intent;
+                            Err(
                             "CleanupUnknown: platform directory retirement admission unavailable"
                                 .into(),
                         )
+                        }
                     }
+                    DeferredConfigDeletion::WarpDevice {
+                        device_id, token, ..
+                    } => self.mesh.try_enqueue_warp_deregister(device_id, token),
                 }
-                DeferredConfigDeletion::WarpDevice {
-                    device_id, token, ..
-                } => self.mesh.try_enqueue_warp_deregister(device_id, token),
-            }
-        });
+            });
         match result {
             Ok(summary) if summary.applied > 0 || summary.cancelled > 0 || summary.retrying > 0 => {
                 log::info!(

@@ -245,7 +245,10 @@ pub fn resolve_mesh_route_snapshot(mut snapshot: MeshRouteSnapshot) -> MeshRoute
                 .config_version
                 .as_ref()
                 .is_none_or(String::is_empty)
-            || !matches!(snapshot.load_evidence, MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted)
+            || !matches!(
+                snapshot.load_evidence,
+                MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted
+            )
             || snapshot.config_source != MeshRouteConfigSource::Running
             || snapshot.snapshot_stale)
     {

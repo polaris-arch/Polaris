@@ -199,7 +199,10 @@ async fn clean_mesh_selection_that_changes_routes_restarts_only_the_running_proj
         );
         assert!(rt.pending_force_restart.read().unwrap().is_none());
         let pending = rt.current_config_snapshot().unwrap();
-        assert_eq!(pending["selectedServerId"], running["selectedServerId"], "{label}");
+        assert_eq!(
+            pending["selectedServerId"], running["selectedServerId"],
+            "{label}"
+        );
         assert_eq!(
             pending["logLevel"], running["logLevel"],
             "{label}: D log debt leaked into R"
@@ -261,7 +264,7 @@ async fn leaving_an_openvpn_mesh_exit_restarts_the_running_projection() {
         "a route-changing selection must not PUT"
     );
     assert!(rt.pending_force_restart.read().unwrap().is_none());
-            let projected = rt.current_config_snapshot().unwrap();
+    let projected = rt.current_config_snapshot().unwrap();
     assert_eq!(projected["selectedServerId"], "ovpn-mesh");
     assert_eq!(
         rt.current_config_snapshot().unwrap()["selectedServerId"],
@@ -1558,13 +1561,19 @@ async fn failed_selection_stays_deferred_until_explicit_stop_takes_over() {
     *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node A")]);
     let intent = rt.register_selector_intent();
     let generation = rt.gate.generation();
-    let outcome = rt.switch_selected_server_if_current("node-b", intent).await.unwrap();
+    let outcome = rt
+        .switch_selected_server_if_current("node-b", intent)
+        .await
+        .unwrap();
     assert_eq!(outcome, Some(SwitchOutcome::Deferred));
     assert!(rt.pending_force_restart.read().unwrap().is_none());
     assert_eq!(rt.current_config_snapshot().unwrap(), running);
     assert_eq!(rt.gate.generation(), generation);
     rt.gate.claim_generation(None, LifecycleKind::Stop);
-    assert_eq!(rt.settle_selected_switch_receipt(outcome, generation, intent), Some(SwitchOutcome::NotRunning));
+    assert_eq!(
+        rt.settle_selected_switch_receipt(outcome, generation, intent),
+        Some(SwitchOutcome::NotRunning)
+    );
 }
 
 #[tokio::test]
@@ -3300,7 +3309,11 @@ async fn switch_mode_norm_field_change_without_baseline_stays_pending() {
 
     // 只改端口（norm 内字段）→ plan_hot_switch 的 norm 前提失败 → kind=None → Restart。
     let out = rt.switch_mode(next).await;
-    assert_eq!(out, SwitchOutcome::Pending, "graph change without a runtime baseline remains unconfirmed/pending");
+    assert_eq!(
+        out,
+        SwitchOutcome::Pending,
+        "graph change without a runtime baseline remains unconfirmed/pending"
+    );
     assert_eq!(rt.current_config_snapshot().unwrap()["mixedPort"], 7891);
     assert_eq!(rt.config.current().unwrap()["mixedPort"], 7899);
     assert!(rt.pending_force_restart.read().unwrap().is_none());
@@ -3598,7 +3611,10 @@ async fn switch_mode_added_unreferenced_node_without_baseline_stays_pending() {
         SwitchOutcome::Pending,
         "graph mutation without a runtime baseline cannot be attested"
     );
-    assert!(!rt.gate.pending().restart_pending, "unconfirmed graph change cannot schedule restart");
+    assert!(
+        !rt.gate.pending().restart_pending,
+        "unconfirmed graph change cannot schedule restart"
+    );
     assert!(rt.pending_force_restart.read().unwrap().is_none());
     assert_eq!(rt.current_config_snapshot().unwrap(), cfg);
 }
@@ -3638,7 +3654,11 @@ async fn switch_mode_push_pending_changes_added_only() {
     assert!(rt.pending_force_restart.read().unwrap().is_none());
     assert_eq!(rt.current_config_snapshot().unwrap(), cfg);
     let evs = pending.lock().unwrap();
-    assert_eq!(evs.len(), 1, "unconfirmed transaction emits pending changes once");
+    assert_eq!(
+        evs.len(),
+        1,
+        "unconfirmed transaction emits pending changes once"
+    );
     assert_eq!(
         evs[0].added,
         vec!["node-c".to_string()],
@@ -3701,9 +3721,13 @@ async fn non_restart_leg_refreshes_legacy_queue_but_preserves_confirmed_snapshot
         let mut cfg = two_node_config(7891, "node-a");
         cfg["language"] = serde_json::json!("zh-CN");
         mark_running_with_snapshot(&rt, &cfg);
-        let source = if confirmed { ForceRestartSource::Confirmed {
-            intent_generation: rt.selector_reconcile.intent_generation(),
-        }} else { ForceRestartSource::Full };
+        let source = if confirmed {
+            ForceRestartSource::Confirmed {
+                intent_generation: rt.selector_reconcile.intent_generation(),
+            }
+        } else {
+            ForceRestartSource::Full
+        };
         *rt.pending_force_restart.write().unwrap() = Some((42, cfg.clone(), source));
         let mut next = cfg.clone();
         next["language"] = serde_json::json!("en-US");
@@ -3711,8 +3735,11 @@ async fn non_restart_leg_refreshes_legacy_queue_but_preserves_confirmed_snapshot
         let pending = rt.pending_force_restart.read().unwrap().clone().unwrap();
         assert_eq!(pending.0, 42);
         assert_eq!(pending.2, source);
-        assert_eq!(pending.1, if confirmed { cfg } else { next },
-            "a user-confirmed snapshot must never absorb a later edit");
+        assert_eq!(
+            pending.1,
+            if confirmed { cfg } else { next },
+            "a user-confirmed snapshot must never absorb a later edit"
+        );
     }
 }
 
@@ -3720,7 +3747,9 @@ async fn non_restart_leg_refreshes_legacy_queue_but_preserves_confirmed_snapshot
 #[tokio::test]
 async fn unconfirmed_graph_change_preserves_existing_force_snapshot() {
     for old_source in [
-        ForceRestartSource::Confirmed { intent_generation: 0 },
+        ForceRestartSource::Confirmed {
+            intent_generation: 0,
+        },
         ForceRestartSource::Full,
         ForceRestartSource::Selected {
             intent_generation: 7,
@@ -3735,7 +3764,14 @@ async fn unconfirmed_graph_change_preserves_existing_force_snapshot() {
         rt.config.save_full(&next).unwrap();
 
         assert_eq!(rt.switch_mode(next).await, SwitchOutcome::Pending);
-        assert_eq!(rt.pending_force_restart.read().unwrap().as_ref().map(|entry| entry.0), Some(42));
+        assert_eq!(
+            rt.pending_force_restart
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|entry| entry.0),
+            Some(42)
+        );
         assert_eq!(rt.gate.pending().force_restart_id, Some(42));
         assert_eq!(rt.config.current().unwrap()["mixedPort"], 7899);
         rt.gate.bump_generation(); // Synthetic running core must not execute the scheduled timer.
@@ -3853,7 +3889,6 @@ async fn apply_pending_without_runtime_baseline_is_unconfirmed_and_never_restart
     assert!(rt.gate.pending().force_restart_id.is_none());
 }
 
-
 #[tokio::test]
 async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
     let (rt, _dir) = test_runtime();
@@ -3887,8 +3922,10 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
         .pending()
         .force_restart_id
         .expect("applied 必须在 gate 里记下 force id");
-    assert!(matches!(rt.pending_force_restart.read().unwrap().as_ref().unwrap().2,
-        ForceRestartSource::Confirmed { .. }));
+    assert!(matches!(
+        rt.pending_force_restart.read().unwrap().as_ref().unwrap().2,
+        ForceRestartSource::Confirmed { .. }
+    ));
 
     // 走真实去抖判定与严格认领；只替代会启动真实进程的 stop/start 半边。
     let scheduled_generation = rt.gate.generation();
@@ -3939,13 +3976,18 @@ async fn apply_pending_busy_is_conflict_without_queuing_restart() {
     assert!(!rt.gate.pending().restart_pending);
 }
 
-
 #[tokio::test]
 async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
     let (rt, _dir) = test_runtime();
     let generation = rt.gate.generation();
     let original = serde_json::json!({"selectedServerId": "node-a"});
-    *rt.pending_force_restart.write().unwrap() = Some((7, original, ForceRestartSource::Confirmed { intent_generation: rt.selector_reconcile.intent_generation() }));
+    *rt.pending_force_restart.write().unwrap() = Some((
+        7,
+        original,
+        ForceRestartSource::Confirmed {
+            intent_generation: rt.selector_reconcile.intent_generation(),
+        },
+    ));
     rt.gate.set_force_restart(7);
     let (tx, rx) = tokio::sync::oneshot::channel();
     rt.debounced
@@ -3961,7 +4003,13 @@ async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
     let next = serde_json::json!({"selectedServerId": "node-b", "logLevel": "debug"});
     {
         let mut pending = rt.pending_force_restart.write().unwrap();
-        *pending = Some((8, next.clone(), ForceRestartSource::Confirmed { intent_generation: rt.selector_reconcile.intent_generation() }));
+        *pending = Some((
+            8,
+            next.clone(),
+            ForceRestartSource::Confirmed {
+                intent_generation: rt.selector_reconcile.intent_generation(),
+            },
+        ));
         rt.gate.set_force_restart(8);
     }
     assert!(rt
@@ -4133,7 +4181,11 @@ async fn real_core_hot_switch_keeps_pid() {
     assert!(rt.pending_force_restart.read().unwrap().is_none());
     assert!(!rt.gate.pending().restart_pending);
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(rt.status().pid, pid1, "no implicit restart during the decision window");
+    assert_eq!(
+        rt.status().pid,
+        pid1,
+        "no implicit restart during the decision window"
+    );
     assert!(ps_alive(pid1));
     let (confirmed, id) = rt.apply_confirmed_for_test().await;
     assert_eq!(confirmed, "applied");
@@ -4308,12 +4360,19 @@ async fn real_core_hot_switch_failure_waits_for_explicit_restart_confirmation() 
 
     assert_eq!(rt.status().pid, pid1);
     assert_eq!(rt.gate.generation(), generation);
-    assert_eq!(rt.current_config_snapshot().unwrap()["selectedServerId"], "node-a");
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a"
+    );
     assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-b");
     assert!(rt.pending_force_restart.read().unwrap().is_none());
     assert!(!rt.gate.pending().restart_pending);
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(rt.status().pid, pid1, "failed HOT must not schedule a successor");
+    assert_eq!(
+        rt.status().pid,
+        pid1,
+        "failed HOT must not schedule a successor"
+    );
     assert_eq!(rt.gate.generation(), generation);
     let (confirmed, id) = rt.apply_confirmed_for_test().await;
     assert_eq!(confirmed, "applied");
@@ -6074,21 +6133,54 @@ fn selector_paths_recheck_original_physical_targets_after_inactive_hot_edit() {
     // source-wiring guard ensures refreshed switch fingerprints cannot bypass
     // that check through the ordinary or specialized selector entry points.
     let hot = include_str!("../hot_switch.rs");
-    let classify = hot.split("pub(super) fn classify_switch").nth(1)
-        .or_else(|| hot.split("fn classify_switch").nth(1)).expect("classifier");
+    let classify = hot
+        .split("pub(super) fn classify_switch")
+        .nth(1)
+        .or_else(|| hot.split("fn classify_switch").nth(1))
+        .expect("classifier");
     assert!(classify.contains("runtime_route_targets_reusable(&old_cfg, &new_cfg, &binding_plan)"));
-    let reconcile = hot.split("runtime_physical_targets_ready(&reconciled_runtime)").nth(1).expect("reconcile guard");
-    assert!(reconcile.find("select_outbound(PROXY_SELECTOR_TAG").is_some());
+    let reconcile = hot
+        .split("runtime_physical_targets_ready(&reconciled_runtime)")
+        .nth(1)
+        .expect("reconcile guard");
+    assert!(reconcile
+        .find("select_outbound(PROXY_SELECTOR_TAG")
+        .is_some());
     let auto = include_str!("../native_auto.rs");
-    let toggle = auto.split("pub(crate) async fn native_auto_set_enabled").nth(1).expect("toggle");
-    assert!(toggle.find("runtime_physical_targets_ready(&next)").unwrap()
-        < toggle.find("self.native_put(&api, wrapper, member)").unwrap());
-    let select = auto.split("pub(crate) async fn native_auto_select_default").nth(1).expect("default Auto");
-    assert!(select.find("runtime_physical_targets_ready(&target_projection)").unwrap()
-        < select.find(".execute_hot_switch_plan_with_pre_switch_snapshot(").unwrap());
-    let manual = auto.split("pub(super) async fn native_manual_exit").nth(1).expect("manual exit");
-    assert!(manual.find("runtime_physical_targets_ready(projected)").unwrap()
-        < manual.find("let plan = HotSwitchPlan").unwrap());
+    let toggle = auto
+        .split("pub(crate) async fn native_auto_set_enabled")
+        .nth(1)
+        .expect("toggle");
+    assert!(
+        toggle
+            .find("runtime_physical_targets_ready(&next)")
+            .unwrap()
+            < toggle
+                .find("self.native_put(&api, wrapper, member)")
+                .unwrap()
+    );
+    let select = auto
+        .split("pub(crate) async fn native_auto_select_default")
+        .nth(1)
+        .expect("default Auto");
+    assert!(
+        select
+            .find("runtime_physical_targets_ready(&target_projection)")
+            .unwrap()
+            < select
+                .find(".execute_hot_switch_plan_with_pre_switch_snapshot(")
+                .unwrap()
+    );
+    let manual = auto
+        .split("pub(super) async fn native_manual_exit")
+        .nth(1)
+        .expect("manual exit");
+    assert!(
+        manual
+            .find("runtime_physical_targets_ready(projected)")
+            .unwrap()
+            < manual.find("let plan = HotSwitchPlan").unwrap()
+    );
     let runtime = include_str!("../runtime_config.rs");
     assert!(runtime.contains("map_or(old, |value| &value.physical_route_config)"));
 }

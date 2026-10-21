@@ -44,8 +44,12 @@ impl SingBoxApiClient {
         &self,
     ) -> Result<daemon::RuntimeCapabilities, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
-        Ok(within_unary_deadline(client.get_runtime_capabilities(self.runtime_config_request(())))
-            .await.map_err(classify)?.into_inner())
+        Ok(
+            within_unary_deadline(client.get_runtime_capabilities(self.runtime_config_request(())))
+                .await
+                .map_err(classify)?
+                .into_inner(),
+        )
     }
 
     /// Forward the exact effective configuration, overrides and optimistic identity.
@@ -54,8 +58,12 @@ impl SingBoxApiClient {
         request: daemon::PlanRuntimeConfigRequest,
     ) -> Result<daemon::RuntimeConfigPlan, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
-        Ok(within_unary_deadline(client.plan_runtime_config(self.runtime_config_request(request)))
-            .await.map_err(classify)?.into_inner())
+        Ok(
+            within_unary_deadline(client.plan_runtime_config(self.runtime_config_request(request)))
+                .await
+                .map_err(classify)?
+                .into_inner(),
+        )
     }
 
     /// Submit once. A timeout/transport failure is an unknown outcome, not proof of
@@ -65,8 +73,14 @@ impl SingBoxApiClient {
         request: daemon::ApplyRuntimeConfigRequest,
     ) -> Result<daemon::RuntimeConfigOperation, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
-        Ok(within_unary_deadline(client.apply_runtime_config(self.runtime_config_request(request)))
-            .await.map_err(classify)?.into_inner())
+        Ok(
+            within_unary_deadline(
+                client.apply_runtime_config(self.runtime_config_request(request)),
+            )
+            .await
+            .map_err(classify)?
+            .into_inner(),
+        )
     }
 
     /// Retry only the original transaction's persistence tail once. Never resend
@@ -76,8 +90,12 @@ impl SingBoxApiClient {
         request: daemon::RuntimePersistenceRetryRequest,
     ) -> Result<daemon::RuntimeConfigOperation, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
-        Ok(within_unary_deadline(client.retry_runtime_persistence(self.runtime_config_request(request)))
-            .await.map_err(classify)?.into_inner())
+        Ok(within_unary_deadline(
+            client.retry_runtime_persistence(self.runtime_config_request(request)),
+        )
+        .await
+        .map_err(classify)?
+        .into_inner())
     }
 
     /// Forward the original owner's durable desired-state acknowledgement once.
@@ -87,8 +105,12 @@ impl SingBoxApiClient {
         request: daemon::RuntimePersistenceAcknowledgementRequest,
     ) -> Result<daemon::RuntimeConfigOperation, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
-        Ok(within_unary_deadline(client.acknowledge_runtime_persistence(self.runtime_config_request(request)))
-            .await.map_err(classify)?.into_inner())
+        Ok(within_unary_deadline(
+            client.acknowledge_runtime_persistence(self.runtime_config_request(request)),
+        )
+        .await
+        .map_err(classify)?
+        .into_inner())
     }
 
     /// Preserve lookup state, incarnation, operation and durability evidence verbatim.
@@ -97,7 +119,11 @@ impl SingBoxApiClient {
         request: daemon::RuntimeConfigStatusRequest,
     ) -> Result<daemon::RuntimeConfigStatus, RuntimeConfigError> {
         let mut client = self.runtime_config_client();
-        Ok(within_unary_deadline(client.get_runtime_config_status(self.runtime_config_request(request)))
-            .await.map_err(classify)?.into_inner())
+        Ok(within_unary_deadline(
+            client.get_runtime_config_status(self.runtime_config_request(request)),
+        )
+        .await
+        .map_err(classify)?
+        .into_inner())
     }
 }

@@ -413,7 +413,10 @@ impl PendingLogicalExitDisconnect {
             log::warn!("logical exit disconnect skipped: {error}");
         }
         if !outcome.failed_ids.is_empty() {
-            log::warn!("logical exit disconnect failed for {} captured IDs", outcome.failed_ids.len());
+            log::warn!(
+                "logical exit disconnect failed for {} captured IDs",
+                outcome.failed_ids.len()
+            );
         }
         Some(outcome)
     }
@@ -517,7 +520,8 @@ impl ManagementApi for TestPutSink {
     }
 
     async fn first_connection_snapshot(&self) -> Result<Vec<ConnectionSnapshot>, ManagementError> {
-        self.connection_snapshot_calls.fetch_add(1, Ordering::SeqCst);
+        self.connection_snapshot_calls
+            .fetch_add(1, Ordering::SeqCst);
         if let Some(error) = self.connection_snapshot_error.lock().unwrap().clone() {
             return Err(error);
         }
@@ -1490,7 +1494,10 @@ impl ProxyRuntime {
         // controls retain their proven path. Save-only never mutates the runtime.
         if !defer_restart && self.core_running() {
             let graph_change = match self.classify_switch(&new_config, false) {
-                ClassifiedSwitch::Decided { decision: SwitchDecision::HotSwitch(_) | SwitchDecision::NoOp, .. }
+                ClassifiedSwitch::Decided {
+                    decision: SwitchDecision::HotSwitch(_) | SwitchDecision::NoOp,
+                    ..
+                }
                 | ClassifiedSwitch::Unchanged => false,
                 _ => true,
             };
@@ -1893,7 +1900,9 @@ impl ProxyRuntime {
                                 return SwitchOutcome::Pending;
                             }
                             self.rollback_selector_puts(&plan, switch_generation).await;
-                            log::warn!("TS mode 切回普通出口失败或读回不符 → 保持待应用，不隐式重启");
+                            log::warn!(
+                                "TS mode 切回普通出口失败或读回不符 → 保持待应用，不隐式重启"
+                            );
                             if scope == SwitchApplyScope::SelectedOnly {
                                 return self.defer_selected_projection(
                                     &new_config,
@@ -2070,7 +2079,9 @@ impl ProxyRuntime {
                             self.selector_reconcile.mark_required();
                             return SwitchOutcome::Pending;
                         }
-                        log::warn!("switchMode：热切换失败（{other:?}）→ 保持待应用，等待显式 Apply");
+                        log::warn!(
+                            "switchMode：热切换失败（{other:?}）→ 保持待应用，等待显式 Apply"
+                        );
                         if scope == SwitchApplyScope::SelectedOnly {
                             return self.defer_selected_projection(
                                 &new_config,
@@ -2429,7 +2440,8 @@ impl ProxyRuntime {
                 .map(|state| state.plan.clone())
                 .unwrap_or_default();
             if !runtime_binding_roots_covered(&new_cfg, &binding_plan)
-                || !self.runtime_route_targets_reusable(&old_cfg, &new_cfg, &binding_plan) {
+                || !self.runtime_route_targets_reusable(&old_cfg, &new_cfg, &binding_plan)
+            {
                 return ClassifiedSwitch::Fallback("目标包含本核未规划或已改变的自动物理出口");
             }
         }
@@ -2499,8 +2511,14 @@ impl ProxyRuntime {
                 SwitchDecision::Defer => "defer",
                 SwitchDecision::Restart => {
                     let current = self.current_config_snapshot();
-                    if current.as_ref().is_some_and(|old| super::runtime_config::structural_runtime_change(old, candidate)) { "restart" } else { "defer" }
-                },
+                    if current.as_ref().is_some_and(|old| {
+                        super::runtime_config::structural_runtime_change(old, candidate)
+                    }) {
+                        "restart"
+                    } else {
+                        "defer"
+                    }
+                }
             },
         };
         StagedClassification {
@@ -2518,9 +2536,13 @@ impl ProxyRuntime {
         self.commit_coex_current_config(new_config.clone());
         if let Ok(mut g) = self.pending_force_restart.write() {
             if let Some((id, snapshot, source)) = g.take() {
-                *g = Some(if matches!(source, super::ForceRestartSource::Confirmed { .. }) {
-                    (id, snapshot, source)
-                } else { (id, new_config.clone(), super::ForceRestartSource::Full) });
+                *g = Some(
+                    if matches!(source, super::ForceRestartSource::Confirmed { .. }) {
+                        (id, snapshot, source)
+                    } else {
+                        (id, new_config.clone(), super::ForceRestartSource::Full)
+                    },
+                );
             }
         }
     }
@@ -2535,7 +2557,9 @@ impl ProxyRuntime {
         self.commit_coex_current_config(projected.clone());
         if let Ok(mut pending) = self.pending_force_restart.write() {
             if let Some((id, config, source)) = pending.as_mut() {
-                if matches!(source, super::ForceRestartSource::Confirmed { .. }) { return; }
+                if matches!(source, super::ForceRestartSource::Confirmed { .. }) {
+                    return;
+                }
                 let pending_mode = config.get("autoSelectEnabled")
                     != projected.get("autoSelectEnabled")
                     || config.get("autoSelectPins") != projected.get("autoSelectPins");
@@ -2677,7 +2701,10 @@ impl ProxyRuntime {
                 intent_generation,
             };
             let captured = PendingLogicalExitDisconnect::capture(&guarded, plan, interrupt).await;
-            return (SwitchExecutor.execute(&guarded, plan, false).await, captured);
+            return (
+                SwitchExecutor.execute(&guarded, plan, false).await,
+                captured,
+            );
         }
         let api = self.management_api().await;
         let guarded = GenerationManagementApi {
@@ -2687,7 +2714,10 @@ impl ProxyRuntime {
             intent_generation,
         };
         let captured = PendingLogicalExitDisconnect::capture(&guarded, plan, interrupt).await;
-        (SwitchExecutor.execute(&guarded, plan, false).await, captured)
+        (
+            SwitchExecutor.execute(&guarded, plan, false).await,
+            captured,
+        )
     }
 
     pub(super) async fn finish_logical_exit_disconnect(
