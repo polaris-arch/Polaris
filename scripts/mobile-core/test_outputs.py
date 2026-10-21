@@ -23,9 +23,277 @@ import artifacts
 from producer import write_json
 
 
+# Exact retained javap -s output from diagnostic run 39562122098, result.json
+# SHA256 cab4336ea2975412264b4eaab68b44a714b8e2fe20fdb4a66cbbe077ab7abeb1.
+# Historical observed generator forms only, never final-source native acceptance.
+HOT_JAVA_FIXTURE = {
+    'CommandServer': """Compiled from "CommandServer.java"
+public final class io.nekohasekai.libbox.CommandServer implements go.Seq$Proxy {
+  public final int refnum;
+    descriptor: I
+  public final int incRefnum();
+    descriptor: ()I
+
+  public io.nekohasekai.libbox.CommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface);
+    descriptor: (Lio/nekohasekai/libbox/CommandServerHandler;Lio/nekohasekai/libbox/PlatformInterface;)V
+
+  io.nekohasekai.libbox.CommandServer(int);
+    descriptor: (I)V
+
+  public native java.lang.String acknowledgeRuntimePersistence(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void activateTailscaleDirectoryDomain(java.lang.String, java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Ljava/lang/String;)V
+
+  public native java.lang.String applyRuntimeConfig(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void cancelNotification(java.lang.String, int) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;I)V
+
+  public native void close();
+    descriptor: ()V
+
+  public native void closeService() throws java.lang.Exception;
+    descriptor: ()V
+
+  public native java.lang.String exportTailscaleDirectoryCapability();
+    descriptor: ()Ljava/lang/String;
+
+  public native java.lang.String exportTailscaleDirectoryRetirement();
+    descriptor: ()Ljava/lang/String;
+
+  public native java.lang.String exportTailscaleStoreRetirement();
+    descriptor: ()Ljava/lang/String;
+
+  public native boolean needFindProcess();
+    descriptor: ()Z
+
+  public native boolean needWIFIState();
+    descriptor: ()Z
+
+  public native void pause();
+    descriptor: ()V
+
+  public native java.lang.String planRuntimeConfig(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void recordScreenState(boolean);
+    descriptor: (Z)V
+
+  public native void resetNetwork();
+    descriptor: ()V
+
+  public native java.lang.String runtimeCapabilities() throws java.lang.Exception;
+    descriptor: ()Ljava/lang/String;
+
+  public native java.lang.String runtimeConfigStatus(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void setError(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+
+  public native void start() throws java.lang.Exception;
+    descriptor: ()V
+
+  public native void startOrReloadService(java.lang.String, io.nekohasekai.libbox.OverrideOptions) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;)V
+
+  public native void startOrReloadServiceWithRetryableRuntimePersistence(java.lang.String, io.nekohasekai.libbox.OverrideOptions, io.nekohasekai.libbox.RuntimePersistenceHandler) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V
+
+  public native void startOrReloadServiceWithRuntimePersistence(java.lang.String, io.nekohasekai.libbox.OverrideOptions, io.nekohasekai.libbox.RuntimePersistenceHandler) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V
+
+  public native void updateWIFIState();
+    descriptor: ()V
+
+  public native void wake();
+    descriptor: ()V
+
+  public native void wakeNow();
+    descriptor: ()V
+
+  public native void writeMessage(int, java.lang.String);
+    descriptor: (ILjava/lang/String;)V
+
+  public boolean equals(java.lang.Object);
+    descriptor: (Ljava/lang/Object;)Z
+
+  public int hashCode();
+    descriptor: ()I
+
+  public java.lang.String toString();
+    descriptor: ()Ljava/lang/String;
+
+  static {};
+    descriptor: ()V
+}
+""",
+    'Libbox$proxyRuntimePersistenceHandler': """Compiled from "Libbox.java"
+final class io.nekohasekai.libbox.Libbox$proxyRuntimePersistenceHandler implements go.Seq$Proxy,io.nekohasekai.libbox.RuntimePersistenceHandler {
+  public final int refnum;
+    descriptor: I
+  public final int incRefnum();
+    descriptor: ()I
+
+  io.nekohasekai.libbox.Libbox$proxyRuntimePersistenceHandler(int);
+    descriptor: (I)V
+
+  public native void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V
+
+  public native java.lang.String runtimePersistenceMode();
+    descriptor: ()Ljava/lang/String;
+}
+""",
+    'OverrideOptions': """Compiled from "OverrideOptions.java"
+public final class io.nekohasekai.libbox.OverrideOptions implements go.Seq$Proxy {
+  public final int refnum;
+    descriptor: I
+  public final int incRefnum();
+    descriptor: ()I
+
+  io.nekohasekai.libbox.OverrideOptions(int);
+    descriptor: (I)V
+
+  public io.nekohasekai.libbox.OverrideOptions();
+    descriptor: ()V
+
+  public final native boolean getAutoRedirect();
+    descriptor: ()Z
+
+  public final native void setAutoRedirect(boolean);
+    descriptor: (Z)V
+
+  public final native io.nekohasekai.libbox.StringIterator getIncludePackage();
+    descriptor: ()Lio/nekohasekai/libbox/StringIterator;
+
+  public final native void setIncludePackage(io.nekohasekai.libbox.StringIterator);
+    descriptor: (Lio/nekohasekai/libbox/StringIterator;)V
+
+  public final native io.nekohasekai.libbox.StringIterator getExcludePackage();
+    descriptor: ()Lio/nekohasekai/libbox/StringIterator;
+
+  public final native void setExcludePackage(io.nekohasekai.libbox.StringIterator);
+    descriptor: (Lio/nekohasekai/libbox/StringIterator;)V
+
+  public boolean equals(java.lang.Object);
+    descriptor: (Ljava/lang/Object;)Z
+
+  public int hashCode();
+    descriptor: ()I
+
+  public java.lang.String toString();
+    descriptor: ()Ljava/lang/String;
+
+  static {};
+    descriptor: ()V
+}
+""",
+    'RuntimePersistenceHandler': """Compiled from "RuntimePersistenceHandler.java"
+public interface io.nekohasekai.libbox.RuntimePersistenceHandler {
+  public abstract void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V
+
+  public abstract java.lang.String runtimePersistenceMode();
+    descriptor: ()Ljava/lang/String;
+}
+""",
+}
+
+
 class FormalOutputs(unittest.TestCase):
     def setUp(self):
         self.value = validate(json.loads((Path(__file__).with_name('fixtures') / 'legacy-source-contract.json').read_bytes()))
+
+    def test_hot_java_accepts_actual_retained_generated_forms(self):
+        with patch('subprocess.Popen', side_effect=AssertionError('no external tools in fixture')):
+            self.assertIs(artifacts.hot_java_contract(HOT_JAVA_FIXTURE), HOT_JAVA_FIXTURE)
+            self.assertIn('OverrideOptions(int)', HOT_JAVA_FIXTURE['OverrideOptions'])
+            calls = []
+            def observed(command):
+                calls.append(command)
+                return HOT_JAVA_FIXTURE[command[-1].removeprefix('io.nekohasekai.libbox.')]
+            self.assertEqual(artifacts.inspect_hot_java(Path('/fixture/classes.jar'), {'javap': 'never-executed'}, observed), HOT_JAVA_FIXTURE)
+            self.assertEqual(len(calls), 4)
+            self.assertTrue(all(command[:4] == ['never-executed', '-s', '-classpath', '/fixture/classes.jar'] for command in calls))
+
+    def test_hot_java_rejects_wrong_receiver_modifier_descriptor_and_error_channels(self):
+        for name, methods in artifacts.HOT_JAVA_API.items():
+            for declaration, descriptor in methods:
+                mutations = [declaration.replace('public ', 'public static ', 1),
+                             declaration.replace('public ', 'protected ', 1),
+                             declaration.replace('public ', '', 1),
+                             declaration.replace('(', 'Wrong(', 1)]
+                if ' native ' in declaration:
+                    mutations.append(declaration.replace(' native ', ' '))
+                if ' abstract ' in declaration:
+                    mutations.append(declaration.replace(' abstract ', ' '))
+                if ' throws java.lang.Exception;' in declaration:
+                    mutations.extend([declaration.replace(' throws java.lang.Exception', ''),
+                                      declaration.replace('java.lang.Exception', 'java.lang.Error')])
+                else:
+                    mutations.append(declaration.replace(';', ' throws java.lang.Exception;'))
+                pair = declaration + '\n    descriptor: ' + descriptor
+                for wrong in mutations + ['']:
+                    java = dict(HOT_JAVA_FIXTURE)
+                    java[name] = java[name].replace(declaration, wrong)
+                    with self.subTest(name=name, declaration=declaration, mutation=wrong), self.assertRaises(RuntimeError):
+                        artifacts.hot_java_contract(java)
+                for wrong in [pair.replace(descriptor, '()I'), pair + '\n  ' + pair,
+                              pair + '\n  ' + declaration.replace('()', '(int)') + '\n    descriptor: (I)V']:
+                    java = dict(HOT_JAVA_FIXTURE); java[name] = java[name].replace(pair, wrong)
+                    # The observed refnum(int) constructor is a distinct valid
+                    # constructor; overloaded required HOT methods are rejected.
+                    if name == 'OverrideOptions' and '(I)V' in wrong:
+                        continue
+                    with self.subTest(name=name, descriptor=wrong), self.assertRaises(RuntimeError):
+                        artifacts.hot_java_contract(java)
+        for name, text in HOT_JAVA_FIXTURE.items():
+            java = dict(HOT_JAVA_FIXTURE)
+            java[name] = text.replace('class io.nekohasekai.libbox.' + name,
+                                      'class io.nekohasekai.libbox.ForeignReceiver').replace(
+                                          'interface io.nekohasekai.libbox.' + name,
+                                          'class io.nekohasekai.libbox.' + name)
+            with self.subTest(receiver=name), self.assertRaises(RuntimeError):
+                artifacts.hot_java_contract(java)
+        java = dict(HOT_JAVA_FIXTURE)
+        java['Libbox$proxyRuntimePersistenceHandler'] = java['Libbox$proxyRuntimePersistenceHandler'].replace(
+            ',io.nekohasekai.libbox.RuntimePersistenceHandler', '')
+        with self.assertRaises(RuntimeError): artifacts.hot_java_contract(java)
+        with self.assertRaises(RuntimeError): artifacts.hot_java_contract({})
+
+    def test_hot_java_noarg_constructor_cannot_be_replaced_by_refnum_constructor(self):
+        java = dict(HOT_JAVA_FIXTURE)
+        java['OverrideOptions'] = java['OverrideOptions'].replace(
+            '  public io.nekohasekai.libbox.OverrideOptions();\n    descriptor: ()V\n', '')
+        self.assertIn('OverrideOptions(int)', java['OverrideOptions'])
+        with self.assertRaises(RuntimeError): artifacts.hot_java_contract(java)
+
+    def test_hot_jni_requires_each_exact_defined_bridge(self):
+        exports = set(artifacts.HOT_JNI_EXPORTS) | {'Java_go_Seq_incRef', 'unrelated'}
+        self.assertEqual(artifacts.hot_jni_contract(exports), sorted(artifacts.HOT_JNI_EXPORTS))
+        for missing in artifacts.HOT_JNI_EXPORTS:
+            with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                artifacts.hot_jni_contract(exports - {missing})
+            with self.subTest(receiver=missing), self.assertRaises(RuntimeError):
+                artifacts.hot_jni_contract((exports - {missing}) | {missing.replace('CommandServer', 'CommandClient') if 'CommandServer' in missing else missing + 'Wrong'})
+
+    def test_common_aar_keeps_legacy_checks_and_requires_shared_hot_predicates(self):
+        source = Path(artifacts.__file__).read_text()
+        body = source.split('def inspect_aar(', 1)[1].split('def tree_inventory(', 1)[0]
+        self.assertIn('hot_jni_contract(exported)', body)
+        self.assertIn('inspect_hot_java(classes, tools, run)', body)
+        for required in ['formal AAR must contain all four ABIs', 'check_buildinfo(facts, value, graph',
+                         "'Java_go_Seq_'", '16KiB PT_LOAD required', 'ELF Android API differs',
+                         'newTransientCommandServer(', 'newStrictCommandServer(', 'newManagedStrictCommandServer(',
+                         'interfaceUpdateListenerIdentity(', 'checkConfigWithResult(', 'exportTailscaleStoreRetirement();',
+                         'exportTailscaleDirectoryCapability();', 'exportTailscaleDirectoryRetirement();',
+                         'activateTailscaleDirectoryDomain(', 'void wakeNow()', 'void recordScreenState(boolean)',
+                         'validation result must be readonly']:
+            self.assertIn(required, body)
 
     def test_native_capacity_caps_current_runner_by_load_affinity_quota_and_memory(self):
         facts = {'logicalCPUs': 16, 'affinityCPUs': 8, 'quotaCPUs': 4.5, 'load1': 1.1,

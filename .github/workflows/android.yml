@@ -101,7 +101,7 @@ on:
         type: boolean
         default: false
       hot_consumer_candidate:
-        description: Exact App SHA for the frozen a567 Android arm64 diagnostic consumer
+        description: Exact App SHA for the frozen final-kernel Android arm64 diagnostic consumer
         type: string
         required: false
         default: ''
@@ -494,6 +494,7 @@ jobs:
           name: android-hot-consumer-${{ github.sha }}-${{ github.run_attempt }}
           path: |
             ${{ steps.hot_candidate.outputs.evidence }}/*.json
+            ${{ steps.hot_candidate.outputs.evidence }}/*.xml
             ${{ steps.hot_candidate.outputs.evidence }}/*.log
             ${{ steps.hot_candidate.outputs.evidence }}/*.log.stdout.raw
             ${{ steps.hot_candidate.outputs.evidence }}/*.log.stderr.raw
@@ -573,13 +574,14 @@ jobs:
             --tests com.polaris2.app.vpn.MainNativeAdmissionWiringTest \
             --tests com.polaris2.app.vpn.DualModeEndpointWiringTest \
             --tests com.polaris2.app.vpn.RuntimePersistenceSourceTest \
+            --tests com.polaris2.app.vpn.RuntimeProtocolAdmissionTest \
             -PpolarisAllowUnsigned=true -x :app:rustBuildArm64Release --max-workers=2 --no-daemon
           python3 -I - "$RUNNER_TEMP/s5-android-unit-results.json" <<'PYRESULT'
           import hashlib, json, re, subprocess, sys
           from pathlib import Path
           from xml.etree import ElementTree as ET
           base = Path('src-tauri/gen/android/app')
-          classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest']
+          classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest', 'RuntimeProtocolAdmissionTest']
           rows = []
           for name in classes:
               source = base / 'src/test/java/com/polaris2/app/vpn' / (name + '.kt')
@@ -643,6 +645,7 @@ jobs:
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.MainNativeAdmissionWiringTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.DualModeEndpointWiringTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimePersistenceSourceTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimeProtocolAdmissionTest.xml
             ${{ runner.temp }}/s5-android-unit-results.json
             ${{ runner.temp }}/release-stage1.log
           # Preserve original Rust/Tauri/frontend/first-Gradle stage1 output even on failure.

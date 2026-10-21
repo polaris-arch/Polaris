@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One frozen a567 / Android arm64 diagnostic consumer. Never a formal producer.
+"""One frozen final-kernel / Android arm64 diagnostic consumer. Never a formal producer.
 
 Only GitHub's direct, exact-SHA manual Android job may execute prepare/build.
 The receipt is evidence for this build, not a mobile component acceptance receipt.
@@ -21,7 +21,7 @@ from xml.etree import ElementTree as ET
 
 sys.dont_write_bytecode = True
 from fork_input import ROOT, canonical, decode, git, git_environment, require, sha, tool_environment
-from artifacts import android_api, elf_loads, file_pin, module, module_stream, tree_inventory, zip_entries
+from artifacts import android_api, elf_loads, file_pin, hot_jni_contract, inspect_hot_java, module, module_stream, tree_inventory, zip_entries
 
 APP_REPOSITORY = 'polaris-arch/Polaris'
 APP_REPOSITORY_ID = '1347028220'
@@ -29,8 +29,8 @@ REF = 'refs/heads/hot/app-runtime-consumer-20261020'
 WORKFLOW_REF = APP_REPOSITORY + '/.github/workflows/android.yml@' + REF
 KERNEL_REPOSITORY = 'polaris-arch/sing-box-polaris'
 KERNEL_REPOSITORY_ID = 1421657509
-KERNEL_COMMIT = 'a5674b5f4dcb5ef2647192e05d891269e56bdae4'
-KERNEL_TREE = '7006d05e46ea0c5e8299c0aea56a011c62d24fc7'
+KERNEL_COMMIT = '9031509c75ade460fd631437decbc9045eccee2a'
+KERNEL_TREE = 'df3add1dee022eaf891ce0a762a5b04b5658a2f9'
 PROTO = 'b6bb4642d1081f238e5b4f3563b7ddab8e5a1d66b65a306fbd215153164fac5f'
 SOURCE_HASHES = {
     'go.mod': '2c41a5a45e22341d2f8ca750134edeb5e09cf79d3366575a5a0966cc10a6162c',
@@ -38,10 +38,12 @@ SOURCE_HASHES = {
     'daemon/runtime_config.proto': PROTO,
     'cmd/internal/build_libbox/main.go': 'f32a147fe0f3f763dd2719887a805ec0c058d87297b0cbddadeeaddfdac32d06',
     'experimental/libbox/command_server.go': 'cf146f2ba3cc38b1e143b40438c4176547c2c4147e88bc02d1745a16d606a99f',
+    'experimental/libbox/command_runtime.go': '3041a85bbda753e961b2b9b19ce1881b5afe000e3bcd6352d786679118055dc9',
     'experimental/libbox/runtime_persistence_handler.go': '837c8c664f1383e1f618babe6134f3509c6e96c1ed0344e7b654536b4e3ef867',
     'release/dependency-sources/metacubex-utls-replacement.json': 'bb44c0350b1d8ae65f364f986085760c024ccd9c9653bd89cb0e407de850888b',
     'release/dependency-sources/metacubex-utls-reality-alpn.patch': 'a0f7bcf8429b003e008ac38fa4a4c083f8c8397b4d75f5e3bd992e24d8fcc932',
 }
+
 # Exact source-owned replacements. Remote submodules (including Cronet native
 # archives) still need their own version and h1; local sources never inherit h1.
 VENDORS = {
@@ -55,6 +57,7 @@ VENDORS = {
     'github.com/sagernet/wireguard-go': ('wireguard-go', '8f2e9708ac31b6453f94ce68837dca6f277c5fff', 85),
     'github.com/database64128/tfo-go/v2': ('tfo-go', '0a46fb2e32fa6082c6c993706fe7c8d03a76db84', 42),
 }
+
 TAGS = ('with_gvisor with_quic with_wireguard with_utls with_naive_outbound with_clash_api '
         'with_usbip with_openvpn with_openconnect badlinkname tfogo_checklinkname0 with_tailscale '
         'ts_omit_logtail ts_omit_ssh ts_omit_drive ts_omit_taildrop ts_omit_webclient ts_omit_doctor '
@@ -69,6 +72,12 @@ ANDROID = {'ndkRevision': '30.0.16248370', 'ndkSourceRevision': '30.0.16248370',
            'bootclasspath': {'platform': 'android-36', 'sha256': 'd9eb9da824d9e247a352f570f01e1169e725b2954bca9e283a71786c59b59f9a'}}
 BUILD = ['bash', 'scripts/build-android-apk.sh', '--debug', '--apk', '--split-per-abi',
          '--target', 'aarch64', '--ci', '--config', 'src-tauri/tauri.android.conf.json']
+UNIT_TEST_CLASSES = ('RuntimeProtocolAdmissionTest', 'RuntimePersistenceSourceTest')
+UNIT_TEST_BUILD = ['bash', 'src-tauri/gen/android/gradlew', '--project-dir', 'src-tauri/gen/android',
+                   ':app:cleanTestArm64DebugUnitTest', ':app:testArm64DebugUnitTest',
+                   *[arg for name in UNIT_TEST_CLASSES for arg in ('--tests', 'com.polaris2.app.vpn.' + name)],
+                   '-x', ':app:rustBuildArm64Debug', '--rerun-tasks', '--max-workers=2', '--no-daemon']
+
 FORMAL_HASH = 'd2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0'
 OVERRIDES = set(('GOFLAGS GOENV GOWORK GOTOOLCHAIN GOOS GOARCH GOARM GOARM64 GOEXPERIMENT '
                  'GOBIN GOMODCACHE GOCACHE GONOSUMDB GOPRIVATE GONOPROXY GOPROXY GOSUMDB GOINSECURE CC CXX CPP AR LD CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH '
@@ -459,30 +468,10 @@ def inspect_component(aar, scratch, tools, run, graph, source):
         so = scratch / 'libbox.so'; so.write_bytes(raw)
         classes = scratch / 'classes.jar'; classes.write_bytes(archive.read('classes.jar'))
         members = {name: {'bytes': len(archive.read(name)), 'sha256': sha(archive.read(name))} for name in names if not name.endswith('/')}
-    declarations = {
-        'CommandServer': [('startOrReloadServiceWithRetryableRuntimePersistence', '(Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V')],
-        'RuntimePersistenceHandler': [('runtimePersistenceMode', '()Ljava/lang/String;'), ('persistRuntimeConfiguration', '(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V')],
-        'Libbox$proxyRuntimePersistenceHandler': [('runtimePersistenceMode', '()Ljava/lang/String;'), ('persistRuntimeConfiguration', '(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V')],
-        'OverrideOptions': [('io.nekohasekai.libbox.OverrideOptions', '()V')],
-    }
-    java = {}
-    for name, methods in declarations.items():
-        text = run([tools['javap'], '-s', '-classpath', classes, 'io.nekohasekai.libbox.' + name])
-        for method, descriptor in methods:
-            modifier = 'public native ' if name == 'CommandServer' else ('public abstract ' if name == 'RuntimePersistenceHandler' else 'public ')
-            require(re.search(re.escape(modifier) + r'(?!static\b)[^\n]*\b' + re.escape(method) + r'\([^\n]*\)[^\n]*;\s*descriptor: ' + re.escape(descriptor), text), 'actual Java method/descriptor missing: ' + method)
-        if name == 'RuntimePersistenceHandler':
-            require('public interface io.nekohasekai.libbox.RuntimePersistenceHandler' in text, 'handler must be an interface')
-        if name in ('CommandServer', 'RuntimePersistenceHandler'):
-            method = 'startOrReloadServiceWithRetryableRuntimePersistence' if name == 'CommandServer' else 'persistRuntimeConfiguration'
-            require(re.search(re.escape(method) + r'\([^\n]*\) throws java.lang.Exception;', text), 'Java error channel missing')
-        java[name] = text
+    java = inspect_hot_java(classes, tools, run)
     symbols = run([tools['readelf'], '--dyn-syms', '--wide', so])
     exported = {m[1] for m in re.finditer(r'GLOBAL\s+DEFAULT\s+(?!UND\b)\S+\s+(\S+)', symbols)}
-    expected = {'JNI_OnLoad', 'Java_io_nekohasekai_libbox_CommandServer_startOrReloadServiceWithRetryableRuntimePersistence',
-                'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_persistRuntimeConfiguration',
-                'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_runtimePersistenceMode'}
-    require(expected <= exported, 'actual JNI exports missing')
+    expected = hot_jni_contract(exported)
     needed = re.findall(r'Shared library: \[([^]]+)\]', run([tools['readelf'], '-d', so]))
     require(set(needed) <= {'liblog.so', 'libdl.so', 'libm.so', 'libandroid.so', 'libc.so'}, 'unpackaged native dependency')
     raw_info = run([tools['go'], 'version', '-m', so])
@@ -507,6 +496,60 @@ def inspect_apk(apk, component, rust):
             require({'bytes': len(raw), 'sha256': sha(raw)} == pin, 'APK did not consume this build input: ' + name)
         require(any(re.fullmatch(r'classes(?:[2-9][0-9]*)?\.dex', n) for n in names), 'actual compiled APK DEX missing')
         return {'artifact': file_pin(apk), 'nativeLibraries': expected, 'dex': {n: sha(bundle.read(n)) for n in names if n.endswith('.dex')}}
+
+
+def unit_test_reports(app, evidence):
+    """Retain original reports even on a failed Gradle invocation; no acceptance."""
+    reports = {}
+    for name in UNIT_TEST_CLASSES:
+        filename = 'TEST-com.polaris2.app.vpn.' + name + '.xml'
+        original = app / 'build/test-results/testArm64DebugUnitTest' / filename
+        if not original.exists() and not original.is_symlink():
+            continue
+        require(original.is_file() and not original.is_symlink() and
+                0 < original.stat().st_size <= 2 * 1024 * 1024, 'bounded regular HOT JUnit report required')
+        raw = original.read_bytes()
+        require(0 < len(raw) <= 2 * 1024 * 1024, 'HOT JUnit report byte budget')
+        retained = evidence / filename
+        with retained.open('xb') as output:
+            output.write(raw)
+        reports[name] = file_pin(retained)
+        require(file_pin(original) == reports[name], 'HOT JUnit report changed during retention')
+    return reports
+
+
+def inspect_unit_results(app, evidence, candidate, component_pin, rust_pin):
+    rows = []
+    for name in UNIT_TEST_CLASSES:
+        source = app / 'src/test/java/com/polaris2/app/vpn' / (name + '.kt')
+        source_pin = file_pin(source)
+        raw = source.read_bytes()
+        require(sha(raw) == source_pin['sha256'], 'HOT test source changed during read')
+        methods = re.findall(r'^\s*@Test(?:\([^\n)]*\))?\s+fun\s+(\w+)\s*\(', raw.decode(), re.M)
+        require(methods and len(methods) == len(set(methods)), 'empty/duplicate HOT test source inventory')
+        filename = 'TEST-com.polaris2.app.vpn.' + name + '.xml'
+        retained = evidence / filename
+        report_pin = file_pin(retained)
+        require(report_pin['bytes'] <= 2 * 1024 * 1024 and
+                file_pin(app / 'build/test-results/testArm64DebugUnitTest' / filename) == report_pin,
+                'original/retained HOT JUnit report differs')
+        result = retained.read_bytes()
+        require(sha(result) == report_pin['sha256'], 'HOT JUnit report changed during read')
+        suite = ET.fromstring(result)
+        classname = 'com.polaris2.app.vpn.' + name
+        require(suite.tag == 'testsuite' and suite.get('name') == classname, 'different HOT JUnit suite')
+        cases = suite.findall('testcase')
+        require(len(cases) == len(methods) == int(suite.get('tests', '-1')), 'HOT test methods missing or duplicated')
+        require(all(int(suite.get(k, '-1')) == 0 for k in ('failures', 'errors', 'skipped')), 'HOT JUnit failure/error/skip')
+        require(sorted(c.get('name') for c in cases) == sorted(methods), 'HOT test results differ from complete source methods')
+        require(all(c.get('classname') == classname and not any(c.find(k) is not None for k in ('failure', 'error', 'skipped'))
+                    for c in cases), 'different/failed/skipped HOT JUnit case')
+        rows.append({'class': classname, 'tests': len(cases), 'methods': sorted(methods),
+                     'sourceSha256': source_pin['sha256'], 'reportSha256': report_pin['sha256']})
+    return {'schema': 'polaris-hot-android-gradle-unit-results-v1', 'candidate': candidate,
+            'kernelCommit': KERNEL_COMMIT, 'variant': 'arm64Debug', 'classes': rows,
+            'component': component_pin, 'rustApp': rust_pin, 'command': UNIT_TEST_BUILD,
+            'scope': 'Real Gradle JVM unit tests with the same actual staged AAR and existing debug Rust output; no JNI/callback/device execution claim'}
 
 
 def build():
@@ -567,7 +610,7 @@ def build():
         ldflags = (source / 'release/LDFLAGS').read_text().strip()
         require(ldflags == '-X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0', 'source linker flags differ')
         flags = ldflags + ' -s -w -X github.com/sagernet/sing-box/constant.DirectoryRetirementSourceIdentity=' + KERNEL_COMMIT
-        aar = work / 'libbox-a567-arm64.aar'
+        aar = work / ('libbox-' + KERNEL_COMMIT[:12] + '-arm64.aar')
         command = [tools['gomobile'], 'bind', '-o', str(aar), '-target', 'android/arm64', '-androidapi', '24',
                    '-bootclasspath', str(jar), '-javapkg=io.nekohasekai', '-libname=box', '-trimpath', '-buildvcs=false',
                    '-work', '-x', '-ldflags', flags, '-tags', ','.join(TAGS), './experimental/libbox']
@@ -629,10 +672,23 @@ def build():
         rust = ROOT / 'target/aarch64-linux-android/debug/libpolaris_lib.so'
         apk = ROOT / 'src-tauri/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk'
         result['apk'] = inspect_apk(apk, component, rust)
+        rust_pin = file_pin(rust)
+        result['unitTestCommand'] = UNIT_TEST_BUILD
+        try:
+            # The debug APK already built the actual Rust target. Exclude only
+            # that completed task, then force this selected JVM suite to execute.
+            run(UNIT_TEST_BUILD, cwd=ROOT, env=app_env, log=evidence / 'unit-tests.log', capture='none')
+        finally:
+            result['unitTestReports'] = unit_test_reports(ROOT / 'src-tauri/gen/android/app', evidence)
+        require(file_pin(stage) == component['artifact'] and file_pin(rust) == rust_pin and
+                tree_inventory(cli) == cli_inventory, 'App inputs changed during unit tests')
+        result['unitTests'] = inspect_unit_results(ROOT / 'src-tauri/gen/android/app', evidence,
+                                                   admission['candidate'], component['artifact'], rust_pin)
+        write_json(evidence / 'unit-results.json', result['unitTests'])
         clean(ROOT, allow_ignored=True)
         require(git(ROOT, 'rev-parse', 'HEAD') == admission['candidate'], 'App candidate changed during build')
         require(file_pin(ROOT / 'scripts/mobile-core/source-contract.json')['sha256'] == FORMAL_HASH, 'formal pin changed')
-        result['status'] = 'compiled-and-statically-verified'
+        result['status'] = 'compiled-statically-verified-and-jvm-unit-tested'
     except BaseException as error:
         result['failure'] = str(error)
         raise

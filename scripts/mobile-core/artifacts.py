@@ -422,6 +422,76 @@ def android_api(raw):
     return result[0]
 
 
+
+# Observed generated Java forms for the Go CommandServer HOT owner API and
+# RuntimePersistenceHandler (sagernet/gomobile v0.1.13). Check the declaration
+# and descriptor together: a same-named static/foreign/overloaded method cannot
+# supply the instance callback/error contract used by the Android consumer.
+HOT_JAVA_API = {
+    'CommandServer': [
+        ('public native void startOrReloadServiceWithRetryableRuntimePersistence(java.lang.String, io.nekohasekai.libbox.OverrideOptions, io.nekohasekai.libbox.RuntimePersistenceHandler) throws java.lang.Exception;',
+         '(Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V'),
+        ('public native java.lang.String runtimeCapabilities() throws java.lang.Exception;', '()Ljava/lang/String;'),
+    ],
+    'RuntimePersistenceHandler': [
+        ('public abstract java.lang.String runtimePersistenceMode();', '()Ljava/lang/String;'),
+        ('public abstract void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;',
+         '(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V'),
+    ],
+    'Libbox$proxyRuntimePersistenceHandler': [
+        ('public native java.lang.String runtimePersistenceMode();', '()Ljava/lang/String;'),
+        ('public native void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;',
+         '(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V'),
+    ],
+    'OverrideOptions': [('public io.nekohasekai.libbox.OverrideOptions();', '()V')],
+}
+HOT_JNI_EXPORTS = frozenset({
+    'JNI_OnLoad',
+    'Java_io_nekohasekai_libbox_CommandServer_startOrReloadServiceWithRetryableRuntimePersistence',
+    'Java_io_nekohasekai_libbox_CommandServer_runtimeCapabilities',
+    'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_persistRuntimeConfiguration',
+    'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_runtimePersistenceMode',
+})
+
+
+def hot_java_contract(java):
+    """Validate actual javap -s output, including owner, modifier and error ABI."""
+    require(isinstance(java, dict) and set(HOT_JAVA_API) <= set(java), 'HOT Java class inventory missing')
+    package = 'io.nekohasekai.libbox.'
+    for name, methods in HOT_JAVA_API.items():
+        text = java[name]
+        # javap emits one class/interface declaration. Keep its actual receiver
+        # identity and implemented callback interface, not just method substrings.
+        headers = re.findall(r'^([^\n]*\b(?:class|interface) [^\n]*\{)\s*$', text, re.M)
+        expected = ('public interface ' + package + name + ' {' if name == 'RuntimePersistenceHandler' else
+                    ('final class ' if name.startswith('Libbox$') else 'public final class ') + package + name +
+                    ' implements go.Seq$Proxy' +
+                    (',' + package + 'RuntimePersistenceHandler' if name.startswith('Libbox$') else '') + ' {')
+        normalize = lambda value: re.sub(r'\s*,\s*', ',', ' '.join(value.split()))
+        require(len(headers) == 1 and normalize(headers[0]) == normalize(expected), 'HOT Java receiver/interface differs: ' + name)
+        for declaration, descriptor in methods:
+            method = declaration.split('(', 1)[0].rsplit(' ', 1)[-1]
+            pairs = re.findall(r'^\s*([^\n]+;)\s*\n\s*descriptor: ([^\n]+)\s*$', text, re.M)
+            actual = [(normalize(decl), desc.strip()) for decl, desc in pairs
+                      if re.search(r'(?<![\w$])' + re.escape(method) + r'\(', decl)]
+            if name == 'OverrideOptions':
+                # gobind also emits its package-private refnum constructor.
+                # Only the public zero-argument consumer constructor is required.
+                actual = [(decl, desc) for decl, desc in actual if desc == '()V' or '()' in decl]
+            require(actual == [(normalize(declaration), descriptor)], 'HOT Java method/descriptor/error differs: ' + name + '.' + method)
+    return java
+
+
+def inspect_hot_java(classes, tools, run):
+    return hot_java_contract({name: run([tools['javap'], '-s', '-classpath', str(classes),
+                                        'io.nekohasekai.libbox.' + name]) for name in HOT_JAVA_API})
+
+
+def hot_jni_contract(exported):
+    require(HOT_JNI_EXPORTS <= set(exported), 'actual HOT JNI exports missing')
+    return sorted(HOT_JNI_EXPORTS)
+
+
 def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
     validate(value)
     helper = module('formal_mobile_buildinfo', 'scripts/libbox-patches/android-source.py')
@@ -462,11 +532,13 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
                 exported = {m[1] for m in re.finditer(r'GLOBAL\s+DEFAULT\s+(?!UND\b)\S+\s+(\S+)', symbols)}
                 require('JNI_OnLoad' in exported and any(n.startswith('Java_go_Seq_') for n in exported),
                         'actual generated JNI loader/sequence exports missing')
+                hot_jni_contract(exported)
                 row.update(goBuildInfo=info, parsedBuildInfo=facts, buildID=actual_id, androidAPI=24,
                            jniExports=sorted(n for n in exported if n.startswith(('Java_', 'JNI_'))))
             native[name] = row
         classes = scratch / 'classes.jar'
         classes.write_bytes(archive.read('classes.jar'))
+        hot_java = inspect_hot_java(classes, tools, run)
         interfaces = {}
         for name in ['Libbox', 'CommandServer', 'PlatformInterface', 'ConfigValidationResult', 'ExchangeContext', 'LocalDNSTransport', 'Func']:
             interfaces[name] = run([tools['javap'], '-constants', '-classpath', str(classes), 'io.nekohasekai.libbox.' + name])
@@ -488,7 +560,7 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
         for setter in ['setRequestID(', 'setConfigDigest(', 'setValidation(', 'setCleanup(', 'setTailscaleStoreRetirement(', 'setTailscaleStoreMembership(']:
             require(setter not in interfaces['ConfigValidationResult'], 'validation result must be readonly')
         return {'format': 'AAR', 'artifact': file_pin(aar), 'nativeLibraries': native,
-                'classes': file_pin(classes), 'javaInterfaces': interfaces,
+                'classes': file_pin(classes), 'javaInterfaces': interfaces, 'hotJavaInterfaces': hot_java,
                 'manifestSha256': sha(archive.read('AndroidManifest.xml')), 'minimumAPI': 24}
 
 

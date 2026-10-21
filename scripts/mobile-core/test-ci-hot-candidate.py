@@ -31,9 +31,9 @@ CANDIDATE_STEPS = {'actions/checkout@v7', 'Admit exact Android consumer candidat
     'Install protoc (pinned URL + sha256)', 'Read pinned libbox Go version', 'actions/setup-go@v6',
     'Pin libbox JDK 17', 'Verify preinstalled candidate SDK and licenses',
     'Build frozen Android arm64 diagnostic consumer', 'Retain Android candidate evidence only'}
-# Exact default executable steps after the reviewed stable-r30 read-only license gate.
+# Exact default executable steps after the reviewed runtime-protocol unit class addition.
 # Candidate routing projection still binds every remaining command/condition/path.
-DEFAULT_DIGESTS = {'release_check': '2600e275ee5973d1f67ffa40a25b48d2a6678ffece1caed65a71a5668e5bcd93', 'release-apk': 'e507797072b2960a340a35bbbe87c8d7293f95c2db92c7634ceb7a817d6b2083'}
+DEFAULT_DIGESTS = {'release_check': '509ff38ac8d5eedcca84491b556e4c7af7539da9e8bed7636ab68a0ee790b139', 'release-apk': 'e507797072b2960a340a35bbbe87c8d7293f95c2db92c7634ceb7a817d6b2083'}
 
 
 def job(source, name):
@@ -136,6 +136,97 @@ class PureFixtures(unittest.TestCase):
         # Substitute only this candidate's pinned branch/repository and inputs.
         self.event = {'ref': hot.REF, 'repository': {'full_name': hot.APP_REPOSITORY, 'id': int(hot.APP_REPOSITORY_ID)},
                       'inputs': {'hot_consumer_candidate': self.sha, 'preserve_run': 'true'}}
+
+    def test_final_kernel_identity_and_runtime_api_source_are_frozen(self):
+        self.assertEqual(hot.KERNEL_COMMIT, '9031509c75ade460fd631437decbc9045eccee2a')
+        self.assertEqual(hot.KERNEL_TREE, 'df3add1dee022eaf891ce0a762a5b04b5658a2f9')
+        self.assertEqual(hot.SOURCE_HASHES['experimental/libbox/command_runtime.go'],
+                         '3041a85bbda753e961b2b9b19ce1881b5afe000e3bcd6352d786679118055dc9')
+        self.assertEqual(hot.SOURCE_HASHES['daemon/runtime_config.proto'], hot.PROTO)
+
+    def unit_fixture(self, root):
+        app, evidence = root / 'app', root / 'evidence'
+        evidence.mkdir()
+        for name in hot.UNIT_TEST_CLASSES:
+            source = app / 'src/test/java/com/polaris2/app/vpn' / (name + '.kt')
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text('@Test fun firstCase() {}\n@Test(expected = Exception::class) fun secondCase() {}\n')
+            report = app / 'build/test-results/testArm64DebugUnitTest' / ('TEST-com.polaris2.app.vpn.' + name + '.xml')
+            report.parent.mkdir(parents=True, exist_ok=True)
+            classname = 'com.polaris2.app.vpn.' + name
+            report.write_text('<testsuite name="' + classname + '" tests="2" failures="0" errors="0" skipped="0">' +
+                              ''.join('<testcase name="' + method + '" classname="' + classname + '"/>'
+                                      for method in ('firstCase', 'secondCase')) + '</testsuite>')
+        return app, evidence
+
+    def test_real_unit_receipt_requires_complete_nonzero_method_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, evidence = self.unit_fixture(Path(tmp))
+            reports = hot.unit_test_reports(app, evidence)
+            self.assertEqual(set(reports), set(hot.UNIT_TEST_CLASSES))
+            receipt = hot.inspect_unit_results(app, evidence, self.sha, {'sha256': 'aar'}, {'sha256': 'rust'})
+            self.assertEqual(receipt['variant'], 'arm64Debug')
+            self.assertEqual(receipt['candidate'], self.sha)
+            self.assertEqual(receipt['kernelCommit'], hot.KERNEL_COMMIT)
+            self.assertEqual(sum(row['tests'] for row in receipt['classes']), 4)
+            self.assertTrue(all(row['methods'] == ['firstCase', 'secondCase'] for row in receipt['classes']))
+            for row in receipt['classes']:
+                name = row['class'].rsplit('.', 1)[1]
+                self.assertEqual(row['reportSha256'], reports[name]['sha256'])
+            self.assertEqual(receipt['component'], {'sha256': 'aar'})
+            self.assertEqual(receipt['rustApp'], {'sha256': 'rust'})
+
+    def test_unit_receipt_rejects_zero_missing_duplicate_skipped_failed_and_foreign_methods(self):
+        mutations = [lambda x: x.replace('tests="2"', 'tests="0"'),
+                     lambda x: x.replace('tests="2"', 'tests="3"'),
+                     lambda x: x.replace('name="secondCase"', 'name="firstCase"'),
+                     lambda x: x.replace('name="secondCase"', 'name="foreignCase"'),
+                     lambda x: x.replace('failures="0"', 'failures="1"'),
+                     lambda x: x.replace('errors="0"', 'errors="1"'),
+                     lambda x: x.replace('skipped="0"', 'skipped="1"'),
+                     lambda x: x.replace('/>', '><skipped/></testcase>', 1),
+                     lambda x: x.replace('/>', '><failure/></testcase>', 1),
+                     lambda x: x.replace('/>', '><error/></testcase>', 1),
+                     lambda x: x.replace('classname="com.polaris2', 'classname="foreign'),
+                     lambda x: x.replace('name="com.polaris2', 'name="foreign'),
+                     lambda x: x.replace('testsuite', 'not-testsuite')]
+        for change in mutations:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                app, evidence = self.unit_fixture(Path(tmp))
+                report = next((app / 'build/test-results/testArm64DebugUnitTest').glob('*.xml'))
+                report.write_text(change(report.read_text()))
+                hot.unit_test_reports(app, evidence)
+                with self.assertRaises(RuntimeError):
+                    hot.inspect_unit_results(app, evidence, self.sha, {}, {})
+        with tempfile.TemporaryDirectory() as tmp:
+            app, evidence = self.unit_fixture(Path(tmp))
+            report = next((app / 'build/test-results/testArm64DebugUnitTest').glob('*.xml')); report.unlink()
+            self.assertEqual(len(hot.unit_test_reports(app, evidence)), 1)
+            with self.assertRaises(RuntimeError): hot.inspect_unit_results(app, evidence, self.sha, {}, {})
+
+    def test_unit_receipt_rejects_stale_retained_bytes_and_empty_source_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, evidence = self.unit_fixture(Path(tmp)); hot.unit_test_reports(app, evidence)
+            report = next((app / 'build/test-results/testArm64DebugUnitTest').glob('*.xml'))
+            original = report.read_bytes(); report.write_bytes(original + b'\n')
+            with self.assertRaisesRegex(RuntimeError, 'original/retained'):
+                hot.inspect_unit_results(app, evidence, self.sha, {}, {})
+            report.write_bytes(original)
+            source = next((app / 'src/test/java/com/polaris2/app/vpn').glob('*.kt')); source.write_text('class Empty {}')
+            with self.assertRaisesRegex(RuntimeError, 'empty/duplicate'):
+                hot.inspect_unit_results(app, evidence, self.sha, {}, {})
+
+    def test_unit_report_retention_rejects_symlink_and_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, evidence = self.unit_fixture(Path(tmp))
+            report = next((app / 'build/test-results/testArm64DebugUnitTest').glob('*.xml'))
+            report = app / 'build/test-results/testArm64DebugUnitTest' / ('TEST-com.polaris2.app.vpn.' + hot.UNIT_TEST_CLASSES[0] + '.xml')
+            raw = report.read_bytes(); target = Path(tmp) / 'redirected'; target.write_bytes(raw)
+            report.unlink(); report.symlink_to(target)
+            with self.assertRaises(RuntimeError): hot.unit_test_reports(app, evidence)
+            report.unlink(); report.write_bytes(raw)
+            hot.unit_test_reports(app, evidence)
+            with self.assertRaises(FileExistsError): hot.unit_test_reports(app, evidence)
 
     def test_exact_direct_candidate(self):
         self.assertEqual(hot.validate_request(self.env, self.inputs, self.event), self.sha)
@@ -560,11 +651,11 @@ class RoutingContracts(unittest.TestCase):
         block = steps(self.workflow, 'release_check')['Retain Android candidate evidence only']
         self.assertEqual(condition(block), "always() && " + ACTIVE + " && steps.hot_candidate.outcome == 'success'")
         paths = [line.strip() for line in block.splitlines() if line.startswith('            ')]
-        self.assertEqual(paths, ['${{ steps.hot_candidate.outputs.evidence }}/*' + suffix for suffix in ('.json', '.log', '.log.stdout.raw', '.log.stderr.raw')])
+        self.assertEqual(paths, ['${{ steps.hot_candidate.outputs.evidence }}/*' + suffix for suffix in ('.json', '.xml', '.log', '.log.stdout.raw', '.log.stderr.raw')])
         self.assertFalse(any(re.search(r'\.(?:aar|apk|aab|so|jks)', path) for path in paths))
         self.assertIn('if-no-files-found: error', block)
 
-    def test_no_product_tests_release_install_or_formal_shortcuts(self):
+    def test_no_native_runtime_release_install_or_formal_shortcuts(self):
         self.assertEqual(hot.BUILD, ['bash', 'scripts/build-android-apk.sh', '--debug', '--apk', '--split-per-abi', '--target', 'aarch64', '--ci', '--config', 'src-tauri/tauri.android.conf.json'])
         for forbidden in ['ci_android.py prepare', 'fork_input.load(', 'inspect_aar(', 'producer.execute(', 'materialize-android', 'gh release', 'adb ', 'sudo ', 'sdkmanager', 'gomobile init']:
             executable = '\n'.join(line for line in self.source.splitlines() if not line.lstrip().startswith(('#', '"""')))
@@ -572,6 +663,31 @@ class RoutingContracts(unittest.TestCase):
         self.assertIn("'runtimeTestsRun': 0", self.source)
         self.assertIn("'full native archive provenance and reproducibility'", self.source)
         self.assertIn("'org.gradle.daemon=false\\norg.gradle.workers.max=2\\nkotlin.compiler.execution.strategy=in-process", self.source)
+
+    def test_candidate_runs_exact_debug_unit_suite_after_build_and_retains_same_inputs(self):
+        self.assertEqual(hot.UNIT_TEST_CLASSES, ('RuntimeProtocolAdmissionTest', 'RuntimePersistenceSourceTest'))
+        self.assertEqual(hot.UNIT_TEST_BUILD, ['bash', 'src-tauri/gen/android/gradlew', '--project-dir', 'src-tauri/gen/android',
+            ':app:cleanTestArm64DebugUnitTest', ':app:testArm64DebugUnitTest',
+            '--tests', 'com.polaris2.app.vpn.RuntimeProtocolAdmissionTest',
+            '--tests', 'com.polaris2.app.vpn.RuntimePersistenceSourceTest',
+            '-x', ':app:rustBuildArm64Debug', '--rerun-tasks', '--max-workers=2', '--no-daemon'])
+        self.assertLess(self.source.index('run(BUILD,'), self.source.index('run(UNIT_TEST_BUILD,'))
+        self.assertLess(self.source.index("result['apk'] = inspect_apk("), self.source.index('run(UNIT_TEST_BUILD,'))
+        self.assertIn("finally:\n            result['unitTestReports'] = unit_test_reports(", self.source)
+        self.assertIn("file_pin(stage) == component['artifact'] and file_pin(rust) == rust_pin", self.source)
+        self.assertIn("write_json(evidence / 'unit-results.json', result['unitTests'])", self.source)
+        component = self.source.split('def inspect_component(', 1)[1].split('def inspect_apk(', 1)[0]
+        self.assertIn('java = inspect_hot_java(classes, tools, run)', component)
+        self.assertIn('expected = hot_jni_contract(exported)', component)
+
+    def test_normal_lane_selects_protocol_class_and_retains_full_method_evidence(self):
+        selected = steps(self.workflow, 'release_check')['Verify S5 Android network observation and admission unit tests']
+        self.assertIn('--tests com.polaris2.app.vpn.RuntimeProtocolAdmissionTest', selected)
+        self.assertIn("'RuntimePersistenceSourceTest', 'RuntimeProtocolAdmissionTest']", selected)
+        for guard in ['methods and len(methods) == len(set(methods))', 'len(cases) == len(methods)',
+                      "sorted(c.get('name') for c in cases) == sorted(methods)", "('failures', 'errors', 'skipped')"]:
+            self.assertIn(guard, selected)
+        self.assertIn('build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimeProtocolAdmissionTest.xml', self.workflow)
 
     def test_pins_all_nine_source_vendor_roots_and_formal_untouched(self):
         self.assertEqual(sum(row[2] for row in hot.VENDORS.values()), 2835)
