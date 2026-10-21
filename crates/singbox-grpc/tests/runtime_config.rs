@@ -112,8 +112,8 @@ async fn start(mock: Mock, secret: &str) -> (SingBoxApiClient, Running) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let task = tokio::spawn(async move {
-        tonic::transport::Server::builder().add_service(RuntimeConfigServiceServer::new(mock))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)).await.unwrap();
+        tonic::transport::Server::builder()
+            .serve_with_incoming(RuntimeConfigServiceServer::new(mock), tokio_stream::wrappers::TcpListenerStream::new(listener)).await.unwrap();
     });
     (SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await.unwrap(), Running(task))
 }
