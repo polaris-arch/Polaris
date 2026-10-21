@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { validateRequest, validatePin, validateBuild, validateTestEvidence, requireSameAppSource, APP_SOURCE_CHECK, OFFICIAL_GO_SETUP, TESTS, REF, REPOSITORY, PROFILE, PROTO } from './runtime-config-loopback.mjs';
+import { validateRequest, validatePin, expectedBuildVcs, recordBuildInfo, validateBuild, validateTestEvidence, requireSameAppSource, APP_SOURCE_CHECK, OFFICIAL_GO_SETUP, TESTS, REF, REPOSITORY, PROFILE, PROTO } from './runtime-config-loopback.mjs';
 import { exactPass } from './run-native-dns-controlled-tests.mjs';
 
 // Pure data/source fixtures. Importing the runner must never execute its entrypoint.
@@ -66,16 +69,119 @@ test('partial-profile pin cannot issue release or complete-feature acceptance', 
     { version: '1.13.0-polaris-alpha.12' }, { implementationManifestDigest: 'invented' }])
     assert.throws(() => validatePin({ ...pin, ...change }));
 });
-test('build metadata binds exact source, profile and module graph', () => {
-  const graph = [{ Path: 'github.com/sagernet/sing-box', Main: true }, { Path: 'example.org/module', Version: 'v1.0.0', Sum: 'h1:fixture' }];
-  const raw = `/fixture/sing-box: go1.27.2\n\tpath\tgithub.com/sagernet/sing-box/cmd/sing-box\n`
-    + '\tmod\tgithub.com/sagernet/sing-box\t(devel)\n\tdep\texample.org/module\tv1.0.0\th1:fixture\n'
-    + Object.entries({ GOOS: 'linux', GOARCH: 'amd64', GOAMD64: 'v1', CGO_ENABLED: '0', '-trimpath': 'true',
-      'vcs.revision': kernel, 'vcs.modified': 'false', '-tags': pin.tags }).map(([key, value]) => `\tbuild\t${key}=${value}\n`).join('');
-  assert.equal(validateBuild(raw, pin, graph).goVersion, '1.27.2');
-  for (const [before, after] of [['vcs.modified=false', 'vcs.modified=true'], [kernel, app], ['CGO_ENABLED=0', 'CGO_ENABLED=1'],
-    ['h1:fixture', 'h1:other'], ['go1.27.2', 'go1.27.1'], ['GOARCH=amd64', 'GOARCH=arm64'], ['GOAMD64=v1', 'GOAMD64=v3']])
-    assert.throws(() => validateBuild(raw.replace(before, after), pin, graph));
+// Synthetic Go output, not a claim about the first CI run's missing raw output.
+// The module-list root has no Version; Go 1.24+ gives the binary a VCS version.
+const buildVcs = { commit: kernel, tree: pin.source.tree, commitTime: '1704067200', tags: '', shallow: 'true' };
+const mainVersion = `v0.0.0-20240101000000-${kernel.slice(0, 12)}`;
+const moduleGraph = [{ Path: 'github.com/sagernet/sing-box', Main: true, GoVersion: '1.27.0' },
+  { Path: 'example.org/module', Version: 'v1.0.0', Sum: 'h1:fixture' }];
+const buildRaw = `/fixture/sing-box: go1.27.2\n\tpath\tgithub.com/sagernet/sing-box/cmd/sing-box\n`
+  + `\tmod\tgithub.com/sagernet/sing-box\t${mainVersion}\n\tdep\texample.org/module\tv1.0.0\th1:fixture\n`
+  + Object.entries({ GOOS: 'linux', GOARCH: 'amd64', GOAMD64: 'v1', CGO_ENABLED: '0', '-buildmode': 'exe', '-compiler': 'gc',
+    '-trimpath': 'true', vcs: 'git', 'vcs.revision': kernel, 'vcs.time': '2024-01-01T00:00:00Z', 'vcs.modified': 'false',
+    '-tags': pin.tags }).map(([key, value]) => `\tbuild\t${key}=${value}\n`).join('');
+
+test('untagged pseudo-version is derived only from independently pinned Git metadata', () => {
+  assert.deepEqual(expectedBuildVcs(pin, buildVcs), { revision: kernel, time: '2024-01-01T00:00:00Z', moduleVersion: mainVersion });
+  for (const changed of [undefined, { ...buildVcs, commit: app }, { ...buildVcs, tree: app },
+    { ...buildVcs, tags: 'refs/tags/v1.0.0' }, { ...buildVcs, shallow: 'false' }])
+    assert.throws(() => expectedBuildVcs(pin, changed), /Exact untagged shallow Git identity/);
+  for (const commitTime of [1704067200, '', '(devel)', '2024-01-01T00:00:00Z', '01704067200', '-1', '1e9',
+    '1704067200\n', '999999999999', '9007199254740993'])
+    assert.throws(() => expectedBuildVcs(pin, { ...buildVcs, commitTime }), /Git commit timestamp/);
+});
+test('build metadata binds exact source, profile and module graph using Go VCS semantics', () => {
+  const facts = validateBuild(buildRaw, pin, moduleGraph, buildVcs);
+  assert.equal(facts.goVersion, '1.27.2');
+  assert.equal(facts.modules['github.com/sagernet/sing-box'].version, mainVersion);
+  // Go omits -ldflags with -trimpath, and records -buildvcs via vcs.* settings.
+  assert.equal(facts.settings['-ldflags'], undefined);
+  assert.equal(facts.settings['-buildvcs'], undefined);
+  for (const [before, after] of [['vcs.modified=false', 'vcs.modified=true'], [`vcs.revision=${kernel}`, `vcs.revision=${app}`],
+    ['vcs.time=2024-01-01T00:00:00Z', 'vcs.time=2024-01-01T00:00:01Z'], ['vcs=git', 'vcs=hg'],
+    ['CGO_ENABLED=0', 'CGO_ENABLED=1'], ['h1:fixture', 'h1:other'], ['v1.0.0', 'v1.0.1'], ['go1.27.2', 'go1.27.1'],
+    ['GOARCH=amd64', 'GOARCH=arm64'], ['GOAMD64=v1', 'GOAMD64=v3'], ['-buildmode=exe', '-buildmode=pie'],
+    ['-compiler=gc', '-compiler=gccgo'], ['-trimpath=true', '-trimpath=false'], [pin.tags, 'with_naive_outbound']])
+    assert.throws(() => validateBuild(buildRaw.replace(before, after), pin, moduleGraph, buildVcs), before);
+  for (const key of ['vcs', 'vcs.revision', 'vcs.time', 'vcs.modified']) {
+    const without = buildRaw.split('\n').filter((line) => !line.startsWith(`\tbuild\t${key}=`)).join('\n');
+    assert.throws(() => validateBuild(without, pin, moduleGraph, buildVcs), /Embedded candidate build setting differs/);
+  }
+  assert.throws(() => validateBuild(buildRaw, pin, moduleGraph, { ...buildVcs, commitTime: '1704067201' }), /vcs.time/);
+  const consistentWrongTime = buildRaw.replace('20240101000000', '20240101000001').replace('2024-01-01T00:00:00Z', '2024-01-01T00:00:01Z');
+  assert.throws(() => validateBuild(consistentWrongTime, pin, moduleGraph, buildVcs), /vcs.time/);
+});
+test('main version rejects devel, tags, unrelated or dirty pseudo-versions and extra metadata', () => {
+  for (const value of ['(devel)', 'v1.0.0', 'arbitrary', `v0.0.0-20240101000001-${kernel.slice(0, 12)}`,
+    `v0.0.0-20240101000000-${app.slice(0, 12)}`, `v1.0.0-20240101000000-${kernel.slice(0, 12)}`,
+    mainVersion + '+dirty', mainVersion + '+incompatible', mainVersion + '\th1:unexpected'])
+    assert.throws(() => validateBuild(buildRaw.replace(mainVersion, value), pin, moduleGraph, buildVcs), /Executable main source differs/);
+  const replacement = buildRaw.replace(`\t${mainVersion}\n`, `\t${mainVersion}\n\t=>\t./other\t(devel)\n\t\n`);
+  assert.throws(() => validateBuild(replacement, pin, moduleGraph, buildVcs), /Executable main source differs/);
+});
+test('main package, module root and module kinds are unique and exact', () => {
+  const path = '\tpath\tgithub.com/sagernet/sing-box/cmd/sing-box\n';
+  for (const changed of [buildRaw.replace(path, ''), buildRaw.replace(path, path + path),
+    buildRaw + '\tpath\n', buildRaw + '\tpath\r\n',
+    buildRaw.replace('/cmd/sing-box\n', '/cmd/other\n'), buildRaw.replace(path, path.trimEnd() + '\textra\n')])
+    assert.throws(() => validateBuild(changed, pin, moduleGraph, buildVcs), /Executable main package path differs/);
+  for (const changed of [buildRaw.replace('\tmod\t', '\tdep\t'), buildRaw.replace('\tdep\t', '\tmod\t'),
+    buildRaw.replace('\tmod\tgithub.com/sagernet/sing-box\t', '\tmod\texample.org/other\t')])
+    assert.throws(() => validateBuild(changed, pin, moduleGraph, buildVcs), /Unique source and executable main modules/);
+  for (const graph of [moduleGraph.slice(1), [...moduleGraph, moduleGraph[0]],
+    [moduleGraph[0], { ...moduleGraph[1], Main: true }], [{ ...moduleGraph[0], Main: false }, moduleGraph[1]],
+    [{ ...moduleGraph[0], Version: 'v1.0.0' }, moduleGraph[1]], [{ ...moduleGraph[0], Sum: 'h1:unexpected' }, moduleGraph[1]],
+    [{ ...moduleGraph[0], Replace: { Path: './other' } }, moduleGraph[1]]])
+    assert.throws(() => validateBuild(buildRaw, pin, graph, buildVcs), /Unique source and executable main modules/);
+  assert.throws(() => validateBuild(buildRaw.replace('\tdep\t', '\tmod\t'), pin,
+    [moduleGraph[0], { ...moduleGraph[1], Main: true }], buildVcs), /Unique source and executable main modules/);
+});
+test('module h1 and local or versioned replacement guards still bind every embedded dependency', () => {
+  const local = { Path: 'example.org/local', Version: 'v1.2.3', Replace: { Path: './third_party/local' } };
+  const remote = { Path: 'example.org/remote', Version: 'v1.2.3', Replace: { Path: 'example.org/replacement', Version: 'v1.2.4', Sum: 'h1:replacement' } };
+  const graph = [...moduleGraph, local, remote];
+  const extra = '\tdep\texample.org/local\tv1.2.3\n\t=>\t./third_party/local\t(devel)\n\t\n'
+    + '\tdep\texample.org/remote\tv1.2.3\n\t=>\texample.org/replacement\tv1.2.4\th1:replacement\n';
+  const raw = buildRaw + extra;
+  assert.equal(Object.keys(validateBuild(raw, pin, graph, buildVcs).modules).length, 4);
+  for (const [before, after] of [['./third_party/local', './third_party/other'], ['(devel)', 'v1.0.0'],
+    ['example.org/replacement', 'example.org/unreviewed'], ['v1.2.4', 'v1.2.5'], ['h1:replacement', 'h1:other'],
+    ['\t(devel)\n', '\t(devel)\th1:unexpected\n']])
+    assert.throws(() => validateBuild(raw.replace(before, after), pin, graph, buildVcs), /Dependency replacement differs/);
+  assert.throws(() => validateBuild(raw, pin, moduleGraph, buildVcs), /Embedded dependency absent/);
+  const unsigned = buildRaw.replace('\th1:fixture', '');
+  assert.throws(() => validateBuild(unsigned, pin, [moduleGraph[0], { Path: 'example.org/module', Version: 'v1.0.0' }], buildVcs), /Dependency h1 differs/);
+  assert.throws(() => validateBuild(buildRaw + '\tbuild\tvcs.modified=false\n', pin, moduleGraph, buildVcs), /Duplicate embedded build setting/);
+  assert.throws(() => validateBuild(buildRaw + `\tmod\tgithub.com/sagernet/sing-box\t${mainVersion}\n`, pin, moduleGraph, buildVcs), /Duplicate\/malformed embedded module/);
+});
+test('raw BuildInfo survives admission or parse failure with exact bytes, hash and no overwrite', () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'loopback-build-info-')));
+  try {
+    for (const [name, raw] of [['identity', buildRaw.replace(mainVersion, '(devel)')], ['parse', 'unparseable raw output\r\n']]) {
+      const path = join(directory, `${name}.txt`);
+      const result = { sourceVerified: false, tests: [] };
+      result.buildInfo = recordBuildInfo(raw, path);
+      assert.throws(() => validateBuild(raw, pin, moduleGraph, buildVcs));
+      assert.equal(readFileSync(path, 'utf8'), raw);
+      assert.deepEqual(result.buildInfo, { path, bytes: Buffer.byteLength(raw), sha256: createHash('sha256').update(raw).digest('hex') });
+      assert.equal(statSync(path).mode & 0o777, 0o600);
+      assert.throws(() => recordBuildInfo('replacement', path), /EEXIST/);
+      assert.equal(readFileSync(path, 'utf8'), raw);
+      assert.equal(result.sourceVerified, false); assert.deepEqual(result.tests, []);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+  const source = readFileSync(fileURLToPath(new URL('./runtime-config-loopback.mjs', import.meta.url)), 'utf8');
+  const write = source.indexOf("result.buildInfo = recordBuildInfo(buildInfo, join(evidence, 'kernel-build-info.txt'))");
+  const validate = source.indexOf('result.build = validateBuild(buildInfo, pin, graph.graph, buildVcs)');
+  assert.ok(write > 0 && write < validate && validate < source.indexOf('result.sourceVerified = true'));
+  assert.ok(source.indexOf('result.observedBinary = filePin(binary)') < validate);
+  assert.ok(source.includes("'--format=%H%n%T%n%ct'"));
+  assert.ok(source.includes("'for-each-ref', '--format=%(refname)', 'refs/tags'"));
+  assert.ok(source.includes("'rev-parse', '--is-shallow-repository'"));
+  assert.ok(source.includes("JSON.stringify(readBuildVcs(source)) === JSON.stringify(buildVcs)"));
+  assert.ok(source.includes("JSON.stringify(filePin(binary)) === JSON.stringify(result.observedBinary)"));
+  assert.ok(source.includes('binary: result.observedBinary, sourceVerified: true'));
+  assert.ok(source.indexOf('Observed executable changed during source verification') < source.indexOf('result.sourceVerified = true'));
 });
 test('exact four real tests require one executed pass, no skip or uncertain cleanup', () => {
   assert.equal(TESTS.length, 4); assert.equal(new Set(TESTS).size, 4);

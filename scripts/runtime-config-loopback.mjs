@@ -101,23 +101,68 @@ export function validatePin(pin) {
   return pin;
 }
 
-export function validateBuild(raw, pin, graph) {
+// Go 1.24+ derives the binary's main-module version from VCS, independently
+// of the Version constant set by -X. This runner fetches one commit, with no
+// tags, so only its untagged v0 pseudo-version is admissible. The timestamp is
+// read from the already verified Git object, never trusted from BuildInfo.
+export function expectedBuildVcs(pin, vcs) {
+  demand(vcs?.commit === pin.source.commit && vcs.tree === pin.source.tree
+    && vcs.tags === '' && vcs.shallow === 'true', 'Exact untagged shallow Git identity required');
+  demand(typeof vcs.commitTime === 'string' && /^[1-9][0-9]{0,11}$/.test(vcs.commitTime),
+    'Canonical Git commit timestamp required');
+  const instant = new Date(Number(vcs.commitTime) * 1000);
+  demand(Number.isFinite(instant.getTime()), 'Git commit timestamp out of range');
+  const iso = instant.toISOString();
+  demand(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z$/.test(iso), 'Git commit timestamp out of range');
+  const time = iso.replace('.000Z', 'Z');
+  return { revision: vcs.commit, time,
+    moduleVersion: `v0.0.0-${time.replace(/[-:TZ]/g, '')}-${vcs.commit.slice(0, 12)}` };
+}
+
+function readBuildVcs(source) {
+  const identity = capture('git', ['show', '-s', '--format=%H%n%T%n%ct', 'HEAD'], source, gitEnv(process.env))
+    .trimEnd().split('\n');
+  demand(identity.length === 3, 'Exact Git commit metadata required');
+  return { commit: identity[0], tree: identity[1], commitTime: identity[2],
+    tags: capture('git', ['for-each-ref', '--format=%(refname)', 'refs/tags'], source, gitEnv(process.env)).trimEnd(),
+    shallow: capture('git', ['rev-parse', '--is-shallow-repository'], source, gitEnv(process.env)).trim() };
+}
+
+export function recordBuildInfo(raw, path) {
+  // Keep the original output even if parsing or identity admission fails.
+  writeFileSync(path, raw, { flag: 'wx', mode: 0o600 });
+  return filePin(path);
+}
+
+export function validateBuild(raw, pin, graph, vcs) {
+  const expected = expectedBuildVcs(pin, vcs);
   const facts = parseBuildInfo(raw);
+  const main = 'github.com/sagernet/sing-box';
+  const paths = raw.split(/\r?\n/).filter((line) => line.split('\t')[1] === 'path');
+  demand(paths.length === 1 && paths[0] === `\tpath\t${main}/cmd/sing-box`, 'Executable main package path differs');
   demand(facts.goVersion === pin.goVersion, 'Go compiler version differs');
+  // -buildvcs=true is represented by vcs.*; -trimpath deliberately suppresses
+  // the -ldflags setting in Go BuildInfo. Neither literal flag is required here.
   for (const [key, value] of Object.entries({ GOOS: 'linux', GOARCH: 'amd64', GOAMD64: 'v1', CGO_ENABLED: '0',
-    '-trimpath': 'true', 'vcs.revision': pin.source.commit, 'vcs.modified': 'false', '-tags': pin.tags }))
+    '-buildmode': 'exe', '-compiler': 'gc', '-trimpath': 'true', vcs: 'git',
+    'vcs.revision': expected.revision, 'vcs.time': expected.time, 'vcs.modified': 'false', '-tags': pin.tags }))
     demand(facts.settings.get(key) === value, `Embedded candidate build setting differs: ${key}`);
   const declared = new Map(graph.map((row) => [row.Path, row]));
-  demand(declared.size === graph.length && facts.modules.has('github.com/sagernet/sing-box'), 'Unique source module graph required');
+  const roots = graph.filter((row) => row.Main === true);
+  const embeddedRoots = [...facts.modules].filter(([, observed]) => observed.kind === 'mod');
+  demand(declared.size === graph.length && roots.length === 1 && roots[0].Path === main
+    && !roots[0].Version && !roots[0].Replace && !roots[0].Sum
+    && embeddedRoots.length === 1 && embeddedRoots[0][0] === main, 'Unique source and executable main modules required');
   for (const [name, observed] of facts.modules) {
     const row = declared.get(name);
     demand(row, `Embedded dependency absent from verified graph: ${name}`);
     if (row.Main) {
-      demand(name === 'github.com/sagernet/sing-box' && observed.kind === 'mod'
-        && observed.version === '(devel)' && !observed.replacement, 'Executable main source differs');
+      demand(name === main && row.Main === true && observed.kind === 'mod'
+        && observed.version === expected.moduleVersion && !observed.replacement && !observed.sum,
+      'Executable main source differs');
       continue;
     }
-    demand(observed.version === row.Version, `Dependency version differs: ${name}`);
+    demand(observed.kind === 'dep' && observed.version === row.Version, `Dependency version differs: ${name}`);
     if (row.Replace) {
       demand(observed.replacement === row.Replace.Path
         && (row.Replace.Version ? observed.replacementVersion === row.Replace.Version
@@ -336,6 +381,8 @@ async function run() {
       'https://github.com/polaris-arch/sing-box-polaris.git', pin.source.commit], ROOT, gitEnv(process.env));
     await execute('kernel-checkout', 'git', ['-C', source, 'checkout', '--detach', pin.source.commit], ROOT, gitEnv(process.env));
     result.sourceBefore = JSON.parse(capture('python3', ['-c', SOURCE_CHECK, ROOT, source, PIN]));
+    const buildVcs = readBuildVcs(source);
+    result.buildVcs = { ...buildVcs, ...expectedBuildVcs(pin, buildVcs) };
     result.officialGo = JSON.parse((await execute('official-go-prepare', 'python3',
       ['-I', '-c', OFFICIAL_GO_SETUP, 'prepare', source, PIN, directory], ROOT, gitEnv(process.env))).stdout);
     result.officialGoInventory = filePin(join(evidence, 'official-go-files.json'));
@@ -364,17 +411,22 @@ async function run() {
     await execute('kernel-build', go, ['build', '-trimpath', '-buildvcs=true', '-tags', pin.tags, '-ldflags', ldflags,
       '-o', binary, './cmd/sing-box'], source, goEnv);
     const buildInfo = capture(go, ['version', '-m', binary], source, goEnv);
-    result.build = validateBuild(buildInfo, pin, graph.graph);
+    result.buildInfo = recordBuildInfo(buildInfo, join(evidence, 'kernel-build-info.txt'));
+    result.observedBinary = filePin(binary);
+    result.build = validateBuild(buildInfo, pin, graph.graph, buildVcs);
     result.sourceAfter = JSON.parse(capture('python3', ['-c', SOURCE_CHECK, ROOT, source, PIN]));
     demand(JSON.stringify(result.sourceBefore) === JSON.stringify(result.sourceAfter), 'Build changed source');
+    demand(JSON.stringify(readBuildVcs(source)) === JSON.stringify(buildVcs), 'Build changed Git source identity');
     const goAfter = JSON.parse((await execute('official-go-verify', 'python3',
       ['-I', '-c', OFFICIAL_GO_SETUP, 'verify', source, PIN, directory], ROOT, gitEnv(process.env))).stdout);
     demand(JSON.stringify(goAfter) === JSON.stringify(result.officialGo), 'Official Go toolchain changed during build');
     result.officialGoAfterBuild = goAfter;
+    demand(JSON.stringify(filePin(binary)) === JSON.stringify(result.observedBinary),
+      'Observed executable changed during source verification');
     result.sourceVerified = true;
     const receipt = { schema: 'polaris-runtime-loopback-candidate-v1', appCommit: candidate,
       kernelCommit: pin.source.commit, kernelTree: pin.source.tree, protoSha256: PROTO, profile: PROFILE,
-      implementationManifestDigest: pin.implementationManifestDigest, binary: filePin(binary), sourceVerified: true,
+      implementationManifestDigest: pin.implementationManifestDigest, binary: result.observedBinary, sourceVerified: true,
       naiveIncluded: false, publicationEligible: false };
     const receiptPath = join(evidence, 'candidate.json'); writeJSON(receiptPath, receipt); result.binary = receipt.binary;
     // Packaging remains unavailable. Only the per-instance cfg(test) injector
