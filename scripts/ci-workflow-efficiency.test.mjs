@@ -464,6 +464,14 @@ function assertLauncherDiagnosticJob(source) {
           assert.equal(runInNewContext(diagnosticExpression, context), event === 'workflow_dispatch' && selected === true && system === ''
             && repository === 'polaris-arch/Polaris' && ref === 'refs/heads/collab/dots-audit-remediation-20261017');
         }
+  for (const appCandidate of ['a'.repeat(40), 'malformed']) {
+    const context = { github: { event_name: 'workflow_dispatch', repository: 'polaris-arch/Polaris',
+      ref: 'refs/heads/collab/dots-audit-remediation-20261017' }, inputs: {
+      app_native_compile_candidate: appCandidate, runtime_config_source_only: true,
+      windows_launcher_diagnostics: true, windows_system_candidate: '' } };
+    assert.equal(runInNewContext(cheapExpression, context), true, 'conflicts must reach a failing admission');
+    assert.equal(runInNewContext(diagnosticExpression, context), false, 'compile conflicts must never start Windows diagnosis');
+  }
   assert.match(source, /windows_launcher_diagnostics:\n\s+description:.*\n\s+type: boolean\n\s+default: false/);
   for (const name of ['lint', 'cross', 'test']) {
     const existing = source.split(`\n  ${name}:\n`)[1].split(/\n  [a-z_]+:\n/)[0];
@@ -489,7 +497,7 @@ function assertLauncherDiagnosticJob(source) {
 test('manual fixed-source launcher diagnosis has no ordinary Rust prerequisite or PR/SYSTEM bypass', () => assertLauncherDiagnosticJob(yaml('ci')));
 for (const [label, before, after] of [
   ['PR heavy gate skipped', "github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true", 'false'],
-  ['diagnostic admits PR', "github.event_name == 'workflow_dispatch' && inputs.windows_launcher_diagnostics == true", "github.event_name == 'pull_request' && inputs.windows_launcher_diagnostics == true"],
+  ['diagnostic admits PR', "github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only != true && inputs.windows_launcher_diagnostics == true", "github.event_name == 'pull_request' && inputs.runtime_config_source_only != true && inputs.windows_launcher_diagnostics == true"],
   ['diagnostic admits other branch', "github.ref == 'refs/heads/collab/dots-audit-remediation-20261017'", 'true'],
   ['diagnostic admits other repository', "github.repository == 'polaris-arch/Polaris'", 'true'],
   ['candidate source is arbitrary', "-cne '68ffb209ded1f9337f9115741cba24f9f4c63421'", "-cne $env:INPUT_SOURCE"],

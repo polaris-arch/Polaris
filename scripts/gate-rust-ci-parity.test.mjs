@@ -152,6 +152,8 @@ const ANDROID_FACE_STEP = 'Android impact face must be registered (dep-info 对�
 // replace any ordinary gate. assertCandidateOnlySteps pins their exact opt-in
 // scope and commands below; native-dns-ci-routing.test.mjs checks admission,
 // payload identity, exact Rust namespaces and failure/evidence routing.
+const CI_ONLY_SOURCE_STEP = 'Test additive RuntimeConfig client against loopback mocks';
+const CI_ONLY_COMPILE_STEP = 'Compile native consumer test binaries without execution';
 const CANDIDATE_BUILD_STEP = 'Build actual candidate helper bytes and freeze the separate App identity';
 const CANDIDATE_RUNTIME_STEP = 'Run exact controlled App lifecycle hot-switch and stats tests';
 const MIRRORED_BUT_NOT_VERBATIM = [
@@ -402,7 +404,7 @@ test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字�
   }
   assert.ok(cargoSteps.length > 0, '一个跑 cargo 的步骤都没抠到 —— 取材面是空的，本断言恒真');
 
-  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM]);
+  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP]);
   const orphans = cargoSteps.filter((n) => !covered.has(n));
   assert.deepEqual(
     orphans,
@@ -474,4 +476,40 @@ test('切片自检：行内 # 诱饵不会截断真实命令参数', () => {
   const block = extractCiStepBlock(stripped, 'Check formatting');
   const command = extractRunCommand(block, 'synthetic');
   assert.equal(command, 'cargo fmt --all -- --check');
+});
+
+// This explicit manual compiler check does not replace or broaden the local gate.
+function assertCompileOnlyStep(ci) {
+  const block = extractCiStepBlock(ci, CI_ONLY_COMPILE_STEP);
+  assert.equal(extractRunCommand(block, CI_ONLY_COMPILE_STEP), 'cargo test --locked --workspace --no-run');
+  assert.deepEqual([...block.matchAll(/^        if: (.+)$/gm)].map((m) => m[1]),
+    ["needs.cheap_format.outputs.app_native_compile_only == 'true'"]);
+  assert.doesNotMatch(block, /continue-on-error|--ignored|--release|\|\| true/);
+  assert.match(ci, /app_native_compile_candidate:\n        description:.*\n        type: string\n        default: ''/);
+  const admission = extractCiStepBlock(ci, 'Admit exact App native compile-only request');
+  assert.match(admission, /github\.event_name == 'workflow_dispatch'/);
+  assert.match(admission, /candidate !== e\.GITHUB_SHA/);
+  assert.match(admission, /selected\.os !== 'ubuntu-22\.04'/);
+  assert.match(admission, /compile_only=true/);
+}
+test('manual native compilation compiles test binaries without executing or replacing ordinary gates', () => {
+  const { ci } = loadStripped();
+  assertCompileOnlyStep(ci);
+  for (const [before, after] of [
+    ['cargo test --locked --workspace --no-run', 'cargo test --locked --workspace'],
+    ["if: needs.cheap_format.outputs.app_native_compile_only == 'true'", 'if: true'],
+    ["selected.os !== 'ubuntu-22.04'", 'false'],
+  ]) assert.throws(() => assertCompileOnlyStep(ci.replaceAll(before, after)));
+});
+
+// Existing RuntimeConfig source tests are independent CI-only checks, not a local
+// Rust-gate replacement; their complete isolation is checked by the routing suite.
+test('existing RuntimeConfig CI-only command has an explicit narrow registration', () => {
+  const { ci } = loadStripped();
+  const block = extractCiStepBlock(ci, CI_ONLY_SOURCE_STEP);
+  assert.equal(extractRunCommand(block, CI_ONLY_SOURCE_STEP), 'cargo test --locked -p polaris-singbox-grpc --test runtime_config');
+  const source = ci.split('  runtime_config_source_tests:')[1].split('  windows_launcher_diagnostics:')[0];
+  assert.ok(source.includes(block));
+  assert.doesNotMatch(source, /fetch-core|prepare-core-identity|sudo|--ignored|--release|continue-on-error/);
+  assert.match(source, /This job is not full CI, native or HOT acceptance/);
 });

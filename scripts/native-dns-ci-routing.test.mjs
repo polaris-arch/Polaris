@@ -115,7 +115,7 @@ test('RuntimeConfig source mocks remain independent of payload admission and use
   assert.deepEqual(commands, ['cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
 });
 
-const runtimeSourceDefaults = { runtime_config_source_only: false, windows_launcher_diagnostics: false,
+const runtimeSourceDefaults = { app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
   native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
   windows_directory_candidate_source: '', os: 'all', preserve_run: false };
 const runtimeSourceConflicts = [
@@ -237,7 +237,7 @@ test('conflicting RuntimeConfig-only requests fail in the scheduled source job b
       runtime_config_source_only: true, ...selection }),
   } });
   for (const selection of [{}, { os: 'ubuntu-22.04' }, { preserve_run: true }]) assert.doesNotThrow(() => admit(selection));
-  for (const selection of [...runtimeSourceConflicts, { native_dns_candidate: 'malformed' },
+  for (const selection of [...runtimeSourceConflicts, { app_native_compile_candidate: sha }, { native_dns_candidate: 'malformed' },
     { windows_directory_candidate_source: ' ' }, { windows_directory_mode: 'unknown' }, { os: 'unknown' }])
     assert.throws(() => admit(selection), /cannot combine diagnostic, candidate or non-Ubuntu selections/);
   for (const value of [false, 'true', '', null])
@@ -716,4 +716,133 @@ test('historical fixture canonicalizes only its owned temp root while release re
       assert.throws(() => regularPath(join(alias, basename(fixture)), true), /Linked release ancestor/);
     } finally { rmSync(fixture, { recursive: true, force: true }); }
   } finally { rmSync(parent, { recursive: true, force: true }); }
+});
+
+
+const compileBranch = 'refs/heads/hot/app-runtime-consumer-20261020';
+const compileInputs = { ...runtimeSourceDefaults, app_native_compile_candidate: sha, os: 'ubuntu-22.04' };
+function compileAdmission(inputs = compileInputs, extra = {}, head = sha, status = '') {
+  const writes = [], calls = [];
+  const source = nodeScript('Admit exact App native compile-only request');
+  new Function('process', 'execFileSync', 'appendFileSync', source)({ env: {
+    ...base, GITHUB_REF: compileBranch, GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/ci.yml@${compileBranch}`,
+    APP_NATIVE_COMPILE_INPUTS: JSON.stringify(inputs), ...extra,
+  } }, (program, args) => {
+    assert.equal(program, 'git'); calls.push(args);
+    assert.ok(['rev-parse', 'status'].includes(args[0]), 'admission cannot execute build/runtime commands');
+    return args[0] === 'rev-parse' ? head : status;
+  }, (path, value) => writes.push({ path, value }));
+  return { writes, calls };
+}
+
+test('exact App compile-only admission is read-only, Ubuntu-only and rejects every conflicting mode', () => {
+  assert.deepEqual(compileAdmission().writes, [{ path: 'output', value: 'compile_only=true\n' }]);
+  for (const candidate of ['', ' ', 'false', false, true, 'A'.repeat(40), 'b'.repeat(40), null])
+    assert.throws(() => compileAdmission({ ...compileInputs, app_native_compile_candidate: candidate }));
+  const conflicts = [{ os: '' }, { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { os: 'other' },
+    { runtime_config_source_only: true }, { windows_launcher_diagnostics: true }, { native_dns_candidate: sha },
+    { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' }, { windows_directory_candidate_source: sha },
+    { native_dns_candidate: ' ' }, { windows_directory_candidate_source: ' ' }];
+  for (const change of conflicts) assert.throws(() => compileAdmission({ ...compileInputs, ...change }), /requires Ubuntu/);
+  for (const extra of [{ GITHUB_ACTIONS: 'false' }, { GITHUB_REPOSITORY: 'other/Polaris' }, { GITHUB_REPOSITORY_ID: '0' },
+    { GITHUB_REF: 'refs/heads/main' }, { GITHUB_WORKFLOW_REF: base.GITHUB_WORKFLOW_REF }, { GITHUB_SHA: 'b'.repeat(40) },
+    ...['push', 'pull_request', 'merge_group', 'workflow_call'].map((GITHUB_EVENT_NAME) => ({ GITHUB_EVENT_NAME }))])
+    assert.throws(() => compileAdmission(compileInputs, extra), /context required/);
+  for (const key of ['CORE_CANDIDATE', 'CORE_PLATFORM', 'POLARIS_NATIVE_DNS_CANDIDATE', 'POLARIS_NATIVE_DNS_FORMAL',
+    'POLARIS_NATIVE_PAYLOAD_VALIDATION', 'POLARIS_NATIVE_DNS_PLATFORM', 'POLARIS_SINGBOX_PATH', 'POLARIS_TEST_CORE',
+    'POLARIS_CORE_IDENTITY_FILE', 'POLARIS_CORE_CARRIER_DIR', 'POLARIS_REQUIRE_KERNEL_GATE', 'POLARIS_KERNEL_GATE_TARGET',
+    'POLARIS_NO_KERNEL_RUN', 'POLARIS_BUILD_ID', 'POLARIS_RUNTIME_CONFIG_PROTO_SOURCE', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'])
+    for (const value of ['', '0', '1']) assert.throws(() => compileAdmission(compileInputs, { [key]: value }), /must not inherit/);
+  assert.throws(() => compileAdmission(compileInputs, {}, 'b'.repeat(40)), /checkout differs/);
+  assert.throws(() => compileAdmission(compileInputs, {}, sha, ' M Cargo.lock'), /dirty/);
+});
+
+function compileRoutingContract(source = workflow) {
+  const names = ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test',
+    'runtime_config_source_tests', 'windows_launcher_diagnostics'];
+  const scheduled = ciSchedule(source, names);
+  const outputs = { native_required: 'true', app_native_compile_only: 'true', native_dns_formal: 'true', native_dns_formal_app: sha };
+  assert.deepEqual(scheduled('workflow_dispatch', compileInputs, outputs), ['cheap_format', 'test']);
+  // Invalid combinations still schedule admission. It fails before any dependent job can run.
+  for (const selection of [{ runtime_config_source_only: true }, { windows_launcher_diagnostics: true },
+    { native_dns_candidate: sha }, { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' },
+    { windows_directory_candidate_source: sha }, { os: 'all' }, { os: 'windows-2022' }]) {
+    const selected = { ...compileInputs, ...selection };
+    const planned = scheduled('workflow_dispatch', selected, outputs);
+    assert.deepEqual(planned, ['cheap_format', 'test']);
+    assert.throws(() => compileAdmission(selected));
+  }
+  const cheap = ciJobSection(source, 'cheap_format');
+  const contractName = 'Execute native compile routing contracts before native setup';
+  const contract = cheap.split(`      - name: ${contractName}\n`)[1].split('      - name:')[0];
+  assert.match(contract, /if: steps\.app_native_compile_admission\.outputs\.compile_only == 'true'/);
+  assert.match(contract, /run: node --test scripts\/native-dns-ci-routing\.test\.mjs scripts\/windows-token-owner\.test\.mjs scripts\/gate-rust-ci-parity\.test\.mjs/);
+  assert.ok(cheap.indexOf(contractName) > cheap.indexOf('Admit exact App native compile-only request'));
+  assert.ok(cheap.indexOf(contractName) < cheap.indexOf('Install existing Rust formatting toolchain'));
+  const launcherName = 'Execute launcher routing contracts before native setup';
+  const launcher = cheap.split(`      - name: ${launcherName}\n`)[1].split('      - name:')[0];
+  assert.match(launcher, /if: steps\.app_native_compile_admission\.outputs\.compile_only == 'true'/);
+  assert.ok(launcher.includes("node --test --test-reporter=tap --test-name-pattern='^manual (fixed-source )?launcher diagnosis' scripts/ci-workflow-efficiency.test.mjs | tee \"$LAUNCHER_CONTRACT_TAP\""));
+  assert.match(launcher, /set -euo pipefail/);
+  assert.doesNotMatch(launcher, /continue-on-error|\|\| true/);
+  assert.ok(launcher.includes("[['pass', 8], ['fail', 0], ['cancelled', 0]]"));
+  assert.ok(launcher.includes('matches.length !== 1'));
+
+  assert.ok(cheap.indexOf(launcherName) > cheap.indexOf(contractName));
+  assert.ok(cheap.indexOf(launcherName) < cheap.indexOf('Install existing Rust formatting toolchain'));
+
+  for (const name of ['Admit exact final candidate SYSTEM request', 'Admit explicit native DNS ordinary CI selection']) {
+    const block = cheap.split(`      - name: ${name}\n`)[1].split('      - name:')[0];
+    assert.match(block, /if: steps\.app_native_compile_admission\.outputs\.compile_only != 'true'/);
+  }
+  const job = ciJobSection(source, 'test');
+  assert.match(job, /needs: cheap_format/);
+  assert.match(job, /Native consumer compile only/);
+  assert.match(job, /run: cargo build --workspace --verbose/);
+  const blocks = job.split(/(?=^      - name: )/m);
+  const retained = new Set(['Setup Node', 'Install Rust toolchain (preinstalled rustup)',
+    'Install protoc (pinned URL + sha256)', 'Install NASM (Windows — pinned URL + sha256)',
+    'Assert pinned tools resolve on PATH', 'Install Linux system dependencies (Tauri webkit/gtk)',
+    'Create resource placeholder dirs (tauri build.rs 路径校验)', 'Build']);
+  const compileOnly = new Set(['Verify compile-only resource placeholders', 'Verify admitted App compile checkout', 'Compile native consumer test binaries without execution',
+    'Record native consumer compilation scope']);
+  for (const block of blocks) {
+    const name = /^      - name: (.+)$/m.exec(block)?.[1];
+    if (!name || retained.has(name)) continue;
+    const match = /^        if: >-\n([\s\S]*?)(?=^        [a-z])/m.exec(block) ?? /^        if: (.+)$/m.exec(block);
+    assert.ok(match, `${name} requires an explicit mode boundary`);
+    const expression = match[1].trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
+    const value = new Function('needs', 'runner', 'github', 'inputs', 'steps', 'success', 'cancelled', 'always', `return (${expression});`)(
+      { cheap_format: { outputs } }, { os: 'Linux' }, { event_name: 'workflow_dispatch' }, compileInputs, {}, () => true, () => false, () => true);
+    assert.equal(value, compileOnly.has(name), name);
+  }
+  assert.equal((job.match(/run: cargo test --locked --workspace --no-run/g) ?? []).length, 1);
+  assert.doesNotMatch(job, /run:.*POLARIS_NO_KERNEL_RUN=/);
+  assert.doesNotMatch(section(source, 'workflow_call'), /app_native_compile_candidate/);
+}
+
+test('compile-only runs the actual CI route contracts and only current native compiler commands', () => {
+  compileRoutingContract();
+  for (const [before, after] of [
+    ["if: steps.app_native_compile_admission.outputs.compile_only != 'true'", 'if: true'],
+    ["if: needs.cheap_format.outputs.app_native_compile_only != 'true'", 'if: true'],
+    ['run: cargo test --locked --workspace --no-run', 'run: cargo test --locked --workspace'],
+    ['run: node --test scripts/native-dns-ci-routing.test.mjs scripts/windows-token-owner.test.mjs scripts/gate-rust-ci-parity.test.mjs', 'run: echo omitted'],
+  ]) assert.throws(() => compileRoutingContract(workflow.replaceAll(before, after)), before);
+});
+
+
+test('filtered launcher route execution rejects zero/missing/duplicate/failed TAP completion', () => {
+  const source = nodeScript('Execute launcher routing contracts before native setup');
+  const validate = (text) => new Function('process', 'readFileSync', source)(
+    { env: { LAUNCHER_CONTRACT_TAP: 'owned-output' } }, (path) => { assert.equal(path, 'owned-output'); return text; });
+  const completed = '# pass 8\n# fail 0\n# cancelled 0\n';
+  assert.doesNotThrow(() => validate(completed));
+  for (const invalid of ['', '# pass 8\n', completed.replace('pass 8', 'pass 0'), completed.replace('pass 8', 'pass 7'),
+    completed.replace('fail 0', 'fail 1'), completed.replace('cancelled 0', 'cancelled 1'), completed + '# pass 8\n',
+    completed.replace('pass 8', 'pass unknown')]) assert.throws(() => validate(invalid), /require exactly one/);
+  const block = step('Execute launcher routing contracts before native setup');
+  assert.match(block, /set -euo pipefail/); // runner/tee nonzero exits cannot be replaced by a parser's zero.
+  assert.ok(block.indexOf('| tee "$LAUNCHER_CONTRACT_TAP"') < block.indexOf("node --input-type=module - <<'NODE'"));
+  assert.doesNotMatch(block, /continue-on-error|\|\| true|set \+e/);
 });

@@ -264,7 +264,9 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     // malformed output keeps them mandatory; PR/call/manual classification is full.
     for (const [name, block] of [['lint', lint], ['test', test]] as const) {
       const condition = foldedJobIf(block, name);
-      expect(condition).toBe("needs.cheap_format.outputs.native_required != 'false'");
+      expect(condition).toBe(name === 'lint'
+        ? "needs.cheap_format.outputs.app_native_compile_only != 'true' && needs.cheap_format.outputs.native_required != 'false'"
+        : "needs.cheap_format.outputs.native_required != 'false'");
       for (const value of ['', 'true', 'unknown', 'false'])
         expect(evaluateActions(condition, CI_ENTRIES[0], value)).toBe(value !== 'false');
       expect(block).toMatch(/^ {4}runs-on: \$\{\{ matrix\.os \}\}$/m);
@@ -283,7 +285,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       const conditions = [...block.matchAll(/^ {4}if: \$\{\{ (.*) \}\}$/gm)];
       expect(block.match(/^ {4}if:/gm) ?? []).toHaveLength(1);
       expect(conditions).toHaveLength(1);
-      expect(conditions[0][1]).toBe("(github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '')");
+      expect(conditions[0][1]).toBe("(github.event_name == 'workflow_dispatch' && (inputs.app_native_compile_candidate || '') != '') || (github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '')");
       for (const event of ['pull_request', 'push', 'merge_group', 'workflow_call', 'workflow_dispatch']) {
         for (const sourceOnly of [undefined, false, true]) {
           for (const selected of [undefined, false, true]) {
@@ -364,7 +366,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const ci = workflow('ci.yml');
     const jobs = [...ci.slice(ci.indexOf('\njobs:\n')).matchAll(/^ {2}([a-z][a-z0-9_-]*):$/gm)].map((m) => m[1]);
     const source = executable(jobBlock(ci, 'runtime_config_source_tests'));
-    const defaults = { runtime_config_source_only: false, windows_launcher_diagnostics: false,
+    const defaults = { app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
       native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
       windows_directory_candidate_source: '', os: 'all' };
     type Selection = Partial<typeof defaults>;
@@ -404,6 +406,13 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       expect(header).toMatch(/^ {4}needs: cheap_format$/m);
       expect(header).not.toMatch(/always\(|cancelled\(|success\(|failure\(|continue-on-error/);
     }
+    const compileOnly = { ...defaults, app_native_compile_candidate: 'a'.repeat(40), os: 'ubuntu-22.04' };
+    for (const selection of [compileOnly, { ...compileOnly, runtime_config_source_only: true },
+      { ...compileOnly, windows_launcher_diagnostics: true }]) {
+      expect(decision('cheap_format', 'workflow_dispatch', selection)).toBe(true);
+      expect(decision('runtime_config_source_tests', 'workflow_dispatch', selection)).toBe(false);
+      expect(decision('windows_launcher_diagnostics', 'workflow_dispatch', selection)).toBe(false);
+    }
     expect(source).not.toMatch(/^ {4}needs:|continue-on-error|fetch-core|sudo/m);
     expect(source).toContain('runs-on: ubuntu-22.04');
     expect(source).toContain('RuntimeConfig source only (not full CI/native/HOT acceptance)');
@@ -425,7 +434,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       expect(scheduled('workflow_dispatch', { ...selection, runtime_config_source_only: true })).toEqual(['runtime_config_source_tests']);
     expect(() => admit({})).not.toThrow();
     expect(() => admit({ os: 'ubuntu-22.04' })).not.toThrow();
-    for (const selection of conflicts) expect(() => admit(selection)).toThrow(/cannot combine/);
+    for (const selection of [...conflicts, { app_native_compile_candidate: 'a'.repeat(40) }]) expect(() => admit(selection)).toThrow(/cannot combine/);
     for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
       for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
         for (const diagnostic of [false, true]) for (const system of ['', 'a'.repeat(40)])
