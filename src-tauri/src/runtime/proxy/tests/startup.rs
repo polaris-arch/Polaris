@@ -466,7 +466,11 @@ fn resolve_core_binary_env_override_rejects_missing_file() {
 #[test]
 fn resolve_core_binary_env_override_rejects_same_name_foreign_file() {
     let dir = crate::test_support::TestDir::new("polaris-foreign-core-");
-    let f = dir.join(if cfg!(windows) { "sing-box.exe" } else { "sing-box" });
+    let f = dir.join(if cfg!(windows) {
+        "sing-box.exe"
+    } else {
+        "sing-box"
+    });
     std::fs::write(&f, b"#!/bin/sh\n").unwrap();
     let path = f.to_string_lossy().into_owned();
     temp_env_var("POLARIS_SINGBOX_PATH", &path, || {
@@ -4716,7 +4720,10 @@ async fn direct_startup_capture_rejects_missing_changed_and_poisoned_proof() {
         let (actual_generation, actual_identity, actual_proof) = captured.as_ref().unwrap();
         assert_eq!(*actual_generation, generation);
         assert!(actual_identity.same_run(&identity));
-        assert_eq!(actual_proof.snapshot.binary_sha256, proof.snapshot.binary_sha256);
+        assert_eq!(
+            actual_proof.snapshot.binary_sha256,
+            proof.snapshot.binary_sha256
+        );
     }
     let replacement = dir.join("capture-replacement");
     std::fs::write(&replacement, b"#!/bin/xx\n").unwrap();
@@ -4739,21 +4746,40 @@ async fn direct_startup_capture_rejects_missing_changed_and_poisoned_proof() {
 fn direct_startup_proof_rejection_preserves_actual_birth_cleanup() {
     let source = crate::test_support::crate_code("runtime/proxy/startup.rs");
     let start = method_body(&source, "    pub(super) async fn start_inner(");
-    let factory = start.split_once("let direct_spawn = self.spawn_direct_native(").unwrap().1;
+    let factory = start
+        .split_once("let direct_spawn = self.spawn_direct_native(")
+        .unwrap()
+        .1;
     let factory = factory.split_once("if direct_spawn.is_err()").unwrap().0;
-    assert!(factory.find("require_direct_startup_cli_proof(").unwrap()
-        < factory.find("TokioSpawner::new().spawn(req)").unwrap());
+    assert!(
+        factory.find("require_direct_startup_cli_proof(").unwrap()
+            < factory.find("TokioSpawner::new().spawn(req)").unwrap()
+    );
     assert!(factory.contains("direct_proof_rejected.set(true)"));
-    let success = start.split_once("Ok(Some((pid, identity))) => {").unwrap().1;
-    let success = success.split_once("Ok(None) => return Ok(self.status()),").unwrap().0;
+    let success = start
+        .split_once("Ok(Some((pid, identity))) => {")
+        .unwrap()
+        .1;
+    let success = success
+        .split_once("Ok(None) => return Ok(self.status()),")
+        .unwrap()
+        .0;
     assert!(success.contains("capture_direct_startup_cli_proof("));
     assert!(success.contains("reject_direct_startup_cli_proof(my_gen, &identity, ts_gate, reason)"));
     assert!(!success.contains("confirmed_no_external_writer"));
-    assert!(success.find("reject_direct_startup_cli_proof(").unwrap()
-        < success.find("direct_run_identity = Some(identity)").unwrap());
+    assert!(
+        success.find("reject_direct_startup_cli_proof(").unwrap()
+            < success
+                .find("direct_run_identity = Some(identity)")
+                .unwrap()
+    );
     let rejection = method_body(&source, "    async fn reject_direct_startup_cli_proof(");
-    assert!(rejection.find("slot.running_matches(identity)").unwrap()
-        < rejection.find("self.kill_core_and_release_main(ts_gate).await").unwrap());
+    assert!(
+        rejection.find("slot.running_matches(identity)").unwrap()
+            < rejection
+                .find("self.kill_core_and_release_main(ts_gate).await")
+                .unwrap()
+    );
     assert!(rejection.contains("self.gate.generation() != generation"));
     assert!(rejection.contains("code::CORE_BUNDLE_MISMATCH"));
     assert!(!rejection.contains("confirmed_no_external_writer"));

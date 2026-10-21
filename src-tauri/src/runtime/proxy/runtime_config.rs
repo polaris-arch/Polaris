@@ -132,19 +132,21 @@ pub(super) fn observe_runtime_pairing(
             field.variant == "RUNTIME_STARTED_UNSUPPORTED" && field.conditions[0] == "runtime"
         });
     if starting {
-        return Err(if capabilities.connected_hot_enabled
-            || unsupported
-            || instances.iter().any(|field| {
-                !matches!(
-                    field.variant.as_str(),
-                    "RUNTIME_STARTING" | "PENDING_ADAPTER" | "OWNER_PERSISTENCE_UNBOUND"
-                )
-            })
-        {
-            invalid
-        } else {
-            RuntimePairingError::Starting
-        });
+        return Err(
+            if capabilities.connected_hot_enabled
+                || unsupported
+                || instances.iter().any(|field| {
+                    !matches!(
+                        field.variant.as_str(),
+                        "RUNTIME_STARTING" | "PENDING_ADAPTER" | "OWNER_PERSISTENCE_UNBOUND"
+                    )
+                })
+            {
+                invalid
+            } else {
+                RuntimePairingError::Starting
+            },
+        );
     }
     let incarnation = if capabilities.connected_hot_enabled {
         if unsupported
@@ -517,7 +519,10 @@ fn selector_intents(
 impl ProxyRuntime {
     /// A cached transaction result is historical; it cannot prove that the
     /// current endpoint still belongs to this startup, including native reloads.
-    async fn verify_cached_runtime_pairing(&self, generation: u64) -> Result<(), RuntimeApplyResult> {
+    async fn verify_cached_runtime_pairing(
+        &self,
+        generation: u64,
+    ) -> Result<(), RuntimeApplyResult> {
         let baseline = self
             .runtime_config_baseline
             .read()
@@ -1034,7 +1039,10 @@ impl ProxyRuntime {
         let transaction_id = pending.plan.transaction_id.clone();
         let mut result = match result {
             Ok(operation) => {
-                match self.acknowledge_regeneration_owner(&pending, operation).await {
+                match self
+                    .acknowledge_regeneration_owner(&pending, operation)
+                    .await
+                {
                     Ok(operation) => self.settle_runtime_operation(&pending, operation),
                     Err(error) => error,
                 }
@@ -1075,7 +1083,10 @@ impl ProxyRuntime {
             {
                 match status.operation {
                     Some(operation) => {
-                        match self.acknowledge_regeneration_owner(&pending, operation).await {
+                        match self
+                            .acknowledge_regeneration_owner(&pending, operation)
+                            .await
+                        {
                             Ok(operation) => self.settle_runtime_operation(&pending, operation),
                             Err(error) => error,
                         }
@@ -1141,7 +1152,8 @@ impl ProxyRuntime {
                 Err(_) => return Ok(None),
             };
             handle.block_on(paired_runtime_capabilities(&client, &pending.pairing))?;
-            Ok(me.config
+            Ok(me
+                .config
                 .with_durable_runtime_owner(&pending.desired, |digest, revision| {
                     me.selector_reconcile.with_intent_claim(|intent| {
                         if intent != pending.intent
@@ -1466,7 +1478,10 @@ impl ProxyRuntime {
                 else {
                     continue;
                 };
-                if paired_runtime_capabilities(&client, &pairing).await.is_err() {
+                if paired_runtime_capabilities(&client, &pairing)
+                    .await
+                    .is_err()
+                {
                     continue;
                 }
                 match client
@@ -1528,11 +1543,10 @@ impl ProxyRuntime {
             else {
                 return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
             };
-            let Some(service) = baseline
-                .generated
-                .services
-                .as_ref()
-                .and_then(|services| services.iter().find(|service| service.type_field == "api"))
+            let Some(service) =
+                baseline.generated.services.as_ref().and_then(|services| {
+                    services.iter().find(|service| service.type_field == "api")
+                })
             else {
                 return self.remember_runtime_result(RuntimeApplyResult::status("unconfirmed"));
             };
@@ -1670,10 +1684,7 @@ impl ProxyRuntime {
                     let Some(generation) = result.runtime_generation else {
                         return RuntimeApplyResult::status("unconfirmed");
                     };
-                    if let Err(error) = self
-                        .verify_cached_runtime_pairing(generation)
-                        .await
-                    {
+                    if let Err(error) = self.verify_cached_runtime_pairing(generation).await {
                         return error;
                     }
                     return result;
@@ -1779,7 +1790,10 @@ impl ProxyRuntime {
         {
             return RuntimeApplyResult::status("unconfirmed");
         }
-        match self.acknowledge_regeneration_owner(pending, operation).await {
+        match self
+            .acknowledge_regeneration_owner(pending, operation)
+            .await
+        {
             Ok(operation) => self.settle_runtime_operation(pending, operation),
             Err(error) => error,
         }
@@ -1940,7 +1954,10 @@ mod tests {
                 6 => value.fields[0].conditions.swap(0, 1),
                 _ => value.implementation_manifest_digest.clear(),
             }
-            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+            assert_eq!(
+                observe_runtime_pairing(&value),
+                Err(RuntimePairingError::Invalid)
+            );
         }
     }
 
@@ -1986,19 +2003,35 @@ mod tests {
                 2 => value.active.as_mut().unwrap().applied_revision = 0,
                 _ => value.active.as_mut().unwrap().effective_digest.clear(),
             }
-            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+            assert_eq!(
+                observe_runtime_pairing(&value),
+                Err(RuntimePairingError::Invalid)
+            );
         }
     }
 
     #[test]
     fn paired_runtime_only_waits_for_noncontradictory_starting_state() {
         let mut value = paired_capabilities();
-        value.fields.push(instance_reason("RUNTIME_STARTING", "runtime"));
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value
+            .fields
+            .push(instance_reason("RUNTIME_STARTING", "runtime"));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
         value.connected_hot_enabled = false;
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Starting));
-        value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Starting)
+        );
+        value
+            .fields
+            .push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
     }
 
     #[test]
@@ -2010,11 +2043,19 @@ mod tests {
         ] {
             let mut value = paired_capabilities();
             value.fields.push(instance_reason(reason, "runtime"));
-            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+            assert_eq!(
+                observe_runtime_pairing(&value),
+                Err(RuntimePairingError::Invalid)
+            );
             value.connected_hot_enabled = false;
             value.active = None;
-            value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
-            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+            value
+                .fields
+                .push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+            assert_eq!(
+                observe_runtime_pairing(&value),
+                Err(RuntimePairingError::Invalid)
+            );
         }
     }
 
@@ -2023,9 +2064,16 @@ mod tests {
         let mut value = paired_capabilities();
         value.connected_hot_enabled = false;
         value.active = None;
-        value.fields.push(instance_reason("PENDING_ADAPTER", "services"));
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
-        value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+        value
+            .fields
+            .push(instance_reason("PENDING_ADAPTER", "services"));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
+        value
+            .fields
+            .push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
         let pairing = observe_runtime_pairing(&value).unwrap();
         assert_eq!(pairing.incarnation, None);
         assert_eq!(unsupported_runtime_paths(&value), ["services"]);
@@ -2036,22 +2084,45 @@ mod tests {
     #[test]
     fn malformed_or_contradictory_dynamic_records_are_not_admission() {
         let mut value = paired_capabilities();
-        value.fields.push(instance_reason("OWNER_PERSISTENCE_UNBOUND", "wrong.path"));
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value
+            .fields
+            .push(instance_reason("OWNER_PERSISTENCE_UNBOUND", "wrong.path"));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
         value.fields.pop();
-        value.fields.push(instance_reason("PENDING_ADAPTER", "services"));
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value
+            .fields
+            .push(instance_reason("PENDING_ADAPTER", "services"));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
         value.connected_hot_enabled = false;
         value.active = None;
-        value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+        value
+            .fields
+            .push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
         assert!(observe_runtime_pairing(&value).is_ok());
-        value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value
+            .fields
+            .push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
         value.fields.pop();
         value.fields[1].conditions.clear();
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
         value.fields.remove(1);
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
     }
 
     #[test]
@@ -2061,7 +2132,11 @@ mod tests {
             .find(".confirm_startup_runtime_pairing(&singbox_config, my_gen, ready_deadline)")
             .unwrap();
         assert!(gate < source.find("let new_status = ProxyStatus {").unwrap());
-        assert!(gate < source.find("self.capture_runtime_config_baseline(").unwrap());
+        assert!(
+            gate < source
+                .find("self.capture_runtime_config_baseline(")
+                .unwrap()
+        );
         assert!(source.contains("t_ready + Duration::from_millis(ready_budget_ms)"));
         let body = crate::commands::guard_scan::impl_method_body(
             &source,
@@ -2102,23 +2177,41 @@ mod tests {
         for incarnation in ["   ".into(), "x".repeat(257)] {
             let mut value = paired_capabilities();
             value.active.as_mut().unwrap().incarnation = incarnation;
-            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+            assert_eq!(
+                observe_runtime_pairing(&value),
+                Err(RuntimePairingError::Invalid)
+            );
         }
         for path in ["", "   ", "runtime"] {
             let mut value = paired_capabilities();
             value.connected_hot_enabled = false;
             value.active = None;
-            value.fields.push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
+            value
+                .fields
+                .push(instance_reason("RUNTIME_STARTED_UNSUPPORTED", "runtime"));
             value.fields.push(instance_reason("PENDING_ADAPTER", path));
-            assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+            assert_eq!(
+                observe_runtime_pairing(&value),
+                Err(RuntimePairingError::Invalid)
+            );
         }
         let mut value = paired_capabilities();
         value.connected_hot_enabled = false;
-        value.fields.push(instance_reason("RUNTIME_STARTING", "wrong.path"));
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value
+            .fields
+            .push(instance_reason("RUNTIME_STARTING", "wrong.path"));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
         value.fields.last_mut().unwrap().conditions = vec!["runtime".into()];
-        value.fields.push(instance_reason("UNKNOWN_FAILURE", "runtime"));
-        assert_eq!(observe_runtime_pairing(&value), Err(RuntimePairingError::Invalid));
+        value
+            .fields
+            .push(instance_reason("UNKNOWN_FAILURE", "runtime"));
+        assert_eq!(
+            observe_runtime_pairing(&value),
+            Err(RuntimePairingError::Invalid)
+        );
     }
 
     #[test]
