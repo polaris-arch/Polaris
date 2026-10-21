@@ -626,6 +626,21 @@ pub(crate) enum DeferredConfigDeletion {
     },
 }
 
+// Test assertion diagnostics must not expose any deletion payload fields.
+#[cfg(test)]
+impl std::fmt::Debug for DeferredConfigDeletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RuleResource { .. } => "RuleResource",
+            Self::BuiltinRuleResource { .. } => "BuiltinRuleResource",
+            Self::AppIcon { .. } => "AppIcon",
+            Self::TailscaleState { .. } => "TailscaleState",
+            Self::TailscaleDirectory { .. } => "TailscaleDirectory",
+            Self::WarpDevice { .. } => "WarpDevice",
+        })
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeferredDeletionJournal {
