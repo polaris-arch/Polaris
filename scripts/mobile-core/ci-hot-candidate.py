@@ -85,9 +85,15 @@ def validate_request(env, inputs, event):
     require(all(env.get(k) == v for k, v in expected.items()), 'direct exact-SHA Android candidate context required')
     require(set(inputs) <= {'hot_consumer_candidate', 'preserve_run'} and
             inputs.get('preserve_run') is True, 'candidate must preserve run; no publish/formal/other input')
-    require(isinstance(event, dict) and event.get('ref') == REF.removeprefix('refs/heads/') and
-            event.get('repository', {}).get('full_name') == APP_REPOSITORY and
-            str(event.get('repository', {}).get('id')) == APP_REPOSITORY_ID, 'direct dispatch event identity differs')
+    require(isinstance(event, dict), 'direct dispatch event object required')
+    # GitHub's workflow_dispatch event carries a full branch ref, unlike the
+    # short branch name accepted by the REST dispatch request's ref parameter.
+    # https://github.com/octokit/webhooks/blob/main/payload-examples/api.github.com/workflow_dispatch/payload.json
+    require(event.get('ref') == REF, 'direct dispatch event ref differs from pinned full branch ref')
+    repository = event.get('repository')
+    require(isinstance(repository, dict), 'direct dispatch event repository object required')
+    require(repository.get('full_name') == APP_REPOSITORY, 'direct dispatch event repository full_name differs')
+    require(str(repository.get('id')) == APP_REPOSITORY_ID, 'direct dispatch event repository id differs')
     require(event.get('inputs') == {'hot_consumer_candidate': candidate, 'preserve_run': 'true'},
             'inherited or conflicting dispatch inputs refused')
     require(env.get('POLARIS_LIGHT_BUILD', '0') == env.get('POLARIS_PUBLISH_RELEASE', '0') == '0',

@@ -108,11 +108,42 @@ class PureFixtures(unittest.TestCase):
                     'GITHUB_REPOSITORY_ID': hot.APP_REPOSITORY_ID, 'GITHUB_EVENT_NAME': 'workflow_dispatch',
                     'GITHUB_REF': hot.REF, 'GITHUB_WORKFLOW_REF': hot.WORKFLOW_REF,
                     'GITHUB_SHA': self.sha, 'GITHUB_WORKFLOW_SHA': self.sha, 'GITHUB_JOB': 'release_check'}
-        self.event = {'ref': hot.REF.removeprefix('refs/heads/'), 'repository': {'full_name': hot.APP_REPOSITORY, 'id': int(hot.APP_REPOSITORY_ID)},
+        # The official Octokit workflow_dispatch example uses refs/heads/master.
+        # Substitute only this candidate's pinned branch/repository and inputs.
+        self.event = {'ref': hot.REF, 'repository': {'full_name': hot.APP_REPOSITORY, 'id': int(hot.APP_REPOSITORY_ID)},
                       'inputs': {'hot_consumer_candidate': self.sha, 'preserve_run': 'true'}}
 
     def test_exact_direct_candidate(self):
         self.assertEqual(hot.validate_request(self.env, self.inputs, self.event), self.sha)
+
+    def test_dispatch_ref_requires_exact_full_branch(self):
+        for value in [hot.REF.removeprefix('refs/heads/'), 'refs/heads/main',
+                      hot.REF.replace('refs/heads/', 'refs/tags/'), hot.REF + '/',
+                      hot.REF + '\n', ' ' + hot.REF, self.sha, '', None, False, []]:
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, '^direct dispatch event ref differs from pinned full branch ref$'):
+                hot.validate_request(self.env, self.inputs, dict(self.event, ref=value))
+
+    def test_dispatch_identity_errors_are_field_specific(self):
+        for payload in [None, [], 'workflow_dispatch']:
+            with self.subTest(payload=payload), self.assertRaisesRegex(RuntimeError, '^direct dispatch event object required$'):
+                hot.validate_request(self.env, self.inputs, payload)
+        for repository in [None, [], 'polaris-arch/Polaris']:
+            with self.subTest(repository=repository), self.assertRaisesRegex(RuntimeError, '^direct dispatch event repository object required$'):
+                hot.validate_request(self.env, self.inputs, dict(self.event, repository=repository))
+        for field, values in [('full_name', [None, 'other/Polaris', 'polaris-arch/Other', 'polaris-arch/polaris']),
+                              ('id', [None, 0, int(hot.APP_REPOSITORY_ID) + 1, False])]:
+            for value in values:
+                repository = dict(self.event['repository'], **{field: value})
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(RuntimeError, '^direct dispatch event repository ' + field + ' differs$'):
+                    hot.validate_request(self.env, self.inputs, dict(self.event, repository=repository))
+
+    def test_full_ref_does_not_relax_exact_event_inputs(self):
+        for inputs in [None, {}, dict(self.event['inputs'], hot_consumer_candidate='b' * 40),
+                       dict(self.event['inputs'], preserve_run=True),
+                       dict(self.event['inputs'], preserve_run='false'),
+                       dict(self.event['inputs'], publish_release='false')]:
+            with self.subTest(inputs=inputs), self.assertRaisesRegex(RuntimeError, '^inherited or conflicting dispatch inputs refused$'):
+                hot.validate_request(self.env, self.inputs, dict(self.event, inputs=inputs))
 
     def test_wrong_context_never_admits(self):
         for key in self.env:
@@ -335,7 +366,7 @@ class RoutingContracts(unittest.TestCase):
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-    if suite.countTestCases() < 25:
+    if suite.countTestCases() < 28:
         raise SystemExit('candidate fixture suite is empty/incomplete')
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
