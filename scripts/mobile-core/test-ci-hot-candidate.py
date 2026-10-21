@@ -189,19 +189,54 @@ class PureFixtures(unittest.TestCase):
             (ndk / 'source.properties').write_text('Pkg.Revision = 28.0.0\n')
             with self.assertRaises(RuntimeError): hot.reject_overrides(env)
 
-    def test_license_hash_keeps_original_whitespace(self):
-        text = '\n  Exact package license.\n'
+    def test_license_hash_uses_sdk_xml_normalization(self):
+        text = '\n  Exact  package\nlicense.\n'
         xml = ET.fromstring('<repository><license id="android-sdk-license">' + text + '</license><localPackage><uses-license ref="android-sdk-license"/></localPackage></repository>')
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp); (home / 'licenses').mkdir()
             file = home / 'licenses/android-sdk-license'
-            exact = hashlib.sha1(text.encode()).hexdigest()
+            exact = hashlib.sha1(b'Exact package license.').hexdigest()
             file.write_text(exact + '\n')
             self.assertEqual(hot.accepted_licenses(xml, xml, home), {'android-sdk-license': exact})
-            file.write_text(hashlib.sha1(text.strip().encode()).hexdigest() + '\n')
-            with self.assertRaises(RuntimeError): hot.accepted_licenses(xml, xml, home)
+            for incorrect in [text, text.strip(), 'Different package license.']:
+                file.write_text(hashlib.sha1(incorrect.encode()).hexdigest() + '\n')
+                with self.assertRaises(RuntimeError): hot.accepted_licenses(xml, xml, home)
             file.unlink()
             with self.assertRaises(RuntimeError): hot.accepted_licenses(xml, xml, home)
+
+    def test_sdk_normalization_matches_each_adapter_step(self):
+        for raw, expected in [(' A \t  B\nC\n\n D ', 'A B C\n\nD'),
+                              ('A\tB', 'A\tB'), ('A\t \tB', 'A\tB'),
+                              ('A\rB', 'A\rB'), ('A\n \t\nB', 'A\n\nB'),
+                              ('\x00\x1f A \x20', 'A'), ('', '')]:
+            with self.subTest(raw=raw):
+                self.assertEqual(hot.sdk_license_value(raw), expected)
+        # XML parsing normalizes CRLF before the SDK's adapter is applied.
+        xml = ET.fromstring('<license> A\r\nB\r\n\r\n C </license>')
+        self.assertEqual(hot.sdk_license_value(''.join(xml.itertext())), 'A B\n\nC')
+
+    def test_sdk_normalization_does_not_use_unicode_whitespace(self):
+        for space in ['\u00a0', '\u0085', '\u2003']:
+            with self.subTest(space=space):
+                self.assertEqual(hot.sdk_license_value(' ' + space + 'Text' + space + ' '), space + 'Text' + space)
+                self.assertEqual(hot.sdk_license_value('A' + space + ' \tB'), 'A' + space + ' B')
+
+    def test_license_acceptance_requires_exact_sdk_lines(self):
+        xml = ET.fromstring('<repository><license id="android-sdk-license">Exact license.</license><localPackage><uses-license ref="android-sdk-license"/></localPackage></repository>')
+        digest = hashlib.sha1(b'Exact license.').hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp); (home / 'licenses').mkdir(); file = home / 'licenses/android-sdk-license'
+            for separator in ['\n', '\r\n', '\r']:
+                file.write_bytes(('older-hash' + separator + digest + separator).encode())
+                self.assertEqual(hot.accepted_licenses(xml, xml, home), {'android-sdk-license': digest})
+            for separator in ['\x0b', '\x0c', '\u0085', '\u2028', '\u2029']:
+                file.write_bytes(('older-hash' + separator + digest + '\n').encode())
+                with self.subTest(separator=separator), self.assertRaises(RuntimeError):
+                    hot.accepted_licenses(xml, xml, home)
+            for value in [' ' + digest, digest + ' ', digest.upper()]:
+                file.write_text(value + '\n')
+                with self.subTest(value=value), self.assertRaises(RuntimeError):
+                    hot.accepted_licenses(xml, xml, home)
 
     def test_license_requires_specific_package(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -366,7 +401,7 @@ class RoutingContracts(unittest.TestCase):
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-    if suite.countTestCases() < 28:
+    if suite.countTestCases() < 31:
         raise SystemExit('candidate fixture suite is empty/incomplete')
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)

@@ -161,8 +161,19 @@ def admit():
         out.write('evidence=' + str(root / 'evidence') + '\n')
 
 
+def sdk_license_value(text):
+    # SDK global.xjb binds xsd:string to TrimStringAdapter before License hashes
+    # getValue() as UTF-8. Match its three replaceAll calls and Java String.trim;
+    # Python's default Unicode \s and strip() would normalize additional bytes.
+    # https://android.googlesource.com/platform/tools/base/+/mirror-goog-studio-main/repository/src/main/java/com/android/repository/impl/meta/TrimStringAdapter.java
+    text = re.sub(r'(?<=[ \t\n\x0b\f\r])[ \t]*', '', text)
+    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
+    text = re.sub(r' +', ' ', text)
+    return text.strip(''.join(chr(code) for code in range(0x21)))
+
+
 def accepted_licenses(xml, package, home):
-    licenses = {el.attrib['id']: ''.join(el.itertext()) for el in xml.iter() if el.tag.rsplit('}', 1)[-1] == 'license'}
+    licenses = {el.attrib['id']: sdk_license_value(''.join(el.itertext())) for el in xml.iter() if el.tag.rsplit('}', 1)[-1] == 'license'}
     refs = [el.attrib['ref'] for el in package.iter() if el.tag.rsplit('}', 1)[-1] == 'uses-license']
     require(refs and all(ref in licenses for ref in refs), 'SDK package lacks its exact license text')
     result = {}
@@ -170,7 +181,9 @@ def accepted_licenses(xml, package, home):
         require(re.fullmatch('[A-Za-z0-9_-]+', ref), 'invalid license name')
         accepted = home / 'licenses' / ref
         digest = hashlib.sha1(licenses[ref].encode()).hexdigest()
-        require(accepted.is_file() and digest in accepted.read_text().splitlines(),
+        # Text I/O normalizes CR/CRLF to LF, matching SDK readLines. Do not use
+        # splitlines(), which would also accept Unicode/control separators.
+        require(accepted.is_file() and digest in accepted.read_text(encoding='utf-8').split('\n'),
                 'SDK license is not already accepted: ' + ref + ' (' + digest + ')')
         result[ref] = digest
     return result
