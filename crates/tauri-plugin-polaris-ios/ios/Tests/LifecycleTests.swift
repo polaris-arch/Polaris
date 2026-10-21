@@ -11,6 +11,7 @@ struct LifecycleTests {
         try directoryRetirementCases()
         try reloadCustodyCases()
         managedBootstrapCases()
+        try runtimeProtocolAdmissionCases()
         try ordinaryStopDispatchCases()
         let identity = TunnelIdentity(sessionID: "session-a", requestID: "start-a", configDigest: "digest-a")
         let lifecycle = TunnelLifecycle()
@@ -773,6 +774,99 @@ struct LifecycleTests {
         reloadFailure.reloadCallbacks[0](.success(reloadFailure.original))
         assert(reloadFailure.original.stops == 0 && reloadFailure.failures == 1)
         reloadFailure.assertNoScopedProof()
+    }
+
+    // Actual production decoder with inert protojson inputs. No libbox, NE,
+    // provider startup, source provenance or generated Swift binding is proved.
+    static func runtimeProtocolAdmissionCases() throws {
+        let digest = String(repeating: "a", count: 64)
+        let methods = ["GetRuntimeCapabilities", "PlanRuntimeConfig", "ApplyRuntimeConfig",
+            "GetRuntimeConfigStatus", "RetryRuntimePersistence", "AcknowledgeRuntimePersistence"]
+        let protocolField: [String: Any] = ["effective_path": "runtime.protocol",
+            "variant": "polaris-daily-runtime-v1", "adapter_version": "1",
+            "platform_build": "ios/arm64", "conditions": methods]
+        let identity: [String: Any] = ["incarnation": "original-instance",
+            "applied_revision": "1", "effective_digest": digest]
+        let ready: [String: Any] = ["contract_version": 1, "connected_hot_enabled": true,
+            "implementation_manifest_digest": digest, "active": identity, "fields": [protocolField]]
+        func decode(_ value: [String: Any]) throws -> TunnelRuntimeAdmission {
+            let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw NSError(domain: "LifecycleTestFixture", code: 1)
+            }
+            return try TunnelRuntimeAdmission.decode(text, platform: "ios/arm64")
+        }
+        func rejected(_ value: [String: Any]) {
+            do { _ = try decode(value); assertionFailure("Invalid runtime admission accepted") } catch {}
+        }
+        func reason(_ code: String, _ path: String = "runtime") -> [String: Any] {
+            ["effective_path": "runtime.instance", "variant": code, "conditions": [path]]
+        }
+        let admitted = try decode(ready)
+        assert(admitted.identity?.incarnation == "original-instance")
+        assert(admitted.manifestDigest == digest && admitted.controlRevision == "0")
+        assert(admitted.unsupportedPaths.isEmpty())
+        var bad = ready; bad["fields"] = []; rejected(bad)
+        bad = ready; bad["contract_version"] = 2; rejected(bad)
+        bad = ready; bad["fields"] = [protocolField, protocolField]; rejected(bad)
+        for (key, value) in [("variant", "upstream"), ("adapter_version", "2"),
+                             ("platform_build", "linux/arm64"), ("update_class", "IN_PLACE")] {
+            var field = protocolField; field[key] = value
+            bad = ready; bad["fields"] = [field]; rejected(bad)
+        }
+        for conditions in [Array(methods.reversed()), Array(methods.dropLast())] {
+            var field = protocolField; field["conditions"] = conditions
+            bad = ready; bad["fields"] = [field]; rejected(bad)
+        }
+        for value in ["", String(repeating: "a", count: 63), String(repeating: "g", count: 64),
+                      String(repeating: "A", count: 64)] {
+            bad = ready; bad["implementation_manifest_digest"] = value; rejected(bad)
+        }
+        for value in ["9007199254740993", "18446744073709551615"] {
+            var active = identity; active["applied_revision"] = value
+            var document = ready; document["active"] = active; document["control_revision"] = value
+            let result = try decode(document)
+            assert(result.controlRevision == value && result.identity?.appliedRevision == value)
+        }
+        let invalidIntegers: [Any] = ["18446744073709551616", "01", "-1", "1.0", "1e3", 1, 1.0]
+        for value in invalidIntegers {
+            bad = ready; bad["control_revision"] = value; rejected(bad)
+            var active = identity; active["applied_revision"] = value
+            bad = ready; bad["active"] = active; rejected(bad)
+        }
+        bad = ready; bad.removeValue(forKey: "active"); rejected(bad)
+        for (key, value) in [("incarnation", ""), ("applied_revision", "0"), ("effective_digest", "")] {
+            var active = identity; active[key] = value
+            bad = ready; bad["active"] = active; rejected(bad)
+        }
+        bad = ready; bad["connected_hot_enabled"] = "true"; rejected(bad)
+        bad = ready; bad["connected_hot_enabled"] = false; rejected(bad)
+        bad = ready; bad.removeValue(forKey: "connected_hot_enabled"); rejected(bad)
+        var unsupported = ready
+        unsupported.removeValue(forKey: "active"); unsupported.removeValue(forKey: "connected_hot_enabled")
+        let pending = reason("PENDING_ADAPTER", "services")
+        let started = reason("RUNTIME_STARTED_UNSUPPORTED")
+        unsupported["fields"] = [protocolField, pending]; rejected(unsupported)
+        unsupported["fields"] = [protocolField, started]; rejected(unsupported)
+        unsupported["fields"] = [protocolField, started, pending]
+        let legacy = try decode(unsupported)
+        assert(legacy.identity == nil && legacy.unsupportedPaths == ["services"])
+        bad = unsupported; bad["active"] = identity; rejected(bad)
+        bad = unsupported; bad["connected_hot_enabled"] = true; rejected(bad)
+        bad = unsupported; bad["fields"] = [protocolField, started, pending, started]; rejected(bad)
+        for code in ["RUNTIME_STARTING", "RUNTIME_STOPPED", "RUNTIME_GRAPH_UNAVAILABLE",
+                     "INITIAL_CONFIG_ENCODING_FAILED", "INVALID_ACTIVE_SNAPSHOT", "UNKNOWN_REASON"] {
+            bad = ready; bad["fields"] = [protocolField, reason(code)]; rejected(bad)
+            bad = unsupported; bad["fields"] = [protocolField, started, pending, reason(code)]; rejected(bad)
+        }
+        bad = ready; bad["fields"] = [protocolField, pending]; rejected(bad)
+        var warning = ready
+        warning["fields"] = [protocolField, reason("OWNER_PERSISTENCE_UNBOUND", "runtime.persistence"),
+            ["effective_path": "runtime.build", "variant": "with_naive_outbound", "conditions": ["state=unknown"]]]
+        let warningResult = try decode(warning)
+        assert(warningResult.identity?.incarnation == "original-instance")
+        bad = ready; bad["fields"] = [protocolField, reason("OWNER_PERSISTENCE_UNBOUND", "wrong.path")]; rejected(bad)
+        print("iOS runtime protocol decoder cases passed: six RPCs, exact uint64, ready identity, unsupported lifecycle, warnings")
     }
 
     // Validator/options coverage only; does not execute provider startup or IPC.

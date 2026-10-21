@@ -120,6 +120,54 @@ class PureFixtures(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 hot.source_identity(dict(value, vendors=changed))
 
+    def test_frozen_source_caller_uses_shared_verifier_and_retains_all_guards(self):
+        from source_policy import candidate_vendors
+        from test_source_policy import nine_vendor_fixture
+        _, files, _, _ = nine_vendor_fixture()
+        selected = copy.deepcopy(hot.source_identity())
+        expected = {name: {'path': './third_party/' + row[0], 'tree': row[1], 'files': row[2]}
+                    for name, row in hot.VENDORS.items()}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve(); (source / 'go.mod').write_bytes(files['go.mod'])
+            def git(_, *args):
+                return hot.KERNEL_TREE if args == ('rev-parse', 'HEAD^{tree}') else hot.KERNEL_COMMIT
+            def pin(path): return {'sha256': hot.SOURCE_HASHES[str(path.relative_to(source))]}
+            with patch.object(hot, 'git', side_effect=git) as read_git, \
+                    patch.object(hot, 'clean') as clean, patch.object(hot, 'file_pin', side_effect=pin) as read_pin, \
+                    patch.object(hot, 'verify_vendor_sources', return_value=(expected, {}, {}, {})) as verify, \
+                    patch.object(hot, 'tracked_mirror', return_value={'leaves': 1}) as mirror:
+                result = hot.source_facts(source, generated=True)
+                self.assertEqual(read_git.call_args_list, [unittest.mock.call(source, 'rev-parse', 'HEAD'),
+                                                          unittest.mock.call(source, 'rev-parse', 'HEAD^{tree}')])
+                clean.assert_called_once_with(source, generated=True)
+                self.assertEqual(read_pin.call_count, len(hot.SOURCE_HASHES))
+                verify.assert_called_once_with(source, candidate_vendors(hot.VENDORS), hot.git)
+                mirror.assert_called_once_with(source)
+                self.assertEqual(result['vendors'], expected)
+                self.assertEqual(result['files'], hot.SOURCE_HASHES)
+                self.assertEqual(result['trackedMirror'], {'leaves': 1})
+        self.assertEqual(hot.source_identity(), selected)
+
+    def test_candidate_graph_uses_shared_exact_nine_vendor_paths_and_no_local_h1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve(); graph = []
+            for name, (directory, _, _) in hot.VENDORS.items():
+                path = source / 'third_party' / directory; path.mkdir(parents=True)
+                graph.append({'Path': name, 'Version': 'v0.0.0-fixture',
+                              'Replace': {'Path': './third_party/' + directory, 'Dir': str(path)}})
+            self.assertIs(hot.graph_facts(graph, source), graph)
+            for case in ('missing', 'extra', 'duplicate', 'sum', 'replacement-sum', 'path', 'directory', 'remote'):
+                changed = copy.deepcopy(graph)
+                if case == 'missing': changed.pop()
+                elif case == 'extra': changed.append({'Path': 'example.invalid/extra', 'Replace': {'Path': './extra', 'Dir': str(source / 'extra')}})
+                elif case == 'duplicate': changed.append(copy.deepcopy(changed[0]))
+                elif case == 'sum': changed[0]['Sum'] = 'h1:invented'
+                elif case == 'replacement-sum': changed[0]['Replace']['Sum'] = 'h1:invented'
+                elif case == 'path': changed[0]['Replace']['Path'] = '../outside'
+                elif case == 'directory': changed[0]['Replace']['Dir'] = str(source)
+                else: changed[0]['Replace']['Version'] = 'v1.0.0'
+                with self.subTest(case=case), self.assertRaises(RuntimeError): hot.graph_facts(changed, source)
+
     def setUp(self):
         # Any accidental external execution in these fixtures is a test failure.
         self.guards = [patch('subprocess.Popen', side_effect=AssertionError('fixture may not execute tools')),

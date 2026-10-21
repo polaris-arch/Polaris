@@ -249,11 +249,16 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
     mark('source-start')
     require(re.fullmatch(r'[a-f0-9]{40}', commit) and re.fullmatch(r'[a-f0-9]{40}', expected_tree),
             'invalid source object identity')
+    vendors = None
     if reviewed_source is not None:
         import sys
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mobile-core'))
         from source_policy import validate_source_policy, verify_source_policy_files
         validate_source_policy(reviewed_source, {**source_identity, 'sourceCommit': commit, 'sourceTree': expected_tree})
+        if reviewed_source['schema'] == 'polaris-reviewed-kernel-source-v2':
+            vendors = reviewed_source['vendors']
+    vendor_prefixes = tuple(pin['replacementPath'][2:] + '/' for pin in vendors.values()) if vendors else ()
+    vendor_modes, vendor_bytes, proof_bytes = {}, 0, 0
     source = Path(path)
     require(0 < record['bytes'] <= 512 * 1024 * 1024
             and source.stat().st_size == record['bytes'], 'source archive size differs')
@@ -323,6 +328,11 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
                 continue
             require(leaf not in node and info.mode & 0o7000 == 0 and info.size <= 200 * 1024 * 1024,
                     'source duplicate/oversized/special-mode file')
+            relative = '/'.join(parts[1:])
+            selected_vendor = relative.startswith(vendor_prefixes)
+            if selected_vendor:
+                require(info.size <= 32 * 1024 * 1024, 'vendor file exceeds byte budget')
+                require(vendor_bytes + info.size <= 512 * 1024 * 1024, 'vendor inventory exceeds byte budget')
             if info.issym():
                 content, mode = info.linkname.encode('utf-8'), b'120000'
             else:
@@ -331,18 +341,27 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
                 require(len(content) == info.size, 'source file length differs')
                 mode = b'100755' if info.mode & 0o111 else b'100644'
             node[leaf] = (mode, object_hash('blob', content))
-            relative = '/'.join(parts[1:])
             if relative in expected_legal:
                 require(info.isfile(), 'source legal file is not regular')
                 observed_legal[relative] = (len(content), hashlib.sha256(content).hexdigest())
-            selected_proof = reviewed_source is not None and (relative.startswith('third_party/metacubex-utls/')
+            selected_proof = reviewed_source is not None and ((not vendors and relative.startswith('third_party/metacubex-utls/'))
                 or relative in (reviewed_source['metacubex']['bindingPath'], reviewed_source['metacubex']['patchPath']))
-            if parts[1:] in [['go.mod'], ['go.sum']] or selected_proof:
+            if selected_vendor:
+                # Link-target bytes and Git modes are observations, never
+                # followed or normalized. The shared verifier permits only
+                # the reviewed tailscale/.stignore -> .gitignore link.
+                vendor_bytes += len(content)
+                require(len(content) <= 32 * 1024 * 1024 and vendor_bytes <= 512 * 1024 * 1024,
+                        'vendor inventory exceeds byte budget')
+                vendor_modes[relative] = mode.decode('ascii')
+                source_files[relative] = content
+            elif parts[1:] in [['go.mod'], ['go.sum']] or selected_proof:
                 require(info.isfile(), 'source proof files must be regular')
                 if selected_proof:
                     require(info.size <= 2 * 1024 * 1024 and
-                            sum(len(raw) for raw in source_files.values()) + info.size <= 32 * 1024 * 1024,
+                            (proof_bytes if vendors else sum(len(raw) for raw in source_files.values())) + info.size <= 32 * 1024 * 1024,
                             'reviewed source proof exceeds bound')
+                proof_bytes += len(content)
                 source_files[relative] = content
     require(observed_legal == expected_legal, 'source legal bytes/inventory differ')
     mark('archive-members-verified')
@@ -378,6 +397,13 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
         require(name in source_files and hashlib.sha256(source_files[name]).hexdigest() == source_identity[field],
                 'downloaded source module bytes differ')
     require(source_identity['sourceOverlay'] == 0, 'source overlay unsupported')
+    if vendors:
+        local_source = source_identity['replacements']
+        require(isinstance(local_source, list) and len(local_source) == len(vendors) and
+                all(isinstance(item, dict) and set(item) == {'module', 'path', 'tree'} for item in local_source) and
+                {item['module']: (item['path'], item['tree']) for item in local_source} ==
+                {name: (pin['replacementPath'], pin['replacementTree']) for name, pin in vendors.items()},
+                'complete reviewed vendor source replacement inventory differs')
     for replacement in source_identity['replacements']:
         require(replacement['path'].startswith('./'), 'source replacement path differs')
         node = entries
@@ -389,7 +415,16 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
                 'downloaded local replacement tree differs')
     if reviewed_source is not None:
         meta_tree = entries['third_party']['metacubex-utls']
-        verify_source_policy_files(reviewed_source, {**source_identity, 'sourceCommit': commit, 'sourceTree': expected_tree}, source_files, tree_hash(meta_tree).hex())
+        vendor_trees = {}
+        for name, pin in (vendors or {}).items():
+            node = entries
+            for part in pin['replacementPath'][2:].split('/'):
+                require(isinstance(node, dict) and part in node, 'reviewed vendor subtree missing')
+                node = node[part]
+            require(isinstance(node, dict), 'reviewed vendor root is not a directory')
+            vendor_trees[name] = tree_hash(node).hex()
+        verify_source_policy_files(reviewed_source, {**source_identity, 'sourceCommit': commit, 'sourceTree': expected_tree},
+            source_files, tree_hash(meta_tree).hex(), **({'vendor_modes': vendor_modes, 'vendor_trees': vendor_trees} if vendors else {}))
     mark('source-policy-verified')
     local_source = source_identity['replacements']
     require(len({item['module'] for item in local_source}) == len(local_source),
@@ -397,6 +432,10 @@ def verify_source_archive(path, record, commit, expected_tree, gitlinks, source_
     linked_local = {}
     for item in build_replacements:
         target = item['replacement']
+        if vendors and item['module'] in vendors:
+            pin = vendors[item['module']]
+            require(item['version'] == pin['version'] and target['module'] == pin['replacementPath'],
+                    'linked reviewed vendor version/path differs')
         if target['module'].startswith('./'):
             require(item['h1'] == '' and target['version'] == '(devel)' and target['h1'] == '',
                     'local replacement cannot carry an invented module sum')

@@ -106,12 +106,23 @@ export function validateNativeArchiveRow(contract, key, row, targets) {
     const meta = policy.metacubex;
     demand(source.goModSha256 === policy.goModSha256 && source.goSumSha256 === policy.goSumSha256,
       'Reviewed source module pins differ');
-    const expected = ['github.com/metacubex/utls', 'github.com/sagernet/sing-tun'].sort();
+    const vendors = policy.schema === 'polaris-reviewed-kernel-source-v2' ? policy.vendors : undefined;
+    const expected = (vendors ? Object.keys(vendors) : ['github.com/metacubex/utls', 'github.com/sagernet/sing-tun']).sort();
     same(source.replacements.map((r) => r.module).sort(), expected, 'Reviewed local source inventory differs');
     demand(source.replacements.some((r) => r.module === meta.module && r.path === meta.replacementPath
       && r.tree === meta.replacementTree), 'Reviewed Meta source subtree differs');
     const local = row.buildGraph.localReplacements.filter((r) => r.replacement.module.startsWith('./'));
     same(local.map((r) => r.module).sort(), expected, 'Reviewed embedded local inventory differs');
+    // Desktop retains complete source/linked equality. A source-policy schema
+    // upgrade alone never authorizes platform pruning or a different profile.
+    for (const [name, pin] of Object.entries(vendors ?? {})) {
+      demand(source.replacements.some((r) => r.module === name && r.path === pin.replacementPath
+        && r.tree === pin.replacementTree), 'Reviewed vendor source subtree differs');
+      const linked = local.find((r) => r.module === name);
+      demand(linked.version === pin.version && linked.h1 === ''
+        && linked.replacement.module === pin.replacementPath && linked.replacement.version === '(devel)'
+        && linked.replacement.h1 === '', 'Actual reviewed vendor local replacement differs');
+    }
     const actual = local.find((r) => r.module === meta.module);
     demand(actual.version === meta.version && actual.h1 === ''
       && actual.replacement.module === meta.replacementPath && actual.replacement.version === '(devel)'

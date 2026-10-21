@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha, validate
-from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_validation_getter_contract, tree_inventory, zip_entries
+from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_hot_contract, objc_validation_getter_contract, tree_inventory, zip_entries
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare_source, prepare
@@ -601,6 +601,97 @@ class FormalOutputs(unittest.TestCase):
                 artifacts.read_receipt(path)
             decode.assert_not_called()
 
+    def hot_objc_header(self):
+        # Source-derived expectations from fresh libbox Go signatures plus
+        # sagernet/gomobile v0.1.13 genobjc.go/types.go, not a fresh generated
+        # framework observation or evidence that Swift compilation succeeded.
+        return '''@class LibboxCommandServer;
+@protocol LibboxRuntimePersistenceHandler;
+@class LibboxRuntimePersistenceHandler;
+@protocol LibboxRuntimePersistenceHandler <NSObject>
+- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;
+- (NSString* _Nonnull)runtimePersistenceMode;
+@end
+@interface LibboxCommandServer : NSObject <goSeqRefInterface> {
+}
+@property(strong, readonly) _Nonnull id _ref;
+- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;
+- (BOOL)startOrReloadServiceWithRetryableRuntimePersistence:(NSString* _Nullable)configContent options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler error:(NSError* _Nullable* _Nullable)error;
+@end
+@interface LibboxOverrideOptions : NSObject <goSeqRefInterface> {
+}
+@property(strong, readonly) _Nonnull id _ref;
+- (nonnull instancetype)initWithRef:(_Nonnull id)ref;
+- (nonnull instancetype)init;
+@end
+@class LibboxRuntimePersistenceHandler;
+@interface LibboxRuntimePersistenceHandler : NSObject <goSeqRefInterface, LibboxRuntimePersistenceHandler> {
+}
+@property(strong, readonly) _Nonnull id _ref;
+- (nonnull instancetype)initWithRef:(_Nonnull id)ref;
+- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;
+- (NSString* _Nonnull)runtimePersistenceMode;
+@end
+'''
+
+    def test_objc_hot_contract_requires_exact_owners_and_pinned_generator_types(self):
+        header = self.hot_objc_header()
+        facts = objc_hot_contract(header)
+        self.assertEqual(set(facts), {'@interface LibboxCommandServer',
+                         '@protocol LibboxRuntimePersistenceHandler',
+                         '@interface LibboxRuntimePersistenceHandler', '@interface LibboxOverrideOptions'})
+        self.assertEqual(objc_hot_contract(header.replace('\n', ' ')), facts)
+        self.assertEqual(objc_hot_contract(header.replace('*', ' * ').replace(':', ' : ')), facts)
+        capability = '- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;'
+        retry = next(line for line in header.splitlines() if ')startOrReloadServiceWithRetryable' in line)
+        persist = next(line for line in header.splitlines() if ')persistRuntimeConfiguration:' in line)
+        mode = '- (NSString* _Nonnull)runtimePersistenceMode;'
+        cases = [
+            header.replace('LibboxCommandServer :', 'LibboxOtherReceiver :'),
+            header.replace(capability, '') + '@interface Other : NSObject\n' + capability + '\n@end',
+            header.replace(capability, '// ' + capability),
+            header.replace(capability, '/* ' + capability + ' */'),
+            header.replace(capability, capability + ' ' + capability),
+            header.replace(capability, capability.replace('- ', '+ ')),
+            header.replace(capability, capability.replace('NSString* _Nonnull', 'BOOL')),
+            header.replace(capability, capability.replace('_Nonnull', '_Nullable')),
+            header.replace(capability, '- (BOOL)runtimeCapabilities:(NSString* _Nonnull* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;'),
+            header.replace(retry, retry.replace('BOOL', 'void')),
+            header.replace(retry, retry.replace('options:', 'overrideOptions:')),
+            header.replace(retry, retry.replace('options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler',
+                                                'handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler options:(LibboxOverrideOptions* _Nullable)options')),
+            header.replace(retry, retry.replace('id<LibboxRuntimePersistenceHandler> _Nullable', 'LibboxRuntimePersistenceHandler* _Nullable')),
+            header.replace(persist, persist.replace('revision:(int64_t)', 'revision:(int32_t)'), 1),
+            header.replace(persist, persist.replace('effectiveDigest:', 'effectiveDigestWrong:'), 1),
+            header.replace(persist, persist.replace('BOOL', 'void'), 1),
+            header.replace(mode, mode.replace('_Nonnull', '_Nullable'), 1),
+            header.replace('@protocol LibboxRuntimePersistenceHandler <NSObject>', '@protocol LibboxRuntimePersistenceHandler <Other>'),
+            header.replace('<goSeqRefInterface, LibboxRuntimePersistenceHandler>', '<goSeqRefInterface>'),
+            header.replace('<goSeqRefInterface, LibboxRuntimePersistenceHandler>', '<LibboxRuntimePersistenceHandler>'),
+            header.replace('<goSeqRefInterface, LibboxRuntimePersistenceHandler>', '<goSeqRefInterface, Other>'),
+            header.replace('- (nonnull instancetype)init;', '- (nullable instancetype)init;'),
+            header.replace('@protocol LibboxRuntimePersistenceHandler <NSObject>', '@protocol LibboxRuntimePersistenceHandler <NSObject>\n@optional'),
+            header + header,
+        ]
+        # Each pointer/nullability position and both callback owners matter.
+        for declaration in (capability, retry, persist):
+            for wrong_error in ('NSError* _Nullable', 'NSError* _Nonnull* _Nullable',
+                                'NSError* _Nullable* _Nonnull', 'NSString* _Nullable* _Nullable'):
+                cases.append(header.replace(declaration, declaration.replace('NSError* _Nullable* _Nullable', wrong_error), 1))
+        for original in ('NSString* _Nullable', 'LibboxOverrideOptions* _Nullable',
+                         'id<LibboxRuntimePersistenceHandler> _Nullable'):
+            cases.append(header.replace(retry, retry.replace(original, original.replace('_Nullable', '_Nonnull')), 1))
+        proxy = header.index('@interface LibboxRuntimePersistenceHandler :')
+        for declaration in (persist, mode):
+            cases.append(header[:proxy] + header[proxy:].replace(declaration, '', 1))
+            cases.append(header[:proxy] + header[proxy:].replace(declaration, declaration.replace('- ', '+ '), 1))
+        protocol_start = header.index('@protocol LibboxRuntimePersistenceHandler <')
+        protocol_end = header.index('@end', protocol_start) + len('@end')
+        cases.append(header[:protocol_start] + header[protocol_end:])
+        for wrong in cases:
+            with self.subTest(header=wrong[:180]), self.assertRaises(RuntimeError):
+                objc_hot_contract(wrong)
+
     def validation_result_objc_header(self):
         # Declaration spelling/receiver/return type from the preserved original
         # ac6 Libbox.objc.h (129711B, e743b050...), not the former bare-name stub.
@@ -704,6 +795,92 @@ class FormalOutputs(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'Go version'): check(changed)
         finally:
             self.value = old
+
+    def nine_vendor_buildinfo(self, source, *, apple=False, simulator=False):
+        from test_source_policy import future_mobile_fixture_v2
+        self.value, _, _, _ = future_mobile_fixture_v2()
+        facts = self.facts(apple=apple, simulator=simulator)
+        facts['goVersion'] = self.value['goVersion']
+        facts['modules'][self.value['goModule']]['replacement'] = str(source)
+        graph = [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
+                 {'Path': self.value['goModule'], 'Main': True, 'Dir': str(source)}]
+        for name, pin in self.value['sourcePolicy']['vendors'].items():
+            directory = source / pin['replacementPath'][2:]; directory.mkdir(parents=True, exist_ok=True)
+            graph.append({'Path': name, 'Version': pin['version'],
+                          'Replace': {'Path': pin['replacementPath'], 'Dir': str(directory)}})
+            facts['modules'][name] = {'kind': 'dep', 'version': pin['version'], 'sum': '',
+                'replacement': pin['replacementPath'], 'replacementVersion': '(devel)', 'replacementSum': ''}
+        return facts, graph
+
+    def check_nine_vendor_buildinfo(self, facts, graph, *, apple=False, simulator=False):
+        check_buildinfo(facts, self.value, graph, os_name='ios' if apple else 'android', arch='arm64',
+                        mode='c-archive' if apple else 'c-shared', simulator=simulator,
+                        expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
+
+    def test_v2_nine_vendor_native_consistency_allows_only_unrequired_link_pruning(self):
+        required = {'github.com/metacubex/utls', 'github.com/sagernet/sing-tun'}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve()
+            for apple, simulator in [(False, False), (True, False), (True, True)]:
+                facts, graph = self.nine_vendor_buildinfo(source, apple=apple, simulator=simulator)
+                frozen = deepcopy(facts)
+                self.check_nine_vendor_buildinfo(facts, graph, apple=apple, simulator=simulator)
+                self.assertEqual(facts, frozen)
+                for name in self.value['sourcePolicy']['vendors']:
+                    changed = deepcopy(facts); del changed['modules'][name]
+                    with self.subTest(apple=apple, simulator=simulator, name=name):
+                        if name in required:
+                            with self.assertRaisesRegex(RuntimeError, 'required local source module'):
+                                self.check_nine_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
+                        else:
+                            self.check_nine_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
+                pruned = deepcopy(facts)
+                for name in set(self.value['sourcePolicy']['vendors']) - required: del pruned['modules'][name]
+                self.check_nine_vendor_buildinfo(pruned, graph, apple=apple, simulator=simulator)
+
+    def test_v2_buildinfo_rejects_every_linked_vendor_identity_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve(); facts, graph = self.nine_vendor_buildinfo(source)
+            for name in self.value['sourcePolicy']['vendors']:
+                for field, bad in [('version', 'v9.9.9'), ('replacement', './third_party/stock'),
+                                   ('replacementVersion', 'v1.0.0'), ('replacementSum', 'h1:invented'),
+                                   ('sum', 'h1:invented'), ('kind', 'mod')]:
+                    changed = deepcopy(facts); changed['modules'][name][field] = bad
+                    with self.subTest(name=name, field=field), self.assertRaises(RuntimeError):
+                        self.check_nine_vendor_buildinfo(changed, graph)
+            changed = deepcopy(facts)
+            changed['modules']['example.invalid/unreviewed'] = {'kind': 'dep', 'version': 'v1.0.0', 'sum': 'h1:invented'}
+            with self.assertRaisesRegex(RuntimeError, 'not in actual source graph'):
+                self.check_nine_vendor_buildinfo(changed, graph)
+            # Source-owned absolute aliases remain admissible for non-Meta vendors.
+            changed = deepcopy(facts)
+            name = 'github.com/sagernet/sing'
+            changed['modules'][name]['replacement'] = str(source / 'third_party/sing')
+            self.check_nine_vendor_buildinfo(changed, graph)
+
+    def test_v2_complete_graph_is_checked_even_for_native_pruned_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve(); facts, graph = self.nine_vendor_buildinfo(source)
+            name = 'github.com/sagernet/fswatch'
+            del facts['modules'][name]
+            index = next(i for i, row in enumerate(graph) if row['Path'] == name)
+            for case in ('missing', 'duplicate', 'version', 'sum', 'path', 'directory', 'replacement-sum', 'stock', 'extra', 'main'):
+                changed = deepcopy(graph); row = changed[index]
+                if case == 'missing': changed.pop(index)
+                elif case == 'duplicate': changed.append(deepcopy(row))
+                elif case == 'version': row['Version'] = 'v9.9.9'
+                elif case == 'sum': row['Sum'] = 'h1:invented'
+                elif case == 'path': row['Replace']['Path'] = '../outside'
+                elif case == 'directory': row['Replace']['Dir'] = str(source / 'third_party/sing')
+                elif case == 'replacement-sum': row['Replace']['Sum'] = 'h1:invented'
+                elif case == 'stock': row.pop('Replace')
+                elif case == 'extra': changed.append({'Path': 'example.invalid/extra', 'Replace': {'Path': './extra', 'Dir': str(source / 'extra')}})
+                else: row['Main'] = True
+                with self.subTest(case=case), self.assertRaises(RuntimeError): self.check_nine_vendor_buildinfo(facts, changed)
+            outside = source / 'outside'; outside.mkdir()
+            escaped = source / 'third_party/fswatch'; escaped.rmdir(); escaped.symlink_to(source.parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
+                self.check_nine_vendor_buildinfo(facts, graph)
 
     def test_trimpath_does_not_invent_absent_ldflags(self):
         self.check(self.facts())
@@ -1077,7 +1254,7 @@ class FormalOutputs(unittest.TestCase):
                     'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement', 'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                     'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
                     'wakeNow', 'recordScreenState']
-                (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' + self.validation_result_objc_header())
+                (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' + self.validation_result_objc_header() + self.hot_objc_header())
             info = framework / 'Info.plist'; info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
             with patch('artifacts.check_buildinfo') as buildinfo:
                 output = inspect_framework(framework, self.value, [], expected_id)
@@ -1085,6 +1262,14 @@ class FormalOutputs(unittest.TestCase):
                 self.assertEqual(buildinfo.call_count, 2)
                 for row in output['slices'].values():
                     self.assertEqual(row['validationResultGetterContract']['receiver'], 'LibboxConfigValidationResult')
+                    self.assertEqual(row['hotObjectiveCContract'], objc_hot_contract(self.hot_objc_header()))
+                for entry in entries:
+                    path = framework / entry['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
+                    original = path.read_text()
+                    path.write_text(original.replace(')runtimeCapabilities:', ')omittedCapabilities:'))
+                    with self.subTest(component=entry['LibraryIdentifier']), self.assertRaisesRegex(RuntimeError, 'HOT method'):
+                        inspect_framework(framework, self.value, [], expected_id)
+                    path.write_text(original)
                 original_header = framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
                 text = original_header.read_text()
                 for missing in ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',

@@ -21,6 +21,7 @@ from xml.etree import ElementTree as ET
 
 sys.dont_write_bytecode = True
 from fork_input import ROOT, canonical, decode, git, git_environment, require, sha, tool_environment
+from source_policy import candidate_vendors, verify_vendor_module_declarations, verify_vendor_sources, verify_vendor_graph
 from artifacts import android_api, elf_loads, file_pin, hot_jni_contract, inspect_hot_java, module, module_stream, tree_inventory, zip_entries
 
 APP_REPOSITORY = 'polaris-arch/Polaris'
@@ -364,12 +365,7 @@ def source_identity(identity=None):
                 and isinstance(digest, str) and re.fullmatch('[0-9a-f]{64}', digest),
                 'invalid kernel source file pin')
     require(files['daemon/runtime_config.proto'] == PROTO, 'paired runtime protocol bytes differ')
-    vendors = identity['vendors']
-    require(isinstance(vendors, dict) and set(vendors) == set(VENDORS), 'exact nine vendor names required')
-    for name, row in vendors.items():
-        require(isinstance(row, (list, tuple)) and len(row) == 3 and row[0] == VENDORS[name][0]
-                and isinstance(row[1], str) and re.fullmatch('[0-9a-f]{40}', row[1])
-                and type(row[2]) is int and 0 < row[2] <= 65536, 'invalid kernel vendor pin')
+    candidate_vendors(identity['vendors'])
     return identity
 
 
@@ -380,30 +376,9 @@ def source_facts(source, generated=False, *, identity=None):
     clean(source, generated=generated)
     for name, digest in selected['files'].items():
         require(file_pin(source / name)['sha256'] == digest, 'kernel file differs: ' + name)
-    from source_policy import source_module_declarations
-    directives, dependencies, replacements = source_module_declarations((source / 'go.mod').read_bytes())
-    require(directives == {'module': 'github.com/sagernet/sing-box', 'go': '1.27.0', 'toolchain': 'go1.27.2'}, 'kernel Go directives differ')
-    local = {key: target[0] for key, (version, target) in replacements.items() if len(target) == 1 and not version}
-    require(local == {key: './third_party/' + row[0] for key, row in selected['vendors'].items()}, 'exact nine local replacements required')
-    vendors = {}
-    for name, (directory, tree, count) in selected['vendors'].items():
-        prefix = 'third_party/' + directory
-        require(git(source, 'rev-parse', 'HEAD:' + prefix) == tree, 'vendor subtree differs')
-        rows = git(source, 'ls-tree', '-r', 'HEAD', '--', prefix).splitlines()
-        require(len(rows) == count, 'vendor inventory differs')
-        for row in rows:
-            info, path = row.split('\t'); mode, kind, blob = info.split()
-            target = source / path
-            if mode == '120000':
-                require(path == 'third_party/tailscale/.stignore' and target.is_symlink() and os.readlink(target) == '.gitignore', 'unexpected vendor symlink')
-                raw = os.readlink(target).encode()
-            else:
-                require(mode in ('100644', '100755') and target.is_file() and not target.is_symlink() and
-                        bool(target.stat().st_mode & 0o111) == (mode == '100755'), 'vendor mode differs')
-                require(target.stat().st_size <= 32 * 1024 * 1024, 'vendor file exceeds byte budget')
-                raw = target.read_bytes()
-            require(kind == 'blob' and hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == blob, 'vendor bytes differ')
-        vendors[name] = {'path': './' + prefix, 'tree': tree, 'files': count}
+    declarations = candidate_vendors(selected['vendors'])
+    verify_vendor_module_declarations((source / 'go.mod').read_bytes(), declarations)
+    vendors, _, _, _ = verify_vendor_sources(source, declarations, git)
     return {'repository': KERNEL_REPOSITORY, 'repositoryId': KERNEL_REPOSITORY_ID,
             'commit': selected['commit'], 'tree': selected['tree'], 'files': selected['files'], 'vendors': vendors,
             'trackedMirror': tracked_mirror(source)}
@@ -411,14 +386,7 @@ def source_facts(source, generated=False, *, identity=None):
 
 def graph_facts(graph, source, *, identity=None):
     selected = source_identity(identity)
-    require(len(graph) == len({row['Path'] for row in graph}), 'duplicate module graph row')
-    local = {r['Path']: r for r in graph if r.get('Replace') and not r['Replace'].get('Version')}
-    require(set(local) == set(selected['vendors']), 'actual graph replacements differ')
-    for name, row in local.items():
-        replacement = row['Replace']; expected = './third_party/' + selected['vendors'][name][0]
-        require(replacement['Path'] == expected and Path(replacement['Dir']).resolve(strict=True) == (source / expected).resolve(strict=True), 'local graph path differs')
-        require(not row.get('Sum') and not replacement.get('Sum') and not replacement.get('Version'), 'local replacement must not invent h1/version')
-    return graph
+    return verify_vendor_graph(graph, source, candidate_vendors(selected['vendors']))
 
 
 def native_modules(facts, graph, source):

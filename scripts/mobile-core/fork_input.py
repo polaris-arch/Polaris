@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
-from source_policy import validate_source_policy, verify_source_policy_files
+from source_policy import validate_source_policy, verify_source_policy_files, verify_vendor_sources
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = Path(__file__).with_name('source-contract.json')
@@ -166,9 +166,14 @@ def verify_source(source, value, *, generator_outputs=False):
     if policy:
         meta = policy['metacubex']
         prefix = meta['replacementPath'][2:]
-        names = git(source, 'ls-tree', '-r', '--name-only', 'HEAD', '--', prefix).splitlines()
-        require(len(names) == meta['replacementFileCount'], 'actual Meta tracked inventory differs')
-        files, total_bytes = {}, 0
+        files, total_bytes, vendor_evidence = {}, 0, {}
+        if 'vendors' in policy:
+            _, files, modes, trees = verify_vendor_sources(source, policy['vendors'], git)
+            vendor_evidence = {'vendor_modes': modes, 'vendor_trees': trees}
+            names = []  # The complete tracked nine-vendor bytes/modes are already read.
+        else:
+            names = git(source, 'ls-tree', '-r', '--name-only', 'HEAD', '--', prefix).splitlines()
+            require(len(names) == meta['replacementFileCount'], 'actual Meta tracked inventory differs')
         for name in names + ['go.mod', 'go.sum', meta['bindingPath'], meta['patchPath']]:
             path = source / name
             require(path.is_file() and not path.is_symlink() and path.resolve(strict=True).is_relative_to(source),
@@ -178,7 +183,7 @@ def verify_source(source, value, *, generator_outputs=False):
             require(total_bytes <= 32 * 1024 * 1024, 'reviewed source proof exceeds bound')
             files[name] = path.read_bytes()
         reviewed['reviewedSource'] = verify_source_policy_files(policy, value, files,
-            git(source, 'rev-parse', 'HEAD:' + prefix))
+            git(source, 'rev-parse', 'HEAD:' + prefix), **vendor_evidence)
     return {'schema': 'polaris-mobile-source-observation-v1', 'sourceCommit': value['sourceCommit'],
             'sourceTree': value['sourceTree'], 'sourceTag': value['sourceTag'],
             'sourceTagObject': value['sourceTagObject'], 'sourceOverlay': 0,

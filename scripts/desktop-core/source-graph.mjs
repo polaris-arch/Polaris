@@ -209,13 +209,27 @@ export const desktopSourceManifestPath = (spec) => isForkSource(spec)
 // source revision needs its own reviewed toolchain input; never admit any Go.
 // This declaration is inside the reviewed, SHA-pinned consumer contract. No
 // mutable branch, release label, environment value or pending selection admits it.
+// Fixed schema names/paths mirror the shared archive/source validator. Actual
+// versions, trees and counts must come from the reviewed caller, never defaults.
+const REVIEWED_VENDOR_DIRECTORIES = Object.freeze({
+  'github.com/sagernet/sing-tun': 'sing-tun',
+  'github.com/sagernet/tailscale': 'tailscale',
+  'github.com/metacubex/utls': 'metacubex-utls',
+  'github.com/sagernet/cronet-go': 'cronet-go',
+  'github.com/sagernet/fswatch': 'fswatch',
+  'github.com/sagernet/sing': 'sing',
+  'github.com/sagernet/sing-quic': 'sing-quic',
+  'github.com/sagernet/wireguard-go': 'wireguard-go',
+  'github.com/database64128/tfo-go/v2': 'tfo-go',
+});
 export function reviewedSourcePolicy(context) {
   if (!Object.hasOwn(context ?? {}, 'sourcePolicy')) return undefined;
   const p = context.sourcePolicy;
+  const v2 = p?.schema === 'polaris-reviewed-kernel-source-v2';
   const fields = ['schema', 'sourceCommit', 'sourceTree', 'goDirective', 'goVersion', 'toolchain',
-    'goModSha256', 'goSumSha256', 'metacubex'];
+    'goModSha256', 'goSumSha256', 'metacubex', ...(v2 ? ['vendors'] : [])];
   requireGraph(p && same(Object.keys(p).sort(), fields.sort())
-    && p.schema === 'polaris-reviewed-kernel-source-v1'
+    && ['polaris-reviewed-kernel-source-v1', 'polaris-reviewed-kernel-source-v2'].includes(p.schema)
     && isTree(p.sourceCommit) && p.sourceCommit === context.sourceCommit
     && isTree(p.sourceTree) && p.sourceTree === context.sourceTree
     && p.goDirective === '1.27.0' && p.goVersion === '1.27.2' && p.toolchain === 'go1.27.2'
@@ -231,6 +245,28 @@ export function reviewedSourcePolicy(context) {
     && m.patchPath === 'release/dependency-sources/metacubex-utls-reality-alpn.patch'
     && isSha(m.bindingSha256) && isSha(m.patchSha256) && isSha(m.upstreamZipSha256)
     && typeof m.upstreamH1 === 'string' && /^h1:[A-Za-z0-9+/]{43}=$/.test(m.upstreamH1), 'Exact reviewed Meta source policy differs');
+  if (v2) {
+    requireGraph([p.sourceCommit, p.sourceTree, m.replacementTree, m.upstreamCommit].every(v => v.length === 40)
+      && [p.goModSha256, p.goSumSha256, m.bindingSha256, m.patchSha256, m.upstreamZipSha256].every(v => v.length === 64)
+      && m.upstreamH1.length === 47
+      && ['goModSha256', 'goSumSha256'].every(key => !Object.hasOwn(context, key) || context[key] === p[key]),
+    'Exact reviewed v2 source hashes differ');
+    const vendors = p.vendors;
+    requireGraph(vendors && same(Object.keys(vendors).sort(), Object.keys(REVIEWED_VENDOR_DIRECTORIES).sort()),
+      'Exact nine reviewed vendor names required');
+    const vendorFields = ['version', 'replacementPath', 'replacementTree', 'replacementFileCount'];
+    for (const [name, pin] of Object.entries(vendors)) {
+      requireGraph(pin && same(Object.keys(pin).sort(), [...vendorFields].sort())
+        && typeof pin.version === 'string'
+        && /^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$(?![\s\S])/.test(pin.version)
+        && pin.replacementPath === `./third_party/${REVIEWED_VENDOR_DIRECTORIES[name]}`
+        && isTree(pin.replacementTree) && pin.replacementTree.length === 40 && Number.isSafeInteger(pin.replacementFileCount)
+        && pin.replacementFileCount > 0 && pin.replacementFileCount <= 65536,
+      `Exact reviewed vendor declaration differs: ${name}`);
+    }
+    requireGraph(same(vendors[m.module], Object.fromEntries(vendorFields.map((key) => [key, m[key]]))),
+      'Meta and nine-vendor declarations disagree');
+  }
   return p;
 }
 export function releaseGoVersion(contract) {
