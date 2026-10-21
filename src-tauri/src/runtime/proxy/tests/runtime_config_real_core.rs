@@ -1049,6 +1049,107 @@ fn store_admission_fixture() -> Value {
     )
 }
 
+// Exercise the exact production hot-intent gate from an existing ordinary CI
+// entrypoint. These cases neither start a core nor change the legacy builder.
+fn fixture_hot_route_reference_admission() {
+    let original = store_admission_fixture();
+    let check = |label: &str, value: Value, expected: bool| {
+        let typed = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            super::super::runtime_config::runtime_route_targets_valid(&typed),
+            expected,
+            "hot route reference admission: {label}"
+        );
+    };
+    for (target, expected) in [
+        ("node-a", true),
+        ("node-b", true),
+        ("", true),
+        ("nonexistent-node", false),
+        (" ", false),
+    ] {
+        let mut value = original.clone();
+        set_fixture_route_target(&mut value, target);
+        check(target, value, expected);
+    }
+    let mut missing = original.clone();
+    set_fixture_route_target(&mut missing, "nonexistent-node");
+    for projection in ["trafficRules", "policyRules", "customRules"] {
+        let mut value = missing.clone();
+        for earlier in ["trafficRules", "policyRules"] {
+            if earlier == projection {
+                break;
+            }
+            value.as_object_mut().unwrap().remove(earlier);
+        }
+        check(projection, value, false);
+    }
+    let mut value = missing.clone();
+    value["trafficRules"] = json!([]);
+    check("empty authoritative traffic collection", value, true);
+    let mut value = missing.clone();
+    value["trafficRules"] = original["trafficRules"].clone();
+    check("stale legacy mirrors", value, true);
+    let mut value = original.clone();
+    value["trafficRules"][0]["targetServerId"] = "nonexistent-node".into();
+    check("authoritative effect overrides legacy target", value, true);
+    let mut value = original.clone();
+    value["trafficRules"][0]["effects"]["route"]["targetServerId"] = "nonexistent-node".into();
+    check("invalid authoritative effect", value, false);
+    for (path, replacement) in [
+        ("/trafficRules/0/enabled", json!(false)),
+        ("/trafficRules/0/effects/route/enabled", json!(false)),
+        ("/trafficRules/0/effects/route/action", json!("direct")),
+        ("/trafficRules/0/effects/route/action", json!("block")),
+        ("/trafficRules/0/effects", json!({})),
+        ("/proxyMode", json!("global")),
+        ("/proxyMode", json!("direct")),
+    ] {
+        let mut value = missing.clone();
+        *value.pointer_mut(path).unwrap() = replacement;
+        check(path, value, true);
+    }
+    let mut value = missing.clone();
+    value["trafficRules"][0]["effects"]["route"]["resolutionOnly"] = true.into();
+    check("resolution-only route", value, true);
+    let mut value = original.clone();
+    value["trafficRules"][0]["effects"]["route"]
+        .as_object_mut()
+        .unwrap()
+        .remove("targetServerId");
+    check("absent authoritative target inherits", value, true);
+    let mut value = missing;
+    let mut added = value["servers"][0].clone();
+    added["id"] = "nonexistent-node".into();
+    value["servers"].as_array_mut().unwrap().push(added);
+    check("new candidate node is a valid target", value, true);
+
+    let mut app = original.clone();
+    app["appRules"] = json!([{"appId":"fixture-app","action":"proxy","enabled":true,
+        "targetServerId":"nonexistent-node"}]);
+    check("app routing disabled", app.clone(), true);
+    app["appRoutingEnabled"] = true.into();
+    check("active app target missing", app.clone(), false);
+    for (path, replacement) in [
+        ("/appRules/0/targetServerId", json!("node-b")),
+        ("/appRules/0/targetServerId", json!("")),
+        ("/appRules/0/enabled", json!(false)),
+        ("/appRules/0/action", json!("direct")),
+        ("/appRules/0/action", json!("block")),
+        ("/proxyMode", json!("global")),
+        ("/proxyMode", json!("direct")),
+    ] {
+        let mut value = app.clone();
+        *value.pointer_mut(path).unwrap() = replacement;
+        check(path, value, true);
+    }
+    app["appRules"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("targetServerId");
+    check("absent app target inherits", app, true);
+}
+
 fn fixture_store_transition_admission() {
     let directory = TestDir::new("polaris-fixture-store-admission-");
     let manager = ConfigManager::new(directory.to_path_buf());
@@ -1229,6 +1330,7 @@ fn selector_admission_fixture() -> Value {
 
 #[test]
 fn private_probe_selector_admission_accepts_only_owned_slot_graph() {
+    fixture_hot_route_reference_admission();
     fixture_store_transition_admission();
     let mut generated = selector_admission_fixture();
     assert_eq!(inspect_selectors(&generated).as_array().unwrap().len(), 3);
@@ -2136,6 +2238,88 @@ async fn prepare_fixture_graph(rt: &ProxyRuntime, config: &Value) -> (Value, Val
     (generated, checked)
 }
 
+// Default selection, DNS and Auto already have strict compiler contracts. Keep
+// them on the ordinary preparation path without duplicating their validators.
+fn fixture_existing_reference_contracts(rt: &ProxyRuntime, original: &Value) {
+    let typed = serde_json::from_value(original.clone()).unwrap();
+    let deps = rt.generate_candidate_deps(&typed, original).unwrap();
+    let check = |label: &str, value: Value, expected: bool| {
+        let typed = serde_json::from_value(value).unwrap();
+        assert!(super::super::runtime_config::runtime_route_targets_valid(
+            &typed
+        ));
+        let result = polaris_config_engine::builder::generate_sing_box_config_with_report(
+            &typed,
+            &std::collections::BTreeMap::new(),
+            &deps,
+        );
+        assert_eq!(
+            result.is_ok(),
+            expected,
+            "existing reference contract: {label}"
+        );
+    };
+    for (id, expected) in [
+        ("node-b", true),
+        ("__direct__", true),
+        ("__block__", true),
+        ("nonexistent-node", false),
+    ] {
+        let mut value = original.clone();
+        value["selectedServerId"] = id.into();
+        check("default selection", value, expected);
+    }
+    for (path, replacement) in [
+        ("/dnsDefaults/proxyServerId", json!("missing-dns")),
+        (
+            "/dnsRules/0/effects/dns/action",
+            json!({"type":"server","serverId":"missing-dns"}),
+        ),
+        (
+            "/dnsRules/0/effects/dns/action",
+            json!({"type":"group","groupId":"missing-group"}),
+        ),
+        (
+            "/dnsServers/3/outbound",
+            json!({"type":"node","nodeId":"nonexistent-node"}),
+        ),
+    ] {
+        let mut value = original.clone();
+        *value.pointer_mut(path).unwrap() = replacement;
+        check(path, value, false);
+    }
+    let mut inherited = original.clone();
+    inherited["dnsDefaults"]["proxyServerId"] = "".into();
+    check("empty DNS default retains inheritance", inherited, true);
+
+    let mut auto = original.clone();
+    auto["autoSelectEnabled"] = true.into();
+    auto["selectedServerId"] = "nonexistent-node".into();
+    auto["selectionIntent"] = json!({"mode":"auto","scope":"manual"});
+    check("Auto supersedes concrete default", auto.clone(), true);
+    auto["selectionIntent"] =
+        json!({"mode":"auto","scope":"subscription","subscriptionId":"missing-sub"});
+    check("Auto absent scope", auto, false);
+
+    let mut auto = original.clone();
+    auto["autoSelectEnabled"] = true.into();
+    for key in ["trafficRules", "policyRules", "customRules"] {
+        let route = &mut auto[key][0];
+        route.as_object_mut().unwrap().remove("targetServerId");
+        route["effects"]["route"]
+            .as_object_mut()
+            .unwrap()
+            .remove("targetServerId");
+        route["effects"]["route"]["targetAutoSelect"] = json!({"scope":"manual"});
+    }
+    check("rule Auto remains valid", auto.clone(), true);
+    auto["autoSelectEnabled"] = false.into();
+    auto["autoSelectPins"] = json!([{"target":{"scope":"manual"},"serverId":"node-b"}]);
+    check("frozen Auto with confirmed pin", auto.clone(), true);
+    auto["autoSelectPins"][0]["serverId"] = "nonexistent-node".into();
+    check("frozen Auto invalid pin", auto, false);
+}
+
 // This runs in the existing ordinary exact entrypoint. Production dependency
 // capture briefly binds/releases loopback ports; no core, process, RPC, backend,
 // DNS request, or outbound traffic is started. Each scenario owns a fresh dir.
@@ -2158,6 +2342,9 @@ fn fixture_generated_transition_admission() {
                     let initial = save_fixture_config(&rt.config, &store_admission_fixture());
                     let (generated, initial_projection) =
                         prepare_fixture_graph(&rt, &initial).await;
+                    if scenario == "apply-and-status" {
+                        fixture_existing_reference_contracts(&rt, &initial);
+                    }
                     let loaded = rt.config.load_full().unwrap();
                     canonical_fixture(&loaded, &initial);
                     saved_fixture_config(&rt.config, &initial);
@@ -2818,6 +3005,10 @@ async fn real_hot_dispatcher_rejections_preserve_runtime() {
     );
     let network = Network::new();
     let running = Running::start(&admission, network.config(), &mut evidence).await;
+    let mut old = connect(running.mixed).await;
+    exchange(&mut old, b'A', b"rejections-old-before").await;
+    assert_eq!(network.a.targets.lock().unwrap()[0].host, "127.0.0.2");
+    assert_eq!(network.a.targets.lock().unwrap()[0].port, 80);
     let snapshot = running.rt.current_config_snapshot().unwrap();
     let source = std::fs::read(running.rt.runtime_config_path()).unwrap();
     let mut desired = running.rt.config.current().unwrap();
@@ -2829,7 +3020,12 @@ async fn real_hot_dispatcher_rejections_preserve_runtime() {
     };
     desired["mixedPort"] = port.into();
     let desired = save_fixture_config(&running.rt.config, &desired);
+    let desired_bytes = std::fs::read(running.rt.config.path()).unwrap();
     let result = running.rt.apply_pending_transaction(None).await;
+    let after = running.client.get_runtime_capabilities().await;
+    let observation = rejection_observation("structural-rejection", &running, &result, &after);
+    evidence.record(observation.clone());
+    eprintln!("{observation}");
     assert_eq!(result.status, "restartRequired");
     assert!(result.restart_required && result.restart_confirmation.is_some());
     assert!(result.apply_id.is_none());
@@ -2839,6 +3035,10 @@ async fn real_hot_dispatcher_rejections_preserve_runtime() {
     );
     assert_eq!(running.rt.current_config_snapshot().unwrap(), snapshot);
     assert_eq!(running.rt.config.current().unwrap(), desired);
+    assert_eq!(
+        std::fs::read(running.rt.config.path()).unwrap(),
+        desired_bytes
+    );
     assert_eq!(desired["mixedPort"], port);
     assert_eq!(
         std::fs::read(running.rt.runtime_config_path()).unwrap(),
@@ -2848,16 +3048,47 @@ async fn real_hot_dispatcher_rejections_preserve_runtime() {
         running.unchanged_process().await.active,
         running.initial.active
     );
+    assert_eq!(
+        after.unwrap().control_revision,
+        running.initial.control_revision
+    );
+    exchange(&mut old, b'A', b"rejections-old-after-structural").await;
     // The real store is allowed to reject an invalid reference before dispatcher.
     let mut invalid = snapshot.clone();
     set_fixture_route_target(&mut invalid, "nonexistent-node");
     let invalid_saved = running.rt.config.save_full(&invalid);
     let invalid_stage = if invalid_saved.is_err() {
+        evidence.record(json!({"phase":"invalid-reference-store-rejection","saveRejected":true}));
+        assert_eq!(running.rt.config.current().unwrap(), desired);
+        assert_eq!(
+            std::fs::read(running.rt.config.path()).unwrap(),
+            desired_bytes
+        );
         "store"
     } else {
+        let invalid_bytes = std::fs::read(running.rt.config.path()).unwrap();
         let rejected = running.rt.apply_pending_transaction(None).await;
-        assert!(matches!(rejected.status, "rejected" | "restartRequired"));
-        assert!(rejected.apply_id.is_none());
+        let after = running.client.get_runtime_capabilities().await;
+        let observation =
+            rejection_observation("invalid-reference-rejection", &running, &rejected, &after);
+        evidence.record(observation.clone());
+        eprintln!("{observation}");
+        assert_eq!(rejected.status, "rejected", "{observation}");
+        assert!(rejected.apply_id.is_none() && rejected.transaction_id.is_none());
+        assert!(!rejected.restart_required && rejected.restart_confirmation.is_none());
+        assert_eq!(
+            serde_json::to_value(&rejected.reasons).unwrap(),
+            json!([{"code":"INVALID_ROUTE_TARGET","path":"route.targetServerId"}])
+        );
+        assert_eq!(
+            after.unwrap().control_revision,
+            running.initial.control_revision
+        );
+        assert_eq!(running.rt.config.current().unwrap(), invalid);
+        assert_eq!(
+            std::fs::read(running.rt.config.path()).unwrap(),
+            invalid_bytes
+        );
         "dispatcher"
     };
     assert!(running.rt.pending_force_restart.read().unwrap().is_none());
@@ -2870,11 +3101,51 @@ async fn real_hot_dispatcher_rejections_preserve_runtime() {
         std::fs::read(running.rt.runtime_config_path()).unwrap(),
         source
     );
+    exchange(&mut old, b'A', b"rejections-old-after-invalid").await;
+    assert_eq!(network.a.targets.lock().unwrap().len(), 1);
+    assert!(network.b.targets.lock().unwrap().is_empty());
+    drop(old);
     evidence.record(json!({"phase":"rejected","structuralResult":result,
         "invalidReferenceRejectedAt":invalid_stage,"savedStructuralIntentPreservedBeforeInvalidCase":true,
-        "runtimeSourceUnchanged":true,"restartConfirmed":false}));
+        "runtimeSourceUnchanged":true,"restartConfirmed":false,"oldTcpStreamPreserved":true}));
     running.finish(&admission, &mut evidence).await;
     network.assert_only_fixture_queries();
     drop(network);
     evidence.passed();
+}
+
+// Flush safe, bounded observations before assertions so failures retain the
+// actual status and identity without exposing config contents or API secrets.
+fn rejection_observation(
+    phase: &str,
+    running: &Running,
+    result: &super::super::runtime_config::RuntimeApplyResult,
+    after: &Result<daemon::RuntimeCapabilities, RuntimeConfigError>,
+) -> Value {
+    let reasons: Vec<_> = result
+        .reasons
+        .iter()
+        .take(8)
+        .map(|reason| {
+            let reason = serde_json::to_value(reason).unwrap();
+            let bounded = |key: &str| {
+                reason[key]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(160)
+                    .collect::<String>()
+            };
+            json!({"code":bounded("code"),"path":bounded("path")})
+        })
+        .collect();
+    json!({"phase":phase,"status":result.status,"reasons":reasons,
+        "hasApplyId":result.apply_id.is_some(),"hasTransactionId":result.transaction_id.is_some(),
+        "restartRequired":result.restart_required,"hasRestartConfirmation":result.restart_confirmation.is_some(),
+        "before":identity(running.initial.active.as_ref()),
+        "after":after.as_ref().ok().map(|value| identity(value.active.as_ref())),
+        "beforeControlRevision":running.initial.control_revision,
+        "afterControlRevision":after.as_ref().ok().map(|value|value.control_revision),
+        "capabilitiesReadSucceeded":after.is_ok(),
+        "expectedPid":running.pid,"observedPid":running.rt.status().pid})
 }

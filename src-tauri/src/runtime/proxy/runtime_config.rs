@@ -439,6 +439,17 @@ fn inline_custom_rules(value: &mut Value, user: &UserConfig, directory: &str) ->
     Ok(())
 }
 
+/// Hot Apply must preserve an explicit active route target. The legacy startup
+/// builder tolerates dangling references by following the global selector; that
+/// fallback is not permission to publish a different live routing intent.
+/// Reuse the builder's effective traffic/app gates, including authoritative
+/// effects and legacy projections. An absent or empty target still inherits.
+pub(super) fn runtime_route_targets_valid(config: &UserConfig) -> bool {
+    polaris_config_engine::builder::endpoint_routes::engaged_rule_targeted_server_ids(config)
+        .iter()
+        .all(|id| id.is_empty() || config.servers.iter().any(|server| server.id == *id))
+}
+
 /// Explicit desired-control deltas only. Config-only edits preserve each live
 /// selector independently. A removed live member requires a validated fallback.
 fn selector_intents(
@@ -795,6 +806,14 @@ impl ProxyRuntime {
             Ok(value) => value,
             Err(_) => return self.remember_runtime_result(RuntimeApplyResult::status("rejected")),
         };
+        if !runtime_route_targets_valid(&typed) {
+            let mut result = RuntimeApplyResult::status("rejected");
+            result.reasons.push(RuntimeApplyReason {
+                code: "INVALID_ROUTE_TARGET",
+                path: "route.targetServerId".into(),
+            });
+            return self.remember_runtime_result(result);
+        }
         if self
             .validate_required_bind_interfaces(&typed)
             .await
