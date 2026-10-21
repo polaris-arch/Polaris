@@ -1359,8 +1359,9 @@ fn restore_core_projection_forms(generated: &Value, expected: &Value) -> Value {
                     .unwrap_or_else(|| vec![actual.clone()]);
                 if actual.len() == wanted.len()
                     && actual.iter().zip(wanted).all(|(a, b)| {
-                        a == b || (key == "ip_cidr"
-                            && fixture_cidr(a).is_some_and(|ip| Some(ip) == fixture_cidr(b)))
+                        a == b
+                            || (key == "ip_cidr"
+                                && fixture_cidr(a).is_some_and(|ip| Some(ip) == fixture_cidr(b)))
                     })
                 {
                     rule[key] = Value::Array(wanted.clone());
@@ -1368,7 +1369,10 @@ fn restore_core_projection_forms(generated: &Value, expected: &Value) -> Value {
             }
         }
     }
-    let expected_sets = expected["route"]["rule_set"].as_array().into_iter().flatten();
+    let expected_sets = expected["route"]["rule_set"]
+        .as_array()
+        .into_iter()
+        .flatten();
     for (set, template) in restored
         .pointer_mut("/route/rule_set")
         .and_then(Value::as_array_mut)
