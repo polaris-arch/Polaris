@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const DOMAIN: &str = "runtime-loopback.test";
+const FIXTURE_RULE_SET: &str = "custom-rule-loop-route";
 const IO_BOUND: Duration = Duration::from_secs(3);
 const METHODS: [&str; 6] = [
     "GetRuntimeCapabilities",
@@ -1438,6 +1439,21 @@ fn fixture_bundled_rules_dir() -> PathBuf {
     actual
 }
 
+// The route writer externalizes the mirrored custom rule even for one domain.
+// DNS effects use their own literal matcher path. Keep these exact contracts
+// together; an accepted inline source still has the same route rule_set edge.
+fn fixture_route_terminal() -> Value {
+    json!({"rule_set":[FIXTURE_RULE_SET],"action":"route","outbound":"rule-sel-loop-route"})
+}
+
+fn fixture_dns_terminal(server: &str) -> Value {
+    json!({"domain":[DOMAIN],"action":"route","server":server})
+}
+
+fn fixture_custom_rules() -> Value {
+    json!([{"domain":[DOMAIN]}])
+}
+
 // Binary sets remain local in HOT's accepted configuration. Prove their exact
 // catalog ownership and bytes, rather than pretending the SRS contains DOMAIN.
 // Ordered terminal rules keep later geo matches off the fixture DOMAIN path.
@@ -1482,50 +1498,67 @@ fn inspect_rule_sets(
                 "size":actual.len(),"sha256":polaris_updater::sha256_hex(&actual)}));
             continue;
         }
-        let rules = match set["type"].as_str().unwrap() {
+        assert_eq!(tag, FIXTURE_RULE_SET, "only the owned custom source tag");
+        let rules = fixture_custom_rules();
+        match set["type"].as_str().unwrap() {
             "local" => {
-                assert_eq!(set["format"], "source");
-                let path = PathBuf::from(set["path"].as_str().unwrap());
-                assert_eq!(path.parent(), Some(custom_dir));
+                let path = custom_dir.join(format!("{FIXTURE_RULE_SET}.json"));
+                assert_eq!(
+                    *set,
+                    json!({"tag":FIXTURE_RULE_SET,"type":"local","format":"source","path":path}),
+                    "exact owned custom source identity"
+                );
                 let content: Value = serde_json::from_slice(&regular(&path, 65536)).unwrap();
-                content["rules"].clone()
+                assert_eq!(
+                    content,
+                    json!({"version":1,"rules":rules}),
+                    "exact owned source document"
+                );
             }
-            "inline" => set["rules"].clone(),
+            "inline" => assert_eq!(
+                *set,
+                json!({"tag":FIXTURE_RULE_SET,"type":"inline","rules":rules}),
+                "exact accepted custom snapshot"
+            ),
             _ => panic!("no remote or unreviewed rule source"),
-        };
-        assert_eq!(
-            rules,
-            json!([{"domain":[DOMAIN]}]),
-            "only owned custom rules"
-        );
-        // Only custom source rules are embedded by the production HOT snapshot.
-        *set = json!({"tag":tag,"type":"inline","rules":rules});
+        }
+        // Only this verified custom source is embedded by the HOT snapshot.
+        *set = json!({"tag":FIXTURE_RULE_SET,"type":"inline","rules":rules});
     }
-    for (rules, terminal) in [
-        (
-            &generated["route"]["rules"],
-            json!({"domain":[DOMAIN],"action":"route","outbound":"rule-sel-loop-route"}),
-        ),
-        (
-            &generated["dns"]["rules"],
-            json!({"domain":[DOMAIN],"action":"route","server":expected_dns}),
-        ),
+    assert!(
+        tags.contains(FIXTURE_RULE_SET),
+        "owned terminal source must exist"
+    );
+    for (section, terminal) in [
+        ("route", fixture_route_terminal()),
+        ("dns", fixture_dns_terminal(expected_dns)),
     ] {
-        let rules = rules.as_array().unwrap();
+        let rules = generated[section]["rules"].as_array().unwrap();
         let positions: Vec<_> = rules
             .iter()
             .enumerate()
             .filter_map(|(index, rule)| (rule == &terminal).then_some(index))
             .collect();
-        assert_eq!(positions.len(), 1, "unique exact fixture terminal rule");
+        assert_eq!(
+            positions.len(),
+            1,
+            "unique exact {section} fixture terminal rule"
+        );
         for (index, rule) in rules.iter().enumerate() {
             assert!(rule["rules"].is_null(), "no unreviewed logical rule branch");
             for tag in strings(&rule["rule_set"]) {
                 assert!(tags.contains(tag), "undefined rule-set reference: {tag}");
-                assert!(
-                    index > positions[0],
-                    "rule-set matching must follow the fixture terminal rule"
-                );
+                if tag == FIXTURE_RULE_SET {
+                    assert!(
+                        section == "route" && index == positions[0] && rule == &terminal,
+                        "owned custom source is reachable only through its exact route terminal"
+                    );
+                } else {
+                    assert!(
+                        index > positions[0],
+                        "builtin rule-set matching must follow the fixture terminal rule"
+                    );
+                }
             }
         }
     }
@@ -1673,22 +1706,22 @@ fn rule_set_admission_fixture() -> (TestDir, Value) {
     for name in ["rules", "bundled"] {
         std::fs::write(directory.join(name).join("geosite-cn.srs"), &bytes).unwrap();
     }
-    let custom = directory.join("custom/owned.json");
-    let content = json!({"version":3,"rules":[{"domain":[DOMAIN]}]});
+    let custom = directory.join(format!("custom/{FIXTURE_RULE_SET}.json"));
+    let content = json!({"version":1,"rules":fixture_custom_rules()});
     std::fs::write(&custom, serde_json::to_vec(&content).unwrap()).unwrap();
     let generated = json!({
         "route":{"rule_set":[
             {"tag":"geosite-cn","type":"local","format":"binary",
                 "path":directory.join("rules/geosite-cn.srs")},
-            {"tag":"owned","type":"local","format":"source","path":custom}
+            {"tag":FIXTURE_RULE_SET,"type":"local","format":"source","path":custom}
         ],"rules":[
-            {"domain":[DOMAIN],"action":"route","outbound":"rule-sel-loop-route"},
+            fixture_route_terminal(),
             {"rule_set":"geosite-cn","action":"route","outbound":"direct"},
             {"ip_cidr":["127.0.0.1/32","::1/128","::ffff:a00:0/104"],
                 "action":"route","outbound":"direct"}
         ]},
         "dns":{"rules":[
-            {"domain":[DOMAIN],"action":"route","server":"dns-user-loop-a"},
+            fixture_dns_terminal("dns-user-loop-a"),
             {"rule_set":"geosite-cn","server":"dns-domestic"}
         ]}
     });
@@ -1697,6 +1730,7 @@ fn rule_set_admission_fixture() -> (TestDir, Value) {
 
 #[test]
 fn builtin_rule_set_admission_accepts_owned_sources_and_order() {
+    fixture_generated_transition_admission();
     let (directory, generated) = rule_set_admission_fixture();
     let inspect = |value: &Value| {
         inspect_rule_sets(
@@ -1715,7 +1749,7 @@ fn builtin_rule_set_admission_accepts_owned_sources_and_order() {
     assert_eq!(sources[0]["sha256"], polaris_updater::sha256_hex(&source));
     assert_eq!(
         route["rule_set"][1],
-        json!({"tag":"owned","type":"inline","rules":[{"domain":[DOMAIN]}]})
+        json!({"tag":FIXTURE_RULE_SET,"type":"inline","rules":fixture_custom_rules()})
     );
     let mut inline = generated.clone();
     inline["route"]["rule_set"][1] = route["rule_set"][1].clone();
@@ -1736,7 +1770,16 @@ fn builtin_rule_set_admission_accepts_owned_sources_and_order() {
             .as_object_mut()
             .unwrap()
             .remove("action");
-        canonical[section]["rules"][0]["domain"] = DOMAIN.into();
+        let matcher = if section == "route" {
+            "rule_set"
+        } else {
+            "domain"
+        };
+        canonical[section]["rules"][0][matcher] = if section == "route" {
+            FIXTURE_RULE_SET.into()
+        } else {
+            DOMAIN.into()
+        };
     }
     let addresses = json!(["127.0.0.1", "::1", "::ffff:10.0.0.0/104"]);
     canonical["route"]["rules"][2]["ip_cidr"] = addresses;
@@ -1774,6 +1817,10 @@ fn builtin_rule_set_admission_rejects_source_and_order_mutations() {
             json!(directory.join("bundled/owned.json")),
         ),
         ("/route/rule_set/1/format", json!("binary")),
+        ("/route/rule_set/1/tag", json!("custom-rule-unowned")),
+        ("/route/rules/0/rule_set", json!(["geosite-cn"])),
+        ("/route/rules/1/rule_set", json!([FIXTURE_RULE_SET])),
+        ("/dns/rules/1/rule_set", json!([FIXTURE_RULE_SET])),
         ("/route/rules/0/outbound", json!("direct")),
         ("/dns/rules/0/server", json!("dns-domestic")),
         ("/route/rules/1/rule_set", json!("undefined")),
@@ -1786,6 +1833,11 @@ fn builtin_rule_set_admission_rejects_source_and_order_mutations() {
             "{pointer}"
         );
     }
+    // Old handcrafted inline terminals must not stand in for a missing source.
+    let mut old_inline = generated.clone();
+    old_inline["route"]["rules"][0] =
+        json!({"domain":[DOMAIN],"action":"route","outbound":"rule-sel-loop-route"});
+    assert!(std::panic::catch_unwind(|| inspect(&old_inline)).is_err());
     for section in ["route", "dns"] {
         for kind in 0..3 {
             let mut mutated = generated.clone();
@@ -1817,7 +1869,7 @@ fn builtin_rule_set_admission_rejects_source_and_order_mutations() {
             2 => sets[0]["url"] = "https://unreviewed.invalid/rules.srs".into(),
             3 => {
                 sets[1] = json!({
-                    "tag":"owned","type":"inline","rules":[{"domain":["other.test"]}]
+                    "tag":FIXTURE_RULE_SET,"type":"inline","rules":[{"domain":["other.test"]}]
                 });
             }
             _ => unreachable!(),
@@ -1829,7 +1881,7 @@ fn builtin_rule_set_admission_rejects_source_and_order_mutations() {
     for (pointer, value) in [
         ("/route/rule_set/0/format", Value::Null),
         ("/route/rules/0/action", Value::Null),
-        ("/route/rules/0/domain", json!("other.test")),
+        ("/route/rules/0/rule_set", json!("other")),
         ("/dns/rules/0/domain", json!([DOMAIN, "other.test"])),
         (
             "/route/rules/2/ip_cidr",
@@ -1839,7 +1891,7 @@ fn builtin_rule_set_admission_rejects_source_and_order_mutations() {
             "/route/rules/2/ip_cidr",
             json!(["::1", "127.0.0.1", "::ffff:10.0.0.0/104"]),
         ),
-        ("/route/rules/0/domain", json!(true)),
+        ("/route/rules/0/rule_set", json!(true)),
         ("/route/rules/2/ip_cidr", json!("invalid/32")),
     ] {
         let mut mutated = generated.clone();
@@ -1851,6 +1903,20 @@ fn builtin_rule_set_admission_rejects_source_and_order_mutations() {
             "{pointer}"
         );
     }
+    let custom = directory.join(format!("custom/{FIXTURE_RULE_SET}.json"));
+    let custom_bytes = std::fs::read(&custom).unwrap();
+    for document in [
+        json!({"version":3,"rules":fixture_custom_rules()}),
+        json!({"version":1,"rules":[{"domain":["other.test"]}]}),
+        json!({"version":1,"rules":[{"domain":[DOMAIN],"invert":true}]}),
+        json!({"version":1,"rules":fixture_custom_rules(),"extra":true}),
+    ] {
+        std::fs::write(&custom, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(std::panic::catch_unwind(|| inspect(&generated)).is_err());
+    }
+    std::fs::remove_file(&custom).unwrap();
+    assert!(std::panic::catch_unwind(|| inspect(&generated)).is_err());
+    std::fs::write(&custom, custom_bytes).unwrap();
     let path = directory.join("rules/geosite-cn.srs");
     let original = std::fs::read(&path).unwrap();
     let mut changed = original.clone();
@@ -1928,6 +1994,28 @@ fn inspect_generated(rt: &ProxyRuntime, config: &Value, generated: &Value) -> Va
     }
     assert_eq!(physical.len(), 2);
     let selectors = inspect_selectors(generated);
+    for (tag, target) in [
+        ("proxy-selector", &config["selectedServerId"]),
+        (
+            "rule-sel-loop-route",
+            &config["trafficRules"][0]["targetServerId"],
+        ),
+    ] {
+        let node = config["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| &node["id"] == target)
+            .expect("selector target must be an owned node");
+        let selector = outbounds
+            .iter()
+            .find(|outbound| outbound["tag"] == tag)
+            .unwrap();
+        assert_eq!(
+            selector["default"], node["name"],
+            "exact fixture selector target: {tag}"
+        );
+    }
     let expected_dns = polaris_config_engine::user_config::dns_policy::dns_server_tag(
         config["dnsRules"][0]["effects"]["dns"]["action"]["serverId"]
             .as_str()
@@ -2007,7 +2095,7 @@ fn inspect_generated(rt: &ProxyRuntime, config: &Value, generated: &Value) -> Va
         "ruleSources":rule_sources,"unusedDnsDefinitions":unused_dns,"domain":DOMAIN,"onlyTrafficInbound":"mixed-in"})
 }
 
-fn preflight(rt: &ProxyRuntime, config: &Value) -> Value {
+fn generate_fixture_graph(rt: &ProxyRuntime, config: &Value) -> Value {
     let typed: UserConfig = serde_json::from_value(config.clone()).unwrap();
     // No generated JSON is rewritten and no metadata/kernel check is bypassed.
     let deps = rt.generate_candidate_deps(&typed, config).unwrap();
@@ -2020,7 +2108,173 @@ fn preflight(rt: &ProxyRuntime, config: &Value) -> Value {
     assert!(outcome.invalid_nodes.is_empty());
     assert!(outcome.mesh_route_candidates.is_empty());
     assert!(outcome.network_canary.is_none());
-    inspect_generated(rt, config, &serde_json::to_value(outcome.config).unwrap())
+    serde_json::to_value(outcome.config).unwrap()
+}
+
+fn preflight(rt: &ProxyRuntime, config: &Value) -> Value {
+    inspect_generated(rt, config, &generate_fixture_graph(rt, config))
+}
+
+// Shared by real startup and ordinary preparation: production externalization,
+// seeding, dependency capture, generation, and complete admission, without start.
+async fn prepare_fixture_graph(rt: &ProxyRuntime, config: &Value) -> (Value, Value) {
+    assert!(rt.management_api_stub.lock().unwrap().is_none());
+    assert!(
+        rt.error_emitter.get().is_none(),
+        "no attached automatic probe emitter"
+    );
+    rt.write_custom_rule_files(&serde_json::from_value(config.clone()).unwrap())
+        .await;
+    let _ = fixture_bundled_rules_dir();
+    crate::runtime::geo_seed::seed_builtin_rule_sets_into(
+        rt.config.dir(),
+        "real HOT fixture preflight",
+        &crate::runtime::geo_seed::SeedOptions::default(),
+    );
+    let generated = generate_fixture_graph(rt, config);
+    let checked = inspect_generated(rt, config, &generated);
+    (generated, checked)
+}
+
+// This runs in the existing ordinary exact entrypoint. Production dependency
+// capture briefly binds/releases loopback ports; no core, process, RPC, backend,
+// DNS request, or outbound traffic is started. Each scenario owns a fresh dir.
+fn fixture_generated_transition_admission() {
+    let mut failures = Vec::new();
+    for scenario in [
+        "apply-and-status",
+        "persistence-retry",
+        "public-rpc-contract",
+        "rejections-preserve-runtime",
+    ] {
+        let result = std::panic::catch_unwind(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let directory = TestDir::new("polaris-fixture-generated-admission-");
+                    let rt = test_runtime_in(directory.to_path_buf());
+                    let initial = save_fixture_config(&rt.config, &store_admission_fixture());
+                    let (generated, initial_projection) =
+                        prepare_fixture_graph(&rt, &initial).await;
+                    let loaded = rt.config.load_full().unwrap();
+                    canonical_fixture(&loaded, &initial);
+                    saved_fixture_config(&rt.config, &initial);
+                    assert_eq!(preflight(&rt, &loaded), initial_projection);
+                    assert_eq!(generated["log"]["level"], initial["logLevel"]);
+                    if scenario == "public-rpc-contract" {
+                        // Public RPC edits the generated core document, never App D.
+                        let desired_before = rt.config.current().unwrap();
+                        let before = std::fs::read(rt.config.path()).unwrap();
+                        let mut candidate = generated;
+                        candidate["log"]["level"] = "debug".into();
+                        assert_eq!(
+                            inspect_generated(&rt, &initial, &candidate),
+                            initial_projection
+                        );
+                        assert_eq!(candidate["log"]["level"], "debug");
+                        assert_eq!(rt.config.current().unwrap(), desired_before);
+                        assert_eq!(std::fs::read(rt.config.path()).unwrap(), before);
+                    } else {
+                        let mut requested = initial.clone();
+                        match scenario {
+                            "apply-and-status" => requested = changed_graph(requested),
+                            "persistence-retry" => requested["logLevel"] = "warn".into(),
+                            "rejections-preserve-runtime" => requested["mixedPort"] = 31017.into(),
+                            _ => unreachable!(),
+                        }
+                        let desired = save_fixture_config(&rt.config, &requested);
+                        let desired_projection = preflight(&rt, &desired);
+                        let loaded = rt.config.load_full().unwrap();
+                        canonical_fixture(&loaded, &desired);
+                        saved_fixture_config(&rt.config, &desired);
+                        assert_eq!(preflight(&rt, &loaded), desired_projection);
+                        // Use the admitted snapshot form only after actual production
+                        // generation; this is preparation, not a claimed kernel Apply.
+                        let mut inline_candidate = generate_fixture_graph(&rt, &desired);
+                        assert_eq!(
+                            inspect_generated(&rt, &desired, &inline_candidate),
+                            desired_projection
+                        );
+                        let custom = inline_candidate["route"]["rule_set"]
+                            .as_array_mut()
+                            .unwrap()
+                            .iter_mut()
+                            .find(|set| set["tag"] == FIXTURE_RULE_SET)
+                            .unwrap()
+                            .as_object_mut()
+                            .unwrap();
+                        custom.remove("path");
+                        custom.remove("format");
+                        custom.insert("type".into(), "inline".into());
+                        custom.insert("rules".into(), fixture_custom_rules());
+                        assert_eq!(
+                            inspect_generated(&rt, &desired, &inline_candidate),
+                            desired_projection
+                        );
+                        assert_eq!(inline_candidate["log"]["level"], desired["logLevel"]);
+                        assert_eq!(
+                            inline_candidate["inbounds"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|inbound| inbound["tag"] == "mixed-in")
+                                .unwrap()["listen_port"],
+                            desired["mixedPort"]
+                        );
+                        assert_eq!(save_fixture_config(&rt.config, &desired), desired);
+                        let loaded = rt.config.load_full().unwrap();
+                        canonical_fixture(&loaded, &desired);
+                        saved_fixture_config(&rt.config, &desired);
+                        assert_eq!(preflight(&rt, &loaded), desired_projection);
+                        if scenario == "rejections-preserve-runtime" {
+                            let mut invalid = initial.clone();
+                            set_fixture_route_target(&mut invalid, "nonexistent-node");
+                            let before = rt.config.current().unwrap();
+                            let bytes = std::fs::read(rt.config.path()).unwrap();
+                            if rt.config.save_full(&invalid).is_ok() {
+                                for key in ["trafficRules", "policyRules", "customRules"] {
+                                    assert_eq!(rt.config.current().unwrap()[key], invalid[key]);
+                                }
+                            } else {
+                                assert_eq!(rt.config.current().unwrap(), before);
+                                assert_eq!(std::fs::read(rt.config.path()).unwrap(), bytes);
+                            }
+                            // Even if the store admits it, generation's selector
+                            // fallback must not pass our exact owned-target gate.
+                            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                preflight(&rt, &invalid)
+                            }))
+                            .is_err());
+                        }
+                    }
+                    assert!(!rt.status().running);
+                    assert_eq!(rt.status().pid, 0);
+                    assert!(rt.current_config_snapshot().is_none());
+                    assert!(
+                        !rt.runtime_config_path().exists(),
+                        "preparation cannot publish a CLI source"
+                    );
+                });
+        });
+        match result {
+            Ok(()) => eprintln!("prepared real fixture: {scenario}"),
+            Err(error) => {
+                let message = error
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| error.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic");
+                failures.push(format!("{scenario}: {message}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "production fixture preparation failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 struct Running {
@@ -2042,23 +2296,7 @@ impl Running {
         let cleanup = RealCoreCleanupGuard::new(&rt);
         rt.inject_real_core_for_test(admission.binary.clone());
         let config = save_fixture_config(&rt.config, &config);
-        assert!(rt.management_api_stub.lock().unwrap().is_none());
-        assert!(
-            rt.error_emitter.get().is_none(),
-            "no attached automatic probe emitter"
-        );
-        // Ordinary externalization only, inside the owned temporary directory.
-        rt.write_custom_rule_files(&serde_json::from_value(config.clone()).unwrap())
-            .await;
-        // start() performs this same default seed before generating its graph.
-        // Admit its checkout source first so preflight observes the identical FS.
-        let _ = fixture_bundled_rules_dir();
-        crate::runtime::geo_seed::seed_builtin_rule_sets_into(
-            rt.config.dir(),
-            "real HOT fixture preflight",
-            &crate::runtime::geo_seed::SeedOptions::default(),
-        );
-        let checked = preflight(&rt, &config);
+        let (_, checked) = prepare_fixture_graph(&rt, &config).await;
         evidence.record(json!({"phase":"prestart-safety","projection":checked,
             "claim":"fixture-reachable closure only; unused production DNS definitions are statically excluded",
             "autoProbeEmitterAttached":false,"canonicalNoTun":true}));
