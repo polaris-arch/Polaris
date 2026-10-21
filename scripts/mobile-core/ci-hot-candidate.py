@@ -75,7 +75,7 @@ OVERRIDES = set(('GOFLAGS GOENV GOWORK GOTOOLCHAIN GOOS GOARCH GOARM GOARM64 GOE
                  'LIBRARY_PATH COMPILER_PATH GCC_EXEC_PREFIX JAVA_TOOL_OPTIONS _JAVA_OPTIONS '
                  'JDK_JAVA_OPTIONS GRADLE_OPTS JAVA_OPTS GRADLE_USER_HOME ORG_GRADLE_PROJECT '
                  'RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER '
-                 'CARGO_TARGET_DIR CARGO_BUILD_TARGET ANDROID_NDK_HOME ANDROID_NDK_ROOT NDK_HOME '
+                 'CARGO_TARGET_DIR CARGO_BUILD_TARGET ANDROID_NDK_HOME ANDROID_NDK_ROOT NDK_HOME NDK_RUST '
                  'NODE_OPTIONS NPM_CONFIG_REGISTRY npm_config_registry POLARIS_FORMAL_MOBILE_ROOT POLARIS_CORE_SOURCE POLARIS_CORE_PATH').split())
 
 
@@ -109,7 +109,7 @@ def validate_request(env, inputs, event):
 
 def reject_overrides(env, prepared=False):
     for key, value in env.items():
-        if key in {'ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT'} and value:
+        if (key in {'ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT'} or (prepared and key == 'NDK_RUST')) and value:
             expected = Path(env['ANDROID_HOME']).resolve(strict=True) / 'ndk/27.3.13750724'
             require(Path(value).resolve(strict=True) == expected.resolve(strict=True) and
                     re.search(r'^Pkg.Revision\s*=\s*27[.]3[.]13750724\s*$', (expected / 'source.properties').read_text(), re.M),
@@ -117,8 +117,9 @@ def reject_overrides(env, prepared=False):
             continue
         forbidden = key in OVERRIDES or key.startswith(('CARGO_PROFILE_', 'CGO_', 'PKG_CONFIG_', 'ORG_GRADLE_PROJECT_', 'TAURI_'))
         forbidden |= key.startswith('POLARIS_') and key not in {'POLARIS_LIGHT_BUILD', 'POLARIS_PUBLISH_RELEASE'}
-        # The candidate SDK step alone writes this selected, exact Rust NDK.
-        if prepared and key == 'NDK_RUST':
+        # actions/setup-go exports exactly local after the early admission gate.
+        # Keep injected pre-setup values and every other toolchain selection closed.
+        if prepared and key == 'GOTOOLCHAIN' and value == 'local':
             forbidden = False
         require(not (forbidden and value), 'ambient candidate override refused: ' + key)
 

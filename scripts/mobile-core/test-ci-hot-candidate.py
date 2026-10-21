@@ -180,6 +180,61 @@ class PureFixtures(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises((RuntimeError, KeyError, FileNotFoundError)):
                 hot.reject_overrides({key: 'injected'})
 
+    def test_setup_go_local_is_allowed_only_after_preparation(self):
+        for prepared in (False, True):
+            for value in ['local', 'auto', 'path', 'go1.27.2', 'go1.28.0+auto', 'go1.27.2+path',
+                          'LOCAL', ' local', 'local ', 'local\n', '\t']:
+                with self.subTest(prepared=prepared, value=value):
+                    if prepared and value == 'local':
+                        hot.reject_overrides({'GOTOOLCHAIN': value}, prepared=prepared)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'ambient candidate override refused: GOTOOLCHAIN'):
+                            hot.reject_overrides({'GOTOOLCHAIN': value}, prepared=prepared)
+        # An explicitly injected local value must still fail the actual admit path.
+        with self.assertRaises(RuntimeError):
+            hot.validate_request(dict(self.env, GOTOOLCHAIN='local'), self.inputs, self.event)
+
+    def test_prepared_local_does_not_exempt_any_other_override(self):
+        keys = hot.OVERRIDES | {'CARGO_PROFILE_DEBUG_OPT_LEVEL', 'CGO_LDFLAGS', 'PKG_CONFIG_PATH',
+                               'POLARIS_RUNTIME_MODE', 'TAURI_ANDROID_PROJECT_PATH', 'ORG_GRADLE_PROJECT_skipRust'}
+        for key in sorted(keys):
+            with self.subTest(key=key), self.assertRaises((RuntimeError, KeyError, FileNotFoundError)):
+                hot.reject_overrides(dict(GOTOOLCHAIN='local', **{key: 'injected'}) if key != 'GOTOOLCHAIN' else {key: 'injected'}, prepared=True)
+
+    def test_full_observed_prepared_environment_and_ndk_guards(self):
+        # Complete visible build-step env from run 39557631480, plus the already
+        # audited hosted-runner SDK/NDK baseline. Only that path becomes temporary.
+        observed = {'PYTHONDONTWRITEBYTECODE': '1', 'POLARIS_LIGHT_BUILD': '0', 'POLARIS_PUBLISH_RELEASE': '0',
+                    'CARGO_INCREMENTAL': '0', 'CARGO_TERM_COLOR': 'always', 'PROTOC_EXPECT': 'libprotoc 35.1',
+                    'GOTOOLCHAIN': 'local', 'JAVA_HOME': '/usr/lib/jvm/temurin-21-jdk-amd64',
+                    'JAVA_HOME_17_X64': '/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.0.20-101/x64',
+                    'MAVEN_ARGS': '-ntp', 'JDK17': '/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.0.20-101/x64'}
+        with tempfile.TemporaryDirectory() as tmp:
+            sdk = Path(tmp); ndk = sdk / 'ndk/27.3.13750724'; ndk.mkdir(parents=True)
+            (ndk / 'source.properties').write_text('Pkg.Revision = 27.3.13750724\n')
+            env = dict(self.env, **observed, ANDROID_HOME=str(sdk), ANDROID_SDK_ROOT=str(sdk),
+                       ANDROID_NDK_HOME=str(ndk), ANDROID_NDK_ROOT=str(ndk), NDK_RUST=str(ndk))
+            hot.reject_overrides(env, prepared=True)
+            with self.assertRaises(RuntimeError): hot.reject_overrides(env)
+            wrong = sdk / 'ndk/28.0.0'; wrong.mkdir(); (wrong / 'source.properties').write_text('Pkg.Revision = 28.0.0\n')
+            for key in ['ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT', 'NDK_RUST']:
+                with self.subTest(key=key), self.assertRaises(RuntimeError):
+                    hot.reject_overrides(dict(env, **{key: str(wrong)}), prepared=True)
+            (ndk / 'source.properties').write_text('Pkg.Revision = 28.0.0\n')
+            with self.assertRaises(RuntimeError): hot.reject_overrides(env, prepared=True)
+
+    def test_selected_rust_ndk_is_allowed_only_after_sdk_preparation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sdk = Path(tmp); ndk = sdk / 'ndk/27.3.13750724'; ndk.mkdir(parents=True)
+            (ndk / 'source.properties').write_text('Pkg.Revision = 27.3.13750724\n')
+            env = {'ANDROID_HOME': str(sdk), 'NDK_RUST': str(ndk)}
+            hot.reject_overrides(env, prepared=True)
+            with self.assertRaisesRegex(RuntimeError, 'ambient candidate override refused: NDK_RUST'):
+                hot.reject_overrides(env)
+            for value in ['28.0.0', '27.3.13750724-beta1', '']:
+                (ndk / 'source.properties').write_text('Pkg.Revision = ' + value + '\n')
+                with self.subTest(value=value), self.assertRaises(RuntimeError): hot.reject_overrides(env, prepared=True)
+
     def test_only_exact_installed_runner_ndk_allowed(self):
         with tempfile.TemporaryDirectory() as tmp:
             sdk = Path(tmp); ndk = sdk / 'ndk/27.3.13750724'; ndk.mkdir(parents=True)
@@ -516,7 +571,7 @@ class RoutingContracts(unittest.TestCase):
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-    if suite.countTestCases() < 36:
+    if suite.countTestCases() < 40:
         raise SystemExit('candidate fixture suite is empty/incomplete')
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)
