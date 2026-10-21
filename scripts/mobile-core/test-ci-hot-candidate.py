@@ -244,6 +244,121 @@ class PureFixtures(unittest.TestCase):
             for xml in ['<repository/>', '<repository><uses-license ref="missing"/></repository>']:
                 with self.assertRaises(RuntimeError): hot.accepted_licenses(ET.fromstring(xml), ET.fromstring(xml), home)
 
+    def stable_ndk_properties(self):
+        # Exact 107-byte member from the official stable r30 Linux archive.
+        return b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\nPkg.BaseRevision = 30.0.16248370\nPkg.ReleaseName = r30\n'
+
+    def test_stable_ndk_profile_and_actual_properties(self):
+        from android_sdk import validate_ndk_properties
+        self.assertEqual(hot.ANDROID['ndkRevision'], '30.0.16248370')
+        self.assertEqual(hot.ANDROID['ndkSourceRevision'], '30.0.16248370')
+        self.assertEqual(hot.ANDROID['ndkPackage'], 'android-ndk-r30')
+        self.assertEqual(hot.ANDROID['licenseId'], 'android-sdk-license')
+        self.assertEqual(hot.ndk_archive_contract(), {
+            'url': 'https://dl.google.com/android/repository/android-ndk-r30-linux.zip',
+            'bytes': 738633529, 'sha1': '5107f898313790e449e87eee2183d9a20602dee9',
+            'sha256': '753611f410d002cfcd3f3dc2ef49aad532089d3180b436c060a90bf0fcb64df2',
+            'archiveRoot': 'android-ndk-r30'})
+        raw = self.stable_ndk_properties()
+        self.assertEqual(hot.sha(raw), hot.ANDROID['sourcePropertiesSha256'])
+        self.assertEqual(validate_ndk_properties(raw.decode(), hot.ANDROID)['Pkg.ReleaseName'], 'r30')
+        for key, value in [('Pkg.Revision', '30.0.16138531-beta3'), ('Pkg.BaseRevision', '30.0.16138531'), ('Pkg.ReleaseName', 'r30-beta3')]:
+            changed = re.sub(r'^' + re.escape(key) + r' = .+$', key + ' = ' + value, raw.decode(), flags=re.M)
+            with self.subTest(key=key), self.assertRaises(RuntimeError): validate_ndk_properties(changed, hot.ANDROID)
+
+    def stable_ndk_metadata(self):
+        archive = hot.ndk_archive_contract()
+        return ('<repository><license id="android-sdk-license">Exact license.</license>'
+                '<remotePackage path="ndk;30.0.16248370"><revision><major>30</major><minor>0</minor><micro>16248370</micro></revision>'
+                '<uses-license ref="android-sdk-license"/><channelRef ref="channel-0"/><archives><archive><complete>'
+                '<size>' + str(archive['bytes']) + '</size><checksum type="sha1">' + archive['sha1'] + '</checksum>'
+                '<url>android-ndk-r30-linux.zip</url></complete><host-os>linux</host-os></archive></archives></remotePackage></repository>').encode()
+
+    def test_stable_ndk_metadata_rejects_preview_and_other_identity(self):
+        raw = self.stable_ndk_metadata()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp); (home / 'licenses').mkdir(); accepted = home / 'licenses/android-sdk-license'
+            accepted.write_text(hashlib.sha1(b'Exact license.').hexdigest() + '\n')
+            facts = hot.ndk_metadata(raw, home)
+            self.assertEqual(facts['profile'], hot.ANDROID)
+            self.assertEqual(facts['archive'], hot.ndk_archive_contract())
+            self.assertEqual(set(facts['licenses']), {'android-sdk-license'})
+            changes = [(b'ndk;30.0.16248370', b'ndk;30.0.16138531'),
+                       (b'<micro>16248370</micro>', b'<micro>16138531</micro>'),
+                       (b'</revision>', b'<preview>3</preview></revision>'), (b'channel-0', b'channel-1'),
+                       (b'<uses-license ref="android-sdk-license"/>', b'<uses-license ref="android-sdk-preview-license"/>'),
+                       (b'android-ndk-r30-linux.zip', b'android-ndk-r30-beta3-linux.zip'),
+                       (b'<host-os>linux', b'<host-os>macosx'), (b'type="sha1"', b'type="sha256"'),
+                       (b'738633529', b'738633528'), (hot.ndk_archive_contract()['sha1'].encode(), b'0' * 40)]
+            for old, new in changes:
+                with self.subTest(old=old), self.assertRaises(RuntimeError): hot.ndk_metadata(raw.replace(old, new), home)
+            accepted.write_text('0' * 40 + '\n')
+            with self.assertRaises(RuntimeError): hot.ndk_metadata(raw, home)
+            accepted.unlink()
+            with self.assertRaises(RuntimeError): hot.ndk_metadata(raw, home)
+
+    def ndk_zip_fixture(self, names=None):
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, 'w') as bundle:
+            for name in names or ['android-ndk-r30/source.properties']:
+                bundle.writestr(name, self.stable_ndk_properties())
+        raw = payload.getvalue()
+        archive = dict(hot.ndk_archive_contract(), bytes=len(raw), sha1=hashlib.sha1(raw).hexdigest(), sha256=hot.sha(raw))
+        return raw, archive
+
+    def test_candidate_ndk_archive_requires_both_hashes_and_safe_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            download = Path(tmp) / 'archive.zip'; raw, archive = self.ndk_zip_fixture(); download.write_bytes(raw)
+            with patch.object(hot, 'ndk_archive_contract', return_value=archive):
+                self.assertEqual(hot.verify_ndk_archive(download)['sha256'], archive['sha256'])
+            for key, value in [('bytes', len(raw) + 1), ('sha1', '0' * 40), ('sha256', '0' * 64)]:
+                with self.subTest(key=key), patch.object(hot, 'ndk_archive_contract', return_value=dict(archive, **{key: value})), self.assertRaises(RuntimeError):
+                    hot.verify_ndk_archive(download)
+            for name in ['other/source.properties', '/android-ndk-r30/source.properties', 'android-ndk-r30/../escape', 'android-ndk-r30/dir\\escape']:
+                raw, archive = self.ndk_zip_fixture([name]); download.write_bytes(raw)
+                with self.subTest(name=name), patch.object(hot, 'ndk_archive_contract', return_value=archive), self.assertRaises(RuntimeError):
+                    hot.verify_ndk_archive(download)
+
+    def test_candidate_ndk_prepare_is_owned_and_receipts_actual_bytes(self):
+        # Fake command adapter writes only data fixtures. Popen/network guards
+        # remain active; no curl, unzip or native executable is actually invoked.
+        raw, archive = self.ndk_zip_fixture(); calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); evidence = root / 'evidence'; evidence.mkdir()
+            def fake_run(args, **kwargs):
+                calls.append(args)
+                if args[0] == 'curl':
+                    self.assertEqual(args[-1], archive['url']); self.assertNotIn('-L', args)
+                    self.assertEqual(args[1], '--disable')
+                    Path(args[args.index('-o') + 1]).write_bytes(raw)
+                elif args[0] == 'unzip':
+                    with zipfile.ZipFile(args[2]) as bundle: bundle.extractall(args[4])
+                else: raise AssertionError('unexpected command')
+            with patch.object(hot, 'ndk_archive_contract', return_value=archive):
+                ndk, facts = hot.prepare_candidate_ndk(root, evidence, fake_run)
+                self.assertEqual((ndk / 'source.properties').read_bytes(), self.stable_ndk_properties())
+                self.assertEqual(facts['profile'], hot.ANDROID)
+                self.assertEqual(facts['archive']['sha256'], archive['sha256'])
+                self.assertEqual(facts['sourceProperties']['sha256'], hot.ANDROID['sourcePropertiesSha256'])
+                self.assertEqual(json.loads((evidence / 'candidate-ndk.json').read_text()), facts)
+                self.assertFalse((root / 'candidate-ndk.zip').exists())
+                with self.assertRaises(RuntimeError): hot.prepare_candidate_ndk(root, evidence, fake_run)
+                self.assertEqual([args[0] for args in calls], ['curl', 'unzip'])
+
+    def test_candidate_ndk_prepare_refuses_properties_drift(self):
+        bad = self.stable_ndk_properties().replace(b'30.0.16248370', b'30.0.16138531')
+        with patch.object(self, 'stable_ndk_properties', return_value=bad): raw, archive = self.ndk_zip_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); evidence = root / 'evidence'; evidence.mkdir()
+            def fake_run(args, **kwargs):
+                if args[0] == 'curl': Path(args[args.index('-o') + 1]).write_bytes(raw)
+                elif args[0] == 'unzip':
+                    with zipfile.ZipFile(args[2]) as bundle: bundle.extractall(args[4])
+                else: raise AssertionError('unexpected command')
+            with patch.object(hot, 'ndk_archive_contract', return_value=archive), self.assertRaisesRegex(RuntimeError, 'source.properties bytes differ'):
+                hot.prepare_candidate_ndk(root, evidence, fake_run)
+            self.assertFalse((evidence / 'candidate-ndk.json').exists())
+
     def test_duplicate_json_input_is_rejected(self):
         with self.assertRaises(RuntimeError): hot.decode(b'{"hot_consumer_candidate":"a","hot_consumer_candidate":"b"}')
 
@@ -401,7 +516,7 @@ class RoutingContracts(unittest.TestCase):
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-    if suite.countTestCases() < 31:
+    if suite.countTestCases() < 36:
         raise SystemExit('candidate fixture suite is empty/incomplete')
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() and not result.skipped else 1)

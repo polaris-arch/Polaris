@@ -8,7 +8,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
@@ -59,8 +59,13 @@ TAGS = ('with_gvisor with_quic with_wireguard with_utls with_naive_outbound with
         'with_usbip with_openvpn with_openconnect badlinkname tfogo_checklinkname0 with_tailscale '
         'ts_omit_logtail ts_omit_ssh ts_omit_drive ts_omit_taildrop ts_omit_webclient ts_omit_doctor '
         'ts_omit_capture ts_omit_kube ts_omit_aws ts_omit_synology ts_omit_bird').split()
-ANDROID = {'ndkRevision': '30.0.16138531', 'ndkSourceRevision': '30.0.16138531-beta3',
-           'ndkPackage': 'android-ndk-r30-beta3',
+ANDROID = {'ndkRevision': '30.0.16248370', 'ndkSourceRevision': '30.0.16248370',
+           'ndkPackage': 'android-ndk-r30', 'licenseId': 'android-sdk-license',
+           'sourcePropertiesSha256': 'e73b7dc557cea2da9212c09ee1795434957d62e63b7550eef69fd1887a355d94',
+           'archive': {'url': 'https://dl.google.com/android/repository/android-ndk-r30-linux.zip',
+                       'bytes': 738633529, 'sha1': '5107f898313790e449e87eee2183d9a20602dee9',
+                       'sha256': '753611f410d002cfcd3f3dc2ef49aad532089d3180b436c060a90bf0fcb64df2',
+                       'archiveRoot': 'android-ndk-r30'},
            'bootclasspath': {'platform': 'android-36', 'sha256': 'd9eb9da824d9e247a352f570f01e1169e725b2954bca9e283a71786c59b59f9a'}}
 BUILD = ['bash', 'scripts/build-android-apk.sh', '--debug', '--apk', '--split-per-abi',
          '--target', 'aarch64', '--ci', '--config', 'src-tauri/tauri.android.conf.json']
@@ -190,12 +195,75 @@ def accepted_licenses(xml, package, home):
 
 
 def ndk_archive_contract():
-    archive = decode((ROOT / 'scripts/libbox-patches/ndk-linux-archive.json').read_bytes())
-    require(archive['url'] == 'https://dl.google.com/android/repository/android-ndk-r30-beta3-linux.zip' and
-            archive['sha256'] == '2698cca1e9f161048ecd84e1e70a556e1aa00b78409473d4c1e87969d40c3efc' and
-            archive['sha1'] == 'f66e852ac01a57f74bcf6fd96dcea04dda5ea392' and archive['bytes'] == 738755979,
-            'pinned official NDK archive differs')
-    return archive
+    # Candidate-owned stable r30 profile; formal archive/source pins stay intact.
+    return dict(ANDROID['archive'])
+
+
+def ndk_metadata(raw, home):
+    archive = ndk_archive_contract()
+    xml = ET.fromstring(raw)
+    packages = [el for el in xml if el.tag.rsplit('}', 1)[-1] == 'remotePackage' and
+                el.get('path') == 'ndk;' + ANDROID['ndkRevision']]
+    require(len(packages) == 1, 'exact stable NDK package metadata unavailable')
+    package = packages[0]
+    revisions = [el for el in package if el.tag.rsplit('}', 1)[-1] == 'revision']
+    require(len(revisions) == 1 and len(revisions[0]) == 3 and
+            {el.tag.rsplit('}', 1)[-1]: el.text for el in revisions[0]} ==
+            dict(zip(('major', 'minor', 'micro'), ANDROID['ndkRevision'].split('.'))), 'stable NDK revision differs')
+    require([el.get('ref') for el in package if el.tag.rsplit('}', 1)[-1] == 'channelRef'] == ['channel-0'],
+            'stable NDK channel differs')
+    require([el.get('ref') for el in package.iter() if el.tag.rsplit('}', 1)[-1] == 'uses-license'] == [ANDROID['licenseId']],
+            'stable NDK must use only the standard SDK license')
+    downloads = [el for el in package.iter() if el.tag.rsplit('}', 1)[-1] == 'archive' and
+                 [node.text for node in el if node.tag.rsplit('}', 1)[-1] == 'host-os'] == ['linux']]
+    require(len(downloads) == 1, 'exact Linux NDK archive metadata unavailable')
+    complete = [el for el in downloads[0] if el.tag.rsplit('}', 1)[-1] == 'complete']
+    require(len(complete) == 1 and len(complete[0]) == 3, 'exact NDK archive metadata unavailable')
+    fields = {el.tag.rsplit('}', 1)[-1]: el.text for el in complete[0]}
+    require(fields == {'checksum': archive['sha1'], 'size': str(archive['bytes']), 'url': archive['url'].rsplit('/', 1)[1]} and
+            [el.get('type') for el in complete[0] if el.tag.rsplit('}', 1)[-1] == 'checksum'] == ['sha1'],
+            'official stable NDK archive metadata differs')
+    return {'metadataSha256': sha(raw), 'profile': ANDROID, 'archive': archive,
+            'licenses': accepted_licenses(xml, package, home)}
+
+
+def verify_ndk_archive(download):
+    archive = ndk_archive_contract()
+    require(download.is_file() and not download.is_symlink() and download.stat().st_size == archive['bytes'], 'candidate NDK archive size/type differs')
+    helper = module('candidate_ndk_hashes', 'scripts/libbox-patches/prepare-ndk-linux.py')
+    actual_sha1, actual_sha256 = helper.hashes(download)
+    require((actual_sha1, actual_sha256) == (archive['sha1'], archive['sha256']), 'candidate NDK archive hashes differ')
+    with zipfile.ZipFile(download) as bundle:
+        names = bundle.namelist()
+        require(names and len(names) == len(set(names)), 'candidate NDK ZIP inventory empty/duplicate')
+        for name in names:
+            path = PurePosixPath(name)
+            require(name.startswith(archive['archiveRoot'] + '/') and '..' not in path.parts and
+                    not path.is_absolute() and '\\' not in name, 'candidate NDK ZIP escapes its root')
+    return {'bytes': download.stat().st_size, 'sha1': actual_sha1, 'sha256': actual_sha256}
+
+
+def prepare_candidate_ndk(root, evidence, run):
+    from android_sdk import validate_ndk_properties
+    archive = ndk_archive_contract()
+    download, unpack = root / 'candidate-ndk.zip', root / 'candidate-ndk-unpacked'
+    require(not any(path.exists() or path.is_symlink() for path in (download, unpack)), 'retained candidate NDK input refused')
+    unpack.mkdir(mode=0o700)
+    run(['curl', '--disable', '-f', '--proto', '=https', '--retry', '3', '--retry-all-errors', '--connect-timeout', '20',
+         '--max-time', '900', '-sS', '-o', download, archive['url']], log=evidence / 'ndk-download.log', capture='none')
+    actual = verify_ndk_archive(download)
+    # The exact official archive needs unzip to preserve its symlinks/executables.
+    run(['unzip', '-q', download, '-d', unpack], log=evidence / 'ndk-unpack.log', capture='none')
+    ndk = unpack / archive['archiveRoot']
+    properties = ndk / 'source.properties'
+    require(properties.is_file() and not properties.is_symlink(), 'candidate NDK source.properties must be regular')
+    require(file_pin(properties)['sha256'] == ANDROID['sourcePropertiesSha256'], 'candidate NDK source.properties bytes differ')
+    values = validate_ndk_properties(properties.read_text(), ANDROID)
+    facts = {'profile': ANDROID, 'archive': actual, 'path': str(ndk),
+             'sourceProperties': file_pin(properties), 'properties': values}
+    write_json(evidence / 'candidate-ndk.json', facts)
+    download.unlink()
+    return ndk, facts
 
 
 def sdk():
@@ -222,25 +290,13 @@ def sdk():
     for key in ('JAVA_HOME_17_X64', 'JAVA_HOME_21_X64'):
         require((Path(os.environ[key]) / 'bin/java').is_file(), 'preinstalled JDK required: ' + key)
     # Read official metadata only. Archive installation occurs later only if its
-    # exact package license is already accepted; never accept a preview license.
-    archive = ndk_archive_contract()
+    # exact standard package license is already accepted; no preview fallback.
     url = 'https://dl.google.com/android/repository/repository2-3.xml'
     with urlopen(url, timeout=45) as response:
         require(response.geturl() == url, 'SDK metadata redirect refused')
         raw = response.read(8 * 1024 * 1024 + 1)
     require(len(raw) <= 8 * 1024 * 1024, 'SDK metadata exceeds bound')
-    xml = ET.fromstring(raw)
-    packages = [el for el in xml if el.tag.rsplit('}', 1)[-1] == 'remotePackage' and
-                any(node.tag.rsplit('}', 1)[-1] == 'url' and node.text == archive['url'].rsplit('/', 1)[1] for node in el.iter())]
-    require(len(packages) == 1, 'exact official NDK package metadata unavailable')
-    package = packages[0]
-    downloads = [el for el in package.iter() if el.tag.rsplit('}', 1)[-1] == 'complete' and
-                 any(node.tag.rsplit('}', 1)[-1] == 'url' and node.text == archive['url'].rsplit('/', 1)[1] for node in el)]
-    require(len(downloads) == 1, 'exact NDK archive metadata unavailable')
-    fields = {el.tag.rsplit('}', 1)[-1]: el.text for el in downloads[0]}
-    require(fields.get('checksum') == archive['sha1'] and fields.get('size') == str(archive['bytes']), 'official NDK archive metadata differs')
-    facts['libboxNdk'] = {'metadataSha256': sha(raw), 'archive': archive,
-                          'licenses': accepted_licenses(xml, package, home)}
+    facts['libboxNdk'] = ndk_metadata(raw, home)
     write_json(root / 'evidence/sdk.json', facts)
     with Path(os.environ['GITHUB_ENV']).open('a') as out:
         out.write('JAVA_HOME=' + os.environ['JAVA_HOME_21_X64'] + '\nJDK17=' + os.environ['JAVA_HOME_17_X64'] + '\nNDK_RUST=' + str(home / 'ndk' / rust_version) + '\n')
@@ -448,8 +504,11 @@ def build():
                            GOBIN=str(tools_dir), GOPATH=str(cache / 'go-path'), GOCACHE=str(cache / 'go-build'), GOMODCACHE=str(cache / 'go-mod'))
         require(run([go, 'version']).startswith('go version go1.27.2 '), 'actual Go differs')
         run([go, 'install', 'github.com/sagernet/gomobile/cmd/gomobile@v0.1.13', 'github.com/sagernet/gomobile/cmd/gobind@v0.1.13'], env=install_env, log=evidence / 'tool-install.log', capture='none')
-        require(decode((evidence / 'sdk.json').read_bytes(), 1024 * 1024)['libboxNdk']['archive'] == ndk_archive_contract(), 'NDK license/metadata admission missing')
-        ndk = Path(run([sys.executable, ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py', root]).strip())
+        ndk_admission = decode((evidence / 'sdk.json').read_bytes(), 1024 * 1024)['libboxNdk']
+        require(ndk_admission['archive'] == ndk_archive_contract() and ndk_admission['profile'] == ANDROID and
+                set(ndk_admission['licenses']) == {ANDROID['licenseId']}, 'NDK license/metadata admission missing')
+        result['sdkNdkAdmission'] = ndk_admission
+        ndk, result['candidateNdk'] = prepare_candidate_ndk(root, evidence, run)
         jdk = Path(os.environ['JAVA_HOME_17_X64']).resolve(strict=True)
         sdk_view, jar = prepare_view(work, os.environ['ANDROID_HOME'], ndk, ANDROID)
         env = tool_environment(go, tools_dir / 'gomobile', tools_dir / 'gobind', cache, scratch, sdk=sdk_view, ndk=ndk, jdk=jdk)
