@@ -1,48 +1,57 @@
 # Formal mobile source and binding input
 
-## Selected replacement source input
+## Selected alpha.12.1 source input
 
 The selected Polaris App mobile producer input is
-`a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae`, tree
-`830f7256af499e5ad3e7da9a79f0a377ca38fc77`, annotated tag
-`v1.15.0-polaris-alpha.12` / object `916d9533ba0a6092e34bc53f63dace63e11fa85e`.
-The exact automatic source archive has been checked against the full tree,
-gitlinks, legal files and unchanged Go/module/libbox inputs. Only seven
-publisher/workflow/documentation files differ from c002. The All producer
-`39128398409`, attempt 1, succeeded; that result is not App mobile acceptance.
+`814da362838e96e54f904836a92c2b0d8c3ae29b`, tree
+`ad574f93026557b49edecb492bd7ecdb851057c1`, annotated tag
+`v1.15.0-polaris-alpha.12.1` / object `8ecda357ea755a1295336a35ec7eaf1fe2daebc2`.
+The tag object peels directly to this reviewed commit. The complete published
+source tree and its bytes/modes, module files and source-owned libbox declaration
+were checked; a tag alone is not an AAR/XCFramework or App acceptance receipt.
 
-The mobile input is bound to the actual replacement tag. Its source contract
-changes the mobile input digest and DirectoryRetirementSourceIdentity.
-Component receipts and input-digest BuildID must therefore be produced against
-this exact new input. Previous c002/fe182 source and artifact evidence retain
-their historical identities. Raw All libraries do not replace App receipts.
+The source contract uses `polaris-reviewed-kernel-source-v2` for the exact nine
+local vendor replacements (2838 files), including the 45-file tfo-go tree
+`97b124004140efa84aeb0f57d9bd41d238f0c9b5`. Actual module versions, replacement
+paths, Git subtree identities and file counts must agree. The source go.mod hash
+is `2c41a5a45e22341d2f8ca750134edeb5e09cf79d3366575a5a0966cc10a6162c`;
+go.sum, the libbox tag declaration and the 355-file Meta replacement tree and
+binding/patch hashes retain their independently checked identities.
 
-Exact component receipts, archive/member hashes and App/device acceptance are
-not bound here yet; artifactPins and producerReceipt remain null. A desktop ELF,
-old 68ff source receipt, or a tag alone cannot attest AAR/XCFramework identity.
-No formal public mobile release URL is invented. The desktop public replacement is independently bound in the existing
-`nextDelivery` record; its acceptance cannot supply missing mobile receipts.
+This source includes RuntimeCapabilities, retryable runtime persistence and the
+RuntimePersistenceHandler API consumed by the existing App. Generated Java/JNI
+and Objective-C declarations, actual Kotlin/Swift compilation, all four Android
+ABI ELF checks and both Apple slices still require this input's own producer and
+consumer evidence. Source API presence and prior diagnostic outputs do not
+substitute for those checks.
 
-The formal tool choice is Go **1.27.2**, with source minimum Go **1.27.0**,
-gomobile and gobind **v0.1.13** for both platforms. Source policy and all 355
-Meta replacement files retain their exact independent byte checks. The
-source-owned libbox tag declaration, source API declarations, go.sum and Meta
-binding/patch hashes and 355-file subtree inventory were rechecked against the exact a4d085 source archive. The
-unchanged original build_libbox helper already injects
-DirectoryRetirementSourceIdentity from its clean source commit; the App producer
-also binds that identity to its selected sourceCommit. Historical policies and
-receipts retain their original identities.
+Input declarations never issue artifact acceptance: `artifactPins` and
+`producerReceipt` stay null, and `AppAccepted`, `devicePassed` and
+`publicationEligible` stay false even after a build. Real evidence belongs in
+the separate original component, consumption and carrier receipts. No formal
+public mobile download URL is invented. Raw kernel All libraries do not replace
+App-built component receipts.
 
-This remains the original `polaris-mobile-fork-input-v1` App source input.
-Consumption still requires its own `polaris-mobile-component-v1` receipt, exact
-sourceContract/nativeInputs, generated API and ABI checks, and the
-`polaris-mobile-<input digest>` BuildID. All AAR/XCFramework archives alone do not
-meet that contract and are not relabeled as App producer receipts.
+Mobile source admission is independent of desktop public asset availability.
+The old desktop `nextDelivery` and release contracts retain their a4d identity.
+`fixtures/selected-source-contract-a4d.json` preserves the exact old mobile input
+bytes (SHA-256 `d2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0`)
+for those historical desktop assertions; it is not the selected producer input
+or a receipt. Old a4d/c002/fe182 sources and diagnostic results are not relabeled.
 
-The source input uses no App overlay or historical patch replay. Verification
-checks the actual tag object, peel, commit, tree, go.mod/go.sum, source-owned tag
-declaration and clean compiler-input inventory. `fork_input.py` does not require
-the old nonempty patch list or a CLI source receipt.
+The formal tools remain Go **1.27.2**, with source minimum Go **1.27.0**, and
+gomobile/gobind **v0.1.13** on both platforms. This remains the original
+`polaris-mobile-fork-input-v1` input schema. Consumption requires its own
+`polaris-mobile-component-v1` receipt, exact sourceContract/nativeInputs,
+generated API and ABI checks, and the `polaris-mobile-<input digest>` BuildID.
+A different source input changes that digest and DirectoryRetirementSourceIdentity;
+old component/cache receipts cannot be reused under the new identity.
+
+The source input uses zero App overlay and no historical patch replay.
+Verification checks the actual annotated tag object, peel, commit, tree,
+go.mod/go.sum, source-owned tag declaration and clean compiler-input inventory.
+The existing App producer binds DirectoryRetirementSourceIdentity to the exact
+selected sourceCommit; a CLI BuildID or source receipt cannot supply that identity.
 
 Formal binding plans are explicit:
 
@@ -63,7 +72,7 @@ Formal binding plans are explicit:
 - Tags are copied from the actual source-owned libbox declaration, including
   gvisor, Naive, Tailscale and Apple-only DHCP/low-memory flags. The Go module
   remains `github.com/sagernet/sing-box`; the pinned source repository is
-  `polaris-arch/sing-box-polaris` at `v1.15.0-polaris-alpha.12`. Published core
+  `polaris-arch/sing-box-polaris` at `v1.15.0-polaris-alpha.12.1`. Published core
   assets use `sing-box-polaris-*`; formal mobile output remains Libbox.
 - Version is passed through fixed ldflags. `ReadTag`/`git describe`, an upstream
   cache tag, or a reused CLI BuildID cannot provide formal mobile identity.
@@ -87,10 +96,10 @@ behavior, beta manifests, archive pins and historical fixtures stay unchanged.
 The hosted entry retains source.properties and its pinned observation even if a
 later producer step fails. Rust keeps its separate NDK 27.3.13750724.
 
-This is a toolchain-only declaration change. Source a4d085 and alpha.12 remain
-pinned; that source does not include the new App's Retry method. A stable NDK
-profile does not establish new-App compatibility, four-ABI production results,
-APK/device acceptance or publication eligibility.
+The earlier stable-r30 migration was toolchain-only on a4d085/alpha.12; its
+source and receipts remain historical. This alpha.12.1 source migration does not
+change that stable profile or claim new-App compatibility, four-ABI production
+results, APK/device acceptance or publication eligibility before actual checks.
 
 
 `plan.py` verifies the input and prints a bind plan. It never executes a build,
@@ -98,7 +107,8 @@ copies an SDK into an App, installs tools, creates a tag or publishes assets.
 Plan fingerprints bind source and target declarations; actual tool identities
 must be added by the producer before compiling. `android_sdk.py` prepares the
 scoped SDK view only under a fixed private work slot held by the caller's
-exclusive producer lease. Tests are authored in `test_inputs.py` and unexecuted.
+exclusive producer lease. The pure source suites exercise admission without running a native producer;
+those tests are distinct from actual component and App acceptance.
 
 The explicit planning entry is `bash scripts/plan-mobile-core.sh android` or
 `apple`, followed by `--source`, `--gomobile`, `--output`, and Android's
@@ -486,10 +496,11 @@ Their raw receipts are not relabeled; the small
 `historical-ci-fragments.json` pins only retired caller fragments for existing
 negative tests. New formal source controls live in `test_inputs.py` and
 `test_outputs.py` and enter the existing host Node gate through
-`mobile-source-unit.test.mjs`. This source batch has not executed those tests,
-compiled native output, dispatched CI, signed/installed Apps or published mobile
-assets. Contract artifact pins/producer receipt remain null, and
-AppAccepted/devicePassed/publicationEligible remain false until actual results.
+`mobile-source-unit.test.mjs`. This source-only gate does not compile native
+output, sign/install Apps or publish mobile assets. Running it cannot establish
+component or App acceptance. Input-contract artifact pins/producer receipt stay
+null and AppAccepted/devicePassed/publicationEligible stay false; actual results
+belong in separate original receipts rather than these input declarations.
 
 ## Exact-tree main merge evidence reuse
 

@@ -20,64 +20,82 @@ class MobileInputs(unittest.TestCase):
         from test_source_policy import future_mobile_fixture
         self.value, _ = future_mobile_fixture()
 
-    def test_selected_repack_source_has_real_final_tag_but_no_artifact_acceptance(self):
+    def test_selected_patch_source_has_real_final_tag_but_no_artifact_acceptance(self):
         value = json.loads(CONTRACT.read_bytes())
-        self.assertEqual(validate(value)['sourceCommit'], 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae')
-        self.assertEqual(value['sourceTree'], '830f7256af499e5ad3e7da9a79f0a377ca38fc77')
-        self.assertEqual(value['sourceTagObject'], '916d9533ba0a6092e34bc53f63dace63e11fa85e')
+        self.assertEqual(validate(value)['sourceCommit'], '814da362838e96e54f904836a92c2b0d8c3ae29b')
+        self.assertEqual(value['sourceTree'], 'ad574f93026557b49edecb492bd7ecdb851057c1')
+        self.assertEqual(value['sourceTagObject'], '8ecda357ea755a1295336a35ec7eaf1fe2daebc2')
+        self.assertEqual((value['version'], value['sourceTag']),
+                         ('1.15.0-polaris-alpha.12.1', 'v1.15.0-polaris-alpha.12.1'))
+        self.assertEqual(value['sourcePolicy']['schema'], 'polaris-reviewed-kernel-source-v2')
+        self.assertEqual(len(value['sourcePolicy']['vendors']), 9)
+        self.assertEqual(sum(pin['replacementFileCount'] for pin in value['sourcePolicy']['vendors'].values()), 2838)
         for key in ('artifactPins', 'producerReceipt'):
             self.assertIsNone(value[key])
         for key in ('AppAccepted', 'devicePassed', 'publicationEligible'):
             self.assertIs(value[key], False)
         from fork_input import linker_flags
         self.assertIn('DirectoryRetirementSourceIdentity=' + value['sourceCommit'], linker_flags(value, 'a' * 64))
-        for previous in ('c0023dbc6dcd7b6eb2f54dd036ae150168bd8e6e',
+        for previous in ('ba73fcfca84f257680f6f46b87fdcce98b5ab94d',
+                         'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae',
+                         'c0023dbc6dcd7b6eb2f54dd036ae150168bd8e6e',
                          'fe182431495711c09bdb3b074ed6aa6309c00cf8',
                          '68ffb209ded1f9337f9115741cba24f9f4c63421'):
             wrong = deepcopy(value); wrong['sourceCommit'] = previous
             with self.subTest(previous=previous), self.assertRaises(RuntimeError): validate(wrong)
 
-    def test_public_desktop_repack_cannot_borrow_the_old_mobile_tag_or_receipt(self):
+    def test_mobile_source_can_advance_without_relabeling_the_selected_desktop_repack(self):
         import tempfile
         from unittest.mock import patch
         pending_path = Path(__file__).resolve().parents[1] / 'desktop-core/pending-release-selection.json'
         pending = json.loads(pending_path.read_bytes())['nextDelivery']
         selected = json.loads(CONTRACT.read_bytes())
+        historical_bytes = (CONTRACT.parent / 'fixtures/selected-source-contract-a4d.json').read_bytes()
+        self.assertEqual(sha(historical_bytes), 'd2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0')
+        historical = validate(json.loads(historical_bytes))
+        self.assertEqual(historical['sourceCommit'], 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae')
+        self.assertEqual(historical['sourceTree'], '830f7256af499e5ad3e7da9a79f0a377ca38fc77')
+        self.assertEqual(historical['sourceTagObject'], '916d9533ba0a6092e34bc53f63dace63e11fa85e')
         self.assertEqual(pending['sourceCommit'], 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae')
         self.assertEqual(pending['sourceTree'], '830f7256af499e5ad3e7da9a79f0a377ca38fc77')
         self.assertTrue(pending['activationEligible'])
         self.assertEqual(pending['releaseId'], 416392475)
         contract = Path(__file__).resolve().parents[1] / 'desktop-core/release-contract.json'
         self.assertEqual(pending['contractSha256'], sha(contract.read_bytes()))
-        self.assertEqual(pending['tagObject'], selected['sourceTagObject'])
-        self.assertEqual(pending['mobileSourceContractSha256'], sha(CONTRACT.read_bytes()))
+        self.assertEqual(pending['tagObject'], historical['sourceTagObject'])
+        self.assertEqual(pending['mobileSourceContractSha256'], sha(historical_bytes))
         for field in ('goVersion', 'goDirective', 'toolchain', 'goModSha256', 'goSumSha256', 'metacubex'):
-            self.assertEqual(pending['sourcePolicy'][field], selected['sourcePolicy'][field])
+            self.assertEqual(pending['sourcePolicy'][field], historical['sourcePolicy'][field])
+        self.assertEqual(selected['sourceCommit'], '814da362838e96e54f904836a92c2b0d8c3ae29b')
+        self.assertNotEqual(pending['sourceCommit'], selected['sourceCommit'])
+        self.assertNotEqual(pending['tagObject'], selected['sourceTagObject'])
+        self.assertNotEqual(pending['mobileSourceContractSha256'], sha(CONTRACT.read_bytes()))
         future = deepcopy(selected)
-        for field in ('sourceCommit', 'sourceTree'):
-            future[field] = future['sourcePolicy'][field] = pending[field]
         future['sourceTagObject'] = None
         with self.assertRaisesRegex(RuntimeError, 'actual immutable source field required: sourceTagObject'):
             validate(future)
         # A well-shaped historical tag hash is still not the new source's tag.
         # Actual peel verification must reject it before module files or bind.
-        future['sourceTagObject'] = 'a85a5332432a92e1de502cfc9c680206371540b8'
-        with tempfile.TemporaryDirectory() as directory:
-            def historical_tag(_root, *args):
-                if args[0] == 'cat-file': return 'tag'
-                if args[1].endswith('^{tag}'): return future['sourceTagObject']
-                if args[1].endswith('^{commit}'): return 'c0023dbc6dcd7b6eb2f54dd036ae150168bd8e6e'
-                self.fail('must reject the old tag peel before additional source reads')
-            with patch('fork_input.git', side_effect=historical_tag):
-                with self.assertRaisesRegex(RuntimeError, 'mobile source tag/object/commit/tree differs'):
-                    verify_source(directory, future)
+        for tag, commit in [('2fee2965920261ce7b0486fd94b3c9c3c00f6643', 'ba73fcfca84f257680f6f46b87fdcce98b5ab94d'),
+                            (historical['sourceTagObject'], historical['sourceCommit']),
+                            ('a85a5332432a92e1de502cfc9c680206371540b8', 'c0023dbc6dcd7b6eb2f54dd036ae150168bd8e6e')]:
+            future['sourceTagObject'] = tag
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as directory:
+                def historical_tag(_root, *args):
+                    if args[0] == 'cat-file': return 'tag'
+                    if args[1].endswith('^{tag}'): return tag
+                    if args[1].endswith('^{commit}'): return commit
+                    self.fail('must reject the old tag peel before additional source reads')
+                with patch('fork_input.git', side_effect=historical_tag):
+                    with self.assertRaisesRegex(RuntimeError, 'mobile source tag/object/commit/tree differs'):
+                        verify_source(directory, future)
         self.assertIsNone(selected['artifactPins'])
         self.assertIsNone(selected['producerReceipt'])
 
     def test_final_source_keeps_reverified_module_meta_and_libbox_declaration_pins(self):
         value = validate(json.loads(CONTRACT.read_bytes()))
         for field, digest in (
-            ('goModSha256', '27275444718d394dcc31040304ccea65e050c417ef8a85ea7fa6ee6a351e0915'),
+            ('goModSha256', '2c41a5a45e22341d2f8ca750134edeb5e09cf79d3366575a5a0966cc10a6162c'),
             ('goSumSha256', '04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa'),
         ):
             self.assertEqual(value[field], digest)
@@ -95,7 +113,9 @@ class MobileInputs(unittest.TestCase):
     def test_same_version_repack_changes_mobile_input_identity_without_accepting_all_archives(self):
         from fork_input import linker_flags
         from plan import plan
-        value = json.loads(CONTRACT.read_bytes())
+        historical_bytes = (CONTRACT.parent / 'fixtures/selected-source-contract-a4d.json').read_bytes()
+        self.assertEqual(sha(historical_bytes), 'd2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0')
+        value = validate(json.loads(historical_bytes))
         previous = deepcopy(value)
         previous.update(sourceCommit='c0023dbc6dcd7b6eb2f54dd036ae150168bd8e6e',
                         sourceTree='cf520419eafa63bc789a67f12417b7a82e3d7bd9',
@@ -470,7 +490,7 @@ class FormalStableNdk(unittest.TestCase):
                 changed = deepcopy(original); changed['android'][key] = other['android'][key]
                 with self.subTest(key=key, repository=original['repository']), self.assertRaisesRegex(RuntimeError, 'formal Android NDK differs'):
                     validate(changed)
-        self.assertEqual(current['sourceCommit'], 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae')
+        self.assertEqual(current['sourceCommit'], '814da362838e96e54f904836a92c2b0d8c3ae29b')
         self.assertEqual((self.root / 'scripts/android-rust-ndk.version').read_text().strip(), '27.3.13750724')
 
     def test_exact_reviewed_profile_rejects_alternate_path_bytes_keys_and_types(self):

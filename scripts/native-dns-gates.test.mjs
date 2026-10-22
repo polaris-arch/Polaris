@@ -433,7 +433,24 @@ test('published replacement is selected only through the complete exact contract
   assert.equal(pending.producerRunId, 39128398409);
   assert.equal(pending.producerRunAttempt, 1);
   assert.equal(pending.originalIndexSha256, '458b3b5b08194ad7ad13127d31768b8b0bfed7a278fe9db4816963c0dbf705e3');
-  assert.equal(pending.mobileSourceContractSha256, digest(readFileSync(join(root, 'scripts/mobile-core/source-contract.json'))));
+  // This receipt selected the historical a4d mobile input. Mobile source may
+  // advance before new desktop public assets exist; never relabel that receipt.
+  const historicalMobileBytes = readFileSync(join(root, 'scripts/mobile-core/fixtures/selected-source-contract-a4d.json'));
+  assert.equal(digest(historicalMobileBytes), 'd2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0');
+  const historicalMobile = JSON.parse(historicalMobileBytes);
+  assert.equal(historicalMobile.sourceCommit, pending.sourceCommit);
+  assert.equal(historicalMobile.sourceTree, pending.sourceTree);
+  assert.equal(historicalMobile.sourceTagObject, pending.tagObject);
+  assert.equal(pending.mobileSourceContractSha256, digest(historicalMobileBytes));
+  const selectedMobileBytes = readFileSync(join(root, 'scripts/mobile-core/source-contract.json'));
+  const selectedMobile = JSON.parse(selectedMobileBytes);
+  assert.equal(selectedMobile.sourceCommit, '814da362838e96e54f904836a92c2b0d8c3ae29b');
+  assert.equal(selectedMobile.sourceTagObject, '8ecda357ea755a1295336a35ec7eaf1fe2daebc2');
+  assert.notEqual(selectedMobile.sourceCommit, current.sourceCommit);
+  assert.notEqual(digest(selectedMobileBytes), pending.mobileSourceContractSha256);
+  assert.equal(selectedMobile.artifactPins, null);
+  assert.equal(selectedMobile.producerReceipt, null);
+  for (const flag of ['AppAccepted', 'devicePassed', 'publicationEligible']) assert.equal(selectedMobile[flag], false);
   assert.equal(pending.sourceArchive.url, `https://github.com/polaris-arch/sing-box-polaris/archive/${pending.sourceCommit}.tar.gz`);
   assert.equal(pending.sourceArchive.sha256, '9e398ef1b8e0551c7ced1cd2fd8e324ca117437d1c51a4873cf40b6c7ff07ab3');
   assert.equal(pending.sourceArchive.sha256, current.sourceArchive.sha256);

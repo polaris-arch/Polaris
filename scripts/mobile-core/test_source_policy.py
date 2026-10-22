@@ -415,14 +415,56 @@ def current_mobile_graph_fixture(value, source):
     raw = 'path\tsynthetic/main\nmod\t' + value['goModule'] + '\t(devel)\t\n'
     if 'sourcePolicy' in value:
         meta = value['sourcePolicy']['metacubex']
-        for name, version, relative in [(meta['module'], meta['version'], meta['replacementPath']),
-                ('github.com/sagernet/sing-tun', 'v0.0.0-fixture', './third_party/sing-tun')]:
+        vendors = value['sourcePolicy'].get('vendors')
+        declarations = ([(name, pin['version'], pin['replacementPath']) for name, pin in vendors.items()]
+                        if vendors is not None else
+                        [(meta['module'], meta['version'], meta['replacementPath']),
+                         ('github.com/sagernet/sing-tun', 'v0.0.0-fixture', './third_party/sing-tun')])
+        for name, version, relative in declarations:
             directory = source / relative[2:]
             directory.mkdir(parents=True, exist_ok=True)
             graph.append({'Path': name, 'Version': version,
                           'Replace': {'Path': relative, 'Dir': str(directory)}})
             raw += 'dep\t' + name + '\t' + version + '\n=>\t' + relative + '\t(devel)\t\n'
     return graph, raw
+
+
+class CurrentMobileGraphFixture(unittest.TestCase):
+    def test_v2_selected_contract_fixture_keeps_exact_nine_source_replacements(self):
+        from fork_input import load
+        from source_policy import verify_vendor_graph
+        value = load()
+        self.assertEqual(value['sourcePolicy']['schema'], 'polaris-reviewed-kernel-source-v2')
+        vendors = value['sourcePolicy']['vendors']
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'source'
+            graph, raw = current_mobile_graph_fixture(value, source)
+            self.assertEqual(len(graph), 10)  # Main plus nine reviewed vendors.
+            self.assertIs(verify_vendor_graph(graph, source, vendors), graph)
+            for row in graph[1:]:
+                self.assertEqual(row['Version'], vendors[row['Path']]['version'])
+                self.assertIn('dep\t' + row['Path'] + '\t' + row['Version'] + '\n', raw)
+            for index in range(1, len(graph)):
+                with self.subTest(missing=graph[index]['Path']), self.assertRaisesRegex(RuntimeError, 'actual graph replacements differ'):
+                    verify_vendor_graph(graph[:index] + graph[index + 1:], source, vendors)
+                wrong = deepcopy(graph); wrong[index]['Version'] = 'v0.0.0-fixture'
+                with self.subTest(version=graph[index]['Path']), self.assertRaisesRegex(RuntimeError, 'actual vendor graph version differs'):
+                    verify_vendor_graph(wrong, source, vendors)
+                wrong = deepcopy(graph); wrong[index]['Replace']['Path'] += '-other'
+                with self.subTest(path=graph[index]['Path']), self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
+                    verify_vendor_graph(wrong, source, vendors)
+
+    def test_v1_and_legacy_fixture_shapes_remain_historical(self):
+        value, _ = future_mobile_fixture()
+        legacy = json.loads((Path(__file__).with_name('fixtures') / 'legacy-source-contract.json').read_bytes())
+        with tempfile.TemporaryDirectory() as temporary:
+            graph, _ = current_mobile_graph_fixture(value, Path(temporary) / 'v1')
+            self.assertEqual([row['Path'] for row in graph],
+                             [value['goModule'], 'github.com/metacubex/utls', 'github.com/sagernet/sing-tun'])
+            self.assertEqual(graph[-1]['Version'], 'v0.0.0-fixture')
+            old_graph, _ = current_mobile_graph_fixture(legacy, Path(temporary) / 'legacy')
+            self.assertEqual(len(old_graph), 1)
+            self.assertTrue(old_graph[0]['Main'])
 
 
 if __name__ == '__main__':

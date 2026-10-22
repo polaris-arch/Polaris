@@ -79,7 +79,7 @@ UNIT_TEST_BUILD = ['bash', 'src-tauri/gen/android/gradlew', '--project-dir', 'sr
                    *[arg for name in UNIT_TEST_CLASSES for arg in ('--tests', 'com.polaris2.app.vpn.' + name)],
                    '-x', ':app:rustBuildArm64Debug', '--rerun-tasks', '--max-workers=2', '--no-daemon']
 
-FORMAL_HASH = 'd2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0'
+FORMAL_HASH = 'cf3bdf9999f99ae180d0b1e3ce6499e1ae6251f682216ae5f0cb1570226869e1'
 OVERRIDES = set(('GOFLAGS GOENV GOWORK GOTOOLCHAIN GOOS GOARCH GOARM GOARM64 GOEXPERIMENT '
                  'GOBIN GOMODCACHE GOCACHE GONOSUMDB GOPRIVATE GONOPROXY GOPROXY GOSUMDB GOINSECURE CC CXX CPP AR LD CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH '
                  'LIBRARY_PATH COMPILER_PATH GCC_EXEC_PREFIX JAVA_TOOL_OPTIONS _JAVA_OPTIONS '
