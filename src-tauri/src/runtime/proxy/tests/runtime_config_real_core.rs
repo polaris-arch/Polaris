@@ -1,11 +1,11 @@
 //! Explicit GitHub-only, source-admitted noTUN consumer tests. There is no RPC mock.
-//! The no-Naive profile proves this graph only, never paired/release acceptance.
+//! Diagnostic source and formal Release inputs are distinct; neither proves TUN/mobile acceptance.
 use super::*;
 use polaris_singbox_grpc::{daemon, ClientError, Endpoint, RuntimeConfigError, SingBoxApiClient};
 use serde_json::json;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,10 +44,478 @@ fn regular(path: &Path, limit: u64) -> Vec<u8> {
     bytes
 }
 
+// Formal bindings retain the existing production selection and original receipt.
+// No writable receipt may choose a different compiled contract/core/sidecar.
+fn formal_bytes(path: &Path, limit: u64) -> (Vec<u8>, u32) {
+    assert!(path.is_absolute());
+    assert_eq!(path.canonicalize().unwrap(), path);
+    let stamp = |m: &std::fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mode(),
+            m.uid(),
+            m.nlink(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    let initial = std::fs::symlink_metadata(path).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .unwrap();
+    let before = file.metadata().unwrap();
+    assert_eq!(stamp(&initial), stamp(&before));
+    assert!(before.is_file() && before.len() > 0 && before.len() <= limit);
+    assert_eq!(before.nlink(), 1);
+    assert_eq!(before.uid(), std::fs::metadata("/proc/self").unwrap().uid());
+    assert_eq!(before.mode() & 0o7022, 0);
+    let mut bytes = Vec::new();
+    (&file)
+        .take(limit.checked_add(1).unwrap())
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert!(bytes.len() as u64 <= limit);
+    assert_eq!(bytes.len() as u64, before.len());
+    assert_eq!(stamp(&before), stamp(&file.metadata().unwrap()));
+    assert_eq!(
+        stamp(&before),
+        stamp(&std::fs::symlink_metadata(path).unwrap())
+    );
+    assert_eq!(path.canonicalize().unwrap(), path);
+    (bytes, before.mode() & 0o7777)
+}
+
+fn formal_pin(value: &Value, expected: &Path, limit: u64) -> Vec<u8> {
+    assert_eq!(value["path"].as_str(), expected.to_str());
+    let (bytes, mode) = formal_bytes(expected, limit);
+    assert_eq!(value["bytes"].as_u64(), Some(bytes.len() as u64));
+    assert_eq!(value["sha256"], polaris_updater::sha256_hex(&bytes));
+    assert_eq!(value["mode"].as_u64(), Some(u64::from(mode)));
+    bytes
+}
+
+// Same sorted-key ASCII JSON as the existing release-consumer portableCanonical.
+// Receipt numbers are bounded integer facts; do not silently reinterpret floats.
+fn formal_canonical(value: &Value) -> String {
+    fn string(value: &str) -> String {
+        serde_json::to_string(value)
+            .unwrap()
+            .encode_utf16()
+            .map(|unit| {
+                if unit >= 0x7f {
+                    format!("\\u{unit:04x}")
+                } else {
+                    char::from_u32(u32::from(unit)).unwrap().to_string()
+                }
+            })
+            .collect()
+    }
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => {
+            let signed = value
+                .as_i64()
+                .is_some_and(|n| n.unsigned_abs() <= 9_007_199_254_740_991);
+            let unsigned = value.as_u64().is_some_and(|n| n <= 9_007_199_254_740_991);
+            assert!(signed || unsigned, "portable receipt integer required");
+            value.to_string()
+        }
+        Value::String(value) => string(value),
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(formal_canonical)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, value)| format!("{}:{}", string(key), formal_canonical(value)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+}
+
+fn formal_fingerprint(value: &Value) -> String {
+    polaris_updater::sha256_hex(formal_canonical(value).as_bytes())
+}
+
+fn formal_public_snapshot(snapshot: &Value, contract: &Value) {
+    for (key, field) in [
+        ("repositoryId", "repositoryId"),
+        ("releaseId", "releaseId"),
+        ("tag", "tagObject"),
+        ("sourceCommit", "sourceCommit"),
+        ("sourceTree", "sourceTree"),
+    ] {
+        assert_eq!(
+            snapshot[key], contract[field],
+            "compiled public identity: {key}"
+        );
+    }
+    assert!(
+        snapshot.get("producerReadback").is_none(),
+        "no fresh producer-success claim"
+    );
+    let links = snapshot["sourceGitlinks"].as_array().unwrap();
+    assert!(links.len() <= 1024);
+    let mut paths = std::collections::BTreeSet::new();
+    for link in links {
+        let path = link["path"].as_str().unwrap();
+        assert!(path
+            .split('/')
+            .all(|part| !part.is_empty() && ![".", ".."].contains(&part) && !part.contains('\0')));
+        assert!(paths.insert(path) && hex(link["sha"].as_str().unwrap(), 40));
+    }
+    let mut pins = Vec::new();
+    if contract["materialTransport"] != "committed-index-github-source-v1" {
+        pins.extend([&contract["assetIndex"], &contract["sourceArchive"]]);
+    }
+    pins.extend(
+        contract["platforms"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|row| &row["releaseAsset"]),
+    );
+    let assets = snapshot["assets"].as_array().unwrap();
+    assert_eq!(assets.len(), pins.len());
+    for pin in pins {
+        let rows: Vec<_> = assets
+            .iter()
+            .filter(|row| row["name"] == pin["name"])
+            .collect();
+        assert_eq!(rows.len(), 1, "unique public asset required");
+        let row = rows[0];
+        for (key, field) in [
+            ("name", "name"),
+            ("id", "assetId"),
+            ("bytes", "bytes"),
+            ("url", "url"),
+        ] {
+            assert_eq!(row[key], pin[field], "compiled public asset: {key}");
+        }
+        assert!(row.get("digest").is_some());
+        assert!(
+            row["digest"].is_null()
+                || row["digest"] == format!("sha256:{}", pin["sha256"].as_str().unwrap())
+        );
+    }
+}
+
+#[test]
+fn formal_portable_receipt_encoding_matches_consumer_ascii_json() {
+    let fixture = json!({"z": [true, null, 17], "a": "\u{7f}中😀\n"});
+    assert_eq!(
+        formal_canonical(&fixture),
+        r#"{"a":"\u007f\u4e2d\ud83d\ude00\n","z":[true,null,17]}"#
+    );
+    assert!(std::panic::catch_unwind(|| formal_canonical(&json!(1.5))).is_err());
+}
+
+#[test]
+fn formal_public_snapshot_rejects_self_consistent_foreign_identity() {
+    let contract = json!({"repositoryId": 1, "releaseId": 2, "tagObject": "fixture-tag",
+        "sourceCommit": "fixture-source", "sourceTree": "fixture-tree",
+        "materialTransport": "committed-index-github-source-v1", "platforms": {"linux": {
+            "releaseAsset": {"name": "fixture-asset", "assetId": 3, "bytes": 4, "url": "https://fixture.invalid/asset", "sha256": "fixture-hash"}}}});
+    let snapshot = json!({"repositoryId": 1, "releaseId": 2, "tag": "fixture-tag", "sourceCommit": "fixture-source", "sourceTree": "fixture-tree",
+        "sourceGitlinks": [], "assets": [{"name": "fixture-asset", "id": 3, "bytes": 4, "url": "https://fixture.invalid/asset", "digest": null}]});
+    formal_public_snapshot(&snapshot, &contract);
+    for key in [
+        "repositoryId",
+        "releaseId",
+        "tag",
+        "sourceCommit",
+        "sourceTree",
+        "assets",
+    ] {
+        let mut foreign = snapshot.clone();
+        foreign[key] = "foreign-fixture".into();
+        assert!(
+            std::panic::catch_unwind(|| formal_public_snapshot(&foreign, &contract)).is_err(),
+            "{key}"
+        );
+    }
+}
+
+fn formal_input(receipt: &Value, receipt_path: &Path) -> PathBuf {
+    assert_eq!(
+        receipt["schema"],
+        "polaris-runtime-loopback-formal-input-v1"
+    );
+    assert_eq!(receipt["inputMode"], "formal-release");
+    assert!(hex(receipt["appTree"].as_str().unwrap(), 40));
+    assert!(receipt["implementationManifestDigest"].is_null());
+    let binding_metadata = std::fs::symlink_metadata(receipt_path).unwrap();
+    assert_eq!(binding_metadata.mode() & 0o7777, 0o600);
+    assert_eq!(binding_metadata.nlink(), 1);
+    assert_eq!(
+        binding_metadata.uid(),
+        std::fs::metadata("/proc/self").unwrap().uid()
+    );
+    assert_eq!(receipt["profile"], "linux-amd64-formal-release");
+    assert!(std::env::var_os("POLARIS_SINGBOX_PATH").is_none());
+    assert_eq!(option_env!("GITHUB_SHA"), receipt["appCommit"].as_str());
+    for (key, field) in [
+        ("GITHUB_RUN_ID", "runId"),
+        ("GITHUB_RUN_ATTEMPT", "runAttempt"),
+    ] {
+        let actual = std::env::var(key).unwrap();
+        assert!(actual.parse::<u64>().unwrap() > 0);
+        assert_eq!(receipt[field].as_str(), Some(actual.as_str()));
+    }
+    let slot = PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap())
+        .canonicalize()
+        .unwrap()
+        .join(format!(
+            "polaris-runtime-loopback-{}-{}",
+            receipt["runId"].as_str().unwrap(),
+            receipt["runAttempt"].as_str().unwrap()
+        ))
+        .join("evidence");
+    assert_eq!(receipt_path, slot.join("formal-input.json"));
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let manifest_raw = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/core-manifest.json"));
+    let contract_raw = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../scripts/desktop-core/release-contract.json"
+    ));
+    let manifest: Value = serde_json::from_slice(manifest_raw).unwrap();
+    let contract: Value = serde_json::from_slice(contract_raw).unwrap();
+    assert!(manifest.get("desktopTemporary").is_none());
+    assert_eq!(
+        manifest["desktopRelease"]["contractPath"],
+        "scripts/desktop-core/release-contract.json"
+    );
+    assert_eq!(
+        manifest["desktopRelease"]["contractSha256"],
+        polaris_updater::sha256_hex(contract_raw)
+    );
+    assert_eq!(
+        contract["schema"],
+        "polaris-upstream-native-release-consumer-v1"
+    );
+    assert_eq!(contract["repository"], "polaris-arch/sing-box-polaris");
+    assert_eq!(receipt["kernelCommit"], contract["sourceCommit"]);
+    assert_eq!(receipt["kernelTree"], contract["sourceTree"]);
+    for field in [
+        "repository",
+        "version",
+        "tag",
+        "tagObject",
+        "sourceCommit",
+        "sourceTree",
+        "releaseId",
+    ] {
+        assert_eq!(receipt["release"][field], contract[field]);
+        if field != "repository" {
+            assert_eq!(manifest["desktopRelease"][field], contract[field]);
+        }
+    }
+    let inputs = &receipt["inputs"];
+    let index_name = contract["assetIndex"]["name"].as_str().unwrap();
+    assert!(
+        !index_name.is_empty()
+            && !index_name.contains(['/', '\\'])
+            && index_name != "."
+            && index_name != ".."
+    );
+    let originals = [
+        (
+            "manifest",
+            root.join("src-tauri/core-manifest.json"),
+            "manifest.json",
+        ),
+        (
+            "contract",
+            root.join("scripts/desktop-core/release-contract.json"),
+            "contract.json",
+        ),
+        (
+            "assetIndex",
+            root.join("resources/.release-receipts").join(index_name),
+            "asset-index.json",
+        ),
+        (
+            "consumption",
+            root.join("resources/.release-receipts/linux.json"),
+            "consumption.json",
+        ),
+        (
+            "readback",
+            root.join("resources/.release-receipts/public-readback.json"),
+            "public-readback.json",
+        ),
+        (
+            "installation",
+            root.join("resources/linux/core-manifest.json"),
+            "installation.json",
+        ),
+    ];
+    let mut original = std::collections::BTreeMap::new();
+    for (key, path, retained) in originals {
+        let bytes = formal_pin(&inputs[key], &path, 8 * 1024 * 1024);
+        let retained_bytes = formal_pin(
+            &receipt["retainedInputs"][key],
+            &slot.join("formal-inputs").join(retained),
+            8 * 1024 * 1024,
+        );
+        assert_eq!(
+            bytes, retained_bytes,
+            "retained original bytes differ: {key}"
+        );
+        original.insert(key, bytes);
+    }
+    assert_eq!(original["manifest"].as_slice(), manifest_raw.as_slice());
+    assert_eq!(original["contract"].as_slice(), contract_raw.as_slice());
+    assert_eq!(
+        inputs["assetIndex"]["sha256"],
+        contract["assetIndex"]["sha256"]
+    );
+    assert_eq!(
+        inputs["assetIndex"]["bytes"],
+        contract["assetIndex"]["bytes"]
+    );
+    let consumption: Value = serde_json::from_slice(&original["consumption"]).unwrap();
+    let readback: Value = serde_json::from_slice(&original["readback"]).unwrap();
+    let installation: Value = serde_json::from_slice(&original["installation"]).unwrap();
+    assert_eq!(consumption["schema"], "polaris-app-release-consumption-v1");
+    assert_eq!(consumption["platform"], "linux");
+    assert_eq!(
+        consumption["signaturePolicy"],
+        "preserve measured original bytes; ad-hoc/not-signed observations do not assert trust"
+    );
+    assert_eq!(consumption.get("macCodeSignature"), Some(&Value::Null));
+    assert_eq!(
+        consumption["actualAppAcceptance"],
+        "pending native load, gvisor/mixed, feature and final carrier gates"
+    );
+    let mut facts = consumption.clone();
+    facts.as_object_mut().unwrap().remove("schema");
+    facts.as_object_mut().unwrap().remove("fingerprint");
+    assert_eq!(consumption["fingerprint"], formal_fingerprint(&facts));
+    assert_eq!(
+        consumption["adapter"]["schema"],
+        "polaris-app-release-adapter-v1"
+    );
+    assert_eq!(
+        consumption["adapter"]["fingerprint"],
+        formal_fingerprint(&consumption["adapter"]["facts"])
+    );
+
+    assert_eq!(
+        consumption["fingerprint"],
+        receipt["consumptionFingerprint"]
+    );
+    assert_eq!(
+        consumption["adapter"]["facts"]["candidate"],
+        receipt["appCommit"]
+    );
+    assert_eq!(consumption["contractSha256"], inputs["contract"]["sha256"]);
+    assert_eq!(
+        consumption["assetIndexSha256"],
+        inputs["assetIndex"]["sha256"]
+    );
+    let row = &contract["platforms"]["linux"];
+    assert_eq!(consumption["producer"], *row);
+    assert_eq!(consumption["releaseAsset"], row["releaseAsset"]);
+    assert_eq!(readback["schema"], "polaris-app-release-readback-v1");
+    assert_eq!(readback["contractSha256"], inputs["contract"]["sha256"]);
+    assert_eq!(readback["before"], readback["after"]);
+    assert_eq!(readback["before"], consumption["publicReadback"]);
+    formal_public_snapshot(&readback["before"], &contract);
+    for field in ["goVersion", "buildID", "tags"] {
+        assert_eq!(receipt["build"][field], row[field]);
+    }
+    assert_eq!(
+        receipt["naiveIncluded"].as_bool(),
+        Some(
+            row["tags"]
+                .as_str()
+                .unwrap()
+                .split(',')
+                .any(|tag| tag == "with_naive_outbound")
+        )
+    );
+    formal_pin(
+        &receipt["observedBuildInfo"],
+        &slot.join("formal-build-info.txt"),
+        8 * 1024 * 1024,
+    );
+    let selected = crate::runtime::core_identity::selected_manifest("linux").unwrap();
+    let (source, contract_sha) =
+        crate::runtime::core_identity::selected_check_source("linux").unwrap();
+    assert_eq!(Some(source.as_str()), receipt["kernelCommit"].as_str());
+    assert_eq!(
+        Some(contract_sha.as_str()),
+        inputs["contract"]["sha256"].as_str()
+    );
+    assert_eq!(installation["id"], receipt["installedCoreId"]);
+    assert_eq!(
+        installation["id"].as_str(),
+        Some(
+            crate::runtime::core_identity::selected_id("linux")
+                .unwrap()
+                .as_str()
+        )
+    );
+    formal_pin(
+        &receipt["helper"],
+        &root.join("resources/linux/polaris-helper"),
+        256 * 1024 * 1024,
+    );
+    assert_eq!(
+        selected.helper_sha256.as_deref(),
+        receipt["helper"]["sha256"].as_str()
+    );
+    assert_eq!(
+        installation["core"]["helperSha256"],
+        receipt["helper"]["sha256"]
+    );
+    for (key, member) in [("binary", "sing-box"), ("sidecar", "libcronet.so")] {
+        formal_pin(
+            &receipt[key],
+            &root.join("resources/linux").join(member),
+            256 * 1024 * 1024,
+        );
+        let expected = &row[if key == "binary" { "core" } else { "sidecar" }];
+        assert_eq!(receipt[key]["sha256"], expected["sha256"]);
+        assert_eq!(receipt[key]["bytes"], expected["bytes"]);
+    }
+    let binary = resolve_core_binary()
+        .expect("compiled formal core and sidecar must resolve")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(binary, root.join("resources/linux/sing-box"));
+    binary
+}
+
 struct Admission {
     receipt: Value,
     receipt_path: PathBuf,
     binary: PathBuf,
+    binding_sha256: Option<String>,
+    formal_bundle: Option<crate::runtime::core_identity::BundleObservation>,
 }
 
 impl Admission {
@@ -87,12 +555,17 @@ impl Admission {
             std::env::var_os("POLARIS_RUNTIME_LOOPBACK_RECEIPT")
                 .expect("exact runner receipt required; no local path fallback"),
         );
-        let receipt: Value = serde_json::from_slice(&regular(&receipt_path, 1024 * 1024))
-            .expect("runner receipt JSON");
-        assert_eq!(receipt["schema"], "polaris-runtime-loopback-candidate-v1");
-        assert_eq!(receipt["profile"], "linux-amd64-purego-no-naive");
+        // Read safely before trusting either the filename or the schema. Valid
+        // diagnostic receipts are already owned regular files with mode 0600.
+        let raw_receipt = formal_bytes(&receipt_path, 1024 * 1024).0;
+        let receipt: Value = serde_json::from_slice(&raw_receipt).expect("runner receipt JSON");
+        let formal = receipt["schema"] == "polaris-runtime-loopback-formal-input-v1";
+        if !formal {
+            assert_eq!(receipt["schema"], "polaris-runtime-loopback-candidate-v1");
+            assert_eq!(receipt["profile"], "linux-amd64-purego-no-naive");
+            assert_eq!(receipt["naiveIncluded"], false);
+        }
         assert_eq!(receipt["sourceVerified"], true);
-        assert_eq!(receipt["naiveIncluded"], false);
         assert_eq!(receipt["publicationEligible"], false);
         for field in ["appCommit", "kernelCommit", "kernelTree"] {
             assert!(hex(receipt[field].as_str().unwrap(), 40), "exact {field}");
@@ -114,23 +587,52 @@ impl Admission {
                 64
             ));
         }
-        let binary = PathBuf::from(receipt["binary"]["path"].as_str().unwrap());
-        assert_eq!(
-            std::env::var_os("POLARIS_SINGBOX_PATH").map(PathBuf::from),
-            Some(binary.clone()),
-            "POLARIS_SINGBOX_PATH only attests this receipt; it is not a production override"
-        );
+        let binary = if formal {
+            formal_input(&receipt, &receipt_path)
+        } else {
+            let binary = PathBuf::from(receipt["binary"]["path"].as_str().unwrap());
+            assert_eq!(
+                std::env::var_os("POLARIS_SINGBOX_PATH").map(PathBuf::from),
+                Some(binary.clone()),
+                "POLARIS_SINGBOX_PATH only attests this receipt; it is not a production override"
+            );
+            binary
+        };
+        let binding_sha256 = formal.then(|| polaris_updater::sha256_hex(&raw_receipt));
+        let formal_bundle =
+            formal.then(|| crate::runtime::core_identity::verify_bundled(&binary).unwrap());
         let result = Self {
             receipt,
             receipt_path,
             binary,
+            binding_sha256,
+            formal_bundle,
         };
         result.verify_binary();
         result
     }
 
     fn verify_binary(&self) {
-        let bytes = regular(&self.binary, 256 * 1024 * 1024);
+        if let Some(expected) = &self.binding_sha256 {
+            assert_eq!(
+                *expected,
+                polaris_updater::sha256_hex(&formal_bytes(&self.receipt_path, 1024 * 1024).0)
+            );
+            assert!(
+                self.formal_bundle.as_ref().unwrap().is_current(),
+                "formal payload object changed"
+            );
+            assert_eq!(formal_input(&self.receipt, &self.receipt_path), self.binary);
+            assert!(
+                self.formal_bundle.as_ref().unwrap().is_current(),
+                "formal payload object changed during verification"
+            );
+        }
+        let bytes = if self.binding_sha256.is_some() {
+            formal_bytes(&self.binary, 256 * 1024 * 1024).0
+        } else {
+            regular(&self.binary, 256 * 1024 * 1024)
+        };
         assert_eq!(
             self.receipt["binary"]["bytes"].as_u64(),
             Some(bytes.len() as u64)
@@ -173,14 +675,20 @@ impl Evidence {
             .unwrap()
             .join(format!("{name}.json"));
         assert!(!path.exists(), "refuse stale per-test evidence");
-        let value = json!({
+        let mut value = json!({
             "schema":"polaris-runtime-loopback-test-v1", "test":name,
-            "passed":false, "profile":"linux-amd64-purego-no-naive",
+            "passed":false, "profile":admission.receipt["profile"],
             "publicationEligible":false, "appCommit":admission.receipt["appCommit"],
             "kernelCommit":admission.receipt["kernelCommit"],
             "kernelTree":admission.receipt["kernelTree"],
             "coreSha256":admission.receipt["binary"]["sha256"], "events":[]
         });
+        if let Some(digest) = &admission.binding_sha256 {
+            value["schema"] = "polaris-runtime-loopback-formal-test-v1".into();
+            value["inputSha256"] = digest.clone().into();
+            value["contractSha256"] = admission.receipt["inputs"]["contract"]["sha256"].clone();
+            value["consumptionFingerprint"] = admission.receipt["consumptionFingerprint"].clone();
+        }
         let result = Self { path, value };
         result.flush();
         result
@@ -2481,12 +2989,18 @@ impl Running {
         let directory = TestDir::new("polaris-runtime-loopback-");
         let rt = test_runtime_in(directory.clone());
         let cleanup = RealCoreCleanupGuard::new(&rt);
+        if admission.binding_sha256.is_some() {
+            admission.verify_binary();
+        }
         rt.inject_real_core_for_test(admission.binary.clone());
         let config = save_fixture_config(&rt.config, &config);
         let (_, checked) = prepare_fixture_graph(&rt, &config).await;
         evidence.record(json!({"phase":"prestart-safety","projection":checked,
             "claim":"fixture-reachable closure only; unused production DNS definitions are statically excluded",
             "autoProbeEmitterAttached":false,"canonicalNoTun":true}));
+        if admission.binding_sha256.is_some() {
+            admission.verify_binary();
+        }
         let status = tokio::time::timeout(Duration::from_secs(45), rt.start(config.clone()))
             .await
             .expect("bounded real start")
@@ -2586,6 +3100,7 @@ impl Running {
             .unwrap();
         assert!(!self.rt.status().running);
         assert!(!ps_alive(self.pid), "owned core reaped");
+        admission.verify_binary();
         evidence.record(json!({"phase":"stopped","pid":self.pid,"ownedChildReaped":true}));
     }
 }

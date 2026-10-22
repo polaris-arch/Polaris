@@ -6,6 +6,9 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpat
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { executeCommand } from './desktop-core/native-dns-gates.mjs';
+import { consumeRelease } from './desktop-core/release-consumer.mjs';
+import { FORMAL_PROFILE, FORMAL_SCHEMA, FORMAL_TEST_SCHEMA, loopbackInput, formalSelection, prepareFormalCarrier,
+  createFormalInput, verifyFormalFiles, verifyFormalInput, formalFile } from './runtime-config-loopback-formal.mjs';
 import { parseBuildInfo } from './desktop-core/source-graph.mjs';
 import { exactPass, runtimeEnvironment, selectExecutable } from './run-native-dns-controlled-tests.mjs';
 
@@ -49,6 +52,7 @@ const capture = (command, args, cwd = ROOT, env = process.env) => execFileSync(c
 
 export function validateRequest(env, inputs, event, prepared = false) {
   demand(inputs && typeof inputs === 'object' && !Array.isArray(inputs), 'Dispatch inputs required');
+  loopbackInput(inputs);
   const candidate = inputs.runtime_config_loopback_candidate;
   demand(typeof candidate === 'string' && /^[0-9a-f]{40}$/.test(candidate), 'Exact lowercase App SHA required');
   const expected = { GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: REPOSITORY,
@@ -62,7 +66,7 @@ export function validateRequest(env, inputs, event, prepared = false) {
     && (inputs.windows_directory_mode || 'formal') === 'formal'
     && ['app_native_compile_candidate', 'native_dns_candidate', 'windows_system_candidate', 'windows_directory_candidate_source']
       .every((key) => (inputs[key] ?? '') === ''), 'Loopback cannot combine other candidate/source/compile/SYSTEM modes');
-  const allowed = ['runtime_config_loopback_candidate', 'app_native_compile_candidate', 'runtime_config_source_only',
+  const allowed = ['runtime_config_loopback_input', 'runtime_config_loopback_candidate', 'app_native_compile_candidate', 'runtime_config_source_only',
     'native_dns_candidate', 'windows_system_candidate', 'windows_launcher_diagnostics', 'windows_directory_mode',
     'windows_directory_candidate_source', 'preserve_run', 'os'];
   demand(Object.keys(inputs).every((key) => allowed.includes(key)), 'Unknown dispatch input');
@@ -179,9 +183,13 @@ export function validateBuild(raw, pin, graph, vcs) {
   return { goVersion: facts.goVersion, settings: Object.fromEntries(facts.settings), modules: Object.fromEntries(facts.modules) };
 }
 
-export function validateTestEvidence(value, name, receipt) {
-  demand(value?.schema === 'polaris-runtime-loopback-test-v1' && value.test === name.split('::').at(-1)
-    && value.passed === true && value.profile === PROFILE && value.publicationEligible === false,
+export function validateTestEvidence(value, name, receipt, inputSha256) {
+  const formal = receipt.schema === FORMAL_SCHEMA;
+  if (formal) demand(value.inputSha256 === inputSha256 && /^[0-9a-f]{64}$/.test(inputSha256 ?? '')
+    && value.contractSha256 === receipt.inputs.contract.sha256 && value.consumptionFingerprint === receipt.consumptionFingerprint,
+  'Formal test input/contract/original receipt attribution differs');
+  demand(value?.schema === (formal ? FORMAL_TEST_SCHEMA : 'polaris-runtime-loopback-test-v1') && value.test === name.split('::').at(-1)
+    && value.passed === true && value.profile === (formal ? FORMAL_PROFILE : PROFILE) && value.publicationEligible === false,
   'Successful attributed real-test evidence required');
   for (const key of ['appCommit', 'kernelCommit', 'kernelTree'])
     demand(value[key] === receipt[key], `Real-test source attribution differs: ${key}`);
@@ -189,7 +197,8 @@ export function validateTestEvidence(value, name, receipt) {
   const starts = value.events.filter((row) => row.phase === 'started');
   const stops = value.events.filter((row) => row.phase === 'stopped');
   demand(starts.length === 1 && stops.length === 1 && stops[0].ownedChildReaped === true
-    && stops[0].pid === starts[0].pid, 'Real-test owned birth/terminal evidence required');
+    && Number.isSafeInteger(starts[0].pid) && starts[0].pid > 0 && stops[0].pid === starts[0].pid
+    && value.events.indexOf(starts[0]) < value.events.indexOf(stops[0]), 'Real-test owned birth/terminal evidence required');
   const observed = starts[0].capabilities;
   demand(observed?.contractVersion === 1 && observed.enabled === true
     && /^[0-9a-f]{64}$/.test(observed.implementationManifestDigest ?? ''), 'Actual enabled protocol manifest required');
@@ -316,11 +325,18 @@ export function retainVerifiedCandidate(request) {
 }
 
 // Preserve the real run failure independently from final archive verification.
-export async function withResultEvidence(evidence, result, run) {
+export async function withResultEvidence(evidence, result, run, finalize) {
   let failure;
   try { await run(); }
   catch (error) { failure = error; result.status = 'failed'; result.failure = error.message; }
   finally {
+    if (finalize) {
+      try { await finalize(); }
+      catch (error) {
+        result.status = 'failed'; result.finalVerificationFailure = error.message;
+        if (!failure) { failure = error; result.failure = error.message; }
+      }
+    }
     if (result.retainedCandidate) {
       try {
         capture('python3', ['-I', '-c', RETAINED_CANDIDATE, 'verify',
@@ -472,20 +488,29 @@ export function requireSameAppSource(before, after) {
   return after;
 }
 
+export function validatePreparedSource(admission, source) {
+  demand(admission.appCommit === source.commit && admission.appTree === source.tree
+    && JSON.stringify(admission.appSource) === JSON.stringify(source), 'Prepared App source/tree differs');
+  return source.tree;
+}
+
 function context(prepared) {
   const env = process.env;
-  const candidate = validateRequest(env, JSON.parse(env.RUNTIME_CONFIG_LOOPBACK_INPUTS ?? '{}'), readJSON(env.GITHUB_EVENT_PATH), prepared);
+  const inputs = JSON.parse(env.RUNTIME_CONFIG_LOOPBACK_INPUTS ?? '{}');
+  const candidate = validateRequest(env, inputs, readJSON(env.GITHUB_EVENT_PATH), prepared);
+  const inputMode = loopbackInput(inputs);
   demand(realpathSync(process.cwd()) === ROOT && capture('git', ['rev-parse', 'HEAD'], ROOT, gitEnv(env)).trim() === candidate,
     'App checkout differs');
   // Reuse the full tracked-byte/mode verifier, rejecting hidden index flags and
   // all untracked/ignored inputs before any generated resources or Cargo build.
   const appSource = appSourceCheck('clean');
   demand(appSource.commit === candidate, 'App tracked source commit differs');
-  const pin = validatePin(readJSON(PIN));
+  const pin = inputMode === 'diagnostic-source' ? validatePin(readJSON(PIN)) : null;
+  const formal = inputMode === 'formal-release' ? formalSelection(ROOT) : null;
   demand(sha(readFileSync(join(ROOT, 'crates/singbox-grpc/proto/runtime_config.proto'))) === PROTO, 'App protocol bytes differ');
   const temporary = realpathSync(env.RUNNER_TEMP);
   const directory = join(temporary, `polaris-runtime-loopback-${env.GITHUB_RUN_ID}-${env.GITHUB_RUN_ATTEMPT}`);
-  return { candidate, pin, appSource, directory, evidence: join(directory, 'evidence') };
+  return { candidate, pin, formal, inputMode, appSource, directory, evidence: join(directory, 'evidence') };
 }
 
 function admit() {
@@ -500,24 +525,27 @@ function admit() {
   writeJSON(join(checked.evidence, 'admission.json'), { appCommit: checked.candidate,
     appTree: capture('git', ['rev-parse', 'HEAD^{tree}'], ROOT, gitEnv(process.env)).trim(),
     appSource: checked.appSource,
-    pinSha256: sha(readFileSync(PIN)), runId: process.env.GITHUB_RUN_ID, runAttempt: process.env.GITHUB_RUN_ATTEMPT,
-    workflowRef: process.env.GITHUB_WORKFLOW_REF, profile: PROFILE, publicationEligible: false });
+    inputMode: checked.inputMode,
+    ...(checked.formal ? { contractSha256: checked.formal.manifest.desktopRelease.contractSha256 } : { pinSha256: sha(readFileSync(PIN)) }), runId: process.env.GITHUB_RUN_ID, runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+    workflowRef: process.env.GITHUB_WORKFLOW_REF, profile: checked.formal ? FORMAL_PROFILE : PROFILE, publicationEligible: false });
   appendFileSync(process.env.GITHUB_OUTPUT, `evidence=${checked.evidence}\n`);
 }
 
 async function run() {
-  const { candidate, pin, appSource, directory, evidence } = context(true);
+  const { candidate, pin, formal, inputMode, appSource, directory, evidence } = context(true);
   demand(process.env.GITHUB_JOB === 'runtime_config_loopback' && realpathSync(directory) === directory,
     'Admitted execution runner required');
   const admission = readJSON(join(evidence, 'admission.json'));
-  demand(admission.appCommit === candidate && admission.pinSha256 === sha(readFileSync(PIN))
+  validatePreparedSource(admission, appSource);
+  demand(admission.appCommit === candidate && admission.inputMode === inputMode
+    && (formal ? admission.contractSha256 === formal.manifest.desktopRelease.contractSha256 : admission.pinSha256 === sha(readFileSync(PIN)))
     && admission.runId === process.env.GITHUB_RUN_ID && admission.runAttempt === process.env.GITHUB_RUN_ATTEMPT
     && JSON.stringify(admission.appSource) === JSON.stringify(appSource),
   'Prepared runner admission differs');
   const source = join(directory, 'kernel'), bin = join(directory, 'bin'), target = join(directory, 'target');
   for (const path of [source, bin, target]) { demand(!existsSync(path), 'Fresh build directory required'); mkdirSync(path, { mode: 0o700 }); }
   const result = { ...admission, schema: 'polaris-runtime-loopback-result-v1', status: 'failed', tests: [], admissionTests: [],
-    sourceVerified: false, naiveIncluded: false, fullFeatureAcceptance: false, mobileAcceptance: false, publicationEligible: false };
+    sourceVerified: false, ...(formal ? {} : { naiveIncluded: false }), fullFeatureAcceptance: false, mobileAcceptance: false, publicationEligible: false };
   const execute = async (id, program, args, cwd = ROOT, env = process.env, timeout = 20 * 60_000) => {
     const observed = await executeCommand({ id, program, args }, { root: cwd, env, directory: evidence, timeout, captureStdout: true });
     demand(observed.status === 0 && !observed.error && !observed.timedOut && !observed.cleanupUncertain && !observed.interrupted,
@@ -525,73 +553,89 @@ async function run() {
     return observed;
   };
   await withResultEvidence(evidence, result, async () => {
-    await execute('kernel-init', 'git', ['init', '--template=', source], ROOT, gitEnv(process.env));
-    await execute('kernel-fetch', 'git', ['-C', source, '-c', 'protocol.file.allow=never', 'fetch', '--no-tags', '--depth=1',
-      'https://github.com/polaris-arch/sing-box-polaris.git', pin.source.commit], ROOT, gitEnv(process.env));
-    await execute('kernel-checkout', 'git', ['-C', source, 'checkout', '--detach', pin.source.commit], ROOT, gitEnv(process.env));
-    result.sourceBefore = JSON.parse(capture('python3', ['-c', SOURCE_CHECK, ROOT, source, PIN]));
-    const buildVcs = readBuildVcs(source);
-    result.buildVcs = { ...buildVcs, ...expectedBuildVcs(pin, buildVcs) };
-    result.officialGo = JSON.parse((await execute('official-go-prepare', 'python3',
-      ['-I', '-c', OFFICIAL_GO_SETUP, 'prepare', source, PIN, directory], ROOT, gitEnv(process.env))).stdout);
-    result.officialGoInventory = filePin(join(evidence, 'official-go-files.json'));
-    const goRoot = join(directory, 'official-go/unpacked/go'), go = join(goRoot, 'bin/go');
-    demand(result.officialGo.root === goRoot, 'Official Go toolchain escaped private slot');
-    const cleanGoEnv = { ...process.env, GOTOOLCHAIN: 'local', GOENV: 'off', GOWORK: 'off',
-      GOAMD64: 'v1', GOFIPS140: 'off', GOTELEMETRY: 'off' };
-    demand(capture(go, ['version'], ROOT, cleanGoEnv).trim() === 'go version go1.27.2 linux/amd64', 'Pinned Linux Go compiler required');
-    result.goExecutable = filePin(realpathSync(go));
-    demand(result.goExecutable.path === go, 'Selected Go executable is redirected');
-    demand(realpathSync(capture(go, ['env', 'GOROOT'], ROOT, cleanGoEnv).trim()) === goRoot, 'Go standard library root differs from selected compiler');
-    const goEnv = { ...cleanGoEnv, GOROOT: goRoot, GOFLAGS: '-mod=readonly',
-      CGO_ENABLED: '0', GOOS: 'linux', GOARCH: 'amd64', GOCACHE: join(directory, 'go-cache'),
-      GOMODCACHE: join(directory, 'go-modules'), GOPATH: join(directory, 'go-path') };
-    const graphText = (await execute('kernel-module-graph', go, ['list', '-m', '-json', 'all'], source, goEnv)).stdout;
-    const graphFile = join(evidence, 'module-graph.jsonstream');
-    writeFileSync(graphFile, graphText, { flag: 'wx', mode: 0o600 });
-    const graph = JSON.parse(capture('python3', ['-c', SOURCE_CHECK, ROOT, source, PIN, graphFile]));
-    demand(JSON.stringify(graph.source) === JSON.stringify(result.sourceBefore), 'Source changed during module resolution');
-    const actualTags = readFileSync(join(source, 'release/DEFAULT_BUILD_TAGS_OTHERS'), 'utf8').trim() + ',with_purego';
-    demand(actualTags === pin.tags, 'Reviewed tags differ from exact source');
-    const ldflags = readFileSync(join(source, 'release/LDFLAGS'), 'utf8').trim()
-      + ` -X github.com/sagernet/sing-box/constant.SourceRevision=${pin.source.commit}`
-      + ` -X github.com/sagernet/sing-box/constant.Version=${pin.version}`;
-    const binary = join(bin, 'sing-box');
-    await execute('kernel-build', go, ['build', '-trimpath', '-buildvcs=true', '-tags', pin.tags, '-ldflags', ldflags,
-      '-o', binary, './cmd/sing-box'], source, goEnv);
-    const buildInfo = capture(go, ['version', '-m', binary], source, goEnv);
-    result.buildInfo = recordBuildInfo(buildInfo, join(evidence, 'kernel-build-info.txt'));
-    result.observedBinary = filePin(binary);
-    result.build = validateBuild(buildInfo, pin, graph.graph, buildVcs);
-    result.sourceAfter = JSON.parse(capture('python3', ['-c', SOURCE_CHECK, ROOT, source, PIN]));
-    demand(JSON.stringify(result.sourceBefore) === JSON.stringify(result.sourceAfter), 'Build changed source');
-    demand(JSON.stringify(readBuildVcs(source)) === JSON.stringify(buildVcs), 'Build changed Git source identity');
-    const goAfter = JSON.parse((await execute('official-go-verify', 'python3',
-      ['-I', '-c', OFFICIAL_GO_SETUP, 'verify', source, PIN, directory], ROOT, gitEnv(process.env))).stdout);
-    demand(JSON.stringify(goAfter) === JSON.stringify(result.officialGo), 'Official Go toolchain changed during build');
-    result.officialGoAfterBuild = goAfter;
-    demand(JSON.stringify(filePin(binary)) === JSON.stringify(result.observedBinary),
-      'Observed executable changed during source verification');
-    result.sourceVerified = true;
-    const receipt = { schema: 'polaris-runtime-loopback-candidate-v1', appCommit: candidate,
-      kernelCommit: pin.source.commit, kernelTree: pin.source.tree, protoSha256: PROTO, profile: PROFILE,
-      implementationManifestDigest: pin.implementationManifestDigest, binary: result.observedBinary, sourceVerified: true,
-      naiveIncluded: false, publicationEligible: false };
-    const receiptPath = join(evidence, 'candidate.json'); writeJSON(receiptPath, receipt); result.binary = receipt.binary;
-    result.retainedCandidate = retainVerifiedCandidate({ directory, evidence, binary, receiptPath, receipt,
-      sourceVerified: result.sourceVerified });
-    // Formal packaging remains unavailable. Only the per-instance cfg(test) injector
-    // may consume this independently verified candidate, never a formal carrier.
+    let binary, receipt, receiptPath;
+    if (!formal) {
+      await execute('kernel-init', 'git', ['init', '--template=', source], ROOT, gitEnv(process.env));
+      await execute('kernel-fetch', 'git', ['-C', source, '-c', 'protocol.file.allow=never', 'fetch', '--no-tags', '--depth=1',
+        'https://github.com/polaris-arch/sing-box-polaris.git', pin.source.commit], ROOT, gitEnv(process.env));
+      await execute('kernel-checkout', 'git', ['-C', source, 'checkout', '--detach', pin.source.commit], ROOT, gitEnv(process.env));
+      result.sourceBefore = JSON.parse(capture('python3', ['-c', SOURCE_CHECK, ROOT, source, PIN]));
+      const buildVcs = readBuildVcs(source);
+      result.buildVcs = { ...buildVcs, ...expectedBuildVcs(pin, buildVcs) };
+      result.officialGo = JSON.parse((await execute('official-go-prepare', 'python3',
+        ['-I', '-c', OFFICIAL_GO_SETUP, 'prepare', source, PIN, directory], ROOT, gitEnv(process.env))).stdout);
+      result.officialGoInventory = filePin(join(evidence, 'official-go-files.json'));
+      const goRoot = join(directory, 'official-go/unpacked/go'), go = join(goRoot, 'bin/go');
+      demand(result.officialGo.root === goRoot, 'Official Go toolchain escaped private slot');
+      const cleanGoEnv = { ...process.env, GOTOOLCHAIN: 'local', GOENV: 'off', GOWORK: 'off',
+        GOAMD64: 'v1', GOFIPS140: 'off', GOTELEMETRY: 'off' };
+      demand(capture(go, ['version'], ROOT, cleanGoEnv).trim() === 'go version go1.27.2 linux/amd64', 'Pinned Linux Go compiler required');
+      result.goExecutable = filePin(realpathSync(go));
+      demand(result.goExecutable.path === go, 'Selected Go executable is redirected');
+      demand(realpathSync(capture(go, ['env', 'GOROOT'], ROOT, cleanGoEnv).trim()) === goRoot, 'Go standard library root differs from selected compiler');
+      const goEnv = { ...cleanGoEnv, GOROOT: goRoot, GOFLAGS: '-mod=readonly',
+        CGO_ENABLED: '0', GOOS: 'linux', GOARCH: 'amd64', GOCACHE: join(directory, 'go-cache'),
+        GOMODCACHE: join(directory, 'go-modules'), GOPATH: join(directory, 'go-path') };
+      const graphText = (await execute('kernel-module-graph', go, ['list', '-m', '-json', 'all'], source, goEnv)).stdout;
+      const graphFile = join(evidence, 'module-graph.jsonstream');
+      writeFileSync(graphFile, graphText, { flag: 'wx', mode: 0o600 });
+      const graph = JSON.parse(capture('python3', ['-c', SOURCE_CHECK, ROOT, source, PIN, graphFile]));
+      demand(JSON.stringify(graph.source) === JSON.stringify(result.sourceBefore), 'Source changed during module resolution');
+      const actualTags = readFileSync(join(source, 'release/DEFAULT_BUILD_TAGS_OTHERS'), 'utf8').trim() + ',with_purego';
+      demand(actualTags === pin.tags, 'Reviewed tags differ from exact source');
+      const ldflags = readFileSync(join(source, 'release/LDFLAGS'), 'utf8').trim()
+        + ` -X github.com/sagernet/sing-box/constant.SourceRevision=${pin.source.commit}`
+        + ` -X github.com/sagernet/sing-box/constant.Version=${pin.version}`;
+      binary = join(bin, 'sing-box');
+      await execute('kernel-build', go, ['build', '-trimpath', '-buildvcs=true', '-tags', pin.tags, '-ldflags', ldflags,
+        '-o', binary, './cmd/sing-box'], source, goEnv);
+      const buildInfo = capture(go, ['version', '-m', binary], source, goEnv);
+      result.buildInfo = recordBuildInfo(buildInfo, join(evidence, 'kernel-build-info.txt'));
+      result.observedBinary = filePin(binary);
+      result.build = validateBuild(buildInfo, pin, graph.graph, buildVcs);
+      result.sourceAfter = JSON.parse(capture('python3', ['-c', SOURCE_CHECK, ROOT, source, PIN]));
+      demand(JSON.stringify(result.sourceBefore) === JSON.stringify(result.sourceAfter), 'Build changed source');
+      demand(JSON.stringify(readBuildVcs(source)) === JSON.stringify(buildVcs), 'Build changed Git source identity');
+      const goAfter = JSON.parse((await execute('official-go-verify', 'python3',
+        ['-I', '-c', OFFICIAL_GO_SETUP, 'verify', source, PIN, directory], ROOT, gitEnv(process.env))).stdout);
+      demand(JSON.stringify(goAfter) === JSON.stringify(result.officialGo), 'Official Go toolchain changed during build');
+      result.officialGoAfterBuild = goAfter;
+      demand(JSON.stringify(filePin(binary)) === JSON.stringify(result.observedBinary),
+        'Observed executable changed during source verification');
+      result.sourceVerified = true;
+      receipt = { schema: 'polaris-runtime-loopback-candidate-v1', appCommit: candidate,
+        kernelCommit: pin.source.commit, kernelTree: pin.source.tree, protoSha256: PROTO, profile: PROFILE,
+        implementationManifestDigest: pin.implementationManifestDigest, binary: result.observedBinary, sourceVerified: true,
+        naiveIncluded: false, publicationEligible: false };
+      receiptPath = join(evidence, 'candidate.json'); writeJSON(receiptPath, receipt); result.binary = receipt.binary;
+      result.retainedCandidate = retainVerifiedCandidate({ directory, evidence, binary, receiptPath, receipt,
+        sourceVerified: result.sourceVerified });
+    } else {
+      for (const platform of ['dashboard', 'linux', 'win', 'mac-arm64', 'mac-x64', '.release-receipts', '.release-consumer.lock'])
+        demand(!existsSync(join(ROOT, 'resources', platform)), 'Formal HOT requires fresh resource destinations');
+      await consumeRelease(ROOT, formal.manifest, ['linux']);
+      binary = join(ROOT, 'resources/linux/sing-box');
+    }
+    // Diagnostic inputs remain isolated. Formal Linux retains the original consumed carrier.
     for (const platform of ['dashboard', 'linux', 'win', 'mac-arm64', 'mac-x64']) {
+      if (formal && platform === 'linux') continue;
       const path = join(ROOT, 'resources', platform);
       demand(!existsSync(path), 'Loopback must not inherit any runtime carrier/resource directory');
       mkdirSync(path, { recursive: true }); writeFileSync(join(path, '.keep'), '', { flag: 'wx' });
     }
     const rustEnv = { ...process.env, CARGO_TARGET_DIR: target, CARGO_INCREMENTAL: '0',
-      POLARIS_RUNTIME_CONFIG_PROTO_SOURCE: join(source, 'daemon/runtime_config.proto') };
+      ...(!formal ? { POLARIS_RUNTIME_CONFIG_PROTO_SOURCE: join(source, 'daemon/runtime_config.proto') } : {}) };
     result.rustCompiler = capture('rustc', ['-vV'], ROOT, rustEnv).trim();
     demand(/^host: x86_64-unknown-linux-gnu$/m.test(result.rustCompiler), 'Native Rust host differs');
     const metadata = JSON.parse(capture('cargo', ['metadata', '--locked', '--no-deps', '--format-version=1'], ROOT, rustEnv));
+    if (formal) {
+      result.formalCarrier = await prepareFormalCarrier(ROOT, target, metadata, execute, rustEnv);
+      receipt = createFormalInput(ROOT, { candidate, appTree: appSource.tree, protoSha256: PROTO,
+        runId: admission.runId, runAttempt: admission.runAttempt }, evidence);
+      receiptPath = join(evidence, 'formal-input.json'); writeJSON(receiptPath, receipt);
+      result.formalInput = receipt; result.formalInputFile = formalFile(receiptPath, 1024 * 1024);
+      result.binary = receipt.binary; result.sourceVerified = true; result.naiveIncluded = receipt.naiveIncluded;
+    }
     const compiled = await execute('app-test-build', 'cargo', ['test', '--locked', '-p', 'polaris', '--lib', '--no-run', '--message-format=json'], ROOT, rustEnv);
     result.appSourceAfterBuild = requireSameAppSource(appSource, appSourceCheck('tracked'));
     const messages = compiled.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
@@ -599,31 +643,42 @@ async function run() {
     result.appTestExecutable = selected;
     const sysroot = capture('rustc', ['--print', 'target-libdir'], ROOT, rustEnv).trim();
     const testEnv = { ...runtimeEnvironment(messages, target, selected.executable, sysroot, rustEnv),
-      POLARIS_RUNTIME_LOOPBACK_RECEIPT: receiptPath, POLARIS_SINGBOX_PATH: binary };
+      POLARIS_RUNTIME_LOOPBACK_RECEIPT: receiptPath, ...(!formal ? { POLARIS_SINGBOX_PATH: binary } : {}) };
+    const pinCore = formal ? formalFile : filePin;
+    const verifyInput = () => {
+      if (formal) {
+        verifyFormalFiles(receipt);
+        demand(JSON.stringify(formalFile(receiptPath, 1024 * 1024)) === JSON.stringify(result.formalInputFile), 'Formal HOT binding changed');
+      }
+    };
     for (const name of ADMISSION_TESTS) {
-      demand(filePin(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
+      verifyInput();
+      demand(pinCore(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
         'Admitted executable changed before admission test');
       const observed = await executeCommand({ id: name.split('::').at(-1), program: selected.executable,
         args: [name, '--exact', '--nocapture', '--test-threads=1'] },
       { root: dirname(selected.manifest), env: testEnv, directory: evidence, timeout: 5 * 60_000 });
       result.admissionTests.push({ name, passed: exactPass(observed), logSha256: observed.logSha256, logBytes: observed.logBytes });
-      demand(filePin(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
+      verifyInput();
+      demand(pinCore(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
         'Admitted executable changed during admission test');
       demand(exactPass(observed), `Selector admission test failed or did not run exactly one test: ${name}`);
     }
     demand(result.admissionTests.length === 4, 'Incomplete selector admission suite');
     for (const name of TESTS) {
-      demand(filePin(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
+      verifyInput();
+      demand(pinCore(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
         'Admitted executable changed before test');
       const observed = await executeCommand({ id: name.split('::').at(-1), program: selected.executable,
         args: [name, '--exact', '--ignored', '--nocapture', '--test-threads=1'] },
       { root: dirname(selected.manifest), env: testEnv, directory: evidence, timeout: 5 * 60_000 });
       result.tests.push({ name, passed: exactPass(observed), logSha256: observed.logSha256, logBytes: observed.logBytes });
-      demand(filePin(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
+      verifyInput();
+      demand(pinCore(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
         'Admitted executable changed during test');
       demand(exactPass(observed), `Real loopback test failed or did not run exactly one test: ${name}`);
       const proofPath = join(evidence, `${name.split('::').at(-1)}.json`);
-      const manifest = validateTestEvidence(readJSON(proofPath), name, receipt);
+      const manifest = validateTestEvidence(readJSON(proofPath), name, receipt, formal ? result.formalInputFile.sha256 : undefined);
       demand(!result.observedImplementationManifestDigest || result.observedImplementationManifestDigest === manifest,
         'Identical source/profile produced inconsistent implementation manifests');
       result.observedImplementationManifestDigest = manifest;
@@ -632,6 +687,12 @@ async function run() {
     result.appSourceAfterTests = requireSameAppSource(appSource, appSourceCheck('tracked'));
     demand(result.tests.length === 4, 'Incomplete real loopback suite');
     result.status = 'passed';
+  }, async () => {
+    if (result.formalInput) {
+      result.formalInputAfter = verifyFormalInput(ROOT, result.formalInput, evidence);
+      demand(JSON.stringify(formalFile(result.formalInputFile.path, 1024 * 1024)) === JSON.stringify(result.formalInputFile), 'Formal HOT binding changed at finalization');
+      result.appSourceFinal = requireSameAppSource(appSource, appSourceCheck('tracked'));
+    }
   });
 }
 

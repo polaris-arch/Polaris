@@ -598,3 +598,14 @@ test('CI step and source-job scanners stop at sibling jobs and unnamed steps', (
   const added = ci.replace('\n  windows_launcher_diagnostics:\n', '\n  sibling_fixture:\n    steps:\n      - run: sudo cargo test --ignored\n\n  windows_launcher_diagnostics:\n');
   assert.doesNotMatch(extractCiJobBlock(added, 'runtime_config_source_tests'), /sudo|--ignored|sibling_fixture/);
 });
+
+
+test('formal HOT adds only the exact helper build and existing identity preparation before App compile', () => {
+  const source = readFileSync(join(ROOT, 'scripts/runtime-config-loopback-formal.mjs'), 'utf8');
+  assert.match(source, /\['build', '--locked', '-p', 'polaris-helper', '--bin', 'polaris-helper', '--message-format=json'\]/);
+  assert.match(source, /selectFormalHelper\(messages, metadata, root, target\)/);
+  assert.match(source, /scripts\/prepare-core-identity\.mjs/);
+  assert.doesNotMatch(source, /--ignored|--include-ignored|cargo test|program:.*polaris-helper/);
+  const runner = readFileSync(join(ROOT, 'scripts/runtime-config-loopback.mjs'), 'utf8');
+  assert.ok(runner.indexOf('await prepareFormalCarrier') < runner.indexOf("execute('app-test-build'"));
+});

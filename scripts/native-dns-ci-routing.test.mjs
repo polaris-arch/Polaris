@@ -8,6 +8,7 @@ import { candidateContext, loadCandidate, hasTemporaryDesktop, loadTemporaryDesk
 import { regularPath } from './desktop-core/release-consumer.mjs';
 import { releaseGoVersion } from './desktop-core/source-graph.mjs';
 import { validateRequest as validateLoopbackRequest } from './runtime-config-loopback.mjs';
+import { loopbackInput } from './runtime-config-loopback-formal.mjs';
 import { TARGETS, loadFormalGateSelection, formalGateContext } from './desktop-core/native-dns-gates.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -116,7 +117,7 @@ test('RuntimeConfig source mocks remain independent of payload admission and use
   assert.deepEqual(commands, ['cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
 });
 
-const runtimeSourceDefaults = { runtime_config_loopback_candidate: '', app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
+const runtimeSourceDefaults = { runtime_config_loopback_input: 'diagnostic-source', runtime_config_loopback_candidate: '', app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
   native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
   windows_directory_candidate_source: '', os: 'all', preserve_run: false };
 const runtimeSourceConflicts = [
@@ -137,16 +138,25 @@ function ciJobCondition(source, name) {
   assert.ok(match, `${name} must retain an explicit job condition`);
   return match[1].trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
 }
+const loopbackRawMode = `(contains(toJSON(inputs), '"runtime_config_loopback_input"') && inputs.runtime_config_loopback_input != 'diagnostic-source')`;
+function evaluateCiExpression(expression, github, inputs, needs = {}) {
+  // Model GitHub's case-insensitive comparison for the new mode predicate,
+  // rather than falsely crediting JS != with rejecting uppercase aliases.
+  const code = expression.replaceAll("inputs.runtime_config_loopback_input != 'diagnostic-source'", '!diagnosticMode(inputs.runtime_config_loopback_input)');
+  return new Function('github', 'inputs', 'needs', 'contains', 'toJSON', 'diagnosticMode', `return (${code});`)(
+    github, inputs, needs, (haystack, needle) => String(haystack).toLowerCase().includes(String(needle).toLowerCase()), JSON.stringify,
+    (mode) => typeof mode === 'string' && mode.toLowerCase() === 'diagnostic-source');
+}
 function ciSchedule(source, names) {
   const jobs = names.map((name) => ({ name,
     needs: /^    needs: (\w+)$/m.exec(ciJobSection(source, name))?.[1],
-    allows: new Function('github', 'inputs', 'needs', `return (${ciJobCondition(source, name)});`),
+    allows: (github, inputs, needs) => evaluateCiExpression(ciJobCondition(source, name), github, inputs, needs),
   }));
   return (event, inputs, outputs = {}, cheapResult = 'success') => {
     const github = { event_name: event, repository: 'polaris-arch/Polaris',
       ref: 'refs/heads/collab/dots-audit-remediation-20261017', workflow_ref: base.GITHUB_WORKFLOW_REF,
       // Inherited caller event payloads must never activate the dispatch-only typed input.
-      event: { inputs: { ...inputs, runtime_config_source_only: 'true' } } };
+      event: { inputs: { os: '', ...inputs, runtime_config_source_only: 'true' } } };
     const started = new Set();
     for (const job of jobs)
       if ((!job.needs || (started.has(job.needs) && cheapResult === 'success')) && job.allows(github, inputs, { cheap_format: { outputs } }))
@@ -870,7 +880,7 @@ function loopbackRoutingContract(source = workflow) {
     'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics']);
   const dispatch = section(source, 'workflow_dispatch');
   assert.deepEqual([...dispatch.matchAll(/^      (\w+):$/gm)].map((m) => m[1]), [
-    'runtime_config_loopback_candidate', 'app_native_compile_candidate', 'runtime_config_source_only',
+    'runtime_config_loopback_input', 'runtime_config_loopback_candidate', 'app_native_compile_candidate', 'runtime_config_source_only',
     'native_dns_candidate', 'windows_system_candidate', 'windows_launcher_diagnostics', 'windows_directory_mode',
     'windows_directory_candidate_source', 'preserve_run', 'os',
   ]);
@@ -881,7 +891,7 @@ function loopbackRoutingContract(source = workflow) {
   assert.match(cheap, /^      runtime_config_loopback_only: \$\{\{ steps\.runtime_config_loopback_admission\.outputs\.loopback_only \}\}$/m);
   const admission = cheap.split('      - name: Admit exact real HOT loopback request\n')[1]?.split('\n      - ')[0];
   assert.ok(admission);
-  assert.match(admission, /^        if: \$\{\{ github\.event_name == 'workflow_dispatch' && \(inputs\.runtime_config_loopback_candidate \|\| ''\) != '' \}\}$/m);
+  assert.ok(admission.includes(`        if: ${'${{'} ${loopbackRawMode} || (github.event_name == 'workflow_dispatch' && (inputs.runtime_config_loopback_candidate || '') != '') }}`));
   assert.match(admission, /^        env:\n          RUNTIME_CONFIG_LOOPBACK_INPUTS: \$\{\{ toJSON\(inputs\) \}\}$/m);
   assert.match(admission, /^        run: node scripts\/runtime-config-loopback\.mjs admit$/m);
   assert.ok(cheap.indexOf('Admit exact real HOT loopback request') < cheap.indexOf('Admit exact App native compile-only request'));
@@ -899,7 +909,7 @@ function loopbackRoutingContract(source = workflow) {
   assert.equal((job.match(/persist-credentials: false/g) ?? []).length, 1);
   assert.ok(job.indexOf('Admit execution runner for real HOT loopback') < job.indexOf('Install Rust toolchain'));
   assert.ok(job.indexOf('Test real HOT loopback admission and routing contracts') < job.indexOf('Install Rust toolchain'));
-  assert.match(job, /run: node --test scripts\/runtime-config-loopback\.test\.mjs scripts\/native-dns-ci-routing\.test\.mjs scripts\/gate-rust-ci-parity\.test\.mjs/);
+  assert.match(job, /run: node --test scripts\/runtime-config-loopback\.test\.mjs scripts\/runtime-config-loopback-formal\.test\.mjs scripts\/native-dns-ci-routing\.test\.mjs scripts\/gate-rust-ci-parity\.test\.mjs/);
   assert.deepEqual([...job.matchAll(/^        run: node scripts\/runtime-config-loopback\.mjs (.+)$/gm)].map((m) => m[1]), ['admit', 'run']);
   const scheduled = ciSchedule(source, jobs);
   const outputs = { native_required: 'true', native_dns_formal: 'true', native_dns_formal_app: sha,
@@ -970,4 +980,102 @@ test('HOT format repair retains the failed gate and exports only complete known 
   assert.match(artifact, /path: \$\{\{ steps\.hot_format_patch\.outputs\.directory \}\}/);
   assert.match(artifact, /retention-days: 3/);
   assert.match(artifact, /if-no-files-found: error/);
+});
+
+
+test('formal or invalid HOT mode without candidate fails closed and suppresses independent jobs', () => {
+  const names = ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics'];
+  const scheduled = ciSchedule(workflow, names);
+  for (const mode of ['formal-release', '', 'unknown', null, false]) {
+    for (const conflict of [{}, { runtime_config_source_only: true }, { windows_launcher_diagnostics: true }]) {
+      const selected = { ...runtimeSourceDefaults, ...conflict, runtime_config_loopback_input: mode };
+      assert.throws(() => loopbackAdmission(selected));
+      assert.deepEqual(scheduled('workflow_dispatch', selected, {}, 'failure'), ['cheap_format']);
+    }
+    assert.throws(() => compileAdmission({ ...compileInputs, runtime_config_loopback_input: mode }));
+    assert.throws(() => runtimeSourceAdmission({ ...runtimeSourceDefaults, runtime_config_source_only: true, runtime_config_loopback_input: mode }));
+  }
+  assert.equal(loopbackAdmission({ ...loopbackInputs, runtime_config_loopback_input: 'formal-release' }), sha);
+  assert.match(section(workflow, 'workflow_dispatch'), /runtime_config_loopback_input:[\s\S]*?type: choice\n        default: diagnostic-source\n        options: \[diagnostic-source, formal-release\]/);
+});
+
+function exactModeSteps(source = workflow) {
+  const check = (name, before) => {
+    const job = ciJobSection(source, name), label = '      - name: Validate exact loopback input mode\n';
+    assert.equal(job.split(label).length, 2, `${name} has one exact input authority`);
+    const step = job.split(label)[1].split('\n      - ')[0];
+    assert.doesNotMatch(step, /\n        if:|continue-on-error/);
+    assert.match(step, /shell: bash/);
+    assert.match(step, /RUNTIME_CONFIG_LOOPBACK_INPUTS: \$\{\{ toJSON\(inputs\) \}\}/);
+    const code = /^        run: node --input-type=module -e '(.*)'$/m.exec(step)?.[1];
+    const imported = 'import { loopbackInput } from "./scripts/runtime-config-loopback-formal.mjs"; ';
+    assert.ok(code?.startsWith(imported));
+    assert.ok(job.indexOf(label) < job.indexOf(before), `${name} validates before native/setup execution`);
+    return (inputs) => new Function('loopbackInput', 'process', code.slice(imported.length))(
+      loopbackInput, { env: { RUNTIME_CONFIG_LOOPBACK_INPUTS: JSON.stringify(inputs) } });
+  };
+  return [check('cheap_format', '      - name: Admit exact real HOT loopback request'),
+    check('runtime_config_source_tests', '      - name: Admit isolated RuntimeConfig source-only selection'),
+    check('windows_launcher_diagnostics', '      - name: Validate the fixed reviewed candidate')];
+}
+function reusableLoopbackModeContract(source = workflow) {
+  const call = section(source, 'workflow_call');
+  assert.match(call, /^      runtime_config_loopback_input:\n        description: .*\n        type: string\n        default: diagnostic-source$/m);
+  assert.doesNotMatch(call, /runtime_config_loopback_candidate/);
+  const names = ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics'];
+  const scheduled = ciSchedule(source, names);
+  const callDefault = { runtime_config_loopback_input: 'diagnostic-source', windows_system_candidate: '', native_dns_candidate: '', preserve_run: false };
+  const admissionStep = ciJobSection(source, 'cheap_format').split('      - name: Admit exact real HOT loopback request\n')[1].split('\n      - ')[0];
+  const admissionIf = /^        if: \$\{\{ (.*) \}\}$/m.exec(admissionStep)[1];
+  const requested = (event, inputs) => evaluateCiExpression(admissionIf, { event_name: event }, inputs);
+  const checks = exactModeSteps(source);
+  for (const event of ['workflow_dispatch', 'push', 'pull_request', 'workflow_call', 'merge_group']) {
+    assert.equal(requested(event, callDefault), false);
+    for (const check of checks) assert.doesNotThrow(() => check(callDefault));
+    const ordinary = scheduled(event, callDefault);
+    for (const name of ['cheap_format', 'lint', 'cross', 'test', 'runtime_config_source_tests']) assert.ok(ordinary.includes(name), `${event}: ${name}`);
+    assert.ok(!ordinary.includes('runtime_config_loopback'));
+    for (const mode of ['formal-release', '', 'unknown', null, false, 'FORMAL-RELEASE']) {
+      const inputs = { ...callDefault, runtime_config_loopback_input: mode };
+      assert.equal(requested(event, inputs), true, `${event}: explicit ${mode} must reach cheap admission`);
+      assert.deepEqual(scheduled(event, inputs, {}, 'failure'), ['cheap_format']);
+      assert.throws(() => loopbackAdmission(inputs, { GITHUB_EVENT_NAME: event }));
+    }
+    // GitHub folds string comparisons: scheduling is not exact acceptance.
+    const uppercase = { ...callDefault, runtime_config_loopback_input: 'DIAGNOSTIC-SOURCE' };
+    assert.equal(requested(event, uppercase), false);
+    for (const check of checks) assert.throws(() => check(uppercase));
+    assert.throws(() => runtimeSourceAdmission({ ...runtimeSourceDefaults, runtime_config_source_only: true, runtime_config_loopback_input: 'DIAGNOSTIC-SOURCE' }));
+    const failed = scheduled(event, uppercase, {}, 'failure');
+    assert.ok(failed.includes('cheap_format'));
+    assert.ok(!failed.some((name) => ['lint', 'cross', 'test', 'runtime_config_loopback'].includes(name)));
+  }
+  for (const event of ['push', 'pull_request']) {
+    assert.equal(requested(event, {}), false, 'ordinary direct event has no typed inputs');
+    assert.equal(requested(event, { unrelated: '"runtime_config_loopback_input"' }), false, 'escaped value cannot fabricate a JSON key');
+    assert.ok(scheduled(event, {}).includes('test'));
+  }
+  for (const check of checks) {
+    for (const inputs of [{}, callDefault, { runtime_config_loopback_input: 'formal-release' }]) assert.doesNotThrow(() => check(inputs));
+    for (const mode of ['', null, false, 0, {}, [], 'unknown', 'DIAGNOSTIC-SOURCE', 'FORMAL-RELEASE'])
+      assert.throws(() => check({ runtime_config_loopback_input: mode }));
+  }
+  // Each standalone dispatch path must reject aliases before product work,
+  // even when the cheap job is intentionally omitted by its original mode.
+  for (const special of [{ runtime_config_source_only: true }, { windows_launcher_diagnostics: true }]) {
+    const inputs = { ...runtimeSourceDefaults, ...special, runtime_config_loopback_input: 'DIAGNOSTIC-SOURCE' };
+    const started = scheduled('workflow_dispatch', inputs, {}, 'failure');
+    assert.deepEqual(started, special.runtime_config_source_only ? ['runtime_config_source_tests'] : ['windows_launcher_diagnostics']);
+  }
+}
+test('reusable caller defaults preserve full CI, explicit modes fail closed across caller events and exact admission rejects case aliases', () => {
+  reusableLoopbackModeContract();
+  for (const [before, after] of [
+    [loopbackRawMode, 'false'],
+    ['      - name: Validate exact loopback input mode\n', '      - name: OMITTED exact input mode\n'],
+    ["loopbackInput(JSON.parse(process.env.RUNTIME_CONFIG_LOOPBACK_INPUTS));", 'void process.env.RUNTIME_CONFIG_LOOPBACK_INPUTS;'],
+  ]) {
+    assert.ok(workflow.includes(before));
+    assert.throws(() => reusableLoopbackModeContract(workflow.replaceAll(before, after)));
+  }
 });

@@ -448,6 +448,11 @@ test('helper target/path controls reject old split-target mode, host drift and i
 });
 
 function assertLauncherDiagnosticJob(source) {
+  // These original fixture matrices need only JSON rendering/key presence;
+  // exact mode/case-folding admission is covered by native-dns-ci-routing.
+  const evaluate = (expression, context) => runInNewContext(expression, { ...context,
+    contains: (value, needle) => String(value).toLowerCase().includes(String(needle).toLowerCase()),
+    toJSON: JSON.stringify });
   const job = source.split('\n  windows_launcher_diagnostics:\n')[1]?.split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
   assert.ok(job, 'independent diagnostic job');
   const cheap = source.split('\n  cheap_format:\n')[1].split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
@@ -460,8 +465,8 @@ function assertLauncherDiagnosticJob(source) {
       for (const repository of ['polaris-arch/Polaris', 'someone/Polaris'])
         for (const ref of ['refs/heads/collab/dots-audit-remediation-20261017', 'refs/heads/main', 'refs/tags/test']) {
           const context = { github: { event_name: event, repository, ref }, inputs: { windows_launcher_diagnostics: selected, windows_system_candidate: system } };
-          assert.equal(runInNewContext(cheapExpression, context), event !== 'workflow_dispatch' || selected !== true || system !== '');
-          assert.equal(runInNewContext(diagnosticExpression, context), event === 'workflow_dispatch' && selected === true && system === ''
+          assert.equal(evaluate(cheapExpression, context), event !== 'workflow_dispatch' || selected !== true || system !== '');
+          assert.equal(evaluate(diagnosticExpression, context), event === 'workflow_dispatch' && selected === true && system === ''
             && repository === 'polaris-arch/Polaris' && ref === 'refs/heads/collab/dots-audit-remediation-20261017');
         }
   for (const candidateKey of ['app_native_compile_candidate', 'runtime_config_loopback_candidate'])
@@ -470,8 +475,8 @@ function assertLauncherDiagnosticJob(source) {
       ref: 'refs/heads/collab/dots-audit-remediation-20261017' }, inputs: {
       [candidateKey]: appCandidate, runtime_config_source_only: true,
       windows_launcher_diagnostics: true, windows_system_candidate: '' } };
-    assert.equal(runInNewContext(cheapExpression, context), true, 'conflicts must reach a failing admission');
-    assert.equal(runInNewContext(diagnosticExpression, context), false, 'compile/loopback conflicts must never start Windows diagnosis');
+    assert.equal(evaluate(cheapExpression, context), true, 'conflicts must reach a failing admission');
+    assert.equal(evaluate(diagnosticExpression, context), false, 'compile/loopback conflicts must never start Windows diagnosis');
   }
   assert.match(source, /windows_launcher_diagnostics:\n\s+description:.*\n\s+type: boolean\n\s+default: false/);
   for (const name of ['lint', 'cross', 'test']) {

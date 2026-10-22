@@ -553,3 +553,15 @@ test('ordinary selector/source admission fixtures execute separately before the 
   assert.ok(source.indexOf('result.retainedCandidate = retainVerifiedCandidate') > source.indexOf('result.sourceVerified = true'));
   assert.ok(source.indexOf('result.retainedCandidate = retainVerifiedCandidate') < source.indexOf("execute('app-test-build'"));
 });
+
+
+test('formal choice preserves exact direct App source dispatch and rejects all invalid discriminants', () => {
+  const formal = { ...inputs, runtime_config_loopback_input: 'formal-release' };
+  assert.equal(validateRequest(env, formal, event(formal)), app);
+  for (const mode of ['', null, false, 'formal', 'unknown']) {
+    const selected = { ...inputs, runtime_config_loopback_input: mode };
+    assert.throws(() => validateRequest(env, selected, event(selected)));
+  }
+  for (const key of ['POLARIS_SINGBOX_PATH', 'POLARIS_CORE_IDENTITY_FILE', 'POLARIS_NATIVE_DNS_FORMAL'])
+    assert.throws(() => validateRequest({ ...env, [key]: '1' }, formal, event(formal)));
+});
