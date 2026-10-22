@@ -128,6 +128,7 @@ test('transport retention, light-build isolation and evidence retention are unch
     "always() && (inputs.hot_consumer_candidate || '') != '' && steps.hot_candidate.outcome == 'success'");
   assert.deepEqual(candidate.split('\n').filter((line) => line.startsWith('            ')).map((line) => line.trim()), [
     '${{ steps.hot_candidate.outputs.evidence }}/*.json',
+    '${{ steps.hot_candidate.outputs.evidence }}/*.xml',
     '${{ steps.hot_candidate.outputs.evidence }}/*.log',
     '${{ steps.hot_candidate.outputs.evidence }}/*.log.stdout.raw',
     '${{ steps.hot_candidate.outputs.evidence }}/*.log.stderr.raw',

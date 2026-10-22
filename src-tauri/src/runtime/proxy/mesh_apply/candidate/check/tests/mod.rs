@@ -192,7 +192,10 @@ mod linux_tests {
         );
         let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
         let current_digest = polaris_updater::verify::sha256_hex(binding.as_bytes());
-        assert_ne!(current_digest, contract, "historical contract is not current");
+        assert_ne!(
+            current_digest, contract,
+            "historical contract is not current"
+        );
         let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
         assert_ne!(binding["sourceCommit"], replacement.source_commit);
         assert_eq!(

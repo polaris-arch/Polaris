@@ -10,7 +10,9 @@ mod runtime_config_wire_check {
             return Err("runtime config proto source exceeds bounded contract check".into());
         }
         if source != SOURCE {
-            return Err("runtime config proto differs from the exact authored kernel source".into());
+            return Err(
+                "runtime config proto differs from the exact authored kernel source".into(),
+            );
         }
         Ok(())
     }

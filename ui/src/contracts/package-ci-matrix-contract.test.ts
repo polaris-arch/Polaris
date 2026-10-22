@@ -112,6 +112,17 @@ function evaluateActions(expression: string, github: { event_name: string; ref: 
   });
 }
 
+// Match Actions' case-insensitive mode routing; the actual Node admission remains
+// the case-sensitive authority. This is routing, never authorization to run HOT.
+const runtimeModeFunctions = {
+  contains: (haystack: string, needle: string) => String(haystack).toLowerCase().includes(String(needle).toLowerCase()),
+  toJSON: JSON.stringify,
+  diagnosticMode: (mode: unknown) => typeof mode === 'string' && mode.toLowerCase() === 'diagnostic-source',
+};
+const runtimeModeExpression = (expression: string) => expression.replaceAll(
+  "inputs.runtime_config_loopback_input != 'diagnostic-source'", '!diagnosticMode(inputs.runtime_config_loopback_input)',
+);
+
 /** 本仓 ci.yml 会遇到的全部入口（`os` 列：没有该输入的事件按 Actions 语义记作 ''）。 */
 const CI_ENTRIES = [
   { label: 'push main', event_name: 'push', ref: 'refs/heads/main', os: '' },
@@ -285,12 +296,13 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       const conditions = [...block.matchAll(/^ {4}if: \$\{\{ (.*) \}\}$/gm)];
       expect(block.match(/^ {4}if:/gm) ?? []).toHaveLength(1);
       expect(conditions).toHaveLength(1);
-      expect(conditions[0][1]).toBe("(github.event_name == 'workflow_dispatch' && ((inputs.runtime_config_loopback_candidate || '') != '' || (inputs.app_native_compile_candidate || '') != '')) || (github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '')");
+      expect(conditions[0][1]).toBe("((contains(toJSON(inputs), '\"runtime_config_loopback_input\"') && inputs.runtime_config_loopback_input != 'diagnostic-source') || (github.event_name == 'workflow_dispatch' && ((inputs.runtime_config_loopback_candidate || '') != '' || (inputs.app_native_compile_candidate || '') != ''))) || (github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '')");
       for (const event of ['pull_request', 'push', 'merge_group', 'workflow_call', 'workflow_dispatch']) {
         for (const sourceOnly of [undefined, false, true]) {
           for (const selected of [undefined, false, true]) {
             for (const candidate of [undefined, '', 'a'.repeat(40), 'malformed']) {
-              expect(runInNewContext(conditions[0][1], {
+              expect(runInNewContext(runtimeModeExpression(conditions[0][1]), {
+                ...runtimeModeFunctions,
                 github: { event_name: event }, inputs: {
                   runtime_config_source_only: sourceOnly,
                   windows_launcher_diagnostics: selected, windows_system_candidate: candidate,
@@ -301,6 +313,18 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
           }
         }
       }
+      // Non-default raw input must reach failing admission even when a conflicting
+      // source-only/launcher request would otherwise omit the formatter ancestor.
+      for (const event of ['pull_request', 'push', 'workflow_call', 'workflow_dispatch'])
+        for (const mode of [undefined, 'diagnostic-source', 'DIAGNOSTIC-SOURCE', 'formal-release', 'FORMAL-RELEASE', '', 'unknown']) {
+          const rawRequest = mode !== undefined && mode.toLowerCase() !== 'diagnostic-source';
+          expect(runInNewContext(runtimeModeExpression(conditions[0][1]), {
+            ...runtimeModeFunctions, github: { event_name: event }, inputs: {
+              ...(mode === undefined ? {} : { runtime_config_loopback_input: mode }),
+              runtime_config_source_only: true, windows_launcher_diagnostics: true,
+            },
+          })).toBe(rawRequest || event !== 'workflow_dispatch');
+        }
       expect(block).not.toMatch(/^ {8}continue-on-error:/m);
       const stepConditions = [...block.matchAll(/^ {8}if: (.+)$/gm)];
       expect(stepConditions).toHaveLength(1);
@@ -369,7 +393,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     const defaults = { runtime_config_loopback_candidate: '', app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
       native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
       windows_directory_candidate_source: '', os: 'all', preserve_run: false };
-    type Selection = Partial<typeof defaults>;
+    type Selection = Partial<typeof defaults> & { runtime_config_loopback_input?: string };
     const conflicts: Selection[] = [{ windows_launcher_diagnostics: true }, { native_dns_candidate: 'a'.repeat(40) },
       { windows_system_candidate: 'a'.repeat(40) }, { windows_directory_mode: 'candidate' },
       { windows_directory_candidate_source: 'a'.repeat(40) }, { os: 'windows-2022' }, { os: 'macos-14' },
@@ -381,7 +405,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       const line = /^ {4}if: (?!>-)(.+)$/m.exec(block)?.[1].replace(/^\$\{\{ | \}\}$/g, '');
       const expression = line ?? foldedJobIf(block, name).replace(/^\$\{\{ | \}\}$/g, '');
       return [name, { needs: /^ {4}needs: (\w+)$/m.exec(block)?.[1],
-        allows: runInNewContext(`(inputs, github, needs) => (${expression})`) }];
+        allows: runInNewContext(`(inputs, github, needs) => (${runtimeModeExpression(expression)})`, runtimeModeFunctions) }];
     }));
     const decision = (name: string, event: string, selection: Selection, nativeRequired = 'true', formal = 'true', loopbackOutput = '') => {
       const inputs = { ...defaults, ...selection };
@@ -434,6 +458,14 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       for (const outcome of ['failure', 'cancelled', 'skipped'])
         expect(scheduled('workflow_dispatch', selected, 'true', 'true', 'true', outcome)).toEqual(['cheap_format']);
     }
+    for (const mode of ['formal-release', 'FORMAL-RELEASE', '', 'unknown']) {
+      const selected = { runtime_config_loopback_input: mode, runtime_config_source_only: true, windows_launcher_diagnostics: true };
+      expect(decision('cheap_format', 'workflow_dispatch', selected)).toBe(true);
+      expect(decision('runtime_config_source_tests', 'workflow_dispatch', selected)).toBe(false);
+      expect(decision('windows_launcher_diagnostics', 'workflow_dispatch', selected)).toBe(false);
+      for (const outcome of ['failure', 'cancelled', 'skipped'])
+        expect(scheduled('workflow_dispatch', selected, 'true', 'true', 'true', outcome)).toEqual(['cheap_format']);
+    }
     expect(loopback).toContain("if: needs.cheap_format.outputs.runtime_config_loopback_only == 'true'");
     expect(loopback).toContain('runs-on: ubuntu-22.04');
     expect(loopback).toContain('permissions:\n      contents: read');
@@ -446,10 +478,12 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       .toContain('run: node scripts/runtime-config-loopback.mjs run');
     const dispatch = ci.split('\n  workflow_dispatch:\n')[1].split('\n  workflow_call:\n')[0];
     expect([...dispatch.matchAll(/^ {6}([a-z][a-z0-9_]*):$/gm)].map((match) => match[1])).toEqual([
+      'runtime_config_loopback_input',
       'runtime_config_loopback_candidate', 'app_native_compile_candidate', 'runtime_config_source_only',
       'native_dns_candidate', 'windows_system_candidate', 'windows_launcher_diagnostics', 'windows_directory_mode',
       'windows_directory_candidate_source', 'preserve_run', 'os',
     ]);
+    expect(dispatch).toMatch(/runtime_config_loopback_input:\n {8}description:.*\n {8}type: choice\n {8}default: diagnostic-source\n {8}options: \[diagnostic-source, formal-release\]/);
     expect(dispatch).toMatch(/runtime_config_loopback_candidate:\n {8}description:.*\n {8}type: string\n {8}default: ''/);
     expect(ci.split('\n  workflow_call:\n')[1].split('\njobs:\n')[0]).not.toContain('runtime_config_loopback_candidate');
     expect(source).not.toMatch(/^ {4}needs:|continue-on-error|fetch-core|sudo/m);
@@ -473,6 +507,9 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       expect(scheduled('workflow_dispatch', { ...selection, runtime_config_source_only: true })).toEqual(['runtime_config_source_tests']);
     expect(() => admit({})).not.toThrow();
     expect(() => admit({ os: 'ubuntu-22.04' })).not.toThrow();
+    expect(() => admit({ runtime_config_loopback_input: 'diagnostic-source' })).not.toThrow();
+    for (const mode of ['formal-release', 'FORMAL-RELEASE', 'DIAGNOSTIC-SOURCE', '', 'unknown'])
+      expect(() => admit({ runtime_config_loopback_input: mode })).toThrow(/cannot combine/);
     for (const selection of [...conflicts, { app_native_compile_candidate: 'a'.repeat(40) }, { runtime_config_loopback_candidate: 'a'.repeat(40) }]) expect(() => admit(selection)).toThrow(/cannot combine/);
     for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
       for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
