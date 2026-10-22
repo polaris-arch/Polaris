@@ -208,6 +208,25 @@ fn publisher_repack_keeps_one_check_semantics_and_distinct_actual_bytes() {
     }
 }
 
+#[test]
+fn published_patch_keeps_one_check_semantics_and_distinct_actual_bytes() {
+    let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::E814DA else {
+        panic!("814da must use the fixed PlainTcpCheckV1 semantics");
+    };
+    assert_eq!(
+        identity.binary_sha256,
+        "363261029cea32333adcdd67288b23e4ae4084efa96b7f2b157af6e9d39946ee"
+    );
+    for historical in [
+        LinuxInputProfile::B609,
+        LinuxInputProfile::FE182,
+        LinuxInputProfile::C002,
+        LinuxInputProfile::A4D085,
+    ] {
+        assert_ne!(LinuxInputProfile::E814DA, historical);
+    }
+}
+
 #[tokio::test]
 async fn source_symlink_rejected_and_replacement_cannot_change_protected_bytes() {
     use std::os::unix::fs::DirBuilderExt;

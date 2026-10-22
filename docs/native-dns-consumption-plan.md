@@ -4,18 +4,20 @@ The native node DNS generator requires the corresponding kernel implementation.
 Source-only success, an absent kernel or a previous kernel cannot establish the
 new policy's runtime compatibility.
 
-## Published publisher-only replacement
+## Published alpha.12.1 selection
 
-The a4d085 replacement is selected using actual public Release416392475 and the
-four independently matched public asset identities below. Its original index,
-automatic source archive, tag and producer identity are bound in one exact
-contract. The previous c002 draft and evidence remain frozen separately; no old
-package or native-runtime observation is relabeled as this delivery.
+The final 814 source is selected using actual public immutable Release 421066315,
+published on 2026-10-22 at 18:47:54Z, and the four independently matched public
+asset identities below. The original All producer index, exact automatic source
+archive, annotated tag and producer identity are bound in one exact contract.
+The a4d085 desktop contract and observations remain available unchanged at App
+commit 42706a1fc096b91f9a4186c0a4c68b0cdc88591b; the older c002/fe182 material and
+mobile a4d snapshot retain their own identities. No prior package, runtime or
+mobile acceptance observation is relabeled as this delivery.
 
-The two source archives differ in exactly seven publisher/workflow/review files;
-product Go, module, Meta and libbox inputs are byte-identical. All new package
-hashes, SourceRevision metadata and mobile input digests are separately bound.
-Source compatibility alone does not establish App runtime acceptance.
+Source, producer and public bytes establish input provenance, not App runtime
+acceptance. Do not overwrite this immutable Release, its tag or its assets to
+repair an App consumer failure.
 
 ## Selected release and independently preserved history
 
@@ -23,17 +25,17 @@ Source compatibility alone does not establish App runtime acceptance.
 canonical `scripts/desktop-core/release-contract.json` bytes:
 
 - Repository: `polaris-arch/sing-box-polaris`.
-- Source: `a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae`.
-- Tree: `830f7256af499e5ad3e7da9a79f0a377ca38fc77`.
-- Version/tag: `1.15.0-polaris-alpha.12` / `v1.15.0-polaris-alpha.12`.
-- Annotated tag object: `916d9533ba0a6092e34bc53f63dace63e11fa85e`.
-- Public asset names use `sing-box-polaris-1.15.0-alpha.12-*`; the tag,
-  original archive filename/root and BuildInfo retain `1.15.0-polaris-alpha.12`.
+- Source: `814da362838e96e54f904836a92c2b0d8c3ae29b`.
+- Tree: `ad574f93026557b49edecb492bd7ecdb851057c1`.
+- Version/tag: `1.15.0-polaris-alpha.12.1` / `v1.15.0-polaris-alpha.12.1`.
+- Annotated tag object: `8ecda357ea755a1295336a35ec7eaf1fe2daebc2`.
+- Public asset names use `sing-box-polaris-1.15.0-alpha.12.1-*`; the tag,
+  original archive filename/root and BuildInfo retain `1.15.0-polaris-alpha.12.1`.
   The original producer index and provenance retain their historical name
   annotations; public renaming changes neither their bytes nor payload pins.
-- Public prerelease: `416392475`; producer run `39128398409`, attempt 1.
-- Exact four archive IDs: Linux `653552247`, Windows `653554803`, Intel macOS
-  `653551589`, Apple Silicon macOS `653551672`.
+- Public prerelease: `421066315`; producer run `39787021317`, attempt 1.
+- Exact four archive IDs: Linux `666747193`, Windows `666748404`, Intel macOS
+  `666739498`, Apple Silicon macOS `666754500`.
 
 This is a real upstream-layout formal release contract, not a relabeled staging
 index. The exact historical 577d contract is retained as
@@ -51,18 +53,18 @@ asset is needed by this selection.
 
 The entire unchanged original index is committed at
 `scripts/desktop-core/release-asset-index.json`, with SHA-256
-`458b3b5b08194ad7ad13127d31768b8b0bfed7a278fe9db4816963c0dbf705e3`.
+`1b5c1ae5a83a452cd14cda6ea608f3964f4e1ee1ee1face98b40ee400fe47cb5215`.
 The consumer checks its byte count, hash and all selected original rows against
 the canonical contract. It does not obtain the index from cross-repository
 Actions credentials or accept a replacement environment path.
 
 Source transport is the fixed commit URL
-`https://github.com/polaris-arch/sing-box-polaris/archive/a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae.tar.gz`.
-The actual 8,126,518 bytes have SHA-256
-`9e398ef1b8e0551c7ced1cd2fd8e324ca117437d1c51a4873cf40b6c7ff07ab3`.
+`https://github.com/polaris-arch/sing-box-polaris/archive/814da362838e96e54f904836a92c2b0d8c3ae29b.tar.gz`.
+The actual 12,673,355 bytes have SHA-256
+`f66a790d43b7a229299928d521141a99588b80535fe2dea3445f3bc436b96fe9`.
 Only its exact same-commit codeload redirect is admitted. The existing archive
 verifier checks the complete expanded Git tree, separately observed gitlinks,
-module hashes, local replacement trees, reviewed Meta source policy and every
+module hashes, all nine reviewed local replacement trees (2,838 tracked files) and every
 original legal-file byte/hash. The original producer custom-source hash remains
 in `producerSourceArchive`; it does not attest these different transport bytes.
 
@@ -125,35 +127,48 @@ Its exact compiled source and canonical contract digest select the same
 PlainTcpCheckV1 semantics. No compiled source/hash pair can borrow c002 or fe182
 admission. Sealed-runtime evidence remains pending.
 
-The selected a4d085 row explicitly records runtime evidence pending. It permits the existing
+A fifth private 814da row binds the current source and canonical contract to
+Linux ELF `363261029cea32333adcdd67288b23e4ae4084efa96b7f2b157af6e9d39946ee`.
+It rejects cross-paired historical sources/contracts and explicitly records runtime evidence pending. It permits the existing
 Linux Test gate to collect its own sealed check evidence; no prior probe is
 claimed or required as a circular prerequisite to that gate. Check success never
 grants managed launch. The closed managed opt-in proposal remains Unsupported
 and is not a dependency of ordinary native birth.
 
-The four current archives have been statically verified against their exact
-hashes, members, executable headers, raw/parsed Go BuildInfo, module graph,
-source, tags and actual BuildID. Empty producer BuildIDs were checked with the
-original `go tool buildid`, not skipped. Linux/Windows Cronet static ABI checks
-passed. Native Mac signature observation, Rust tests, sealed execution and App
-final-package/runtime acceptance are still required on the actual native jobs.
-Earlier four-host success on fe182/App `1f771b8` does not transfer to a4d085.
-Schema fixtures cannot be regenerated merely to obtain a pass.
+The four public archive bytes/IDs/API digests match the reviewed final producer
+inventory and immutable Release. Their payload hashes, raw/parsed Go BuildInfo,
+module graph, source, tags and producer observations remain the original index
+facts. This source change does not claim a fresh App download, ELF execution,
+Mac signature observation, Rust pass, sealed execution or final-package runtime
+acceptance. Those must be collected by the existing actual native consumers.
+Earlier four-host success on fe182, a4d085 or another App commit does not transfer
+to 814. Schema fixtures cannot be regenerated merely to obtain a pass.
 
 ## Mobile and publication boundaries
 
-Mobile source-contract independently binds the actual a4d085 replacement
-source/tree/tag object, Go 1.27.0 directive and Go 1.27.2 toolchain, actual module hashes, reviewed Meta
-355-file subtree/binding/patch and libbox source/API declarations. Unknown mobile
-output receipts remain null; desktop ELF evidence cannot fill them.
+Mobile source-contract independently binds the same actual 814 source/tree/tag,
+Go 1.27.0 directive, Go 1.27.2 toolchain, exact module hashes, nine reviewed vendor
+trees and libbox source/API declarations. Its raw SHA-256 is
+`cf3bdf9999f99ae180d0b1e3ce6499e1ae6251f682216ae5f0cb1570226869e1`.
+Unknown output receipts remain null and acceptance flags remain false; neither
+a public desktop ELF nor a successful kernel SDK producer can fill them.
 
-An All AAR/XCFramework is reusable only if it satisfies the existing
-`polaris-mobile-component-v1` contract: source observation, selected
-DirectoryRetirementSourceIdentity, native inputs, tool/module graph, ABI/API
-receipts and the expected input-digest BuildID. Filename/hash equality alone
-cannot substitute for that provenance. Otherwise the existing App mobile
-producer rebuilds against these exact inputs. App link/load, PacketTunnel and
-device validation remain separate evidence.
+The All producer's genuine 814 internal SDK artifacts are not App formal
+`polaris-mobile-component-v1` inputs: Android artifacts are separate single-ABI
+AARs, Apple lacks the required iOS-arm64 simulator slice, and their empty BuildID
+and producer receipts do not satisfy the current App input-fingerprint binding.
+They are not relabeled old diagnostics, but must not be combined or re-signed
+as an App receipt. Reuse source/tool evidence and normally admitted tool/module
+caches, then run the existing App formal producer once for its exact profiles.
+
+The Android producer retains API 24, all four ABIs and the existing 16 KiB contract
+for every native ELF, plus generated Java/JNI HOT symbols and actual Kotlin
+compilation/fixtures. The Apple producer retains exactly iOS-arm64 and
+iOS-simulator-arm64, actual ObjC/Swift importer/host compilation, and the existing
+PacketTunnel lifecycle checks. RuntimeCapabilities, all six runtime RPCs,
+Retryable start and RuntimePersistenceHandler remain strict consumer gates.
+A toolchain build, compile-only host or JVM fixture does not prove callback,
+link/load, device execution or signed carrier acceptance.
 
 `pending-release-selection.json` deliberately retains `AppAccepted: false`.
 The existing publication guard admits this exact reviewed canonical formal

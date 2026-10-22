@@ -29,7 +29,7 @@ pub struct ReviewedPlainTcpCheckIdentity {
     binary_sha256: &'static str,
 }
 
-const REVIEWED_PLAIN_TCP_CHECK_IDENTITIES: [ReviewedPlainTcpCheckIdentity; 4] = [
+const REVIEWED_PLAIN_TCP_CHECK_IDENTITIES: [ReviewedPlainTcpCheckIdentity; 5] = [
     ReviewedPlainTcpCheckIdentity {
         binary_sha256: PINNED_B609_LINUX_X86_64_SHA256,
     },
@@ -45,6 +45,10 @@ const REVIEWED_PLAIN_TCP_CHECK_IDENTITIES: [ReviewedPlainTcpCheckIdentity; 4] = 
     // The actual public contract is bound; sealed-runtime observation remains pending.
     ReviewedPlainTcpCheckIdentity {
         binary_sha256: "2a7495faeb18d2666dfcc77f678057c35cc7a7bb36b03a8a16ff9ac6249b4db8",
+    },
+    // Exact814 ELF identity; fresh sealed-runtime evidence remains pending.
+    ReviewedPlainTcpCheckIdentity {
+        binary_sha256: "363261029cea32333adcdd67288b23e4ae4084efa96b7f2b157af6e9d39946ee",
     },
 ];
 
@@ -62,6 +66,7 @@ impl LinuxInputProfile {
     pub const FE182: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[1]);
     pub const C002: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[2]);
     pub const A4D085: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[3]);
+    pub const E814DA: Self = Self::PlainTcpCheckV1(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES[4]);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

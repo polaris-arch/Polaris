@@ -44,7 +44,7 @@ class MobileInputs(unittest.TestCase):
             wrong = deepcopy(value); wrong['sourceCommit'] = previous
             with self.subTest(previous=previous), self.assertRaises(RuntimeError): validate(wrong)
 
-    def test_mobile_source_can_advance_without_relabeling_the_selected_desktop_repack(self):
+    def test_final_desktop_and_mobile_source_bind_without_relabeling_history(self):
         import tempfile
         from unittest.mock import patch
         pending_path = Path(__file__).resolve().parents[1] / 'desktop-core/pending-release-selection.json'
@@ -56,20 +56,19 @@ class MobileInputs(unittest.TestCase):
         self.assertEqual(historical['sourceCommit'], 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae')
         self.assertEqual(historical['sourceTree'], '830f7256af499e5ad3e7da9a79f0a377ca38fc77')
         self.assertEqual(historical['sourceTagObject'], '916d9533ba0a6092e34bc53f63dace63e11fa85e')
-        self.assertEqual(pending['sourceCommit'], 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae')
-        self.assertEqual(pending['sourceTree'], '830f7256af499e5ad3e7da9a79f0a377ca38fc77')
+        self.assertEqual(pending['sourceCommit'], selected['sourceCommit'])
+        self.assertEqual(pending['sourceTree'], selected['sourceTree'])
         self.assertTrue(pending['activationEligible'])
-        self.assertEqual(pending['releaseId'], 416392475)
+        self.assertEqual(pending['releaseId'], 421066315)
         contract = Path(__file__).resolve().parents[1] / 'desktop-core/release-contract.json'
         self.assertEqual(pending['contractSha256'], sha(contract.read_bytes()))
-        self.assertEqual(pending['tagObject'], historical['sourceTagObject'])
-        self.assertEqual(pending['mobileSourceContractSha256'], sha(historical_bytes))
-        for field in ('goVersion', 'goDirective', 'toolchain', 'goModSha256', 'goSumSha256', 'metacubex'):
-            self.assertEqual(pending['sourcePolicy'][field], historical['sourcePolicy'][field])
+        self.assertEqual(pending['tagObject'], selected['sourceTagObject'])
+        self.assertEqual(pending['mobileSourceContractSha256'], sha(CONTRACT.read_bytes()))
+        self.assertEqual(pending['sourcePolicy'], selected['sourcePolicy'])
         self.assertEqual(selected['sourceCommit'], '814da362838e96e54f904836a92c2b0d8c3ae29b')
-        self.assertNotEqual(pending['sourceCommit'], selected['sourceCommit'])
-        self.assertNotEqual(pending['tagObject'], selected['sourceTagObject'])
-        self.assertNotEqual(pending['mobileSourceContractSha256'], sha(CONTRACT.read_bytes()))
+        self.assertNotEqual(pending['sourceCommit'], historical['sourceCommit'])
+        self.assertNotEqual(pending['tagObject'], historical['sourceTagObject'])
+        self.assertNotEqual(pending['mobileSourceContractSha256'], sha(historical_bytes))
         future = deepcopy(selected)
         future['sourceTagObject'] = None
         with self.assertRaisesRegex(RuntimeError, 'actual immutable source field required: sourceTagObject'):

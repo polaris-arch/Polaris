@@ -281,8 +281,8 @@ test('formal enablement requires validated committed upstream bytes, never histo
   const bytes = readFileSync(join(root, 'scripts/desktop-core/release-contract.json'));
   const current = loadFormalGateSelection(root);
   assert.deepEqual(current, JSON.parse(bytes));
-  assert.equal(current.sourceCommit, 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae');
-  assert.equal(current.sourceTree, '830f7256af499e5ad3e7da9a79f0a377ca38fc77');
+  assert.equal(current.sourceCommit, '814da362838e96e54f904836a92c2b0d8c3ae29b');
+  assert.equal(current.sourceTree, 'ad574f93026557b49edecb492bd7ecdb851057c1');
   assert.equal(manifest.desktopRelease.contractSha256, digest(bytes));
   assert.equal(manifest.desktopTemporary, undefined);
   const historical = JSON.parse(readFileSync(join(root, 'scripts/desktop-core/pending-release-selection.json'))).historicalSelection;
@@ -424,36 +424,42 @@ test('published replacement is selected only through the complete exact contract
   const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json')));
   const pending = JSON.parse(readFileSync(join(root, 'scripts/desktop-core/pending-release-selection.json'))).nextDelivery;
   const current = loadReleaseContract(root, manifest);
-  assert.equal(current.sourceCommit, 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae');
-  assert.equal(pending.sourceCommit, 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae');
+  assert.equal(current.sourceCommit, '814da362838e96e54f904836a92c2b0d8c3ae29b');
+  assert.equal(pending.sourceCommit, '814da362838e96e54f904836a92c2b0d8c3ae29b');
   assert.equal(pending.activationEligible, true);
   assert.equal(pending.releaseId, current.releaseId);
   assert.equal(pending.contractSha256, manifest.desktopRelease.contractSha256);
-  assert.equal(pending.tagObject, '916d9533ba0a6092e34bc53f63dace63e11fa85e');
-  assert.equal(pending.producerRunId, 39128398409);
+  assert.equal(pending.tagObject, '8ecda357ea755a1295336a35ec7eaf1fe2daebc2');
+  assert.equal(pending.producerRunId, 39787021317);
   assert.equal(pending.producerRunAttempt, 1);
-  assert.equal(pending.originalIndexSha256, '458b3b5b08194ad7ad13127d31768b8b0bfed7a278fe9db4816963c0dbf705e3');
-  // This receipt selected the historical a4d mobile input. Mobile source may
-  // advance before new desktop public assets exist; never relabel that receipt.
+  assert.equal(pending.originalIndexSha256, '1b5c1ae5a83a452cd14cda6ea608f3964f4e1ee1face98b40ee400fe47cb5215');
+  // Final desktop and mobile share814, while the original a4d input remains
+  // immutable history and cannot be relabeled as this delivery.
   const historicalMobileBytes = readFileSync(join(root, 'scripts/mobile-core/fixtures/selected-source-contract-a4d.json'));
   assert.equal(digest(historicalMobileBytes), 'd2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0');
   const historicalMobile = JSON.parse(historicalMobileBytes);
-  assert.equal(historicalMobile.sourceCommit, pending.sourceCommit);
-  assert.equal(historicalMobile.sourceTree, pending.sourceTree);
-  assert.equal(historicalMobile.sourceTagObject, pending.tagObject);
-  assert.equal(pending.mobileSourceContractSha256, digest(historicalMobileBytes));
+  assert.notEqual(historicalMobile.sourceCommit, pending.sourceCommit);
+  assert.notEqual(historicalMobile.sourceTree, pending.sourceTree);
+  assert.notEqual(historicalMobile.sourceTagObject, pending.tagObject);
+  assert.notEqual(pending.mobileSourceContractSha256, digest(historicalMobileBytes));
   const selectedMobileBytes = readFileSync(join(root, 'scripts/mobile-core/source-contract.json'));
   const selectedMobile = JSON.parse(selectedMobileBytes);
   assert.equal(selectedMobile.sourceCommit, '814da362838e96e54f904836a92c2b0d8c3ae29b');
   assert.equal(selectedMobile.sourceTagObject, '8ecda357ea755a1295336a35ec7eaf1fe2daebc2');
-  assert.notEqual(selectedMobile.sourceCommit, current.sourceCommit);
-  assert.notEqual(digest(selectedMobileBytes), pending.mobileSourceContractSha256);
+  assert.equal(selectedMobile.sourceCommit, current.sourceCommit);
+  assert.equal(selectedMobile.sourceTree, current.sourceTree);
+  assert.equal(selectedMobile.sourceTagObject, current.tagObject);
+  assert.deepEqual(selectedMobile.sourcePolicy, current.sourcePolicy);
+  assert.equal(digest(selectedMobileBytes), pending.mobileSourceContractSha256);
   assert.equal(selectedMobile.artifactPins, null);
   assert.equal(selectedMobile.producerReceipt, null);
   for (const flag of ['AppAccepted', 'devicePassed', 'publicationEligible']) assert.equal(selectedMobile[flag], false);
   assert.equal(pending.sourceArchive.url, `https://github.com/polaris-arch/sing-box-polaris/archive/${pending.sourceCommit}.tar.gz`);
-  assert.equal(pending.sourceArchive.sha256, '9e398ef1b8e0551c7ced1cd2fd8e324ca117437d1c51a4873cf40b6c7ff07ab3');
+  assert.equal(pending.sourceArchive.sha256, 'f66a790d43b7a229299928d521141a99588b80535fe2dea3445f3bc436b96fe9');
   assert.equal(pending.sourceArchive.sha256, current.sourceArchive.sha256);
+  const notice = readFileSync(join(root, 'NOTICE'), 'utf8');
+  assert.ok(notice.includes(`完整对应源码：${current.sourceArchive.url}`));
+  assert.ok(notice.includes(`实际传输 SHA-256：${current.sourceArchive.sha256}`));
   assert.throws(() => loadReleaseContract(root, { ...manifest, desktopRelease: pending }));
   assert.throws(() => loadReleaseContract(root, { ...manifest,
     desktopRelease: { ...manifest.desktopRelease, sourceCommit: 'c0023dbc6dcd7b6eb2f54dd036ae150168bd8e6e', sourceTree: 'cf520419eafa63bc789a67f12417b7a82e3d7bd9' } }));
