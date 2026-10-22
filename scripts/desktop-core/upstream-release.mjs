@@ -1,7 +1,13 @@
 // Versioned adapter for unchanged upstream archives and same-run source/legal
 // sidecars. It never upgrades historical v1 evidence or runs target binaries.
+import { readFileSync } from 'node:fs';
 import { canonical, digest, kernelRepositoryIdentity, upstreamSourceGoVersion, reviewedSourcePolicy, requireGraph as demand } from './source-graph.mjs';
 const REPO = 'polaris-arch/sing-box-polaris';
+// Shared JS/Python grammar; Rust admission is checked against the same corpus.
+const VERSION_PATTERN = JSON.parse(readFileSync(new URL('../lib/polaris-version.json', import.meta.url), 'utf8')).pattern;
+const VERSION = new RegExp(VERSION_PATTERN);
+const ARCHIVE_VERSION = new RegExp('^sing-box-' + VERSION_PATTERN.slice(1, -1) + '-(.+)$');
+const upstreamVersion = value => typeof value === 'string' && VERSION.exec(value)?.[0] === value;
 const hex = (v, n) => typeof v === 'string' && new RegExp(`^[a-f0-9]{${n}}$`).test(v);
 const positive = (v) => Number.isSafeInteger(v) && v > 0;
 const same = (a, b, reason) => demand(canonical(a) === canonical(b), reason);
@@ -39,8 +45,8 @@ function producerReleaseName(archive) {
 export function upstreamReleaseName(archive) {
   const name = nativeArchiveName(archive);
   if (!Object.hasOwn(archive, 'releaseName')) return name;
-  const parts = /^sing-box-([0-9]+\.[0-9]+\.[0-9]+)-polaris-((?:alpha|beta|rc)\.(?:0|[1-9][0-9]*))-(.+)$/.exec(name);
-  demand(parts && archive.releaseName === `sing-box-polaris-${parts[1]}-${parts[2]}-${parts[3]}`,
+  const parts = ARCHIVE_VERSION.exec(name);
+  demand(parts && parts[0] === name && archive.releaseName === `sing-box-polaris-${parts[1]}-${parts[2]}-${parts[4]}`,
     'Upstream release archive name differs');
   return archive.releaseName;
 }
@@ -181,7 +187,7 @@ export function validateUpstreamContract(contract, targets) {
   demand(isUpstreamRelease(contract) && contract.providerContract === 'polaris-upstream-native-release-v1'
     && contract.repository === REPO && contract.repositoryId === kernelRepositoryIdentity(REPO).id
     && positive(contract.releaseId) && hex(contract.sourceCommit, 40) && hex(contract.sourceTree, 40)
-    && hex(contract.tagObject, 40) && /^[0-9]+\.[0-9]+\.[0-9]+-polaris-(?:alpha|beta|rc)\.(?:0|[1-9][0-9]*)$/.test(contract.version ?? '')
+    && hex(contract.tagObject, 40) && upstreamVersion(contract.version)
     && contract.tag === `v${contract.version}`, 'Upstream release contract identity differs');
   const producer = contract.producer;
   demand(producer?.repository === REPO && producer.repositoryId === contract.repositoryId

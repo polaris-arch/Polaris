@@ -357,6 +357,10 @@ class ProducerCalls(unittest.TestCase):
         helper = 'scripts/mobile-core/source_policy.py'
         self.assertEqual(actual_producer['files'][helper], producer.file_pin(producer.ROOT / helper))
         self.assertEqual(actual_consumer['consumerCode'][helper], producer.file_pin(producer.ROOT / helper))
+        helper = 'scripts/lib/polaris-version.json'
+        self.assertEqual(actual_producer['files'][helper], producer.file_pin(producer.ROOT / helper))
+        self.assertEqual(actual_consumer['consumerCode'][helper], producer.file_pin(producer.ROOT / helper))
+        self.assertIn(helper, producer.android_build_code(actual_producer)['files'])
         link_helper = 'scripts/mobile-core/apple_tls_fingerprint.py'
         for project in ('src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'):
             source = (producer.ROOT / project).read_text()

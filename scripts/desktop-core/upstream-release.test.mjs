@@ -19,11 +19,11 @@ import { validateUpstreamIndex, upstreamMetadata, upstreamPayloadPins, contractP
 // not assert that a release exists or that any native artifact has passed.
 const hash = 'a'.repeat(64), commit = '55300c55560bcc604fd9675c5526b5713db81cc1',
   tree = '7767ba9a9901a061ff07db7716baed7896cfefbc';
-function fixture() {
+function fixture(version = '1.15.0-polaris-alpha.12') {
   let id = 1;
   const contract = { schema: 'polaris-upstream-native-release-consumer-v1', providerContract: 'polaris-upstream-native-release-v1',
     repository: 'polaris-arch/sing-box-polaris', repositoryId: 1421657509, releaseId: 100,
-    version: '1.15.0-polaris-alpha.12', tag: 'v1.15.0-polaris-alpha.12', tagObject: 'd'.repeat(40), sourceCommit: commit, sourceTree: tree,
+    version, tag: `v${version}`, tagObject: 'd'.repeat(40), sourceCommit: commit, sourceTree: tree,
     producer: { repository: 'polaris-arch/sing-box-polaris', repositoryId: 1421657509, workflow: '.github/workflows/build.yml', workflowCommit: commit, runId: 1, runAttempt: 1, nativeJobs: Object.fromEntries(Object.entries({ linux: 'linux-amd64-purego', win: 'windows-amd64', 'mac-x64': 'darwin-amd64', 'mac-arm64': 'darwin-arm64' }).map(([key, id], i) => [key, { id: i + 1, name: `Native final-package Cronet and gVisor smoke (${id})` }])) },
     legalFiles: ['LICENSE', 'NOTICE'].map((name) => ({ path: `licenses/${name}`, content: name, bytes: Buffer.byteLength(name), sha256: digest(name) })), platforms: {} };
   const asset = (name) => ({ name, bytes: 1, sha256: hash, assetId: id++, releaseId: 100,
@@ -585,8 +585,8 @@ test('source replacement inventory cannot claim an unlinked module or invented l
   }
 });
 
-function brandedFixture() {
-  const value = fixture();
+function brandedFixture(version) {
+  const value = fixture(version);
   value.index = structuredClone(value.index);
   for (const row of value.index.platforms) {
     row.archive.releaseName = 'sing-box-polaris-' + row.archive.name.slice('sing-box-'.length);
@@ -888,4 +888,52 @@ else:
   }}),/identity changed/);
   // Failed acquisitions never replace the already installed, verified payload.
   verifyPackagedRelease(root,manifest,'linux',join(root,'resources/linux/sing-box'),run,'linux');
+});
+
+
+const versionCases = JSON.parse(readFileSync(new URL('../lib/polaris-version-fixtures.json', import.meta.url), 'utf8'));
+test('shared version corpus retains patch tags and exact original/public archive mapping', () => {
+  assert.ok(ADAPTER_FILES.includes('scripts/lib/polaris-version.json'));
+  for (const version of versionCases.accepted) {
+    const { contract, index } = brandedFixture(version);
+    assert.equal(validateReleaseContract(contract), contract, version);
+    assert.equal(validateUpstreamIndex(index, contract), index, version);
+    for (const row of Object.values(contract.platforms)) {
+      assert.equal(row.version, version);
+      assert.equal(row.tag, `v${version}`);
+      assert.ok(row.archive.root.startsWith(`sing-box-${version}-`));
+      assert.ok(row.releaseAsset.name.startsWith(`sing-box-polaris-${version.replace('-polaris-', '-')}-`));
+      assert.ok(row.releaseAsset.url.includes(`/v${version}/`));
+      assert.deepEqual(JSON.parse(upstreamMetadata(contract, row)['provenance.json']).receipt,
+        index.platforms.find(original => original.id === row.id));
+    }
+    const legacy = fixture(version);
+    validateReleaseContract(legacy.contract);
+    validateUpstreamIndex(legacy.index, legacy.contract);
+  }
+  for (const version of versionCases.rejected) {
+    assert.throws(() => validateReleaseContract(brandedFixture(version).contract), undefined, JSON.stringify(version));
+  }
+});
+test('patch syntax never substitutes for complete release identity or matching raw versions', () => {
+  const version = '1.15.0-polaris-alpha.12.1';
+  for (const mutate of [
+    c => { c.tag = 'v1.15.0-polaris-alpha.12'; },
+    c => { c.repository = 'SagerNet/sing-box'; },
+    c => { c.repositoryId = 1407705262; },
+    c => { c.platforms.linux.version = '1.15.0-polaris-alpha.12'; },
+    c => { c.platforms.linux.sourceCommit = 'f'.repeat(40); },
+    c => { c.platforms.linux.sourceTree = 'f'.repeat(40); },
+    c => { c.platforms.linux.releaseAsset.releaseId++; },
+    c => { c.platforms.linux.releaseAsset.sha256 = 'f'.repeat(64); },
+    c => { c.platforms.linux.releaseAsset.url = c.platforms.linux.releaseAsset.url.replace('.12.1/', '.12/'); },
+    c => { c.platforms.linux.archive.releaseName = c.platforms.linux.archive.releaseName.replace('.12.1-', '.12-'); },
+  ]) {
+    const { contract } = brandedFixture(version); mutate(contract);
+    assert.throws(() => validateReleaseContract(contract));
+  }
+  for (const key of ['version', 'tag', 'tagObject', 'sourceCommit', 'sourceTree']) {
+    const { contract, index } = brandedFixture(version); index[key] += 'changed';
+    assert.throws(() => validateUpstreamIndex(index, contract));
+  }
 });

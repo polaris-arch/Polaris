@@ -241,7 +241,7 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
     const fixturePaths = [...inputPaths, 'scripts/assert-pc-runtime-release.mjs',
       'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/release-consumer.mjs',
       // release-consumer statically imports the upstream adapter even for legacy inputs.
-      'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/native-dns-candidate.mjs',
+      'scripts/desktop-core/upstream-release.mjs', 'scripts/lib/polaris-version.json', 'scripts/desktop-core/native-dns-candidate.mjs',
       'scripts/lib/core-identity.mjs',
       'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs'];
     for (const path of fixturePaths) {
@@ -432,7 +432,7 @@ function formalPolicyFixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'formal-source-publication-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const paths = ['scripts/assert-pc-runtime-release.mjs', 'scripts/desktop-core/source-graph.mjs',
-    'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs',
+    'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/lib/polaris-version.json',
     'scripts/desktop-core/native-dns-candidate.mjs', 'scripts/lib/core-identity.mjs',
     'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs', manifestPath,
     'scripts/desktop-core/release-contract.json', 'scripts/desktop-core/release-asset-index.json'];
@@ -444,6 +444,15 @@ function formalPolicyFixture(t) {
   reset();
   return { directory, files, reset, run: env => runPolicy([], env, join(directory, 'scripts/assert-pc-runtime-release.mjs')) };
 }
+
+test('copied release adapter requires its shared grammar with no missing-file fallback', t => {
+  const f = formalPolicyFixture(t);
+  rmSync(join(f.directory, 'scripts/lib/polaris-version.json'));
+  const result = f.run({});
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /ENOENT/);
+  assert.match(result.stderr, /polaris-version\.json/);
+});
 
 test('formal publication source admission uses the exact strict selected contract and committed index', t => {
   const f = formalPolicyFixture(t), manifest = JSON.parse(f.files.get(manifestPath));

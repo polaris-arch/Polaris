@@ -247,3 +247,51 @@ fn archived_formal_identity_cannot_replace_the_current_compiled_release() {
     );
     assert!(desktop_release_identity(old).is_none());
 }
+
+#[test]
+fn shared_version_corpus_preserves_raw_patch_identity_without_promoting_pins() {
+    let cases: Value = serde_json::from_str(&polaris_source_probe::repo_file!(
+        "scripts/lib/polaris-version-fixtures.json"
+    ))
+    .unwrap();
+    for (group, accepted) in [("accepted", true), ("rejected", false)] {
+        for value in cases[group].as_array().unwrap() {
+            let version = value.as_str().unwrap();
+            assert_eq!(upstream_release_version(version), accepted, "{version:?}");
+            let (selection, raw) = bound_fixture(version, true);
+            let identity = desktop_release_identity_from_contract(&selection, &raw);
+            assert_eq!(identity.is_some(), accepted, "{version:?}");
+            if accepted {
+                assert_eq!(identity.unwrap().0, version);
+            }
+            // Synthetic valid syntax is not the currently compiled release.
+            assert!(desktop_release_identity(&selection).is_none());
+        }
+    }
+}
+
+#[test]
+fn patch_identity_requires_independent_contract_tag_source_and_asset_bindings() {
+    let (value, raw) = bound_fixture("1.15.0-polaris-alpha.12.1", true);
+    for (key, bad) in [
+        ("version", json!("1.15.0-polaris-alpha.12")),
+        ("tag", json!("v1.15.0-polaris-alpha.12")),
+        ("tagObject", json!("f".repeat(40))),
+        ("sourceCommit", json!("f".repeat(40))),
+        ("sourceTree", json!("f".repeat(40))),
+        ("releaseId", json!(18)),
+        ("contractSha256", json!("f".repeat(64))),
+    ] {
+        let mut changed = value.clone();
+        changed[key] = bad;
+        assert!(
+            desktop_release_identity_from_contract(&changed, &raw).is_none(),
+            "{key}"
+        );
+    }
+    for platform in ["linux", "win"] {
+        let mut changed = value.clone();
+        changed["librarySha256"][platform] = json!("f".repeat(64));
+        assert!(desktop_release_identity_from_contract(&changed, &raw).is_none());
+    }
+}

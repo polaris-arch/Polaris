@@ -42,6 +42,7 @@ export const ADAPTER_FILES = ['scripts/desktop-core/native-dns-candidate.mjs', '
   'scripts/desktop-core/native-dns-gates.mjs',
   'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/release-archive.py', 'scripts/mobile-core/source_policy.py',
   'scripts/desktop-core/wire-input-handoff.mjs',
+  'scripts/lib/polaris-version.json',
   'scripts/prepare-core-identity.mjs', 'scripts/lib/core-identity.mjs',
   'scripts/postprocess-appimage.mjs', 'src-tauri/build.rs',
   'src-tauri/src/runtime/core_identity.rs', 'src-tauri/src/runtime/helper.rs',

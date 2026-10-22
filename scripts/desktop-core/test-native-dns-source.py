@@ -84,6 +84,22 @@ class SourceBindingTests(unittest.TestCase):
         self.assertEqual(binding['producer']['runAttempt'], 1)
         self.assertEqual(binding['indexArtifact']['id'], 12117466241)
 
+    def test_shared_version_corpus_keeps_staging_inactive_and_alpha_only(self):
+        cases = json.loads((HERE.parent / 'lib/polaris-version-fixtures.json').read_bytes())
+        for version in cases['accepted'] + cases['rejected']:
+            binding = self.binding()
+            binding['version'] = version
+            with self.subTest(version=version):
+                if version in cases['accepted'] and '-polaris-alpha.' in version:
+                    self.assertEqual(source.validate(binding)['version'], version)
+                    for key in ('active', 'AppAccepted', 'publicationEligible'):
+                        self.assertIs(binding[key], False)
+                        changed = deepcopy(binding)
+                        changed[key] = True
+                        with self.assertRaises(ValueError): source.validate(changed)
+                else:
+                    with self.assertRaisesRegex(ValueError, 'source identity invalid'): source.validate(binding)
+
     def test_binding_rejects_promotion_extra_policy_and_bad_identities(self):
         changes = [('active', True), ('AppAccepted', True), ('publicationEligible', True),
                    ('tagObject', 'a' * 40), ('state', 'release'), ('sourcePolicy', {}),

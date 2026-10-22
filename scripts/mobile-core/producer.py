@@ -494,6 +494,7 @@ def tool_facts(args, value, env):
 
 PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py',
              'scripts/mobile-core/plan.py', 'scripts/mobile-core/android_sdk.py',
+                 'scripts/lib/polaris-version.json',
              'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
              'scripts/mobile-core/consume.py', 'scripts/mobile-core/carriers.py',

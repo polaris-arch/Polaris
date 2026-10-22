@@ -159,6 +159,27 @@ class MobileInputs(unittest.TestCase):
             with self.subTest(version=version, tag=tag), self.assertRaisesRegex(RuntimeError, 'tag/version differs'):
                 validate(value)
 
+    def test_shared_patch_version_corpus_keeps_alpha_only_and_full_raw_identity(self):
+        from fork_input import linker_flags
+        cases = json.loads((Path(__file__).resolve().parents[1] / 'lib/polaris-version-fixtures.json').read_bytes())
+        for version in cases['accepted'] + cases['rejected']:
+            value = deepcopy(self.value)
+            old = value['version']
+            value.update(version=version, sourceTag='v' + version)
+            for platform in ('android', 'apple'):
+                value[platform]['outputName'] = value[platform]['outputName'].replace(old, version)
+            with self.subTest(version=version):
+                if version in cases['accepted'] and '-polaris-alpha.' in version:
+                    self.assertEqual(validate(value)['version'], version)
+                    self.assertIn('constant.Version=' + version, linker_flags(value, 'a' * 64))
+                    self.assertEqual(value['sourceTag'], 'v' + version)
+                    self.assertFalse(value['AppAccepted'])
+                    self.assertFalse(value['publicationEligible'])
+                    value['sourceTag'] = 'v1.15.0-polaris-alpha.12.999'
+                    with self.assertRaisesRegex(RuntimeError, 'tag/version differs'): validate(value)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'tag/version differs'): validate(value)
+
     def test_zero_overlay_does_not_require_historical_patch_inventory(self):
         self.assertEqual(validate(self.value)['patches'], [])
         for field, bad in [('sourceOverlay', 1), ('patches', [{'file': 'legacy.patch'}]),

@@ -14,6 +14,8 @@ from source_policy import validate_source_policy, verify_source_policy_files, ve
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = Path(__file__).with_name('source-contract.json')
+# Shared desktop/mobile grammar; this entry retains its existing alpha-only scope.
+POLARIS_VERSION = re.compile(json.loads((ROOT / 'scripts/lib/polaris-version.json').read_bytes())['pattern'])
 ANDROID_TARGETS = ['android/arm64', 'android/arm', 'android/386', 'android/amd64']
 APPLE_TARGETS = ['ios/arm64', 'iossimulator/arm64']
 ANDROID_ABIS = ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']
@@ -58,9 +60,11 @@ def validate(value):
                        ('goModSha256', 64), ('goSumSha256', 64)]:
         require(isinstance(value.get(key), str) and re.fullmatch('[0-9a-f]{%d}' % width, value[key]),
                 'actual immutable source field required: ' + key)
-    version_pattern = r'\d+\.\d+\.\d+-alpha\.\d+' if historical else r'\d+\.\d+\.\d+-polaris-alpha\.\d+'
-    require(re.fullmatch(version_pattern, value.get('version', '')) and
-            value.get('sourceTag') == 'v' + value['version'], 'mobile source tag/version differs')
+    version = value.get('version')
+    version_match = (re.fullmatch(r'\d+\.\d+\.\d+-alpha\.\d+', version) if historical
+                     else POLARIS_VERSION.fullmatch(version)) if isinstance(version, str) else None
+    require(version_match and (historical or version_match[3] == 'alpha') and
+            value.get('sourceTag') == 'v' + version, 'mobile source tag/version differs')
     require(historical or 'sourcePolicy' in value, 'new mobile repository requires an explicit reviewed source policy')
     policy = validate_source_policy(value['sourcePolicy'], value) if 'sourcePolicy' in value else None
     require(type(value.get('sourceOverlay')) is int and value['sourceOverlay'] == 0 and
