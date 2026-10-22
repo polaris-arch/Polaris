@@ -4484,6 +4484,12 @@ fn the_management_secret_has_a_single_reader() {
             "从原始配置 JSON 取这个键的单点。",
         ),
         (
+            "runtime/proxy/runtime_config.rs",
+            1,
+            0,
+            "structural_runtime_change compares opaque old/new values; it does not grant management credentials to clients.",
+        ),
+        (
             "runtime/proxy/startup.rs",
             0,
             1,

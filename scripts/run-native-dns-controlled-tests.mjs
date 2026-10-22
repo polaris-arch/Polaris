@@ -63,9 +63,70 @@ export function exactPass(result) {
     && summaries.length === 1 && summaries[0].startsWith('test result: ok. 1 passed; 0 failed; 0 ignored;');
 }
 
+function records(output, prefix) {
+  return output.split(/\r?\n/).filter((line) => line.startsWith(prefix))
+    .map((line) => JSON.parse(line.slice(prefix.length)));
+}
+
+export function confirmedCleanup(result, name) {
+  if (result.error || result.timedOut || result.cleanupUncertain || result.interrupted
+      || !Number.isSafeInteger(result.processId) || result.processId <= 0
+      || !Number.isInteger(result.status)) return false;
+  try {
+    const rows = records(result.output, 'POLARIS_CONTROLLED_CLEANUP ');
+    if (rows.length !== 1) return false;
+    const r = rows[0], c = r.custody;
+    if (r.schema !== 'polaris-controlled-cleanup-v1' || r.testName !== name
+        || r.processId !== result.processId || r.shutdownFenced !== true
+        || !Number.isSafeInteger(r.generation) || r.generation < 0
+        || r.publicationEligible !== false || !c) return false;
+    if (c.state === 'empty-after-shutdown-fence') return c.runRef === null && c.corePid === null;
+    if (!['retained-child-exit-observed', 'emergency-owned-child-reaped'].includes(c.state)
+        || !/^direct-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(c.runRef)) return false;
+    return (Number.isSafeInteger(c.corePid) && c.corePid > 0)
+      || (c.corePid === null && c.state === 'retained-child-exit-observed');
+  } catch { return false; }
+}
+
+function oneExecutedTest(result) {
+  const counts = [...result.output.matchAll(/test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;/g)];
+  return counts.length === 1 && Number(counts[0][1]) + Number(counts[0][2]) === 1
+    && Number(counts[0][3]) === 0;
+}
+
+export function preserveProductionGraph(result, name, directory, executableSha256) {
+  const rows = records(result.output, 'POLARIS_DEFAULT_GRAPH ');
+  if (!rows.length) return false;
+  demand(rows.length === 1, 'Duplicate controlled production graph record');
+  const r = rows[0];
+  demand(name === TESTS[2] && r.schema === 'polaris-controlled-production-graph-v1'
+    && r.processId === result.processId && r.stage === 'initial-start'
+    && r.source === 'actual-runtime-config-path' && r.dashboardEnabled === true
+    && typeof r.startSucceeded === 'boolean' && typeof r.configJson === 'string'
+    && r.publicationEligible === false, 'Controlled production graph provenance mismatch');
+  const bytes = Buffer.from(r.configJson, 'utf8');
+  demand(bytes.length > 0 && bytes.length <= 4 * 1024 * 1024 && bytes.length === r.bytes
+    && createHash('sha256').update(bytes).digest('hex') === r.sha256,
+  'Controlled production graph bytes/hash mismatch');
+  const graph = JSON.parse(r.configJson), apis = graph.services?.filter((s) => s.type === 'api');
+  demand(apis?.length === 1 && typeof r.dashboardPath === 'string'
+    && apis[0].dashboard?.path === r.dashboardPath, 'Production default dashboard was not retained');
+  demand(Array.isArray(graph.inbounds) && graph.inbounds.length > 0
+    && graph.inbounds.every((i) => ['mixed', 'http', 'socks'].includes(i.type) && i.listen === '127.0.0.1'),
+  'Controlled production graph must remain loopback/manual');
+  const path = join(directory, 'default-production-graph.json');
+  writeFileSync(path, bytes, { flag: 'wx', mode: 0o600 });
+  writeFileSync(join(directory, 'default-production-graph.receipt.json'), JSON.stringify({
+    ...r, configJson: undefined, testName: name, executableSha256, graphFile: 'default-production-graph.json',
+    outboundCount: graph.outbounds?.length ?? null, appAccepted: false,
+  }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+  return true;
+}
+
 export async function runTests(selected, env, directory, execute = executeCommand) {
   const digest = selected.sha256 ?? hash(selected.executable);
   const statusPath = join(directory, 'runtime-status.txt');
+  const failures = [];
   for (const name of TESTS) {
     demand(hash(selected.executable) === digest, 'Controlled executable changed before a test');
     appendFileSync(statusPath, `${name}: started\n`);
@@ -73,9 +134,14 @@ export async function runTests(selected, env, directory, execute = executeComman
       args: [name, '--exact', '--ignored', '--nocapture', '--test-threads=1'] },
     { root: dirname(selected.manifest), env, directory, timeout: 20 * 60_000 });
     demand(hash(selected.executable) === digest, 'Controlled executable changed during a test');
-    demand(exactPass(result), `Controlled test failed or did not run exactly one test: ${name}`);
-    appendFileSync(statusPath, `${name}: passed\n`);
+    demand(confirmedCleanup(result, name), `Controlled owned-child cleanup is unconfirmed: ${name}`);
+    demand(oneExecutedTest(result), `Controlled invocation did not execute exactly one reviewed test: ${name}`);
+    const graph = preserveProductionGraph(result, name, directory, digest);
+    const passed = exactPass(result) && (name !== TESTS[2] || graph);
+    appendFileSync(statusPath, `${name}: ${passed ? 'passed' : 'failed; owned-child cleanup confirmed'}\n`);
+    if (!passed) failures.push(name);
   }
+  demand(!failures.length, `Controlled business/evidence failures after confirmed cleanup: ${failures.join(', ')}`);
 }
 
 async function main() {

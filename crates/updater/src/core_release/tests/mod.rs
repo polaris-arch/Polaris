@@ -9,26 +9,37 @@ fn selection() -> Value {
     pending["selection"].clone()
 }
 
+fn current_release_contract() -> Value {
+    serde_json::from_str(&polaris_source_probe::repo_file!(
+        "scripts/desktop-core/release-contract.json"
+    ))
+    .unwrap()
+}
+
 #[test]
 fn complete_release_identity_is_distinct_from_source_identity() {
     let value = selection();
+    let contract = current_release_contract();
+    assert_eq!(value["sourceCommit"], contract["sourceCommit"]);
+    assert_ne!(contract["sourceCommit"], contract["sourceTree"]);
     assert_eq!(
         desktop_release_identity(&value),
         Some((
-            "1.15.0-polaris-alpha.12",
-            "830f7256af499e5ad3e7da9a79f0a377ca38fc77"
+            contract["version"].as_str().unwrap(),
+            contract["sourceTree"].as_str().unwrap()
         ))
     );
 }
 
 #[test]
-fn final_polaris_alpha12_is_admitted_only_with_the_complete_exact_release_binding() {
+fn current_formal_release_is_admitted_only_with_the_complete_exact_release_binding() {
     let value = &selection();
+    let contract = current_release_contract();
     assert_eq!(
         desktop_release_identity(value),
         Some((
-            "1.15.0-polaris-alpha.12",
-            "830f7256af499e5ad3e7da9a79f0a377ca38fc77"
+            contract["version"].as_str().unwrap(),
+            contract["sourceTree"].as_str().unwrap()
         ))
     );
     let mut invalid = value.clone();

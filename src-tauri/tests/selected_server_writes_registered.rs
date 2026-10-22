@@ -64,7 +64,7 @@ const KEY_ALIASES: &[&str] = &[];
 enum Class {
     /// 用户显式选了出口。写入方必须在同一次写里处置选择意图（清掉，或显式路径明确保留）。
     User,
-    /// 用户明确选择原生 Auto scope：同一 CAS writer 写意图与可选真实出口 seed。
+    /// 用户明确操作原生 Auto：选择 scope 或切换模式，同一 CAS writer 处置意图与真实出口 seed。
     UserAuto,
     /// 系统代选：故障切换、自动选择、删除或刷新之后的兜底。不得清意图。
     System,
@@ -84,6 +84,12 @@ const WRITES: &[(&str, &[Site])] = &[
     (
         "src-tauri/src/runtime/proxy/native_auto.rs",
         &[
+            (Class::UserAuto, "native_auto_set_enabled",
+             "用户关闭 Auto：冻结已观测实际出口并清 Auto 意图，next 经同一 generation/intent/config CAS writer 落盘，不是系统代选"),
+            (Class::UserAuto, "native_auto_set_enabled",
+             "核未运行时用户关闭 Auto：沿已验证 eligible 的原 pin 冻结 default 并清选择意图，next 经同一 CAS writer 落盘"),
+            (Class::Projection, "native_auto_set_enabled",
+             "CAS 成功后已接受 pin 和模式投影到运行内存，不另写磁盘或重选出口"),
             (Class::UserAuto, "native_auto_select_default",
              "用户明确选择Auto scope，CAS写入意图与当前eligible真实出口seed，不运行App竞速"),
             (Class::Projection, "native_auto_select_default",
@@ -632,7 +638,7 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
                 ),
                 Class::UserAuto => assert!(
                     write.touches_intent,
-                    "{path}:{}: explicit native Auto writer must carry selection intent",
+                    "{path}:{}: explicit native Auto writer must settle selection intent in the same function",
                     write.line
                 ),
                 Class::User | Class::Restore | Class::Projection => {}
@@ -694,10 +700,20 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
         .collect();
     assert_eq!(
         user_auto,
-        vec![(
-            "src-tauri/src/runtime/proxy/native_auto.rs",
-            "native_auto_select_default"
-        )]
+        vec![
+            (
+                "src-tauri/src/runtime/proxy/native_auto.rs",
+                "native_auto_set_enabled"
+            ),
+            (
+                "src-tauri/src/runtime/proxy/native_auto.rs",
+                "native_auto_set_enabled"
+            ),
+            (
+                "src-tauri/src/runtime/proxy/native_auto.rs",
+                "native_auto_select_default"
+            ),
+        ]
     );
 }
 

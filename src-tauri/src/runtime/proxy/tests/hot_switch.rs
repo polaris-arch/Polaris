@@ -1808,7 +1808,7 @@ fn install_startup_snapshot(rt: &ProxyRuntime, cfg: &Value) {
 /// **变异对照**：给 `PendingChangesSummary` 加回 `updated` 字段 → 键集断言转红；
 /// 去掉 `#[serde(rename_all = "camelCase")]` → 键名变 `restart_deferred` → 同样转红。
 #[test]
-fn pending_changes_contract_has_exactly_three_keys() {
+fn pending_changes_contract_has_exactly_six_typed_fields() {
     let (rt, _dir) = test_runtime();
     let v = serde_json::to_value(rt.pending_changes()).expect("契约体应可序列化");
     let mut keys: Vec<&str> = v
@@ -1820,7 +1820,18 @@ fn pending_changes_contract_has_exactly_three_keys() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["added", "modified", "removed", "restartDeferred"]
+        vec![
+            "added",
+            "modified",
+            "pendingApply",
+            "removed",
+            "restartDeferred",
+            "restartRequired"
+        ]
+    );
+    assert_eq!(
+        v,
+        serde_json::json!({"added":[],"modified":[],"removed":[],"restartDeferred":false,"pendingApply":false,"restartRequired":false})
     );
 }
 
@@ -3901,6 +3912,7 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
     // 条上「配置变更待应用」的两条来源各摆一个：①「保存不重启」的欠账 ② 一个尚未进核的新节点。
     rt.restart_deferred.store(true, Ordering::SeqCst);
     let mut next = base.clone();
+    next["mixedPort"] = serde_json::json!(7892);
     next["servers"]
         .as_array_mut()
         .unwrap()
@@ -4050,9 +4062,43 @@ async fn real_core_hot_switch_keeps_pid() {
     // ── ① 起核（两节点，选中 Node A）────────────────────────────────────────
     // 生产时序：save_full 落盘 → broadcast_config_changed → switch_mode。测试逐条照做，
     // 否则去抖重启回落读磁盘时会拿到默认配置（restart 腿的载荷来自 config.current()）。
+    // Keep the production default enabled; only replace unrelated Internet ZIP
+    // download with this test's own inert static bundle via the real resolver.
+    let dashboard = rt.config.dir().join("singbox-dashboard");
+    std::fs::create_dir_all(&dashboard).unwrap();
+    std::fs::write(
+        dashboard.join("index.html"),
+        "<!doctype html><title>controlled fixture</title>",
+    )
+    .unwrap();
+    assert_eq!(
+        super::super::core_binary::resolve_dashboard_serve_dir(rt.config.dir()),
+        Some(dashboard.to_string_lossy().into_owned())
+    );
     let cfg_a = two_node_config_ports(mixed, "node-a", pa, pb);
+    assert_eq!(
+        cfg_a["singboxDashboard"], true,
+        "production default dashboard must stay enabled"
+    );
     rt.config.save_full(&cfg_a).expect("落盘应成功");
-    let st = rt.start(cfg_a.clone()).await.expect("起核应成功");
+    let started = rt.start(cfg_a.clone()).await;
+    // These are the actual bytes written by the production generator for this
+    // isolated synthetic fixture, not a second serialization/reconstructed graph.
+    // Existing controlled-test logs carry the lossless string; the runner stores
+    // its original UTF-8 bytes and checks SHA before the normal start assertion.
+    if let Ok(raw) = std::fs::read(rt.runtime_config_path()) {
+        let record = serde_json::json!({
+            "schema":"polaris-controlled-production-graph-v1",
+            "processId":std::process::id(), "stage":"initial-start", "startSucceeded":started.is_ok(),
+            "source":"actual-runtime-config-path", "dashboardEnabled":true,
+            "dashboardPath":dashboard.to_string_lossy(), "bytes":raw.len(),
+            "sha256":polaris_updater::sha256_hex(&raw),
+            "configJson":String::from_utf8(raw).expect("generator emits UTF-8 JSON"),
+            "publicationEligible":false,
+        });
+        println!("\nPOLARIS_DEFAULT_GRAPH {record}");
+    }
+    let st = started.expect("起核应成功");
     let pid1 = st.pid;
     println!(
         "[①] start → pid={pid1} mixedPort={} apiPort={}",
@@ -6132,7 +6178,7 @@ fn selector_paths_recheck_original_physical_targets_after_inactive_hot_edit() {
     // Pure route-target tests cover A->B inactive edits then activation. This
     // source-wiring guard ensures refreshed switch fingerprints cannot bypass
     // that check through the ordinary or specialized selector entry points.
-    let hot = include_str!("../hot_switch.rs");
+    let hot = crate::test_support::crate_source("runtime/proxy/hot_switch.rs");
     let classify = hot
         .split("pub(super) fn classify_switch")
         .nth(1)
@@ -6146,7 +6192,7 @@ fn selector_paths_recheck_original_physical_targets_after_inactive_hot_edit() {
     assert!(reconcile
         .find("select_outbound(PROXY_SELECTOR_TAG")
         .is_some());
-    let auto = include_str!("../native_auto.rs");
+    let auto = crate::test_support::crate_source("runtime/proxy/native_auto.rs");
     let toggle = auto
         .split("pub(crate) async fn native_auto_set_enabled")
         .nth(1)
@@ -6181,6 +6227,6 @@ fn selector_paths_recheck_original_physical_targets_after_inactive_hot_edit() {
             .unwrap()
             < manual.find("let plan = HotSwitchPlan").unwrap()
     );
-    let runtime = include_str!("../runtime_config.rs");
+    let runtime = crate::test_support::crate_source("runtime/proxy/runtime_config.rs");
     assert!(runtime.contains("map_or(old, |value| &value.physical_route_config)"));
 }

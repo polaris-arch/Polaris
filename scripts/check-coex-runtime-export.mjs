@@ -30,10 +30,12 @@ export const HOT_PROXY_SOURCE_PATHS = [
   'src-tauri/src/runtime/proxy/native_auto.rs',
   'src-tauri/src/runtime/proxy/pending_changes.rs',
   'src-tauri/src/runtime/proxy/runtime_config.rs',
+  'src-tauri/src/runtime/proxy/runtime_config/tests/mod.rs',
   'src-tauri/src/runtime/proxy/tests/hot_switch.rs',
   'src-tauri/src/runtime/proxy/tests/hot_switch/auto_select.rs',
   'src-tauri/src/runtime/proxy/tests/lifecycle.rs',
   'src-tauri/src/runtime/proxy/tests/mesh_route_report.rs',
+  'src-tauri/src/runtime/proxy/tests/real_core_cleanup.rs',
 ];
 export const DECODER_PATHS = [
   'ui/src/contracts/coex-runtime.ts',

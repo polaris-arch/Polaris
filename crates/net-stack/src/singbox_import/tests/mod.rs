@@ -1520,7 +1520,8 @@ fn remote_openvpn_static_key_mode_omits_tls_and_checks_with_core() {
     let dir = std::env::temp_dir().join(format!("polaris-ov-static-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("static.json");
-    let mut surface = json!({"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":endpoints});
+    let mut surface =
+        json!({"log":{"disabled":true},"outbounds":cfg["outbounds"],"endpoints":endpoints});
     surface["dns"] = outbound_dns_surface(&cfg);
     surface["route"] = json!({"default_domain_resolver":"dns-bootstrap"});
     std::fs::write(&path, serde_json::to_vec_pretty(&surface).unwrap()).unwrap();

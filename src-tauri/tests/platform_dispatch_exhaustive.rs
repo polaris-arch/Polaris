@@ -1524,6 +1524,12 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    (
+        "src-tauri/src/runtime/proxy/runtime_config.rs",
+        "\"macos\" => \"darwin\", other => other,",
+        1,
+        "Only macOS spelling becomes Go darwin. iOS, Android and unknown strings remain themselves; unknown is not mapped to a supported desktop carrier.",
+    ),
     ("crates/config-engine/src/builder/outbound.rs", "if matches!( tls.get(\"engine\").and_then(serde_json::Value::as_str), Some(\"apple\" | \"windows\") ) && [\"fragment\", \"record_fragment\"] .iter() .any(|key| tls.get(*key).and_then(serde_json::Value::as_bool) == Some(true))", 1, "TLS native engine and fragmentation capabilities are incompatible; this is engine selection, not host OS dispatch."),
     ("crates/config-engine/src/builder/outbound.rs", "if server .tls_settings .as_ref() .is_some_and(|t| t.fragment == Some(true)) && ob .tls .as_ref() .is_some_and(|tls| matches!(tls.engine.as_deref(), Some(\"apple\" | \"windows\")))", 1, "Explicit node fragment plus native engine is rejected consistently; unknown hosts do not gain native engine support."),
     ("crates/config-engine/src/builder/outbound_helpers.rs", "!is_quic_managed_tls(protocol) && protocol != \"naive\" && !matches!(engine, Some(\"apple\" | \"windows\"))", 1, "TLS options follow protocol capability: QUIC, Naive and native engines do not receive incompatible uTLS/fragment options."),
@@ -2362,6 +2368,13 @@ enum IosSide {
 /// 加 40 个 iOS 答案而这一轴一句话都不说。
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        5,
+        IosSide::WithAndroid,
+        "Five additional desktop startup source/protocol custody captures and retained process checks cannot prove mobile loaded-libbox identity. Android and iOS both exclude CLI paths and retain native container admission.",
+    ),
     ("src-tauri/src/commands/proxy.rs", "target_os = \"android\"", 1, IosSide::DiffersRight, "Explicit rule-pattern admission uses Android CheckConfig; iOS has no isolated construction proof and cannot use JNI."),
     ("src-tauri/src/commands/proxy.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "Rule-pattern admission explicitly reports unavailable on iOS; Android keeps its actual native checker."),
     ("src-tauri/src/runtime/proxy/android_bridge.rs", "any(target_os = \"android\", test)", 1, IosSide::DiffersRight, "Android lifecycle_observation is shared by native consumption and host state tests; iOS keeps its own NE lifecycle, not Android observation types."),

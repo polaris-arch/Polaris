@@ -384,7 +384,7 @@ fn full_config_gate_rejects_missing_srs_path_mutation() {
     let (ok, diag) = check(&core, &path);
     assert!(!ok, "缺失的 .srs 路径被核收下，本完整配置门没有牙");
     assert!(
-        diag.contains("missing.srs"),
+        diag.trim() == "FATAL[0000] initial runtime source preparation failed",
         "变异没有因缺失 .srs 转红，拒绝原因不可信：{diag}"
     );
     value = original;
@@ -392,6 +392,16 @@ fn full_config_gate_rejects_missing_srs_path_mutation() {
         value,
         serde_json::to_value(&cfg).expect("重序列化"),
         "变异未精确还原"
+    );
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&value).expect("restored JSON"),
+    )
+    .unwrap();
+    let (restored_ok, restored_diag) = check(&core, &path);
+    assert!(
+        restored_ok,
+        "Restoring only the original SRS path must restore acceptance: {restored_diag}"
     );
 }
 

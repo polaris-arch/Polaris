@@ -29,23 +29,20 @@ use std::path::{Path, PathBuf};
 /// 失效方式也一样。只因为它取的是二进制而不是文本就漏掉不管，等于按类型分类而不是按缺陷分类
 /// —— 本门第一版正是这么写的，随后 Batch A 把 8 处 `include_bytes!("../../../icons/*.png")`
 /// 从 `app_tray.rs` 搬进 `app_tray/tests/mod.rs`，那串 `..` 整体平移，门一声不吭。
-const FORBIDDEN: &[&str] = &["include_str!", "include_bytes!"];
+const FORBIDDEN: &[&str] = &["include_str", "include_bytes"];
 
-/// 永久白名单：每条必须**恰好命中一次**，多了少了都红。
-///
-/// 「恰好一次」不是洁癖：白名单条目命中 0 次说明它守的东西已经没了，条目本身成了将来某个
-/// 真违规的免死金牌；命中多次说明一条豁免悄悄覆盖了它没打算覆盖的地方。
-/// **当前为空**：唯一一条（门 C 的棘轮基线清单 `data/gate_c_baseline.txt`）已随 Batch A 收尾
-/// 删除，本门当场按设计报「命中 0 次」把清理逼了出来 —— 那正是「恰好一次」这条规则的用途。
-///
-/// 机制保留而不是连同 [`Exempt`] 一起删掉：下一个要开豁免的人必须落进这套防腐规则里，
-/// 而不是自己新起一个没有过期检查的例外表。
-const WHITELIST: [Exempt; 0] = [];
-
+// Three compiled identities cannot be replaced by runtime source-probe reads.
+// Each exact expression is allowed once in this one owner; no file-wide exemption.
+const COMPILED_IDENTITY_OWNER: &str =
+    "src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs";
+const WHITELIST: [Exempt; 3] = [
+    Exempt { file: COMPILED_IDENTITY_OWNER, expression: "include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/core-manifest.json\"))", reason: "Compile-time bytes bind the real-core test artifact, not mutable runtime files." },
+    Exempt { file: COMPILED_IDENTITY_OWNER, expression: "include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../scripts/desktop-core/release-contract.json\"))", reason: "Compile-time bytes bind the real-core test artifact, not mutable runtime files." },
+    Exempt { file: COMPILED_IDENTITY_OWNER, expression: "include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../crates/singbox-grpc/proto/runtime_config.proto\"))", reason: "Compile-time bytes bind the real-core test artifact, not mutable runtime files." },
+ ];
 struct Exempt {
-    /// 仓库相对路径（`/` 分隔）。
     file: &'static str,
-    /// 为什么这条可以豁免。写清楚是为了让下一个人判断得了它还该不该在。
+    expression: &'static str,
     reason: &'static str,
 }
 
@@ -56,6 +53,7 @@ struct Hit {
     line: usize,
     /// 判定为测试代码的依据。
     why: &'static str,
+    expression: Option<String>,
 }
 
 fn workspace_root() -> PathBuf {
@@ -217,42 +215,180 @@ fn cfg_test_regions(masked: &str) -> Vec<(usize, usize)> {
     regions
 }
 
-fn scan() -> Vec<Hit> {
-    let mut hits = Vec::new();
-    for (rel, path) in scan_surface() {
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("读不到 `{}`（{err}）", path.display()));
-        let masked = polaris_source_probe::mask_comments_and_strings(&source);
-        if !FORBIDDEN.iter().any(|needle| masked.contains(needle)) {
+// Comments may move between tokens; literal contents and token boundaries may not.
+fn expression_tokens(source: &str) -> Option<Vec<String>> {
+    let source = polaris_source_probe::mask_comments(source);
+    let b = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
             continue;
         }
-        let in_tests_dir = rel.contains("/tests/");
-        let regions = if in_tests_dir {
-            Vec::new()
-        } else {
-            cfg_test_regions(&masked)
-        };
-        for needle in FORBIDDEN {
-            let mut from = 0usize;
-            while let Some(offset) = masked[from..].find(needle) {
-                let at = from + offset;
-                from = at + needle.len();
-                let why = if in_tests_dir {
-                    "文件在 `tests/` 目录下（本仓约定：`<dir>/tests/` 恒为测试）"
-                } else if regions.iter().any(|(a, b)| *a <= at && at <= *b) {
-                    "位于 `#[cfg(…test…)]` 罩住的块内"
-                } else {
-                    continue;
-                };
-                hits.push(Hit {
-                    file: rel.clone(),
-                    line: masked[..at].matches('\n').count() + 1,
-                    why,
-                });
+        let start = i;
+        if b[i] == b'"' {
+            i += 1;
+            loop {
+                match b.get(i) {
+                    Some(b'\\') => {
+                        i += 2;
+                        if i > b.len() {
+                            return None;
+                        }
+                    }
+                    Some(b'"') => {
+                        i += 1;
+                        break;
+                    }
+                    Some(_) => i += 1,
+                    None => return None,
+                }
             }
+        } else if b[i].is_ascii_alphanumeric() || b[i] == b'_' {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+        } else if b[i].is_ascii() {
+            i += 1;
+        } else {
+            return None;
+        }
+        tokens.push(source[start..i].to_string());
+    }
+    Some(tokens)
+}
+
+// Do not skip the outer expression: a nested forbidden macro must also be found.
+fn rust_space(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '\u{200e}' | '\u{200f}')
+}
+
+fn macro_sites(masked: &str) -> Vec<(usize, usize)> {
+    // Consume a complete identifier, including non-ASCII components, rather than
+    // granting an ASCII suffix of a different macro the builtin's exemption.
+    let identifier =
+        |ch: char| ch == '_' || ch.is_ascii_alphanumeric() || (!ch.is_ascii() && !rust_space(ch));
+    let mut sites = Vec::new();
+    let mut i = 0;
+    while let Some(ch) = masked[i..].chars().next() {
+        if !identifier(ch) {
+            i += ch.len_utf8();
+            continue;
+        }
+        let start = i;
+        while let Some(ch) = masked[i..].chars().next().filter(|ch| identifier(*ch)) {
+            i += ch.len_utf8();
+        }
+        if !FORBIDDEN.contains(&&masked[start..i]) {
+            continue;
+        }
+        let mut bang = i;
+        while let Some(ch) = masked[bang..].chars().next().filter(|ch| rust_space(*ch)) {
+            bang += ch.len_utf8();
+        }
+        if masked.as_bytes().get(bang) == Some(&b'!') {
+            sites.push((start, bang + 1));
         }
     }
-    hits
+    sites
+}
+
+fn complete_expression(source: &str, masked: &str, at: usize, after_bang: usize) -> Option<String> {
+    // Qualified/raw identifiers are not the reviewed unqualified builtin call.
+    if matches!(
+        masked[..at]
+            .trim_end_matches(rust_space)
+            .chars()
+            .next_back(),
+        Some(':' | '#')
+    ) {
+        return None;
+    }
+    let b = masked.as_bytes();
+    let mut open = after_bang;
+    while b.get(open).is_some_and(u8::is_ascii_whitespace) {
+        open += 1;
+    }
+    if b.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, byte) in b[open..].iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(source[at..=open + offset].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn scan_source(rel: &str, source: &str) -> Vec<Hit> {
+    let masked = polaris_source_probe::mask_comments_and_strings(source);
+    let in_tests_dir = rel.contains("/tests/");
+    let regions = if in_tests_dir {
+        Vec::new()
+    } else {
+        cfg_test_regions(&masked)
+    };
+    macro_sites(&masked)
+        .into_iter()
+        .filter_map(|(at, after_bang)| {
+            let why = if in_tests_dir {
+                "file is in tests/"
+            } else if regions.iter().any(|(a, b)| *a <= at && at <= *b) {
+                "inside cfg(test)"
+            } else {
+                return None;
+            };
+            Some(Hit {
+                file: rel.to_string(),
+                line: masked[..at].matches('\n').count() + 1,
+                why,
+                expression: complete_expression(source, &masked, at, after_bang),
+            })
+        })
+        .collect()
+}
+
+fn matches_exemption(hit: &Hit, exempt: &Exempt) -> bool {
+    hit.file == exempt.file
+        && hit.expression.as_ref().is_some_and(|expression| {
+            let actual = expression_tokens(expression);
+            actual.is_some() && actual == expression_tokens(exempt.expression)
+        })
+}
+
+fn unregistered_hits(hits: &[Hit]) -> Vec<&Hit> {
+    let mut used = [0usize; WHITELIST.len()];
+    hits.iter()
+        .filter(|hit| {
+            for (i, exempt) in WHITELIST.iter().enumerate() {
+                if matches_exemption(hit, exempt) {
+                    used[i] += 1;
+                    return used[i] != 1;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+fn scan() -> Vec<Hit> {
+    scan_surface()
+        .into_iter()
+        .flat_map(|(rel, path)| {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+            scan_source(&rel, &source)
+        })
+        .collect()
 }
 
 /// 🔴 测试代码里不许出现 `include_str!`。
@@ -262,11 +398,7 @@ fn scan() -> Vec<Hit> {
 #[test]
 fn test_code_uses_source_probe_anchors_not_include_str() {
     let hits = scan();
-    let exempt_files: BTreeSet<&str> = WHITELIST.iter().map(|e| e.file).collect();
-    let violations: Vec<&Hit> = hits
-        .iter()
-        .filter(|hit| !exempt_files.contains(hit.file.as_str()))
-        .collect();
+    let violations = unregistered_hits(&hits);
 
     assert!(
         violations.is_empty(),
@@ -291,7 +423,10 @@ fn test_code_uses_source_probe_anchors_not_include_str() {
 fn whitelist_entries_must_all_match_exactly_once() {
     let hits = scan();
     for exempt in WHITELIST {
-        let count = hits.iter().filter(|hit| hit.file == exempt.file).count();
+        let count = hits
+            .iter()
+            .filter(|hit| matches_exemption(hit, &exempt))
+            .count();
         assert_eq!(
             count, 1,
             "白名单 `{}` 命中 {count} 次（应为 1）。豁免理由：{}",
@@ -929,4 +1064,96 @@ fn the_cfg_test_leg_has_live_population() {
          躲在 `#[cfg(test)] fn` 里的 `include_str!` 会整类放行"
     );
     eprintln!("[门 D] cfg 腿活样本：{with_regions} 个生产文件 / {total_regions} 个块");
+}
+
+#[test]
+fn compiled_identity_exemptions_bind_exact_file_tokens_literals_and_one_occurrence() {
+    let good = WHITELIST
+        .iter()
+        .map(|e| e.expression)
+        .collect::<Vec<_>>()
+        .join(";\n");
+    let hits = scan_source(COMPILED_IDENTITY_OWNER, &good);
+    assert_eq!(hits.len(), 3);
+    assert!(unregistered_hits(&hits).is_empty());
+    for exempt in &WHITELIST {
+        assert_eq!(
+            hits.iter().filter(|h| matches_exemption(h, exempt)).count(),
+            1
+        );
+        let spaced = exempt
+            .expression
+            .replace("!", " /* comment */ ! ")
+            .replace(",", ",\n");
+        let hits = scan_source(COMPILED_IDENTITY_OWNER, &spaced);
+        assert_eq!(hits.len(), 1);
+        assert!(matches_exemption(&hits[0], exempt));
+        assert_eq!(
+            unregistered_hits(&scan_source("src-tauri/tests/other.rs", exempt.expression)).len(),
+            1
+        );
+    }
+    let first = WHITELIST[0].expression;
+    for bad in [
+        first.replace("include_bytes", "include_str"),
+        first.replace("CARGO_MANIFEST_DIR", "CARGO_MANIFEST_DI R"),
+        first.replace("CARGO_MANIFEST_DIR", "OTHER_ROOT"),
+        first.replace("env!", "option_env!"),
+        first.replace("/core-manifest.json", "/core-manifest .json"),
+        first.replace("/core-manifest.json", "/other.json"),
+        first.replace("concat", "con cat"),
+        first.replace("env", "e nv"),
+        format!("std::{first}"),
+        format!("std::\u{200e}{first}"),
+        format!("r#{first}"),
+        first.replace("))", ", 1))"),
+        first.trim_end_matches(')').to_string(),
+        "include_bytes!(\"../core-manifest.json\")".into(),
+        "include_bytes!{concat!(env!(\"CARGO_MANIFEST_DIR\"),\"/core-manifest.json\")}".into(),
+    ] {
+        let hits = scan_source(COMPILED_IDENTITY_OWNER, &bad);
+        assert!(!hits.is_empty(), "negative must be scanned: {bad}");
+        assert!(!unregistered_hits(&hits).is_empty(), "must reject: {bad}");
+    }
+    // Three total is insufficient: each of the three distinct identities is required.
+    for changed in [
+        format!("{good}; {first}"),
+        format!("{first};{first};{first}"),
+    ] {
+        let hits = scan_source(COMPILED_IDENTITY_OWNER, &changed);
+        assert!(!unregistered_hits(&hits).is_empty());
+    }
+    let missing = scan_source(COMPILED_IDENTITY_OWNER, first);
+    assert!(WHITELIST
+        .iter()
+        .any(|e| !missing.iter().any(|h| matches_exemption(h, e))));
+    let fourth = format!("{good}; include_bytes!(\"unreviewed\")");
+    assert_eq!(
+        unregistered_hits(&scan_source(COMPILED_IDENTITY_OWNER, &fourth)).len(),
+        1
+    );
+    let nested = first.replace("\"/core-manifest.json\"", "include_bytes!(\"unreviewed\")");
+    assert_eq!(
+        unregistered_hits(&scan_source(COMPILED_IDENTITY_OWNER, &nested)).len(),
+        2
+    );
+    let fake = format!("// {first}\n/* {first} */\nlet text = {first:?};");
+    assert!(scan_source(COMPILED_IDENTITY_OWNER, &fake).is_empty());
+    assert!(scan_source(COMPILED_IDENTITY_OWNER, "foo_include_bytes!(\"x\")").is_empty());
+    for lookalike in [
+        format!("α{first}"),
+        first.replacen("include_bytes", "include_bytesα", 1),
+        first.replacen("include_bytes", "include_bytes\u{301}", 1),
+    ] {
+        assert!(scan_source(COMPILED_IDENTITY_OWNER, &lookalike).is_empty());
+    }
+    // Unicode whitespace is a separator, not an identifier prefix hiding a macro.
+    assert_eq!(
+        scan_source(
+            COMPILED_IDENTITY_OWNER,
+            &format!("\u{200e}include_bytes\u{200e}!(\"unreviewed\")")
+        )
+        .len(),
+        1
+    );
 }

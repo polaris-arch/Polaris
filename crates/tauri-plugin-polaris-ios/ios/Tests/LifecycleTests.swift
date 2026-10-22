@@ -805,7 +805,7 @@ struct LifecycleTests {
         let admitted = try decode(ready)
         assert(admitted.identity?.incarnation == "original-instance")
         assert(admitted.manifestDigest == digest && admitted.controlRevision == "0")
-        assert(admitted.unsupportedPaths.isEmpty())
+        assert(admitted.unsupportedPaths.isEmpty)
         var bad = ready; bad["fields"] = []; rejected(bad)
         bad = ready; bad["contract_version"] = 2; rejected(bad)
         bad = ready; bad["fields"] = [protocolField, protocolField]; rejected(bad)

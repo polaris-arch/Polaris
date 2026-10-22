@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
+#[cfg(test)]
 use std::sync::Arc;
 
 use polaris_config_engine::builder::custom_rule_files::build_custom_rule_files;
@@ -235,12 +236,6 @@ impl ProxyRuntime {
     #[cfg(test)]
     pub async fn apply_pending(self: &Arc<Self>) -> &'static str {
         self.apply_pending_transaction(None).await.status
-    }
-
-    #[cfg(test)]
-    pub async fn apply_pending_owned(self: &Arc<Self>) -> (&'static str, Option<u64>) {
-        let result = self.apply_pending_transaction(None).await;
-        (result.status, result.apply_id)
     }
 
     /// 消费由暂存保存腿写下的不可逆删除意图。失败条目保留在 journal，下次 Apply/启动重试。

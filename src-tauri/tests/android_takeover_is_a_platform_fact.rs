@@ -104,6 +104,12 @@ const RAW_READ_EXEMPTIONS: &[Exemption] = &[];
 type RawJsonSite = (&'static str, &'static str, usize, &'static str);
 const RAW_JSON_REGISTRY: &[RawJsonSite] = &[
     (
+        "src-tauri/src/runtime/proxy/runtime_config.rs",
+        "[ \"proxyModeType\", \"tunConfig\", \"mixedPort\", \"httpPort\", \"allowLan\", \"clashApiSecret\", \"singboxDashboard\", ] .iter() .any(|key| old.get(*key) != new.get(*key))",
+        1,
+        "Structural preview compares opaque D/R physical-control values, not raw takeover policy. Android still uses effective_on(Tun), and the core Plan is authoritative for admission.",
+    ),
+    (
         "src-tauri/src/commands/config.rs",
         "next[\"proxyModeType\"] = json!(mode)",
         1,

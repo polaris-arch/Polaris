@@ -1493,14 +1493,13 @@ impl ProxyRuntime {
         // Graph changes use the additive transaction; ordinary selector/no-op
         // controls retain their proven path. Save-only never mutates the runtime.
         if !defer_restart && self.core_running() {
-            let graph_change = match self.classify_switch(&new_config, false) {
+            let graph_change = !matches!(
+                self.classify_switch(&new_config, false),
                 ClassifiedSwitch::Decided {
                     decision: SwitchDecision::HotSwitch(_) | SwitchDecision::NoOp,
                     ..
-                }
-                | ClassifiedSwitch::Unchanged => false,
-                _ => true,
-            };
+                } | ClassifiedSwitch::Unchanged
+            );
             if graph_change {
                 let result = self.apply_runtime_candidate(new_config.clone()).await;
                 return Self::runtime_result_outcome(&result);

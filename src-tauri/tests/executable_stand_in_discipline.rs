@@ -137,8 +137,8 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
     (
         "src-tauri/src/runtime/proxy/tests/startup.rs",
         Kind::Shebang,
-        5,
-        "两项只验路径解析/可执行权限；另三项是 TLS 证明的原文件、缓存压力文件与同长度替换文件，仅哈希/身份校验，Native 探测见 shebang 即拒绝执行",
+        9,
+        "两项路径/权限、三项 TLS 身份及四项 startup proof/captured custody/replacement 身份夹具。后七项只取哈希/身份，Native probe 识别 shebang 后拒绝执行；并非可运行的假内核",
     ),
     (
         "src-tauri/src/runtime/proxy/tests/startup.rs",

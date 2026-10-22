@@ -2437,6 +2437,7 @@ impl ConfigManager {
     }
 
     /// Apply / 冷启动消费延迟删除。每条先按最新配置复核；执行失败保留在日志中，下一次 Apply/启动重试。
+    #[cfg(test)]
     pub(crate) fn process_deferred_deletions(
         &self,
         apply: impl FnMut(&DeferredConfigDeletion, &Value) -> Result<(), String>,
