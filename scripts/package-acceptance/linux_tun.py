@@ -31,15 +31,18 @@ HERE = Path(__file__).resolve().parent
 
 def inspect_helper(payload, members):
     payload = Path(payload).resolve()
-    helpers = [p for p in payload.rglob('polaris-helper') if p.is_file()]
-    require(len(helpers) == 1, 'one packaged helper required')
-    helper = base.regular(helpers[0], payload)
+    # The package also carries the source/update configuration with the same
+    # basename. Installation identity belongs only beside the frozen core.
+    core = base.regular(payload / members['core']['path'], payload)
+    cronet = base.regular(payload / members['cronet']['path'], payload)
+    # CarrierRun already verified these bytes against the frozen members.
+    require(core.parent == cronet.parent, 'split frozen core/Cronet payload')
+    helper = base.regular(core.parent / 'polaris-helper', payload)
+    require(len([p for p in payload.rglob('polaris-helper') if p.is_file()]) == 1,
+            'one packaged helper required')
     require(helper.read_bytes()[:4] == b'\x7fELF' and os.access(helper, os.X_OK), 'packaged helper must be executable ELF')
-    manifests = [p for p in payload.rglob('core-manifest.json') if p.is_file()]
-    require(len(manifests) == 1, 'one embedded selected-core manifest required')
-    manifest = base.regular(manifests[0], payload)
-    require(manifest.parent == (payload / members['core']['path']).parent and manifest.stat().st_size < 1024 * 1024,
-            'embedded manifest must accompany frozen core')
+    manifest = base.regular(core.parent / 'core-manifest.json', payload)
+    require(0 < manifest.stat().st_size <= 65536, 'bounded adjacent selected-core manifest required')
     return {'helper': base.byte_identity(helper, payload), 'manifest': base.byte_identity(manifest, payload),
             'embeddedManifest': json.loads(manifest.read_bytes()),
             'core': members['core'], 'cronet': members['cronet']}
@@ -224,17 +227,20 @@ root ledger confirms every observed birth. Missing observations fail forever.
         return super().signal(item, sig)
 
     def close(self, normal):
-        if self.window or any(key not in self.confirmed for key in self.quarantine):
-            self.unknown.append('unconfirmed-privileged-GUI-lineage')
-        for item in self.quarantine.values():
-            current = base.process_identity(item['pid'])
-            if base.same_process(item, current) and current['state'] != 'Z':
-                self.unknown.append('privileged-GUI-descendant-not-reaped')
-        # The fixed root controller must finish before ordinary tool cleanup.
-        for item in self.controller_descendants.values():
-            current = base.process_identity(item['pid'])
-            if base.same_process(item, current) and current['state'] != 'Z':
-                self.unknown.append('root-controller-descendant-not-reaped')
+        try:
+            if self.window or any(key not in self.confirmed for key in self.quarantine):
+                self.unknown.append('unconfirmed-privileged-GUI-lineage')
+            for item in self.quarantine.values():
+                current = base.process_identity(item['pid'])
+                if base.same_process(item, current) and current['state'] != 'Z':
+                    self.unknown.append('privileged-GUI-descendant-not-reaped')
+            # The fixed root controller must finish before ordinary tool cleanup.
+            for item in self.controller_descendants.values():
+                current = base.process_identity(item['pid'])
+                if base.same_process(item, current) and current['state'] != 'Z':
+                    self.unknown.append('root-controller-descendant-not-reaped')
+        except Exception:
+            self.unknown.append('privileged-cleanup-observation-unconfirmed')
         return super().close(normal)
 
 
@@ -815,7 +821,7 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
             self.stage = 'restored-control-connectivity'
             self.result['controlConnectivity']['after'] = self.control_connectivity('after')
         except BaseException as error:
-            self.result['failure'] = {'stage': self.stage, 'kind': type(error).__name__}
+            self.result['failure'] = {'stage': self.stage, 'kind': type(error).__name__, 'code': 'TUN_RUNTIME_FAILED'}
             if self.controller and not self.controller.closed:
                 try:
                     recovery = self.controller.call('abort')
@@ -875,6 +881,17 @@ def run_node(args, supervisor, stdin=None):
     return json.loads(output) if output.strip() else None
 
 
+ENTRY_FAILURE_CODES = {
+    'construct': 'TUN_CONSTRUCTION_FAILED',
+    'inspect-helper': 'TUN_INSPECTION_FAILED',
+    'bind-helper': 'TUN_BIND_HELPER_FAILED',
+    'authorize': 'TUN_AUTHORIZE_FAILED',
+    'runtime': 'TUN_RUNTIME_BOUNDARY_FAILED',
+    'post-runtime-carrier': 'TUN_CARRIER_RECHECK_FAILED',
+    'binding-copy': 'TUN_BINDING_COPY_FAILED',
+}
+
+
 def run_all(args):
     import pwd
     admission_path = base.regular(args.admission)
@@ -890,22 +907,32 @@ def run_all(args):
     require(not output.is_symlink(), 'redirected report prohibited')
     previous = {sig: signal.signal(sig, base.cancellation) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
-        with tempfile.TemporaryDirectory(prefix='polaris-tun-', dir='/tmp') as temp:
-            workspace = Path(temp); workspace.chmod(0o700)
-            run = TunCarrierRun(item, package, workspace, output.parent, base.regular(args.rpc_client), admission, None, {})
+        workspace = Path(tempfile.mkdtemp(prefix='polaris-tun-', dir='/tmp'))
+        result = None
+        try:
+            run = None
+            entry_stage = 'construct'
             try:
+                workspace.chmod(0o700)
+                run = TunCarrierRun(item, package, workspace, output.parent, base.regular(args.rpc_client), admission, None, {})
+                entry_stage = 'inspect-helper'
                 inspection_path = workspace / 'inspection.json'
                 inspection_path.write_text(json.dumps(inspect_helper(run.payload, run.members)))
                 bound_path = workspace / 'bound.json'
+                entry_stage = 'bind-helper'
                 run_node(['bind-helper', admission_path, inspection_path, bound_path], run.supervisor)
                 bound_bytes = bound_path.read_bytes()
                 run.bound = json.loads(bound_bytes)
                 require(run.bound['schema'] == 'polaris-linux-tun-bound-v1' and run.bound['admission'] == admission,
                         'helper binding changed admission')
+                entry_stage = 'authorize'
                 run.launch_options = run_node(['authorize', admission_path], run.supervisor,
                     {'runToken': run.run_id, 'guiUid': os.getuid(), 'account': pwd.getpwuid(os.getuid()).pw_name})
+                entry_stage = 'runtime'
                 result = run.run()
+                entry_stage = 'post-runtime-carrier'
                 require(base.sha(package) == item['sha256'], 'carrier bytes drifted during TUN run')
+                entry_stage = 'binding-copy'
                 binding_copy = output.parent / (args.kind + '-bound.json')
                 require(not binding_copy.exists() and not binding_copy.is_symlink(), 'fresh public binding copy required')
                 binding_copy.write_bytes(bound_bytes)
@@ -914,13 +941,58 @@ def run_all(args):
                     transportSha256=admission['transportSha256'], carrierKind=item['kind'], carrierSha256=item['sha256'],
                     context=admission['context'], scope='same-final-carrier', publicationEligible=False)
             except BaseException as error:
-                # No authentication action can occur before authorize returns.
-                ordinary = run.supervisor.close(False)
-                result = tun.report_result({}, {'state': 'failed', 'forced': False,
-                    'unknown': ['admission-or-authorization-unconfirmed']}, 'same-final-carrier')
-                result.update(failure={'kind': type(error).__name__}, ordinaryCleanup=ordinary)
-            output.write_text(json.dumps(result, indent=2) + '\n')
+                # This boundary also covers runtime/post-runtime exceptions.
+                # Reached-stage diagnostics do not establish absence of auth or cleanup.
+                try:
+                    ordinary = run.supervisor.close(False) if run is not None else {
+                        'state': 'failed', 'forced': [], 'remaining': [], 'unknown': ['construction-unconfirmed']}
+                except BaseException:
+                    ordinary = {'state': 'failed', 'forced': [], 'remaining': [],
+                                'unknown': ['ordinary-cleanup-unconfirmed']}
+                # Preserve earlier runtime/root/ordinary evidence if a second
+                # exception occurs at cleanup or the post-runtime binding boundary.
+                prior = result if isinstance(result, dict) else getattr(run, 'result', None)
+                result = dict(prior) if isinstance(prior, dict) else {}
+                cleanup = dict(result.get('cleanup', {}))
+                cleanup.update(state='failed', forced=cleanup.get('forced', False),
+                    unknown=list(cleanup.get('unknown', [])) + ['admission-or-authorization-unconfirmed'])
+                result.update(tun.report_result(result.get('cases', {}), cleanup, 'same-final-carrier',
+                                                result.get('blocked', [])))
+                entry_failure = {'schema': 'polaris-linux-tun-entry-failure-v1', 'kind': type(error).__name__, 'stage': entry_stage,
+                                 'code': ENTRY_FAILURE_CODES[entry_stage]}
+                result['entryFailure'] = entry_failure
+                result.setdefault('failure', entry_failure)
+                if 'ordinaryCleanup' in result:
+                    result['boundaryOrdinaryCleanup'] = ordinary
+                else:
+                    result['ordinaryCleanup'] = ordinary
+            result['entryProgress'] = {'schema': 'polaris-linux-tun-entry-progress-v1',
+                'lastReached': entry_stage, 'claim': 'entry-reached-only-not-completion'}
             return result
+        finally:
+            ordinary_rows = [(result or {}).get('ordinaryCleanup', {})]
+            if 'boundaryOrdinaryCleanup' in (result or {}):
+                ordinary_rows.append(result['boundaryOrdinaryCleanup'])
+            ordinary_stopped = all(ordinary.get('remainingAssessment') == 'observed' and
+                                   ordinary.get('remaining') == [] and ordinary.get('unknown') == []
+                                   for ordinary in ordinary_rows)
+            # TunSupervisor's unknown list includes unreaped quarantine/controller
+            # births. A controller also needs affirmative privileged reaping proof;
+            # absent evidence keeps the workspace, never attempts mount cleanup.
+            privileged_stopped = (run is not None and (run.controller is None or
+                (run.controller.closed is True and
+                 (result or {}).get('cleanup', {}).get('privilegedProcessesReaped') is True)))
+            workspace_cleanup = base.cleanup_workspace(workspace,
+                processes_stopped=ordinary_stopped and privileged_stopped)
+            if result is not None:
+                result['workspaceCleanup'] = workspace_cleanup
+                if workspace_cleanup.get('state') != 'normal':
+                    cleanup = dict(result['cleanup'])
+                    cleanup.update(state='failed', unknown=list(cleanup.get('unknown', [])) +
+                                   ['workspace-cleanup-unconfirmed'])
+                    result.update(tun.report_result(result['cases'], cleanup, 'same-final-carrier',
+                                                    result.get('blocked', [])))
+                output.write_text(json.dumps(result, indent=2) + '\n')
     finally:
         for sig, old in previous.items(): signal.signal(sig, old)
 

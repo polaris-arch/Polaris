@@ -105,6 +105,25 @@ reported honestly, not asserted to be a Cronet request test. The original final
 native proof separately must demonstrate the exact packaged Cronet CAPI engine
 initialization and actual-core library mapping.
 
+## Runtime boundary failures
+
+The TUN helper and selected `core-manifest.json` must be regular files adjacent
+to the frozen executable. The separately bundled application source manifest
+has a different role; it is not a second selected installation manifest. The
+selected manifest still passes the complete installation identity/hash contract.
+
+Process admission and pidfd signal authority remain unchanged. A rejected process
+records only bounded birth/UID/capability/namespace diagnostics, never argv,
+environment values or raw stderr. Unreadable identity remains unknown. Monitor
+stop/join runs even when inventory fails; an unconfirmed stop remains a failed
+cleanup, not an empty-process success. Workspace removal requires observed process
+exit, no unknown ownership, and no remaining mount beneath the private directory.
+Unconfirmed exit, ownership or mount prerequisites prevent removal. Removal
+errors remain failed without retry or permission changes; no chmod, unmount or
+additional privilege is used to force cleanup. Primary scenario and cleanup errors
+are recorded separately. TUN entry progress indicates entry reached, not completion
+of a password, helper or network action.
+
 ## Evidence and limitations
 
 Actual App-generated `singbox-runtime.json` is read twice with stable inode,

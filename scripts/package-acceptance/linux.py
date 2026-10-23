@@ -218,6 +218,66 @@ def process_identity(pid):
         return None
 
 
+def process_diagnostic(item):
+    """Bounded public kernel facts only; never grants signal authority."""
+    result = {key: item.get(key) for key in ('pid', 'startTime', 'ppid', 'uid')}
+    result['observation'] = 'unknown'
+    base = Path('/proc') / str(item['pid'])
+    try:
+        before = process_identity(item['pid'])
+        if not same_process(item, before):
+            return result
+        with (base / 'status').open() as stream:
+            status = stream.read(16385)
+        require(len(status) <= 16384, 'status diagnostic bound')
+        fields = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
+        for name, count, pattern in (('Uid', 4, r'[0-9]+'), ('Gid', 4, r'[0-9]+'),
+                                      ('CapEff', 1, r'[0-9a-fA-F]{1,16}'),
+                                      ('CapPrm', 1, r'[0-9a-fA-F]{1,16}'),
+                                      ('CapAmb', 1, r'[0-9a-fA-F]{1,16}'),
+                                      ('NoNewPrivs', 1, r'[01]'), ('Seccomp', 1, r'[012]')):
+            values = fields.get(name, '').split()
+            result[name] = values if len(values) == count and all(re.fullmatch(pattern, v) for v in values) else 'unknown'
+        for namespace in ('user', 'mnt', 'pid'):
+            try:
+                value = os.readlink(base / 'ns' / namespace)
+                result[namespace + 'Namespace'] = value if re.fullmatch(namespace + r':\[[0-9]+\]', value) else 'unknown'
+            except OSError:
+                result[namespace + 'Namespace'] = 'unknown'
+        try:
+            with (base / 'uid_map').open() as stream:
+                mapping = stream.read(1025)
+            rows = [line.split() for line in mapping.splitlines()]
+            result['uidMap'] = rows if len(mapping) <= 1024 and 0 < len(rows) <= 16 and all(len(row) == 3 and all(re.fullmatch(r'[0-9]+', v) for v in row) for row in rows) else 'unknown'
+        except OSError:
+            result['uidMap'] = 'unknown'
+        if not same_process(item, process_identity(item['pid'])):
+            return {**{key: item.get(key) for key in ('pid', 'startTime', 'ppid', 'uid')}, 'observation': 'unstable'}
+        result['observation'] = 'same-birth-snapshot-not-authorization'
+    except (OSError, ValueError):
+        result['observation'] = 'unknown'
+    return result
+
+
+def cleanup_workspace(directory, *, processes_stopped=False):
+    """Never recurse into an active portal mount or repair its permissions."""
+    directory = Path(directory).absolute()
+    if not processes_stopped:
+        return {'state': 'failed', 'reason': 'workspace-process-exit-unconfirmed'}
+    try:
+        for line in Path('/proc/self/mountinfo').read_text().splitlines():
+            fields = line.split()
+            require(len(fields) >= 10 and '-' in fields, 'mount inventory malformed')
+            mount = Path(re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4]))
+            if mount == directory or mount.is_relative_to(directory):
+                return {'state': 'failed', 'reason': 'workspace-mount-remains'}
+        # No onerror chmod retry, umount, privilege change, or link traversal.
+        shutil.rmtree(directory)
+        return {'state': 'normal'}
+    except (OSError, ValueError) as error:
+        return {'state': 'failed', 'reason': 'workspace-cleanup-unconfirmed', 'type': type(error).__name__}
+
+
 def same_process(left, right):
     return bool(left and right and left['pid'] == right['pid'] and left['startTime'] == right['startTime'])
 
@@ -274,12 +334,14 @@ class Supervisor:
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.unknown = []
+        self.diagnostics = []
+        self.diagnostics_truncated = False
         self.forced = []
         self.network = {}
         self.network_errors = set()
         self.network_truncated = False
         self.network_next = 0.0
-        self.thread = threading.Thread(target=self._monitor, daemon=False)
+        self.thread = threading.Thread(target=self._monitor, daemon=True)
         self.thread.start()
 
     def _monitor(self):
@@ -290,7 +352,21 @@ class Supervisor:
                     self.observe_sockets(observed)
                     self.network_next = time.monotonic() + 0.5
             except Exception:
-                self.unknown.append('process-inventory-unreadable')
+                if 'process-inventory-unreadable' not in self.unknown:
+                    self.unknown.append('process-inventory-unreadable')
+
+    def record_diagnostic(self, code, item, parent=None):
+        with self.lock:
+            key = (code, item['pid'], item['startTime'])
+            if any((row['code'], row['process']['pid'], row['process']['startTime']) == key for row in self.diagnostics):
+                return
+            if len(self.diagnostics) >= 64:
+                self.diagnostics_truncated = True
+                return
+            row = {'code': code, 'process': process_diagnostic(item)}
+            if parent:
+                row['parent'] = {key: parent[key] for key in ('pid', 'startTime', 'uid')}
+            self.diagnostics.append(row)
 
     def scan(self):
         observed = {int(p.name): process_identity(int(p.name)) for p in Path('/proc').iterdir() if p.name.isdigit()}
@@ -301,11 +377,15 @@ class Supervisor:
                 changed = False
                 for pid, item in observed.items():
                     if same_process(item, self.owned.get(pid)):
+                        if item['uid'] != os.getuid() or self.owned[pid]['uid'] != os.getuid():
+                            self.record_diagnostic('owned-birth-uid-mismatch', item)
                         require(item['uid'] == os.getuid() and self.owned[pid]['uid'] == os.getuid(),
                                 'owned birth changed UID unexpectedly')
                         continue
                     parent = observed.get(item['ppid'])
                     if same_process(parent, self.owned.get(item['ppid'])):
+                        if item['uid'] != os.getuid():
+                            self.record_diagnostic('owned-descendant-uid-mismatch', item, parent)
                         require(item['uid'] == os.getuid(), 'owned descendant elevated unexpectedly')
                         self.owned[pid] = item
                         self.roles[pid] = self.roles.get(item['ppid'], 'unknown')
@@ -435,6 +515,28 @@ class Supervisor:
             os.close(fd)
 
     def close(self, normal):
+        cleanup = {'state': 'failed', 'forced': self.forced, 'remaining': [],
+                   'remainingAssessment': 'unknown', 'unknown': []}
+        try:
+            cleanup = self._close_owned(normal)
+            cleanup['remainingAssessment'] = 'observed'
+        except Exception as error:
+            self.unknown.append('cleanup-inventory-unconfirmed')
+            cleanup['failure'] = {'stage': 'supervisor-close', 'type': type(error).__name__}
+        finally:
+            self.stop.set()
+            self.thread.join(2)
+            if self.thread.is_alive():
+                self.unknown.append('monitor-stop-unconfirmed')
+                cleanup['remainingAssessment'] = 'unknown'
+            cleanup['unknown'] = sorted(set(self.unknown))
+            cleanup['identityDiagnostics'] = getattr(self, 'diagnostics', [])
+            cleanup['identityDiagnosticsTruncated'] = getattr(self, 'diagnostics_truncated', False)
+            if cleanup['unknown']:
+                cleanup['state'] = 'failed'
+        return cleanup
+
+    def _close_owned(self, normal):
         # Product must already have exited through Ctrl+Q. Tools may receive TERM.
         product = self.living('product')
         if product:
@@ -458,9 +560,10 @@ class Supervisor:
                 pass
             except (ValueError, OSError):
                 self.unknown.append('pidfd-signal-identity-unconfirmed')
+        wait_deadline = time.monotonic() + 5
         for child in self.children.values():
             try:
-                child.wait(timeout=5)
+                child.wait(timeout=max(0, wait_deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 self.unknown.append('child-wait-timeout')
         while True:
@@ -470,8 +573,6 @@ class Supervisor:
             except ChildProcessError:
                 break
         remaining = [{'pid': p['pid'], 'startTime': p['startTime']} for p in self.living()]
-        self.stop.set()
-        self.thread.join(2)
         return {'state': 'normal' if normal and not self.forced and not remaining and not self.unknown else 'failed',
                 'forced': self.forced, 'remaining': remaining, 'unknown': sorted(set(self.unknown))}
 
@@ -1202,25 +1303,39 @@ return buttons.length===1?buttons[0]:null;
                 except Exception:
                     self.result['failure']['screenshotState'] = 'unavailable'
         finally:
-            for stream in self.sockets:
-                stream.close()
-            fixture_cleanup = True
+            failures = []
             try:
-                self.network.close()
-            except Exception:
-                fixture_cleanup = False
-            self.result['network'] = self.network.snapshot()
-            if self.result['network']['healthFailures'] or any(self.result['network'][key]['failures'] for key in ('a', 'b', 'dnsA', 'dnsB')):
-                fixture_cleanup = False
-            cleanup = self.supervisor.close(self.normal_quit)
-            if not fixture_cleanup:
+                for stream in self.sockets:
+                    try:
+                        stream.close()
+                    except Exception as error:
+                        failures.append({'stage': 'fixture-stream-close', 'type': type(error).__name__})
+                try:
+                    self.network.close()
+                except Exception as error:
+                    failures.append({'stage': 'fixture-close', 'type': type(error).__name__})
+                try:
+                    self.result['network'] = self.network.snapshot()
+                    if self.result['network']['healthFailures'] or any(self.result['network'][key]['failures'] for key in ('a', 'b', 'dnsA', 'dnsB')):
+                        failures.append({'stage': 'fixture-health', 'type': 'Unconfirmed'})
+                except Exception as error:
+                    failures.append({'stage': 'fixture-snapshot', 'type': type(error).__name__})
+            finally:
+                cleanup = self.supervisor.close(self.normal_quit)
+                self.result['cleanup'] = cleanup
+            if failures:
                 cleanup['state'] = 'failed'
                 cleanup['unknown'].append('fixture-cleanup')
-            self.result['ownedNetworkObservation'] = self.supervisor.network_evidence()
-            self.result['cleanup'] = cleanup
+                cleanup['failures'] = failures
+            try:
+                self.result['ownedNetworkObservation'] = self.supervisor.network_evidence()
+            except Exception as error:
+                cleanup['state'] = 'failed'
+                cleanup['unknown'].append('network-evidence-unavailable')
+                cleanup.setdefault('failures', []).append({'stage': 'network-evidence', 'type': type(error).__name__})
             if cleanup['state'] == 'normal':
                 self.record('cleanup', **cleanup)
-            self.result['result'] = 'success' if set(self.result['cases']) == set(CASES) and 'failure' not in self.result else 'failed'
+            self.result['result'] = 'success' if set(self.result['cases']) == set(CASES) and 'failure' not in self.result and cleanup['state'] == 'normal' else 'failed'
         return self.result
 
 
@@ -1252,12 +1367,30 @@ def run_all(index, packages, rpc_client, output):
     try:
         for item in carriers:
             package = carrier_path(packages, item)
-            with tempfile.TemporaryDirectory(prefix='polaris-final-package-') as directory:
-                case = CarrierRun(item, package, Path(directory), output.parent, rpc_client, fixtures)
-                receipt = case.run()
-                result['carriers'].append(receipt)
+            directory = Path(tempfile.mkdtemp(prefix='polaris-final-package-'))
+            receipt = {'kind': item['kind'], 'result': 'failed', 'cases': {},
+                       'cleanup': {'state': 'failed', 'forced': [], 'remaining': []}}
+            result['carriers'].append(receipt)
+            case = None
+            try:
+                case = CarrierRun(item, package, directory, output.parent, rpc_client, fixtures)
+                receipt.update(case.run())
                 require(sha(package) == item['sha256'], 'carrier changed during execution')
-                require(receipt['result'] == 'success', 'mandatory native carrier scenario failed')
+            except Exception as error:
+                if case is not None:
+                    receipt.update(case.result)
+                receipt.setdefault('failure', {'stage': 'carrier-run', 'type': type(error).__name__})
+                receipt['result'] = 'failed'
+            finally:
+                receipt['workspaceCleanup'] = cleanup_workspace(directory,
+                    processes_stopped=receipt['cleanup'].get('remainingAssessment') == 'observed'
+                    and not receipt['cleanup']['remaining']
+                    and not receipt['cleanup'].get('unknown'))
+                if receipt['workspaceCleanup']['state'] != 'normal':
+                    receipt['cleanup']['state'] = 'failed'
+                    receipt['cleanup'].setdefault('unknown', []).append('workspace-cleanup-unconfirmed')
+                    receipt['result'] = 'failed'
+            require(receipt['result'] == 'success', 'mandatory native carrier scenario failed')
         cleanups = [item['cleanup'] for item in result['carriers']]
         result['cleanup'] = {'state': 'normal', 'forced': [p for c in cleanups for p in c['forced']],
                              'remaining': [p for c in cleanups for p in c['remaining']]}

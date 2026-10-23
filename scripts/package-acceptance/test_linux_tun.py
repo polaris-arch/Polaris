@@ -13,6 +13,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 SUPPORT = Path(os.environ.get('POLARIS_TUN_SUPPORT_DIR', HERE))
@@ -89,24 +90,186 @@ class PureContracts(unittest.TestCase):
         self.assertNotIn('secret', M.TUN_OBSERVER)
         self.assertIn('state.rows.length>256', M.TUN_OBSERVER)
 
-    def test_inspection_requires_one_original_helper_and_adjacent_manifest(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); core = root / 'usr/lib/Polaris/core'; core.mkdir(parents=True)
-            helper = core.parent / 'polaris-helper'; helper.write_bytes(b'\x7fELFfixture'); helper.chmod(0o755)
-            manifest = core / 'core-manifest.json'; manifest.write_text('{"id":"test"}')
-            members = {'core': {'path': 'usr/lib/Polaris/core/sing-box', 'sha256': H},
-                       'cronet': {'path': 'usr/lib/Polaris/core/libcronet.so', 'sha256': H}}
-            result = M.inspect_helper(root, members)
-            self.assertEqual(result['helper']['sha256'], hashlib.sha256(helper.read_bytes()).hexdigest())
-            self.assertEqual(result['embeddedManifest'], {'id': 'test'})
-            other = root / 'polaris-helper'; other.write_bytes(b'\x7fELF'); other.chmod(0o755)
-            with self.assertRaises(ValueError): M.inspect_helper(root, members)
+    def inspection_fixture(self, root):
+        directory = root / 'usr/lib/Polaris/_up_/resources/linux'
+        directory.mkdir(parents=True)
+        for name in ('sing-box', 'libcronet.so'):
+            (directory / name).write_bytes(b'fixture-not-executable')
+        helper = directory / 'polaris-helper'
+        helper.write_bytes(b'\x7fELFfixture'); helper.chmod(0o755)
+        manifest = directory / 'core-manifest.json'
+        manifest.write_text('{"schema":"polaris-core-manifest-v1","id":"mock-only"}')
+        upper = root / 'usr/lib/Polaris/core-manifest.json'
+        upper.write_text('{"bundledCoreVersion":"1.15.0-alpha.8","desktopRelease":{}}')
+        members = {role: M.base.byte_identity(directory / name, root)
+                   for role, name in (('core', 'sing-box'), ('cronet', 'libcronet.so'))}
+        return directory, helper, manifest, upper, members
 
-    def test_symlinked_helper_rejected(self):
+    def test_real_dual_role_layout_selects_only_frozen_core_neighbor(self):
+        # Real carrier path topology, synthetic bytes: not runtime evidence.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); real = root / 'real'; real.write_bytes(b'\x7fELF'); real.chmod(0o755)
-            (root / 'polaris-helper').symlink_to(real)
-            with self.assertRaises(ValueError): M.inspect_helper(root, {'core': {'path': 'sing-box'}})
+            root = Path(tmp)
+            directory, helper, manifest, upper, members = self.inspection_fixture(root)
+            result = M.inspect_helper(root, members)
+            self.assertEqual(result['manifest'], M.base.byte_identity(manifest, root))
+            self.assertEqual(result['helper'], M.base.byte_identity(helper, root))
+            self.assertEqual(result['core'], members['core'])
+            self.assertEqual(result['cronet'], members['cronet'])
+            self.assertEqual(result['embeddedManifest']['id'], 'mock-only')
+            self.assertTrue(upper.exists())
+            self.assertEqual(len(list(root.rglob('core-manifest.json'))), 2)
+
+    def test_adjacent_manifest_missing_linked_invalid_or_oversized_never_falls_back(self):
+        for fault in ('missing', 'symlink', 'invalid-json', 'oversize', 'directory'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                directory, helper, manifest, upper, members = self.inspection_fixture(root)
+                manifest.unlink()
+                if fault == 'symlink': manifest.symlink_to(upper)
+                elif fault == 'invalid-json': manifest.write_text('{')
+                elif fault == 'oversize': manifest.write_text(' ' * 65537)
+                elif fault == 'directory': manifest.mkdir()
+                with self.assertRaises(ValueError): M.inspect_helper(root, members)
+
+    def test_exact_helper_elf_mode_link_and_uniqueness_fail_closed(self):
+        for fault in ('missing', 'foreign-only', 'symlink', 'not-elf', 'not-executable', 'duplicate'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                directory, helper, manifest, upper, members = self.inspection_fixture(root)
+                if fault in ('missing', 'foreign-only', 'symlink'): helper.unlink()
+                if fault in ('foreign-only', 'symlink', 'duplicate'):
+                    other = root / 'polaris-helper'; other.write_bytes(b'\x7fELF'); other.chmod(0o755)
+                    if fault == 'symlink': helper.symlink_to(other)
+                elif fault == 'not-elf': helper.write_bytes(b'not-ELF')
+                elif fault == 'not-executable': helper.chmod(0o644)
+                with self.assertRaises(ValueError): M.inspect_helper(root, members)
+
+    def test_frozen_member_paths_must_be_regular_adjacent_and_inside_payload(self):
+        for fault in ('split', 'core-link', 'ancestor-link', 'escape'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                directory, helper, manifest, upper, members = self.inspection_fixture(root)
+                if fault == 'split': members['cronet']['path'] = str(upper.relative_to(root))
+                elif fault == 'core-link':
+                    core = directory / 'sing-box'; core.unlink(); core.symlink_to(upper)
+                elif fault == 'ancestor-link':
+                    alias = root / 'alias'; alias.symlink_to(directory, target_is_directory=True)
+                    members['core']['path'] = 'alias/sing-box'
+                else: members['core']['path'] = str(Path(__file__).absolute())
+                with self.assertRaises(ValueError): M.inspect_helper(root, members)
+
+    def test_entry_diagnostics_are_fixed_reached_stages_not_secret_messages_or_pass(self):
+        for fault in ('inspect-helper', 'bind-helper', 'authorize', 'runtime',
+                      'post-runtime-carrier', 'binding-copy', 'returned-runtime-failure',
+                      'construct', 'workspace-mounted', 'workspace-error', 'ordinary-close-error',
+                      'workspace-after-success', 'processes-stopped', 'controller-unconfirmed', 'controller-reaped',
+                      'runtime-second-failure'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); package = root / 'package'; package.write_bytes(b'package')
+                transport = root / 'transport'; transport.write_bytes(b'transport')
+                rpc = root / 'rpc'; rpc.write_bytes(b'not-executed')
+                admission = {'schema': 'polaris-linux-tun-admission-v1',
+                    'kernelCommit': M.tun.KERNEL_COMMIT, 'sourceScope': 'same-final-carrier',
+                    'publicationEligible': False, 'transportSha256': M.base.sha(transport),
+                    'carrier': {'kind': 'deb', 'sha256': M.base.sha(package)}, 'context': {}}
+                admitted = root / 'admitted.json'; admitted.write_text(json.dumps(admission))
+                args = SimpleNamespace(admission=admitted, transport=transport, packages=root,
+                    output=root / 'run.json', rpc_client=rpc, kind='deb')
+                run = Mock(); run.run_id = '123456789abc'; run.controller = None
+                run.supervisor.close.return_value = {'state': 'failed', 'unknown': ['unconfirmed']}
+                secret = 'PRIVATE-EXCEPTION-CONTENT-NEVER-EXPORT'
+                if fault == 'ordinary-close-error': run.supervisor.close.side_effect = PermissionError(secret)
+                if fault in ('controller-unconfirmed', 'controller-reaped'):
+                    run.controller = SimpleNamespace(closed=fault == 'controller-reaped')
+                cleanup_authorizations = []
+                real_cleanup = M.base.cleanup_workspace
+                def workspace_cleanup(directory, *, processes_stopped=False):
+                    cleanup_authorizations.append(processes_stopped)
+                    # Do not leak mock workspaces: no process was started in this test.
+                    real_cleanup(directory, processes_stopped=True)
+                    value = {'state': 'normal'} if processes_stopped else {
+                        'state': 'failed', 'reason': 'workspace-process-exit-unconfirmed'}
+                    if fault in ('workspace-mounted', 'workspace-error', 'workspace-after-success', 'processes-stopped', 'controller-unconfirmed', 'controller-reaped',
+                      'runtime-second-failure'):
+                        return {'state': 'failed', 'reason': 'workspace-mount-remains' if fault == 'workspace-mounted'
+                                else 'workspace-cleanup-unconfirmed'}
+                    return value
+                def node(argv, *unused, **kwargs):
+                    if argv[0] == fault: raise ValueError(secret)
+                    if argv[0] == 'bind-helper':
+                        Path(argv[3]).write_text(json.dumps({'schema': 'polaris-linux-tun-bound-v1',
+                                                          'admission': admission}))
+                    return {}
+                def runtime():
+                    if fault in ('runtime', 'ordinary-close-error'): raise ValueError(secret)
+                    if fault == 'post-runtime-carrier': package.write_bytes(b'changed')
+                    if fault == 'binding-copy': (root / 'deb-bound.json').write_text('occupied')
+                    result = M.tun.report_result({}, {'state': 'failed', 'forced': False,
+                        'unknown': ['runtime-cleanup-unconfirmed']}, 'same-final-carrier')
+                    if fault == 'workspace-after-success':
+                        # Synthetic boundary response only; cleanup must veto even a success label.
+                        return {'result': 'success', 'cases': {}, 'blocked': [],
+                                'cleanup': {'state': 'normal', 'forced': False, 'unknown': []}}
+                    if fault in ('processes-stopped', 'controller-unconfirmed', 'controller-reaped'):
+                        result['ordinaryCleanup'] = {'state': 'normal', 'remainingAssessment': 'observed',
+                                                     'remaining': [], 'unknown': []}
+                        if fault == 'controller-reaped': result['cleanup']['privilegedProcessesReaped'] = True
+                    result['rootCleanupEvidence'] = {'marker': 'mock-prior-evidence'}
+                    result['failure'] = {'stage': 'native-launch', 'kind': 'ValueError',
+                                         'code': 'TUN_RUNTIME_FAILED'}
+                    if fault == 'runtime-second-failure':
+                        result['ordinaryCleanup'] = {'state': 'normal', 'remainingAssessment': 'observed',
+                                                     'remaining': [], 'unknown': []}
+                        result['cases'] = {'mock-original-case': {'status': 'failed', 'evidence': {}}}
+                        run.result = result
+                        raise ValueError(secret)
+                    return result
+                run.run.side_effect = runtime
+                with patch.object(M.base, 'carrier_path', return_value=package), \
+                     patch.object(M, 'TunCarrierRun', return_value=run,
+                                  side_effect=ValueError(secret) if fault == 'construct' else None), \
+                     patch.object(M, 'inspect_helper', side_effect=ValueError(secret) if fault == 'inspect-helper' else None,
+                                  return_value={}), patch.object(M, 'run_node', side_effect=node), \
+                     patch.object(M.base, 'cleanup_workspace', side_effect=workspace_cleanup):
+                    result = M.run_all(args)
+                if fault == 'workspace-after-success':
+                    self.assertEqual(result['entryProgress']['lastReached'], 'binding-copy')
+                    self.assertEqual(result['workspaceCleanup']['state'], 'failed')
+                    self.assertEqual(result['cleanup']['state'], 'failed')
+                    self.assertIn('workspace-cleanup-unconfirmed', result['cleanup']['unknown'])
+                elif fault in ('returned-runtime-failure', 'workspace-mounted', 'workspace-error',
+                                'processes-stopped', 'controller-unconfirmed', 'controller-reaped'):
+                    self.assertEqual(result['failure']['stage'], 'native-launch')
+                    self.assertEqual(result['failure']['code'], 'TUN_RUNTIME_FAILED')
+                    self.assertEqual(result['entryProgress']['lastReached'], 'binding-copy')
+                    self.assertIn('runtime-cleanup-unconfirmed', result['cleanup']['unknown'])
+                    if fault.startswith('workspace-'):
+                        self.assertIn('workspace-cleanup-unconfirmed', result['cleanup']['unknown'])
+                        self.assertEqual(result['workspaceCleanup']['state'], 'failed')
+                else:
+                    expected_stage = 'runtime' if fault in ('ordinary-close-error', 'runtime-second-failure') else fault
+                    self.assertEqual(result['entryFailure']['stage'], expected_stage)
+                    self.assertEqual(result['entryFailure']['code'], M.ENTRY_FAILURE_CODES[expected_stage])
+                    if fault in ('post-runtime-carrier', 'binding-copy', 'runtime-second-failure'):
+                        self.assertEqual(result['failure']['stage'], 'native-launch')
+                        self.assertIn('runtime-cleanup-unconfirmed', result['cleanup']['unknown'])
+                        self.assertEqual(result['rootCleanupEvidence'], {'marker': 'mock-prior-evidence'})
+                        if fault == 'runtime-second-failure':
+                            self.assertIn('mock-original-case', result['cases'])
+                            self.assertEqual(result['ordinaryCleanup']['state'], 'normal')
+                            self.assertEqual(result['boundaryOrdinaryCleanup']['state'], 'failed')
+                    else:
+                        self.assertEqual(result['failure'], result['entryFailure'])
+                    self.assertEqual(result['entryProgress']['lastReached'], expected_stage)
+                    if fault == 'ordinary-close-error':
+                        self.assertIn('ordinary-cleanup-unconfirmed', result['ordinaryCleanup']['unknown'])
+                    self.assertIn('admission-or-authorization-unconfirmed', result['cleanup']['unknown'])
+                self.assertEqual(cleanup_authorizations, [fault in ('processes-stopped', 'controller-reaped')])
+                self.assertEqual(result['entryProgress']['claim'], 'entry-reached-only-not-completion')
+                self.assertEqual(result['result'], 'failed')
+                self.assertNotIn(secret, args.output.read_text())
+                self.assertEqual(json.loads(args.output.read_text()), result)
+                if fault in ('inspect-helper', 'bind-helper', 'authorize'): run.run.assert_not_called()
 
     def test_real_capture_origin_dns_join(self):
         plan, analysis, snapshots, streams, dns = fixture_evidence()
@@ -188,6 +351,17 @@ class PureContracts(unittest.TestCase):
             obj.scan()
         self.assertIn('foreign-descendant-outside-exact-GUI-transaction', obj.unknown)
         self.assertNotIn(11, obj.owned)
+
+    def test_privileged_cleanup_observation_failure_still_enters_shared_close(self):
+        obj = supervisor(); root = identity(11, 0)
+        obj.quarantine[(11, '1234')] = root
+        with patch.object(M.base, 'process_identity', side_effect=PermissionError('private-detail')), \
+             patch.object(M.base.Supervisor, 'close', return_value={'state': 'failed'}) as close:
+            result = obj.close(False)
+        close.assert_called_once_with(False)
+        self.assertEqual(result['state'], 'failed')
+        self.assertIn('privileged-cleanup-observation-unconfirmed', obj.unknown)
+        self.assertNotIn('private-detail', json.dumps(obj.unknown))
 
     def test_root_signal_prohibited_even_after_confirmation(self):
         obj = supervisor(); root = identity(11, 0); obj.owned[11] = root

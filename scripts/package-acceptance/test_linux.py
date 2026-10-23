@@ -9,7 +9,7 @@ import struct
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, mock_open
 
 SPEC = importlib.util.spec_from_file_location('package_linux', Path(__file__).with_name('linux.py'))
 M = importlib.util.module_from_spec(SPEC)
@@ -291,6 +291,7 @@ class PrimitiveTests(unittest.TestCase):
         supervisor.unknown = []
         supervisor.stop = Mock()
         supervisor.thread = Mock()
+        supervisor.thread.is_alive.return_value = False
         with patch.object(M.os, 'waitpid', side_effect=ChildProcessError):
             result = supervisor.close(True)
         self.assertEqual(result['state'], 'failed')
@@ -305,10 +306,106 @@ class PrimitiveTests(unittest.TestCase):
         supervisor.unknown = ['unobserved-adopted-descendant']
         supervisor.stop = Mock()
         supervisor.thread = Mock()
+        supervisor.thread.is_alive.return_value = False
         with patch.object(M.os, 'waitpid', side_effect=ChildProcessError):
             result = supervisor.close(True)
         self.assertEqual(result['state'], 'failed')
         self.assertEqual(result['unknown'], ['unobserved-adopted-descendant'])
+
+    def test_close_inventory_exceptions_always_stop_monitor(self):
+        for failure_at in range(5):
+            supervisor = M.Supervisor.__new__(M.Supervisor)
+            supervisor.living = Mock(side_effect=[[]] * failure_at + [ValueError('private text must not leak')])
+            supervisor.signal = Mock()
+            supervisor.children = {}
+            supervisor.forced = []
+            supervisor.unknown = []
+            supervisor.stop = Mock()
+            supervisor.thread = Mock()
+            supervisor.thread.is_alive.return_value = False
+            with patch.object(M.os, 'waitpid', side_effect=ChildProcessError):
+                result = supervisor.close(True)
+            supervisor.stop.set.assert_called_once()
+            supervisor.thread.join.assert_called_once_with(2)
+            supervisor.signal.assert_not_called()
+            self.assertEqual(result['state'], 'failed')
+            self.assertEqual(result['remainingAssessment'], 'unknown')
+            self.assertNotIn('private text', json.dumps(result))
+
+    def test_close_monitor_that_did_not_stop_fails(self):
+        supervisor = M.Supervisor.__new__(M.Supervisor)
+        supervisor._close_owned = Mock(return_value={'state': 'normal', 'forced': [], 'remaining': [], 'unknown': []})
+        supervisor.forced, supervisor.unknown = [], []
+        supervisor.stop, supervisor.thread = Mock(), Mock()
+        supervisor.thread.is_alive.return_value = True
+        result = supervisor.close(True)
+        self.assertEqual(result['state'], 'failed')
+        self.assertIn('monitor-stop-unconfirmed', result['unknown'])
+        self.assertEqual(result['remainingAssessment'], 'unknown')
+        self.assertIn('threading.Thread(target=self._monitor, daemon=True)', Path(M.__file__).read_text())
+
+    def test_identity_diagnostic_is_bounded_and_not_authorization(self):
+        identity = {'pid': 17, 'startTime': '25', 'ppid': 9, 'uid': 0}
+        status = 'Uid: 1000 1000 1000 1000\nGid: 1000 1000 1000 1000\nCapEff: 0\nCapPrm: 0\nCapAmb: 0\nNoNewPrivs: 1\nSeccomp: 2\nName: secret-argv\n'
+        files = [mock_open(read_data=status).return_value, mock_open(read_data='0 1000 1\n').return_value]
+        with patch.object(M, 'process_identity', return_value=identity), patch.object(M.Path, 'open', side_effect=files), patch.object(M.os, 'readlink', side_effect=['user:[3]', 'mnt:[4]', 'pid:[5]']):
+            result = M.process_diagnostic(identity)
+        self.assertEqual(result['Uid'], ['1000'] * 4)
+        self.assertEqual(result['uid'], 0)  # Original rejection UID remains unchanged.
+        self.assertEqual(result['uidMap'], [['0', '1000', '1']])
+        self.assertNotIn('secret-argv', json.dumps(result))
+        self.assertIn('not-authorization', result['observation'])
+        with patch.object(M, 'process_identity', return_value=identity), patch.object(M.Path, 'open', side_effect=PermissionError):
+            self.assertEqual(M.process_diagnostic(identity)['observation'], 'unknown')
+        with patch.object(M, 'process_identity', return_value={**identity, 'startTime': '26'}):
+            self.assertEqual(M.process_diagnostic(identity)['observation'], 'unknown')
+
+    def test_workspace_mount_and_permission_failures_are_not_bypassed(self):
+        mount = '35 20 0:32 / /tmp/owned/home/runtime/doc rw - fuse.portal portal rw\n'
+        with patch.object(M.Path, 'read_text', return_value=mount), patch.object(M.shutil, 'rmtree') as remove:
+            result = M.cleanup_workspace('/tmp/owned', processes_stopped=True)
+        self.assertEqual(result['reason'], 'workspace-mount-remains')
+        remove.assert_not_called()
+        with patch.object(M.Path, 'read_text', return_value=''), patch.object(M.shutil, 'rmtree', side_effect=PermissionError) as remove:
+            result = M.cleanup_workspace('/tmp/owned', processes_stopped=True)
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(result['type'], 'PermissionError')
+        remove.assert_called_once_with(Path('/tmp/owned'))
+        with patch.object(M.Path, 'read_text', side_effect=PermissionError), patch.object(M.shutil, 'rmtree') as remove:
+            self.assertEqual(M.cleanup_workspace('/tmp/owned', processes_stopped=True)['state'], 'failed')
+        remove.assert_not_called()
+
+    def test_workspace_requires_confirmed_process_exit(self):
+        with patch.object(M.Path, 'read_text') as inventory, patch.object(M.shutil, 'rmtree') as remove:
+            result = M.cleanup_workspace('/tmp/owned')
+        self.assertEqual(result['reason'], 'workspace-process-exit-unconfirmed')
+        inventory.assert_not_called()
+        remove.assert_not_called()
+
+    def test_run_all_retains_case_and_directory_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index, rpc, output = root / 'index.json', root / 'rpc', root / 'result.json'
+            index.write_text(json.dumps({'freeze': {'carriers': [
+                {'kind': 'deb', 'sha256': 'frozen'}, {'kind': 'AppImage', 'sha256': 'frozen'}]}}))
+            rpc.write_text('test')
+            receipt = {'kind': 'deb', 'result': 'failed', 'cases': {},
+                       'failure': {'stage': 'launch', 'type': 'ValueError'},
+                       'cleanup': {'state': 'failed', 'forced': [], 'remaining': [],
+                                   'remainingAssessment': 'observed', 'unknown': ['unobserved-adopted-descendant'], 'failure': {'stage': 'supervisor-close', 'type': 'ValueError'}}}
+            case = Mock()
+            case.run.return_value = receipt
+            case.result = receipt
+            with patch.dict(M.os.environ, {'GITHUB_ACTIONS': 'true'}, clear=True), patch.object(M.os, 'geteuid', return_value=1000), patch.object(M.subprocess, 'run'), patch.object(M, 'load_fixtures'), patch.object(M, 'carrier_path', return_value=rpc), patch.object(M, 'CarrierRun', return_value=case), patch.object(M, 'sha', return_value='frozen'), patch.object(M.tempfile, 'mkdtemp', return_value=str(root / 'workspace')), patch.object(M, 'cleanup_workspace', return_value={'state': 'failed', 'reason': 'workspace-cleanup-unconfirmed', 'type': 'PermissionError'}) as workspace_cleanup:
+                with self.assertRaises(ValueError):
+                    M.run_all(index, root, rpc, output)
+                self.assertFalse(workspace_cleanup.call_args.kwargs['processes_stopped'])
+            result = json.loads(output.read_text())
+            carrier = result['carriers'][0]
+            self.assertEqual(carrier['failure']['stage'], 'launch')
+            self.assertEqual(carrier['cleanup']['failure']['stage'], 'supervisor-close')
+            self.assertEqual(carrier['workspaceCleanup']['type'], 'PermissionError')
+            self.assertEqual(result['result'], 'failed')
 
     def test_cancel_is_failure_not_skip(self):
         with self.assertRaises(M.AcceptanceCancelled):
