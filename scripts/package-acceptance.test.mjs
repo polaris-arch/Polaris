@@ -347,7 +347,15 @@ test('read-only auth preflight is one existing setup job and default DAG is byte
   // Reverse only the added default-false guards/input/steps/ref selection. The
   // complete resulting workflow must equal the reviewed f20ce source hash:
   // dependencies, matrices, original conditions (including always), and bodies.
-  let projected = workflow.replace(/      linux_auth_preflight_only:\n        description: [^\n]+\n        type: boolean\n        default: false\n/, '');
+  // N5 adds only one opt-in choice and two exact descriptions. Reverse those
+  // literals first; retain the original f20ce byte hash rather than widening it.
+  let projected = workflow
+    .replace('          - temporary-existing-runner-password-and-sudo-group\n', '')
+    .replace("        description: 'Temporary password/group modes require separate exact-SHA approval; existing session remains default'",
+      "        description: 'Temporary password mode requires separate explicit approval for this exact dispatch'")
+    .replace("        description: 'Leave empty unless the exact selected password/relock or password/sudo-membership/relock/removal action was approved'",
+      "        description: 'Leave empty unless this exact temporary runner password and relock action was explicitly approved'");
+  projected = projected.replace(/      linux_auth_preflight_only:\n        description: [^\n]+\n        type: boolean\n        default: false\n/, '');
   projected = projected.replace('inputs.linux_auth_preflight_only && github.sha || ', '');
   projected = projected.replace(/^        if: inputs\.linux_auth_preflight_only == true \|\| \((.*)\)$/gm, '        if: $1');
   projected = projected.replace(/^        if: inputs\.linux_auth_preflight_only != true && \((.*)\)$/gm, '        if: $1');

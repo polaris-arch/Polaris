@@ -6,8 +6,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { admit, sha256 } from './package-acceptance/transport.mjs';
 import { selectedCoreManifest } from './lib/core-identity.mjs';
-import { AUTH_MODE, AUTH_PHRASE, CASES, KERNEL, VERSION, authorizationFacts, credentialAuthorization,
-  stamp, tunSelection, unstamped, verifyAuthenticationAdmission, verifyAuthorization, verifyHelper, verifyKernel, verifyReport } from './package-acceptance/tun_transport.mjs';
+import { AUTH_MODE, AUTH_PHRASE, AUTH_GROUP_MODE, AUTH_GROUP_PHRASE, CASES, KERNEL, VERSION, authorizationFacts, credentialAuthorization,
+  stamp, tunSelection, unstamped, verifyAuthenticationAdmission, verifyAuthorization, verifyGroupRecovery, verifyHelper, verifyKernel, verifyReport } from './package-acceptance/tun_transport.mjs';
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const sha = 'a'.repeat(40), tree = 'b'.repeat(40), hash = 'c'.repeat(64);
 const env = { GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_REPOSITORY_ID: '1347028220',
@@ -262,7 +262,7 @@ for kind in ('install','uninstall'):
     observer.rows={(102,'125'):row}; observer.pkexec={(102,'125'):row}; observer.shells={(102,'125'):row}
     closed=observer.finish()
     run=object.__new__(gui.TunCarrierRun)
-    run.app=app; run.driver=Mock(); run.supervisor=Mock(); run.controller=Mock()
+    run.app=app; run.driver=Mock(); run.supervisor=Mock(); run.controller=Mock(); run.launch_options={'authenticationMode':'existing-session'}
     run.controller.call.side_effect=lambda command,**args: closed if command=='transaction_end' else {}
     run.text=lambda key:key
     replies=iter([[],[{'sequence':1,'kind':'helper','envelopeSuccess':True,'success':True,'installed':kind=='install','ready':kind=='install'}]])
@@ -281,5 +281,92 @@ print(json.dumps(results))`;
       const bad = clone(rows[index]); mutate(bad);
       assert.throws(() => verifyAuthorization(bad, kind, report.execution.app, 1001, 'existing-session', subject));
     }
+  }
+});
+
+
+test('joint sudo membership authority is separate, default off, exact runner and invocation', () => {
+  const approved = clone(event);
+  approved.inputs.linux_tun_auth_mode = AUTH_GROUP_MODE;
+  approved.inputs.linux_tun_credential_authorization = AUTH_GROUP_PHRASE;
+  const facts = authorizationFacts(context, approved, env);
+  const lease = credentialAuthorization(facts, {runToken:'abcdef123456', guiUid:1001, account:'runner'}, 1000);
+  assert.equal(lease.schema, 'polaris-tun-credential-group-lease-v1');
+  assert.equal(lease.authMode, AUTH_GROUP_MODE);
+  assert.deepEqual(lease.groupLease, {group:'sudo', account:'runner', guiUid:1001, maxLeaseSeconds:90,
+    originalMembership:'absent', restore:'remove-only-added-membership'});
+  assert.equal(lease.maxLeaseSeconds, 90);
+  assert.equal(lease.expiresUnix - lease.notBeforeUnix, 900);
+  assert.equal(lease.groupLease.gid, undefined);
+  for (const phrase of ['', AUTH_PHRASE, 'true']) {
+    const bad = clone(approved); bad.inputs.linux_tun_credential_authorization = phrase;
+    assert.throws(() => authorizationFacts(context, bad, env));
+  }
+  const wrongMode = clone(approved); wrongMode.inputs.linux_tun_auth_mode = AUTH_MODE;
+  assert.throws(() => authorizationFacts(context, wrongMode, env));
+  assert.throws(() => authorizationFacts({...context, attempt:'2'}, approved, {...env,GITHUB_RUN_ATTEMPT:'2'}));
+  assert.throws(() => credentialAuthorization(facts, {runToken:'abcdef123456',guiUid:1001,account:'other'},1000));
+  assert.throws(() => credentialAuthorization(facts, {runToken:'abcdef123456',guiUid:0,account:'root'},1000));
+  assert.throws(() => credentialAuthorization(facts, {runToken:'abcdef123456',guiUid:1002,account:'runner'},1000));
+  assert.equal(credentialAuthorization(authorizationFacts(context,event,env),{runToken:'abcdef123456',guiUid:1001,account:'runner'},1000),null);
+  const old = clone(event); old.inputs.linux_tun_auth_mode=AUTH_MODE; old.inputs.linux_tun_credential_authorization=AUTH_PHRASE;
+  const oldLease = credentialAuthorization(authorizationFacts(context,old,env),{runToken:'abcdef123456',guiUid:1001,account:'runner'},1000);
+  assert.equal(oldLease.schema,'polaris-tun-credential-lease-v1');
+  assert.equal(oldLease.groupLease,undefined);
+  const workflow = readFileSync(join(ROOT,'.github/workflows/package.yml'),'utf8');
+  assert.match(workflow,/linux_tun_auth_mode:[\s\S]*?default: existing-session/);
+  assert.match(workflow,/          - temporary-existing-runner-password-and-sudo-group\n/);
+});
+
+
+test('joint recovery requires real relock and removal of only the added bound membership', () => {
+  const row = authorization('install');
+  const group = {schema:'polaris-sudo-membership-recovery-v1', account:'runner', guiUid:1001,
+    group:'sudo', groupGid:27, originalMembership:'absent', finalMembership:'absent',
+    removedOnlyAddedMembership:true, writerStopped:true, maxLeaseSeconds:90};
+  const credential = {guiUid:1001, account:'runner', finalPasswordStatus:'L',plaintextPersisted:false,
+    emptyPasswordRestored:false,temporaryPasswordHash:'locked until disposable VM destruction'};
+  Object.assign(row.authorization,{authenticationMode:AUTH_GROUP_MODE,credentialAuthenticationComplete:true,
+    authDescendantsReaped:true,credentialRecovery:credential,jointLease:{credentialRecovery:clone(credential),groupRecovery:group}});
+  verifyAuthorization(row,'install',report.execution.app,1001,AUTH_GROUP_MODE,subject);
+  for (const [key,value] of Object.entries({schema:'fake',account:'root',guiUid:0,group:'admin',groupGid:0,
+    originalMembership:'present',finalMembership:'present',removedOnlyAddedMembership:false,writerStopped:false,maxLeaseSeconds:91})) {
+    const bad=clone(row); bad.authorization.jointLease.groupRecovery[key]=value;
+    assert.throws(()=>verifyAuthorization(bad,'install',report.execution.app,1001,AUTH_GROUP_MODE,subject));
+  }
+  for (const mutate of [r=>delete r.authorization.jointLease,
+    r=>r.authorization.jointLease.credentialRecovery.finalPasswordStatus='P',
+    r=>r.authorization.authDescendantsReaped=false,
+    r=>r.authorization.jointLease.groupRecovery.secret='forbidden']) {
+    const bad=clone(row); mutate(bad);
+    assert.throws(()=>verifyAuthorization(bad,'install',report.execution.app,1001,AUTH_GROUP_MODE,subject));
+  }
+  assert.throws(()=>verifyAuthorization(row,'install',report.execution.app,1001,AUTH_MODE,subject));
+  assert.throws(()=>verifyGroupRecovery({...group,groupGid:true},1001,'runner'));
+});
+
+test('joint report requires pending preparation and final same-GID recovery for both transactions', () => {
+  const actual=clone(report), admitted=clone(admission);
+  admitted.authentication.mode=AUTH_GROUP_MODE;
+  const {fingerprint, ...bindingFacts}=actual.binding;
+  actual.binding=stamp({...bindingFacts,admission:admitted});
+  actual.bindingSha256=sha256(JSON.stringify(actual.binding,null,2)+'\n');
+  const group={schema:'polaris-sudo-membership-recovery-v1',account:'runner',guiUid:1001,group:'sudo',groupGid:451,
+    originalMembership:'absent',finalMembership:'absent',removedOnlyAddedMembership:true,writerStopped:true,maxLeaseSeconds:90};
+  const credential={guiUid:1001,account:'runner',finalPasswordStatus:'L',plaintextPersisted:false,
+    emptyPasswordRestored:false,temporaryPasswordHash:'locked until disposable VM destruction'};
+  for(const key of ['helperInstall','helperUninstall']) Object.assign(actual[key].authorization,
+    {authenticationMode:AUTH_GROUP_MODE,credentialAuthenticationComplete:true,authDescendantsReaped:true,
+      credentialRecovery:clone(credential),jointLease:{credentialRecovery:clone(credential),groupRecovery:clone(group)}});
+  actual.rootPreparation={guarded:true,authentication:'pending-real-product-authorization',
+    authenticationReadiness:{authenticated:false,groupMembership:'pending-guarded-lease'}};
+  actual.authenticationClosed={groupRecovery:clone(group)};
+  verifyReport(actual,admitted,hash,AUTH_GROUP_MODE);
+  for(const mutate of [r=>delete r.authenticationClosed,r=>r.authenticationClosed.groupRecovery.groupGid=27,
+    r=>r.helperUninstall.authorization.jointLease.groupRecovery.groupGid=27,
+    r=>r.rootPreparation.authenticationReadiness.authenticated=true,
+    r=>r.rootPreparation.authenticationReadiness.groupMembership='ready',
+    r=>r.rootPreparation.guarded=false]) {
+    const bad=clone(actual);mutate(bad);assert.throws(()=>verifyReport(bad,admitted,hash,AUTH_GROUP_MODE));
   }
 });

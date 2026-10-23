@@ -54,14 +54,15 @@ on:
         type: boolean
         default: false
       linux_tun_auth_mode:
-        description: 'Temporary password mode requires separate explicit approval for this exact dispatch'
+        description: 'Temporary password/group modes require separate exact-SHA approval; existing session remains default'
         type: choice
         default: existing-session
         options:
           - existing-session
           - temporary-existing-runner-password
+          - temporary-existing-runner-password-and-sudo-group
       linux_tun_credential_authorization:
-        description: 'Leave empty unless this exact temporary runner password and relock action was explicitly approved'
+        description: 'Leave empty unless the exact selected password/relock or password/sudo-membership/relock/removal action was approved'
         type: string
         default: ''
       linux_acceptance_candidate:

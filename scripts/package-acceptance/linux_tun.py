@@ -30,6 +30,48 @@ require = base.require
 HERE = Path(__file__).resolve().parent
 
 
+AUTH_GROUP_MODE = 'temporary-existing-runner-password-and-sudo-group'
+
+
+def verify_group_recovery(value, uid, account, expected_gid=None):
+    keys = {'schema', 'account', 'guiUid', 'group', 'groupGid', 'originalMembership',
+            'finalMembership', 'removedOnlyAddedMembership', 'writerStopped', 'maxLeaseSeconds'}
+    require(isinstance(value, dict) and set(value) == keys
+            and value['schema'] == 'polaris-sudo-membership-recovery-v1'
+            and account == 'runner' and type(uid) is int and uid == 1001
+            and value['account'] == account and type(value['guiUid']) is int and value['guiUid'] == uid
+            and value['group'] == 'sudo' and type(value['groupGid']) is int and value['groupGid'] > 0
+            and value['originalMembership'] == value['finalMembership'] == 'absent'
+            and value['removedOnlyAddedMembership'] is True and value['writerStopped'] is True
+            and type(value['maxLeaseSeconds']) is int and value['maxLeaseSeconds'] == 90,
+            'bounded membership recovery unconfirmed')
+    require(expected_gid is None or value['groupGid'] == expected_gid, 'bound sudo group identity changed')
+    return value
+
+
+def verify_joint_recovery(proof, subject, expected_gid=None):
+    joint = proof.get('jointLease', {})
+    credential = proof.get('credentialRecovery')
+    require(isinstance(credential, dict) and joint.get('credentialRecovery') == credential
+            and proof.get('credentialAuthenticationComplete') is True
+            and proof.get('authDescendantsReaped') is True
+            and credential.get('guiUid') == subject['guiUid'] and credential.get('account') == subject['account']
+            and credential.get('finalPasswordStatus') == 'L' and credential.get('plaintextPersisted') is False
+            and credential.get('emptyPasswordRestored') is False
+            and credential.get('temporaryPasswordHash') == 'locked until disposable VM destruction',
+            'joint credential recovery unconfirmed')
+    return verify_group_recovery(joint.get('groupRecovery'), subject['guiUid'], subject['account'], expected_gid)
+
+
+def verify_group_preparation(value):
+    readiness = value.get('authenticationReadiness', {})
+    require(value.get('guarded') is True and value.get('authentication') == 'pending-real-product-authorization'
+            and readiness.get('authenticated') is False
+            and readiness.get('groupMembership') == 'pending-guarded-lease',
+            'membership must remain pending before guarded lease')
+    return 'prepared-pending-group-lease'
+
+
 def private_root_probe(source, directory, expected_hash):
     """Detach Cargo's hardlinked example; never relax the root single-link guard."""
     source, directory = Path(source), Path(directory)
@@ -569,6 +611,10 @@ class TunCarrierRun(base.CarrierRun):
                 reply.get('installed') == (kind == 'install') and reply.get('ready') == (kind == 'install'),
                 'actual helper GUI action failed')
         proof = self.controller.call('transaction_end')
+        if self.launch_options.get('authenticationMode') == AUTH_GROUP_MODE:
+            subject = self.launch_options['authorization']
+            recovered = verify_joint_recovery(proof, subject, getattr(self, 'membership_gid', None))
+            self.membership_gid = recovered['groupGid']
         self.supervisor.end_window(proof['owned'])
         self.driver.click('.side .nav-item', self.text('settings.nav.back'))
         return {'callback': reply, 'authorization': proof}
@@ -834,7 +880,10 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
         self.result['rootGuiBinding'] = verify_gui_binding(self.app, self.controller.call('bind_gui', pid=self.app['pid']))
         self.result['rootPreparationProgress']['stage'] = 'prepare'
         self.result['rootPreparation'] = self.controller.call('prepare')
-        self.result['rootPreparationProgress']['stage'] = 'prepared'
+        if self.launch_options.get('authenticationMode') == AUTH_GROUP_MODE:
+            self.result['rootPreparationProgress']['stage'] = verify_group_preparation(self.result['rootPreparation'])
+        else:
+            self.result['rootPreparationProgress']['stage'] = 'prepared'
         # CredentialLease, if explicitly authorized, opens/closes inside each
         # controller transaction_begin/end. No password action is exposed here.
 
@@ -973,6 +1022,11 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
                 require(closed.get('closed') is True and not closed.get('errors'), 'fixture failed normal native shutdown')
             self.stage = 'authentication-close'
             self.result['authenticationClosed'] = self.controller.call('auth_close')
+            if self.launch_options.get('authenticationMode') == AUTH_GROUP_MODE:
+                subject = self.launch_options['authorization']
+                require(getattr(self, 'membership_gid', None) is not None, 'no completed membership lease')
+                verify_group_recovery(self.result['authenticationClosed'].get('groupRecovery'),
+                                      subject['guiUid'], subject['account'], self.membership_gid)
             self.stage = 'root-normal-cleanup'
             cleanup = self.controller.call('cleanup')
             self.stage = 'root-finish'

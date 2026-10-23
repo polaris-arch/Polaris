@@ -14,6 +14,8 @@ import { coreIdentityId, selectedCoreManifest } from '../lib/core-identity.mjs';
 export const KERNEL = 'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a';
 export const AUTH_MODE = 'temporary-existing-runner-password';
 export const AUTH_PHRASE = 'AUTHORIZE TEMPORARY RUNNER PASSWORD AND RELOCK FOR THIS RUN';
+export const AUTH_GROUP_MODE = 'temporary-existing-runner-password-and-sudo-group';
+export const AUTH_GROUP_PHRASE = 'AUTHORIZE TEMPORARY RUNNER PASSWORD AND SUDO GROUP MEMBERSHIP WITH RELOCK AND REMOVAL FOR THIS RUN';
 export const VERSION = '1.15.0-polaris-alpha.12.2';
 export const CASES = ['default_graph', 'tun_data_plane', 'graph_apply', 'daily_switch',
   'auto_preserves', 'manual_preserve', 'manual_disconnect', 'uncovered_target_restart', 'synthetic_route', 'normal_cleanup'];
@@ -62,8 +64,8 @@ export function authorizationFacts(context, event, env = process.env) {
   'Actual dispatch payload/repository/ref/actor/source differs');
   const mode = event.inputs?.linux_tun_auth_mode || 'existing-session';
   const phrase = event.inputs?.linux_tun_credential_authorization || '';
-  demand(['existing-session', AUTH_MODE].includes(mode), 'Unknown authentication mode');
-  if (mode === AUTH_MODE) demand(phrase === AUTH_PHRASE && context.attempt === '1'
+  demand(['existing-session', AUTH_MODE, AUTH_GROUP_MODE].includes(mode), 'Unknown authentication mode');
+  if (mode === AUTH_MODE || mode === AUTH_GROUP_MODE) demand(phrase === (mode === AUTH_MODE ? AUTH_PHRASE : AUTH_GROUP_PHRASE) && context.attempt === '1'
       && (!env.GITHUB_TRIGGERING_ACTOR || env.GITHUB_TRIGGERING_ACTOR === env.GITHUB_ACTOR),
     'Exact current-run credential action authorization required; rerun cannot renew it');
   else demand(phrase === '', 'Unused credential authorization forbidden');
@@ -76,6 +78,14 @@ export function credentialAuthorization(facts, subject, now = Math.floor(Date.no
     && /^[a-z_][a-z0-9_-]{0,31}$/.test(subject.account ?? '') && Number.isSafeInteger(now) && now > 0,
   'Exact observed GUI account and invocation required');
   if (facts.mode === 'existing-session') return null;
+  if (facts.mode === AUTH_GROUP_MODE) {
+    demand(facts.phrase === AUTH_GROUP_PHRASE && subject.account === 'runner' && subject.guiUid === 1001, 'Exact joint credential/group lease permission missing');
+    return { schema: 'polaris-tun-credential-group-lease-v1', phrase: AUTH_GROUP_PHRASE, authMode: AUTH_GROUP_MODE,
+      execution: facts.execution, runToken: subject.runToken, guiUid: subject.guiUid, account: subject.account,
+      transactions: ['install', 'uninstall'], notBeforeUnix: now, expiresUnix: now + 900, maxLeaseSeconds: 90,
+      groupLease: { group: 'sudo', account: 'runner', guiUid: subject.guiUid, maxLeaseSeconds: 90,
+        originalMembership: 'absent', restore: 'remove-only-added-membership' } };
+  }
   demand(facts.mode === AUTH_MODE && facts.phrase === AUTH_PHRASE, 'Credential lease permission missing');
   return { schema: 'polaris-tun-credential-lease-v1', phrase: AUTH_PHRASE, authMode: AUTH_MODE,
     execution: facts.execution, runToken: subject.runToken, guiUid: subject.guiUid, account: subject.account,
@@ -134,6 +144,18 @@ function executableIdentity(executable, identity) {
   demand(executable?.dev === identity.exeDev && executable.inode === identity.exeInode && hex(executable.sha256),
     'Executable object differs from observed process');
 }
+export function verifyGroupRecovery(recovery, uid, account) {
+  const keys = ['schema','account','guiUid','group','groupGid','originalMembership','finalMembership',
+    'removedOnlyAddedMembership','writerStopped','maxLeaseSeconds'];
+  demand(recovery && Object.keys(recovery).length === keys.length && keys.every(k => Object.hasOwn(recovery,k))
+    && recovery.schema === 'polaris-sudo-membership-recovery-v1' && account === 'runner' && uid === 1001
+    && recovery.account === account && recovery.guiUid === uid && recovery.group === 'sudo'
+    && Number.isSafeInteger(recovery.groupGid) && recovery.groupGid > 0
+    && recovery.originalMembership === 'absent' && recovery.finalMembership === 'absent'
+    && recovery.removedOnlyAddedMembership === true && recovery.writerStopped === true
+    && recovery.maxLeaseSeconds === 90, 'Exact bounded added-membership recovery required');
+  return recovery;
+}
 export function verifyAuthorization(row, kind, app, uid, mode, subject) {
   const a = row?.authorization;
   demand(row?.callback?.envelopeSuccess === true && row.callback.success === true
@@ -146,7 +168,7 @@ export function verifyAuthorization(row, kind, app, uid, mode, subject) {
   same(a.pkexecBirths[0], a.rootShellBirths[0], 'Root shell was not the same observed pkexec birth');
   demand(Array.isArray(a.owned) && a.owned.some(p => p.uid === 0 && p.ppid === app.pid
     && canonical(birth(p)) === canonical(a.rootShellBirths[0])), 'Original root shell lineage missing');
-  if (mode === AUTH_MODE) demand(a.credentialAuthenticationComplete === true && a.authDescendantsReaped === true
+  if (mode === AUTH_MODE || mode === AUTH_GROUP_MODE) demand(a.credentialAuthenticationComplete === true && a.authDescendantsReaped === true
     && a.credentialRecovery?.guiUid === uid && a.credentialRecovery.finalPasswordStatus === 'L'
     && subject?.guiUid === uid && a.credentialRecovery.account === subject.account
     && a.credentialRecovery.emptyPasswordRestored === false
@@ -154,6 +176,10 @@ export function verifyAuthorization(row, kind, app, uid, mode, subject) {
     && a.credentialRecovery.plaintextPersisted === false,
   'Actual private credential exchange, same account relock and auth descendants closure required');
   else demand(mode === 'existing-session' && a.credentialAuthenticationComplete !== true, 'Authentication scope differs');
+  if (mode === AUTH_GROUP_MODE) {
+    same(a.jointLease?.credentialRecovery, a.credentialRecovery, 'Joint credential recovery differs');
+    verifyGroupRecovery(a.jointLease?.groupRecovery, uid, subject.account);
+  }
 }
 export function verifyReport(report, admission, admissionSha256, authMode = 'existing-session') {
   demand(report?.schema === 'polaris-linux-tun-acceptance-v1' && report.result === 'success'
@@ -227,6 +253,18 @@ export function verifyReport(report, admission, admissionSha256, authMode = 'exi
   'Original runtime bytes are not the observed TUN core graph');
   verifyAuthorization(report.helperInstall, 'install', execution.app, execution.uid, authMode, subject);
   verifyAuthorization(report.helperUninstall, 'uninstall', execution.app, execution.uid, authMode, subject);
+  if (authMode === AUTH_GROUP_MODE) {
+    demand(report.rootPreparation?.guarded === true
+      && report.rootPreparation.authentication === 'pending-real-product-authorization'
+      && report.rootPreparation.authenticationReadiness?.authenticated === false
+      && report.rootPreparation.authenticationReadiness.groupMembership === 'pending-guarded-lease',
+      'Initial preparation must not claim authentication or group readiness');
+    const installed = report.helperInstall.authorization.jointLease.groupRecovery;
+    const uninstalled = report.helperUninstall.authorization.jointLease.groupRecovery;
+    const closed = verifyGroupRecovery(report.authenticationClosed?.groupRecovery, execution.uid, subject.account);
+    demand(installed.groupGid === uninstalled.groupGid && installed.groupGid === closed.groupGid,
+      'Bound sudo group identity changed between transactions or final close');
+  }
   demand(report.off?.stopped === true && canonical(birth(report.off.identity)) === canonical(birth(execution.core)), 'Actual OFF of registered TUN core required');
   demand(report.productUninstalled?.productUninstalled === true, 'Actual original helper uninstall required');
   const quit = report.trayQuit;

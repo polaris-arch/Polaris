@@ -965,4 +965,472 @@ class ExistingGroupObservationTests(unittest.TestCase):
             with self.assertRaises(ValueError): m.validate_group_observation(value | change)
 
 
+
+def group_controller():
+    c = controller(m.AUTH_MODE)
+    c.launch['authenticationMode'] = m.AUTH_GROUP_MODE
+    c.launch['authorization'].update(schema='polaris-tun-credential-group-lease-v1', phrase=m.AUTH_GROUP_PHRASE,
+        authMode=m.AUTH_GROUP_MODE, groupLease={'group':'sudo','account':'runner','guiUid':1001,
+        'maxLeaseSeconds':90,'originalMembership':'absent','restore':'remove-only-added-membership'})
+    c.group_binding = {'account':'runner','guiUid':1001,'primaryGid':1001,'group':'sudo','groupGid':451}
+    return c
+
+
+class GroupLeaseAuthorityTests(unittest.TestCase):
+    def test_new_authority_is_separate_and_fixed(self):
+        c=group_controller();m.validate_launch(c.launch)
+        for key,value in (('phrase',m.AUTH_PHRASE),('schema','polaris-tun-credential-lease-v1'),
+                          ('authMode',m.AUTH_MODE),('account','root'),('guiUid',1002)):
+            bad=copy.deepcopy(c.launch);bad['authorization'][key]=value
+            with self.subTest(key=key),self.assertRaises(ValueError):m.validate_permission(bad)
+        for key,value in (('group','admin'),('maxLeaseSeconds',91),('guiUid',1002),('restore','replace-groups'),('originalMembership','present')):
+            bad=copy.deepcopy(c.launch);bad['authorization']['groupLease'][key]=value
+            with self.subTest(key=key),self.assertRaises(ValueError):m.validate_permission(bad)
+        old=launch(m.AUTH_MODE);old['authorization']['groupLease']=c.launch['authorization']['groupLease']
+        with self.assertRaises(ValueError):m.validate_permission(old)
+
+    def test_group_binding_fixed_account_gid_absence(self):
+        c=group_controller();user=types.SimpleNamespace(pw_uid=1001,pw_name='runner',pw_gid=1001)
+        group=types.SimpleNamespace(gr_name='sudo',gr_gid=451,gr_mem=[])
+        with patch.object(m.pwd,'getpwnam',return_value=user),patch.object(m.pwd,'getpwall',return_value=[user]),patch('grp.getgrnam',return_value=group):
+            self.assertEqual(m.group_binding(c.launch,expected_member=False)[0],c.group_binding)
+            group.gr_mem=['runner']
+            with self.assertRaises(ValueError):m.group_binding(c.launch,expected_member=False)
+            group.gr_mem=[];group.gr_gid=452
+            with self.assertRaises(ValueError):m.group_binding(c.launch,original=c.group_binding)
+            group.gr_gid=451;user.pw_uid=1002
+            with self.assertRaises(ValueError):m.group_binding(c.launch)
+
+    def test_pending_group_does_not_authorize_old_mode(self):
+        with self.assertRaises(ValueError):m.credential_account(launch(m.AUTH_MODE),Mock(),group_pending=True)
+
+    def test_group_mode_pending_still_rejects_existing_password(self):
+        c=group_controller();user=types.SimpleNamespace(pw_uid=1001,pw_name='runner',pw_gid=1001,pw_shell='/bin/bash',pw_dir='/home/runner')
+        with patch.object(m.pwd,'getpwall',return_value=[user]),patch.object(m.pwd,'getpwnam',return_value=user), \
+             patch('grp.getgrall',return_value=[]),patch.object(m,'group_binding',return_value=(c.group_binding,False)), \
+             patch.object(m,'account_status',return_value='P'),patch.object(m.subprocess,'Popen') as spawn:
+            with self.assertRaises(ValueError):m.credential_account(c.launch,c.tun,group_pending=True)
+            spawn.assert_not_called()
+
+
+class GroupLeaseRecoveryTests(unittest.TestCase):
+    def lease(self):
+        c=group_controller();lease=m.CredentialLease(c,'install');c.lease=lease
+        lease.attempted=True;lease.group_intent_written=True;lease.group_timer_verified=True
+        c.ledger.value['authentication']['lease']={};c.ops.run.return_value='inactive'
+        return c,lease
+
+    def test_relock_remove_independent_and_failure_keeps_timer(self):
+        for fail in ('lock','remove','lineage'):
+            c,lease=self.lease();events=[];c.auth_observer=Mock()
+            c.auth_observer.close.side_effect=ValueError('PRIVATE') if fail=='lineage' else lambda:events.append('lineage') or {'ownedBirths':[]}
+            def lock(*a):
+                events.append('lock')
+                if fail=='lock':raise ValueError('PRIVATE')
+                return {'finalPasswordStatus':'L'}
+            def remove(*a):
+                events.append('remove')
+                if fail=='remove':raise ValueError('PRIVATE')
+                return {'finalMembership':'absent'}
+            with patch.object(m,'relock_account',side_effect=lock),patch.object(m,'recover_group_membership',side_effect=remove):
+                with self.subTest(fail=fail),self.assertRaises(ValueError):lease.close()
+            self.assertLess(events.index('lock'),events.index('remove'));c.ops.run.assert_not_called()
+            self.assertFalse(lease.closed);self.assertTrue(c.recovery_unknown)
+            self.assertNotIn('PRIVATE',json.dumps(c.recovery_unknown))
+
+    def test_success_closes_timer_only_after_both_proofs(self):
+        c,lease=self.lease();events=[]
+        with patch.object(m,'relock_account',side_effect=lambda *a:events.append('lock') or {'finalPasswordStatus':'L'}), \
+             patch.object(m,'recover_group_membership',side_effect=lambda *a:events.append('remove') or {'finalMembership':'absent'}), \
+             patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}),patch.object(m,'write_group_closed'):
+            lease.close()
+        self.assertEqual(events,['lock','remove']);self.assertTrue(lease.closed)
+        self.assertEqual(c.ledger.value['authentication']['lease']['groupRecovery'],{'finalMembership':'absent'})
+        self.assertEqual(c.ops.run.call_args_list[0].args[0][1],'stop')
+
+    def test_group_restore_without_password_intent_does_not_lock(self):
+        c,lease=self.lease();lease.attempted=False
+        with patch.object(m,'relock_account') as lock,patch.object(m,'recover_group_membership',return_value={'finalMembership':'absent'}) as remove:
+            lease.close();lock.assert_not_called();remove.assert_called_once()
+
+    def test_missing_writer_evidence_cannot_be_clean(self):
+        c=group_controller()
+        with patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}), \
+             patch.object(m,'stop_group_writer',return_value=False),patch.object(m,'run_group_writer') as mutate:
+            with self.assertRaises(ValueError):m.recover_group_membership(c.launch,c.tun,c.directory,'install',c.ops)
+            mutate.assert_not_called()
+
+    def test_exact_remove_postcondition_not_exit_code(self):
+        c=group_controller()
+        with patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}), \
+             patch.object(m,'stop_group_writer',side_effect=[True,False,True]), \
+             patch.object(m,'group_binding',side_effect=[(c.group_binding,True),ValueError('still member')]), \
+             patch.object(m,'run_group_writer',return_value=True) as writer:
+            with self.assertRaises(ValueError):m.recover_group_membership(c.launch,c.tun,c.directory,'install',c.ops)
+            self.assertEqual(writer.call_args.args[-2],'remove')
+
+    def test_old_close_never_reads_or_writes_groups(self):
+        c=controller(m.AUTH_MODE);lease=m.CredentialLease(c,'install');c.ops.run.return_value='inactive'
+        with patch.object(m,'group_binding') as binding,patch.object(m,'run_group_writer') as writer,patch.object(m,'recover_group_membership') as recover:
+            lease.close();binding.assert_not_called();writer.assert_not_called();recover.assert_not_called()
+
+
+class FixedGroupWriterTests(unittest.TestCase):
+    def test_parent_never_releases_gate_before_durable_birth(self):
+        c=group_controller();events=[];row=identity(80,0);row['ppid']=os.getpid()
+        c.ops.proc.return_value=row;c.tun.file_identity.return_value={'dev':1,'inode':77,'sha256':H}
+        c.tun.executable_identity.return_value=c.tun.file_identity.return_value
+        child=Mock(pid=80,returncode=0);child.communicate.side_effect=lambda **kw:events.append(('gate',kw['input']))
+        with patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}), \
+             patch.object(m.subprocess,'Popen',return_value=child), \
+             patch.object(m,'independent_record',side_effect=lambda *a:events.append(('record',a[1]))), \
+             patch.object(m,'group_binding',return_value=(c.group_binding,True)):
+            m.run_group_writer(c.launch,c.tun,c.directory,'install','add',c.ops)
+        self.assertEqual(events,[('record','group-writer-install-add.json'),('gate',b'GO\n')])
+        self.assertNotIn('/usr/bin/gpasswd',child.call_args_list if child.call_args_list else [])
+
+    def test_pre_gate_birth_record_failure_closes_input_no_go(self):
+        for fault in ('birth','record'):
+            c=group_controller();row=identity(80,0);row['ppid']=os.getpid();c.ops.proc.return_value=None if fault=='birth' else row
+            c.tun.file_identity.return_value={'dev':1,'inode':77,'sha256':H};c.tun.executable_identity.return_value=c.tun.file_identity.return_value
+            child=Mock(pid=80,returncode=None);child.poll.return_value=None
+            with patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}),patch.object(m.subprocess,'Popen',return_value=child), \
+                 patch.object(m,'independent_record',side_effect=ValueError('record failed') if fault=='record' else None),patch.object(m,'stop_group_writer',return_value=False):
+                with self.subTest(fault=fault),self.assertRaises(ValueError):m.run_group_writer(c.launch,c.tun,c.directory,'install','add',c.ops)
+            child.communicate.assert_not_called();child.stdin.close.assert_called_once()
+
+    def test_child_eof_malformed_or_deadline_never_executes(self):
+        c=group_controller();row=identity(os.getpid(),0);record={'runId':c.launch['runId'],'kind':'install','operation':'add','identity':row,'python':{},'gpasswd':{}}
+        c.tun.process_identity.return_value=row;c.tun.executable_identity.return_value={};c.tun.file_identity.return_value={}
+        for raw in (b'',b'NO\n',b'GO\n'):
+            with patch.object(m,'read_group_intent',return_value={'binding':c.group_binding,'deadlineMonotonic':0}), \
+                 patch.object(m,'read_line',return_value=raw),patch.object(m.Path,'read_bytes',return_value=json.dumps(record).encode()), \
+                 patch.object(m,'group_binding',return_value=(c.group_binding,False)),patch.object(m.os,'execve') as execute:
+                with self.subTest(raw=raw),self.assertRaises(ValueError):m.group_writer_main(c.launch,c.tun,c.directory,'install','add')
+                execute.assert_not_called()
+
+    def test_child_same_birth_exec_only_fixed_command(self):
+        c=group_controller();row=identity(os.getpid(),0);record={'runId':c.launch['runId'],'kind':'install','operation':'add','identity':row,'python':{},'gpasswd':{}}
+        c.tun.process_identity.return_value=row;c.tun.executable_identity.return_value={};c.tun.file_identity.return_value={}
+        with patch.object(m,'read_group_intent',return_value={'binding':c.group_binding,'deadlineMonotonic':time.monotonic()+85}), \
+             patch.object(m,'read_line',return_value=b'GO\n'),patch.object(m.Path,'read_bytes',return_value=json.dumps(record).encode()), \
+             patch.object(m,'group_binding',return_value=(c.group_binding,False)),patch.object(m.os,'execve') as execute,patch.object(m.subprocess,'Popen') as spawn:
+            m.group_writer_main(c.launch,c.tun,c.directory,'install','add')
+            execute.assert_called_once_with('/usr/bin/gpasswd',['/usr/bin/gpasswd','-a','runner','sudo'],m.ENV)
+            spawn.assert_not_called()
+
+    def test_recovery_rejects_different_birth_or_arbitrary_root_exe(self):
+        for fault in ('birth','exe'):
+            c=group_controller();old=identity(80,0);now=copy.deepcopy(old)
+            if fault=='birth':now['startTime']='999'
+            c.ops.proc.return_value=now;c.tun.file_identity.return_value={'dev':1,'inode':2,'sha256':H}
+            c.tun.executable_identity.return_value={'dev':1,'inode':3 if fault=='exe' else 2,'sha256':H}
+            record={'runId':c.launch['runId'],'kind':'install','operation':'add','identity':old,
+                    'python':c.tun.file_identity.return_value,'gpasswd':c.tun.file_identity.return_value}
+            with patch.object(m.Path,'exists',return_value=True),patch.object(m.Path,'stat',return_value=types.SimpleNamespace(st_size=500)), \
+                 patch.object(m.Path,'read_bytes',return_value=json.dumps(record).encode()),patch.object(m,'stop_recorded') as stop:
+                with self.subTest(fault=fault),self.assertRaises(ValueError):m.stop_group_writer(c.launch,c.tun,c.directory,'install','add',c.ops)
+                stop.assert_not_called()
+
+
+
+class JointLeaseOrderingTests(unittest.TestCase):
+    def exercise_open(self, fault=None):
+        c=group_controller();lease=m.CredentialLease(c,'install');c.agent=Mock();c.ops.run.return_value='inactive'
+        c.ledger.value['authentication']['registered']=True;events=[]
+        writer=Mock(pid=89,returncode=0);writer.poll.return_value=0
+        c.ops.proc.return_value={**identity(89,0),'ppid':os.getpid()}
+        c.tun.executable_identity.return_value=c.tun.file_identity.return_value={'sha256':H}
+        writer.communicate.side_effect=lambda **kw:events.append('password-input')
+        def point(name):
+            def f(*args,**kw):
+                events.append(name)
+                if fault==name:raise ValueError('PRIVATE')
+                if name=='verified-timer':return {'deadlineMonotonic':time.monotonic()+10}
+            return f
+        user=types.SimpleNamespace(pw_name='runner',pw_uid=1001)
+        account=Mock(return_value=(user,'L'))
+        with patch.object(m,'credential_account',account),patch.object(m,'group_binding',return_value=(c.group_binding,False)), \
+             patch.object(m,'group_intent',side_effect=point('group-intent')),patch.object(m,'verify_timer',side_effect=point('verified-timer')), \
+             patch.object(m,'run_group_writer',side_effect=point('group-add')),patch.object(m,'account_status',side_effect=['L','P']), \
+             patch.object(m,'setting_intent',side_effect=point('password-intent')),patch.object(m,'independent_record',side_effect=point('password-birth')), \
+             patch.object(m.subprocess,'Popen',return_value=writer) as spawn,patch.object(m.os,'pidfd_open',return_value=99), \
+             patch.object(m.threading,'Thread',return_value=Mock()),patch.object(lease,'close'):
+            if fault:
+                with self.assertRaises(ValueError):lease.open()
+            else:lease.open()
+        return c,lease,events,spawn,account
+
+    def test_order_intent_timer_add_original_gate_then_password(self):
+        c,lease,events,spawn,account=self.exercise_open()
+        self.assertEqual(events,['group-intent','verified-timer','group-add','password-intent','password-birth','password-input'])
+        self.assertEqual(account.call_args_list[0].kwargs,{'group_pending':True})
+        self.assertEqual(account.call_args_list[1].kwargs,{})
+        self.assertLessEqual(lease.group_deadline-time.monotonic(),90)
+        self.assertEqual(spawn.call_count,1)
+
+    def test_no_password_writer_before_every_group_guard(self):
+        for fault in ('group-intent','verified-timer','group-add'):
+            with self.subTest(fault=fault):
+                c,lease,events,spawn,account=self.exercise_open(fault)
+                spawn.assert_not_called();self.assertNotIn('password-intent',events)
+                if fault!='group-add':self.assertNotIn('group-add',events)
+
+    def test_pending_readiness_never_claims_authenticated_or_group_present(self):
+        c=group_controller();user=types.SimpleNamespace(pw_name='runner',pw_uid=1001)
+        with patch.object(m,'group_binding',return_value=(c.group_binding,False)), \
+             patch.object(m,'credential_account',return_value=(user,'L')) as account:
+            result=c.authentication_readiness()
+            self.assertFalse(result['authenticated']);self.assertEqual(result['groupMembership'],'pending-guarded-lease')
+            self.assertTrue(account.call_args.kwargs['group_pending'])
+
+    def test_private_pump_does_not_send_for_changed_selected_identity(self):
+        c=group_controller();c.pty=90;lease=m.CredentialLease(c,'install');lease.window=90;lease.group_deadline=time.monotonic()+90
+        lease.user=types.SimpleNamespace(pw_name='runner',pw_gecos='runner');lease.secret=bytearray(b'PRIVATE')
+        chunks=[b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nChoose identity to authenticate as\n 1.  runner\n',
+                b'Authenticating as: root\nPassword:']
+        with patch.object(m.select,'select',return_value=([90],[],[])),patch.object(m.os,'read',side_effect=chunks), \
+             patch.object(m.os,'write') as write,patch.object(lease,'close'):
+            lease.pump()
+        self.assertFalse(lease.sent);self.assertFalse(lease.authenticated)
+        self.assertEqual(write.call_args_list,[unittest.mock.call(90,b'1\n')])
+
+
+class JointWatchdogTests(unittest.TestCase):
+    def run_watchdog(self, fault):
+        c=group_controller();events=[];c.tun.Ledger.side_effect=ValueError('PRIVATE ledger')
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d);(directory/'controller-birth.json').write_text(json.dumps(identity(81,0)))
+            def point(name,result=None):
+                def f(*args,**kwargs):
+                    events.append(name)
+                    if fault==name:raise ValueError('PRIVATE')
+                    return result
+                return f
+            with patch.object(m,'has_setting_intent',return_value=fault!='no-password'), \
+                 patch.object(m,'stop_recorded',side_effect=point('producer-stop')), \
+                 patch.object(m,'read_group_intent',side_effect=point('group-intent',{})), \
+                 patch.object(m,'stop_group_writer',side_effect=point('group-writer-stop',True)), \
+                 patch.object(m,'relock_account',side_effect=point('relock',{'finalPasswordStatus':'L'})), \
+                 patch.object(m,'recover_group_membership',side_effect=point('group-remove',{'finalMembership':'absent'})):
+                result=m.watchdog_recover(c.launch,c.tun,directory,'install')
+                receipt=json.loads((directory/'emergency-install.json').read_text())
+        return events,result,receipt
+
+    def test_watchdog_both_restorations_survive_ledger_and_each_other_failure(self):
+        for fault in ('relock','group-remove','group-writer-stop','no-password'):
+            with self.subTest(fault=fault):
+                events,result,receipt=self.run_watchdog(fault)
+                self.assertEqual(events[0],'producer-stop');self.assertIn('group-remove',events)
+                self.assertEqual('relock' in events,fault!='no-password')
+                self.assertLess(events.index('group-writer-stop'),events.index('group-remove'))
+                self.assertEqual(result['result'],'failed');self.assertFalse(receipt['restorationProven'])
+                self.assertIn('product-ledger-recovery-incomplete',result['errors'])
+                self.assertNotIn('PRIVATE',json.dumps(receipt))
+
+    def test_group_intent_invalid_never_mutates_group(self):
+        events,result,_=self.run_watchdog('group-intent')
+        self.assertIn('group-intent-unproved',result['errors']);self.assertNotIn('group-remove',events)
+        self.assertIn('group-writer-stop',events) # recorded writer stopped even if intent cannot be parsed
+
+    def test_intent_persists_before_writer_and_rejects_changed_permission(self):
+        c=group_controller()
+        with tempfile.TemporaryDirectory() as d,patch.object(m,'group_binding',return_value=(c.group_binding,False)):
+            directory=Path(d);m.group_intent(directory,'install',c.launch,c.group_binding,time.monotonic()+60)
+            value=m.read_group_intent(directory,'install',c.launch,c.tun)
+            self.assertEqual(value['binding']['groupGid'],451)
+            self.assertEqual((directory/'group-intent-install.json').stat().st_mode & 0o777,0o600)
+            c.launch['authorization']['expiresUnix']+=1
+            with self.assertRaises(ValueError):m.read_group_intent(directory,'install',c.launch,c.tun)
+
+
+
+class GroupWriterFinalBoundaryTests(unittest.TestCase):
+    def test_exec_transition_race_never_claims_stopped(self):
+        c=group_controller();old=identity(80,0);c.ops.proc.return_value=old
+        executable={'dev':1,'inode':77,'sha256':H};c.tun.file_identity.return_value=executable;c.tun.executable_identity.return_value=executable
+        record={'runId':c.launch['runId'],'kind':'install','operation':'add','identity':old,'python':executable,'gpasswd':executable}
+        with patch.object(m.Path,'exists',return_value=True),patch.object(m.Path,'stat',return_value=types.SimpleNamespace(st_size=500)), \
+             patch.object(m.Path,'read_bytes',return_value=json.dumps(record).encode()), \
+             patch.object(m,'stop_recorded',side_effect=ValueError('exec changed during signal gate')):
+            with self.assertRaises(ValueError):m.stop_group_writer(c.launch,c.tun,c.directory,'install','add',c.ops)
+
+    def test_remove_timeout_or_collision_never_reports_absence(self):
+        for fault in ('timeout','collision','exit','reap'):
+            c=group_controller();row={**identity(80,0),'ppid':os.getpid()};c.ops.proc.return_value=row
+            c.tun.file_identity.return_value=c.tun.executable_identity.return_value={'dev':1,'inode':77,'sha256':H}
+            child=Mock(pid=80,returncode=1 if fault=='exit' else 0);child.poll.return_value=None
+            if fault in ('timeout','reap'):child.communicate.side_effect=subprocess.TimeoutExpired('fixed',10)
+            if fault=='reap':child.wait.side_effect=subprocess.TimeoutExpired('fixed',5)
+            with patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}), \
+                 patch.object(m.subprocess,'Popen',return_value=child), \
+                 patch.object(m,'independent_record',side_effect=FileExistsError() if fault=='collision' else None), \
+                 patch.object(m,'stop_group_writer',return_value=True) as stop,patch.object(m,'group_binding') as binding:
+                with self.subTest(fault=fault),self.assertRaises(Exception):m.run_group_writer(c.launch,c.tun,c.directory,'install','remove',c.ops)
+                binding.assert_not_called();stop.assert_called_once();child.wait.assert_called_once_with(timeout=5)
+                if fault=='collision':child.communicate.assert_not_called()
+
+    def test_unknown_previous_removal_does_not_spawn_unrecorded_retry(self):
+        c=group_controller()
+        with patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}), \
+             patch.object(m,'stop_group_writer',return_value=True),patch.object(m,'group_binding',return_value=(c.group_binding,True)), \
+             patch.object(m,'run_group_writer') as writer:
+            with self.assertRaises(ValueError):m.recover_group_membership(c.launch,c.tun,c.directory,'install',c.ops)
+            writer.assert_not_called()
+
+    def test_cross_transaction_gid_change_rejected_before_intent_or_writer(self):
+        c=group_controller();c.agent=Mock();c.ledger.value['authentication']['registered']=True
+        lease=m.CredentialLease(c,'uninstall');user=types.SimpleNamespace(pw_name='runner',pw_uid=1001)
+        with patch.object(m,'credential_account',return_value=(user,'L')), \
+             patch.object(m,'group_binding',side_effect=ValueError('GID changed')) as binding, \
+             patch.object(m,'read_group_closed',return_value={}),patch.object(m,'group_intent') as intent,patch.object(m,'run_group_writer') as writer,patch.object(lease,'close'):
+            with self.assertRaises(ValueError):lease.open()
+            self.assertEqual(binding.call_args.kwargs['original'],c.group_binding)
+            intent.assert_not_called();writer.assert_not_called()
+
+    def test_add_completed_before_parent_loss_still_requires_remove_fence_and_absence(self):
+        c=group_controller();events=[]
+        stop_results=iter((True,False,True))
+        def stopped(*args):events.append('stop-'+args[-2]);return next(stop_results)
+        def binding(*args,**kw):events.append('absence' if kw.get('expected_member') is False else 'membership');return c.group_binding,True
+        with patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}),patch.object(m,'stop_group_writer',side_effect=stopped), \
+             patch.object(m,'group_binding',side_effect=binding),patch.object(m,'run_group_writer',side_effect=lambda *a:events.append('remove')):
+            result=m.recover_group_membership(c.launch,c.tun,c.directory,'install',c.ops)
+        self.assertEqual(events,['stop-add','stop-remove','membership','remove','stop-remove','absence'])
+        self.assertTrue(result['writerStopped']);self.assertEqual(result['groupGid'],451)
+
+
+
+class FixedJointBudgetTests(unittest.TestCase):
+    def test_twenty_activity_seventy_reserved_and_both_service_budgets(self):
+        self.assertEqual((m.GROUP_ACTIVITY_SECONDS,m.GROUP_RECOVERY_RESERVE),(20,70))
+        _,lease,_,_,_=JointLeaseOrderingTests().exercise_open()
+        # Source contract complements mocks: both actual systemd producers use
+        # verified new-mode recovery budget; old20/15 values remain unchanged.
+        source=Path(m.__file__).read_text()
+        self.assertIn("timer_seconds = GROUP_ACTIVITY_SECONDS if self.grouped else window",source)
+        self.assertIn("GROUP_RECOVERY_SERVICE_SECONDS if self.grouped else 20",source)
+        self.assertIn("GROUP_RECOVERY_SERVICE_SECONDS if self.launch['authenticationMode'] == AUTH_GROUP_MODE else 15",source)
+        self.assertEqual(source.count("{'recovery_seconds': GROUP_RECOVERY_SERVICE_SECONDS}"),2)
+
+    def test_actual_service_budget_is_verified_not_assumed(self):
+        argv=['/usr/bin/env','fixed'];unit='fixed-unit'
+        for budget in ('20s','70s','infinity'):
+            service='\n'.join(['User=root','Group=root','DynamicUser=no','FragmentPath=/run/systemd/transient/fixed-unit.service',
+                'DropInPaths=','ActiveState=inactive','ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env fixed ; }','TimeoutStartUSec='+budget])
+            timer='ActiveState=active\nUnit=fixed-unit.service\nTimersMonotonic=[ { OnActiveUSec=20s ; next_elapse=120s } ]'
+            ops=Mock();ops.run.side_effect=[service,timer]
+            with patch.object(m.time,'monotonic',return_value=100):
+                if budget=='70s':m.verify_timer(ops,Mock(SYSTEMCTL='/usr/bin/systemctl'),unit,argv,20,100,recovery_seconds=70)
+                else:
+                    with self.assertRaises(ValueError):m.verify_timer(ops,Mock(SYSTEMCTL='/usr/bin/systemctl'),unit,argv,20,100,recovery_seconds=70)
+
+    def test_overdue_normal_recovery_never_cancels_timer_or_writes_closed(self):
+        c,lease=GroupLeaseRecoveryTests().lease();lease.group_deadline=time.monotonic()-1
+        with patch.object(m,'relock_account',return_value={'finalPasswordStatus':'L'}), \
+             patch.object(m,'recover_group_membership',return_value={'finalMembership':'absent'}),patch.object(m,'write_group_closed') as closed:
+            with self.assertRaises(ValueError):lease.close()
+        self.assertIn('joint-lease-deadline-exceeded',c.recovery_unknown)
+        self.assertFalse(lease.closed);closed.assert_not_called();c.ops.run.assert_not_called()
+
+    def test_group_relock_skips_unused_prelock_status_but_keeps_exact_uid(self):
+        c=group_controller();user=types.SimpleNamespace(pw_uid=1001,pw_name='runner')
+        with patch.object(m.pwd,'getpwall',return_value=[user]),patch.object(m.pwd,'getpwnam',return_value=user), \
+             patch.object(m,'account_status',return_value='L') as status,patch.object(m.subprocess,'run') as run:
+            m.relock_account(c.launch,c.tun)
+            status.assert_called_once_with('runner');self.assertEqual(run.call_args.kwargs['timeout'],10)
+            self.assertEqual(run.call_args.args[0],['/usr/bin/passwd','-l','runner'])
+            user.pw_uid=1002
+            with self.assertRaises(ValueError):m.relock_account(c.launch,c.tun)
+            self.assertEqual(run.call_count,1)
+
+    def test_immediate_emergency_fence_still_exact_identity(self):
+        c=group_controller();old=identity(80,0);c.ops.proc.return_value=old;c.ops.signal_owned.return_value=True
+        self.assertTrue(m.stop_recorded(c.ops,c.tun,old,immediate=True))
+        c.ops.signal_owned.assert_called_once_with(old,signal.SIGKILL)
+        c.ops.proc.return_value={**old,'startTime':'999'};c.ops.signal_owned.reset_mock()
+        with self.assertRaises(ValueError):m.stop_recorded(c.ops,c.tun,old,immediate=True)
+        c.ops.signal_owned.assert_not_called()
+
+    def test_agent_fenced_before_restore_and_account_checkpoint_before_lineage(self):
+        c=group_controller();events=[];c.tun.Ledger.side_effect=ValueError('ledger')
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d)
+            for name,pid in (('controller-birth.json',81),('agent-install.json',82)):
+                (directory/name).write_text(json.dumps(identity(pid,0 if pid==81 else 1001)))
+            def stop(ops,tun,old,**kw):
+                events.append(('stop',old['pid'],kw.get('immediate',False)))
+                if old['pid']==82 and not kw.get('immediate'):
+                    self.assertTrue((directory/'emergency-install-account.json').exists())
+            with patch.object(m,'read_group_closed',return_value=None),patch.object(m,'has_setting_intent',return_value=True), \
+                 patch.object(m,'read_group_intent',return_value={'deadlineMonotonic':time.monotonic()+60}), \
+                 patch.object(m,'stop_recorded',side_effect=stop),patch.object(m,'stop_group_writer',return_value=True), \
+                 patch.object(m,'relock_account',side_effect=lambda *a:events.append(('lock',)) or {}), \
+                 patch.object(m,'recover_group_membership',side_effect=lambda *a:events.append(('remove',)) or {}):
+                result=m.watchdog_recover(c.launch,c.tun,directory,'install')
+            self.assertLess(events.index(('stop',82,True)),events.index(('lock',)))
+            self.assertLess(events.index(('remove',)),events.index(('stop',82,False)))
+            self.assertEqual(result['result'],'failed')
+
+    def test_durable_closed_receipt_fresh_process_checks_and_no_ledger_authority(self):
+        c=group_controller();credential={'account':'runner','guiUid':1001,'finalPasswordStatus':'L',
+            'emptyPasswordRestored':False,'plaintextPersisted':False,'temporaryPasswordHash':'locked until disposable VM destruction'}
+        group={'schema':'polaris-sudo-membership-recovery-v1','account':'runner','guiUid':1001,
+            'group':'sudo','groupGid':451,'originalMembership':'absent','finalMembership':'absent',
+            'removedOnlyAddedMembership':True,'writerStopped':True,'maxLeaseSeconds':90}
+        with tempfile.TemporaryDirectory() as d,patch.object(m,'group_binding',return_value=(c.group_binding,False)),patch.object(m,'proc_absent',return_value=True) as absent:
+            directory=Path(d);deadline=time.monotonic()+90
+            m.group_intent(directory,'install',c.launch,c.group_binding,deadline)
+            m.write_group_closed(directory,'install',c.launch,c.group_binding,deadline,credential,group)
+            for name in ('writer-install.json','agent-install.json','group-writer-install-add.json','group-writer-install-remove.json'):
+                (directory/name).write_text(json.dumps({'identity':identity(80,0)} if name.startswith('group-') else identity(80,0)))
+            self.assertIsNotNone(m.read_group_closed(directory,'install',c.launch,c.tun))
+            self.assertEqual(absent.call_count,4)
+            absent.return_value=False
+            with self.assertRaises(ValueError):m.read_group_closed(directory,'install',c.launch,c.tun)
+            absent.return_value=True
+            (directory/'writer-install.json').unlink()
+            with self.assertRaises(FileNotFoundError):m.read_group_closed(directory,'install',c.launch,c.tun)
+
+    def test_watch_auth_does_not_replay_independently_closed_install(self):
+        c=group_controller();c.tun.Ledger.side_effect=ValueError('ledger')
+        with tempfile.TemporaryDirectory() as d,patch.object(m,'stop_recorded'), \
+             patch.object(m,'read_group_closed',side_effect=lambda directory,kind,*a: {} if kind=='install' else None), \
+             patch.object(m,'read_group_intent',return_value={'deadlineMonotonic':time.monotonic()+80}), \
+             patch.object(m,'has_setting_intent',return_value=True),patch.object(m,'stop_group_writer',return_value=True), \
+             patch.object(m,'relock_account',return_value={}),patch.object(m,'recover_group_membership',return_value={}) as recover:
+            directory=Path(d);(directory/'controller-birth.json').write_text(json.dumps(identity(81,0)))
+            m.watchdog_recover(c.launch,c.tun,directory)
+            recover.assert_called_once();self.assertEqual(recover.call_args.args[3],'uninstall')
+
+
+
+class ActualJointTimerDeadlineTests(unittest.TestCase):
+    def test_late_actual_target_rejected_before_add_even_with_valid_interval(self):
+        c=group_controller();c.agent=Mock();c.ledger.value['authentication']['registered']=True
+        lease=m.CredentialLease(c,'install');user=types.SimpleNamespace(pw_name='runner',pw_uid=1001)
+        with patch.object(m.time,'monotonic',return_value=100),patch.object(m,'credential_account',return_value=(user,'L')), \
+             patch.object(m,'group_binding',return_value=(c.group_binding,False)),patch.object(m,'group_intent'), \
+             patch.object(m,'verify_timer',return_value={'deadlineMonotonic':121}) as verify, \
+             patch.object(m,'run_group_writer') as writer,patch.object(lease,'close'):
+            with self.assertRaises(ValueError):lease.open()
+            writer.assert_not_called();self.assertFalse(lease.group_timer_verified)
+            self.assertEqual(lease.group_deadline,190)
+            self.assertEqual(verify.call_args.args[4],18) # 2 seconds arming/precision margin
+            self.assertEqual(verify.call_args.kwargs['recovery_seconds'],70)
+
+    def test_setup_time_consumes_activity_not_recovery_reserve(self):
+        c=group_controller();c.agent=Mock();c.ledger.value['authentication']['registered']=True
+        lease=m.CredentialLease(c,'install');user=types.SimpleNamespace(pw_name='runner',pw_uid=1001);clock=[100]
+        def intent(*args):clock[0]=110
+        with patch.object(m.time,'monotonic',side_effect=lambda:clock[0]),patch.object(m,'credential_account',return_value=(user,'L')), \
+             patch.object(m,'group_binding',return_value=(c.group_binding,False)),patch.object(m,'group_intent',side_effect=intent), \
+             patch.object(m,'verify_timer',return_value={'deadlineMonotonic':118}) as verify, \
+             patch.object(m,'run_group_writer',side_effect=ValueError('stop test before mutation')) as writer,patch.object(lease,'close'):
+            with self.assertRaises(ValueError):lease.open()
+            self.assertEqual(lease.group_deadline,190) # never reset to200 after slow intent
+            self.assertEqual(verify.call_args.args[4],8)
+            self.assertTrue(lease.group_timer_verified);writer.assert_called_once()
+
+
 if __name__ == '__main__': unittest.main(verbosity=2)

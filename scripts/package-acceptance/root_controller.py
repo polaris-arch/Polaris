@@ -152,8 +152,8 @@ def validate_launch(value, recovery=False):
             value['originalAdmission'] == 'verified', 'complete c6 carrier admission required')
     validate_execution(value['execution'])
     require(Path(value['rpcProbePath']).is_absolute(), 'fixed admitted test probe required')
-    require(value['authenticationMode'] in ('existing-session', 'pkttyagent-observe', AUTH_MODE), 'unknown authentication mode')
-    if value['authenticationMode'] == AUTH_MODE: validate_permission(value, recovery=recovery)
+    require(value['authenticationMode'] in ('existing-session', 'pkttyagent-observe', *CREDENTIAL_MODES), 'unknown authentication mode')
+    if value['authenticationMode'] in CREDENTIAL_MODES: validate_permission(value, recovery=recovery)
     else: require(value['authorization'] is None, 'unexpected credential permission')
     return value
 
@@ -246,6 +246,12 @@ def private_bytes(path, uid, home, maximum=8 * 1024 * 1024):
 
 AUTH_PHRASE = 'AUTHORIZE TEMPORARY RUNNER PASSWORD AND RELOCK FOR THIS RUN'
 AUTH_MODE = 'temporary-existing-runner-password'
+AUTH_GROUP_MODE = 'temporary-existing-runner-password-and-sudo-group'
+AUTH_GROUP_PHRASE = 'AUTHORIZE TEMPORARY RUNNER PASSWORD AND SUDO GROUP MEMBERSHIP WITH RELOCK AND REMOVAL FOR THIS RUN'
+CREDENTIAL_MODES = (AUTH_MODE, AUTH_GROUP_MODE)
+GROUP_ACTIVITY_SECONDS = 20
+GROUP_RECOVERY_RESERVE = 70
+GROUP_RECOVERY_SERVICE_SECONDS = 70
 EXECUTION_KEYS = ('repository', 'sourceSha', 'sourceTree', 'githubRunId', 'githubRunAttempt',
                   'actor', 'workflowRef', 'eventSha256')
 
@@ -360,6 +366,8 @@ ABORT_UNKNOWN_CODES = frozenset(('root-preparation-incomplete', 'root-ledger-fai
     'privilege-transaction-cleanup-unknown', 'product-cleanup-unknown', 'owned-secret-controller-stop-unproved',
     'credential-setting-intent-unknown', 'setting-writer-not-yet-recorded', 'credential-writer-stop-unproved',
     'authentication-lineage-stop-unproved', 'credential-relock-unproved', 'product-ledger-recovery-incomplete',
+    'group-membership-recovery-unproved', 'group-intent-unproved', 'group-writer-stop-unproved',
+    'joint-lease-deadline-exceeded', 'joint-closed-unproved',
     'transaction-birth-or-exec-changed', 'transaction-required-force-kill', 'authentication-agent-spawn-unknown',
     'authentication-agent-required-force-kill', 'authentication-agent-exited-early', 'earlier-failure-is-permanent',
     'helper-emergency-stop-unknown', 'unregistered-product-installation', 'owned-process-cleanup-unknown',
@@ -402,11 +410,19 @@ def validate_permission(launch, now=None, recovery=False, observation=None):
     """Frozen real-event admission is authority, NEVER pkexec authentication proof."""
     auth_mark(observation, 'permission-schema')
     p = launch.get('authorization')
+    grouped = launch['authenticationMode'] == AUTH_GROUP_MODE
     exact(p, ('schema', 'phrase', 'authMode', 'execution', 'runToken', 'guiUid', 'account',
-              'transactions', 'notBeforeUnix', 'expiresUnix', 'maxLeaseSeconds'))
+              'transactions', 'notBeforeUnix', 'expiresUnix', 'maxLeaseSeconds') + (('groupLease',) if grouped else ()))
     auth_mark(observation, 'permission-mode')
-    require(p['schema'] == 'polaris-tun-credential-lease-v1' and p['phrase'] == AUTH_PHRASE and
-            p['authMode'] == AUTH_MODE and launch['authenticationMode'] == AUTH_MODE, 'specific credential authorization absent')
+    require(p['schema'] == ('polaris-tun-credential-group-lease-v1' if grouped else 'polaris-tun-credential-lease-v1') and
+            p['phrase'] == (AUTH_GROUP_PHRASE if grouped else AUTH_PHRASE) and
+            p['authMode'] == launch['authenticationMode'] and p['authMode'] in CREDENTIAL_MODES,
+            'specific credential authorization absent')
+    if grouped:
+        require(p['account'] == 'runner' and p['guiUid'] == 1001 and
+                p['groupLease'] == {'group': 'sudo', 'account': 'runner', 'guiUid': 1001,
+                    'maxLeaseSeconds': 90, 'originalMembership': 'absent', 'restore': 'remove-only-added-membership'},
+                'specific bounded existing-group authority absent')
     auth_mark(observation, 'permission-binding')
     require(p['execution'] == launch['execution'] and launch['execution']['githubRunAttempt'] == '1' and p['runToken'] == launch['runId'] and
             p['guiUid'] == launch['guiUid'] and type(p['guiUid']) is int, 'credential execution/UID binding differs')
@@ -435,8 +451,9 @@ def account_status(name, observation=None):
     return words[1]
 
 
-def credential_account(launch, tun, recovery=False, observation=None):
+def credential_account(launch, tun, recovery=False, observation=None, *, group_pending=False):
     p = validate_permission(launch, recovery=recovery, observation=observation)
+    require(not group_pending or (not recovery and launch['authenticationMode'] == AUTH_GROUP_MODE), 'group preparation authority absent')
     auth_mark(observation, 'account-unique')
     users = [u for u in pwd.getpwall() if u.pw_uid == p['guiUid']]
     require(len(users) == 1 and users[0].pw_name == p['account'] and pwd.getpwnam(p['account']).pw_uid == p['guiUid'],
@@ -449,8 +466,11 @@ def credential_account(launch, tun, recovery=False, observation=None):
         groups = validate_group_observation(observe_existing_admin_groups(user))
         if observation is not None: observation['groups'] = groups
         auth_mark(observation, groups['guard'])
-        require(groups['lookupState'] == 'observed' and groups['groupRequirementSatisfied'] is True,
-                'existing administrator group required; no group changes allowed')
+        if group_pending:
+            group_binding(launch, expected_member=False)
+        else:
+            require(groups['lookupState'] == 'observed' and groups['groupRequirementSatisfied'] is True,
+                    'existing administrator group required; no group changes allowed')
     # Recovery already deliberately ignores membership changes. Do not make
     # exact-account re-lock depend on an unused NSS group enumeration.
     for path in ('/usr/bin/passwd', '/usr/sbin/chpasswd', '/usr/bin/pkttyagent', '/usr/bin/setsid', '/usr/bin/setpriv'):
@@ -465,9 +485,192 @@ def credential_account(launch, tun, recovery=False, observation=None):
     return user, status
 
 
+def group_binding(launch, *, expected_member=None, original=None):
+    """Public NSS identity only; never reads shadow/gshadow or changes groups."""
+    import grp
+    validate_permission(launch, recovery=True)
+    require(launch['authenticationMode'] == AUTH_GROUP_MODE, 'group lease not authorized')
+    user = pwd.getpwnam('runner'); rows = [u for u in pwd.getpwall() if u.pw_uid == launch['guiUid'] or u.pw_name == 'runner']
+    group = grp.getgrnam('sudo')
+    require(len(rows) == 1 and user.pw_uid == launch['guiUid'] == 1001 and rows[0].pw_name == 'runner' and
+            group.gr_name == 'sudo' and type(group.gr_gid) is int and group.gr_gid > 0 and
+            user.pw_gid != group.gr_gid and type(group.gr_mem) in (list, tuple) and
+            all(type(n) is str for n in group.gr_mem) and len(group.gr_mem) == len(set(group.gr_mem)),
+            'exact existing account/group identity required')
+    value = {'account': 'runner', 'guiUid': user.pw_uid, 'primaryGid': user.pw_gid,
+             'group': 'sudo', 'groupGid': group.gr_gid}
+    if original is not None: require(value == original, 'account/group identity changed')
+    member = 'runner' in group.gr_mem
+    if expected_member is not None: require(member is expected_member, 'group membership differs')
+    return value, member
+
+
+def group_intent(directory, kind, launch, binding, deadline):
+    require(kind in ('install', 'uninstall') and time.monotonic() < deadline <= time.monotonic() + 90,
+            'bounded joint lease deadline required')
+    value = {'schema': 'polaris-sudo-membership-intent-v1', 'runId': launch['runId'], 'kind': kind,
+             'binding': binding, 'originalMembership': 'absent', 'deadlineMonotonic': deadline,
+             'permissionSha256': sha(json.dumps(launch['authorization'], sort_keys=True).encode())}
+    independent_record(directory, 'group-intent-' + kind + '.json', value)
+    return value
+
+
+def read_group_intent(directory, kind, launch, tun):
+    path = directory / ('group-intent-' + kind + '.json')
+    if not path.exists(): return None
+    tun.root_path(path); require(path.stat().st_size <= 16384, 'group intent bound')
+    value = json.loads(path.read_bytes())
+    exact(value, ('schema', 'runId', 'kind', 'binding', 'originalMembership', 'deadlineMonotonic', 'permissionSha256'))
+    require(value['schema'] == 'polaris-sudo-membership-intent-v1' and value['runId'] == launch['runId'] and
+            value['kind'] == kind and value['originalMembership'] == 'absent' and
+            type(value['deadlineMonotonic']) in (int, float) and 0 < value['deadlineMonotonic'] < float('inf') and
+            value['permissionSha256'] == sha(json.dumps(launch['authorization'], sort_keys=True).encode()), 'group intent authority differs')
+    group_binding(launch, original=value['binding'])
+    return value
+
+
+def group_writer_path(directory, kind, operation):
+    require(kind in ('install', 'uninstall') and operation in ('add', 'remove'), 'fixed group operation required')
+    return directory / ('group-writer-' + kind + '-' + operation + '.json')
+
+
+def stop_group_writer(launch, tun, directory, kind, operation, ops, *, immediate=False):
+    path = group_writer_path(directory, kind, operation)
+    if not path.exists(): return False
+    tun.root_path(path); require(path.stat().st_size <= 16384, 'group writer record bound')
+    value = json.loads(path.read_bytes())
+    exact(value, ('runId', 'kind', 'operation', 'identity', 'python', 'gpasswd'))
+    require(value['runId'] == launch['runId'] and value['kind'] == kind and value['operation'] == operation,
+            'group writer transaction differs')
+    old = value['identity']; now = ops.proc(old['pid'])
+    if now and now['state'] != 'Z':
+        require(birth(now) == birth(old) and now['uid'] == old['uid'] == 0 and
+                now['namespaces'] == old['namespaces'] and now['cgroup'] == old['cgroup'] and
+                tun.executable_identity(now['pid']) in (value['python'], value['gpasswd']) and
+                value['python'] == tun.file_identity(Path('/usr/bin/python3').resolve()) and
+                value['gpasswd'] == tun.file_identity(Path('/usr/bin/gpasswd').resolve()),
+                'fixed group writer birth/exec changed')
+        stop_recorded(ops, tun, now, **({'immediate': True} if immediate else {}))  # unchanged exact identity gate
+    else: stop_recorded(ops, tun, old, **({'immediate': True} if immediate else {}))
+    return True
+
+
+def run_group_writer(launch, tun, directory, kind, operation, ops):
+    intent = read_group_intent(directory, kind, launch, tun)
+    require(intent is not None, 'durable group intent required')
+    child = subprocess.Popen(['/usr/bin/python3', '-I', str(directory / 'root_controller.py'), 'group-write',
+        '--run-id', launch['runId'], '--transaction', kind, '--group-operation', operation], env=ENV,
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        row = ops.proc(child.pid)
+        python = tun.file_identity(Path('/usr/bin/python3').resolve())
+        gpasswd = tun.file_identity(Path('/usr/bin/gpasswd').resolve())
+        require(row and row['uid'] == 0 and row['ppid'] == os.getpid() and tun.executable_identity(child.pid) == python,
+                'gated fixed group writer birth required')
+        independent_record(directory, group_writer_path(directory, kind, operation).name,
+            {'runId': launch['runId'], 'kind': kind, 'operation': operation, 'identity': row, 'python': python, 'gpasswd': gpasswd})
+        child.communicate(input=b'GO\n', timeout=10)
+        require(child.returncode == 0, 'fixed group writer failed')
+    except BaseException:
+        if child.stdin: child.stdin.close()  # before GO, EOF cannot mutate
+        if child.poll() is None:
+            # A missing record never permits mutation (no GO was sent).
+            # Retain unknown rather than signal an unrecorded process.
+            stop_group_writer(launch, tun, directory, kind, operation, ops)
+        child.wait(timeout=5)
+        raise
+    group_binding(launch, original=intent['binding'], expected_member=operation == 'add')
+    return True
+
+
+def group_writer_main(launch, tun, directory, kind, operation):
+    intent = read_group_intent(directory, kind, launch, tun)
+    require(intent is not None, 'group intent absent')
+    require(read_line(sys.stdin.buffer, timeout=10, maximum=3) == b'GO\n', 'group writer gate closed')
+    path = group_writer_path(directory, kind, operation); tun.root_path(path)
+    value = json.loads(path.read_bytes()); current = tun.process_identity(os.getpid())
+    require(value['runId'] == launch['runId'] and value['kind'] == kind and value['operation'] == operation and
+            tun.same_process(value['identity'], current) and
+            tun.executable_identity(os.getpid()) == value['python'] and
+            tun.file_identity(Path('/usr/bin/gpasswd').resolve()) == value['gpasswd'], 'group writer gate identity differs')
+    group_binding(launch, original=intent['binding'], expected_member=operation == 'remove')
+    if operation == 'add':
+        validate_permission(launch)
+        require(time.monotonic() < intent['deadlineMonotonic'] - GROUP_RECOVERY_RESERVE, 'joint lease deadline exhausted')
+    # No subprocess/grandchild: the recorded gated birth becomes only this exact executable.
+    os.execve('/usr/bin/gpasswd', ['/usr/bin/gpasswd', '-a' if operation == 'add' else '-d', 'runner', 'sudo'], ENV)
+
+
+def recover_group_membership(launch, tun, directory, kind, ops):
+    intent = read_group_intent(directory, kind, launch, tun)
+    require(intent is not None, 'group recovery intent absent')
+    require(stop_group_writer(launch, tun, directory, kind, 'add', ops), 'group writer outcome unrecorded')
+    previous_remove = stop_group_writer(launch, tun, directory, kind, 'remove', ops)
+    _, member = group_binding(launch, original=intent['binding'])
+    require(not (member and previous_remove), 'previous removal failed; no unrecorded retry')
+    if member:
+        run_group_writer(launch, tun, directory, kind, 'remove', ops)
+        require(stop_group_writer(launch, tun, directory, kind, 'remove', ops), 'removal writer outcome unrecorded')
+    group_binding(launch, original=intent['binding'], expected_member=False)
+    return {'schema': 'polaris-sudo-membership-recovery-v1', 'account': 'runner', 'guiUid': launch['guiUid'],
+            'group': 'sudo', 'groupGid': intent['binding']['groupGid'], 'originalMembership': 'absent',
+            'finalMembership': 'absent', 'removedOnlyAddedMembership': True, 'writerStopped': True, 'maxLeaseSeconds': 90}
+
+
+def write_group_closed(directory, kind, launch, binding, deadline, credential, group):
+    now = time.monotonic()
+    require(now <= deadline and credential and credential.get('finalPasswordStatus') == 'L' and
+            group and group.get('finalMembership') == 'absent', 'joint lease deadline or restoration unproved')
+    value = {'schema': 'polaris-joint-lease-closed-v1', 'runId': launch['runId'], 'kind': kind,
+             'permissionSha256': sha(json.dumps(launch['authorization'], sort_keys=True).encode()),
+             'binding': binding, 'deadlineMonotonic': deadline, 'closedMonotonic': now,
+             'credentialRecovery': credential, 'groupRecovery': group}
+    independent_record(directory, 'group-closed-' + kind + '.json', value)
+    require(time.monotonic() <= deadline, 'joint closure persistence exceeded deadline')
+    return value
+
+
+def read_group_closed(directory, kind, launch, tun):
+    path = directory / ('group-closed-' + kind + '.json')
+    if not path.exists(): return None
+    tun.root_path(path); require(path.stat().st_size <= 16384, 'joint closed receipt bound')
+    value = json.loads(path.read_bytes())
+    exact(value, ('schema', 'runId', 'kind', 'permissionSha256', 'binding', 'deadlineMonotonic',
+                  'closedMonotonic', 'credentialRecovery', 'groupRecovery'))
+    intent = read_group_intent(directory, kind, launch, tun)
+    require(intent is not None and value['schema'] == 'polaris-joint-lease-closed-v1' and
+            value['runId'] == launch['runId'] and value['kind'] == kind and value['binding'] == intent['binding'] and
+            value['permissionSha256'] == intent['permissionSha256'] and value['deadlineMonotonic'] == intent['deadlineMonotonic'] and
+            type(value['closedMonotonic']) in (int, float) and 0 < value['closedMonotonic'] <= value['deadlineMonotonic'] and
+            value['credentialRecovery'] == {'account': 'runner', 'guiUid': 1001, 'finalPasswordStatus': 'L',
+                'emptyPasswordRestored': False, 'plaintextPersisted': False,
+                'temporaryPasswordHash': 'locked until disposable VM destruction'} and
+            value['groupRecovery'] == {'schema': 'polaris-sudo-membership-recovery-v1', 'account': 'runner', 'guiUid': 1001,
+                'group': 'sudo', 'groupGid': intent['binding']['groupGid'], 'originalMembership': 'absent',
+                'finalMembership': 'absent', 'removedOnlyAddedMembership': True, 'writerStopped': True, 'maxLeaseSeconds': 90},
+            'joint closed receipt identity/phase differs')
+    # Fresh account/group identity and old writer/agent process absence, not a
+    # mutable ledger flag. A later active lease may currently own the membership;
+    # its final recovery (or the all-closed path) must separately prove absence.
+    group_binding(launch, original=intent['binding'])
+    for name in ('writer-' + kind + '.json', 'agent-' + kind + '.json',
+                 'group-writer-' + kind + '-add.json', 'group-writer-' + kind + '-remove.json'):
+        row_path = directory / name; tun.root_path(row_path)
+        require(row_path.stat().st_size <= 16384, 'closed writer proof bound')
+        row = json.loads(row_path.read_bytes()); old = row['identity'] if name.startswith('group-') else row
+        require(proc_absent(old['pid']), 'closed transaction process still exists or reused')
+    return value
+
+
 def relock_account(launch, tun):
     """Independent recovery does not need a readable mutable product ledger."""
-    user, _ = credential_account(launch, tun, recovery=True)
+    if launch['authenticationMode'] == AUTH_GROUP_MODE:
+        p = validate_permission(launch, recovery=True)
+        rows = [u for u in pwd.getpwall() if u.pw_uid == p['guiUid'] or u.pw_name == p['account']]
+        require(len(rows) == 1 and rows[0].pw_uid == p['guiUid'] and rows[0].pw_name == p['account'] and
+                pwd.getpwnam(p['account']).pw_uid == p['guiUid'], 'unique approved recovery account required')
+        user = rows[0]; tun.file_identity(Path('/usr/bin/passwd').resolve())
+    else: user, _ = credential_account(launch, tun, recovery=True)
     subprocess.run(['/usr/bin/passwd', '-l', user.pw_name], env=ENV, stdin=subprocess.DEVNULL,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=True)
     require(account_status(user.pw_name) == 'L', 'temporary account re-lock not proved')
@@ -483,14 +686,17 @@ def duration_seconds(text):
     return sum(float(n) * scale[u] for n, u in pieces)
 
 
-def verify_timer(ops, tun, unit, argv, seconds, started):
+def verify_timer(ops, tun, unit, argv, seconds, started, *, recovery_seconds=None):
     props = dict(line.split('=', 1) for line in ops.run([tun.SYSTEMCTL, 'show', unit + '.service',
-        '--property=ExecStart,User,Group,DynamicUser,FragmentPath,DropInPaths,ActiveState']).splitlines() if '=' in line)
+        '--property=ExecStart,User,Group,DynamicUser,FragmentPath,DropInPaths,ActiveState' +
+        (',TimeoutStartUSec' if recovery_seconds is not None else '')]).splitlines() if '=' in line)
     require(props.get('User') in ('', 'root', '0') and props.get('Group') in ('', 'root', '0') and
             props.get('DynamicUser') == 'no' and not props.get('DropInPaths') and props.get('ActiveState') == 'inactive' and
             props.get('FragmentPath') == '/run/systemd/transient/' + unit + '.service', 'watchdog root transient service differs')
     require('path=' + argv[0] + ' ;' in props.get('ExecStart', '') and
             'argv[]=' + ' '.join(argv) + ' ;' in props.get('ExecStart', ''), 'watchdog fixed command differs')
+    if recovery_seconds is not None:
+        require(duration_seconds(props.get('TimeoutStartUSec', '')) == recovery_seconds, 'watchdog recovery service budget differs')
     timer = dict(line.split('=', 1) for line in ops.run([tun.SYSTEMCTL, 'show', unit + '.timer',
         '--property=ActiveState,Unit,TimersMonotonic']).splitlines() if '=' in line)
     require(timer.get('ActiveState') == 'active' and timer.get('Unit') == unit + '.service', 'watchdog target/activation differs')
@@ -502,7 +708,7 @@ def verify_timer(ops, tun, unit, argv, seconds, started):
 
 
 def independent_record(directory, name, value):
-    require(re.fullmatch(r'(controller-birth|agent-(install|uninstall)|writer-(install|uninstall)|setting-intent-(install|uninstall))\.json', name), 'fixed recovery identity filename required')
+    require(re.fullmatch(r'(controller-birth|agent-(install|uninstall)|writer-(install|uninstall)|setting-intent-(install|uninstall)|group-intent-(install|uninstall)|group-closed-(install|uninstall)|group-writer-(install|uninstall)-(add|remove))\.json', name), 'fixed recovery identity filename required')
     fd = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as f:
         json.dump(value, f, sort_keys=True); f.flush(); os.fsync(f.fileno())
@@ -514,6 +720,7 @@ def independent_record(directory, name, value):
 def watchdog_recover(launch, tun, directory, transaction=None):
     """Stop recorded writers/secret processes BEFORE final lock; no intent, no lock."""
     errors = []; recovery = None; ops = tun.Commands()
+    grouped = launch['authenticationMode'] == AUTH_GROUP_MODE
     kinds = [transaction] if transaction else ['install', 'uninstall']
     def read_identity(name):
         path = directory / name
@@ -527,10 +734,25 @@ def watchdog_recover(launch, tun, directory, transaction=None):
     try:
         controller = read_identity('controller-birth.json')
         require(controller is not None, 'independent controller birth missing')
-        stop_recorded(ops, tun, controller); producer_stopped = True
+        stop_recorded(ops, tun, controller, **({'immediate': True} if grouped else {})); producer_stopped = True
     except Exception: errors.append('owned-secret-controller-stop-unproved')
+    if grouped:
+        active = []
+        for kind in kinds:
+            try:
+                if read_group_closed(directory, kind, launch, tun) is None:
+                    if read_group_intent(directory, kind, launch, tun) is not None: active.append(kind)
+            except Exception:
+                errors.append('joint-closed-unproved'); active.append(kind)
+        if len(active) > 1: errors.append('joint-closed-unproved')
+        kinds = active
+        if not kinds:
+            try:
+                group_binding(launch, expected_member=False)
+                require(account_status('runner') == 'L', 'closed account no longer locked')
+            except Exception: errors.append('joint-closed-unproved')
     intents = []
-    if launch['authenticationMode'] == AUTH_MODE:
+    if launch['authenticationMode'] in CREDENTIAL_MODES:
         for kind in kinds:
             try:
                 if has_setting_intent(directory, kind, launch, tun): intents.append(kind)
@@ -540,30 +762,66 @@ def watchdog_recover(launch, tun, directory, transaction=None):
     for kind in kinds:
         try:
             writer = read_identity('writer-' + kind + '.json')
-            if writer: stop_recorded(ops, tun, writer)
+            if writer: stop_recorded(ops, tun, writer, **({'immediate': True} if grouped else {}))
             elif kind in intents: errors.append('setting-writer-not-yet-recorded')
         except Exception: errors.append('credential-writer-stop-unproved')
-    known = set()
-    for kind in kinds:
-        try:
-            path = directory / ('auth-lineage-' + kind + '.json')
-            if path.exists():
-                tun.root_path(path); require(path.stat().st_size <= 1024 * 1024, 'auth lineage bound')
-                rows = json.loads(path.read_bytes())
-                require(rows['runId'] == launch['runId'] and rows['kind'] == kind and not rows.get('observationError'),
-                        'authentication lineage snapshot incomplete')
-                for old in reversed(rows['processes']):
-                    known.add(birth(old)); stop_recorded(ops, tun, old)
-            agent = read_identity('agent-' + kind + '.json')
-            if agent and birth(agent) not in known: known.add(birth(agent)); stop_recorded(ops, tun, agent)
-        except Exception: errors.append('authentication-lineage-stop-unproved')
+    def close_lineage():
+        known = set()
+        for kind in kinds:
+            try:
+                path = directory / ('auth-lineage-' + kind + '.json')
+                if path.exists():
+                    tun.root_path(path); require(path.stat().st_size <= 1024 * 1024, 'auth lineage bound')
+                    rows = json.loads(path.read_bytes())
+                    require(rows['runId'] == launch['runId'] and rows['kind'] == kind and not rows.get('observationError'),
+                            'authentication lineage snapshot incomplete')
+                    for old in reversed(rows['processes']):
+                        known.add(birth(old)); stop_recorded(ops, tun, old)
+                agent = read_identity('agent-' + kind + '.json')
+                if agent and birth(agent) not in known: known.add(birth(agent)); stop_recorded(ops, tun, agent)
+            except Exception: errors.append('authentication-lineage-stop-unproved')
+    if not grouped: close_lineage()
+    group_intents = []; group_recoveries = []
+    if launch['authenticationMode'] == AUTH_GROUP_MODE:
+        for kind in kinds:
+            try: stop_group_writer(launch, tun, directory, kind, 'add', ops, immediate=True)
+            except Exception: errors.append('group-writer-stop-unproved')
+            try:
+                if read_group_intent(directory, kind, launch, tun) is not None: group_intents.append(kind)
+            except Exception: errors.append('group-intent-unproved')
+    if grouped:
+        for kind in kinds:
+            try:
+                agent = read_identity('agent-' + kind + '.json')
+                if agent: stop_recorded(ops, tun, agent, immediate=True)
+            except Exception: errors.append('authentication-lineage-stop-unproved')
     # Unknown setting result still requires lock; a final L is not a stability
     # claim if any writer/lineage stop above is unproved. Such a run always FAILs.
     if intents:
         try: recovery = relock_account(launch, tun)
         except Exception: errors.append('credential-relock-unproved')
-    ledger = tun.Ledger(launch['runId'])
+    for kind in group_intents:
+        try: group_recoveries.append(recover_group_membership(launch, tun, directory, kind, ops))
+        except Exception: errors.append('group-membership-recovery-unproved')
+    if grouped:
+        for kind in group_intents:
+            try:
+                intent = read_group_intent(directory, kind, launch, tun)
+                require(time.monotonic() <= intent['deadlineMonotonic'], 'joint deadline exceeded')
+            except Exception: errors.append('joint-lease-deadline-exceeded')
+        checkpoint = directory / ('emergency-' + (transaction or 'auth') + '-account.json')
+        fd = os.open(checkpoint, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump({'result': 'failed', 'restorationProven': False, 'credentialRecovery': recovery,
+                       'groupRecoveries': group_recoveries, 'errors': sorted(set(errors))}, f)
+            f.flush(); os.fsync(f.fileno())
+        close_lineage()  # full auth/root cleanup still required, never inferred from group removal
+    try: ledger = tun.Ledger(launch['runId'])
+    except Exception:
+        if launch['authenticationMode'] != AUTH_GROUP_MODE: raise
+        ledger = None; errors.append('product-ledger-recovery-incomplete')
     try:
+        require(ledger is not None, 'product ledger unavailable')
         ledger.mutate(lambda v: (v.update(result='failed', forcedCleanup=True),
             v['authentication'].update(accountMutated=bool(intents) and recovery is None),
             v.update(unknown=sorted(set(v['unknown'] + errors)))))
@@ -576,7 +834,8 @@ def watchdog_recover(launch, tun, directory, transaction=None):
     fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as f:
         json.dump({'result': 'failed', 'settingIntents': intents, 'credentialRecovery': recovery,
-                   'restorationProven': False, 'errors': sorted(set(errors))}, f)
+                   'restorationProven': False, 'errors': sorted(set(errors)),
+                   **({'groupRecoveries': group_recoveries} if launch['authenticationMode'] == AUTH_GROUP_MODE else {})}, f)
         f.flush(); os.fsync(f.fileno())
     return {'result': 'failed', 'errors': sorted(set(errors))}
 
@@ -635,7 +894,7 @@ def proc_stat(pid):
     return {'pid': pid, 'startTime': fields[19], 'state': fields[0], 'ppid': int(fields[1])}
 
 
-def stop_recorded(ops, tun, old):
+def stop_recorded(ops, tun, old, *, immediate=False):
     now = ops.proc(old['pid'])
     if not now:
         remaining = proc_stat(old['pid'])
@@ -646,6 +905,9 @@ def stop_recorded(ops, tun, old):
         require(birth(old) == birth(now), 'registered zombie birth changed')
         return False
     require(tun.same_process(old, now), 'registered secret-process birth/exec changed')
+    if immediate:
+        require(ops.signal_owned(old, signal.SIGKILL), 'registered process failed emergency fence')
+        return True
     if not ops.signal_owned(old, signal.SIGTERM):
         require(ops.signal_owned(old, signal.SIGKILL), 'registered secret-process failed to stop')
         return True
@@ -737,31 +999,65 @@ observably active before a password-setting attempt. Each transaction re-locks.
         self.closed = False; self.error = None; self.sent = False; self.authenticated = False; self.close_lock = threading.Lock()
         self.stop = threading.Event(); self.thread = None; self.writer = None; self.writer_fd = None
         self.timer = 'polaris-tun-lease-' + controller.launch['runId'] + '-' + kind
+        self.grouped = controller.launch['authenticationMode'] == AUTH_GROUP_MODE
+        self.group_intent_written = False; self.group_timer_verified = False; self.group_recovery = None
+        self.group_deadline = None
 
     def open(self):
+        try: return self._open()
+        except BaseException:
+            if self.grouped:
+                try: self.close()
+                except BaseException: pass  # original failure retained; fixed cleanup unknown is recorded
+            raise
+
+    def _open(self):
         c = self.c; p = validate_permission(c.launch)
-        self.user, original = credential_account(c.launch, c.tun)
+        self.user, original = credential_account(c.launch, c.tun, **({'group_pending': True} if self.grouped else {}))
         require(c.agent and c.ledger.load()['authentication'].get('registered') is True, 'real agent must register first')
         window = min(p['maxLeaseSeconds'], int(c.ledger.load()['deadlineMonotonic'] - time.monotonic()) - 35)
-        require(window >= 15, 'not enough guarded time for another credential lease')
+        require(window >= (90 if self.grouped else 15), 'not enough guarded time for another credential lease')
         self.window = window
+        timer_seconds = GROUP_ACTIVITY_SECONDS if self.grouped else window
+        if self.grouped and self.kind == 'uninstall':
+            require(read_group_closed(c.directory, 'install', c.launch, c.tun) is not None, 'install joint lease not durably closed')
         state = {'kind': self.kind, 'account': self.user.pw_name, 'guiUid': self.user.pw_uid,
                  'originalPasswordStatus': original, 'state': 'guard-pending',
                  'deadlineMonotonic': time.monotonic() + window, 'timer': self.timer + '.timer'}
         c.ledger.mutate(lambda v: v['authentication'].update(lease=state))
         started = time.monotonic()
+        if self.grouped:
+            require(getattr(c, 'group_binding', None) is not None, 'initial group identity not bound')
+            binding, _ = group_binding(c.launch, expected_member=False, original=c.group_binding)
+            self.group_deadline = started + window
+            group_intent(c.directory, self.kind, c.launch, binding, self.group_deadline)
+            self.group_intent_written = True
         argv = ['/usr/bin/env', '-i', 'PATH=' + ENV['PATH'], 'LANG=C', '/usr/bin/python3', '-I',
                 str(c.directory / 'root_controller.py'), 'watch-lease', '--run-id', c.launch['runId'], '--transaction', self.kind]
-        c.ops.run(['/usr/bin/systemd-run', '--unit=' + self.timer, '--on-active=' + str(window) + 's', '--timer-property=AccuracySec=1s',
-            '--property=Type=oneshot', '--property=TimeoutStartSec=20s', '/usr/bin/env', '-i', 'PATH=' + ENV['PATH'], 'LANG=C',
+        timer_started = started
+        if self.grouped:
+            timer_started = time.monotonic()
+            timer_seconds = int(self.group_deadline - GROUP_RECOVERY_RESERVE - timer_started) - 2
+            require(timer_seconds >= 1, 'no time remains to arm joint recovery')
+        c.ops.run(['/usr/bin/systemd-run', '--unit=' + self.timer, '--on-active=' + str(timer_seconds) + 's', '--timer-property=AccuracySec=1s',
+            '--property=Type=oneshot', '--property=TimeoutStartSec=' + str(GROUP_RECOVERY_SERVICE_SECONDS if self.grouped else 20) + 's', '/usr/bin/env', '-i', 'PATH=' + ENV['PATH'], 'LANG=C',
             '/usr/bin/python3', '-I', str(c.directory / 'root_controller.py'), 'watch-lease', '--run-id', c.launch['runId'],
             '--transaction', self.kind])
-        verify_timer(c.ops, c.tun, self.timer, argv, window, started)
+        timer_proof = verify_timer(c.ops, c.tun, self.timer, argv, timer_seconds, timer_started,
+                     **({'recovery_seconds': GROUP_RECOVERY_SERVICE_SECONDS} if self.grouped else {}))
+        if self.grouped:
+            require(timer_proof['deadlineMonotonic'] <= self.group_deadline - GROUP_RECOVERY_RESERVE,
+                    'actual recovery timer leaves insufficient joint-deadline reserve')
+            self.group_timer_verified = True
+            run_group_writer(c.launch, c.tun, c.directory, self.kind, 'add', c.ops)
+            self.user, original = credential_account(c.launch, c.tun)
+            require(time.monotonic() < self.group_deadline - GROUP_RECOVERY_RESERVE - 5, 'joint lease deadline exhausted')
         # The setting outcome may become unknown: persist recovery identity first.
         c.ledger.mutate(lambda v: v['authentication']['lease'].update(state='setting-pending', watchdogActive=True))
         import secrets
         self.secret = bytearray(secrets.token_urlsafe(48).encode('ascii'))
         try:
+            if self.grouped: require(time.monotonic() < self.group_deadline - GROUP_RECOVERY_RESERVE - 5, 'joint lease deadline exhausted')
             original_now = account_status(self.user.pw_name)
             require(original_now in ('L', 'NP'), 'account changed before setting')
             setting_intent(c.directory, self.kind, c.launch, original_now)
@@ -789,7 +1085,7 @@ observably active before a password-setting attempt. Each transaction re-locks.
 
     def pump(self):
         import termios
-        data = bytearray(); deadline = time.monotonic() + self.window - 5; selected = False
+        data = bytearray(); deadline = self.group_deadline - GROUP_RECOVERY_RESERVE if self.grouped else time.monotonic() + self.window - 5; selected = False
         user = self.user
         display = user.pw_name if not user.pw_gecos or user.pw_gecos == user.pw_name else user.pw_gecos + ' (' + user.pw_name + ')'
         try:
@@ -804,6 +1100,9 @@ observably active before a password-setting attempt. Each transaction re-locks.
                     matches = re.findall(r'^ ([0-9]+)\.  ' + re.escape(display) + r'$', text, re.M)
                     require(len(matches) == 1, 'approved existing identity not uniquely offered')
                     os.write(self.c.pty, matches[0].encode() + b'\n'); selected = True
+                if self.grouped:
+                    offered = re.findall(r'^Authenticating as: (.+)$', text, re.M)
+                    require(all(name == display for name in offered), 'authentication changed to another identity')
                 identity_ok = selected or ('Authenticating as: ' + display + '\n') in text
                 if 'Password:' in text and not self.sent:
                     require(identity_ok, 'password requested for another identity')
@@ -826,6 +1125,7 @@ observably active before a password-setting attempt. Each transaction re-locks.
             for i in range(len(data)): data[i] = 0
 
     def close(self):
+        if self.grouped: return self.close_group()
         self.stop.set()
         worker_stopped = True
         if self.thread and self.thread is not threading.current_thread():
@@ -847,6 +1147,62 @@ observably active before a password-setting attempt. Each transaction re-locks.
                 require(self.c.ops.run([self.c.tun.SYSTEMCTL, 'show', unit, '--property=ActiveState', '--value']).strip() == 'inactive',
                         'credential watchdog fired or did not close')
             require(worker_stopped, 'private credential worker did not stop')
+            self.closed = True
+        finally:
+            for i in range(len(self.secret)): self.secret[i] = 0
+            self.secret.clear()
+            if self.writer_fd is not None: os.close(self.writer_fd); self.writer_fd = None
+            self.close_lock.release()
+
+    def close_group(self):
+        self.stop.set()
+        errors = []; proof = None
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=3)
+            if self.thread.is_alive(): errors.append('credential-writer-stop-unproved')
+        require(self.close_lock.acquire(timeout=15), 'credential closure concurrency unknown')
+        try:
+            if self.closed: return
+            try:
+                if self.writer and self.writer.poll() is None:
+                    require(self.writer_fd is not None, 'credential writer pidfd missing')
+                    signal.pidfd_send_signal(self.writer_fd, signal.SIGKILL); self.writer.wait(timeout=5)
+            except Exception: errors.append('credential-writer-stop-unproved')
+            try:
+                agent = self.c.ledger.load()['authentication'].get('agent')
+                if agent:
+                    require(not stop_recorded(self.c.ops, self.c.tun, agent['identity']), 'agent required emergency fence')
+                    if self.c.agent: self.c.agent.wait(timeout=5)
+            except Exception: errors.append('authentication-lineage-stop-unproved')
+            # These independent restorations must both be attempted, even if either fails.
+            if self.attempted:
+                try: proof = relock_account(self.c.launch, self.c.tun)
+                except Exception: errors.append('credential-relock-unproved')
+            if self.group_intent_written:
+                try: self.group_recovery = recover_group_membership(self.c.launch, self.c.tun, self.c.directory, self.kind, self.c.ops)
+                except Exception: errors.append('group-membership-recovery-unproved')
+            if self.group_deadline is not None and time.monotonic() > self.group_deadline:
+                errors.append('joint-lease-deadline-exceeded')
+            try:
+                if self.c.auth_observer:
+                    lineage = self.c.auth_observer.close()
+                    self.c.group_lineage_closed = lineage; self.c.auth_observer = None
+            except Exception: errors.append('authentication-lineage-stop-unproved')
+            if errors:
+                self.c.recovery_unknown.extend(errors)
+                raise ValueError('joint credential/group recovery unproved')
+            if self.group_intent_written:
+                if proof is not None:
+                    intent = read_group_intent(self.c.directory, self.kind, self.c.launch, self.c.tun)
+                    write_group_closed(self.c.directory, self.kind, self.c.launch, intent['binding'],
+                                       self.group_deadline, proof, self.group_recovery)
+                self.c.ledger.mutate(lambda v: (v['authentication'].update(accountMutated=False),
+                    v['authentication']['lease'].update(state='closed', recovery=proof, groupRecovery=self.group_recovery)))
+            if self.group_timer_verified:
+                self.c.ops.run([self.c.tun.SYSTEMCTL, 'stop', self.timer + '.timer'])
+                for unit in (self.timer + '.timer', self.timer + '.service'):
+                    require(self.c.ops.run([self.c.tun.SYSTEMCTL, 'show', unit, '--property=ActiveState', '--value']).strip() == 'inactive',
+                            'joint lease watchdog not inactive')
             self.closed = True
         finally:
             for i in range(len(self.secret)): self.secret[i] = 0
@@ -1008,11 +1364,14 @@ class Controller:
 
     def authentication_readiness(self):
         mode = self.launch['authenticationMode']
-        if mode == AUTH_MODE:
+        if mode in CREDENTIAL_MODES:
             self.readonly_auth = auth_observation()
-            user, status = credential_account(self.launch, self.tun, observation=self.readonly_auth)
+            grouped = mode == AUTH_GROUP_MODE
+            if grouped: self.group_binding, _ = group_binding(self.launch, expected_member=False)
+            user, status = credential_account(self.launch, self.tun, observation=self.readonly_auth, group_pending=grouped)
             return {'kind': 'exact-dispatch-credential-authority', 'account': user.pw_name,
-                    'originalPasswordStatus': status, 'authenticated': False}
+                    'originalPasswordStatus': status, 'authenticated': False,
+                    **({'groupMembership': 'pending-guarded-lease'} if grouped else {})}
         require(mode == 'existing-session', 'observer-only agent cannot authorize mutation')
         tool = Path('/usr/bin/pkcheck'); self.tun.file_identity(tool.resolve())
         subject = str(self.gui['pid']) + ',' + self.gui['startTime'] + ',' + str(self.launch['guiUid'])
@@ -1050,13 +1409,14 @@ class Controller:
         started = time.monotonic()
         self.stage = 'auth-watchdog-start'
         self.ops.run(['/usr/bin/systemd-run', '--unit=' + unit, '--on-active=580s', '--timer-property=AccuracySec=1s',
-            '--property=Type=oneshot', '--property=TimeoutStartSec=15s', '/usr/bin/env', '-i', 'PATH=' + ENV['PATH'],
+            '--property=Type=oneshot', '--property=TimeoutStartSec=' + str(GROUP_RECOVERY_SERVICE_SECONDS if self.launch['authenticationMode'] == AUTH_GROUP_MODE else 15) + 's', '/usr/bin/env', '-i', 'PATH=' + ENV['PATH'],
             'LANG=C', '/usr/bin/python3', '-I', str(self.directory / 'root_controller.py'),
             'watch-auth', '--run-id', self.launch['runId']])
         self.stage = 'auth-watchdog-verify'
         verify_timer(self.ops, self.tun, unit, ['/usr/bin/env', '-i', 'PATH=' + ENV['PATH'], 'LANG=C',
                      '/usr/bin/python3', '-I', str(self.directory / 'root_controller.py'), 'watch-auth',
-                     '--run-id', self.launch['runId']], 580, started)
+                     '--run-id', self.launch['runId']], 580, started,
+            **({'recovery_seconds': GROUP_RECOVERY_SERVICE_SECONDS} if self.launch['authenticationMode'] == AUTH_GROUP_MODE else {}))
         require(time.monotonic() + 580 < self.ledger.load()['deadlineMonotonic'] - 5, 'auth watchdog preparation consumed reserved margin')
         self.ledger.mutate(lambda v: v.update(authenticationWatchdogActive=True, authenticationTimer=unit + '.timer'))
         self.stage = 'prepared'
@@ -1065,7 +1425,7 @@ class Controller:
 
     def agent_register(self):
         self.guard()
-        require(self.launch['authenticationMode'] in ('pkttyagent-observe', AUTH_MODE) and self.agent is None,
+        require(self.launch['authenticationMode'] in ('pkttyagent-observe', *CREDENTIAL_MODES) and self.agent is None,
                 'owned observer agent not requested or already started')
         import pty
         master, slave = pty.openpty(); read_fd, notify_fd = os.pipe()
@@ -1108,7 +1468,7 @@ class Controller:
         require(not value['authentication']['closed'], 'authentication window closed')
         require((kind == 'install' and not value.get('helper')) or
                 (kind == 'uninstall' and value.get('helper') and value.get('capture')), 'transaction order differs')
-        if self.launch['authenticationMode'] == AUTH_MODE:
+        if self.launch['authenticationMode'] in CREDENTIAL_MODES:
             self.agent_register()
             independent_record(self.directory, 'agent-' + kind + '.json',
                                self.ledger.load()['authentication']['agent']['identity'])
@@ -1126,6 +1486,10 @@ class Controller:
             result['credentialAuthenticationComplete'] = True
             closed_auth = self.stop_agent(close_window=False)
             result['credentialRecovery'] = self.ledger.load()['authentication']['lease']['recovery']
+            if self.launch['authenticationMode'] == AUTH_GROUP_MODE:
+                require(self.lease.group_recovery is not None, 'joint membership recovery absent')
+                self.group_recovery = self.lease.group_recovery
+                result['jointLease'] = {'credentialRecovery': result['credentialRecovery'], 'groupRecovery': self.group_recovery}
             result['authDescendantsReaped'] = closed_auth['authDescendantsReaped']
             self.lease = None
         self.ledger.mutate(lambda v: (v.setdefault('transactions', []).append(result),
@@ -1262,7 +1626,8 @@ class Controller:
                 'bytes': size, 'sha256': proof['sha256'], 'base64': base64.b64encode(data).decode()}
 
     def stop_agent(self, close_window=True):
-        lineage = self.auth_observer.close() if self.auth_observer else None
+        lineage = self.auth_observer.close() if self.auth_observer else getattr(self, 'group_lineage_closed', None)
+        self.group_lineage_closed = None
         if lineage:
             self.ledger.mutate(lambda v: v['authentication'].update(lineageClosed=lineage))
         self.auth_observer = None
@@ -1281,7 +1646,14 @@ class Controller:
     def auth_close(self):
         require(self.observer is None, 'privilege transaction not closed')
         if self.lease: self.lease.close()
-        return self.stop_agent()
+        result = self.stop_agent()
+        if self.launch['authenticationMode'] == AUTH_GROUP_MODE:
+            require(getattr(self, 'group_recovery', None) is not None, 'final membership recovery absent')
+            intent = read_group_intent(self.directory, 'uninstall', self.launch, self.tun)
+            require(intent is not None, 'final group intent absent')
+            group_binding(self.launch, original=intent['binding'], expected_member=False)
+            result['groupRecovery'] = self.group_recovery
+        return result
 
     def finish(self):
         value = self.guard()
@@ -1422,9 +1794,10 @@ def close_auth(ledger, tun, forced, close_window=True):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('serve', 'watch-auth', 'watch-lease'))
+    parser.add_argument('command', choices=('serve', 'watch-auth', 'watch-lease', 'group-write'))
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--transaction', choices=('install', 'uninstall'))
+    parser.add_argument('--group-operation', choices=('add', 'remove'))
     args = parser.parse_args()
     if args.command == 'serve':
         startup_stage = 'frozen-load'
@@ -1443,6 +1816,10 @@ def main():
             raise SystemExit(72) from None
     else:
         launch, tun, directory = load_frozen(args.run_id, recovery=True)
+    if args.command == 'group-write':
+        group_writer_main(launch, tun, directory, args.transaction, args.group_operation)
+        raise SystemExit(1)
+    require(args.group_operation is None, 'unexpected group operation')
     if args.command in ('watch-lease', 'watch-auth'):
         require((args.command == 'watch-lease') == bool(args.transaction), 'watchdog transaction binding differs')
         watchdog_recover(launch, tun, directory, args.transaction)

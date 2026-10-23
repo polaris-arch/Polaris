@@ -874,5 +874,75 @@ class ControllerLifecycleContracts(unittest.TestCase):
         run.controller.call.assert_not_called()
 
 
+    def membership_recovery(self):
+        return {'schema':'polaris-sudo-membership-recovery-v1','account':'runner','guiUid':1001,
+                'group':'sudo','groupGid':27,'originalMembership':'absent','finalMembership':'absent',
+                'removedOnlyAddedMembership':True,'writerStopped':True,'maxLeaseSeconds':90}
+
+    def test_joint_membership_recovery_is_exact_bound_and_no_gid_assumption(self):
+        recovery = self.membership_recovery()
+        self.assertIs(M.verify_group_recovery(recovery,1001,'runner'), recovery)
+        alternate = {**recovery,'groupGid':451}
+        self.assertEqual(M.verify_group_recovery(alternate,1001,'runner',451)['groupGid'],451)
+        for key,value in {'schema':'fake','account':'other','guiUid':0,'group':'admin','groupGid':True,
+                          'originalMembership':'present','finalMembership':'present','removedOnlyAddedMembership':False,
+                          'writerStopped':False,'maxLeaseSeconds':91}.items():
+            with self.assertRaises(ValueError): M.verify_group_recovery({**recovery,key:value},1001,'runner')
+        for args in ((recovery,1002,'runner'),(recovery,1001,'other'),(recovery,1001,'runner',451)):
+            with self.assertRaises(ValueError): M.verify_group_recovery(*args)
+        with self.assertRaises(ValueError): M.verify_group_recovery({**recovery,'secret':'private'},1001,'runner')
+
+    def test_joint_group_lease_never_substitutes_for_real_password_relock(self):
+        secret_free = {'guiUid':1001,'account':'runner','finalPasswordStatus':'L','plaintextPersisted':False,
+                      'emptyPasswordRestored':False,'temporaryPasswordHash':'locked until disposable VM destruction'}
+        proof = {'credentialRecovery':secret_free,'credentialAuthenticationComplete':True,'authDescendantsReaped':True,
+                 'jointLease':{'credentialRecovery':dict(secret_free),'groupRecovery':self.membership_recovery()}}
+        subject = {'guiUid':1001,'account':'runner'}
+        self.assertEqual(M.verify_joint_recovery(proof,subject)['groupGid'],27)
+        for key in ('credentialAuthenticationComplete','authDescendantsReaped'):
+            with self.assertRaises(ValueError): M.verify_joint_recovery({**proof,key:False},subject)
+        for key,value in {'finalPasswordStatus':'P','account':'root','guiUid':0,'plaintextPersisted':True,
+                          'emptyPasswordRestored':True,'temporaryPasswordHash':'restored empty hash'}.items():
+            bad = copy.deepcopy(proof); bad['credentialRecovery'][key]=value
+            bad['jointLease']['credentialRecovery'][key]=value
+            with self.assertRaises(ValueError): M.verify_joint_recovery(bad,subject)
+        bad = copy.deepcopy(proof); bad['jointLease']['credentialRecovery']['account']='other'
+        with self.assertRaises(ValueError): M.verify_joint_recovery(bad,subject)
+
+    def test_group_preparation_is_only_guarded_pending_not_authentication(self):
+        value = {'guarded':True,'authentication':'pending-real-product-authorization',
+                 'authenticationReadiness':{'authenticated':False,'groupMembership':'pending-guarded-lease'}}
+        self.assertEqual(M.verify_group_preparation(value),'prepared-pending-group-lease')
+        for mutate in (lambda v:v.update(guarded=False),lambda v:v.update(authentication='ready'),
+                       lambda v:v['authenticationReadiness'].update(authenticated=True),
+                       lambda v:v['authenticationReadiness'].update(groupMembership='ready')):
+            bad=copy.deepcopy(value);mutate(bad)
+            with self.assertRaises(ValueError): M.verify_group_preparation(bad)
+
+
+    def test_group_gui_adapter_cannot_close_window_on_unproved_joint_recovery(self):
+        credential={'guiUid':1001,'account':'runner','finalPasswordStatus':'L','plaintextPersisted':False,
+                    'emptyPasswordRestored':False,'temporaryPasswordHash':'locked until disposable VM destruction'}
+        proof={'owned':[],'credentialRecovery':credential,'credentialAuthenticationComplete':True,'authDescendantsReaped':True,
+               'jointLease':{'credentialRecovery':dict(credential),'groupRecovery':self.membership_recovery()}}
+        for valid in (True,False):
+            run=M.TunCarrierRun.__new__(M.TunCarrierRun)
+            run.app={'pid':100,'startTime':'123'};run.driver=Mock();run.supervisor=Mock();run.controller=Mock()
+            run.launch_options={'authenticationMode':M.AUTH_GROUP_MODE,'authorization':{'guiUid':1001,'account':'runner'}}
+            result=copy.deepcopy(proof)
+            if not valid: result['jointLease']['groupRecovery']['writerStopped']=False
+            run.controller.call.side_effect=lambda command,**args:result if command=='transaction_end' else {}
+            run.text=lambda key:key
+            replies=iter([[],[{'sequence':1,'kind':'helper','envelopeSuccess':True,'success':True,'installed':True,'ready':True}]])
+            run.tun_observations=lambda:next(replies)
+            if valid:
+                self.assertEqual(run.helper_action('install')['authorization'],result)
+                self.assertEqual(run.membership_gid,27)
+                run.supervisor.end_window.assert_called_once_with([])
+            else:
+                with self.assertRaises(ValueError):run.helper_action('install')
+                run.supervisor.end_window.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

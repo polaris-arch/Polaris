@@ -61,6 +61,11 @@ postconditions, and complete process closure.
 credential action. General TUN installation authorization is not that approval.**
 No such action was executed while implementing or testing these sources.
 
+The password-only mode does not authorize changing group membership. A hosted
+runner's passwordless sudo access does not prove that it is an administrator
+identity offered by polkit. The read-only preflight must not be treated as
+successful authentication, even when the group prerequisite passes.
+
 Only the authorized dispatcher may select:
 
 ```
@@ -106,6 +111,55 @@ The precise potential side effects are:
 
 There is no password setter, arbitrary command/path, generic PID-kill, secret
 setter or unbounded network operation in the GUI/controller IPC.
+
+### Separately approved joint password and existing-sudo-group lease
+
+This is a distinct, closed-by-default action. The password-only approval above
+**does not authorize it**. Do not select it until the user approves this bounded
+membership change on the two dedicated disposable Ubuntu VMs:
+
+```
+linux_tun_auth_mode: temporary-existing-runner-password-and-sudo-group
+linux_tun_credential_authorization: AUTHORIZE TEMPORARY RUNNER PASSWORD AND SUDO GROUP MEMBERSHIP WITH RELOCK AND REMOVAL FOR THIS RUN
+```
+
+The only eligible account is the existing `runner`, UID `1001`. The existing
+`sudo` group must be observed and its actual GID bound to the recovery intent;
+no numeric GID is assumed. Original membership must be absent. The original
+account, locked/no-password prerequisite, source, run and subject identity guards
+remain in force. A failed group preflight is not authorization, readiness or
+successful authentication.
+
+Each install or uninstall authentication transaction has a **90-second total
+restoration deadline**, with a 20-second authentication activity budget and
+70 seconds reserved for recovery. This is a deadline that the run must actually
+measure and satisfy, not a guarantee under arbitrary OS/NSS/storage failure.
+An overrun permanently fails acceptance; emergency recovery must continue and
+must not cancel its timer or claim that the deadline was met. Before adding membership, the controller
+must persist the exact recovery intent and establish the independently verified
+recovery timer. Only the single approved membership is added to the existing
+group. Its identity and membership are re-read before proceeding to the original
+password lease. No new group/account, sudoers rule, polkit rule or global policy
+is installed. The GUI and agent do not acquire new supplementary kernel groups;
+the original clear-groups launch boundary remains unchanged.
+
+**This is a system authorization change within the disposable VM.** During the
+window, NSS-based rules referencing `sudo` can apply to that account beyond the
+Polaris authentication transaction. It is not a product-scoped policy exception
+and must never be used on a shared runner or a user device. Real polkit must offer
+the exact approved runner identity before the private credential is supplied;
+a root or different administrator identity is rejected. NSS membership by itself
+is never accepted as proof that authentication succeeded.
+
+Recovery first fences the owned mutation/authentication writers against late
+writes. Password re-lock and removal of the exact newly added membership are
+independent attempts: failure of one must not skip the other. Recovery re-reads
+locked status, original account/group identities, and membership absence. It may
+remove only a membership attributed to this durable lease, not arbitrary existing
+membership. Missing evidence, identity drift, unclosed writers or unproved
+restoration fail the run and retain recovery responsibility; they are not reported
+as clean. The 600-second network recovery boundary is unchanged. A locked
+temporary password hash can still remain until VM destruction, as above.
 
 ## Execution, observations and termination
 
