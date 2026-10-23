@@ -40,6 +40,8 @@ def supervisor():
     obj.lock = threading.RLock(); obj.window = None; obj.quarantine = {}; obj.confirmed = set()
     obj.controller_birth = None; obj.controller_descendants = {}; obj.gui_birth = None
     obj.owned = {}; obj.children = {}; obj.roles = {}; obj.unknown = []; obj.forced = []
+    obj.diagnostics = []; obj.diagnostics_truncated = False
+    obj.diagnostic_executable_budget = [M.base.DIAGNOSTIC_EXE_LIMIT]
     return obj
 
 
@@ -535,6 +537,232 @@ class PureContracts(unittest.TestCase):
         self.assertIn('self.supervisor.close(self.normal_quit and root_finish is not None)', source)
         self.assertIn("root_finish['watchdogCancelled']", source)
         self.assertNotIn("'watchdogCancelled': True", source)
+
+
+class PrivateProbeContracts(unittest.TestCase):
+    def test_hardlinked_cargo_source_gets_independent_single_link_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp); source = home / 'hashed'; source.write_bytes(b'cargo-probe')
+            alias = home / 'example'; os.link(source, alias)
+            copied = M.private_root_probe(alias, home, hashlib.sha256(b'cargo-probe').hexdigest())
+            self.assertEqual(alias.stat().st_nlink, 2)
+            self.assertEqual(copied.stat().st_nlink, 1)
+            self.assertNotEqual(copied.stat().st_ino, alias.stat().st_ino)
+            self.assertEqual(copied.read_bytes(), alias.read_bytes())
+            self.assertEqual(copied.stat().st_mode & 0o777, 0o500)
+            with self.assertRaises(FileExistsError): M.private_root_probe(alias, home, M.base.sha(alias))
+
+    def test_source_symlink_hash_mismatch_and_unprivate_directory_rejected(self):
+        for fault in ('symlink', 'hash', 'directory'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp); source = home / 'source'; source.write_bytes(b'probe')
+                if fault == 'symlink':
+                    alias = home / 'alias'; alias.symlink_to(source); source = alias
+                if fault == 'directory': home.chmod(0o755)
+                digest = '0' * 64 if fault == 'hash' else M.base.sha(source)
+                with self.assertRaises(ValueError): M.private_root_probe(source, home, digest)
+                self.assertFalse((home / 'root-rpc-probe').exists())
+
+    def test_partial_write_failure_retained_without_source_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp); source = home / 'source'; source.write_bytes(b'probe')
+            with patch.object(M.os, 'fsync', side_effect=OSError('PRIVATE')):
+                with self.assertRaises(OSError): M.private_root_probe(source, home, M.base.sha(source))
+            self.assertEqual(source.read_bytes(), b'probe')
+            self.assertTrue((home / 'root-rpc-probe').exists())
+
+    def test_foreign_owner_and_source_changed_during_copy_rejected(self):
+        for fault in ('owner', 'late-change'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp); source = home / 'source'; source.write_bytes(b'probe')
+                real_sync = os.fsync
+                def change_source(fd):
+                    real_sync(fd); source.write_bytes(b'other')
+                context = patch.object(M.os, 'getuid', return_value=os.getuid() + 1) if fault == 'owner' else patch.object(M.os, 'fsync', side_effect=change_source)
+                with context:
+                    with self.assertRaises(ValueError): M.private_root_probe(source, home, hashlib.sha256(b'probe').hexdigest())
+
+    def test_source_replacement_between_lstat_and_open_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp); source = home / 'source'; source.write_bytes(b'probe')
+            replacement = home / 'replacement'; replacement.write_bytes(b'probe')
+            real_open = os.open
+            def racing_open(path, *args, **kwargs):
+                if Path(path) == source: replacement.replace(source)
+                return real_open(path, *args, **kwargs)
+            with patch.object(M.os, 'open', side_effect=racing_open):
+                with self.assertRaises(ValueError): M.private_root_probe(source, home, hashlib.sha256(b'probe').hexdigest())
+            self.assertFalse((home / 'root-rpc-probe').exists())
+
+    def test_source_mutation_after_read_and_target_replacement_rejected(self):
+        for fault in ('source', 'target'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp); source = home / 'source'; source.write_bytes(b'probe')
+                original = os.fstat; counts = {}
+                def racing_stat(fd):
+                    counts[fd] = counts.get(fd, 0) + 1
+                    value = original(fd)
+                    if fault == 'source' and value.st_ino == source.stat().st_ino and counts[fd] == 2:
+                        source.write_bytes(b'other')
+                        return original(fd)
+                    return value
+                real_sync = os.fsync
+                def racing_sync(fd):
+                    real_sync(fd)
+                    if fault == 'target':
+                        target = home / 'root-rpc-probe'; target.unlink(); target.write_bytes(b'other')
+                with patch.object(M.os, 'fstat', side_effect=racing_stat), patch.object(M.os, 'fsync', side_effect=racing_sync):
+                    with self.assertRaises(ValueError): M.private_root_probe(source, home, hashlib.sha256(b'probe').hexdigest())
+                if fault == 'target': self.assertEqual((home / 'root-rpc-probe').read_bytes(), b'other')
+
+
+class ControllerLifecycleContracts(unittest.TestCase):
+    def test_allocation_never_spawns(self):
+        with patch.object(M.subprocess, 'Popen') as popen:
+            client = M.Controller()
+        popen.assert_not_called()
+        self.assertIsNone(client.child)
+        self.assertFalse(client.lifecycle['spawned'])
+
+    def test_pre_ready_failure_matrix_retains_handle_and_never_signals_root(self):
+        for fault in ('envelope', 'spawn', 'birth', 'write-envelope', 'malformed', 'eof', 'timeout', 'wrong-ready', 'root-failure'):
+            with self.subTest(fault=fault):
+                client = M.Controller(); sup = supervisor(); child = Mock(); child.pid = 901
+                child.wait.return_value = 70
+                launch = {'runId': '123456789abc'}
+                sources = {'source': b'x' * (2 * 1024 * 1024 if fault == 'envelope' else 1)}
+                ready = {'schema': 'polaris-tun-controller-v1', 'ready': True, 'runId': launch['runId']}
+                if fault == 'wrong-ready': ready['runId'] = '000000000000'
+                if fault == 'root-failure': ready = {'schema': 'polaris-tun-controller-v1', 'ready': False,
+                    'runId': launch['runId'], 'startupFailure': {'stage': 'probe', 'code': 'BOOTSTRAP_FAILED',
+                        'stagingCleanup': 'removed', 'secret': 'NEVER-EXPORT'}}
+                read_error = ValueError('NEVER-EXPORT') if fault in ('malformed', 'eof', 'timeout') else None
+                with patch.object(M.subprocess, 'Popen', return_value=child,
+                                  side_effect=OSError('NEVER-EXPORT') if fault == 'spawn' else None) as popen, \
+                     patch.object(M.base, 'process_identity', return_value=None if fault == 'birth' else identity(901)), \
+                     patch.object(client, '_write', side_effect=BrokenPipeError('NEVER-EXPORT') if fault == 'write-envelope' else None), \
+                     patch.object(client, '_read', return_value=ready, side_effect=read_error), \
+                     patch.object(M.os, 'kill') as kill:
+                    with self.assertRaises(Exception): client.start(launch, sources, sup, {})
+                    result = client.recover()
+                kill.assert_not_called()
+                self.assertEqual(result['state'], 'failed')
+                self.assertFalse(client.lifecycle['ready'])
+                self.assertNotIn('NEVER-EXPORT', json.dumps(client.lifecycle))
+                if fault in ('envelope', 'spawn'):
+                    child.stdin.close.assert_not_called(); child.wait.assert_not_called()
+                else:
+                    self.assertIs(client.child, child)
+                    child.stdin.close.assert_called_once(); child.wait.assert_called_once_with(timeout=20)
+                    self.assertTrue(client.closed)
+                if fault == 'root-failure':
+                    self.assertEqual(client.lifecycle['rootStartupFailure']['stage'], 'probe')
+
+    def test_ready_abort_failure_and_incomplete_exit_are_unknown(self):
+        for fault in ('abort', 'input-close', 'wait'):
+            with self.subTest(fault=fault):
+                client = M.Controller(); client.child = Mock()
+                client.child.wait.return_value = 1
+                client.lifecycle.update(spawned=True, ready=True)
+                if fault == 'input-close': client.child.stdin.close.side_effect = OSError('PRIVATE')
+                if fault == 'wait': client.child.wait.side_effect = M.subprocess.TimeoutExpired('fixed-child', 20)
+                with patch.object(client, 'call', return_value={'unknown': []},
+                                  side_effect=ValueError('PRIVATE') if fault == 'abort' else None) as call, \
+                     patch.object(M.os, 'kill') as kill:
+                    result = client.recover()
+                call.assert_called_once_with('abort'); kill.assert_not_called()
+                self.assertEqual(result['state'], 'failed')
+                self.assertGreater(len(result['unknown']), 1)
+                self.assertEqual(client.closed, fault != 'wait')
+                self.assertNotIn('PRIVATE', json.dumps(client.lifecycle))
+
+    def test_real_pipe_read_eof_malformed_timeout_and_buffered_frames(self):
+        # Actual unprivileged anonymous pipes only: no child/product/root process.
+        for mode in ('frames', 'eof', 'malformed', 'timeout'):
+            with self.subTest(mode=mode):
+                read_fd, write_fd = os.pipe()
+                client = M.Controller()
+                client.child = SimpleNamespace(stdout=os.fdopen(read_fd, 'rb'))
+                try:
+                    if mode == 'frames': os.write(write_fd, b'{"one":1}\n{"two":2}\n')
+                    elif mode == 'malformed': os.write(write_fd, b'PRIVATE-invalid-json\n')
+                    elif mode == 'eof': os.close(write_fd); write_fd = -1
+                    if mode == 'frames':
+                        self.assertEqual(client._read(0.05), {'one': 1})
+                        self.assertEqual(client._read(0.05), {'two': 2})
+                    else:
+                        with self.assertRaises(ValueError): client._read(0.01)
+                finally:
+                    if write_fd >= 0: os.close(write_fd)
+                    client.child.stdout.close()
+
+    def test_real_pipe_write_is_bounded_json_line(self):
+        read_fd, write_fd = os.pipe(); client = M.Controller()
+        client.child = SimpleNamespace(stdin=os.fdopen(write_fd, 'wb'))
+        try:
+            client._write({'seq': 1, 'action': 'abort'})
+            self.assertEqual(json.loads(os.read(read_fd, 4096)), {'seq': 1, 'action': 'abort'})
+        finally:
+            client.child.stdin.close(); os.close(read_fd)
+
+    def test_bind_failure_frame_is_allowlisted_and_unknown_fields_are_not_exported(self):
+        client = M.Controller(); client.lifecycle['ready'] = True
+        response = {'seq': 1, 'ok': False, 'error': {'stage': 'bind-gui', 'code': 'CONTROLLER_FAILED',
+                                                   'message': 'PRIVATE', 'secret': 'PRIVATE'}}
+        with patch.object(client, '_write'), patch.object(client, '_read', return_value=response):
+            with self.assertRaises(ValueError): client.call('bind_gui', pid=10)
+        self.assertEqual(client.lifecycle['rootOperationFailure'], {'stage': 'bind-gui', 'code': 'CONTROLLER_FAILED'})
+        self.assertNotIn('PRIVATE', json.dumps(client.lifecycle))
+        client = M.Controller(); response['error']['stage'] = 'PRIVATE'
+        with patch.object(client, '_write'), patch.object(client, '_read', return_value=response):
+            with self.assertRaises(ValueError): client.call('bind_gui', pid=10)
+        self.assertNotIn('rootOperationFailure', client.lifecycle)
+
+    def test_finish_wait_failure_keeps_handle_open_for_recovery(self):
+        client = M.Controller(); client.child = Mock(); client.lifecycle.update(spawned=True, ready=True)
+        client.child.wait.side_effect = [M.subprocess.TimeoutExpired('fixed-child', 15), 0]
+        with patch.object(client, 'call', return_value={'unknown': []}):
+            with self.assertRaises(M.subprocess.TimeoutExpired): client.finish()
+            self.assertFalse(client.closed)
+            result = client.recover()
+        self.assertTrue(client.closed)
+        self.assertEqual(result['state'], 'failed')
+        self.assertNotIn('privilegedProcessesReaped', result)
+
+    def test_start_controller_assigns_before_start_can_fail(self):
+        import root_controller
+        with tempfile.TemporaryDirectory() as tmp:
+            run = M.TunCarrierRun.__new__(M.TunCarrierRun)
+            run.home = Path(tmp); directory = run.home / 'config/com.polaris.app/polaris'; directory.mkdir(parents=True)
+            run.env = {'XDG_CONFIG_HOME': str(run.home / 'config')}; run.supervisor = supervisor()
+            run.result = {}; run.run_id = '123456789abc'; run.rpc_client = run.home / 'probe'; run.rpc_client.write_bytes(b'probe')
+            run.members = {'app': {'sha256': H}, 'core': {'sha256': H}}
+            run.bound = {'helperBinding': {'helper': {'sha256': H}}}; run.item = {'sha256': H}; run.launch_options = {}
+            run.controller = None
+            client = Mock(); client.lifecycle = {'stage': 'allocated'}
+            client.start.side_effect = ValueError('PRIVATE')
+            source = Mock(); source.read_bytes.return_value = b'frozen-test'
+            with patch.object(M, 'direct_driver', return_value=identity()), \
+                 patch.object(M.base, 'regular', return_value=source), patch.object(M.base, 'sha', return_value=H), \
+                 patch.object(root_controller, 'validate_launch'), patch.object(M, 'private_root_probe', return_value=run.rpc_client), \
+                 patch.object(M, 'Controller', return_value=client):
+                with self.assertRaises(ValueError): run.start_controller()
+            self.assertIs(run.controller, client)
+            self.assertIs(run.result['controllerLifecycle'], client.lifecycle)
+            self.assertEqual(run.result['rootPreparationProgress']['stage'], 'controller-start')
+
+    def test_tun_rejections_keep_original_unknown_and_add_bounded_diagnostics(self):
+        obj = supervisor(); gui = identity(10, os.getuid()); foreign = identity(11, os.getuid() + 1, 10)
+        obj.owned[10] = gui; obj.roles[10] = 'product'
+        with patch.object(M.Path, 'iterdir', return_value=[Path('/proc/10'), Path('/proc/11')]), \
+             patch.object(M.base, 'process_identity', side_effect=lambda pid: {10: gui, 11: foreign}.get(pid)), \
+             patch.object(obj, 'record_diagnostic') as diagnostic:
+            obj.scan()
+        self.assertIn('foreign-descendant-outside-exact-GUI-transaction', obj.unknown)
+        self.assertNotIn(11, obj.owned)
+        self.assertEqual([call.args[0] for call in diagnostic.call_args_list],
+                         ['foreign-descendant-outside-exact-gui-transaction', 'tun-privileged-birth-quarantined'])
+        self.assertTrue(all(call.kwargs['stage'] == 'tun-scan' for call in diagnostic.call_args_list))
 
 
 if __name__ == '__main__':

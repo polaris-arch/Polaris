@@ -32,38 +32,80 @@ MAX_CAPTURE = 16 * 1024 * 1024
 # This literal is the entire root bootstrap program. Parent source/transport
 # admission must bind its bytes and codeHashes; the stdin manifest is not itself
 # a source/carrier verifier. No user-selected destination or command is accepted.
+BOOTSTRAP_STAGES = ('envelope', 'sources', 'staging', 'probe', 'exec',
+                    'frozen-load', 'subreaper', 'controller-init')
+CONTROLLER_STAGES = ('idle', 'bind-gui', 'authentication-readiness', 'vm-preflight',
+                     'tool-identities', 'root-ledger', 'controller-ledger',
+                     'auth-watchdog-start', 'auth-watchdog-verify', 'prepared', 'dispatch')
 BOOTSTRAP = r'''import os,sys,json,base64,hashlib,re,stat
 from pathlib import Path
-assert os.geteuid()==0 and sys.flags.isolated
-raw=sys.stdin.buffer.readline(2*1024*1024+1)
-assert raw.endswith(b'\n') and len(raw)<=2*1024*1024
-v=json.loads(raw); assert set(v)=={'launch','files'}
-l=v['launch']; r=l['runId']; assert re.fullmatch('[0-9a-f]{12}',r)
-names={'root_controller.py','tun.py','tun_fixtures.py','fixtures.py'}
-assert set(v['files'])==set(l['codeHashes'])==names
-contents={}
-for n in names:
- b=base64.b64decode(v['files'][n],validate=True)
- assert 0<len(b)<=1024*1024 and hashlib.sha256(b).hexdigest()==l['codeHashes'][n]
- contents[n]=b
-base=Path('/run/polaris-tun-controller')
-if not base.exists(): base.mkdir(mode=0o700)
-for p in [base,*base.parents]:
- s=p.lstat(); assert stat.S_ISDIR(s.st_mode) and s.st_uid==0 and not s.st_mode&0o022
-assert not base.stat().st_mode&0o077
-d=base/r; d.mkdir(mode=0o700)
-contents['launch.json']=json.dumps(l,sort_keys=True,separators=(',',':')).encode()
-for n,b in contents.items():
- fd=os.open(d/n,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
- with os.fdopen(fd,'wb') as f: f.write(b); f.flush(); os.fsync(f.fileno())
-p=Path(l['rpcProbePath']); fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)
-with os.fdopen(fd,'rb') as f:
- s=os.fstat(f.fileno()); assert stat.S_ISREG(s.st_mode) and s.st_uid==l['guiUid'] and s.st_nlink==1 and 0<s.st_size<=128*1024*1024
- b=f.read(); assert hashlib.sha256(b).hexdigest()==l['rpcProbeSha256']
-fd=os.open(d/'rpc-probe',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o500)
-with os.fdopen(fd,'wb') as f: f.write(b); f.flush(); os.fsync(f.fileno())
-os.execve('/usr/bin/python3',['/usr/bin/python3','-I',str(d/'root_controller.py'),'serve','--run-id',r],{'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'})
+stage='envelope'; run_id=None; d=None; dfd=None; directory_identity=None; created={}
+def cleanup_staging():
+ if d is None: return 'not-created'
+ if dfd is None: return 'unconfirmed'
+ ok=True
+ for name,identity in created.items():
+  try:
+   s=os.stat(name,dir_fd=dfd,follow_symlinks=False)
+   assert stat.S_ISREG(s.st_mode) and s.st_uid==0 and s.st_nlink==1 and (s.st_dev,s.st_ino)==identity
+   os.unlink(name,dir_fd=dfd)
+  except Exception: ok=False
+ try:
+  s=d.lstat()
+  assert stat.S_ISDIR(s.st_mode) and s.st_uid==0 and (s.st_dev,s.st_ino)==directory_identity
+  if ok: d.rmdir()
+ except Exception: ok=False
+ return 'removed' if ok else 'unconfirmed'
+try:
+ assert os.geteuid()==0 and sys.flags.isolated
+ raw=sys.stdin.buffer.readline(2*1024*1024+1)
+ assert raw.endswith(b'\n') and len(raw)<=2*1024*1024
+ v=json.loads(raw); assert set(v)=={'launch','files'}
+ l=v['launch']; r=l['runId']; assert re.fullmatch('[0-9a-f]{12}',r); run_id=r
+ stage='sources'
+ names={'root_controller.py','tun.py','tun_fixtures.py','fixtures.py'}
+ assert set(v['files'])==set(l['codeHashes'])==names
+ contents={}
+ for n in names:
+  b=base64.b64decode(v['files'][n],validate=True)
+  assert 0<len(b)<=1024*1024 and hashlib.sha256(b).hexdigest()==l['codeHashes'][n]
+  contents[n]=b
+ stage='staging'
+ base=Path('/run/polaris-tun-controller')
+ if not base.exists(): base.mkdir(mode=0o700)
+ for p in [base,*base.parents]:
+  s=p.lstat(); assert stat.S_ISDIR(s.st_mode) and s.st_uid==0 and not s.st_mode&0o022
+ assert not base.stat().st_mode&0o077
+ candidate=base/r; candidate.mkdir(mode=0o700)
+ d=candidate
+ dfd=os.open(d,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ s=os.fstat(dfd); directory_identity=(s.st_dev,s.st_ino)
+ contents['launch.json']=json.dumps(l,sort_keys=True,separators=(',',':')).encode()
+ for n,b in contents.items():
+  fd=os.open(n,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=dfd)
+  with os.fdopen(fd,'wb') as f:
+   s=os.fstat(f.fileno()); created[n]=(s.st_dev,s.st_ino)
+   f.write(b); f.flush(); os.fsync(f.fileno())
+ stage='probe'
+ p=Path(l['rpcProbePath']); fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)
+ with os.fdopen(fd,'rb') as f:
+  s=os.fstat(f.fileno()); assert stat.S_ISREG(s.st_mode) and s.st_uid==l['guiUid'] and s.st_nlink==1 and 0<s.st_size<=128*1024*1024
+  b=f.read(); assert hashlib.sha256(b).hexdigest()==l['rpcProbeSha256']
+ fd=os.open('rpc-probe',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o500,dir_fd=dfd)
+ with os.fdopen(fd,'wb') as f:
+  s=os.fstat(f.fileno()); created['rpc-probe']=(s.st_dev,s.st_ino)
+  f.write(b); f.flush(); os.fsync(f.fileno())
+ stage='exec'
+ os.execve('/usr/bin/python3',['/usr/bin/python3','-I',str(d/'root_controller.py'),'serve','--run-id',r],{'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C','LC_ALL':'C'})
+except BaseException:
+ cleanup=cleanup_staging()
+ print(json.dumps({'schema':'polaris-tun-controller-v1','ready':False,'runId':run_id,
+  'startupFailure':{'stage':stage,'code':'BOOTSTRAP_FAILED','stagingCleanup':cleanup}}),flush=True)
+ raise SystemExit(70 if cleanup in ('not-created','removed') else 71)
+finally:
+ if dfd is not None: os.close(dfd)
 '''
+
 
 
 class AuthenticationNotReady(ValueError):
@@ -751,6 +793,7 @@ class Controller:
         self.ops = tun.Commands(); self.seq = 0; self.failed = False; self.finished = False
         self.gui = None; self.ledger = None; self.observer = None; self.fixtures = {}; self.capture_offset = 0
         self.agent = None; self.pty = None; self.tools = {}; self.lease = None; self.auth_observer = None
+        self.stage = 'idle'; self.preparation_pending = False; self.recovery_unknown = []
 
     def fail(self):
         self.failed = True
@@ -758,7 +801,8 @@ class Controller:
             try: self.lease.close()
             except Exception: pass  # independent fixed lease watchdog remains armed
         if self.ledger:
-            self.ledger.mutate(lambda v: v.update(result='failed'))
+            try: self.ledger.mutate(lambda v: v.update(result='failed'))
+            except Exception: self.recovery_unknown.append('root-ledger-failure-unconfirmed')
 
     def guard(self):
         require(self.ledger is not None, 'guard not prepared')
@@ -776,6 +820,7 @@ class Controller:
         return proof
 
     def bind_gui(self, pid):
+        self.stage = 'bind-gui'
         require(self.gui is None and type(pid) is int and pid > 1, 'single actual GUI birth required')
         gui = self.ops.proc(pid); driver = self.ops.proc(self.launch['driver']['pid'])
         require(driver and birth(driver) == (self.launch['driver']['pid'], self.launch['driver']['startTime']) and
@@ -823,31 +868,39 @@ class Controller:
 
     def prepare(self):
         require(self.gui and self.ledger is None, 'single preparation after GUI binding required')
+        self.stage = 'authentication-readiness'
         readiness = self.authentication_readiness()
+        self.stage = 'vm-preflight'
         facts = self.tun.collect_preflight(self.launch['guiUid'], self.launch['vmContext'], True, self.ops)
         check = self.tun.preflight(facts, self.launch, authentication_confirmed=False)
         require(check['blocked'] == ['realPkexecAuthenticationPendingConfirmation'], 'VM/material preflight blocked')
         # Registration/guard preparation is NOT authentication. Network remains closed
         # until the real original product installation authorization is observed.
+        self.stage = 'tool-identities'
         self.tools = {name: self.tun.file_identity(Path(path).resolve()) for name, path in
                       (('pkexec', '/usr/bin/pkexec'), ('bash', '/bin/bash'), ('pkttyagent', '/usr/bin/pkttyagent'))}
+        self.stage = 'root-ledger'; self.preparation_pending = True
         self.ledger = self.tun.prepare_root(self.launch['runId'], self.launch['guiUid'],
             {'systemNamespaces': facts['systemNamespaces'], 'network': facts['network']},
             self.launch['helperSha256'], self.launch['coreSha256'], seconds=600, ops=self.ops)
+        self.preparation_pending = False; self.stage = 'controller-ledger'
         self.ledger.mutate(lambda v: v.update(controllerGui=self.gui, controllerIdentity=self.tun.process_identity(os.getpid()), authentication={'mode': self.launch['authenticationMode'],
             'authorized': False, 'closed': False, 'accountMutated': False, 'agent': None}, transactionProcesses=[]))
         independent_record(self.directory, 'controller-birth.json', self.tun.process_identity(os.getpid()))
         unit = 'polaris-tun-auth-' + self.launch['runId']
         started = time.monotonic()
+        self.stage = 'auth-watchdog-start'
         self.ops.run(['/usr/bin/systemd-run', '--unit=' + unit, '--on-active=580s', '--timer-property=AccuracySec=1s',
             '--property=Type=oneshot', '--property=TimeoutStartSec=15s', '/usr/bin/env', '-i', 'PATH=' + ENV['PATH'],
             'LANG=C', '/usr/bin/python3', '-I', str(self.directory / 'root_controller.py'),
             'watch-auth', '--run-id', self.launch['runId']])
+        self.stage = 'auth-watchdog-verify'
         verify_timer(self.ops, self.tun, unit, ['/usr/bin/env', '-i', 'PATH=' + ENV['PATH'], 'LANG=C',
                      '/usr/bin/python3', '-I', str(self.directory / 'root_controller.py'), 'watch-auth',
                      '--run-id', self.launch['runId']], 580, started)
         require(time.monotonic() + 580 < self.ledger.load()['deadlineMonotonic'] - 5, 'auth watchdog preparation consumed reserved margin')
         self.ledger.mutate(lambda v: v.update(authenticationWatchdogActive=True, authenticationTimer=unit + '.timer'))
+        self.stage = 'prepared'
         return {'guarded': True, 'authentication': 'pending-real-product-authorization', 'preflight': check, 'authenticationReadiness': readiness,
                 'controllerDeadlineMarginSeconds': 30}
 
@@ -1087,6 +1140,7 @@ class Controller:
                 'accountMutated': False, 'publicationEligible': False}
 
     def dispatch(self, message):
+        self.stage = 'dispatch'
         require(type(message) is dict and type(message.get('seq')) is int and message['seq'] == self.seq + 1,
                 'request sequence/replay differs')
         seq = message['seq']; self.seq = seq; action = message.get('action')
@@ -1142,9 +1196,11 @@ class Controller:
         self.fail()
         if self.observer:
             self.observer.stop.set(); self.observer.thread.join(timeout=3); self.observer = None
-        if not self.ledger: return {'state': 'failed', 'prepared': False}
+        if not self.ledger:
+            return {'state': 'failed', 'prepared': None if self.preparation_pending else False, 'unknown': sorted(set(self.recovery_unknown +
+                (['root-preparation-incomplete'] if self.preparation_pending else [])))}
         # Auth recovery is independent and attempted even if product cleanup raises.
-        errors = []
+        errors = list(self.recovery_unknown)
         if self.auth_observer:
             try: self.auth_observer.close(forced=True)
             except Exception: errors.append('authentication-subtree-cleanup-unknown')
@@ -1155,8 +1211,10 @@ class Controller:
         except Exception: errors.append('privilege-transaction-cleanup-unknown')
         try: result = self.tun.cleanup(self.ledger, forced=True)
         except Exception: result = {'state': 'failed'}; errors.append('product-cleanup-unknown')
-        self.ledger.mutate(lambda v: v.update(unknown=sorted(set(v['unknown'] + errors)), result='failed'))
-        return {'state': 'failed', 'forced': True, 'unknown': errors, 'productCleanup': result}
+        try:
+            self.ledger.mutate(lambda v: v.update(unknown=sorted(set(v['unknown'] + errors)), result='failed'))
+        except Exception: errors.append('root-ledger-recovery-unconfirmed')
+        return {'state': 'failed', 'forced': True, 'unknown': sorted(set(errors)), 'productCleanup': result}
 
 
 def close_transactions(ledger, tun, signal_live=True):
@@ -1206,14 +1264,27 @@ def main():
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--transaction', choices=('install', 'uninstall'))
     args = parser.parse_args()
-    launch, tun, directory = load_frozen(args.run_id, recovery=args.command != 'serve')
+    if args.command == 'serve':
+        startup_stage = 'frozen-load'
+        try:
+            launch, tun, directory = load_frozen(args.run_id)
+            startup_stage = 'subreaper'
+            import ctypes
+            require(ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0, 'process-local child subreaper required')
+            startup_stage = 'controller-init'
+            controller = Controller(launch, tun, directory)
+        except BaseException:
+            print(json.dumps({'schema': SCHEMA, 'ready': False,
+                'runId': args.run_id if re.fullmatch(r'[0-9a-f]{12}', args.run_id) else None,
+                'startupFailure': {'stage': startup_stage, 'code': 'FROZEN_STARTUP_FAILED',
+                                   'stagingCleanup': 'retained'}}), flush=True)
+            raise SystemExit(72) from None
+    else:
+        launch, tun, directory = load_frozen(args.run_id, recovery=True)
     if args.command in ('watch-lease', 'watch-auth'):
         require((args.command == 'watch-lease') == bool(args.transaction), 'watchdog transaction binding differs')
         watchdog_recover(launch, tun, directory, args.transaction)
         raise SystemExit(1)  # timeout/recovery always fails acceptance
-    import ctypes
-    require(ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0, 'process-local child subreaper required')
-    controller = Controller(launch, tun, directory)
     print(json.dumps({'schema': SCHEMA, 'ready': True, 'runId': args.run_id,
                       'credentialMutationImplemented': True, 'credentialAuthorityPresent': launch['authorization'] is not None}), flush=True)
     try:
@@ -1228,6 +1299,7 @@ def main():
                 response = {'seq': controller.seq, 'ok': False, 'terminal': True,
                             'error': {'code': 'AUTHENTICATION_NOT_READY' if not_ready else 'CONTROLLER_FAILED',
                                       'kind': type(error).__name__,
+                                      'stage': controller.stage if controller.stage in CONTROLLER_STAGES else 'dispatch',
                                       'message': 'fixed operation failed; no acceptance or authentication success'}}
                 if not_ready:
                     response['error'].update(mutated=False, mutationScope='product-network-account')

@@ -218,10 +218,72 @@ def process_identity(pid):
         return None
 
 
-def process_diagnostic(item):
+DIAGNOSTIC_EXE_LIMIT = 64 * 1024 * 1024
+DIAGNOSTIC_ANCESTORS = 8
+
+
+def diagnostic_error(error):
+    # Do not export exception text, argv, environment, or arbitrary paths.
+    return {'state': 'unknown', 'errno': error.errno if isinstance(error, OSError) else None}
+
+
+def executable_diagnostic(item, budget):
+    """Optional executable facts, not identity or signal authorization."""
+    path = Path('/proc') / str(item['pid']) / 'exe'
+    result = {'state': 'unknown'}
+    deadline = time.monotonic() + 1
+    diagnostic_stage = 'birth-check'
+    try:
+        if not same_process(item, process_identity(item['pid'])):
+            return {'state': 'unstable'}
+        diagnostic_stage = 'executable-link'
+        link = os.readlink(path)
+        require(0 < len(link) <= 4096 and link.startswith('/') and
+                all(ord(char) >= 32 and ord(char) != 127 for char in link), 'executable link bound')
+        result['link'] = link
+        diagnostic_stage = 'executable-open'
+        with path.open('rb') as stream:
+            before = os.fstat(stream.fileno())
+            require(stat.S_ISREG(before.st_mode), 'executable must be regular')
+            result.update(device=before.st_dev, inode=before.st_ino, bytes=before.st_size,
+                          mode=stat.S_IMODE(before.st_mode), ownerUid=before.st_uid, ownerGid=before.st_gid)
+            diagnostic_stage = 'executable-byte-budget'
+            require(0 < before.st_size <= min(DIAGNOSTIC_EXE_LIMIT, budget[0]), 'executable diagnostic byte budget')
+            digest = hashlib.sha256()
+            total = 0
+            while total < before.st_size:
+                diagnostic_stage = 'executable-time-budget'
+                require(time.monotonic() <= deadline, 'executable diagnostic deadline')
+                block = stream.read(min(65536, before.st_size - total))
+                require(block, 'executable diagnostic short read')
+                total += len(block)
+                budget[0] -= len(block)
+                digest.update(block)
+                require(time.monotonic() <= deadline, 'executable diagnostic deadline')
+            diagnostic_stage = 'executable-stability'
+            require(not stream.read(1), 'executable diagnostic grew')
+            after = os.fstat(stream.fileno())
+            signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            require(signature(before) == signature(after), 'executable diagnostic changed')
+            # An exec can replace the executable without changing process birth.
+            current = path.stat()
+            require(signature(current) == signature(before) and os.readlink(path) == link,
+                    'executable diagnostic exec transition')
+        if not same_process(item, process_identity(item['pid'])):
+            return {'state': 'unstable'}
+        result.update(state='observed-not-authorization', sha256=digest.hexdigest())
+    except (OSError, ValueError) as error:
+        # Do not retain partial path/metadata across failed birth/exec checks.
+        result = diagnostic_error(error)
+        result['failureStage'] = diagnostic_stage
+    return result
+
+
+def process_diagnostic(item, *, executable_budget=None):
     """Bounded public kernel facts only; never grants signal authority."""
     result = {key: item.get(key) for key in ('pid', 'startTime', 'ppid', 'uid')}
     result['observation'] = 'unknown'
+    budget = executable_budget if executable_budget is not None else [DIAGNOSTIC_EXE_LIMIT]
     base = Path('/proc') / str(item['pid'])
     try:
         before = process_identity(item['pid'])
@@ -231,6 +293,9 @@ def process_diagnostic(item):
             status = stream.read(16385)
         require(len(status) <= 16384, 'status diagnostic bound')
         fields = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
+        name = fields.get('Name', '').strip()
+        result['nameHint'] = name if re.fullmatch(r'[A-Za-z0-9_.+() -]{1,64}', name) else 'unknown'
+        result['nameHintScope'] = 'mutable-kernel-name-not-executable-identity'
         for name, count, pattern in (('Uid', 4, r'[0-9]+'), ('Gid', 4, r'[0-9]+'),
                                       ('CapEff', 1, r'[0-9a-fA-F]{1,16}'),
                                       ('CapPrm', 1, r'[0-9a-fA-F]{1,16}'),
@@ -242,20 +307,24 @@ def process_diagnostic(item):
             try:
                 value = os.readlink(base / 'ns' / namespace)
                 result[namespace + 'Namespace'] = value if re.fullmatch(namespace + r':\[[0-9]+\]', value) else 'unknown'
-            except OSError:
+            except OSError as error:
                 result[namespace + 'Namespace'] = 'unknown'
+                result[namespace + 'NamespaceError'] = diagnostic_error(error)
         try:
             with (base / 'uid_map').open() as stream:
                 mapping = stream.read(1025)
             rows = [line.split() for line in mapping.splitlines()]
             result['uidMap'] = rows if len(mapping) <= 1024 and 0 < len(rows) <= 16 and all(len(row) == 3 and all(re.fullmatch(r'[0-9]+', v) for v in row) for row in rows) else 'unknown'
-        except OSError:
+        except OSError as error:
             result['uidMap'] = 'unknown'
+            result['uidMapError'] = diagnostic_error(error)
+        result['executable'] = executable_diagnostic(item, budget)
         if not same_process(item, process_identity(item['pid'])):
             return {**{key: item.get(key) for key in ('pid', 'startTime', 'ppid', 'uid')}, 'observation': 'unstable'}
         result['observation'] = 'same-birth-snapshot-not-authorization'
-    except (OSError, ValueError):
+    except (OSError, ValueError) as error:
         result['observation'] = 'unknown'
+        result['error'] = diagnostic_error(error)
     return result
 
 
@@ -336,6 +405,7 @@ class Supervisor:
         self.unknown = []
         self.diagnostics = []
         self.diagnostics_truncated = False
+        self.diagnostic_executable_budget = [DIAGNOSTIC_EXE_LIMIT]
         self.forced = []
         self.network = {}
         self.network_errors = set()
@@ -355,17 +425,72 @@ class Supervisor:
                 if 'process-inventory-unreadable' not in self.unknown:
                     self.unknown.append('process-inventory-unreadable')
 
-    def record_diagnostic(self, code, item, parent=None):
+    def record_diagnostic(self, code, item, parent=None, *, stage=None):
+        try:
+            self._record_diagnostic(code, item, parent, stage=stage)
+        except Exception:
+            # Diagnostic failure never substitutes for the original rejection.
+            if 'identity-diagnostic-unavailable' not in self.unknown:
+                self.unknown.append('identity-diagnostic-unavailable')
+
+    def _record_diagnostic(self, code, item, parent=None, *, stage=None):
+        """Shared by plain/TUN rejection paths; observation never grants ownership."""
         with self.lock:
+            # Labels are fixed call-site classifications, not raw errors or argv.
+            label = lambda value: value if isinstance(value, str) and re.fullmatch(r'[a-z][a-z0-9-]{0,63}', value) else 'unknown'
             key = (code, item['pid'], item['startTime'])
             if any((row['code'], row['process']['pid'], row['process']['startTime']) == key for row in self.diagnostics):
                 return
             if len(self.diagnostics) >= 64:
                 self.diagnostics_truncated = True
                 return
-            row = {'code': code, 'process': process_diagnostic(item)}
-            if parent:
-                row['parent'] = {key: parent[key] for key in ('pid', 'startTime', 'uid')}
+            budget = self.diagnostic_executable_budget
+            def facts(identity):
+                remembered = same_process(identity, self.owned.get(identity['pid']))
+                row = process_diagnostic(identity, executable_budget=budget)
+                confirmed = row.get('observation') == 'same-birth-snapshot-not-authorization'
+                row['role'] = label(self.roles.get(identity['pid'])) if remembered and confirmed else 'unknown'
+                row['directSpawnRole'] = row['role'] if remembered and identity['pid'] in self.children else 'unknown'
+                return row
+            row = {'code': label(code), 'stage': label(stage or 'process-inventory'),
+                   'process': facts(item), 'ancestors': [], 'ancestryState': 'unknown'}
+            if parent is None:
+                parent = self.owned.get(item.get('ppid'))
+            if parent is not None:
+                row['parent'] = {key: parent.get(key) for key in ('pid', 'startTime', 'uid', 'ppid')}
+                row['parent'].update(observation='inventory-birth-not-revalidated', role='unknown', directSpawnRole='unknown')
+            seen = {(item['pid'], item['startTime'])}
+            for _ in range(DIAGNOSTIC_ANCESTORS):
+                if parent is None:
+                    break
+                birth = (parent['pid'], parent['startTime'])
+                if birth in seen:
+                    row['ancestryState'] = 'cycle'
+                    break
+                seen.add(birth)
+                try:
+                    current = process_identity(parent['pid'])
+                except (OSError, ValueError):
+                    current = None
+                if not same_process(parent, current) or not same_process(parent, self.owned.get(parent['pid'])):
+                    row['ancestryState'] = 'unconfirmed-birth'
+                    break
+                fact = facts(current)
+                row['ancestors'].append(fact)
+                if fact.get('observation') != 'same-birth-snapshot-not-authorization':
+                    row['ancestryState'] = 'unconfirmed-snapshot'
+                    break
+                if len(row['ancestors']) == 1:
+                    row['parent'] = fact
+                    row['parentRole'] = fact['role']
+                if parent['pid'] in self.children:
+                    row['ancestryState'] = 'direct-spawn-reached'
+                    break
+                parent = self.owned.get(current.get('ppid'))
+            else:
+                row['ancestryState'] = 'depth-limit'
+            row.setdefault('parentRole', 'unknown')
+            row['executableByteBudgetRemaining'] = budget[0]
             self.diagnostics.append(row)
 
     def scan(self):
@@ -393,6 +518,7 @@ class Supervisor:
                     elif item['ppid'] == os.getpid() and pid not in self.children:
                         # An adopted descendant was not observed before reparenting.
                         # It is ours to reap, but unknown lineage must fail the gate.
+                        self.record_diagnostic('unobserved-adopted-descendant', item)
                         self.unknown.append('unobserved-adopted-descendant')
                         self.owned[pid] = item
                         self.roles[pid] = 'unknown'

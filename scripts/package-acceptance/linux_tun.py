@@ -16,6 +16,7 @@ from pathlib import Path
 import select
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -27,6 +28,60 @@ import tun_fixtures as fixture
 
 require = base.require
 HERE = Path(__file__).resolve().parent
+
+
+def private_root_probe(source, directory, expected_hash):
+    """Detach Cargo's hardlinked example; never relax the root single-link guard."""
+    source, directory = Path(source), Path(directory)
+    uid = os.getuid()
+    def identity(value):
+        return tuple(getattr(value, key) for key in
+                     ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink',
+                      'st_size', 'st_mtime_ns', 'st_ctime_ns'))
+    parent = directory.lstat()
+    require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == uid and
+            parent.st_mode & 0o077 == 0, 'private probe directory required')
+    dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        require(identity(os.fstat(dfd)) == identity(parent), 'private probe directory changed')
+        before = source.lstat()
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == uid and
+                0 < before.st_size <= 128 * 1024 * 1024, 'private probe source metadata invalid')
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as incoming:
+            require(identity(os.fstat(fd)) == identity(before), 'private probe source changed')
+            # Bounded even if another same-user writer grows the source.
+            data = incoming.read(128 * 1024 * 1024 + 1)
+            require(len(data) == before.st_size and
+                    hashlib.sha256(data).hexdigest() == expected_hash and
+                    identity(os.fstat(fd)) == identity(before) and
+                    identity(source.lstat()) == identity(before), 'private probe source changed')
+        name = 'root-rpc-probe'
+        out = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        with os.fdopen(out, 'w+b') as target:
+            created = os.fstat(out)
+            require(stat.S_ISREG(created.st_mode) and created.st_uid == uid and created.st_nlink == 1 and
+                    (created.st_dev, created.st_ino) != (before.st_dev, before.st_ino),
+                    'private probe copy identity invalid')
+            target.write(data); target.flush(); os.fchmod(out, 0o500); os.fsync(out)
+            copied = os.fstat(out)
+            target.seek(0)
+            require(hashlib.sha256(target.read(128 * 1024 * 1024 + 1)).hexdigest() == expected_hash and
+                    copied.st_size == len(data) and copied.st_uid == uid and copied.st_nlink == 1 and
+                    identity(os.fstat(out)) == identity(copied) and
+                    identity(os.stat(name, dir_fd=dfd, follow_symlinks=False)) == identity(copied),
+                    'private probe copy changed')
+        final_parent = directory.lstat()
+        require(stat.S_ISDIR(final_parent.st_mode) and final_parent.st_uid == uid and
+                final_parent.st_mode & 0o077 == 0 and
+                (final_parent.st_dev, final_parent.st_ino) == (parent.st_dev, parent.st_ino) and
+                identity(source.lstat()) == identity(before) and
+                identity((directory / name).lstat()) == identity(copied), 'private probe path changed')
+        return directory / name
+    finally:
+        # On error retain any partial/changed target for the existing guarded
+        # workspace cleanup; never unlink an unconfirmed same-name replacement.
+        os.close(dfd)
 
 
 def inspect_helper(payload, members):
@@ -192,8 +247,10 @@ root ledger confirms every observed birth. Missing observations fail forever.
                         within = self.window and time.monotonic() - self.window['started'] < 90
                         gui_ancestor = same_birth(parent, self.gui_birth) or root_parent
                         if not (within and gui_ancestor):
+                            self.record_diagnostic('foreign-descendant-outside-exact-gui-transaction', item, parent, stage='tun-scan')
                             self.unknown.append('foreign-descendant-outside-exact-GUI-transaction')
                         self.owned.pop(pid, None); self.roles.pop(pid, None)
+                        self.record_diagnostic('tun-privileged-birth-quarantined', item, parent, stage='tun-scan')
                         self.quarantine[key] = item
                         if self.window: self.window['births'].add(key)
                         changed = True
@@ -205,6 +262,7 @@ root ledger confirms every observed birth. Missing observations fail forever.
                         self.owned[pid] = item
                         self.roles[pid] = self.roles.get(item['ppid'], 'unknown'); changed = True
                     elif item['ppid'] == os.getpid() and pid not in self.children:
+                        self.record_diagnostic('unobserved-adopted-descendant', item, parent, stage='tun-scan')
                         self.unknown.append('unobserved-adopted-descendant')
                         # Unknown foreign births are never eligible for signal.
                         if not foreign:
@@ -233,11 +291,13 @@ root ledger confirms every observed birth. Missing observations fail forever.
             for item in self.quarantine.values():
                 current = base.process_identity(item['pid'])
                 if base.same_process(item, current) and current['state'] != 'Z':
+                    self.record_diagnostic('privileged-gui-descendant-not-reaped', current, stage='tun-close')
                     self.unknown.append('privileged-GUI-descendant-not-reaped')
             # The fixed root controller must finish before ordinary tool cleanup.
             for item in self.controller_descendants.values():
                 current = base.process_identity(item['pid'])
                 if base.same_process(item, current) and current['state'] != 'Z':
+                    self.record_diagnostic('root-controller-descendant-not-reaped', current, stage='tun-close')
                     self.unknown.append('root-controller-descendant-not-reaped')
         except Exception:
             self.unknown.append('privileged-cleanup-observation-unconfirmed')
@@ -273,24 +333,89 @@ def direct_driver(supervisor):
 
 class Controller:
     """Bounded JSON-line IPC to the independently frozen, narrow root broker."""
-    def __init__(self, launch, sources, supervisor, env):
-        import root_controller
+    def __init__(self):
+        # Assignment to the owning run precedes every possible child launch.
         self.seq, self.closed = 0, False
+        self.child = None
         self.read_buffer = bytearray()
         self.lock = threading.Lock()
+        self.lifecycle = {'schema': 'polaris-tun-controller-lifecycle-v1',
+                          'stage': 'allocated', 'spawned': False, 'ready': False,
+                          'claim': 'observed-boundaries-not-privileged-cleanup-proof'}
+
+    def start(self, launch, sources, supervisor, env):
+        try:
+            return self._start(launch, sources, supervisor, env)
+        except BaseException:
+            self.lifecycle['failureCode'] = 'CONTROLLER_START_FAILED'
+            raise
+
+    def _start(self, launch, sources, supervisor, env):
+        import root_controller
+        require(self.child is None and not self.closed, 'single controller start required')
+        self.lifecycle['stage'] = 'envelope'
         envelope = {'launch': launch, 'files': {name: base64.b64encode(data).decode() for name, data in sources.items()}}
+        require(len((json.dumps(envelope, separators=(',', ':')) + '\n').encode()) <= 2 * 1024 * 1024,
+                'bootstrap envelope bound')
+        self.lifecycle['stage'] = 'spawn'
         with supervisor.lock:
             self.child = subprocess.Popen(['sudo', '-n', '/usr/bin/env', '-i',
                 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', '/usr/bin/python3', '-I', '-c', root_controller.BOOTSTRAP],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 env=env, start_new_session=True)
+            self.lifecycle.update(spawned=True, stage='birth')
             identity = base.process_identity(self.child.pid)
             require(identity, 'root controller birth unavailable')
+            self.lifecycle['childBirth'] = birth(identity)
             supervisor.controller_birth = identity
             supervisor.controller_descendants[identity['pid']] = identity
+        self.lifecycle['stage'] = 'write-envelope'
         self._write(envelope)
-        self.ready = self._read(30)
-        require(self.ready.get('ready') is True and self.ready.get('runId') == launch['runId'], 'root controller preparation blocked or failed')
+        self.lifecycle['stage'] = 'read-ready'
+        ready = self._read(30)
+        if (isinstance(ready, dict) and ready.get('schema') == root_controller.SCHEMA and
+                ready.get('runId') in (None, launch['runId']) and ready.get('ready') is False):
+            failure = ready.get('startupFailure', {})
+            if (failure.get('stage') in root_controller.BOOTSTRAP_STAGES and
+                    failure.get('code') in ('BOOTSTRAP_FAILED', 'FROZEN_STARTUP_FAILED') and
+                    failure.get('stagingCleanup') in ('not-created', 'removed', 'unconfirmed', 'retained')):
+                self.lifecycle['rootStartupFailure'] = {key: failure[key] for key in ('stage', 'code', 'stagingCleanup')}
+        require(isinstance(ready, dict) and ready.get('schema') == root_controller.SCHEMA and
+                ready.get('ready') is True and ready.get('runId') == launch['runId'],
+                'root controller preparation blocked or failed')
+        self.lifecycle.update(stage='ready', ready=True)
+
+    def recover(self):
+        """Only typed broker abort, own stdin closure and direct-child wait.
+
+        Ordinary ownership never gains signal authority over root processes.
+        Child exit is not evidence of privileged resource restoration.
+        """
+        unknown = []
+        if self.lifecycle['ready'] and not self.closed:
+            try:
+                recovery = self.call('abort')
+                unknown.extend(recovery.get('unknown', []))
+                self.lifecycle['abortAcknowledged'] = True
+            except Exception:
+                unknown.append('root-abort-unconfirmed')
+        if self.child is not None:
+            try:
+                self.child.stdin.close()
+                self.lifecycle['inputClosed'] = True
+            except Exception:
+                unknown.append('controller-input-close-unconfirmed')
+            try:
+                status = self.child.wait(timeout=20)
+                self.lifecycle['childExit'] = status
+                self.closed = True
+            except Exception:
+                unknown.append('controller-exit-unconfirmed')
+        else:
+            self.closed = True
+        self.lifecycle['recoveryUnknown'] = sorted(set(unknown))
+        return {'state': 'failed', 'forced': True,
+                'unknown': sorted(set(unknown + ['exception-required-recovery']))}
 
     def _write(self, value):
         raw = (json.dumps(value, separators=(',', ':')) + '\n').encode()
@@ -327,16 +452,25 @@ class Controller:
         with self.lock:
             require(not self.closed, 'controller already closed')
             self.seq += 1
+            self.lifecycle['lastAction'] = action
             self._write({'seq': self.seq, 'action': action, **args})
             value = self._read(90 if action in ('cleanup', 'finish') else 45)
-            require(value.get('seq') == self.seq and value.get('ok') is True, 'root controller action failed')
+            if isinstance(value, dict) and value.get('ok') is False:
+                error = value.get('error', {})
+                import root_controller
+                if error.get('stage') in root_controller.CONTROLLER_STAGES and error.get('code') in ('CONTROLLER_FAILED', 'AUTHENTICATION_NOT_READY'):
+                    self.lifecycle['rootOperationFailure'] = {'stage': error['stage'], 'code': error['code']}
+            require(isinstance(value, dict) and value.get('seq') == self.seq and value.get('ok') is True, 'root controller action failed')
             return value['result']
 
     def finish(self):
         value = self.call('finish')
-        self.closed = True
         self.child.stdin.close()
-        require(self.child.wait(timeout=15) == 0, 'root controller did not exit normally')
+        self.lifecycle['inputClosed'] = True
+        status = self.child.wait(timeout=15)
+        self.lifecycle['childExit'] = status
+        self.closed = True
+        require(status == 0, 'root controller did not exit normally')
         return value
 
 
@@ -652,11 +786,17 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
 
     def start_controller(self):
         import root_controller
+        self.result['rootPreparationProgress'] = {'stage': 'direct-driver', 'claim': 'entry-reached-only'}
         driver = direct_driver(self.supervisor)
+        self.result['rootPreparationProgress']['stage'] = 'config-directory'
         directory = Path(self.env['XDG_CONFIG_HOME']) / 'com.polaris.app' / 'polaris'
         require(directory.is_dir() and not directory.is_symlink(), 'real App config directory unavailable')
         self.runtime_path = directory / 'singbox-runtime.json'
+        self.result['rootPreparationProgress']['stage'] = 'frozen-sources'
         sources = {name: base.regular(HERE / name).read_bytes() for name in root_controller.FILES}
+        self.result['rootPreparationProgress']['stage'] = 'private-probe'
+        probe_hash = base.sha(self.rpc_client)
+        probe = private_root_probe(self.rpc_client, self.home, probe_hash)
         launch = {'schema': root_controller.SCHEMA, 'runId': self.run_id, 'guiUid': os.getuid(),
             'driver': birth(driver), 'guiHome': str(self.home), 'helperScriptDir': str(directory),
             'runtimePath': str(self.runtime_path), 'appSha256': self.members['app']['sha256'],
@@ -666,12 +806,19 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
             'vmContext': {'githubHosted': os.environ.get('GITHUB_ACTIONS') == 'true' and
                           os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'dedicatedVM': True},
             'materialsDownloaded': True, 'codeHashes': {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()},
-            'rpcProbePath': str(self.rpc_client), 'rpcProbeSha256': base.sha(self.rpc_client),
+            'rpcProbePath': str(probe), 'rpcProbeSha256': probe_hash,
             **self.launch_options}
+        self.result['rootPreparationProgress']['stage'] = 'launch-contract'
         root_controller.validate_launch(launch)
-        self.controller = Controller(launch, sources, self.supervisor, self.env)
+        self.controller = Controller()
+        self.result['controllerLifecycle'] = self.controller.lifecycle
+        self.result['rootPreparationProgress']['stage'] = 'controller-start'
+        self.controller.start(launch, sources, self.supervisor, self.env)
+        self.result['rootPreparationProgress']['stage'] = 'bind-gui'
         self.result['rootGuiBinding'] = verify_gui_binding(self.app, self.controller.call('bind_gui', pid=self.app['pid']))
+        self.result['rootPreparationProgress']['stage'] = 'prepare'
         self.result['rootPreparation'] = self.controller.call('prepare')
+        self.result['rootPreparationProgress']['stage'] = 'prepared'
         # CredentialLease, if explicitly authorized, opens/closes inside each
         # controller transaction_begin/end. No password action is exposed here.
 
@@ -823,15 +970,7 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
         except BaseException as error:
             self.result['failure'] = {'stage': self.stage, 'kind': type(error).__name__, 'code': 'TUN_RUNTIME_FAILED'}
             if self.controller and not self.controller.closed:
-                try:
-                    recovery = self.controller.call('abort')
-                    cleanup = {'state': 'failed', 'forced': True,
-                               'unknown': recovery.get('unknown', []) or ['exception-required-recovery']}
-                    self.controller.child.stdin.close()
-                    self.controller.child.wait(timeout=20)
-                    self.controller.closed = True
-                except BaseException:
-                    cleanup = {'state': 'failed', 'forced': True, 'unknown': ['root-recovery-unconfirmed']}
+                cleanup = self.controller.recover()
         finally:
             for stream in self.sockets:
                 try: stream.close()

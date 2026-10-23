@@ -124,6 +124,21 @@ additional privilege is used to force cleanup. Primary scenario and cleanup erro
 are recorded separately. TUN entry progress indicates entry reached, not completion
 of a password, helper or network action.
 
+Startup failures retain the controller handle before any child is spawned. Fixed
+startup stages distinguish local admission, bootstrap staging, broker readiness
+and later typed operations. A pre-ready failure is not proof that sudo never ran.
+The bootstrap may remove only its own exclusively created, unchanged fixed files
+through the held directory identity; unknown or replaced objects remain failed.
+After exec, a failure before a managed broker/ledger exists retains unknown staging
+rather than claiming recovery. Ordinary code never signals an unknown root task.
+
+Rejected-process diagnostics include bounded original parent births and confirmed
+owned ancestry/roles. Process names are hints, not executable identity; readable
+executable facts are birth/stability checked and have an aggregate 64 MiB budget.
+The per-file one-second check is cooperative between reads, not a hard OS I/O
+deadline. Unreadable or changing facts remain unknown. None of these observations
+changes UID admission, signal ownership, or the requirement for normal cleanup.
+
 ## Evidence and limitations
 
 Actual App-generated `singbox-runtime.json` is read twice with stable inode,
@@ -143,6 +158,14 @@ Source/contract tests and compilation are not a successful package run. A
 successful receipt is produced only after both actual carriers complete every
 mandatory case and normal cleanup. This code does not imply that a newer kernel
 has been formally bound or that any not-yet-produced package has already passed.
+
+Cargo may hardlink its example executable into the public target path. Before
+root preparation, the ordinary harness creates a byte-identical, exclusive
+private copy and verifies the source and destination identities and digest. The
+root bootstrap still requires an ordinary-owner, single-link regular input and
+verifies its digest again; the Cargo output is not modified or executed by this
+copy operation. This producer compatibility check is not evidence that a past
+root-preparation failure had this cause.
 
 ## Source tests
 

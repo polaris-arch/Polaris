@@ -9,6 +9,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, Mock, mock_open
 
 SPEC = importlib.util.spec_from_file_location('package_linux', Path(__file__).with_name('linux.py'))
@@ -346,9 +347,9 @@ class PrimitiveTests(unittest.TestCase):
 
     def test_identity_diagnostic_is_bounded_and_not_authorization(self):
         identity = {'pid': 17, 'startTime': '25', 'ppid': 9, 'uid': 0}
-        status = 'Uid: 1000 1000 1000 1000\nGid: 1000 1000 1000 1000\nCapEff: 0\nCapPrm: 0\nCapAmb: 0\nNoNewPrivs: 1\nSeccomp: 2\nName: secret-argv\n'
+        status = 'Uid: 1000 1000 1000 1000\nGid: 1000 1000 1000 1000\nCapEff: 0\nCapPrm: 0\nCapAmb: 0\nNoNewPrivs: 1\nSeccomp: 2\nName: safe-name\nIgnored: secret-argv\n'
         files = [mock_open(read_data=status).return_value, mock_open(read_data='0 1000 1\n').return_value]
-        with patch.object(M, 'process_identity', return_value=identity), patch.object(M.Path, 'open', side_effect=files), patch.object(M.os, 'readlink', side_effect=['user:[3]', 'mnt:[4]', 'pid:[5]']):
+        with patch.object(M, 'process_identity', return_value=identity), patch.object(M.Path, 'open', side_effect=files), patch.object(M.os, 'readlink', side_effect=['user:[3]', 'mnt:[4]', 'pid:[5]']), patch.object(M, 'executable_diagnostic', return_value={'state': 'unknown', 'errno': 13}):
             result = M.process_diagnostic(identity)
         self.assertEqual(result['Uid'], ['1000'] * 4)
         self.assertEqual(result['uid'], 0)  # Original rejection UID remains unchanged.
@@ -359,6 +360,128 @@ class PrimitiveTests(unittest.TestCase):
             self.assertEqual(M.process_diagnostic(identity)['observation'], 'unknown')
         with patch.object(M, 'process_identity', return_value={**identity, 'startTime': '26'}):
             self.assertEqual(M.process_diagnostic(identity)['observation'], 'unknown')
+
+    def diagnostic_supervisor(self):
+        obj = M.Supervisor.__new__(M.Supervisor)
+        obj.lock = M.threading.RLock()
+        obj.owned, obj.roles, obj.children = {}, {}, {}
+        obj.diagnostics, obj.unknown = [], []
+        obj.diagnostics_truncated = False
+        obj.diagnostic_executable_budget = [M.DIAGNOSTIC_EXE_LIMIT]
+        return obj
+
+    def test_diagnostic_role_chain_stops_at_known_direct_spawn(self):
+        obj = self.diagnostic_supervisor()
+        tool = {'pid': 10, 'startTime': '100', 'ppid': 1, 'uid': os.getuid()}
+        parent = {'pid': 11, 'startTime': '101', 'ppid': 10, 'uid': os.getuid()}
+        foreign = {'pid': 12, 'startTime': '102', 'ppid': 11, 'uid': 0}
+        obj.owned = {10: tool, 11: parent}; obj.roles = {10: 'dbus', 11: 'dbus'}; obj.children = {10: Mock()}
+        with patch.object(M, 'process_identity', side_effect=lambda pid: obj.owned.get(pid)), patch.object(M, 'process_diagnostic', side_effect=lambda item, **kw: {**item, 'observation': 'same-birth-snapshot-not-authorization'}):
+            obj.record_diagnostic('owned-descendant-uid-mismatch', foreign, parent)
+            obj.record_diagnostic('owned-descendant-uid-mismatch', foreign, parent)
+        self.assertEqual(len(obj.diagnostics), 1)
+        row = obj.diagnostics[0]
+        self.assertEqual(row['parentRole'], 'dbus')
+        self.assertEqual(row['process']['directSpawnRole'], 'unknown')
+        self.assertEqual(row['ancestors'][-1]['directSpawnRole'], 'dbus')
+        self.assertEqual(row['ancestryState'], 'direct-spawn-reached')
+        self.assertNotIn(12, obj.owned)  # Observation does not adopt the birth.
+
+    def test_diagnostic_ancestry_cycle_depth_and_pid_reuse_fail_closed(self):
+        for fault in ('cycle', 'depth-limit', 'unconfirmed-birth'):
+            obj = self.diagnostic_supervisor()
+            obj.owned = {pid: {'pid': pid, 'startTime': str(pid), 'ppid': pid + 1, 'uid': os.getuid()} for pid in range(10, 21)}
+            if fault == 'cycle': obj.owned[11]['ppid'] = 10
+            item = {'pid': 9, 'startTime': '9', 'ppid': 10, 'uid': 0}
+            def current(pid):
+                value = obj.owned.get(pid)
+                return {**value, 'startTime': 'reused'} if fault == 'unconfirmed-birth' else value
+            with patch.object(M, 'process_identity', side_effect=current), patch.object(M, 'process_diagnostic', side_effect=lambda item, **kw: {**item, 'observation': 'same-birth-snapshot-not-authorization'}):
+                obj.record_diagnostic('foreign-process', item)
+            row = obj.diagnostics[0]
+            self.assertEqual(row['ancestryState'], fault)
+            self.assertLessEqual(len(row['ancestors']), 8)
+            if fault == 'unconfirmed-birth':
+                self.assertEqual(row['parentRole'], 'unknown')
+                self.assertEqual(row['parent']['pid'], 10)
+                self.assertEqual(row['parent']['startTime'], '10')
+                self.assertEqual(row['parent']['role'], 'unknown')
+                self.assertEqual(row['parent']['observation'], 'inventory-birth-not-revalidated')
+
+    def test_diagnostic_failures_do_not_replace_original_uid_rejection(self):
+        obj = self.diagnostic_supervisor()
+        parent = {'pid': 10, 'startTime': '10', 'ppid': 1, 'uid': os.getuid()}
+        foreign = {'pid': 11, 'startTime': '11', 'ppid': 10, 'uid': 1 if os.getuid() == 0 else 0}
+        obj.owned = {10: parent}; obj.roles = {10: 'driver'}; obj.children = {10: Mock()}
+        with patch.object(M.Path, 'iterdir', return_value=[Path('/proc/10'), Path('/proc/11')]), patch.object(M, 'process_identity', side_effect=lambda pid: {10: parent, 11: foreign}[pid]), patch.object(M, 'process_diagnostic', side_effect=PermissionError(13, 'private-error')):
+            with self.assertRaisesRegex(ValueError, 'owned descendant elevated unexpectedly'):
+                obj.scan()
+        self.assertNotIn(11, obj.owned)
+        self.assertIn('identity-diagnostic-unavailable', obj.unknown)
+        self.assertNotIn('private-error', json.dumps(obj.unknown))
+
+    def test_executable_diagnostic_stable_regular_bytes_and_budget(self):
+        item = {'pid': 17, 'startTime': '25'}
+        raw = b'not-an-executable-fixture'
+        info = SimpleNamespace(st_mode=M.stat.S_IFREG | 0o4755, st_dev=2, st_ino=4, st_size=len(raw), st_uid=0, st_gid=0, st_mtime_ns=6, st_ctime_ns=7)
+        budget = [len(raw)]
+        with patch.object(M, 'process_identity', return_value=item), patch.object(M.os, 'readlink', return_value='/usr/bin/fixture'), patch.object(M.Path, 'open', mock_open(read_data=raw)), patch.object(M.os, 'fstat', return_value=info), patch.object(M.Path, 'stat', return_value=info):
+            result = M.executable_diagnostic(item, budget)
+            blocked = M.executable_diagnostic(item, budget)
+        self.assertEqual(result['state'], 'observed-not-authorization')
+        self.assertEqual(result['sha256'], M.hashlib.sha256(raw).hexdigest())
+        self.assertEqual(result['mode'], 0o4755)
+        self.assertEqual(budget, [0])
+        self.assertEqual(blocked['state'], 'unknown')
+        self.assertEqual(blocked['failureStage'], 'executable-byte-budget')
+        self.assertNotIn('sha256', blocked)
+
+    def test_executable_diagnostic_unreadable_reused_changed_and_deadline(self):
+        item = {'pid': 17, 'startTime': '25'}
+        with patch.object(M, 'process_identity', return_value=item), patch.object(M.os, 'readlink', side_effect=PermissionError(13, 'secret')):
+            denied = M.executable_diagnostic(item, [100])
+        self.assertEqual(denied['errno'], 13)
+        self.assertNotIn('secret', json.dumps(denied))
+        with patch.object(M, 'process_identity', return_value={**item, 'startTime': '26'}):
+            self.assertEqual(M.executable_diagnostic(item, [100])['state'], 'unstable')
+        info = SimpleNamespace(st_mode=M.stat.S_IFREG | 0o755, st_dev=2, st_ino=4, st_size=3, st_uid=0, st_gid=0, st_mtime_ns=6, st_ctime_ns=7)
+        changed = SimpleNamespace(**{**vars(info), 'st_ino': 8})
+        for fault in ('exec-change', 'oversize', 'deadline', 'invalid-link'):
+            with self.subTest(fault=fault), patch.object(M, 'process_identity', return_value=item), patch.object(M.os, 'readlink', return_value='bad\nlink' if fault == 'invalid-link' else '/usr/bin/fixture'), patch.object(M.Path, 'open', mock_open(read_data=b'abc')), patch.object(M.os, 'fstat', return_value=info), patch.object(M.Path, 'stat', return_value=changed), patch.object(M.time, 'monotonic', side_effect=[0, 2] if fault == 'deadline' else None, return_value=0):
+                result = M.executable_diagnostic(item, [2 if fault == 'oversize' else 100])
+                self.assertEqual(result['state'], 'unknown')
+                self.assertNotIn('sha256', result)
+
+    def test_executable_diagnostic_pid_reuse_after_read_discards_facts(self):
+        item = {'pid': 17, 'startTime': '25'}
+        info = SimpleNamespace(st_mode=M.stat.S_IFREG | 0o755, st_dev=2, st_ino=4, st_size=3, st_uid=0, st_gid=0, st_mtime_ns=6, st_ctime_ns=7)
+        with patch.object(M, 'process_identity', side_effect=[item, {**item, 'startTime': '26'}]), patch.object(M.os, 'readlink', return_value='/usr/bin/fixture'), patch.object(M.Path, 'open', mock_open(read_data=b'abc')), patch.object(M.os, 'fstat', return_value=info), patch.object(M.Path, 'stat', return_value=info):
+            result = M.executable_diagnostic(item, [100])
+        self.assertEqual(result, {'state': 'unstable'})
+
+    def test_name_hint_invalid_characters_are_unknown(self):
+        identity = {'pid': 17, 'startTime': '25', 'ppid': 9, 'uid': 0}
+        for name in ('unsafe\x1bname', 'x' * 65, ''):
+            files = [mock_open(read_data='Name: ' + name + '\nUid: 1 0 0 0\n').return_value,
+                     mock_open(read_data='0 0 1\n').return_value]
+            with patch.object(M, 'process_identity', return_value=identity), patch.object(M.Path, 'open', side_effect=files), patch.object(M.os, 'readlink', side_effect=PermissionError(13, 'private')), patch.object(M, 'executable_diagnostic', return_value={'state': 'unknown'}):
+                result = M.process_diagnostic(identity)
+            self.assertEqual(result['nameHint'], 'unknown')
+            self.assertNotIn('private', json.dumps(result))
+            self.assertEqual(result['userNamespaceError']['errno'], 13)
+
+    def test_diagnostic_supervisor_cumulative_byte_budget_and_record_cap(self):
+        obj = self.diagnostic_supervisor()
+        def snapshot(item, *, executable_budget):
+            self.assertIs(executable_budget, obj.diagnostic_executable_budget)
+            executable_budget[0] -= 1
+            return dict(item)
+        with patch.object(M, 'process_diagnostic', side_effect=snapshot):
+            for pid in range(65):
+                obj.record_diagnostic('foreign-process', {'pid': pid, 'startTime': str(pid), 'ppid': -1, 'uid': 0})
+        self.assertEqual(len(obj.diagnostics), 64)
+        self.assertTrue(obj.diagnostics_truncated)
+        self.assertEqual(obj.diagnostic_executable_budget[0], M.DIAGNOSTIC_EXE_LIMIT - 64)
 
     def test_workspace_mount_and_permission_failures_are_not_bypassed(self):
         mount = '35 20 0:32 / /tmp/owned/home/runtime/doc rw - fuse.portal portal rw\n'

@@ -1,5 +1,8 @@
 """Pure/mock controller contracts; never execute root/product/account/network tools."""
 import copy
+import base64
+import builtins
+import stat
 import importlib.util
 import io
 import json
@@ -663,6 +666,151 @@ class ZombieClosureTests(unittest.TestCase):
         c.agent=Mock();c.agent.wait.return_value=-signal.SIGTERM;c.ops.proc.return_value=None
         with patch.object(m,'close_auth',return_value={}),patch.object(m,'proc_absent',return_value=False):
             with self.assertRaises(ValueError):c.stop_agent()
+
+
+class StartupLifecycleTests(unittest.TestCase):
+    def bootstrap_case(self, fault):
+        # Ordinary temporary files plus mocked UID/isolated/root path/syscalls.
+        # The fixed root bootstrap is never launched as a root process.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); stage_base = root / 'controller'; probe = root / 'probe'
+            probe.write_bytes(b'mock-rpc')
+            value = launch(); value['rpcProbePath'] = str(probe); value['rpcProbeSha256'] = m.sha(probe.read_bytes())
+            files = {name: b'mock-frozen-source' for name in m.FILES}
+            value['codeHashes'] = {name: m.sha(data) for name, data in files.items()}
+            envelope = {'launch': value, 'files': {name: base64.b64encode(data).decode() for name, data in files.items()}}
+            if fault == 'source-hash': envelope['files']['tun.py'] = base64.b64encode(b'changed').decode()
+            output = io.StringIO()
+            fake_sys = types.SimpleNamespace(flags=types.SimpleNamespace(isolated=True),
+                stdin=types.SimpleNamespace(buffer=io.BytesIO((json.dumps(envelope) + '\n').encode())), stdout=output)
+            def facts(info, uid=0, mode=None, nlink=None):
+                return types.SimpleNamespace(st_mode=info.st_mode if mode is None else mode, st_uid=uid,
+                    st_nlink=info.st_nlink if nlink is None else nlink, st_dev=info.st_dev,
+                    st_ino=info.st_ino, st_size=info.st_size)
+            class FakePath:
+                def __init__(self, path): self.path = stage_base if str(path) == '/run/polaris-tun-controller' else Path(path)
+                def __truediv__(self, other): return FakePath(self.path / other)
+                def __fspath__(self): return str(self.path)
+                def __str__(self): return str(self.path)
+                @property
+                def parents(self): return [FakePath(p) for p in self.path.parents]
+                def exists(self): return self.path.exists()
+                def mkdir(self, **kwargs): return self.path.mkdir(**kwargs)
+                def rmdir(self): return self.path.rmdir()
+                def lstat(self):
+                    info = self.path.lstat()
+                    return facts(info, mode=info.st_mode & ~0o077)
+                def stat(self): return self.lstat()
+            fake_os = types.SimpleNamespace(**{name: getattr(os, name) for name in dir(os) if not name.startswith('__')})
+            fake_os.geteuid = lambda: 0
+            def opened(path, flags, *args, **kwargs):
+                if fault == 'directory-open' and flags & os.O_DIRECTORY: raise PermissionError('PRIVATE')
+                return os.open(path, flags, *args, **kwargs)
+            fake_os.open = opened
+            def fstat(fd):
+                info = os.fstat(fd); path = os.readlink('/proc/self/fd/' + str(fd))
+                if path == str(probe):
+                    return facts(info, uid=1001 if fault != 'probe-owner' else 0,
+                                 nlink=2 if fault == 'probe-links' else info.st_nlink)
+                return facts(info)
+            fake_os.fstat = fstat
+            fake_os.stat = lambda *a, **kw: facts(os.stat(*a, **kw))
+            def execve(*args):
+                directory = stage_base / value['runId']
+                if fault == 'unknown-file': (directory / 'untouched').write_text('foreign')
+                if fault == 'replaced-file':
+                    (directory / 'tun.py').rename(directory / 'old-tun')
+                    (directory / 'tun.py').write_text('replacement')
+                raise OSError('PRIVATE')  # Never execute the frozen file or any command.
+            fake_os.execve = Mock(side_effect=execve)
+            if fault == 'unlink-failure': fake_os.unlink = Mock(side_effect=PermissionError('PRIVATE'))
+            def importer(name, *args, **kwargs):
+                return {'os': fake_os, 'sys': fake_sys, 'pathlib': types.SimpleNamespace(Path=FakePath)}.get(name) or builtins.__import__(name, *args, **kwargs)
+            fake_builtins = dict(vars(builtins)); fake_builtins['__import__'] = importer
+            fake_builtins['print'] = lambda *args, **kw: builtins.print(*args, **{**kw, 'file': output})
+            with self.assertRaises(SystemExit) as caught:
+                exec(compile(m.BOOTSTRAP, '<fixed-bootstrap-mocked>', 'exec'), {'__builtins__': fake_builtins})
+            response = json.loads(output.getvalue())
+            self.assertNotIn('PRIVATE', output.getvalue())
+            self.assertFalse(response['ready'])
+            directory = stage_base / value['runId']
+            if fault == 'source-hash':
+                self.assertFalse(stage_base.exists()); self.assertEqual(response['startupFailure']['stage'], 'sources')
+            elif fault in ('directory-open', 'unknown-file', 'replaced-file', 'unlink-failure'):
+                self.assertTrue(directory.exists())
+                self.assertEqual(response['startupFailure']['stagingCleanup'], 'unconfirmed')
+                self.assertEqual(caught.exception.code, 71)
+            else:
+                self.assertFalse(directory.exists()); self.assertTrue(stage_base.exists())
+                self.assertEqual(response['startupFailure']['stagingCleanup'], 'removed')
+                self.assertEqual(caught.exception.code, 70)
+            if fault in ('probe-owner', 'probe-links'):
+                fake_os.execve.assert_not_called(); self.assertEqual(response['startupFailure']['stage'], 'probe')
+            if fault == 'replaced-file': self.assertEqual((directory / 'tun.py').read_text(), 'replacement')
+            if fault == 'unknown-file': self.assertEqual((directory / 'untouched').read_text(), 'foreign')
+
+    def test_fixed_bootstrap_failure_cleanup_owns_only_created_inodes(self):
+        for fault in ('source-hash', 'directory-open', 'probe-owner', 'probe-links', 'exec',
+                      'unknown-file', 'replaced-file', 'unlink-failure'):
+            with self.subTest(fault=fault): self.bootstrap_case(fault)
+
+    def test_post_exec_startup_failure_frames_retain_staging(self):
+        import ctypes
+        for fault in ('frozen-load', 'subreaper', 'controller-init'):
+            with self.subTest(fault=fault):
+                output = io.StringIO(); libc = Mock(); libc.prctl.return_value = 1 if fault == 'subreaper' else 0
+                with patch.object(m.sys, 'argv', ['root_controller.py', 'serve', '--run-id', '0123456789ab']), \
+                     patch.object(m, 'load_frozen', return_value=(launch(), Mock(), Path('/fixed')),
+                                  side_effect=ValueError('PRIVATE') if fault == 'frozen-load' else None), \
+                     patch.object(ctypes, 'CDLL', return_value=libc), \
+                     patch.object(m, 'Controller', side_effect=ValueError('PRIVATE')) as ctor, \
+                     patch.object(m.sys, 'stdout', output), self.assertRaises(SystemExit) as caught:
+                    m.main()
+                row = json.loads(output.getvalue())
+                self.assertEqual(caught.exception.code, 72)
+                self.assertEqual(row['startupFailure'], {'stage': fault, 'code': 'FROZEN_STARTUP_FAILED', 'stagingCleanup': 'retained'})
+                self.assertNotIn('PRIVATE', output.getvalue())
+                if fault != 'controller-init': ctor.assert_not_called()
+
+    def test_bind_rejection_does_not_prepare_or_mutate_ledger(self):
+        c = controller(); c.gui = None; c.ledger = None
+        c.ops.proc.return_value = None
+        with self.assertRaises(ValueError): c.bind_gui(50)
+        self.assertEqual(c.stage, 'bind-gui')
+        self.assertIsNone(c.ledger)
+        c.tun.prepare_root.assert_not_called()
+        self.assertEqual(c.abort(), {'state': 'failed', 'prepared': False, 'unknown': []})
+
+    def test_prepare_failure_matrix_preserves_original_guards_and_partial_ledger_unknown(self):
+        for fault in ('authentication-readiness', 'vm-preflight', 'tool-identities', 'root-ledger',
+                      'controller-ledger', 'auth-watchdog-start', 'auth-watchdog-verify'):
+            with self.subTest(fault=fault):
+                c = controller(); ledger = c.ledger; c.ledger = None
+                c.authentication_readiness = Mock(return_value={}, side_effect=ValueError('PRIVATE') if fault == 'authentication-readiness' else None)
+                c.tun.collect_preflight.return_value = {'systemNamespaces': {}, 'network': {}}
+                c.tun.preflight.return_value = {'blocked': ['realPkexecAuthenticationPendingConfirmation']}
+                if fault == 'vm-preflight': c.tun.preflight.return_value = {'blocked': ['extra-blocker']}
+                c.tun.file_identity.side_effect = ValueError('PRIVATE') if fault == 'tool-identities' else None
+                c.tun.prepare_root.return_value = ledger
+                if fault == 'root-ledger': c.tun.prepare_root.side_effect = ValueError('PRIVATE')
+                if fault == 'controller-ledger': ledger.mutate = Mock(side_effect=ValueError('PRIVATE'))
+                if fault == 'auth-watchdog-start': c.ops.run.side_effect = ValueError('PRIVATE')
+                c.tun.cleanup.return_value = {'state': 'failed'}
+                with patch.object(m, 'independent_record'), patch.object(m, 'verify_timer',
+                    side_effect=ValueError('PRIVATE') if fault == 'auth-watchdog-verify' else None):
+                    with self.assertRaises(ValueError): c.prepare()
+                self.assertEqual(c.stage, fault)
+                with patch.object(m, 'close_auth'), patch.object(m, 'close_transactions'):
+                    recovery = c.abort()
+                self.assertEqual(recovery['state'], 'failed')
+                if fault == 'root-ledger':
+                    self.assertTrue(c.preparation_pending)
+                    self.assertIn('root-preparation-incomplete', recovery['unknown'])
+                    c.tun.cleanup.assert_not_called()  # Never adopt an unconfirmed ledger.
+                elif fault in ('controller-ledger', 'auth-watchdog-start', 'auth-watchdog-verify'):
+                    c.tun.cleanup.assert_called_once_with(ledger, forced=True)
+                else: c.tun.prepare_root.assert_not_called()
+                self.assertNotIn('PRIVATE', json.dumps(recovery))
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)
