@@ -149,10 +149,10 @@ JSON, HOME, random API secret and raw App stdout are **never uploaded**. Private
 originals disappear with the ephemeral workspace; this is not cross-VM original
 JSON archival. Screenshots show the native App, not a browser mock.
 
-For this release, actual acceptance remains pending until the genuine 12.2 formal
-contract and final App 1.0.0 carriers exist. The generic gate follows the real
-committed formal pin; running against the unchanged historical pin would not
-constitute 12.2 acceptance.
+The genuine alpha.12.2 formal contract and App 1.0.0 candidate carriers are now
+bound, but packaged GUI/TUN acceptance is still pending. The gate follows the
+committed formal pin; historical source checks or successful carrier builds do
+not constitute runtime acceptance of those packages.
 
 Source/contract tests and compilation are not a successful package run. A
 successful receipt is produced only after both actual carriers complete every
@@ -200,3 +200,24 @@ queries are direct registered children with bounded output, timeout and reaping,
 not adopted-process name exemptions. On an inventory failure, only the exact
 registered ordinary session bus can still receive identity-checked TERM; unknown
 processes remain failed and prevent workspace removal.
+
+### Actual API endpoint and read-only authentication preflight
+
+The App allocates its management API endpoint during startup. A fixture's legacy
+`controlPort` value is not that endpoint. Acceptance binds the unique loopback
+API in the stable App-generated runtime configuration to `status.clashApiPort`,
+the same owned core birth and the private fixture secret. The existing native
+probe verifies the actual listening socket's ownership. Reconnection must bind
+the new endpoint; no fixed port or previous process endpoint is assumed. Public
+startup diagnostics contain only fixed stages and bounded non-secret facts,
+never the runtime configuration or API secret.
+
+The explicit `linux_auth_preflight_only` Package input runs only the existing
+Ubuntu setup job. It requires the exact candidate SHA and excludes all package,
+GUI, TUN and credential-window inputs. It reads only the current runner's public
+account/group facts and evaluates the existing administrator-group prerequisite.
+It does not read shadow/password data, invoke privileged commands, change groups
+or polkit policy, build packages, or run the App/core. All other jobs are skipped.
+Its JSON is diagnostic evidence, not authentication, recovery, or TUN acceptance.
+Passwordless sudo access is not evidence of membership in a polkit administrator
+identity; an unmet prerequisite remains a failure, not an automatic exemption.

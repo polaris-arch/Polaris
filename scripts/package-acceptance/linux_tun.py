@@ -575,27 +575,34 @@ class TunCarrierRun(base.CarrierRun):
 
     def connect(self):
         """TUN-only override: never weakens base CarrierRun.connect."""
+        self.connect_phase('stopped-check')
         require(not self.status().get('running'), 'TUN connect requires stopped core')
+        self.connect_phase('gui-click')
         self.driver.click('#connect-btn')
-        status = base.wait_for(self.status, lambda s: s.get('running') is True and not s.get('starting'), timeout=75)
+        self.connect_phase('status-ready')
+        status = base.wait_for(self.connect_status, lambda s: s.get('running') is True and not s.get('starting'), timeout=75)
+        self.connect_phase('core-birth', status)
         require(status.get('startedViaHelper') is True, 'real production helper path required')
         self.controller.call('register_core')
         attested = self.controller.call('core_attest')
         self.core = {**attested['identity'], 'sha256': attested['executable']['sha256']}
         require(status.get('pid') == self.core['pid'] and self.core['sha256'] == self.members['core']['sha256'],
                 'App/core frozen helper identity differs')
+        self.connect_phase('runtime-path')
         self.runtime_path = base.regular(self.runtime_path, self.home)
         require(self.runtime_path.name == 'singbox-runtime.json', 'actual private runtime path required')
-        runtime = self.runtime_identity()
+        self.connect_phase('runtime-api')
+        endpoint, runtime, graph = self.observed_api_endpoint()
         require(runtime['sha256'] == attested['runtime']['sha256'], 'root/core actual runtime differs')
-        graph = json.loads(self.runtime_path.read_bytes())
         inbounds = [i for i in graph.get('inbounds', []) if i.get('type') == 'tun']
         require(len(inbounds) == 1 and inbounds[0].get('interface_name') == 'polaris-tun0', 'original TUN interface graph required')
-        api = [i for i in graph.get('services', []) if i.get('type') == 'api']
-        require(len(api) == 1 and api[0].get('listen') == '127.0.0.1' and api[0].get('listen_port') == self.control
-                and api[0].get('secret') == self.secret, 'private real API differs')
+        self.api_endpoint = endpoint
+        self.connect_phase('owned-api-probe')
+        self.rpc('capabilities')  # Root's existing frozen probe owns LISTEN-inode verification.
         self.controller.call('tun_register')
         self.stopped = False
+        self.connect_phase('receipt')
+        self.result['apiEndpoint'] = {**endpoint, 'ownedListenerProbe': True}
         self.result['execution'] = {'uid': os.getuid(), 'defaultSandbox': True, 'originalEntry': True,
             'automation': 'tauri-driver 2.0.5', 'app': {k: self.app[k] for k in ('pid', 'startTime', 'sha256', 'exeDev', 'exeInode')},
             'core': self.core, 'startedViaHelper': True, 'rootAttestation': attested,
@@ -618,10 +625,12 @@ class TunCarrierRun(base.CarrierRun):
             args.update(request)
         else:
             require(request is None, 'capabilities has no request payload')
+        self.revalidate_api_endpoint()
         envelope = self.controller.call('rpc', **args)
         require(envelope.get('schema') == 'polaris-package-rpc-probe-v1' and
                 envelope.get('ok') is True and envelope.get('action') == 'tun-' + action,
                 'root-attested restricted native RPC failed')
+        self.revalidate_api_endpoint()
         return envelope['result']
 
     def socket(self, label):
@@ -766,6 +775,7 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
         base.save_fixture(self.driver, accepted)
 
     def disconnect(self):
+        self.api_endpoint = None
         require(self.status().get('running'), 'TUN OFF requires running core')
         self.driver.click('#connect-btn')
         base.wait_for(self.status, lambda s: s.get('running') is False and not s.get('starting'), timeout=45)
@@ -775,6 +785,7 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
         return proof
 
     def quit_product(self):
+        self.api_endpoint = None
         require(self.stopped and not self.status().get('running'), 'quit requires verified TUN OFF')
         require(base.same_process(self.app, base.process_identity(self.app['pid'])), 'GUI exited before tray quit')
         marker = self.runtime_path.parent / 'clean-exit.marker'
@@ -921,7 +932,7 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
             require(network['topology'] == self.network.plan, 'root fixture topology differs')
             before = self.boundary('synthetic-before')
             self.special_reply()
-            patch = self.network.config_patch(self.mixed, self.control, self.secret)
+            patch = self.network.config_patch(self.mixed, self.fixture_control_port, self.secret)
             patch.update(language='en-US', autoConnect=False, autoSelectEnabled=True,
                          periodicSpeedTestEnabled=False, interruptConnectionsOnSwitch=False)
             patch['subscriptions'] = [{'id': 'package-fixture', 'name': 'Package isolated TUN',

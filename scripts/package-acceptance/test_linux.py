@@ -777,5 +777,169 @@ class PrimitiveTests(unittest.TestCase):
         supervisor.thread.join.assert_called_once_with(2)
 
 
+    def api_fixture(self, port=41321):
+        core = {'pid': 77, 'startTime': '125', 'uid': os.getuid(), 'sha256': 'a' * 64, 'exe': '/private/sing-box'}
+        secret = 'private-test-secret-never-public'
+        graph = {'services': [{'type': 'api', 'listen': '127.0.0.1', 'listen_port': port, 'secret': secret}]}
+        status = {'running': True, 'pid': 77, 'clashApiPort': port}
+        return core, secret, graph, status
+
+    def test_dynamic_api_binder_matches_actual_status_not_legacy_control(self):
+        core, secret, graph, status = self.api_fixture()
+        graph['controlPort'] = 52345
+        endpoint = M.bind_api_endpoint(graph, status, secret, core)
+        self.assertEqual(endpoint['port'], 41321)
+        self.assertEqual(endpoint['startTime'], '125')
+        self.assertNotIn(secret, json.dumps(endpoint))
+        self.assertNotIn('secret', endpoint)
+
+    def test_api_binding_rejects_all_foreign_or_malformed_endpoints(self):
+        import copy
+        core, secret, graph, status = self.api_fixture()
+        mutations = [lambda g,s: g['services'].append(copy.deepcopy(g['services'][0])),
+            lambda g,s: g['services'].clear(), lambda g,s: g['services'][0].update(listen='0.0.0.0'),
+            lambda g,s: g['services'][0].update(secret='wrong'), lambda g,s: s.update(pid=78),
+            lambda g,s: s.update(pid=True), lambda g,s: s.update(running=False),
+            lambda g,s: s.update(starting=True), lambda g,s: s.pop('clashApiPort')]
+        for port in (None, True, 0, -1, 65536, '41321', 41322):
+            mutations.append(lambda g,s,p=port: s.update(clashApiPort=p))
+        for port in (None, True, 0, -1, 65536, '41321'):
+            mutations.append(lambda g,s,p=port: g['services'][0].update(listen_port=p))
+        for mutate in mutations:
+            g,s = copy.deepcopy(graph), dict(status); mutate(g,s)
+            with self.assertRaises(ValueError): M.bind_api_endpoint(g,s,secret,core)
+
+    def test_api_capture_uses_exact_private_content_and_brackets_status(self):
+        core, secret, graph, status = self.api_fixture()
+        run = M.CarrierRun.__new__(M.CarrierRun)
+        run.core, run.secret, run.runtime_path, run.home, run.workspace = core, secret, Path('/tmp/runtime'), Path('/tmp'), Path('/tmp')
+        proof = {'sha256': 'a'*64, 'pid': 77, 'startTime': '125'}
+        run.status = Mock(return_value=status); run.runtime_identity = Mock(return_value=dict(proof))
+        with patch.object(M, 'stable_runtime_capture', return_value=(proof, graph)) as capture:
+            endpoint, result, content = run.observed_api_endpoint()
+            self.assertIs(content, graph); self.assertEqual(endpoint['port'], 41321)
+            self.assertTrue(capture.call_args.kwargs['include_content'])
+            for field, value in (('sha256', 'b'*64), ('pid', 78), ('startTime', '126')):
+                run.runtime_identity.return_value = {**proof, field: value}
+                with self.assertRaises(ValueError): run.observed_api_endpoint()
+
+    def test_endpoint_revalidation_allows_apply_graph_change_not_endpoint_or_birth(self):
+        run = M.CarrierRun.__new__(M.CarrierRun)
+        core, secret, graph, status = self.api_fixture()
+        run.api_endpoint = M.bind_api_endpoint(graph, status, secret, core)
+        run.observed_api_endpoint = Mock(return_value=(dict(run.api_endpoint), {'sha256': 'new-hot-graph'}, {}))
+        self.assertEqual(run.revalidate_api_endpoint()['sha256'], 'new-hot-graph')
+        for field, value in (('port', 41322), ('pid', 78), ('startTime', '126')):
+            run.observed_api_endpoint.return_value = ({**run.api_endpoint, field:value}, {}, {})
+            with self.assertRaises(ValueError): run.revalidate_api_endpoint()
+        run.api_endpoint = None
+        with self.assertRaises(ValueError): run.revalidate_api_endpoint()
+
+    def test_connect_diagnostics_are_fixed_bounded_and_secret_free(self):
+        run = M.CarrierRun.__new__(M.CarrierRun); run.result = {}; run.api_endpoint = {'old': True}
+        run.connect_phase('stopped-check')
+        self.assertIsNone(run.api_endpoint)
+        status = {'running': True, 'starting': False, 'pid': 77, 'clashApiPort': 41321,
+                  'mainGeneration': 5, 'mixedPort': 41234, 'secret': 'private-test-secret', 'config': 'never public'}
+        run.status = Mock(return_value=status)
+        for _ in range(500): run.connect_status()
+        for phase in M.CONNECT_PHASES[1:]: run.connect_phase(phase, status)
+        observation = run.result['connectObservation']
+        self.assertEqual(len(observation['phases']), len(M.CONNECT_PHASES))
+        self.assertEqual(observation['lastStatus']['clashApiPort'], 41321)
+        self.assertNotIn('private-test-secret', json.dumps(observation))
+        self.assertNotIn('never public', json.dumps(observation))
+        with self.assertRaises(ValueError): run.connect_phase('untrusted stage')
+        self.assertEqual(M.safe_connect_status({'pid': True, 'mainGeneration': -1, 'starting': 'secret'}), {})
+
+    def test_actual_producer_serialization_and_existing_probe_ownership_contract(self):
+        source = lambda path: (SOURCE / path).read_text()
+        self.assertIn('clash_api_port: api_port,', source('src-tauri/src/runtime/proxy/startup.rs'))
+        self.assertIn('tailscale_api_port: api_port,', source('src-tauri/src/runtime/proxy/startup.rs'))
+        self.assertIn('listen_port: deps.tailscale_api_port,', source('crates/config-engine/src/builder/generate.rs'))
+        self.assertIn('#[serde(rename = "clashApiPort", default)]', source('src-tauri/src/runtime/proxy.rs'))
+        self.assertIn('fn control_port(&self) -> Option<u16> {\n        None\n', source('crates/config-engine/src/builder/inbounds.rs'))
+        probe = source('crates/singbox-grpc/examples/package_runtime_probe.rs')
+        for guard in ('owned-loopback-listener-not-unique', 'listener-not-owned-by-core', 'owned-process-changed', 'owned-process-uid-differs'):
+            self.assertIn(guard, probe)
+        shared = Path(M.__file__).read_text()
+        self.assertNotIn("'port': self.control", shared)
+        self.assertIn("self.api_endpoint['port']", shared)
+
+    def test_plain_connect_rebinds_restart_and_requires_owned_probe(self):
+        core, secret, graph, status = self.api_fixture()
+        run = M.CarrierRun.__new__(M.CarrierRun)
+        run.result = {'cases': {'default_dashboard': {'evidence': {}}}}
+        run.secret, run.home, run.workspace, run.payload = secret, Path('/tmp'), Path('/tmp'), Path('/payload')
+        run.members = {'core': {'path': 'sing-box'}, 'cronet': {'path': 'libcronet.so', 'sha256':'b'*64}}
+        run.app = {'pid': 70, 'startTime': '100', 'sha256': 'c'*64}
+        run.status = Mock(return_value={'running':False}); run.driver = Mock(); run.supervisor = Mock()
+        run.supervisor.executable.return_value = core
+        endpoint = M.bind_api_endpoint(graph,status,secret,core)
+        run.observed_api_endpoint = Mock(return_value=(endpoint, {'sha256':'d'*64}, graph))
+        run.runtime_identity = Mock(return_value={'sha256':'d'*64}); run.rpc = Mock()
+        with patch.object(M, 'wait_for', return_value=status), patch.object(M, 'regular', side_effect=lambda p,*a: p), patch.object(Path, 'read_bytes', return_value=b'core\0run\0-c\0/tmp/singbox-runtime.json\0'), patch.object(Path, 'read_text', return_value=''), patch.object(M, 'cronet_mapping', return_value={}):
+            run.connect()
+            self.assertTrue(run.result['apiEndpoint']['ownedListenerProbe'])
+            self.assertEqual(run.api_endpoint['port'], 41321)
+            run.rpc.assert_called_once_with('capabilities')
+            changed = {**endpoint,'port':41322}
+            run.observed_api_endpoint.return_value = (changed, {'sha256':'e'*64}, graph)
+            run.connect()
+            self.assertEqual(run.api_endpoint['port'],41322)
+            run.rpc.side_effect = ValueError('listener-not-owned-by-core')
+            with self.assertRaises(ValueError): run.connect()
+            self.assertEqual(run.result['connectObservation']['phase'], 'owned-api-probe')
+
+
+    def test_plain_rpc_uses_actual_bound_endpoint_and_revalidates_after_probe(self):
+        import threading
+        core, secret, graph, status = self.api_fixture()
+        run = M.CarrierRun.__new__(M.CarrierRun)
+        run.core, run.secret = core, secret
+        run.api_endpoint = M.bind_api_endpoint(graph,status,secret,core)
+        run.fixture_control_port = 52345
+        run.revalidate_api_endpoint = Mock()
+        run.runtime_path, run.rpc_client, run.env = Path('/tmp/singbox-runtime.json'), Path('/private/probe'), {}
+        run.supervisor = SimpleNamespace(lock=threading.RLock(), children={},owned={},roles={})
+        child = Mock(pid=99, returncode=0)
+        child.communicate.return_value = (json.dumps({'schema':'polaris-package-rpc-probe-v1', 'ok':True, 'action':'capabilities', 'result':{'active':{}}}).encode(), None)
+        with patch.object(M, 'process_identity', side_effect=lambda pid: core if pid==77 else {'pid':99,'startTime':'200'}), patch.object(M.subprocess,'Popen',return_value=child) as popen:
+            self.assertEqual(run.rpc('capabilities'), {'active':{}})
+            sent = json.loads(child.communicate.call_args.args[0])
+            self.assertEqual(sent['port'],41321); self.assertNotEqual(sent['port'],run.fixture_control_port)
+            self.assertEqual(sent['secret'],secret)
+            self.assertNotIn(secret,str(popen.call_args))
+            self.assertEqual(run.revalidate_api_endpoint.call_count,2)
+            run.revalidate_api_endpoint.side_effect = [None, ValueError('birth changed after call')]
+            with self.assertRaises(ValueError): run.rpc('capabilities')
+
+    def test_every_connect_phase_failure_keeps_fixed_redacted_phase(self):
+        core, secret, graph, status = self.api_fixture()
+        for failed_phase in M.CONNECT_PHASES:
+            run = M.CarrierRun.__new__(M.CarrierRun)
+            run.result = {'cases':{'default_dashboard':{'evidence':{}}}}
+            run.secret, run.home, run.workspace, run.payload = secret, Path('/tmp'), Path('/tmp'), Path('/payload')
+            run.members = {'core':{'path':'sing-box'},'cronet':{'path':'libcronet.so','sha256':'b'*64}}
+            run.app = {'pid':70,'startTime':'100','sha256':'c'*64}
+            run.status = Mock(return_value={'running':False}); run.driver = Mock(); run.supervisor = Mock()
+            run.supervisor.executable.return_value = core
+            endpoint = M.bind_api_endpoint(graph,status,secret,core)
+            run.observed_api_endpoint = Mock(return_value=(endpoint,{},graph))
+            run.runtime_identity = Mock(return_value={}); run.rpc = Mock()
+            original = run.connect_phase
+            def phase(name, status=None):
+                original(name,status)
+                if name == failed_phase: raise ValueError('fixture private error')
+            run.connect_phase = phase
+            with patch.object(M,'wait_for',return_value=status), patch.object(M,'regular',side_effect=lambda p,*a:p), patch.object(Path,'read_bytes',return_value=b'core\0run\0-c\0/tmp/singbox-runtime.json\0'), patch.object(Path,'read_text',return_value=''), patch.object(M,'cronet_mapping',return_value={}):
+                with self.assertRaises(ValueError): run.connect()
+            self.assertEqual(run.result['connectObservation']['phase'],failed_phase)
+            self.assertNotIn(secret,json.dumps(run.result))
+            self.assertNotIn('fixture private error',json.dumps(run.result))
+            self.assertNotIn('execution',run.result)
+            self.assertNotIn('apiEndpoint',run.result)
+
+
 if __name__ == '__main__':
     unittest.main()

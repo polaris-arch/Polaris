@@ -496,6 +496,7 @@ class PureContracts(unittest.TestCase):
 
     def test_only_two_fixed_root_rpc_methods(self):
         run = M.TunCarrierRun.__new__(M.TunCarrierRun); run.controller = Mock()
+        run.revalidate_api_endpoint = Mock()
         run.controller.call.return_value = {'schema': 'polaris-package-rpc-probe-v1', 'ok': True,
                                            'action': 'tun-capabilities', 'result': {'active': {}}}
         self.assertEqual(run.rpc('capabilities'), {'active': {}})
@@ -506,6 +507,7 @@ class PureContracts(unittest.TestCase):
 
     def test_rpc_wrong_envelope_never_success(self):
         run = M.TunCarrierRun.__new__(M.TunCarrierRun); run.controller = Mock()
+        run.revalidate_api_endpoint = Mock()
         for response in ({'ok': False}, {'schema': 'polaris-package-rpc-probe-v1', 'ok': True, 'action': 'suite'}):
             run.controller.call.return_value = response
             with self.assertRaises(ValueError): run.rpc('capabilities')
@@ -817,6 +819,59 @@ class ControllerLifecycleContracts(unittest.TestCase):
         self.assertEqual([call.args[0] for call in diagnostic.call_args_list],
                          ['foreign-descendant-outside-exact-gui-transaction', 'tun-privileged-birth-quarantined'])
         self.assertTrue(all(call.kwargs['stage'] == 'tun-scan' for call in diagnostic.call_args_list))
+
+
+    def tun_connect_fixture(self):
+        run = M.TunCarrierRun.__new__(M.TunCarrierRun)
+        run.result, run.home, run.runtime_path = {}, Path('/tmp'), Path('/tmp/singbox-runtime.json')
+        core = identity(); core['sha256'] = H
+        run.members = {'core': {'sha256': H}}
+        run.app = {'pid': 7, 'startTime': '10', 'sha256': H, 'exeDev': 1, 'exeInode': 7}
+        run.status = Mock(return_value={'running': False}); run.driver = Mock(); run.controller = Mock()
+        run.controller.call.return_value = {'identity': core, 'executable': {'sha256': H}, 'runtime': {'sha256': H}}
+        endpoint = {'host': '127.0.0.1', 'port': 45001, 'pid': core['pid'], 'startTime': core['startTime']}
+        graph = {'inbounds': [{'type': 'tun', 'interface_name': 'polaris-tun0'}]}
+        run.observed_api_endpoint = Mock(return_value=(endpoint, {'sha256': H}, graph))
+        run.rpc = Mock()
+        status = {'running': True, 'startedViaHelper': True, 'pid': core['pid'], 'clashApiPort': 45001}
+        return run, status, endpoint, graph
+
+    def test_tun_actual_endpoint_connect_reuses_root_owned_probe_and_rebinds(self):
+        run, status, endpoint, graph = self.tun_connect_fixture()
+        with patch.object(M.base, 'wait_for', return_value=status), patch.object(M.base, 'regular', side_effect=lambda p,*args: p):
+            run.connect()
+            self.assertEqual(run.api_endpoint, endpoint)
+            self.assertTrue(run.result['apiEndpoint']['ownedListenerProbe'])
+            run.rpc.assert_called_once_with('capabilities')
+            self.assertIn('tun_register', [c.args[0] for c in run.controller.call.call_args_list])
+            second = {**endpoint, 'port':45002}
+            run.observed_api_endpoint.return_value = (second, {'sha256':H}, graph)
+            run.connect()
+            self.assertEqual(run.api_endpoint['port'],45002)
+
+    def test_tun_connect_rejects_attestation_graph_and_listener_failures(self):
+        for failure in ('root-runtime', 'tun-graph', 'owned-listener'):
+            run, status, endpoint, graph = self.tun_connect_fixture()
+            if failure == 'root-runtime': run.observed_api_endpoint.return_value = (endpoint, {'sha256':'b'*64}, graph)
+            if failure == 'tun-graph': run.observed_api_endpoint.return_value = (endpoint, {'sha256':H}, {'inbounds':[]})
+            if failure == 'owned-listener': run.rpc.side_effect = ValueError('root owned socket mismatch')
+            with patch.object(M.base, 'wait_for', return_value=status), patch.object(M.base, 'regular', side_effect=lambda p,*args: p):
+                with self.assertRaises(ValueError): run.connect()
+            self.assertNotIn('execution', run.result)
+            self.assertNotIn('apiEndpoint', run.result)
+            self.assertEqual(run.result['connectObservation']['phase'], 'owned-api-probe' if failure == 'owned-listener' else 'runtime-api')
+
+    def test_tun_rpc_brackets_root_call_without_supplying_endpoint_authority(self):
+        run = M.TunCarrierRun.__new__(M.TunCarrierRun)
+        run.controller = Mock(); run.revalidate_api_endpoint = Mock()
+        run.controller.call.return_value = {'schema':'polaris-package-rpc-probe-v1', 'ok':True, 'action':'tun-capabilities', 'result':{}}
+        run.rpc('capabilities')
+        self.assertEqual(run.revalidate_api_endpoint.call_count,2)
+        run.controller.call.assert_called_once_with('rpc', method='capabilities')
+        run.revalidate_api_endpoint.side_effect = ValueError('status endpoint mismatch')
+        run.controller.reset_mock()
+        with self.assertRaises(ValueError): run.rpc('capabilities')
+        run.controller.call.assert_not_called()
 
 
 if __name__ == '__main__':

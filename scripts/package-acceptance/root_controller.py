@@ -262,14 +262,15 @@ def validate_execution(value):
 
 
 AUTH_GUARDS = ('permission-schema', 'permission-mode', 'permission-binding', 'permission-actions',
-    'permission-window', 'permission-time', 'account-unique', 'account-login', 'account-groups',
+    'permission-window', 'permission-time', 'account-unique', 'account-login',
+    'account-groups-enumerate', 'account-groups-records', 'account-groups-required',
     'tool-passwd', 'tool-chpasswd', 'tool-pkttyagent', 'tool-setsid', 'tool-setpriv',
     'status-command', 'status-format', 'status-existing-password', 'complete')
 
 
 def auth_observation():
     return {'schema': 'polaris-auth-readiness-observation-v1', 'guard': 'permission-schema',
-            'code': 'AUTH_PERMISSION_SCHEMA', 'passwordStatus': 'unknown', 'completed': False,
+            'code': 'AUTH_PERMISSION_SCHEMA', 'passwordStatus': 'unknown', 'completed': False, 'groups': None,
             'scope': 'read-only-check-observation-not-account-restoration'}
 
 
@@ -280,13 +281,77 @@ def auth_mark(observation, guard):
 
 
 def validate_auth_observation(value):
-    exact(value, ('schema', 'guard', 'code', 'passwordStatus', 'completed', 'scope'))
+    exact(value, ('schema', 'guard', 'code', 'passwordStatus', 'completed', 'scope', 'groups'))
+    if value['groups'] is not None: validate_group_observation(value['groups'])
     require(value['schema'] == 'polaris-auth-readiness-observation-v1' and value['guard'] in AUTH_GUARDS and
             value['code'] == 'AUTH_' + value['guard'].upper().replace('-', '_') and
             value['passwordStatus'] in ('L', 'NP', 'P', 'unknown') and type(value['completed']) is bool and
             value['completed'] == (value['guard'] == 'complete') and
             value['scope'] == 'read-only-check-observation-not-account-restoration', 'authentication observation differs')
     require(not value['completed'] or value['passwordStatus'] in ('L', 'NP'), 'usable existing password is never admitted')
+    return value
+
+
+GROUP_NAMES = ('sudo', 'admin')
+GROUP_ERRORS = ('none', 'OSError', 'KeyError', 'TypeError', 'ValueError', 'other')
+
+
+def observe_existing_admin_groups(user):
+    """Observe the original primary/explicit-membership gate; no authorization."""
+    value = {'schema': 'polaris-existing-admin-groups-v1', 'guard': 'account-groups-enumerate',
+             'lookupState': 'unreached', 'errorType': 'none', 'groupRequirementSatisfied': None,
+             'groups': {name: {'exists': None, 'primaryMatch': None, 'explicitSupplementaryMatch': None}
+                        for name in GROUP_NAMES}}
+    try:
+        import grp
+        rows = grp.getgrall()
+        value['guard'] = 'account-groups-records'
+        require(type(rows) in (list, tuple), 'group enumeration shape differs')
+        groups = {name: {'exists': False, 'primaryMatch': False, 'explicitSupplementaryMatch': False}
+                  for name in GROUP_NAMES}
+        for group in rows:
+            require(type(group.gr_name) is str and type(group.gr_gid) is int and
+                    type(group.gr_mem) in (list, tuple) and all(type(name) is str for name in group.gr_mem),
+                    'group record shape differs')
+            if group.gr_name in groups:
+                record = groups[group.gr_name]
+                record['exists'] = True
+                record['primaryMatch'] |= group.gr_gid == user.pw_gid
+                record['explicitSupplementaryMatch'] |= user.pw_name in group.gr_mem
+        value.update(lookupState='observed', guard='account-groups-required', groups=groups,
+                     groupRequirementSatisfied=any(row['primaryMatch'] or row['explicitSupplementaryMatch']
+                                                   for row in groups.values()))
+    except Exception as error:
+        value.update(lookupState='failed', errorType=next((name for kind, name in
+            ((OSError, 'OSError'), (KeyError, 'KeyError'), (TypeError, 'TypeError'), (ValueError, 'ValueError'))
+            if isinstance(error, kind)), 'other'))
+    return value
+
+
+def validate_group_observation(value):
+    exact(value, ('schema', 'guard', 'lookupState', 'errorType', 'groupRequirementSatisfied', 'groups'))
+    require(value['schema'] == 'polaris-existing-admin-groups-v1' and
+            value['guard'] in ('account-groups-enumerate', 'account-groups-records', 'account-groups-required') and
+            value['lookupState'] in ('unreached', 'observed', 'failed') and value['errorType'] in GROUP_ERRORS,
+            'fixed group observation required')
+    exact(value['groups'], GROUP_NAMES)
+    for row in value['groups'].values():
+        exact(row, ('exists', 'primaryMatch', 'explicitSupplementaryMatch'))
+        require(all(v is None or type(v) is bool for v in row.values()), 'finite group flags required')
+    if value['lookupState'] == 'observed':
+        require(value['guard'] == 'account-groups-required' and value['errorType'] == 'none' and
+                type(value['groupRequirementSatisfied']) is bool and
+                all(type(v) is bool for row in value['groups'].values() for v in row.values()) and
+                all(row['exists'] or not (row['primaryMatch'] or row['explicitSupplementaryMatch'])
+                    for row in value['groups'].values()) and
+                value['groupRequirementSatisfied'] == any(row['primaryMatch'] or row['explicitSupplementaryMatch']
+                                                         for row in value['groups'].values()),
+                'group result differs from observation')
+    else:
+        require(value['guard'] != 'account-groups-required' and value['groupRequirementSatisfied'] is None and
+                all(v is None for row in value['groups'].values() for v in row.values()) and
+                ((value['lookupState'] == 'failed') == (value['errorType'] != 'none')),
+                'incomplete group observation cannot pass')
     return value
 
 
@@ -371,7 +436,6 @@ def account_status(name, observation=None):
 
 
 def credential_account(launch, tun, recovery=False, observation=None):
-    import grp
     p = validate_permission(launch, recovery=recovery, observation=observation)
     auth_mark(observation, 'account-unique')
     users = [u for u in pwd.getpwall() if u.pw_uid == p['guiUid']]
@@ -381,10 +445,14 @@ def credential_account(launch, tun, recovery=False, observation=None):
     if not recovery:
         auth_mark(observation, 'account-login')
         require(user.pw_shell in ('/bin/bash', '/usr/bin/bash') and user.pw_dir.startswith('/home/'), 'existing runner login account required')
-    auth_mark(observation, 'account-groups')
-    groups = [g.gr_name for g in grp.getgrall() if user.pw_name in g.gr_mem or g.gr_gid == user.pw_gid]
     if not recovery:
-        require('sudo' in groups or 'admin' in groups, 'existing administrator group required; no group changes allowed')
+        groups = validate_group_observation(observe_existing_admin_groups(user))
+        if observation is not None: observation['groups'] = groups
+        auth_mark(observation, groups['guard'])
+        require(groups['lookupState'] == 'observed' and groups['groupRequirementSatisfied'] is True,
+                'existing administrator group required; no group changes allowed')
+    # Recovery already deliberately ignores membership changes. Do not make
+    # exact-account re-lock depend on an unused NSS group enumeration.
     for path in ('/usr/bin/passwd', '/usr/sbin/chpasswd', '/usr/bin/pkttyagent', '/usr/bin/setsid', '/usr/bin/setpriv'):
         auth_mark(observation, 'tool-' + Path(path).name)
         tun.file_identity(Path(path).resolve())

@@ -41,6 +41,10 @@ on:
   # 单平台用于定位平台故障，发布仍必须 all。
   workflow_dispatch:
     inputs:
+      linux_auth_preflight_only:
+        description: 'Read-only exact-source runner group diagnostic in setup only; no credential authority'
+        type: boolean
+        default: false
       linux_package_acceptance:
         description: 'Run real unpacked Linux final packages on this exact reviewed branch (no branch publication)'
         type: boolean
@@ -192,13 +196,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         id: checkout
-        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '' || inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != ''
+        if: inputs.linux_auth_preflight_only == true || (inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '' || inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != '')
         with:
-          ref: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.linux_auth_preflight_only && github.sha || inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@v7
-        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '' || inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != ''
+        if: inputs.linux_auth_preflight_only != true && (inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '' || inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != '')
         with:
           node-version: '26'
 
@@ -241,6 +245,7 @@ jobs:
       #     那段在原位时同理，Actions 先做 YAML 解析、注释在表达式求值前就被丢掉了。）
       - name: Resolve platform matrix
         id: resolve
+        if: inputs.linux_auth_preflight_only != true
         shell: bash
         env:
           # workflow_call 的 platforms JSON 优先；手动/单平台复用继续走 platform。tag push 两者都空，
@@ -349,7 +354,7 @@ jobs:
       # the matrix resolver. Never erase a 0/1 flag to manufacture formal origin.
       - name: Admit actual formal Linux package source
         id: linux_acceptance_admission
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != ''
+        if: inputs.linux_auth_preflight_only != true && (startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '')
         env:
           PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
           PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
@@ -366,7 +371,7 @@ jobs:
           echo 'enabled=true' >> "$GITHUB_OUTPUT"
 
       - name: Admit separately selected same-carrier TUN and credential authority
-        if: inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != ''
+        if: inputs.linux_auth_preflight_only != true && (inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != '')
         env:
           PACKAGE_TUN_REQUESTED: ${{ inputs.linux_tun_acceptance && 'true' || 'false' }}
           PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
@@ -392,12 +397,32 @@ jobs:
   # 其正确性由调用侧已有 CI/UI 门承担；重复跑完整 3-OS 只增加等待。
   # **发布路径不变**：tag push 走 `platform=all` ⇒ full=true
   # ⇒ 本门照跑，不绿则 package 一条腿都不起。
+      - name: Read-only exact-source account group preflight
+        if: inputs.linux_auth_preflight_only == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          export PREFLIGHT_WORKTREE_CLEAN=true
+          export PREFLIGHT_CHECKOUT_SHA="$(git rev-parse HEAD)"
+          python3 -B scripts/package-acceptance/diagnostic_scope.py --auth-preflight-only
+
+      - name: Preserve bounded read-only preflight diagnostic
+        if: always() && inputs.linux_auth_preflight_only == true
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-auth-preflight-diagnostic
+          path: linux-auth-preflight-evidence/groups.json
+          if-no-files-found: error
+          retention-days: 7
+
+
   ci:
     name: ci gate
     needs: setup
     if: >-
-      needs.setup.outputs.full == 'true'
-      && inputs.skip_quality_gates != true
+      inputs.linux_auth_preflight_only != true && (needs.setup.outputs.full == 'true'
+      && inputs.skip_quality_gates != true)
     uses: ./.github/workflows/ci.yml
     with:
       windows_system_candidate: ${{ inputs.windows_system_candidate || '' }}
@@ -410,8 +435,8 @@ jobs:
     name: ui gate
     needs: setup
     if: >-
-      needs.setup.outputs.full == 'true'
-      && inputs.skip_quality_gates != true
+      inputs.linux_auth_preflight_only != true && (needs.setup.outputs.full == 'true'
+      && inputs.skip_quality_gates != true)
     uses: ./.github/workflows/ui.yml
     with:
       preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
@@ -422,7 +447,7 @@ jobs:
   desktop_core:
     name: four native source producers
     needs: setup
-    if: inputs.core_bundle_artifact == ''
+    if: inputs.linux_auth_preflight_only != true && (inputs.core_bundle_artifact == '')
     permissions:
       contents: read
       actions: read
@@ -460,9 +485,9 @@ jobs:
     #    可达，而 tag ref 的并发组从不取消在途（见文件头 concurrency 段）。
     needs: [setup, desktop_core]
     if: >-
-      !cancelled() && needs.setup.result == 'success'
+      inputs.linux_auth_preflight_only != true && (!cancelled() && needs.setup.result == 'success'
       && (needs.desktop_core.result == 'success'
-        || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''))
+        || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != '')))
     # W24：helper 与 app 分两次 cargo build，但必须共享同一份构建身份。放 job 级而非某一步，
     # 让 helper staging 与后面的 tauri-action 都继承当前 checkout commit；同 protocol 的旧 helper
     # 才能被新 app 识别为 upgradeable。resolved candidate 在 PR 上为 head，在 tag/dispatch 为 github.sha。
@@ -1787,8 +1812,8 @@ jobs:
     name: real final Linux packages (non-root, non-TUN)
     needs: [setup, package]
     if: >-
-      !cancelled() && needs.setup.outputs.acceptance_enabled == 'true'
-      && needs.setup.result == 'success' && needs.package.result == 'success'
+      inputs.linux_auth_preflight_only != true && (!cancelled() && needs.setup.outputs.acceptance_enabled == 'true'
+      && needs.setup.result == 'success' && needs.package.result == 'success')
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     permissions:
@@ -1922,9 +1947,9 @@ jobs:
     name: real final Linux TUN (${{ matrix.kind }}, disposable VM)
     needs: [setup, package]
     if: >-
-      !cancelled() && inputs.linux_tun_acceptance == true
+      inputs.linux_auth_preflight_only != true && (!cancelled() && inputs.linux_tun_acceptance == true
       && needs.setup.outputs.acceptance_enabled == 'true'
-      && needs.setup.result == 'success' && needs.package.result == 'success'
+      && needs.setup.result == 'success' && needs.package.result == 'success')
     runs-on: ubuntu-22.04
     timeout-minutes: 35
     strategy:
@@ -2095,9 +2120,9 @@ jobs:
     name: bundled core gRPC wire contract
     needs: [setup, desktop_core]
     if: >-
-      !cancelled() && needs.setup.result == 'success'
+      inputs.linux_auth_preflight_only != true && (!cancelled() && needs.setup.result == 'success'
       && (needs.desktop_core.result == 'success'
-        || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''))
+        || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != '')))
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -2267,7 +2292,7 @@ jobs:
     # `github.ref` 与 `needs` 在 **job 级** 都可用（不同于 matrix 级——见 package job 搬走的那段
     # github.workspace 教训：那是上下文**求值时机**问题，不是名字拼错）。
     if: >-
-      always()
+      inputs.linux_auth_preflight_only != true && (always()
       && startsWith(github.ref, 'refs/tags/v')
       && needs.setup.outputs.full == 'true'
       && needs.package.result == 'success'
@@ -2275,7 +2300,7 @@ jobs:
       && needs.linux_package_acceptance.result == 'success'
       && (inputs.linux_tun_acceptance != true || needs.linux_tun_package_acceptance.result == 'success')
       && (needs.ci.result == 'success' || needs.ci.result == 'skipped')
-      && (needs.ui.result == 'success' || needs.ui.result == 'skipped')
+      && (needs.ui.result == 'success' || needs.ui.result == 'skipped'))
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -2616,6 +2641,7 @@ jobs:
   # 第二段：桌面草稿已经落定后，才允许签名 APK job 对**同一个 tag 草稿**写入。
   # `secrets: inherit` 把仓库已配置的四项发布签名 secret 交给被调用 workflow；值不进入本文件。
   android_release:
+    if: inputs.linux_auth_preflight_only != true
     name: build + upload signed Android APK
     needs: release_desktop
     # reusable workflow 不能把 caller 的 GITHUB_TOKEN 从 read 自行抬到 write；写权限必须在调用点授予。
@@ -2634,11 +2660,11 @@ jobs:
     name: verify combined release + promote public
     needs: [release_desktop, android_release, linux_package_acceptance, linux_tun_package_acceptance]
     if: >-
-      always()
+      inputs.linux_auth_preflight_only != true && (always()
       && needs.release_desktop.result == 'success'
       && needs.android_release.result == 'success'
       && needs.linux_package_acceptance.result == 'success'
-      && (inputs.linux_tun_acceptance != true || needs.linux_tun_package_acceptance.result == 'success')
+      && (inputs.linux_tun_acceptance != true || needs.linux_tun_package_acceptance.result == 'success'))
     runs-on: ubuntu-22.04
     permissions:
       contents: write

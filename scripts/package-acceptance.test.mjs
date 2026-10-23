@@ -326,3 +326,35 @@ test('both Linux consumers prove installed drivers without unsupported version p
   for (const suite of ['test_tooling.py', 'test_diagnostic_scope.py'])
     assert.ok(readFileSync(join(ROOT, 'scripts/package-acceptance', suite)).length > 0);
 });
+
+
+test('read-only auth preflight is one existing setup job and default DAG is byte-preserved', () => {
+  const workflow = readFileSync(join(ROOT, '.github/workflows/package.yml'), 'utf8');
+  const names = [...workflow.slice(workflow.indexOf('\njobs:\n')).matchAll(/^  ([a-z_]+):$/gm)].map(m => m[1]);
+  assert.deepEqual(names, ['setup','ci','ui','desktop_core','package','linux_package_acceptance',
+    'linux_tun_package_acceptance','core_wire','release_desktop','android_release','release']);
+  for (const name of names.slice(1)) {
+    const block = workflow.split(`\n  ${name}:\n`)[1].split(/\n  [a-z_]+:\n/)[0];
+    assert.match(block, /^    if: (?:>-\n      )?inputs\.linux_auth_preflight_only != true/m, name);
+  }
+  const setup = workflow.split('\n  setup:\n')[1].split('\n  ci:\n')[0];
+  assert.match(setup, /runs-on: ubuntu-22\.04/);
+  assert.match(setup, /if: always\(\) && inputs\.linux_auth_preflight_only == true\n        uses: actions\/upload-artifact@v7/);
+  assert.match(setup, /if-no-files-found: error/);
+  assert.match(setup, /test -z "\$\(git status --porcelain --untracked-files=all\)"/);
+  assert.match(setup, /python3 -B scripts\/package-acceptance\/diagnostic_scope\.py --auth-preflight-only/);
+  assert.doesNotMatch(workflow.split('  workflow_call:')[1].split('\npermissions:')[0], /linux_auth_preflight_only/);
+  // Reverse only the added default-false guards/input/steps/ref selection. The
+  // complete resulting workflow must equal the reviewed f20ce source hash:
+  // dependencies, matrices, original conditions (including always), and bodies.
+  let projected = workflow.replace(/      linux_auth_preflight_only:\n        description: [^\n]+\n        type: boolean\n        default: false\n/, '');
+  projected = projected.replace('inputs.linux_auth_preflight_only && github.sha || ', '');
+  projected = projected.replace(/^        if: inputs\.linux_auth_preflight_only == true \|\| \((.*)\)$/gm, '        if: $1');
+  projected = projected.replace(/^        if: inputs\.linux_auth_preflight_only != true && \((.*)\)$/gm, '        if: $1');
+  projected = projected.replace('        id: resolve\n        if: inputs.linux_auth_preflight_only != true\n', '        id: resolve\n');
+  projected = projected.replace(/\n      - name: Read-only exact-source account group preflight\n[\s\S]*?          retention-days: 7\n\n/, '');
+  projected = projected.replace(/^    if: inputs\.linux_auth_preflight_only != true && \((.*)\)$/gm, '    if: $1');
+  projected = projected.replace(/^    if: >-\n      inputs\.linux_auth_preflight_only != true && \(([\s\S]*?)\)\n(?=    [^ ])/gm, '    if: >-\n      $1\n');
+  projected = projected.replace('  android_release:\n    if: inputs.linux_auth_preflight_only != true\n', '  android_release:\n');
+  assert.equal(sha256(projected), '0983b4a8580cd9e31b09899d30818928a72dbf53fc60523da9a235ebd3e3a995');
+});

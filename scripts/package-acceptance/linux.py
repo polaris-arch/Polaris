@@ -137,7 +137,7 @@ def inspect_carrier(path, kind):
 
 
 
-def stable_runtime_capture(path, home, identity, destination):
+def stable_runtime_capture(path, home, identity, destination, *, include_content=False):
     """Keep exact original bytes privately; never put the API secret in artifacts."""
     path = regular(path, home)
     started = time.time_ns()
@@ -169,7 +169,37 @@ def stable_runtime_capture(path, home, identity, destination):
     fd = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, 'w') as stream:
         json.dump({'evidence': proof, 'originalBytesBase64': base64.b64encode(first).decode()}, stream)
-    return proof
+    return (proof, content) if include_content else proof
+
+
+def bind_api_endpoint(graph, status, secret, core):
+    """Pure contract binding. Returned proof contains no configuration/secret."""
+    require(isinstance(graph, dict) and isinstance(status, dict), 'API binding inputs unavailable')
+    require(isinstance(graph.get('services'), list), 'API service inventory invalid')
+    apis = [item for item in graph['services'] if isinstance(item, dict) and item.get('type') == 'api']
+    require(len(apis) == 1 and apis[0].get('listen') == '127.0.0.1', 'unique loopback API required')
+    port = apis[0].get('listen_port')
+    require(type(port) is int and 0 < port < 65536, 'actual API port invalid')
+    require(type(status.get('pid')) is int and status['pid'] == core['pid']
+            and status.get('running') is True and status.get('starting', False) is False, 'API status/core differs')
+    require(type(status.get('clashApiPort')) is int and status['clashApiPort'] == port,
+            'actual API/status port differs')
+    require(isinstance(secret, str) and len(secret) >= 16 and apis[0].get('secret') == secret,
+            'actual API secret differs')
+    return {'host': '127.0.0.1', 'port': port, 'pid': core['pid'], 'startTime': core['startTime']}
+
+
+def safe_connect_status(status):
+    if not isinstance(status, dict):
+        return {}
+    safe = {key: status[key] for key in ('running', 'starting') if type(status.get(key)) is bool}
+    safe.update({key: status[key] for key in ('pid', 'mainGeneration', 'mixedPort', 'clashApiPort')
+                 if type(status.get(key)) is int and 0 <= status[key] < 2 ** 64})
+    return safe
+
+
+CONNECT_PHASES = ('stopped-check', 'gui-click', 'status-ready', 'core-birth',
+                  'runtime-path', 'runtime-api', 'owned-api-probe', 'cronet-map', 'receipt')
 
 
 def clean_exit_marker(path, started):
@@ -1056,10 +1086,11 @@ class CarrierRun:
         self.normal_quit = False
         self.sockets = []
         self.secret = os.urandom(32).hex()
-        self.mixed, self.control = free_port(), free_port()
-        while self.control == self.mixed:
-            self.control = free_port()
+        self.mixed, self.fixture_control_port = free_port(), free_port()
+        while self.fixture_control_port == self.mixed:
+            self.fixture_control_port = free_port()
         self.core = None
+        self.api_endpoint = None
         self.runtime_path = None
         self.translations = json.loads((ROOT / 'ui/src/i18n/locales/en-US.json').read_text())
         self.network = self.create_network()
@@ -1153,14 +1184,54 @@ class CarrierRun:
     def status(self):
         return self.driver.invoke('proxy_get_status')
 
+    def connect_phase(self, phase, status=None):
+        require(phase in CONNECT_PHASES, 'fixed connect phase required')
+        if phase == 'stopped-check':
+            self.api_endpoint = None
+            self.result.pop('apiEndpoint', None)
+            self._connect_started = time.monotonic()
+            self.result['connectObservation'] = {'phases': []}
+        record = {'phase': phase, 'elapsedMs': max(0, int((time.monotonic() - self._connect_started) * 1000))}
+        if status is not None:
+            record['status'] = safe_connect_status(status)
+        self.result['connectObservation']['phase'] = phase
+        self.result['connectObservation']['phases'].append(record)
+
+    def connect_status(self):
+        status = self.status()
+        self.result['connectObservation']['lastStatus'] = safe_connect_status(status)
+        return status
+
+    def observed_api_endpoint(self):
+        # Parse exactly the stable bytes captured privately, never a subsequent
+        # unbound read. Status and the parsed graph are bracketed by captures.
+        proof, graph = stable_runtime_capture(self.runtime_path, self.home, self.core,
+            self.workspace / 'private-runtime-originals', include_content=True)
+        status = self.status()
+        after = self.runtime_identity()
+        require(proof['sha256'] == after['sha256'] and proof['pid'] == after['pid']
+                and proof['startTime'] == after['startTime'], 'API runtime changed during binding')
+        return bind_api_endpoint(graph, status, self.secret, self.core), proof, graph
+
+    def revalidate_api_endpoint(self):
+        require(self.api_endpoint is not None, 'API endpoint not bound')
+        endpoint, proof, _ = self.observed_api_endpoint()
+        require(endpoint == self.api_endpoint, 'bound API endpoint/core changed')
+        return proof
+
     def connect(self):
+        self.connect_phase('stopped-check')
         require(not self.status().get('running'), 'connect requires stopped core')
+        self.connect_phase('gui-click')
         self.driver.click('#connect-btn')
-        status = wait_for(self.status, lambda s: s.get('running') is True and not s.get('starting'), timeout=75)
+        self.connect_phase('status-ready')
+        status = wait_for(self.connect_status, lambda s: s.get('running') is True and not s.get('starting'), timeout=75)
+        self.connect_phase('core-birth', status)
         require(status.get('startedViaHelper') is not True, 'privileged helper prohibited')
         core = self.supervisor.executable(self.payload / self.members['core']['path'])
         require(status.get('pid') == core['pid'], 'App status is not owned packaged core')
         self.core = core
+        self.connect_phase('runtime-path')
         arguments = (Path('/proc') / str(core['pid']) / 'cmdline').read_bytes().split(b'\0')
         candidates = []
         for index, arg in enumerate(arguments[:-1]):
@@ -1172,15 +1243,18 @@ class CarrierRun:
             path = (Path('/proc') / str(core['pid']) / 'cwd').resolve() / path
         self.runtime_path = regular(path, self.home)
         require(self.runtime_path.name == 'singbox-runtime.json', 'unexpected runtime config source')
-        content = json.loads(self.runtime_path.read_text())
+        self.connect_phase('runtime-api')
+        endpoint, runtime, content = self.observed_api_endpoint()
         require(all(item.get('type') != 'tun' for item in content.get('inbounds', [])), 'TUN not permitted')
-        api = [item for item in content.get('services', []) if item.get('type') == 'api']
-        require(len(api) == 1 and api[0].get('listen') == '127.0.0.1'
-                and api[0].get('listen_port') == self.control and api[0].get('secret') == self.secret,
-                'actual App-owned API differs')
+        self.api_endpoint = endpoint
+        self.connect_phase('owned-api-probe')
+        self.rpc('capabilities')  # Existing frozen probe verifies the core's LISTEN inode.
+        self.connect_phase('cronet-map')
         maps = (Path('/proc') / str(core['pid']) / 'maps').read_text()
         expected = self.payload / self.members['cronet']['path']
         mapping = cronet_mapping(maps, expected, self.members['cronet']['sha256'])
+        self.connect_phase('receipt')
+        self.result['apiEndpoint'] = {**endpoint, 'ownedListenerProbe': True}
         self.result['execution'] = {'uid': os.getuid(), 'defaultSandbox': True, 'originalEntry': True,
             'automation': 'tauri-driver 2.0.5',
             'app': {key: self.app[key] for key in ('sha256', 'pid', 'startTime')},
@@ -1192,6 +1266,7 @@ class CarrierRun:
         return status
 
     def disconnect(self):
+        self.api_endpoint = None
         before = self.core
         require(self.status().get('running'), 'disconnect requires running core')
         self.driver.click('#connect-btn')
@@ -1223,7 +1298,8 @@ class CarrierRun:
 
     def rpc(self, action, request=None):
         require(same_process(self.core, process_identity(self.core['pid'])), 'owned core identity changed')
-        data = {'action': action, 'host': '127.0.0.1', 'port': self.control, 'secret': self.secret,
+        self.revalidate_api_endpoint()
+        data = {'action': action, 'host': self.api_endpoint['host'], 'port': self.api_endpoint['port'], 'secret': self.secret,
                 'owned': {'pid': self.core['pid'], 'startTimeTicks': int(self.core['startTime']),
                           'exe': self.core['exe'], 'runtimeConfig': str(self.runtime_path)},
                 'request': request or {}}
@@ -1248,6 +1324,7 @@ class CarrierRun:
         require(child.returncode == 0 and result.get('ok') is True
                 and result.get('schema') == 'polaris-package-rpc-probe-v1'
                 and result.get('action') == action, 'RPC probe failed')
+        self.revalidate_api_endpoint()
         return result['result']
 
     def apply(self, expected='hotApplied', retry=None):
@@ -1449,7 +1526,7 @@ return buttons.length===1?buttons[0]:null;
         wanted = self.config()
         structural = copy.deepcopy(wanted)
         structural['mixedPort'] = free_port()
-        while structural['mixedPort'] in (self.mixed, self.control):
+        while structural['mixedPort'] in (self.mixed, self.fixture_control_port, self.api_endpoint['port']):
             structural['mixedPort'] = free_port()
         save_fixture(self.driver, structural)
         rejected = self.apply('restartRequired')
@@ -1481,6 +1558,7 @@ return buttons.length===1?buttons[0]:null;
         return wanted
 
     def quit_product(self):
+        self.api_endpoint = None
         self.stage = 'tray-quit'
         marker = self.runtime_path.parent / 'clean-exit.marker'
         require(not marker.exists() and not marker.is_symlink(), 'stale clean-exit marker before GUI quit')
@@ -1530,7 +1608,7 @@ return buttons.length===1?buttons[0]:null;
             require(initial.get('hardwareAcceleration') is not False, 'default graphics escape active')
             self.record('default_dashboard', emptyHome=True, observed=True,
                         defaultGraphics=True, screenshot=self.snapshot('default'))
-            patch = self.network.config_patch(self.mixed, self.control, self.secret)
+            patch = self.network.config_patch(self.mixed, self.fixture_control_port, self.secret)
             selection_patch = copy.deepcopy(patch)
             for key in ('trafficRules', 'policyRules', 'customRules', 'routeRuleOrder'):
                 selection_patch[key] = []

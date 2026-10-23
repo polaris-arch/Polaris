@@ -270,7 +270,8 @@ class ReadinessObservationTests(unittest.TestCase):
         if fault == 'permission-window': c.launch['authorization']['expiresUnix'] += 1000
         if fault == 'permission-time': c.launch['authorization']['notBeforeUnix'] -= 2000; c.launch['authorization']['expiresUnix'] -= 2000
         if fault == 'account-login': user.pw_shell = '/sbin/nologin'
-        if fault == 'account-groups': group.gr_name = 'users'
+        if fault == 'account-groups-required': group.gr_name = 'users'
+        if fault == 'account-groups-records': group.gr_mem = None
         def tool(path):
             if fault == 'tool-' + Path(path).name: raise ValueError('PRIVATE')
             return {'dev': 1, 'inode': 2, 'sha256': H}
@@ -279,7 +280,7 @@ class ReadinessObservationTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch.object(m.pwd, 'getpwall', return_value=[user,user] if fault == 'account-unique' else [user]))
             stack.enter_context(patch.object(m.pwd, 'getpwnam', return_value=user))
-            stack.enter_context(patch('grp.getgrall', return_value=[group]))
+            stack.enter_context(patch('grp.getgrall', return_value=[group], side_effect=OSError('PRIVATE') if fault == 'account-groups-enumerate' else None))
             run = stack.enter_context(patch.object(m.subprocess, 'run', return_value=types.SimpleNamespace(stdout=output),
                 side_effect=OSError('PRIVATE') if fault == 'status-command' else None))
             spawn = stack.enter_context(patch.object(m.subprocess, 'Popen'))
@@ -920,6 +921,48 @@ class StartupLifecycleTests(unittest.TestCase):
                     c.tun.cleanup.assert_called_once_with(ledger, forced=True)
                 else: c.tun.prepare_root.assert_not_called()
                 self.assertNotIn('PRIVATE', json.dumps(recovery))
+
+
+class ExistingGroupObservationTests(unittest.TestCase):
+    def user(self):
+        return types.SimpleNamespace(pw_uid=1001, pw_name='runner', pw_gid=42,
+                                     pw_shell='/bin/bash', pw_dir='/home/runner')
+
+    def test_original_primary_or_explicit_membership_only(self):
+        for name in ('sudo', 'admin', 'adm', 'docker', 'sudo-extra'):
+            for primary, supplementary in ((True, False), (False, True), (False, False)):
+                row = types.SimpleNamespace(gr_name=name, gr_gid=42 if primary else 99,
+                                            gr_mem=['runner'] if supplementary else [])
+                with self.subTest(name=name, primary=primary, supplementary=supplementary), patch('grp.getgrall', return_value=[row]):
+                    value = m.validate_group_observation(m.observe_existing_admin_groups(self.user()))
+                    self.assertEqual(value['groupRequirementSatisfied'], name in ('sudo','admin') and (primary or supplementary))
+                    self.assertEqual(set(value['groups']), {'sudo','admin'})
+
+    def test_errors_are_bounded_and_never_echo_nss(self):
+        for error, label in ((OSError('PRIVATE'), 'OSError'), (KeyError('PRIVATE'),'KeyError'),
+                             (TypeError('PRIVATE'),'TypeError'), (RuntimeError('PRIVATE'),'other')):
+            with patch('grp.getgrall', side_effect=error):
+                value = m.validate_group_observation(m.observe_existing_admin_groups(self.user()))
+            self.assertEqual(value['errorType'], label)
+            self.assertEqual(value['guard'], 'account-groups-enumerate')
+            self.assertNotIn('PRIVATE', json.dumps(value))
+            self.assertIsNone(value['groupRequirementSatisfied'])
+
+    def test_recovery_never_enumerates_groups_but_keeps_exact_account(self):
+        c = controller(m.AUTH_MODE); user = self.user()
+        with patch.object(m.pwd,'getpwall',return_value=[user]), patch.object(m.pwd,'getpwnam',return_value=user), \
+             patch('grp.getgrall',side_effect=AssertionError('unused group lookup')) as groups, \
+             patch.object(m,'account_status',return_value='P'):
+            self.assertEqual(m.credential_account(c.launch,c.tun,recovery=True)[0], user)
+            groups.assert_not_called()
+            user.pw_uid = 1002
+            with self.assertRaises(ValueError): m.credential_account(c.launch,c.tun,recovery=True)
+            groups.assert_not_called()
+
+    def test_forged_group_receipts_rejected(self):
+        with patch('grp.getgrall',return_value=[]): value=m.observe_existing_admin_groups(self.user())
+        for change in ({'errorType':'PRIVATE'}, {'groupRequirementSatisfied':True}, {'extra':True}):
+            with self.assertRaises(ValueError): m.validate_group_observation(value | change)
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)
