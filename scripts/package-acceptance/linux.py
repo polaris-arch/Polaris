@@ -648,6 +648,14 @@ def load_fixtures():
     return module
 
 
+def verified_tools():
+    # The harness reads runner custody; none of this context enters private_env.
+    spec = importlib.util.spec_from_file_location('package_tooling', Path(__file__).with_name('tooling.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.verify()
+
+
 def save_fixture(driver, desired):
     before = driver.invoke('config_get')
     value = driver.invoke('config_save', {'config': desired, 'deferRestart': True,
@@ -717,6 +725,7 @@ class CarrierRun:
         self.result['cases'][key] = {'status': 'passed', 'evidence': evidence}
 
     def start_tools(self):
+        tools = verified_tools()
         import select
         read_fd, write_fd = os.pipe()
         try:
@@ -738,14 +747,10 @@ class CarrierRun:
         address = bus.stdout.readline(4096).decode().strip()
         require(address.startswith('unix:') and len(address) < 4096, 'private DBus address differs')
         self.env['DBUS_SESSION_BUS_ADDRESS'] = address
-        driver = shutil.which('tauri-driver')
-        native = shutil.which('WebKitWebDriver')
-        require(driver and native, 'native automation tooling missing')
-        version_process = self.supervisor.spawn([driver, '--version'], self.env, 'tool-version', stdout=subprocess.PIPE)
-        version = version_process.communicate(timeout=10)[0].decode().strip()
-        require(version_process.returncode == 0, 'automation version query failed')
-        require(version == 'tauri-driver 2.0.5', 'exact reviewed tauri-driver required')
-        self.result['tools'] = {'automation': version, 'nativeDriver': byte_identity(Path(native).resolve()),
+        driver = tools['automation']['binary']['path']
+        native = tools['nativeDriver']['binary']['path']
+        self.result['tools'] = {'automation': 'tauri-driver ' + tools['automation']['version'],
+                                'identity': tools, 'nativeDriver': tools['nativeDriver']['binary'],
                                 'xvfb': 'private display', 'dbus': 'private session'}
         self.driver_port, native_port = free_port(), free_port()
         while native_port == self.driver_port:

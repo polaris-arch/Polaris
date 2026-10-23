@@ -191,6 +191,7 @@ jobs:
       acceptance_context: ${{ steps.linux_acceptance_admission.outputs.context }}
     steps:
       - uses: actions/checkout@v7
+        id: checkout
         if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '' || inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != ''
         with:
           ref: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
@@ -512,6 +513,7 @@ jobs:
         run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 179 * 60000) + "\n")'
 
       - uses: actions/checkout@v7
+        id: checkout
         with:
           ref: ${{ needs.setup.outputs.candidate }}
           persist-credentials: false
@@ -766,6 +768,7 @@ jobs:
       # NASM 仍是两处内联：判据与版本依据写在 `ci.yml` 同名步上方，**改 NASM 前先读那段**，
       # 两个文件的 NASM 常量必须同时改，改一处就漂移（对拍照旧）。
       - name: Install protoc (pinned URL + sha256)
+        id: protoc_install
         run: node scripts/fetch-protoc.mjs
 
       - name: Install NASM (Windows — pinned URL + sha256)
@@ -820,6 +823,7 @@ jobs:
         run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
+        id: core_go
         with:
           go-version: ${{ steps.core-go.outputs.version }}
           cache: false
@@ -1804,6 +1808,7 @@ jobs:
       PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
     steps:
       - uses: actions/checkout@v7
+        id: checkout
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -1811,22 +1816,26 @@ jobs:
         with:
           node-version: '26'
       - name: Require unchanged actual formal source
+        id: admission
         run: node scripts/package-acceptance/transport.mjs admit
       - name: Install native automation runtime (not sandbox workarounds)
+        id: native_tools
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev webkit2gtk-driver xvfb dbus-x11 squashfs-tools
       - name: Install test-side tools only
+        id: test_tools
         run: |
           set -euo pipefail
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-          cargo install tauri-driver --version '=2.0.5' --locked
-          tauri-driver --version
-          WebKitWebDriver --version
+          cargo install --root "$RUNNER_TEMP/polaris-package-automation" --version '=2.0.5' --locked tauri-driver
+          python3 -B scripts/package-acceptance/tooling.py prepare --root "$RUNNER_TEMP/polaris-package-automation" --output "$RUNNER_TEMP/polaris-package-automation/receipt.json"
       - name: Install protoc (pinned URL + sha256)
+        id: protoc_install
         run: node scripts/fetch-protoc.mjs
       - name: Verify protoc toolchain
+        id: protoc
         run: |
           got="$(protoc --version)"
           [ "$got" = "$PROTOC_EXPECT" ] || {
@@ -1836,18 +1845,22 @@ jobs:
         id: core-go
         run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v6
+        id: core_go
         with:
           go-version: ${{ steps.core-go.outputs.version }}
           cache: false
       - name: Fetch original formal core receipts for comparison only
+        id: core_receipts
         env:
           POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
         run: node scripts/fetch-core.mjs --platform=linux
       - name: Download exact final package transport and bytes
+        id: transport
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/package-acceptance/transport.mjs fetch linux-package-input linux-package-carriers
       - name: Verify original final-package receipts
+        id: native_receipt
         shell: bash
         run: |
           set -euo pipefail
@@ -1857,12 +1870,15 @@ jobs:
           python3 -B scripts/final-package-receipt.py --platform linux --kind deb --artifact "${debs[0]}" --output linux-package-evidence/final-deb.json
           python3 -B scripts/final-package-receipt.py --platform linux --kind AppImage --artifact "${images[0]}" --output linux-package-evidence/final-AppImage.json
       - name: Build the small RPC test client (not App or core)
+        id: rpc_client
         run: |
           cargo test --locked -p polaris-singbox-grpc --example package_runtime_probe
           cargo build --locked -p polaris-singbox-grpc --example package_runtime_probe
       - name: Exercise real original Linux package entrypoints
+        id: runtime
         run: python3 -B scripts/package-acceptance/linux.py run --transport linux-package-input/transport.json --packages linux-package-carriers --rpc-client target/debug/examples/package_runtime_probe --output linux-package-evidence/run.json
       - name: Require every real case and normal cleanup before acceptance
+        id: verification
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/package-acceptance/transport.mjs accept linux-package-input/transport.json linux-package-evidence/run.json linux-package-evidence linux-package-accepted/accepted.json
@@ -1874,6 +1890,22 @@ jobs:
           path: linux-package-accepted/accepted.json
           if-no-files-found: error
           retention-days: 7
+      - name: Record bounded workflow diagnostic scope (not acceptance)
+        if: always()
+        env:
+          DIAGNOSTIC_CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          DIAGNOSTIC_ADMISSION_OUTCOME: ${{ steps.admission.outcome }}
+          DIAGNOSTIC_NATIVE_TOOLS_OUTCOME: ${{ steps.native_tools.outcome }}
+          DIAGNOSTIC_TEST_TOOLS_OUTCOME: ${{ steps.test_tools.outcome }}
+          DIAGNOSTIC_PROTOC_OUTCOME: ${{ steps.protoc.outcome }}
+          DIAGNOSTIC_CORE_GO_OUTCOME: ${{ steps.core_go.outcome }}
+          DIAGNOSTIC_CORE_RECEIPTS_OUTCOME: ${{ steps.core_receipts.outcome }}
+          DIAGNOSTIC_TRANSPORT_OUTCOME: ${{ steps.transport.outcome }}
+          DIAGNOSTIC_NATIVE_RECEIPT_OUTCOME: ${{ steps.native_receipt.outcome }}
+          DIAGNOSTIC_RPC_CLIENT_OUTCOME: ${{ steps.rpc_client.outcome }}
+          DIAGNOSTIC_RUNTIME_OUTCOME: ${{ steps.runtime.outcome }}
+          DIAGNOSTIC_VERIFICATION_OUTCOME: ${{ steps.verification.outcome }}
+        run: python3 -B scripts/package-acceptance/diagnostic_scope.py --lane plain --kind both
       - name: Preserve bounded sanitized Linux evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -1914,6 +1946,7 @@ jobs:
       PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
     steps:
       - uses: actions/checkout@v7
+        id: checkout
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -1921,24 +1954,28 @@ jobs:
         with:
           node-version: '26'
       - name: Require unchanged actual formal source
+        id: admission
         run: node scripts/package-acceptance/tun_transport.mjs admit
       - name: Install native automation runtime (not sandbox workarounds)
+        id: native_tools
         run: |
           sudo apt-get update
           # No sandbox/sysctl/AppArmor/polkit/sudo policy changes. Root tools
           # are prefetched before the bounded TUN window can interrupt runner I/O.
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev webkit2gtk-driver xvfb dbus-x11 squashfs-tools policykit-1 tcpdump tshark nftables iproute2
       - name: Install test-side tools only
+        id: test_tools
         run: |
           set -euo pipefail
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-          cargo install tauri-driver --version '=2.0.5' --locked
-          tauri-driver --version
-          WebKitWebDriver --version
+          cargo install --root "$RUNNER_TEMP/polaris-package-automation" --version '=2.0.5' --locked tauri-driver
+          python3 -B scripts/package-acceptance/tooling.py prepare --root "$RUNNER_TEMP/polaris-package-automation" --output "$RUNNER_TEMP/polaris-package-automation/receipt.json"
       - name: Install protoc (pinned URL + sha256)
+        id: protoc_install
         run: node scripts/fetch-protoc.mjs
       - name: Verify protoc toolchain
+        id: protoc
         run: |
           got="$(protoc --version)"
           [ "$got" = "$PROTOC_EXPECT" ] || {
@@ -1948,18 +1985,22 @@ jobs:
         id: core-go
         run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v6
+        id: core_go
         with:
           go-version: ${{ steps.core-go.outputs.version }}
           cache: false
       - name: Fetch original formal core receipts for comparison only
+        id: core_receipts
         env:
           POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
         run: node scripts/fetch-core.mjs --platform=linux
       - name: Download exact final package transport and bytes
+        id: transport
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/package-acceptance/transport.mjs fetch linux-package-input linux-package-carriers
       - name: Verify original final-package receipt for this exact carrier
+        id: native_receipt
         env:
           TUN_CARRIER_KIND: ${{ matrix.kind }}
         shell: bash
@@ -1969,18 +2010,22 @@ jobs:
           [ "${#carriers[@]}" -eq 1 ]
           python3 -B scripts/final-package-receipt.py --platform linux --kind "$TUN_CARRIER_KIND" --artifact "${carriers[0]}" --output linux-tun-evidence/final-native.json
       - name: Bind actual source, artifact, carrier and original native receipt
+        id: binding
         env:
           TUN_CARRIER_KIND: ${{ matrix.kind }}
         run: node scripts/package-acceptance/tun_transport.mjs prepare linux-package-input/transport.json linux-package-carriers linux-tun-evidence/final-native.json "$TUN_CARRIER_KIND" linux-tun-evidence/admitted.json
       - name: Build the small RPC test client (not App or core)
+        id: rpc_client
         run: |
           cargo test --locked -p polaris-singbox-grpc --example package_runtime_probe
           cargo build --locked -p polaris-singbox-grpc --example package_runtime_probe
       - name: Real ordinary-UID GUI with bounded production helper and TUN
+        id: runtime
         env:
           TUN_CARRIER_KIND: ${{ matrix.kind }}
         run: python3 -B scripts/package-acceptance/linux_tun.py run --admission linux-tun-evidence/admitted.json --transport linux-package-input/transport.json --packages linux-package-carriers --kind "$TUN_CARRIER_KIND" --rpc-client target/debug/examples/package_runtime_probe --output linux-tun-evidence/run.json
       - name: Require every real TUN case, same bytes and normal restoration
+        id: verification
         run: node scripts/package-acceptance/tun_transport.mjs finish linux-tun-evidence/admitted.json linux-package-carriers linux-tun-evidence/run.json linux-package-input/transport.json
       - name: Upload same-run successful TUN evidence (not an independent release receipt)
         uses: actions/upload-artifact@v7
@@ -1991,6 +2036,24 @@ jobs:
             linux-tun-evidence/run.json
           if-no-files-found: error
           retention-days: 7
+      - name: Record bounded workflow diagnostic scope (not acceptance)
+        if: always()
+        env:
+          DIAGNOSTIC_CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          DIAGNOSTIC_ADMISSION_OUTCOME: ${{ steps.admission.outcome }}
+          DIAGNOSTIC_NATIVE_TOOLS_OUTCOME: ${{ steps.native_tools.outcome }}
+          DIAGNOSTIC_TEST_TOOLS_OUTCOME: ${{ steps.test_tools.outcome }}
+          DIAGNOSTIC_PROTOC_OUTCOME: ${{ steps.protoc.outcome }}
+          DIAGNOSTIC_CORE_GO_OUTCOME: ${{ steps.core_go.outcome }}
+          DIAGNOSTIC_CORE_RECEIPTS_OUTCOME: ${{ steps.core_receipts.outcome }}
+          DIAGNOSTIC_TRANSPORT_OUTCOME: ${{ steps.transport.outcome }}
+          DIAGNOSTIC_NATIVE_RECEIPT_OUTCOME: ${{ steps.native_receipt.outcome }}
+          DIAGNOSTIC_RPC_CLIENT_OUTCOME: ${{ steps.rpc_client.outcome }}
+          DIAGNOSTIC_RUNTIME_OUTCOME: ${{ steps.runtime.outcome }}
+          DIAGNOSTIC_VERIFICATION_OUTCOME: ${{ steps.verification.outcome }}
+          DIAGNOSTIC_BINDING_OUTCOME: ${{ steps.binding.outcome }}
+          TUN_CARRIER_KIND: ${{ matrix.kind }}
+        run: python3 -B scripts/package-acceptance/diagnostic_scope.py --lane tun --kind "$TUN_CARRIER_KIND"
       - name: Preserve bounded sanitized TUN diagnostics after local recovery
         if: always()
         uses: actions/upload-artifact@v7

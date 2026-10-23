@@ -301,3 +301,28 @@ test('callback observation is shape-limited, monotonic and bounded; immutable in
   const wrong = { __TAURI_INTERNALS__: { invoke: () => {}, callbacks: new Map() } };
   assert.throws(() => vm.runInNewContext(`(function(){${observer}})()`, { window: wrong, Map }));
 });
+
+test('both Linux consumers prove installed drivers without unsupported version probes', () => {
+  const workflow = readFileSync(join(ROOT, '.github/workflows/package.yml'), 'utf8');
+  for (const name of ['linux_package_acceptance', 'linux_tun_package_acceptance']) {
+    const body = workflow.split(`\n  ${name}:\n`)[1].split(/\n  [a-z][a-z_]+:\n/)[0];
+    assert.match(body, /cargo install --root "\$RUNNER_TEMP\/polaris-package-automation" --version '=2\.0\.5' --locked tauri-driver/);
+    assert.match(body, /tooling\.py prepare --root "\$RUNNER_TEMP\/polaris-package-automation" --output "\$RUNNER_TEMP\/polaris-package-automation\/receipt\.json"/);
+    assert.doesNotMatch(body, /(?:tauri-driver|WebKitWebDriver) --(?:version|help)/);
+    assert.match(body, /Record bounded workflow diagnostic scope \(not acceptance\)\n        if: always\(\)/);
+    const scope = body.split('Record bounded workflow diagnostic scope (not acceptance)')[1].split('      - name:')[0];
+    for (const id of ['checkout', 'admission', 'native_tools', 'test_tools', 'protoc', 'core_go', 'core_receipts', 'transport', 'native_receipt', 'rpc_client', 'runtime', 'verification']) {
+      assert.match(body, new RegExp(`        id: ${id}\\n`));
+      assert.ok(scope.includes(`steps.${id}.outcome`), `${name}: missing diagnostic ${id}`);
+    }
+    assert.doesNotMatch(scope, /toJSON|continue-on-error|run\.json|accepted\.json/);
+    assert.match(body, /if-no-files-found: error/);
+    const lane = name === 'linux_package_acceptance' ? 'plain' : 'tun';
+    assert.ok(scope.includes(`diagnostic_scope.py --lane ${lane} --kind `));
+    if (lane === 'tun') assert.ok(scope.includes('steps.binding.outcome'));
+  }
+  const harness = readFileSync(join(ROOT, 'scripts/package-acceptance/linux.py'), 'utf8');
+  assert.doesNotMatch(harness, /\[driver,\s*['"]--version['"]\]/);
+  for (const suite of ['test_tooling.py', 'test_diagnostic_scope.py'])
+    assert.ok(readFileSync(join(ROOT, 'scripts/package-acceptance', suite)).length > 0);
+});

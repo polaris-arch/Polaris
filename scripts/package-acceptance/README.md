@@ -36,6 +36,25 @@ must establish its own authorization, routing isolation and recovery evidence.
   closed. A consumer-only rerun cannot reuse an earlier attempt: start a new
   full run. Existing immutable carrier artifact naming is not overwritten.
 
+## Automation tooling and preparation failures
+
+Both Linux lanes install the locked `tauri-driver 2.0.5` crate into a private
+runner-temporary root. A same-source/run/attempt/job receipt records the Cargo
+installation inventory and actual executable hash, plus the installed Ubuntu
+WebKit driver package version, architecture, owner and executable hash. The
+shared runtime revalidates those bytes before launching the recorded absolute
+paths. Neither driver supports the old `--version` probe; a displayed or
+hard-coded version string is not provenance. Product HOME and environment
+isolation are unchanged.
+
+An always-run, bounded `scope.json` records selected workflow step outcomes,
+including failures before the runtime harness starts. It is diagnostic-only,
+never an admission, runtime, cleanup or publication receipt. Missing outcomes
+remain unknown, and cleanup is not assessed by this recorder. Checkout failure
+or VM termination may prevent recording; original workflow logs remain the
+source for those failures. A new source/run must produce and test its own
+carrier identity; old successful package builds are not relabelled.
+
 ## Actual execution
 
 Each carrier is extracted separately as an ordinary user. deb keeps its
