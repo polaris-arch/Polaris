@@ -164,6 +164,7 @@ class PrimitiveTests(unittest.TestCase):
 
     def test_unknown_apply_cannot_resubmit(self):
         run = M.CarrierRun.__new__(M.CarrierRun)
+        run.result = {}
         run.driver = Mock()
         run.driver.observations.side_effect = [[], [{'source': 'original-native-callback', 'sequence': 1,
                                                    'success': False, 'outcome': 'unknown'}]]
@@ -175,6 +176,7 @@ class PrimitiveTests(unittest.TestCase):
 
     def test_unconfirmed_apply_only_reads_same_transaction(self):
         run = M.CarrierRun.__new__(M.CarrierRun)
+        run.result = {}
         run.driver = Mock()
         run.driver.observations.side_effect = [[], [{'source': 'original-native-callback', 'sequence': 1,
                                                    'success': True, 'status': 'unconfirmed', 'transactionId': 'original'}]]
@@ -186,6 +188,7 @@ class PrimitiveTests(unittest.TestCase):
 
     def test_wrong_retry_transaction_fails(self):
         run = M.CarrierRun.__new__(M.CarrierRun)
+        run.result = {}
         run.driver = Mock()
         run.driver.observations.side_effect = [[], [{'source': 'original-native-callback', 'sequence': 1,
                                                    'success': True, 'status': 'hotApplied', 'transactionId': 'other'}]]
@@ -940,6 +943,189 @@ class PrimitiveTests(unittest.TestCase):
             self.assertNotIn('execution',run.result)
             self.assertNotIn('apiEndpoint',run.result)
 
+
+
+class GuiNavigationContracts(unittest.TestCase):
+    def run_fixture(self, expanded='false'):
+        run = M.CarrierRun.__new__(M.CarrierRun)
+        run.result = {}; run.driver = Mock(); run.text = lambda key: key
+        config = {'servers': [{'id': 'node-a', 'name': 'Loop A', 'subscriptionId': 'package-fixture'},
+                              {'id': 'node-b', 'name': 'Loop B', 'subscriptionId': 'package-fixture'}],
+                  'subscriptions': [{'id': 'package-fixture', 'name': 'Package loopback'}],
+                  'selectedServerId': 'node-b', 'selectionIntent': None}
+        run.config = Mock(return_value=config); run.status = Mock(return_value={'running': False})
+        run.driver.element.return_value = None; run.driver.execute.return_value = 'false'
+        state = {'expanded': expanded}
+        def control(kind, label):
+            return {'element': {M.ELEMENT: kind}, 'expanded': state['expanded'], 'checked': 'false'}
+        run.driver.contract_control.side_effect = control
+        run.driver.wait_control.side_effect = control
+        def click(value):
+            if value['element'][M.ELEMENT] == 'fixture-group': state['expanded'] = 'true'
+        run.driver.click_control.side_effect = click
+        return run
+
+    def test_folded_group_expands_once_then_native_option_click(self):
+        run = self.run_fixture(); run.pick('B')
+        self.assertEqual([c.args[0]['element'][M.ELEMENT] for c in run.driver.click_control.call_args_list],
+                         ['fixture-group', 'fixture-node'])
+        self.assertEqual(run.result['guiObservation']['phase'], 'pick-complete')
+
+    def test_expanded_group_never_toggled(self):
+        run = self.run_fixture('true'); run.pick('B')
+        self.assertEqual(run.driver.click_control.call_count, 1)
+        self.assertEqual(run.driver.click_control.call_args.args[0]['element'][M.ELEMENT], 'fixture-node')
+
+    def test_open_menu_not_toggled_closed(self):
+        run = self.run_fixture(); run.driver.execute.return_value = 'true'; run.pick('B')
+        run.driver.click.assert_not_called()
+
+    def test_wrong_fixture_identity_and_duplicate_label_never_click(self):
+        for variant in ('name','group','duplicate','node'):
+            run = self.run_fixture(); config=run.config.return_value
+            if variant=='name': config['subscriptions'][0]['name']='other private group'
+            if variant=='group': config['subscriptions'][0]['id']='other'
+            if variant=='duplicate': config['servers'].append({'id':'third','name':'Loop B'})
+            if variant=='node': config['servers'][1]['name']='other'
+            with self.assertRaises(M.GuiFailure): run.pick('B')
+            run.driver.click.assert_not_called(); run.driver.click_control.assert_not_called()
+
+    def test_unknown_expansion_no_toggle(self):
+        run=self.run_fixture(None)
+        with self.assertRaises(M.GuiFailure): run.pick('B')
+        run.driver.click_control.assert_not_called()
+
+    def test_ambiguous_click_failure_never_retried(self):
+        run=self.run_fixture(); run.driver.click_control.side_effect=M.GuiFailure('webdriver-http-error',500)
+        with self.assertRaises(M.GuiFailure): run.pick('B')
+        self.assertEqual(run.driver.click_control.call_count,1)
+        self.assertEqual(run.result['guiObservation']['phase'],'pick-group-expand')
+
+    def test_actual_node_unknown_remains_failure_after_ui_selection(self):
+        run=self.run_fixture('true'); run.status.return_value={'running':True,'actualServerId':None}
+        original_read = run.gui_read
+        with patch.object(M, 'wait_for', side_effect=lambda read, condition=bool, **kw: read() if condition(read()) else (_ for _ in ()).throw(M.GuiFailure('observation-timeout'))):
+            with self.assertRaises(M.GuiFailure): run.pick('B')
+        self.assertIsNone(run.result['guiObservation']['lastState']['actualServerId'])
+
+    def test_control_rejects_duplicate_hidden_disabled_and_bad_identity(self):
+        valid={'count':1,'visible':True,'disabled':False,'element':{M.ELEMENT:'control'}}
+        for change in ({'count':2},{'count':0},{'visible':False},{'disabled':True},{'element':{}}):
+            driver=M.WebDriver(1); driver.execute=Mock(return_value={**valid,**change})
+            with self.assertRaises(M.GuiFailure): driver.contract_control('preference-switch','fixed')
+        driver=M.WebDriver(1); driver.execute=Mock(return_value=valid)
+        self.assertEqual(driver.contract_control('preference-switch','fixed'),valid)
+        script=driver.execute.call_args.args[0]
+        self.assertIn('.sr-title > b',script); self.assertIn('[role="switch"]',script)
+        self.assertNotIn('button[role=switch]',script); self.assertIn("getAttribute('aria-disabled')",script)
+        primitives=(SOURCE/'ui/src/components/screens/settings/Primitives.tsx').read_text()
+        self.assertIn('className="sr-title"',primitives)
+        self.assertRegex(primitives,r'<span\s+id=\{id\}\s+role="switch"')
+
+    def test_preference_shared_real_span_control_and_readback(self):
+        run=self.run_fixture(); run.config.side_effect=[{'interruptConnectionsOnSwitch':False},{'interruptConnectionsOnSwitch':True}]
+        run.preference(True)
+        run.driver.wait_control.assert_called_once_with('preference-switch','settings.network.interruptOnSwitch')
+        self.assertEqual(run.driver.click_control.call_count,1)
+        self.assertEqual(run.result['guiObservation']['phase'],'preference-return')
+
+    def test_observations_bounded_and_secret_free(self):
+        run=self.run_fixture()
+        for n in range(200): run.gui_phase('pick-status-readback',{'running':bool(n % 2),'actualServerId':'secret','clashApiSecret':'secret'})
+        result=run.result['guiObservation']; self.assertEqual(len(result['steps']),128); self.assertTrue(result['truncated'])
+        self.assertNotIn('secret',json.dumps(result)); self.assertEqual(result['lastState']['actualServerId'],'other')
+        self.assertEqual(M.gui_failure(ValueError('secret')),{'code':'unclassified-contract-failure'})
+
+    def test_echo_pending_failure_and_validated_evidence(self):
+        run=self.run_fixture(); run.fixtures=Mock()
+        run.fixtures.exchange.side_effect=ValueError('private payload')
+        with self.assertRaises(ValueError): run.exchange(Mock(),'A')
+        row=run.result['streamObservation']['exchanges'][0]
+        self.assertEqual(row['state'],'failed'); self.assertNotIn('private',json.dumps(row))
+        self.assertEqual(row['bytes'],36); self.assertEqual(len(row['nonceSha256']),64)
+        run.fixtures.exchange.side_effect=None;run.fixtures.exchange.return_value={'backend':'A'}
+        self.assertEqual(run.exchange(Mock(),'A'),{'backend':'A'})
+        self.assertTrue(run.result['streamObservation']['exchanges'][1]['exactEchoMatched'])
+
+    def test_wait_control_only_retries_missing_read_not_click_or_ambiguity(self):
+        driver=M.WebDriver(1)
+        valid={'count':1,'visible':True,'disabled':False,'element':{M.ELEMENT:'x'}}
+        driver.execute=Mock(side_effect=[{'count':0},valid]);driver.request=Mock()
+        with patch.object(M.time,'sleep'):
+            self.assertEqual(driver.wait_control('fixture-group','fixed'),valid)
+        self.assertEqual(driver.execute.call_count,2);driver.request.assert_not_called()
+        driver.execute=Mock(return_value={'count':2})
+        with self.assertRaises(M.GuiFailure):driver.wait_control('fixture-group','fixed')
+        self.assertEqual(driver.execute.call_count,1);driver.request.assert_not_called()
+
+    def test_preference_wrong_checked_state_is_not_blindly_toggled(self):
+        run=self.run_fixture();run.config.return_value={'interruptConnectionsOnSwitch':False}
+        run.driver.wait_control.side_effect=None
+        run.driver.wait_control.return_value={'element':{M.ELEMENT:'switch'},'checked':'true'}
+        with self.assertRaises(M.GuiFailure):run.preference(True)
+        run.driver.click_control.assert_not_called()
+
+    def test_actual_locator_script_on_bounded_dom_fixture(self):
+        import subprocess
+        driver=M.WebDriver(1)
+        driver.execute=Mock(return_value={'count':1,'visible':True,'disabled':False,'element':{M.ELEMENT:'x'}})
+        driver.contract_control('fixture-group','Package loopback')
+        script=driver.execute.call_args.args[0]
+        harness=r'''
+const input=JSON.parse(require('fs').readFileSync(0,'utf8'));
+const make=(row)=>({tagName:'BUTTON',disabled:row.disabled===true,
+ getClientRects:()=>row.hidden?[]:[{}],getAttribute:k=>row[k]??null,
+ children:[{tagName:'SPAN',classList:{contains:()=>false},textContent:row.label},
+ {tagName:'SPAN',classList:{contains:()=>true},textContent:'2'}],
+ querySelectorAll:s=>s==='.nm-name'||s==='.sr-title > b'?[{textContent:row.label}]:s==='[role="switch"]'?[make({...row,switch:true})]:[],
+ marker:row.switch?'span-switch':'button'});
+const elements=input.rows.map(make);
+const doc={querySelectorAll:s=>elements};
+const run=new Function('document','getComputedStyle','return function(){'+input.script+'}')(doc,()=>({visibility:'visible'}));
+const value=run(input.kind,input.label);
+if(value.element)value.element={marker:value.element.marker};
+process.stdout.write(JSON.stringify(value));
+'''
+        for kind in ('fixture-group','fixture-node','preference-switch'):
+            for rows,count,disabled in [([{'label':'fixed'}],1,False),
+                    ([{'label':'fixed'},{'label':'fixed'}],2,None),
+                    ([{'label':'other'}],0,None),
+                    ([{'label':'fixed','aria-disabled':'true'}],1,True)]:
+                value=json.loads(subprocess.run(['node','-e',harness],input=json.dumps(
+                    {'script':script,'kind':kind,'label':'fixed','rows':rows}),text=True,capture_output=True,check=True).stdout)
+                self.assertEqual(value['count'],count)
+                if count==1:
+                    self.assertEqual(value['disabled'],disabled)
+                    if kind=='preference-switch':self.assertEqual(value['element']['marker'],'span-switch')
+
+    def test_webdriver_error_categories_discard_remote_content(self):
+        import io
+        for remote, expected in [('element click intercepted','element click intercepted'),('secret-value','unknown'),({'secret':'value'},'unknown')]:
+            driver=M.WebDriver(1)
+            raw=json.dumps({'value':{'error':remote,'message':'SECRET','stacktrace':'SECRET'}}).encode()
+            error=M.urllib.error.HTTPError('http://localhost',400,'SECRET',{},io.BytesIO(raw))
+            opener=Mock();opener.open.side_effect=error
+            with patch.object(M.urllib.request,'build_opener',return_value=opener):
+                with self.assertRaises(M.GuiFailure) as raised:driver.request('POST','/safe',{})
+            self.assertEqual(M.gui_failure(raised.exception),{'code':'webdriver-http-error','httpStatus':400,'protocol':expected})
+            self.assertNotIn('SECRET',str(raised.exception))
+
+    def test_render_matrix_dialog_auto_and_quit_contract(self):
+        home=(SOURCE/'ui/src/components/screens/home/HomeScreen.tsx').read_text()
+        menu=(SOURCE/'ui/src/components/screens/home/NodeMenu.tsx').read_text()
+        modal=(SOURCE/'ui/src/components/dialogs/Modal.tsx').read_text()
+        restart=(SOURCE/'ui/src/components/dialogs/RestartApplyDialog.tsx').read_text()
+        auto=(SOURCE/'ui/src/mobile/AutoSelectControls.tsx').read_text()
+        self.assertIn('aria-expanded={nodeMenuOpen}',home)
+        self.assertIn('aria-expanded={isOpen}',menu)
+        self.assertIn('isOpen && items.map',menu)
+        self.assertIn('<dialog',modal);self.assertIn('titleId="restart-apply-title"',restart)
+        self.assertIn('data-auto-select-scope={target.scope}',auto)
+        self.assertIn('className="auto-choice-pick"',auto)
+        source=Path(M.__file__).read_text()
+        self.assertIn('dialog[open][aria-labelledby="restart-apply-title"] button',source)
+        self.assertNotIn('button[role=switch]',source)
+        self.assertNotIn('dispatchEvent(',source)
 
 if __name__ == '__main__':
     unittest.main()

@@ -262,6 +262,7 @@ for kind in ('install','uninstall'):
     observer.rows={(102,'125'):row}; observer.pkexec={(102,'125'):row}; observer.shells={(102,'125'):row}
     closed=observer.finish()
     run=object.__new__(gui.TunCarrierRun)
+    run.result={}
     run.app=app; run.driver=Mock(); run.supervisor=Mock(); run.controller=Mock(); run.launch_options={'authenticationMode':'existing-session'}
     run.controller.call.side_effect=lambda command,**args: closed if command=='transaction_end' else {}
     run.text=lambda key:key

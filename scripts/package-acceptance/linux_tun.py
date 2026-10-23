@@ -437,7 +437,7 @@ class Controller:
         if self.lifecycle['ready'] and not self.closed:
             try:
                 import root_controller
-                recovery = root_controller.validate_abort_receipt(self.call('abort'))
+                recovery = root_controller.validate_abort_receipt(self.call('abort'), vm_validator=tun.validate_vm_observation)
                 self.lifecycle['abortReceipt'] = copy.deepcopy(recovery)
                 unknown.extend(recovery.get('unknown', []))
                 self.lifecycle['abortAcknowledged'] = True
@@ -504,6 +504,8 @@ class Controller:
                 import root_controller
                 if error.get('stage') in root_controller.CONTROLLER_STAGES and error.get('code') in ('CONTROLLER_FAILED', 'AUTHENTICATION_NOT_READY'):
                     self.lifecycle['rootOperationFailure'] = {'stage': error['stage'], 'code': error['code']}
+                    if 'vmPreflight' in error:
+                        self.lifecycle['rootOperationFailure']['vmPreflight'] = copy.deepcopy(tun.validate_vm_observation(error['vmPreflight']))
                     if 'actualReadOnlyAuth' in error:
                         observed = root_controller.validate_auth_observation(error['actualReadOnlyAuth'])
                         self.lifecycle['rootOperationFailure']['actualReadOnlyAuth'] = copy.deepcopy(observed)
@@ -553,6 +555,7 @@ class GuiConfigAdapter(fixture.ConfigAdapter):
 
 
 class TunCarrierRun(base.CarrierRun):
+    fixture_group_label = 'Package isolated TUN'
     def __init__(self, item, package, workspace, evidence_dir, rpc_client, admission, bound, launch_options):
         self.run_id = os.urandom(6).hex()
         self.controller = None
@@ -591,6 +594,7 @@ class TunCarrierRun(base.CarrierRun):
         return self.driver.execute("if(window.__tunObservation.failed) throw Error('TUN observer failed'); return window.__tunObservation.rows;")
 
     def helper_action(self, kind):
+        self.gui_phase('helper-begin')
         require(kind in ('install', 'uninstall'), 'only genuine helper action')
         self.driver.click('.side .nav-item', self.text('sidebar.settings'))
         self.driver.click('.set-nav', self.text('settings.nav.helper'))
@@ -620,6 +624,7 @@ class TunCarrierRun(base.CarrierRun):
         return {'callback': reply, 'authorization': proof}
 
     def connect(self):
+        self.gui_phase('connect-begin')
         """TUN-only override: never weakens base CarrierRun.connect."""
         self.connect_phase('stopped-check')
         require(not self.status().get('running'), 'TUN connect requires stopped core')
@@ -680,12 +685,14 @@ class TunCarrierRun(base.CarrierRun):
         return envelope['result']
 
     def socket(self, label):
+        self.gui_phase('stream-connect-begin')
         stream = fixture.direct_connect(self.network.plan)
         self.sockets.append(stream)
         return stream, self.exchange(stream, label)
 
     def exchange(self, stream, label):
-        proof = fixture.exchange(stream, label, os.urandom(18).hex())
+        self.fixtures = fixture
+        proof = super().exchange(stream, label)
         self.pending_streams[proof['nonceSha256']] = proof
         return proof
 
@@ -695,21 +702,7 @@ class TunCarrierRun(base.CarrierRun):
         return row
 
     def preference(self, wanted):
-        require(type(wanted) is bool, 'boolean preference required')
-        if self.config().get('interruptConnectionsOnSwitch') == wanted:
-            return
-        self.driver.click('.side .nav-item', self.text('sidebar.settings'))
-        self.driver.click('.set-nav', self.text('settings.nav.network'))
-        switch = self.driver.execute(r'''
-const rows=[...document.querySelectorAll('.set-row')].filter(e=>e.textContent.includes(arguments[0]));
-const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);return controls.length===1?controls[0]:null;
-''', self.text('settings.network.interruptOnSwitch'))
-        require(switch and base.ELEMENT in switch, 'real preference control unavailable')
-        self.driver.request('POST', self.driver.path('/element/' + switch[base.ELEMENT] + '/click'), {})
-        if self.driver.element('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn')):
-            self.driver.click('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn'))
-        base.wait_for(self.config, lambda c: c.get('interruptConnectionsOnSwitch') == wanted)
-        self.driver.click('.side .nav-item', self.text('settings.nav.back'))
+        return super().preference(wanted)
 
     def graph_case(self):
         self.stage = 'graph_apply'; self.boundary(self.stage)
@@ -748,6 +741,7 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
                     firstConnection=first, newConnection=fresh, selected='node-b')
 
     def auto_case(self):
+        self.gui_phase('auto-begin')
         self.stage = 'auto_preserves'; self.boundary(self.stage)
         self.preference(False)
         self.network.set_latency('A', 0); self.network.set_latency('B', 0.15)
@@ -812,7 +806,7 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
         rows = [r for r in self.tun_observations() if r['sequence'] > cursor and r['kind'] == 'apply']
         require(rows and {'code': 'structuralChange', 'path': 'outbounds.physical_route_binding'} in rows[-1]['reasons'],
                 'uncovered route must return original structural reason')
-        self.driver.click('dialog button', self.text('home.restartApplyKeepConnection'))
+        self.driver.click('dialog[open][aria-labelledby="restart-apply-title"] button', self.text('home.restartApplyKeepConnection'))
         self.same_core(initial); after = self.rpc('capabilities')['active']
         preserved = self.exchange(old, 'B')
         self.record('uncovered_target_restart', beforeCore=initial, afterCore=dict(self.core),
@@ -831,6 +825,7 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
         return proof
 
     def quit_product(self):
+        self.gui_phase('quit-begin')
         self.api_endpoint = None
         require(self.stopped and not self.status().get('running'), 'quit requires verified TUN OFF')
         require(base.same_process(self.app, base.process_identity(self.app['pid'])), 'GUI exited before tray quit')
@@ -1038,7 +1033,7 @@ const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);r
             self.stage = 'restored-control-connectivity'
             self.result['controlConnectivity']['after'] = self.control_connectivity('after')
         except BaseException as error:
-            self.result['failure'] = {'stage': self.stage, 'kind': type(error).__name__, 'code': 'TUN_RUNTIME_FAILED'}
+            self.result['failure'] = {'stage': self.stage, 'kind': type(error).__name__, 'code': 'TUN_RUNTIME_FAILED', 'guiFailure': base.gui_failure(error)}
             if self.controller and not self.controller.closed:
                 cleanup = self.controller.recover()
         finally:

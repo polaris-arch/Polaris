@@ -190,18 +190,23 @@ local to this controlled backend; this is NOT independent physical egress.
             'ports': {'proxy': 1080, 'dns': 5353, 'echo': 48080, 'health': 48081, 'special': 48082}}
 
 
-def network_snapshot(ops):
-    value = {'links': ops.json([IP, '-j', 'link', 'show']),
-             'addresses': ops.json([IP, '-j', 'address', 'show']),
-             'route4': ops.json([IP, '-j', '-N', '-4', 'route', 'show', 'table', 'all']),
-             'route6': ops.json([IP, '-j', '-N', '-6', 'route', 'show', 'table', 'all']),
-             'rule4': ops.json([IP, '-j', '-4', 'rule', 'show']),
-             'rule6': ops.json([IP, '-j', '-6', 'rule', 'show']),
-             'resolved': ops.run(['/usr/bin/resolvectl', 'status', '--no-pager']),
-             'firewall': ops.json(['/usr/sbin/nft', '-j', 'list', 'ruleset'])}
+def network_snapshot(ops, progress=None):
+    def observe(name, call):
+        if progress: progress(name)
+        return call()
+    value = {'links': observe('links', lambda: ops.json([IP, '-j', 'link', 'show'])),
+             'addresses': observe('addresses', lambda: ops.json([IP, '-j', 'address', 'show'])),
+             'route4': observe('route4', lambda: ops.json([IP, '-j', '-N', '-4', 'route', 'show', 'table', 'all'])),
+             'route6': observe('route6', lambda: ops.json([IP, '-j', '-N', '-6', 'route', 'show', 'table', 'all'])),
+             'rule4': observe('rule4', lambda: ops.json([IP, '-j', '-4', 'rule', 'show'])),
+             'rule6': observe('rule6', lambda: ops.json([IP, '-j', '-6', 'rule', 'show'])),
+             'resolved': observe('resolved', lambda: ops.run(['/usr/bin/resolvectl', 'status', '--no-pager'])),
+             'firewall': observe('firewall', lambda: ops.json(['/usr/sbin/nft', '-j', 'list', 'ruleset']))}
+    if progress: progress('resolv-conf')
     resolver = Path('/etc/resolv.conf')
     value['resolvConf'] = {'symlink': os.readlink(resolver) if resolver.is_symlink() else None,
                            'sha256': digest(resolver.read_bytes())}
+    if progress: progress('network-forwarding')
     value['forwarding'] = [int(Path(p).read_text()) for p in
         ('/proc/sys/net/ipv4/ip_forward', '/proc/sys/net/ipv6/conf/all/forwarding')]
     return value
@@ -228,43 +233,152 @@ def tun_table_routes(snapshot):
     return selected
 
 
+VM_STAGES = ('manager', 'pid1', 'namespaces', 'cgroup-mount', 'pidfd', 'privileges',
+    'tun-device', 'forwarding', 'tools', 'product-paths', 'environment', 'network', 'route-tables', 'gate')
+VM_CHECKS = ('githubHosted', 'dedicatedVM', 'ordinaryGUI', 'rootManager', 'pid1Systemd',
+    'sameSystemNamespaces', 'pidfd', 'noNewPrivsZero', 'tunDevice', 'forwardingBaseline',
+    'toolsRootOwned', 'freshProductPaths', 'defaultEnvironment', 'networkSnapshotComplete', 'materialsDownloaded')
+VM_BLOCKS = frozenset(('githubHosted', 'dedicatedVM', 'pid1Systemd', 'rootManager', 'tunDevice', 'pidfd',
+    'sameSystemNamespaces', 'toolsRootOwned', 'ordinaryGUI', 'VMPrivilegesOrForwardingBaseline',
+    'freshProductAndDefaultSandbox', 'fixtureCIDRCollision', 'productTunRuleOrTableAlreadyOwned',
+    'localEvidenceAndMaterials', 'c6CompleteCarrierAdmission', 'completeCarrierHashes',
+    'realPkexecAuthenticationPendingConfirmation'))
+VM_PROBES = ('none', 'ip', 'systemctl', 'systemd-run', 'resolvectl', 'nft', 'python', 'setpriv', 'tcpdump', 'tshark',
+    'links', 'addresses', 'route4', 'route6', 'rule4', 'rule6', 'resolved', 'firewall', 'resolv-conf', 'network-forwarding')
+VM_ERRORS = ('none', 'OSError', 'ValueError', 'SubprocessError', 'TypeError', 'KeyError', 'other')
+
+
+def vm_observation():
+    return {'schema': 'polaris-vm-preflight-observation-v1',
+        'stages': {name: {'state': 'not-reached', 'error': 'none'} for name in VM_STAGES},
+        'checks': {name: None for name in VM_CHECKS}, 'managerControlGroup': 'unknown',
+        'gate': 'not-reached', 'blocked': [], 'failedProbe': 'none'}
+
+
+def vm_error(error):
+    for kind in (OSError, ValueError, subprocess.SubprocessError, TypeError, KeyError):
+        if isinstance(error, kind): return kind.__name__
+    return 'other'
+
+
+def validate_vm_observation(value):
+    require(type(value) is dict and set(value) == {'schema', 'stages', 'checks', 'managerControlGroup', 'gate', 'blocked', 'failedProbe'},
+            'fixed VM observation required')
+    require(value['schema'] == 'polaris-vm-preflight-observation-v1' and
+        type(value['stages']) is dict and set(value['stages']) == set(VM_STAGES) and
+        type(value['checks']) is dict and set(value['checks']) == set(VM_CHECKS), 'VM schema differs')
+    for row in value['stages'].values():
+        require(type(row) is dict and set(row) == {'state', 'error'} and
+            row['state'] in ('observed', 'failed', 'not-reached') and row['error'] in VM_ERRORS and
+            ((row['state'] == 'failed') == (row['error'] != 'none')), 'VM stage differs')
+    require(value['failedProbe'] in VM_PROBES, 'fixed VM probe required')
+    require(all(v is None or type(v) is bool for v in value['checks'].values()) and
+        value['managerControlGroup'] in ('unknown', 'empty-root', 'root-slash', 'nonroot', 'missing') and
+        value['gate'] in ('not-reached', 'blocked', 'ready', 'failed') and
+        type(value['blocked']) is list and all(type(v) is str and v in VM_BLOCKS for v in value['blocked']) and
+        value['blocked'] == sorted(set(value['blocked'])), 'VM bounded observations differ')
+    require((value['gate'] == 'blocked') == bool(value['blocked']) and
+        (value['gate'] not in ('ready', 'blocked') or value['stages']['gate']['state'] == 'observed') and
+        (value['gate'] != 'failed' or value['stages']['gate']['state'] == 'failed'), 'VM gate state differs')
+    if value['gate'] == 'ready' or value['blocked'] == ['realPkexecAuthenticationPendingConfirmation']:
+        require(all(v is True for v in value['checks'].values()) and
+            all(row['state'] == 'observed' for row in value['stages'].values()) and
+            value['failedProbe'] == 'none' and value['managerControlGroup'] in ('empty-root', 'root-slash'),
+            'incomplete VM observation cannot claim ready or authentication-only pending')
+    return value
+
+
+def manager_root(ops, observation):
+    # Keep the property name: missing/unknown property stdout is NOT an empty root.
+    raw = ops.run([SYSTEMCTL, 'show', '--property=ControlGroup'])
+    rows = raw.splitlines()
+    if len(rows) != 1 or not rows[0].startswith('ControlGroup='):
+        observation['managerControlGroup'] = 'missing'
+        raise ValueError('explicit unique manager property required')
+    value = rows[0][len('ControlGroup='):]
+    observation['managerControlGroup'] = 'empty-root' if value == '' else 'root-slash' if value == '/' else 'nonroot'
+    return os.geteuid() == 0 and value in ('', '/')
+
+
 def collect_preflight(gui_uid, vm_context, materials_downloaded=False, ops=None):
     """Read-only target-VM observations; no sudo, device creation or auth probe."""
     ops = ops or Commands()
     facts = {'guiUid': gui_uid, 'githubHosted': vm_context.get('githubHosted') is True,
              'dedicatedVM': vm_context.get('dedicatedVM') is True,
              'materialsDownloaded': materials_downloaded is True, 'observationErrors': []}
+    observation = vm_observation()
+    facts['vmPreflight'] = observation
+    stage = None; probe = 'none'
+    def probing(name):
+        nonlocal probe
+        require(name in VM_PROBES, 'fixed VM probe required')
+        probe = name
+    def reached(name):
+        nonlocal stage, probe
+        probe = 'none'
+        if stage is not None: observation['stages'][stage] = {'state': 'observed', 'error': 'none'}
+        stage = name
     try:
-        facts['rootManager'] = os.geteuid() == 0 and ops.run([SYSTEMCTL, 'show', '--property=ControlGroup', '--value']).strip() == '/'
+        reached('manager')
+        facts['rootManager'] = manager_root(ops, observation)
+        reached('pid1')
         facts['pid1Systemd'] = Path('/proc/1/comm').read_text().strip() == 'systemd'
+        reached('namespaces')
         ns = {name: (Path('/proc/1/ns') / name).stat().st_ino for name in ('net', 'mnt', 'pid', 'cgroup')}
         facts['systemNamespaces'] = ns
         facts['sameSystemNamespaces'] = all((Path('/proc/self/ns') / n).stat().st_ino == i for n, i in ns.items())
+        reached('cgroup-mount')
         mounts = Path('/proc/self/mountinfo').read_text().splitlines()
         cg = [r.split() for r in mounts if ' - cgroup2 ' in r]
         require(len(cg) == 1 and cg[0][3:5] == ['/', '/sys/fs/cgroup'] and
                 not any(r.split()[4].startswith('/sys/fs/cgroup/') for r in mounts), 'unmasked root cgroup2 required')
+        reached('pidfd')
         facts['pidfd'] = hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal')
+        reached('privileges')
         status = dict(r.split(':', 1) for r in Path('/proc/self/status').read_text().splitlines() if ':' in r)
         facts['noNewPrivs'] = int(status['NoNewPrivs'].strip())
+        reached('tun-device')
         info = Path('/dev/net/tun').stat()
         facts['tunDevice'] = stat.S_ISCHR(info.st_mode) and (os.major(info.st_rdev), os.minor(info.st_rdev)) == (10, 200)
+        reached('forwarding')
         facts['forwarding'] = [int(Path(path).read_text()) for path in
             ('/proc/sys/net/ipv4/ip_forward', '/proc/sys/net/ipv6/conf/all/forwarding')]
-        facts['toolsRootOwned'] = all(root_path(Path(path).resolve()).is_file() for path in
-            (IP, SYSTEMCTL, '/usr/bin/systemd-run', '/usr/bin/resolvectl', '/usr/sbin/nft', '/usr/bin/python3', '/usr/bin/setpriv', '/usr/bin/tcpdump', '/usr/bin/tshark'))
+        reached('tools')
+        tools_ok = True
+        for name, path in (('ip', IP), ('systemctl', SYSTEMCTL), ('systemd-run', '/usr/bin/systemd-run'),
+                ('resolvectl', '/usr/bin/resolvectl'), ('nft', '/usr/sbin/nft'), ('python', '/usr/bin/python3'),
+                ('setpriv', '/usr/bin/setpriv'), ('tcpdump', '/usr/bin/tcpdump'), ('tshark', '/usr/bin/tshark')):
+            probing(name)
+            if not root_path(Path(path).resolve()).is_file():
+                tools_ok = False; observation['failedProbe'] = name
+                break
+        facts['toolsRootOwned'] = tools_ok
+        reached('product-paths')
         facts['existingProductPaths'] = [path for path in ('/usr/local/lib/polaris', str(UNIT), '/run/polaris', '/var/lib/polaris')
                                          if Path(path).exists() or Path(path).is_symlink()]
+        reached('environment')
         forbidden = ('WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS', 'WEBKIT_FORCE_SANDBOX',
                      'POLARIS_SINGBOX_PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH')
         facts['unsafeEnvironment'] = [key for key in forbidden if key in os.environ]
-        facts['network'] = network_snapshot(ops)
+        reached('network')
+        facts['network'] = network_snapshot(ops, progress=probing)
         facts['routes'] = facts['network']['route4'] + facts['network']['route6']
+        reached('route-tables')
         facts['tunTableRoutes'] = tun_table_routes(facts['network'])
         facts['networkSnapshotComplete'] = True
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        observation['stages'][stage] = {'state': 'observed', 'error': 'none'}
+    except Exception as error:
+        observation['failedProbe'] = probe
+        observation['stages'][stage] = {'state': 'failed', 'error': vm_error(error)}
         facts['observationErrors'].append(type(error).__name__)
         facts['networkSnapshotComplete'] = False
+    for name in VM_CHECKS:
+        if name in facts and type(facts[name]) is bool: observation['checks'][name] = facts[name]
+    observation['checks']['ordinaryGUI'] = type(gui_uid) is int and gui_uid > 0
+    for check, field, wanted in (('noNewPrivsZero', 'noNewPrivs', 0), ('forwardingBaseline', 'forwarding', [0, 0]),
+            ('freshProductPaths', 'existingProductPaths', []), ('defaultEnvironment', 'unsafeEnvironment', [])):
+        if field in facts: observation['checks'][check] = facts[field] == wanted
+    validate_vm_observation(observation)
     return facts
 
 

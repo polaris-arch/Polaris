@@ -19,6 +19,8 @@ from unittest.mock import Mock, patch
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('test_root_controller_module', HERE / 'root_controller.py')
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+spec_tun = importlib.util.spec_from_file_location('vm_test_tun', HERE / 'tun.py')
+vm_tun = importlib.util.module_from_spec(spec_tun); spec_tun.loader.exec_module(vm_tun)
 H = 'a' * 64
 
 
@@ -63,6 +65,8 @@ class Ledger:
 
 def controller(mode='existing-session'):
     tun = Mock(); tun.Commands.return_value = Mock()
+    for name in ('vm_observation', 'validate_vm_observation', 'vm_error'):
+        setattr(tun, name, getattr(vm_tun, name))
     tun.same_process.side_effect = lambda a, b: bool(a and b and all(a.get(k) == b.get(k) for k in ('pid','startTime','uid','exeDev','exeInode','namespaces','cgroup')))
     c = m.Controller(launch(mode), tun, Path('/root/not-executed'))
     c.ledger = Ledger(); c.ops = c.ledger.ops
@@ -645,7 +649,7 @@ class EntryAndConcurrencyTests(unittest.TestCase):
             if dispatch_error:raise ValueError('PRIVATE SECRET MUST NOT BE PRINTED')
             if finish:c.finished=True
             return {'seq':1,'ok':True,'result':{}}
-        c.readonly_auth = None
+        c.readonly_auth = None; c.vm_preflight = None
         c.dispatch.side_effect=dispatch
         lines=[b'{"seq":1,"action":"prepare"}\n',ValueError('EOF')]
         out=io.StringIO()
@@ -897,9 +901,12 @@ class StartupLifecycleTests(unittest.TestCase):
             with self.subTest(fault=fault):
                 c = controller(); ledger = c.ledger; c.ledger = None
                 c.authentication_readiness = Mock(return_value={}, side_effect=ValueError('PRIVATE') if fault == 'authentication-readiness' else None)
-                c.tun.collect_preflight.return_value = {'systemNamespaces': {}, 'network': {}}
+                c.tun.collect_preflight.return_value = {'systemNamespaces': {}, 'network': {}, 'vmPreflight': vm_tun.vm_observation()}
+                obs=c.tun.collect_preflight.return_value['vmPreflight']
+                obs['stages']={name:{'state':'observed','error':'none'} for name in vm_tun.VM_STAGES}
+                obs['checks']=dict.fromkeys(vm_tun.VM_CHECKS,True);obs['managerControlGroup']='empty-root'
                 c.tun.preflight.return_value = {'blocked': ['realPkexecAuthenticationPendingConfirmation']}
-                if fault == 'vm-preflight': c.tun.preflight.return_value = {'blocked': ['extra-blocker']}
+                if fault == 'vm-preflight': c.tun.preflight.return_value = {'blocked': ['rootManager']}
                 c.tun.file_identity.side_effect = ValueError('PRIVATE') if fault == 'tool-identities' else None
                 c.tun.prepare_root.return_value = ledger
                 if fault == 'root-ledger': c.tun.prepare_root.side_effect = ValueError('PRIVATE')
@@ -1431,6 +1438,59 @@ class ActualJointTimerDeadlineTests(unittest.TestCase):
             self.assertEqual(lease.group_deadline,190) # never reset to200 after slow intent
             self.assertEqual(verify.call_args.args[4],8)
             self.assertTrue(lease.group_timer_verified);writer.assert_called_once()
+
+
+class VMPreparationDiagnosticTests(unittest.TestCase):
+    def fixture(self):
+        c=controller(); c.ledger=None; c.authentication_readiness=Mock(return_value={})
+        c.tun.collect_preflight.return_value={'vmPreflight':vm_tun.vm_observation()}
+        return c
+
+    def test_all_blocked_codes_preserved_without_root_mutation(self):
+        for code in sorted(vm_tun.VM_BLOCKS-{'realPkexecAuthenticationPendingConfirmation'}):
+            with self.subTest(code=code):
+                c=self.fixture();c.tun.preflight.return_value={'blocked':sorted([code,'realPkexecAuthenticationPendingConfirmation'])}
+                with patch.object(m,'independent_record') as record,patch.object(m,'CredentialLease') as lease:
+                    with self.assertRaises(ValueError):c.prepare()
+                self.assertEqual(c.vm_preflight['blocked'],sorted([code,'realPkexecAuthenticationPendingConfirmation']))
+                self.assertEqual(c.vm_preflight['gate'],'blocked')
+                c.tun.prepare_root.assert_not_called();c.tun.file_identity.assert_not_called()
+                c.ops.run.assert_not_called();record.assert_not_called();lease.assert_not_called()
+                receipt=c.abort();m.validate_abort_receipt(receipt,vm_validator=vm_tun.validate_vm_observation)
+                self.assertFalse(receipt['prepared']);self.assertEqual(receipt['vmPreflight'],c.vm_preflight)
+                self.assertEqual(receipt['state'],'failed')
+
+    def test_gate_parser_exception_retains_stage_but_no_message_or_mutation(self):
+        for error in (ValueError('PRIVATE'),TypeError('PRIVATE'),KeyError('PRIVATE')):
+            c=self.fixture();c.tun.preflight.side_effect=error
+            with self.assertRaises(type(error)):c.prepare()
+            self.assertEqual(c.vm_preflight['gate'],'failed')
+            self.assertEqual(c.vm_preflight['stages']['gate']['error'],type(error).__name__)
+            self.assertNotIn('PRIVATE',json.dumps(c.abort()))
+            c.tun.prepare_root.assert_not_called();c.ops.run.assert_not_called()
+
+    def test_abort_optional_observation_cannot_bypass_validator(self):
+        c=self.fixture();c.vm_preflight=vm_tun.vm_observation();r=c.abort()
+        with self.assertRaises(ValueError):m.validate_abort_receipt(r)
+        m.validate_abort_receipt(r,vm_validator=vm_tun.validate_vm_observation)
+        r['vmPreflight']['checks']['rootManager']='PRIVATE'
+        with self.assertRaises(ValueError):m.validate_abort_receipt(r,vm_validator=vm_tun.validate_vm_observation)
+
+    def test_root_ipc_preserves_safe_observation(self):
+        c=Mock();c.finished=False;c.seq=1;c.readonly_auth=None;c.stage='vm-preflight'
+        c.vm_preflight=vm_tun.vm_observation();c.vm_preflight['gate']='failed'
+        c.vm_preflight['stages']['gate']={'state':'failed','error':'ValueError'}
+        c.tun.validate_vm_observation=vm_tun.validate_vm_observation
+        c.dispatch.side_effect=ValueError('PRIVATE');out=io.StringIO()
+        import ctypes
+        with patch.object(m.sys,'argv',['controller','serve','--run-id','0123456789ab']), \
+             patch.object(m,'load_frozen',return_value=(launch(),Mock(),Path('/root/frozen'))), \
+             patch.object(m,'Controller',return_value=c),patch.object(ctypes,'CDLL',return_value=Mock(prctl=Mock(return_value=0))), \
+             patch.object(m,'read_line',side_effect=[b'{"seq":1,"action":"prepare"}',ValueError('EOF')]), \
+             patch.object(m.sys,'stdout',out),self.assertRaises(ValueError):m.main()
+        response=json.loads(out.getvalue().splitlines()[1])
+        self.assertEqual(response['error']['vmPreflight'],c.vm_preflight)
+        self.assertNotIn('PRIVATE',out.getvalue());c.abort.assert_called_once()
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)

@@ -1,5 +1,7 @@
 """Pure/mocked tests: no privilege, sockets, product, namespaces or system changes."""
 import copy
+from contextlib import ExitStack
+from types import SimpleNamespace
 import hashlib
 import importlib.util
 import io
@@ -9,6 +11,7 @@ from pathlib import Path
 import shutil
 import socket
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -447,6 +450,123 @@ class ReportTests(unittest.TestCase):
         e = {'beforeCore': identity(), 'afterCore': identity(), 'newConnection': {'exit': 'B', 'bytes': 1, 'nonceSha256': H}}
         tun.validate_case('daily_switch', e)
         with self.assertRaises((ValueError, KeyError)): tun.validate_case('graph_apply', e)
+
+
+class VMObservationTests(unittest.TestCase):
+    def collect(self, fault=None):
+        def hit(stage):
+            if stage == fault: raise ValueError('PRIVATE raw host data')
+        def text(path, *args, **kwargs):
+            value = str(path)
+            if value == '/proc/1/comm': hit('pid1'); return 'systemd\n'
+            if value == '/proc/self/mountinfo':
+                hit('cgroup-mount'); return '1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n'
+            if value == '/proc/self/status': hit('privileges'); return 'NoNewPrivs: 0\n'
+            hit('forwarding'); return '0'
+        def stat_(path, *args, **kwargs):
+            if '/ns/' in str(path): hit('namespaces'); return SimpleNamespace(st_ino=1)
+            hit('tun-device'); return SimpleNamespace(st_mode=0o020600, st_rdev=os.makedev(10,200))
+        def paths(path, *args, **kwargs): hit('product-paths'); return False
+        tool_names=iter(('ip','systemctl','systemd-run','resolvectl','nft','python','setpriv','tcpdump','tshark'))
+        def root(path, *args, **kwargs):
+            hit('tools'); hit('tool:'+next(tool_names)); return Mock(is_file=lambda: True)
+        def network(*args, **kwargs):
+            hit('network')
+            if fault and fault.startswith('network:'):
+                kwargs['progress'](fault.split(':')[1]); raise ValueError('PRIVATE')
+            return {'route4': [], 'route6': []}
+        def tables(*args): hit('route-tables'); return []
+        ops = Mock()
+        def manager(*args): hit('manager'); return 'ControlGroup=\n'
+        ops.run.side_effect = manager
+        with ExitStack() as stack:
+            for target, kwargs in ((('read_text'), {'autospec':True,'side_effect':text}),
+                    ('stat', {'autospec':True,'side_effect':stat_}),
+                    ('exists', {'autospec':True,'side_effect':paths}), ('is_symlink', {'return_value':False})):
+                stack.enter_context(patch.object(tun.Path,target,**kwargs))
+            stack.enter_context(patch.object(tun,'root_path',side_effect=root))
+            stack.enter_context(patch.object(tun,'network_snapshot',side_effect=network))
+            stack.enter_context(patch.object(tun,'tun_table_routes',side_effect=tables))
+            stack.enter_context(patch.object(tun.os,'geteuid',return_value=0))
+            stack.enter_context(patch.dict(tun.os.environ,{},clear=True))
+            if fault=='pidfd': stack.enter_context(patch.object(tun,'hasattr',side_effect=ValueError('PRIVATE'),create=True))
+            if fault=='environment':
+                bad=Mock();bad.__contains__=Mock(side_effect=ValueError('PRIVATE'))
+                stack.enter_context(patch.object(tun.os,'environ',bad))
+            return tun.collect_preflight(1001,{'githubHosted':True,'dedicatedVM':True},True,ops)
+
+    def test_collector_success_and_pending_gate(self):
+        facts=self.collect(); obs=tun.validate_vm_observation(facts['vmPreflight'])
+        self.assertEqual(obs['managerControlGroup'],'empty-root')
+        self.assertTrue(all(row['state']=='observed' for k,row in obs['stages'].items() if k!='gate'))
+        self.assertEqual(tun.preflight(facts,carrier())['blocked'],['realPkexecAuthenticationPendingConfirmation'])
+
+    def test_each_io_stage_failure_is_bounded_and_remaining_not_reached(self):
+        for stage in ('manager','pid1','namespaces','cgroup-mount','privileges','tun-device',
+                      'forwarding','tools','product-paths','network','route-tables','pidfd','environment'):
+            with self.subTest(stage=stage):
+                facts=self.collect(stage); obs=tun.validate_vm_observation(facts['vmPreflight'])
+                self.assertEqual(obs['stages'][stage],{'state':'failed','error':'ValueError'})
+                remaining=tun.VM_STAGES[tun.VM_STAGES.index(stage)+1:]
+                self.assertTrue(all(obs['stages'][name]['state']=='not-reached' for name in remaining))
+                self.assertFalse(facts['networkSnapshotComplete'])
+                self.assertIn('localEvidenceAndMaterials',tun.preflight(facts,carrier())['blocked'])
+                self.assertNotIn('PRIVATE',json.dumps(obs))
+
+    def test_manager_property_presence_and_root_variants(self):
+        for raw,expected in (('ControlGroup=\n',True),('ControlGroup=/\n',True),('ControlGroup=/user.slice\n',False)):
+            ops=Mock();ops.run.return_value=raw;obs=tun.vm_observation()
+            with patch.object(tun.os,'geteuid',return_value=0): self.assertEqual(tun.manager_root(ops,obs),expected)
+            self.assertNotIn('--value',ops.run.call_args.args[0])
+        for raw in ('','\n','Unknown=','ControlGroup=\nControlGroup=/','ControlGroup=\nOther=x'):
+            with self.subTest(raw=raw),self.assertRaises(ValueError):
+                tun.manager_root(Mock(run=Mock(return_value=raw)),tun.vm_observation())
+        with patch.object(tun.os,'geteuid',return_value=1001):
+            self.assertFalse(tun.manager_root(Mock(run=Mock(return_value='ControlGroup=')),tun.vm_observation()))
+
+    def test_observation_rejects_injected_unbounded_or_false_success_fields(self):
+        for change in (lambda o:o.update(raw='secret'),lambda o:o['checks'].update(rootManager='yes'),
+                       lambda o:o['stages']['manager'].update(error='PRIVATE'),
+                       lambda o:o.update(blocked=['PRIVATE']),lambda o:o.update(gate='ready')):
+            obs=tun.vm_observation();change(obs)
+            with self.assertRaises(ValueError):tun.validate_vm_observation(obs)
+
+    def test_each_tool_and_network_failure_has_exact_safe_label(self):
+        tools=('ip','systemctl','systemd-run','resolvectl','nft','python','setpriv','tcpdump','tshark')
+        network=('links','addresses','route4','route6','rule4','rule6','resolved','firewall','resolv-conf','network-forwarding')
+        for prefix,names in (('tool:',tools),('network:',network)):
+            for name in names:
+                with self.subTest(probe=name):
+                    facts=self.collect(prefix+name);obs=facts['vmPreflight']
+                    tun.validate_vm_observation(obs)
+                    self.assertEqual(obs['failedProbe'],name)
+                    self.assertEqual(obs['stages']['tools' if prefix=='tool:' else 'network']['state'],'failed')
+                    if prefix=='tool:':self.assertIsNone(obs['checks']['toolsRootOwned'])
+                    self.assertNotIn('PRIVATE',json.dumps(obs))
+
+    def test_real_network_snapshot_reports_each_fixed_probe_before_call(self):
+        ops=Mock();ops.json.return_value=[];ops.run.return_value='PRIVATE raw resolver'
+        probes=[]
+        with patch.object(tun.Path,'is_symlink',return_value=False),patch.object(tun.Path,'read_bytes',return_value=b'raw'), \
+             patch.object(tun.Path,'read_text',return_value='0'):
+            tun.network_snapshot(ops,progress=probes.append)
+        self.assertEqual(probes,['links','addresses','route4','route6','rule4','rule6','resolved','firewall','resolv-conf','network-forwarding'])
+
+    def test_unknown_checks_cannot_claim_authentication_only_pending(self):
+        obs=tun.vm_observation();obs['gate']='blocked'
+        obs['blocked']=['realPkexecAuthenticationPendingConfirmation']
+        obs['stages']['gate']={'state':'observed','error':'none'}
+        with self.assertRaises(ValueError):tun.validate_vm_observation(obs)
+        obs['stages']={name:{'state':'observed','error':'none'} for name in tun.VM_STAGES}
+        obs['checks']=dict.fromkeys(tun.VM_CHECKS,True);obs['managerControlGroup']='empty-root'
+        tun.validate_vm_observation(obs)
+        obs['checks']['networkSnapshotComplete']=None
+        with self.assertRaises(ValueError):tun.validate_vm_observation(obs)
+
+    def test_exception_classes_are_fixed(self):
+        for e,wanted in ((FileNotFoundError('PRIVATE'),'OSError'),(subprocess.TimeoutExpired('secret',1),'SubprocessError'),
+                         (KeyError('secret'),'KeyError'),(RuntimeError('secret'),'other')):
+            self.assertEqual(tun.vm_error(e),wanted)
 
 
 if __name__ == '__main__':

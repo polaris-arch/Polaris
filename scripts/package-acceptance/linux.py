@@ -809,7 +809,7 @@ def wait_for(read, condition=bool, timeout=30, interval=0.2):
         value = read()
         if condition(value):
             return value
-        require(time.monotonic() < until, 'bounded observation timed out')
+        gui_require(time.monotonic() < until, 'observation-timeout')
         time.sleep(interval)
 
 
@@ -855,6 +855,34 @@ return true;
 '''
 
 
+WEBDRIVER_ERRORS = frozenset(('element click intercepted', 'element not interactable', 'stale element reference',
+    'no such element', 'no such window', 'invalid session id', 'javascript error', 'script timeout',
+    'timeout', 'unexpected alert open', 'unknown error'))
+
+
+class GuiFailure(ValueError):
+    """Fixed non-secret failure classification, never a remote message."""
+    def __init__(self, code, http_status=None, protocol=None):
+        super().__init__('bounded GUI contract failed')
+        self.code = code
+        self.http_status = http_status
+        self.protocol = protocol if type(protocol) is str and protocol in WEBDRIVER_ERRORS else 'unknown'
+
+
+def gui_failure(error):
+    result = {'code': error.code if isinstance(error, GuiFailure) else 'native-command-rejected' if isinstance(error, NativeRejected) else 'unclassified-contract-failure'}
+    if isinstance(error, GuiFailure) and type(error.http_status) is int:
+        result['httpStatus'] = error.http_status
+    if isinstance(error, GuiFailure) and error.code.startswith('webdriver-'):
+        result['protocol'] = error.protocol
+    return result
+
+
+def gui_require(ok, code):
+    if not ok:
+        raise GuiFailure(code)
+
+
 class NativeRejected(ValueError):
     """Actual native failure envelope, not timeout or unknown outcome."""
 
@@ -874,9 +902,18 @@ class WebDriver:
                 body = json.load(response)
         except urllib.error.HTTPError as error:
             # Never echo remote response strings: they may contain fixture secrets.
-            raise ValueError(f'WebDriver HTTP {error.code}') from None
+            protocol = None
+            try:
+                raw = error.read(16385)
+                if len(raw) <= 16384:
+                    parsed = json.loads(raw)
+                    protocol = parsed.get('value', {}).get('error')
+            except Exception:
+                pass
+            raise GuiFailure('webdriver-http-error', error.code, protocol) from None
         value = body.get('value')
-        require(not isinstance(value, dict) or 'error' not in value, 'native WebDriver command failed')
+        if isinstance(value, dict) and 'error' in value:
+            raise GuiFailure('webdriver-protocol-error', protocol=value.get('error'))
         return value
 
     def start(self, entry):
@@ -911,7 +948,7 @@ window.__TAURI_INTERNALS__.invoke(command,args).then(raw => {
 ''', 'args': [command, args or {}]})
         if value and value.get('rejected') is True:
             raise NativeRejected('actual native fixture/read rejection')
-        require(value and value.get('ok') is True, 'native IPC outcome unknown')
+        gui_require(value and value.get('ok') is True, 'native-ipc-unconfirmed')
         return value.get('data')
 
     def element(self, selector, text=None):
@@ -919,11 +956,56 @@ window.__TAURI_INTERNALS__.invoke(command,args).then(raw => {
         # unlike executing element.click() or dispatching synthetic JS events.
         return self.execute(r'''
 const matches = [...document.querySelectorAll(arguments[0])].filter(e =>
- e.getClientRects().length && !e.disabled && (arguments[1] === null ||
+ e.getClientRects().length && getComputedStyle(e).visibility === 'visible' && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && (arguments[1] === null ||
  e.textContent.trim() === arguments[1] || e.getAttribute('aria-label') === arguments[1]));
 if(matches.length !== 1) return null;
 return matches[0];
 ''', selector, text)
+
+    def contract_control(self, kind, label):
+        gui_require(kind in ('fixture-group', 'fixture-node', 'preference-switch'), 'control-kind-invalid')
+        value = self.execute(r''' 
+const visible=e=>e.getClientRects().length && getComputedStyle(e).visibility==='visible';
+let matches;
+if(arguments[0]==='fixture-group') {
+ matches=[...document.querySelectorAll('#node-menu button.ns-grp')].filter(e=>
+ [...e.children].some(c=>c.tagName==='SPAN' && !c.classList.contains('ns-c') && c.textContent.trim()===arguments[1]));
+} else if(arguments[0]==='fixture-node') {
+ matches=[...document.querySelectorAll('#node-menu button[role="option"]')].filter(e=>
+ [...e.querySelectorAll('.nm-name')].some(c=>c.textContent.trim()===arguments[1]));
+} else {
+ const rows=[...document.querySelectorAll('.set-row')].filter(e=>
+ [...e.querySelectorAll('.sr-title > b')].some(c=>c.textContent.trim()===arguments[1]));
+ matches=rows.flatMap(e=>[...e.querySelectorAll('[role="switch"]')]);
+}
+const result={count:matches.length};
+if(matches.length===1) {
+ const e=matches[0]; result.visible=!!visible(e); result.disabled=!!e.disabled || e.getAttribute('aria-disabled')==='true';
+ result.expanded=e.getAttribute('aria-expanded'); result.checked=e.getAttribute('aria-checked'); result.element=e;
+}
+return result;
+''', kind, label)
+        if isinstance(value, dict) and value.get('count') == 0:
+            raise GuiFailure('control-missing')
+        gui_require(isinstance(value, dict) and value.get('count') == 1, 'control-not-unique')
+        gui_require(value.get('visible') is True and value.get('disabled') is False, 'control-not-interactable')
+        gui_require(isinstance(value.get('element'), dict) and ELEMENT in value['element'], 'control-identity-invalid')
+        return value
+
+    def wait_control(self, kind, label):
+        def read():
+            try:
+                return self.contract_control(kind, label)
+            except GuiFailure as error:
+                if error.code == 'control-missing':
+                    return None
+                raise
+        return wait_for(read, timeout=10)
+
+    def click_control(self, value):
+        gui_require(isinstance(value, dict) and isinstance(value.get('element'), dict)
+                    and ELEMENT in value['element'], 'control-identity-invalid')
+        self.request('POST', self.path('/element/' + value['element'][ELEMENT] + '/click'), {})
 
     def click(self, selector, text=None):
         element = wait_for(lambda: self.element(selector, text))
@@ -1064,6 +1146,7 @@ def carrier_path(directory, item):
 
 
 class CarrierRun:
+    fixture_group_label = 'Package loopback'
     def __init__(self, item, package, workspace, evidence_dir, rpc_client, fixtures):
         self.item, self.package = item, package
         self.workspace, self.evidence_dir = workspace, evidence_dir
@@ -1263,34 +1346,143 @@ class CarrierRun:
         self.result['configIdentity'] = self.runtime_identity()
         self.result['cases']['default_dashboard']['evidence'].setdefault(
             'actualGeneratedRuntime', self.result['configIdentity'])
+        self.gui_phase('connect-backend-observed', status)
         return status
 
     def disconnect(self):
+        self.gui_phase('disconnect-begin')
         self.api_endpoint = None
         before = self.core
         require(self.status().get('running'), 'disconnect requires running core')
         self.driver.click('#connect-btn')
-        wait_for(self.status, lambda s: s.get('running') is False and not s.get('starting'), timeout=45)
+        wait_for(lambda: self.gui_read('disconnect-status', self.status), lambda s: s.get('running') is False and not s.get('starting'), timeout=45)
         wait_for(lambda: process_identity(before['pid']),
                  lambda p: not same_process(p, before) or p['state'] == 'Z', timeout=15)
 
+    def gui_phase(self, phase, state=None):
+        observation = self.result.setdefault('guiObservation', {'steps': [], 'truncated': False})
+        now = time.monotonic()
+        if not hasattr(self, '_gui_started'):
+            self._gui_started = now
+        row = {'phase': phase, 'elapsedMs': max(0, int((now - self._gui_started) * 1000))}
+        if state is not None:
+            row['state'] = {key: state[key] for key in ('running', 'starting') if type(state.get(key)) is bool}
+            if 'selectionIntent' in state:
+                row['state']['selectionIntentPresent'] = state['selectionIntent'] is not None
+            for key in ('mainGeneration', 'pid'):
+                if type(state.get(key)) is int and state[key] >= 0:
+                    row['state'][key] = state[key]
+            for key in ('selectedServerId', 'actualServerId'):
+                if key in state:
+                    row['state'][key] = state[key] if state[key] in ('node-a', 'node-b', None) else 'other'
+        observation['phase'] = phase
+        if 'state' in row:
+            observation['lastState'] = row['state']
+        if observation['steps'] and all(observation['steps'][-1].get(key) == row.get(key) for key in ('phase', 'state')):
+            return
+        if len(observation['steps']) < 128:
+            observation['steps'].append(row)
+        else:
+            observation['truncated'] = True
+
+    def gui_read(self, phase, read):
+        value = read()
+        self.gui_phase(phase, value)
+        return value
+
     def pick(self, label):
+        gui_require(label in ('A', 'B'), 'fixture-node-invalid')
+        self.gui_phase('pick-fixture-identity')
+        config = self.config()
+        nodes = [n for n in config.get('servers', []) if n.get('id') == 'node-' + label.lower()]
+        gui_require(len(nodes) == 1 and nodes[0].get('name') == 'Loop ' + label
+                    and sum(n.get('name') == 'Loop ' + label for n in config.get('servers', [])) == 1, 'fixture-node-identity-differs')
+        group_id = nodes[0].get('subscriptionId')
+        if group_id:
+            groups = [g for g in config.get('subscriptions', []) if g.get('id') == group_id]
+            gui_require(group_id == 'package-fixture' and len(groups) == 1 and
+                        groups[0].get('name') == self.fixture_group_label, 'fixture-group-identity-differs')
+            group_label = groups[0]['name']
+        else:
+            group_label = self.text('nodes.tab.manual')
+        self.gui_phase('pick-menu-open')
         if not self.driver.element('#node-menu .nm-name', 'Loop ' + label):
-            self.driver.click('#node-trigger')
-        self.driver.click('#node-menu .nm-name', 'Loop ' + label)
-        wait_for(self.config, lambda c: c.get('selectedServerId') == 'node-' + label.lower()
+            expanded = self.driver.execute("return document.querySelector('#node-trigger')?.getAttribute('aria-expanded');")
+            gui_require(expanded in ('true', 'false'), 'node-menu-state-invalid')
+            if expanded == 'false':
+                self.driver.click('#node-trigger')
+            self.gui_phase('pick-group-resolve')
+            group = self.driver.wait_control('fixture-group', group_label)
+            gui_require(group.get('expanded') in ('true', 'false'), 'fixture-group-state-invalid')
+            if group['expanded'] == 'false':
+                self.gui_phase('pick-group-expand')
+                self.driver.click_control(group)
+                wait_for(lambda: self.driver.contract_control('fixture-group', group_label),
+                         lambda row: row.get('expanded') == 'true', timeout=10)
+        self.gui_phase('pick-node-click')
+        target = self.driver.wait_control('fixture-node', 'Loop ' + label)
+        self.driver.click_control(target)
+        self.gui_phase('pick-config-readback')
+        observed = wait_for(lambda: self.gui_read('pick-config-readback', self.config), lambda c: c.get('selectedServerId') == 'node-' + label.lower()
                  and not c.get('selectionIntent'), timeout=30)
+        self.gui_phase('pick-status-readback', observed)
         if self.status().get('running'):
-            wait_for(self.status, lambda s: s.get('actualServerId') == 'node-' + label.lower(), timeout=45)
+            status = wait_for(lambda: self.gui_read('pick-status-readback', self.status), lambda s: s.get('actualServerId') == 'node-' + label.lower(), timeout=45)
+            self.gui_phase('pick-complete', status)
+        else:
+            self.gui_phase('pick-complete', observed)
+
+    def preference(self, wanted):
+        gui_require(type(wanted) is bool, 'preference-value-invalid')
+        self.gui_phase('preference-readback')
+        if self.config().get('interruptConnectionsOnSwitch') == wanted:
+            return
+        self.gui_phase('preference-navigation')
+        self.driver.click('.side .nav-item', self.text('sidebar.settings'))
+        self.driver.click('.set-nav', self.text('settings.nav.network'))
+        self.gui_phase('preference-control')
+        control = self.driver.wait_control('preference-switch', self.text('settings.network.interruptOnSwitch'))
+        gui_require(control.get('checked') in ('true', 'false') and
+                    (control['checked'] == 'true') != wanted, 'preference-state-differs')
+        self.gui_phase('preference-click')
+        self.driver.click_control(control)
+        self.gui_phase('preference-save')
+        if self.driver.element('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn')):
+            self.driver.click('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn'))
+        self.gui_phase('preference-config-readback')
+        wait_for(self.config, lambda c: c.get('interruptConnectionsOnSwitch') == wanted)
+        self.gui_phase('preference-return')
+        self.driver.click('.side .nav-item', self.text('settings.nav.back'))
 
     def socket(self, label):
+        self.gui_phase('stream-connect-begin')
         stream = self.fixtures.socks_connect(('127.0.0.1', self.mixed), self.network.domain, 80)
         self.sockets.append(stream)
-        proof = self.fixtures.exchange(stream, label, os.urandom(18).hex())
+        proof = self.exchange(stream, label)
         return stream, proof
 
     def exchange(self, stream, label):
-        return self.fixtures.exchange(stream, label, os.urandom(18).hex())
+        gui_require(label in ('A', 'B'), 'fixture-node-invalid')
+        self.gui_phase('stream-exchange')
+        nonce = os.urandom(18).hex()
+        row = {'backend': label, 'bytes': len(nonce), 'nonceSha256': hashlib.sha256(nonce.encode()).hexdigest(),
+               'state': 'pending'}
+        observations = self.result.setdefault('streamObservation', {'exchanges': [], 'truncated': False})
+        if len(observations['exchanges']) < 128:
+            observations['exchanges'].append(row)
+        else:
+            observations['truncated'] = True
+        try:
+            proof = self.fixtures.exchange(stream, label, nonce)
+        except Exception as error:
+            row['state'] = 'failed'
+            row['failure'] = ('echo-mismatch' if type(error) is ValueError else
+                              'read-eof' if isinstance(error, EOFError) else
+                              'io-timeout' if isinstance(error, TimeoutError) else 'io-unconfirmed')
+            raise
+        row.update(state='validated', exactEchoMatched=True)
+        self.gui_phase('stream-validated')
+        return proof
 
     def runtime_identity(self):
         path = regular(self.runtime_path, self.home)
@@ -1328,9 +1520,11 @@ class CarrierRun:
         return result['result']
 
     def apply(self, expected='hotApplied', retry=None):
+        self.gui_phase('apply-begin')
         observations = self.driver.observations()
         cursor = max((row['sequence'] for row in observations), default=0)
         label = 'home.pendingRetryPersistenceBtn' if retry else 'home.pendingApplyBtn'
+        self.gui_phase('apply-click')
         self.driver.click('.pending-bar .pb-acts button', self.text(label))
         def changed():
             rows = self.driver.observations()
@@ -1339,6 +1533,7 @@ class CarrierRun:
             if retry:
                 matches = [row for row in matches if row.get('transactionId') == retry]
             return matches[0] if matches else None
+        self.gui_phase('apply-original-callback')
         result = wait_for(changed, timeout=65)
         require(result.get('success') is True, 'GUI Apply outcome unknown; no automatic resubmission')
         transaction = result.get('transactionId')
@@ -1371,23 +1566,7 @@ class CarrierRun:
         second, second_proof = self.socket('B')
         self.record('gui_selection', selected='node-b', before=first_proof,
                     newConnection=second_proof, screenshot=self.snapshot('selected-b'))
-        # Toggle the real preference control. This setting is a user action, not a
-        # fixture bypass; native config readback proves which policy was exercised.
-        self.driver.click('.side .nav-item', self.text('sidebar.settings'))
-        self.driver.click('.set-nav', self.text('settings.nav.network'))
-        switch = self.driver.execute(r'''
-const rows=[...document.querySelectorAll('.set-row')].filter(e=>e.textContent.includes(arguments[0]));
-const buttons=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);
-return buttons.length===1?buttons[0]:null;
-''', self.text('settings.network.interruptOnSwitch'))
-        require(switch and ELEMENT in switch, 'real interrupt preference switch unavailable')
-        self.driver.request('POST', self.driver.path('/element/' + switch[ELEMENT] + '/click'), {})
-        # Settings can stage the preference. Use its real Save control if present.
-        save = self.driver.element('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn'))
-        if save:
-            self.driver.click('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn'))
-        wait_for(self.config, lambda c: c.get('interruptConnectionsOnSwitch') is True)
-        self.driver.click('.side .nav-item', self.text('settings.nav.back'))
+        self.preference(True)
         self.pick('A')
         def closed():
             try:
@@ -1412,10 +1591,13 @@ return buttons.length===1?buttons[0]:null;
         self.record('gui_on_off', selected=saved, newProcess=True, restoredConnection=proof)
 
     def auto_case(self):
+        self.gui_phase('auto-begin')
         self.stage = 'gui-auto'
         self.pick('A')
         self.driver.click('#node-trigger')
+        self.gui_phase('auto-enable-click')
         self.driver.click('[data-auto-select-scope="global"] .auto-choice-pick')
+        self.gui_phase('auto-intent-readback')
         wait_for(self.config, lambda c: c.get('selectionIntent') is not None)
         wait_for(self.status, lambda s: s.get('actualServerId') == 'node-a', timeout=45)
         old, before = self.socket('A')
@@ -1443,6 +1625,7 @@ return buttons.length===1?buttons[0]:null;
         self.pick('A')
 
     def graph_cases(self, patch):
+        self.gui_phase('graph-begin')
         self.stage = 'gui-apply-tcp-dns'
         self.disconnect()
         desired = self.config()
@@ -1530,7 +1713,8 @@ return buttons.length===1?buttons[0]:null;
             structural['mixedPort'] = free_port()
         save_fixture(self.driver, structural)
         rejected = self.apply('restartRequired')
-        self.driver.click('dialog button', self.text('home.restartApplyKeepConnection'))
+        self.gui_phase('restart-dialog-dismiss')
+        self.driver.click('dialog[open][aria-labelledby="restart-apply-title"] button', self.text('home.restartApplyKeepConnection'))
         require(self.runtime_path.read_bytes() == source, 'declined restart changed runtime source')
         after_cap = self.rpc('capabilities')
         require(before_cap['active'] == after_cap['active'] and before_cap['controlRevision'] == after_cap['controlRevision'],
@@ -1558,6 +1742,7 @@ return buttons.length===1?buttons[0]:null;
         return wanted
 
     def quit_product(self):
+        self.gui_phase('quit-begin')
         self.api_endpoint = None
         self.stage = 'tray-quit'
         marker = self.runtime_path.parent / 'clean-exit.marker'
@@ -1581,6 +1766,7 @@ return buttons.length===1?buttons[0]:null;
                 'cleanExitMarker': marker_proof}
 
     def restart_case(self, wanted):
+        self.gui_phase('restart-begin')
         self.stage = 'same-home-restart'
         previous_app, previous_core = dict(self.app), dict(self.core)
         accepted = self.runtime_identity()
@@ -1640,7 +1826,7 @@ return buttons.length===1?buttons[0]:null;
             self.record('tray_quit', entry='native WebDriver Ctrl+Q -> original tray_quit',
                         normalProductExit=True, **exited)
         except Exception as error:
-            self.result['failure'] = {'stage': self.stage, 'type': type(error).__name__}
+            self.result['failure'] = {'stage': self.stage, 'type': type(error).__name__, **gui_failure(error)}
             if self.driver and self.driver.session:
                 try:
                     self.result['failure']['screenshot'] = self.snapshot('failed')

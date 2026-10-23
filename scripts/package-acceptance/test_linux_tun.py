@@ -513,7 +513,7 @@ class PureContracts(unittest.TestCase):
             with self.assertRaises(ValueError): run.rpc('capabilities')
 
     def test_core_off_required_before_tray_shortcut(self):
-        run = M.TunCarrierRun.__new__(M.TunCarrierRun); run.driver = Mock()
+        run = M.TunCarrierRun.__new__(M.TunCarrierRun); run.result = {}; run.driver = Mock()
         run.stopped = False
         with self.assertRaises(ValueError): run.quit_product()
         run.driver.quit_shortcut.assert_not_called()
@@ -926,7 +926,7 @@ class ControllerLifecycleContracts(unittest.TestCase):
         proof={'owned':[],'credentialRecovery':credential,'credentialAuthenticationComplete':True,'authDescendantsReaped':True,
                'jointLease':{'credentialRecovery':dict(credential),'groupRecovery':self.membership_recovery()}}
         for valid in (True,False):
-            run=M.TunCarrierRun.__new__(M.TunCarrierRun)
+            run=M.TunCarrierRun.__new__(M.TunCarrierRun); run.result={}
             run.app={'pid':100,'startTime':'123'};run.driver=Mock();run.supervisor=Mock();run.controller=Mock()
             run.launch_options={'authenticationMode':M.AUTH_GROUP_MODE,'authorization':{'guiUid':1001,'account':'runner'}}
             result=copy.deepcopy(proof)
@@ -943,6 +943,57 @@ class ControllerLifecycleContracts(unittest.TestCase):
                 with self.assertRaises(ValueError):run.helper_action('install')
                 run.supervisor.end_window.assert_not_called()
 
+
+
+class SharedGuiAndVmContracts(unittest.TestCase):
+    def test_tun_uses_shared_role_preference_without_button_assumption(self):
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun)
+        with patch.object(M.base.CarrierRun,'preference',return_value='observed') as shared:
+            self.assertEqual(run.preference(True),'observed');shared.assert_called_once_with(True)
+        self.assertEqual(run.fixture_group_label,'Package isolated TUN')
+        self.assertIs(M.TunCarrierRun.pick,M.base.CarrierRun.pick)
+        source=Path(M.__file__).read_text()
+        self.assertNotIn('button[role=switch]',source)
+        self.assertIn('dialog[open][aria-labelledby="restart-apply-title"] button',source)
+
+    def test_tun_exchange_retains_framed_fixture_and_pending_proof(self):
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.pending_streams={}
+        proof={'exit':'A','bytes':36,'nonceSha256':'a'*64}
+        with patch.object(M.fixture,'exchange',return_value=proof) as exchange:
+            self.assertEqual(run.exchange(Mock(),'A'),proof)
+            exchange.assert_called_once()
+        self.assertEqual(run.pending_streams['a'*64],proof)
+        self.assertEqual(run.result['streamObservation']['exchanges'][0]['state'],'validated')
+
+    def test_vm_preflight_error_is_validated_and_preserved_not_promoted(self):
+        import root_controller
+        for invalid in (False,True):
+            client=M.Controller();client.closed=False
+            observation=M.tun.vm_observation()
+            if invalid:observation['secret']='PRIVATE'
+            payload={'seq':1,'ok':False,'error':{'stage':'vm-preflight','code':'CONTROLLER_FAILED','vmPreflight':observation}}
+            self.assertIn('vm-preflight',root_controller.CONTROLLER_STAGES)
+            with patch.object(client,'_write'),patch.object(client,'_read',return_value=payload):
+                with self.assertRaises(ValueError):client.call('prepare')
+            saved=client.lifecycle['rootOperationFailure']
+            if invalid:self.assertNotIn('vmPreflight',saved)
+            else:self.assertEqual(saved['vmPreflight'],observation)
+            self.assertNotIn('PRIVATE',json.dumps(client.lifecycle))
+
+    def test_vm_abort_receipt_preserved_only_after_shared_validation(self):
+        import root_controller
+        for invalid in (False,True):
+            observation=M.tun.vm_observation()
+            if invalid:observation['failedProbe']='PRIVATE'
+            value={'schema':'polaris-root-abort-v1','state':'failed','forced':True,'prepared':False,
+                   'actualReadOnlyAuth':root_controller.auth_observation(),'unknown':[],'vmPreflight':observation}
+            client=M.Controller();client.child=Mock();client.child.wait.return_value=1
+            client.lifecycle.update(ready=True,spawned=True)
+            with patch.object(client,'call',return_value=value):result=client.recover()
+            self.assertEqual(result['state'],'failed')
+            if invalid:self.assertNotIn('abortReceipt',client.lifecycle)
+            else:self.assertEqual(client.lifecycle['abortReceipt']['vmPreflight'],observation)
+            self.assertNotIn('PRIVATE',json.dumps(client.lifecycle))
 
 if __name__ == '__main__':
     unittest.main()

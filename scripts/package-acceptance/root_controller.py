@@ -375,11 +375,15 @@ ABORT_UNKNOWN_CODES = frozenset(('root-preparation-incomplete', 'root-ledger-fai
     'product-network-recovery-unproved', 'network-restoration-unproved', 'route-removal-unknown'))
 
 
-def validate_abort_receipt(value):
+def validate_abort_receipt(value, vm_validator=None):
     """Parse failure evidence only; an empty unknown list grants no authority."""
     fields = ('schema', 'state', 'forced', 'prepared', 'actualReadOnlyAuth', 'unknown')
     require(type(value) is dict, 'typed abort receipt required')
-    exact(value, fields + (('productCleanup',) if 'productCleanup' in value else ()))
+    exact(value, fields + (('productCleanup',) if 'productCleanup' in value else ()) +
+          (('vmPreflight',) if 'vmPreflight' in value else ()))
+    if 'vmPreflight' in value:
+        require(callable(vm_validator), 'VM observation validator required')
+        vm_validator(value['vmPreflight'])
     require(value['schema'] == 'polaris-root-abort-v1' and value['state'] == 'failed' and value['forced'] is True and
             (value['prepared'] is None or type(value['prepared']) is bool), 'abort failure scope differs')
     if value['actualReadOnlyAuth'] is not None: validate_auth_observation(value['actualReadOnlyAuth'])
@@ -1308,6 +1312,7 @@ class Controller:
         self.agent = None; self.pty = None; self.tools = {}; self.lease = None; self.auth_observer = None
         self.stage = 'idle'; self.preparation_pending = False; self.recovery_unknown = []
         self.readonly_auth = None
+        self.vm_preflight = None
 
     def fail(self):
         self.failed = True
@@ -1389,8 +1394,20 @@ class Controller:
         self.stage = 'authentication-readiness'
         readiness = self.authentication_readiness()
         self.stage = 'vm-preflight'
+        self.vm_preflight = self.tun.vm_observation()
         facts = self.tun.collect_preflight(self.launch['guiUid'], self.launch['vmContext'], True, self.ops)
-        check = self.tun.preflight(facts, self.launch, authentication_confirmed=False)
+        self.vm_preflight = self.tun.validate_vm_observation(facts['vmPreflight'])
+        try:
+            check = self.tun.preflight(facts, self.launch, authentication_confirmed=False)
+            self.vm_preflight['blocked'] = check['blocked']
+            self.vm_preflight['gate'] = 'blocked' if check['blocked'] else 'ready'
+            self.vm_preflight['stages']['gate'] = {'state': 'observed', 'error': 'none'}
+            self.tun.validate_vm_observation(self.vm_preflight)
+        except Exception as error:
+            self.vm_preflight['blocked'] = []
+            self.vm_preflight['gate'] = 'failed'
+            self.vm_preflight['stages']['gate'] = {'state': 'failed', 'error': self.tun.vm_error(error)}
+            raise
         require(check['blocked'] == ['realPkexecAuthenticationPendingConfirmation'], 'VM/material preflight blocked')
         # Registration/guard preparation is NOT authentication. Network remains closed
         # until the real original product installation authorization is observed.
@@ -1730,6 +1747,7 @@ class Controller:
         if not self.ledger:
             return {'schema': 'polaris-root-abort-v1', 'state': 'failed', 'forced': True,
                 'prepared': None if self.preparation_pending else False, 'actualReadOnlyAuth': self.readonly_auth,
+                **({'vmPreflight': self.tun.validate_vm_observation(self.vm_preflight)} if self.vm_preflight is not None else {}),
                 'unknown': sorted(set(self.recovery_unknown +
                 (['root-preparation-incomplete'] if self.preparation_pending else [])))}
         # Auth recovery is independent and attempted even if product cleanup raises.
@@ -1748,7 +1766,8 @@ class Controller:
             self.ledger.mutate(lambda v: v.update(unknown=sorted(set(v['unknown'] + errors)), result='failed'))
         except Exception: errors.append('root-ledger-recovery-unconfirmed')
         return {'schema': 'polaris-root-abort-v1', 'state': 'failed', 'forced': True, 'prepared': True,
-                'actualReadOnlyAuth': self.readonly_auth, 'unknown': sorted(set(errors)), 'productCleanup': result}
+                'actualReadOnlyAuth': self.readonly_auth, 'unknown': sorted(set(errors)), 'productCleanup': result,
+                **({'vmPreflight': self.tun.validate_vm_observation(self.vm_preflight)} if self.vm_preflight is not None else {})}
 
 
 def close_transactions(ledger, tun, signal_live=True):
@@ -1840,6 +1859,8 @@ def main():
                                       'kind': type(error).__name__,
                                       'stage': controller.stage if controller.stage in CONTROLLER_STAGES else 'dispatch',
                                       'message': 'fixed operation failed; no acceptance or authentication success'}}
+                if controller.vm_preflight is not None:
+                    response['error']['vmPreflight'] = controller.tun.validate_vm_observation(controller.vm_preflight)
                 if controller.readonly_auth is not None:
                     response['error']['actualReadOnlyAuth'] = validate_auth_observation(controller.readonly_auth)
                 if not_ready:
