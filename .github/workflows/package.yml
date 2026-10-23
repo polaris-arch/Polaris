@@ -41,6 +41,14 @@ on:
   # 单平台用于定位平台故障，发布仍必须 all。
   workflow_dispatch:
     inputs:
+      linux_package_acceptance:
+        description: 'Run real unpacked Linux final packages on this exact reviewed branch (no branch publication)'
+        type: boolean
+        default: false
+      linux_acceptance_candidate:
+        description: 'Explicit exact App SHA required for branch Linux package acceptance'
+        type: string
+        default: ''
       windows_system_candidate:
         description: 'Explicit exact final App SHA for existing hosted Windows SYSTEM checks; requires platform=all'
         type: string
@@ -164,15 +172,17 @@ jobs:
       include: ${{ steps.resolve.outputs.include }}
       full: ${{ steps.resolve.outputs.full }}
       candidate: ${{ steps.resolve.outputs.candidate }}
+      acceptance_enabled: ${{ steps.linux_acceptance_admission.outputs.enabled }}
+      acceptance_context: ${{ steps.linux_acceptance_admission.outputs.context }}
     steps:
       - uses: actions/checkout@v7
-        if: inputs.native_validation
+        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != ''
         with:
           ref: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@v7
-        if: inputs.native_validation
+        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != ''
         with:
           node-version: '26'
 
@@ -317,6 +327,27 @@ jobs:
             echo "full=$full"
             echo "candidate=$CORE_CANDIDATE"
           } >> "$GITHUB_OUTPUT"
+
+
+      # Separate step scope: no legacy native-validation env is inherited from
+      # the matrix resolver. Never erase a 0/1 flag to manufacture formal origin.
+      - name: Admit actual formal Linux package source
+        id: linux_acceptance_admission
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != ''
+        env:
+          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
+          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
+          PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
+          PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
+          PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
+          PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
+          PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
+          PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
+        run: |
+          set -euo pipefail
+          context="$(node scripts/package-acceptance/transport.mjs admit)"
+          echo "context=$context" >> "$GITHUB_OUTPUT"
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
 
   # ══ 发布前置门：与打包并行跑，门不绿则不发布 ══
   # 复用 ci.yml（workflow_call）跑**完整 3-OS** fmt+clippy+build+test，CI 不绿则 4 平台打包
@@ -1652,7 +1683,31 @@ jobs:
       # Release transport and manual package recovery share the same seven-day window.
       # Both release_desktop and release consume these bytes; evidence has separate uploads.
       # Release assets are durable distribution copies. Do not auto-delete transport on upload.
+      # Freeze only after all Linux hardening/repacking and final naming.
+      # Producer legacy=0 is recorded, NOT relabeled as formal acceptance.
+      - name: Freeze final Linux carrier bytes and members
+        if: runner.os == 'Linux' && needs.setup.outputs.acceptance_enabled == 'true'
+        shell: bash
+        env:
+          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
+          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
+          PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
+          PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
+          PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
+          PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
+          PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
+          PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
+          PACKAGE_ACCEPTANCE_CONTEXT: ${{ needs.setup.outputs.acceptance_context }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(target/release/bundle/deb/*.deb)
+          images=(target/release/bundle/appimage/*.AppImage)
+          [ "${#debs[@]}" -eq 1 ] && [ "${#images[@]}" -eq 1 ]
+          node scripts/package-acceptance/transport.mjs freeze "${debs[0]}" "${images[0]}" linux-package-freeze.json
+
       - name: Upload artifacts
+        id: package_artifact
         if: env.POLARIS_UPLOAD_ARTIFACTS == '1'
         uses: actions/upload-artifact@v7
         with:
@@ -1663,6 +1718,142 @@ jobs:
             target/*/release/bundle/**/*.dmg
             dist-win/*.exe
             dist-win/Polaris_*-win-Portable.zip
+          if-no-files-found: error
+          retention-days: 7
+
+
+      - name: Bind actual current-attempt package transport
+        if: runner.os == 'Linux' && needs.setup.outputs.acceptance_enabled == 'true'
+        env:
+          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
+          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
+          PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
+          PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
+          PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
+          PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
+          PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
+          PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
+          PACKAGE_ACCEPTANCE_CONTEXT: ${{ needs.setup.outputs.acceptance_context }}
+          PACKAGE_UPLOAD_OUTCOME: ${{ steps.package_artifact.outcome }}
+          PACKAGE_ARTIFACT_ID: ${{ steps.package_artifact.outputs.artifact-id }}
+          PACKAGE_ARTIFACT_DIGEST: ${{ steps.package_artifact.outputs.artifact-digest }}
+        run: node scripts/package-acceptance/transport.mjs seal linux-package-freeze.json linux-package-transport/transport.json
+
+      - name: Upload immutable Linux package transport index
+        if: runner.os == 'Linux' && needs.setup.outputs.acceptance_enabled == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-package-transport-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: linux-package-transport/transport.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # Runs the exact uploaded deb/AppImage bytes: no App/core build or repack here.
+  # A consumer-only rerun cannot reuse an earlier attempt's transport index.
+  linux_package_acceptance:
+    name: real final Linux packages (non-root, non-TUN)
+    needs: [setup, package]
+    if: >-
+      !cancelled() && needs.setup.outputs.acceptance_enabled == 'true'
+      && needs.setup.result == 'success' && needs.package.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.accepted.outputs.artifact-id }}
+      artifact_digest: ${{ steps.accepted.outputs.artifact-digest }}
+    env:
+      PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
+      PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
+      PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
+      PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
+      PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
+      PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
+      PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
+      PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Require unchanged actual formal source
+        run: node scripts/package-acceptance/transport.mjs admit
+      - name: Install native automation runtime (not sandbox workarounds)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev webkit2gtk-driver xvfb dbus-x11 squashfs-tools
+      - name: Install test-side tools only
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo install tauri-driver --version '=2.0.5' --locked
+          tauri-driver --version
+          WebKitWebDriver --version
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+      - name: Verify protoc toolchain
+        run: |
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc differs from pinned toolchain"; exit 1;
+          }
+      - name: Read pinned source Go version
+        id: core-go
+        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.core-go.outputs.version }}
+          cache: false
+      - name: Fetch original formal core receipts for comparison only
+        env:
+          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
+        run: node scripts/fetch-core.mjs --platform=linux
+      - name: Download exact final package transport and bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/package-acceptance/transport.mjs fetch linux-package-input linux-package-carriers
+      - name: Verify original final-package receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t debs < <(find linux-package-carriers -type f -name '*.deb')
+          mapfile -t images < <(find linux-package-carriers -type f -name '*.AppImage')
+          [ "${#debs[@]}" -eq 1 ] && [ "${#images[@]}" -eq 1 ]
+          python3 -B scripts/final-package-receipt.py --platform linux --kind deb --artifact "${debs[0]}" --output linux-package-evidence/final-deb.json
+          python3 -B scripts/final-package-receipt.py --platform linux --kind AppImage --artifact "${images[0]}" --output linux-package-evidence/final-AppImage.json
+      - name: Build the small RPC test client (not App or core)
+        run: |
+          cargo test --locked -p polaris-singbox-grpc --example package_runtime_probe
+          cargo build --locked -p polaris-singbox-grpc --example package_runtime_probe
+      - name: Exercise real original Linux package entrypoints
+        run: python3 -B scripts/package-acceptance/linux.py run --transport linux-package-input/transport.json --packages linux-package-carriers --rpc-client target/debug/examples/package_runtime_probe --output linux-package-evidence/run.json
+      - name: Require every real case and normal cleanup before acceptance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/package-acceptance/transport.mjs accept linux-package-input/transport.json linux-package-evidence/run.json linux-package-evidence linux-package-accepted/accepted.json
+      - name: Upload exact successful Linux acceptance
+        id: accepted
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-package-accepted-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: linux-package-accepted/accepted.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve bounded sanitized Linux evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-package-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Never upload private HOME, runtime JSON, tokens or raw App stdout.
+          path: |
+            linux-package-evidence/*.json
+            linux-package-evidence/*.png
           if-no-files-found: error
           retention-days: 7
 
@@ -1847,7 +2038,7 @@ jobs:
     # 2026-09-04：ci / ui 由 package 的 needs 移到这里 —— 打包与门并行开跑，**草稿写入仍必须等门**。
     # 2026-10-07：core_wire 同理列入 —— wire 契约从打包腿内的一步变成并行 job 后，「契约不成立
     # 就没有安装包」变成「契约不成立就写不进草稿」，判据必须在这里显式接回。
-    needs: [setup, ci, ui, package, core_wire]
+    needs: [setup, ci, ui, package, core_wire, linux_package_acceptance]
     # 六条闸门，缺一不可：
     #   · `always()` —— **必需的，不是保险**：两门在单平台 dispatch、以及 release-risk.yml 以
     #     `skip_quality_gates: true` 复用本 workflow 时都是 `skipped`，而默认 needs 语义把 skipped
@@ -1872,11 +2063,13 @@ jobs:
       && needs.setup.outputs.full == 'true'
       && needs.package.result == 'success'
       && needs.core_wire.result == 'success'
+      && needs.linux_package_acceptance.result == 'success'
       && (needs.ci.result == 'success' || needs.ci.result == 'skipped')
       && (needs.ui.result == 'success' || needs.ui.result == 'skipped')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      actions: read
     outputs:
       release_tag: ${{ steps.release_identity.outputs.tag }}
       release_sha: ${{ steps.release_identity.outputs.sha }}
@@ -1929,7 +2122,7 @@ jobs:
       #       同样能替换它。它防的是**传输损坏与截断**，**不防**「GitHub 账号或 TLS 被攻破」。真正的
       #       端到端完整性需要签名（公钥内置于应用），那是独立决策，本轮不做，也不假装 SHA 等价于它。
       #    ② 它的起点是 **dist-release**，不是构建产出：清单在 `download-artifact` 之后才算，故
-      #       **build job → actions artifact → dist-release 这一跳没有摘要判据**（那一跳坏了字节，
+      #       **非 Linux 的 build job → actions artifact → dist-release 仍没有构建端摘要判据**（那一跳坏了字节，
       #       清单会忠实地记下坏字节的摘要，两道门全绿）。补它要每条腿各产局部清单再聚合合并，
       #       收益不抵复杂度，故如实登记不做。
       #
@@ -1968,8 +2161,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_ACCEPTANCE_RESULT: ${{ needs.linux_package_acceptance.result }}
+          PACKAGE_ACCEPTED_ARTIFACT_ID: ${{ needs.linux_package_acceptance.outputs.artifact_id }}
+          PACKAGE_ACCEPTED_ARTIFACT_DIGEST: ${{ needs.linux_package_acceptance.outputs.artifact_digest }}
         run: |
           set -euo pipefail
+          node scripts/package-acceptance/transport.mjs release-check linux-accepted-before-draft dist-release
           tag="${GITHUB_REF_NAME}"
 
           version="$(node -p 'require("./src-tauri/tauri.conf.json").version')"
@@ -2218,14 +2415,16 @@ jobs:
   # 对真实 release 的资产集合 / state / digest 做双向精确对账。只有本 job 持有公开动作。
   release:
     name: verify combined release + promote public
-    needs: [release_desktop, android_release]
+    needs: [release_desktop, android_release, linux_package_acceptance]
     if: >-
       always()
       && needs.release_desktop.result == 'success'
       && needs.android_release.result == 'success'
+      && needs.linux_package_acceptance.result == 'success'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v7
 
@@ -2392,6 +2591,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_ACCEPTANCE_RESULT: ${{ needs.linux_package_acceptance.result }}
+          PACKAGE_ACCEPTED_ARTIFACT_ID: ${{ needs.linux_package_acceptance.outputs.artifact_id }}
+          PACKAGE_ACCEPTED_ARTIFACT_DIGEST: ${{ needs.linux_package_acceptance.outputs.artifact_digest }}
+          PACKAGE_CHECK_REMOTE: 'true'
           TAG: ${{ steps.release_identity.outputs.tag }}
           VERIFIED_ANDROID_APKS: ${{ needs.android_release.outputs.signed_apks }}
         run: |
@@ -2431,5 +2634,6 @@ jobs:
           awk -F'\t' '{ print $1 "  " $3 }' "$raw" | sed 's/^sha256://' | LC_ALL=C sort -k2 > "$actual"
           diff -u "$expected" "$actual" || {
             echo "::error::公开紧前远端资产已被替换，拒绝公开"; exit 1; }
+          node scripts/package-acceptance/transport.mjs release-check linux-accepted-before-public dist-release
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
           echo "release $TAG 已转为公开"

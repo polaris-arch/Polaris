@@ -37,6 +37,8 @@ thiserror = "2"
 log = "0.4"
 
 [dev-dependencies]
+# JSON stdin/output for the package-only probe; no production dependency.
+serde_json.workspace = true
 polaris-source-probe = { version = "1.0.0", path = "../source-probe" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "test-util"] }
 tokio-stream = { version = "0.1", features = ["net"] }

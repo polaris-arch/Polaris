@@ -51,6 +51,7 @@ required_tests=(
   scripts/mobile-source-unit.test.mjs
   scripts/apple-ci-impact.test.mjs
   scripts/ci-workflow-efficiency.test.mjs
+  scripts/package-acceptance.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {
