@@ -45,6 +45,21 @@ on:
         description: 'Run real unpacked Linux final packages on this exact reviewed branch (no branch publication)'
         type: boolean
         default: false
+      linux_tun_acceptance:
+        description: 'Explicit same-final-carrier TUN test on two disposable VMs; selected tests gate publication'
+        type: boolean
+        default: false
+      linux_tun_auth_mode:
+        description: 'Temporary password mode requires separate explicit approval for this exact dispatch'
+        type: choice
+        default: existing-session
+        options:
+          - existing-session
+          - temporary-existing-runner-password
+      linux_tun_credential_authorization:
+        description: 'Leave empty unless this exact temporary runner password and relock action was explicitly approved'
+        type: string
+        default: ''
       linux_acceptance_candidate:
         description: 'Explicit exact App SHA required for branch Linux package acceptance'
         type: string
@@ -176,13 +191,13 @@ jobs:
       acceptance_context: ${{ steps.linux_acceptance_admission.outputs.context }}
     steps:
       - uses: actions/checkout@v7
-        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != ''
+        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '' || inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != ''
         with:
           ref: ${{ inputs.core_candidate || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@v7
-        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != ''
+        if: inputs.native_validation || startsWith(github.ref, 'refs/tags/v') || inputs.linux_package_acceptance == true || inputs.linux_acceptance_candidate != '' || inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != ''
         with:
           node-version: '26'
 
@@ -348,6 +363,20 @@ jobs:
           context="$(node scripts/package-acceptance/transport.mjs admit)"
           echo "context=$context" >> "$GITHUB_OUTPUT"
           echo 'enabled=true' >> "$GITHUB_OUTPUT"
+
+      - name: Admit separately selected same-carrier TUN and credential authority
+        if: inputs.linux_tun_acceptance == true || inputs.linux_tun_credential_authorization != ''
+        env:
+          PACKAGE_TUN_REQUESTED: ${{ inputs.linux_tun_acceptance && 'true' || 'false' }}
+          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
+          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
+          PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
+          PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
+          PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
+          PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
+          PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
+          PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
+        run: node scripts/package-acceptance/tun_transport.mjs admit
 
   # ══ 发布前置门：与打包并行跑，门不绿则不发布 ══
   # 复用 ci.yml（workflow_call）跑**完整 3-OS** fmt+clippy+build+test，CI 不绿则 4 平台打包
@@ -1857,6 +1886,123 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  linux_tun_package_acceptance:
+    name: real final Linux TUN (${{ matrix.kind }}, disposable VM)
+    needs: [setup, package]
+    if: >-
+      !cancelled() && inputs.linux_tun_acceptance == true
+      && needs.setup.outputs.acceptance_enabled == 'true'
+      && needs.setup.result == 'success' && needs.package.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [deb, AppImage]
+    permissions:
+      contents: read
+      actions: read
+    env:
+      PACKAGE_TUN_REQUESTED: 'true'
+      PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
+      PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
+      PACKAGE_ACCEPTANCE_PLATFORM: ${{ inputs.platform || 'all' }}
+      PACKAGE_ACCEPTANCE_PLATFORMS: ${{ inputs.platforms }}
+      PACKAGE_ACCEPTANCE_LIGHT: ${{ inputs.light_build }}
+      PACKAGE_ACCEPTANCE_NATIVE: ${{ inputs.native_validation }}
+      PACKAGE_ACCEPTANCE_SKIP_QUALITY: ${{ inputs.skip_quality_gates }}
+      PACKAGE_ACCEPTANCE_BUNDLE: ${{ inputs.core_bundle_artifact }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Require unchanged actual formal source
+        run: node scripts/package-acceptance/tun_transport.mjs admit
+      - name: Install native automation runtime (not sandbox workarounds)
+        run: |
+          sudo apt-get update
+          # No sandbox/sysctl/AppArmor/polkit/sudo policy changes. Root tools
+          # are prefetched before the bounded TUN window can interrupt runner I/O.
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev webkit2gtk-driver xvfb dbus-x11 squashfs-tools policykit-1 tcpdump tshark nftables iproute2
+      - name: Install test-side tools only
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo install tauri-driver --version '=2.0.5' --locked
+          tauri-driver --version
+          WebKitWebDriver --version
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+      - name: Verify protoc toolchain
+        run: |
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc differs from pinned toolchain"; exit 1;
+          }
+      - name: Read pinned source Go version
+        id: core-go
+        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.core-go.outputs.version }}
+          cache: false
+      - name: Fetch original formal core receipts for comparison only
+        env:
+          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
+        run: node scripts/fetch-core.mjs --platform=linux
+      - name: Download exact final package transport and bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/package-acceptance/transport.mjs fetch linux-package-input linux-package-carriers
+      - name: Verify original final-package receipt for this exact carrier
+        env:
+          TUN_CARRIER_KIND: ${{ matrix.kind }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t carriers < <(find linux-package-carriers -type f -name "*.$TUN_CARRIER_KIND")
+          [ "${#carriers[@]}" -eq 1 ]
+          python3 -B scripts/final-package-receipt.py --platform linux --kind "$TUN_CARRIER_KIND" --artifact "${carriers[0]}" --output linux-tun-evidence/final-native.json
+      - name: Bind actual source, artifact, carrier and original native receipt
+        env:
+          TUN_CARRIER_KIND: ${{ matrix.kind }}
+        run: node scripts/package-acceptance/tun_transport.mjs prepare linux-package-input/transport.json linux-package-carriers linux-tun-evidence/final-native.json "$TUN_CARRIER_KIND" linux-tun-evidence/admitted.json
+      - name: Build the small RPC test client (not App or core)
+        run: |
+          cargo test --locked -p polaris-singbox-grpc --example package_runtime_probe
+          cargo build --locked -p polaris-singbox-grpc --example package_runtime_probe
+      - name: Real ordinary-UID GUI with bounded production helper and TUN
+        env:
+          TUN_CARRIER_KIND: ${{ matrix.kind }}
+        run: python3 -B scripts/package-acceptance/linux_tun.py run --admission linux-tun-evidence/admitted.json --transport linux-package-input/transport.json --packages linux-package-carriers --kind "$TUN_CARRIER_KIND" --rpc-client target/debug/examples/package_runtime_probe --output linux-tun-evidence/run.json
+      - name: Require every real TUN case, same bytes and normal restoration
+        run: node scripts/package-acceptance/tun_transport.mjs finish linux-tun-evidence/admitted.json linux-package-carriers linux-tun-evidence/run.json linux-package-input/transport.json
+      - name: Upload same-run successful TUN evidence (not an independent release receipt)
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-package-tun-${{ matrix.kind }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            linux-tun-evidence/admitted.json
+            linux-tun-evidence/run.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve bounded sanitized TUN diagnostics after local recovery
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-package-tun-diagnostics-${{ matrix.kind }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # No private HOME/config, secret, raw pcap, PTY, root ledger or App stdout.
+          path: |
+            linux-tun-evidence/*.json
+            linux-tun-evidence/*.png
+          if-no-files-found: error
+          retention-days: 7
+
   # ══ 四平台 wire 契约：与宿主平台无关，全 workflow 只跑一次（2026-10-07）══
   #
   # 此前 `Bundled core gRPC wire contract (all platforms)` 挂在每条打包腿上：四条腿各付一次
@@ -2038,7 +2184,7 @@ jobs:
     # 2026-09-04：ci / ui 由 package 的 needs 移到这里 —— 打包与门并行开跑，**草稿写入仍必须等门**。
     # 2026-10-07：core_wire 同理列入 —— wire 契约从打包腿内的一步变成并行 job 后，「契约不成立
     # 就没有安装包」变成「契约不成立就写不进草稿」，判据必须在这里显式接回。
-    needs: [setup, ci, ui, package, core_wire, linux_package_acceptance]
+    needs: [setup, ci, ui, package, core_wire, linux_package_acceptance, linux_tun_package_acceptance]
     # 六条闸门，缺一不可：
     #   · `always()` —— **必需的，不是保险**：两门在单平台 dispatch、以及 release-risk.yml 以
     #     `skip_quality_gates: true` 复用本 workflow 时都是 `skipped`，而默认 needs 语义把 skipped
@@ -2064,6 +2210,7 @@ jobs:
       && needs.package.result == 'success'
       && needs.core_wire.result == 'success'
       && needs.linux_package_acceptance.result == 'success'
+      && (inputs.linux_tun_acceptance != true || needs.linux_tun_package_acceptance.result == 'success')
       && (needs.ci.result == 'success' || needs.ci.result == 'skipped')
       && (needs.ui.result == 'success' || needs.ui.result == 'skipped')
     runs-on: ubuntu-22.04
@@ -2161,12 +2308,19 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_TUN_REQUESTED: ${{ inputs.linux_tun_acceptance && 'true' || 'false' }}
+          PACKAGE_TUN_RESULT: ${{ needs.linux_tun_package_acceptance.result }}
+          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
+          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
           PACKAGE_ACCEPTANCE_RESULT: ${{ needs.linux_package_acceptance.result }}
           PACKAGE_ACCEPTED_ARTIFACT_ID: ${{ needs.linux_package_acceptance.outputs.artifact_id }}
           PACKAGE_ACCEPTED_ARTIFACT_DIGEST: ${{ needs.linux_package_acceptance.outputs.artifact_digest }}
         run: |
           set -euo pipefail
           node scripts/package-acceptance/transport.mjs release-check linux-accepted-before-draft dist-release
+          if [ "$PACKAGE_TUN_REQUESTED" = true ]; then
+            node scripts/package-acceptance/tun_transport.mjs release-check linux-tun-before-draft dist-release
+          fi
           tag="${GITHUB_REF_NAME}"
 
           version="$(node -p 'require("./src-tauri/tauri.conf.json").version')"
@@ -2415,12 +2569,13 @@ jobs:
   # 对真实 release 的资产集合 / state / digest 做双向精确对账。只有本 job 持有公开动作。
   release:
     name: verify combined release + promote public
-    needs: [release_desktop, android_release, linux_package_acceptance]
+    needs: [release_desktop, android_release, linux_package_acceptance, linux_tun_package_acceptance]
     if: >-
       always()
       && needs.release_desktop.result == 'success'
       && needs.android_release.result == 'success'
       && needs.linux_package_acceptance.result == 'success'
+      && (inputs.linux_tun_acceptance != true || needs.linux_tun_package_acceptance.result == 'success')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -2591,6 +2746,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_TUN_REQUESTED: ${{ inputs.linux_tun_acceptance && 'true' || 'false' }}
+          PACKAGE_TUN_RESULT: ${{ needs.linux_tun_package_acceptance.result }}
+          PACKAGE_ACCEPTANCE_REQUESTED: ${{ inputs.linux_package_acceptance && 'true' || 'false' }}
+          PACKAGE_ACCEPTANCE_CANDIDATE: ${{ inputs.linux_acceptance_candidate }}
           PACKAGE_ACCEPTANCE_RESULT: ${{ needs.linux_package_acceptance.result }}
           PACKAGE_ACCEPTED_ARTIFACT_ID: ${{ needs.linux_package_acceptance.outputs.artifact_id }}
           PACKAGE_ACCEPTED_ARTIFACT_DIGEST: ${{ needs.linux_package_acceptance.outputs.artifact_digest }}
@@ -2635,5 +2794,8 @@ jobs:
           diff -u "$expected" "$actual" || {
             echo "::error::公开紧前远端资产已被替换，拒绝公开"; exit 1; }
           node scripts/package-acceptance/transport.mjs release-check linux-accepted-before-public dist-release
+          if [ "$PACKAGE_TUN_REQUESTED" = true ]; then
+            node scripts/package-acceptance/tun_transport.mjs release-check linux-tun-before-public dist-release
+          fi
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
           echo "release $TAG 已转为公开"

@@ -1,0 +1,941 @@
+#!/usr/bin/env python3
+"""Separate, fail-closed final-carrier TUN GUI consumer.
+
+No import-time privilege/network/product action. Ordinary GUI stays sandboxed;
+root operations use only frozen root_controller typed IPC. Mock tests are never
+runtime evidence. deb means extraction, not package installation/uninstallation.
+"""
+from __future__ import annotations
+import argparse
+import base64
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import signal
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+
+import linux as base
+import tun
+import tun_fixtures as fixture
+
+require = base.require
+HERE = Path(__file__).resolve().parent
+
+
+def inspect_helper(payload, members):
+    payload = Path(payload).resolve()
+    helpers = [p for p in payload.rglob('polaris-helper') if p.is_file()]
+    require(len(helpers) == 1, 'one packaged helper required')
+    helper = base.regular(helpers[0], payload)
+    require(helper.read_bytes()[:4] == b'\x7fELF' and os.access(helper, os.X_OK), 'packaged helper must be executable ELF')
+    manifests = [p for p in payload.rglob('core-manifest.json') if p.is_file()]
+    require(len(manifests) == 1, 'one embedded selected-core manifest required')
+    manifest = base.regular(manifests[0], payload)
+    require(manifest.parent == (payload / members['core']['path']).parent and manifest.stat().st_size < 1024 * 1024,
+            'embedded manifest must accompany frozen core')
+    return {'helper': base.byte_identity(helper, payload), 'manifest': base.byte_identity(manifest, payload),
+            'embeddedManifest': json.loads(manifest.read_bytes()),
+            'core': members['core'], 'cronet': members['cronet']}
+
+
+def birth(value):
+    """Public, stable identity, independent of restricted proc dumpability."""
+    require(isinstance(value, dict) and type(value.get('pid')) is int and value['pid'] > 0,
+            'actual process birth required')
+    start = value.get('startTime', value.get('startTimeTicks'))
+    require(str(start).isdigit() and int(start) > 0, 'actual process start time required')
+    return {'pid': value['pid'], 'startTime': str(start)}
+
+
+def same_birth(a, b):
+    try:
+        return birth(a) == birth(b)
+    except ValueError:
+        return False
+
+
+def app_execution_identity(app):
+    before = base.process_identity(app['pid'])
+    require(base.same_process(before, app) and before['uid'] == os.getuid(), 'actual ordinary App birth required')
+    path = Path('/proc') / str(app['pid']) / 'exe'
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        require(0 < info.st_size <= 128 * 1024 * 1024, 'bounded actual App ELF required')
+        digest = hashlib.sha256()
+        while chunk := stream.read(1024 * 1024): digest.update(chunk)
+        final = os.fstat(stream.fileno())
+    current = path.stat(); after = base.process_identity(app['pid'])
+    require((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) ==
+            (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) and
+            (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino) and
+            digest.hexdigest() == app['sha256'] and base.same_process(before, after) and after['uid'] == os.getuid(),
+            'actual App ELF/birth changed while observing inode')
+    return {**app, 'exeDev': info.st_dev, 'exeInode': info.st_ino}
+
+
+def verify_gui_binding(app, proof):
+    root = proof.get('identity', {}); executable = proof.get('executable', {})
+    require(all(type(app.get(key)) is int and app[key] > 0 for key in ('exeDev', 'exeInode')),
+            'observed App inode identity required')
+    require(same_birth(app, root) and root.get('uid') == os.getuid() and
+            root.get('exeDev') == app.get('exeDev') and root.get('exeInode') == app.get('exeInode') and
+            executable.get('dev') == app.get('exeDev') and executable.get('inode') == app.get('exeInode') and
+            executable.get('sha256') == app['sha256'], 'root authorization subject is not exact observed App ELF')
+    return proof
+
+
+def join_capture(analysis, snapshots, streams, dns, plan):
+    """Join real pcap frames, ordinary client nonces and origin observations."""
+    require(analysis.get('analysisExecution') == 'real-tool', 'simulated capture cannot establish TUN evidence')
+    require(set(snapshots) == {'A', 'B', 'O'}, 'all controlled backend observations required')
+    for role, snapshot in snapshots.items():
+        require(snapshot.get('role') == role and not snapshot.get('errors'), 'backend failed or changed role')
+    captured = {r['nonceSha256']: r for r in analysis['nonces']}
+    require(len(captured) == len(analysis['nonces']), 'duplicate captured nonce identity')
+    origins = snapshots['O']['rows']
+    joined = {}
+    for label, stream in streams.items():
+        nonce = stream['nonceSha256']
+        matches = [r for r in origins if r.get('kind') == 'echo' and r.get('nonceSha256') == nonce]
+        require(nonce in captured and len(matches) == 1, 'client/capture/origin nonce not uniquely joined')
+        origin = matches[0]
+        require(stream['bytes'] == captured[nonce]['bytes'] == origin['bytes'] and
+                stream['exit'] == origin['exit'] and origin['originPeer'] == plan['exit'][stream['exit']],
+                'origin egress/nonce byte identity differs')
+        row = {'source': 'owned-tun-capture-and-origin', 'analysisExecution': 'real-tool',
+               'captureSha256': analysis['captureSha256'], 'destination': plan['origin'],
+               'interface': 'polaris-tun0', 'proxyEnvironment': 'absent', 'clientMode': 'direct-tcp',
+               'packets': analysis['packets'], 'captureNonceSha256': nonce, 'originNonceSha256': nonce,
+               'exit': stream['exit'], 'originPeer': origin['originPeer']}
+        tun.validate_data_plane(row)
+        joined[label] = row
+    joined_dns = []
+    for query in dns:
+        cap = [r for r in analysis['dnsQueries'] if r.get('querySha256') == query['querySha256']
+               and r.get('transport') == query['transport'] and r.get('name') == query['name']]
+        back = [{**r, 'backendRole': role} for role in ('A', 'B') for r in snapshots[role]['rows']
+                if r.get('name') == query['name'] and r.get('type') == query['type']]
+        require(cap and back and all(r.get('answer') == plan['origin'] and r.get('ttl') == 0
+                and r['backendRole'] == query.get('expectedBackend', r['backendRole']) for r in back),
+                'actual TUN DNS capture/backend/TTL0 join missing')
+        joined_dns.append({**{k: v for k, v in query.items() if k != 'expectedBackend'}, 'tunObserved': True, 'analysisExecution': 'real-tool',
+                           'captureSha256': analysis['captureSha256'],
+                           'captureQuerySha256': cap[0]['querySha256'],
+                           'backendName': back[0]['name'], 'backendType': back[0]['type'],
+                           'backendQuerySha256': back[0]['querySha256'], 'backendRole': back[0]['backendRole'], 'ttl': back[0]['ttl']})
+    return joined, joined_dns
+
+
+class TunSupervisor(base.Supervisor):
+    """Ordinary ownership is unchanged. Privileged births are quarantined only.
+
+No privileged birth is admitted to ``owned``, and no name/path inference grants
+signal authority. A bounded GUI window is accepted only after an independent
+root ledger confirms every observed birth. Missing observations fail forever.
+"""
+    def __init__(self):
+        self.window = None
+        self.quarantine = {}
+        self.confirmed = set()
+        self.controller_birth = None
+        self.controller_descendants = {}
+        self.gui_birth = None
+        super().__init__()
+
+    def begin_window(self, kind, gui):
+        require(kind in ('install', 'uninstall') and self.window is None, 'bounded GUI auth window required')
+        self.gui_birth = birth(gui)
+        self.window = {'kind': kind, 'started': time.monotonic(), 'births': set()}
+
+    def end_window(self, root_observed):
+        require(self.window is not None, 'no GUI authentication window')
+        observed = {(birth(p)['pid'], birth(p)['startTime']) for p in root_observed}
+        required = self.window['births']
+        # Root has the authoritative fast observer and may see births ordinary
+        # polling missed; ordinary polling must never invent missing root proof.
+        require(required <= observed and observed, 'root GUI lineage observation incomplete')
+        self.confirmed.update(observed)
+        self.window = None
+
+    def scan(self):
+        observed = {int(p.name): base.process_identity(int(p.name)) for p in Path('/proc').iterdir() if p.name.isdigit()}
+        observed = {pid: item for pid, item in observed.items() if item}
+        with self.lock:
+            changed = True
+            while changed:
+                changed = False
+                for pid, item in observed.items():
+                    key = (pid, item['startTime'])
+                    parent = observed.get(item['ppid'])
+                    controller_parent = self.controller_descendants.get(item['ppid'])
+                    if same_birth(item, self.controller_birth) or same_birth(parent, controller_parent):
+                        if not same_birth(item, self.controller_descendants.get(pid)):
+                            self.controller_descendants[pid] = item; changed = True
+                        continue
+                    if key in self.quarantine:
+                        continue
+                    foreign = item['uid'] != os.getuid()
+                    owned_parent = base.same_process(parent, self.owned.get(item['ppid']))
+                    root_parent = bool(parent and (parent['pid'], parent['startTime']) in self.quarantine)
+                    if foreign and (base.same_process(item, self.owned.get(pid)) or owned_parent or root_parent):
+                        within = self.window and time.monotonic() - self.window['started'] < 90
+                        gui_ancestor = same_birth(parent, self.gui_birth) or root_parent
+                        if not (within and gui_ancestor):
+                            self.unknown.append('foreign-descendant-outside-exact-GUI-transaction')
+                        self.owned.pop(pid, None); self.roles.pop(pid, None)
+                        self.quarantine[key] = item
+                        if self.window: self.window['births'].add(key)
+                        changed = True
+                        continue
+                    if base.same_process(item, self.owned.get(pid)):
+                        continue
+                    if owned_parent:
+                        require(not foreign, 'ordinary ownership cannot admit elevated descendant')
+                        self.owned[pid] = item
+                        self.roles[pid] = self.roles.get(item['ppid'], 'unknown'); changed = True
+                    elif item['ppid'] == os.getpid() and pid not in self.children:
+                        self.unknown.append('unobserved-adopted-descendant')
+                        # Unknown foreign births are never eligible for signal.
+                        if not foreign:
+                            self.owned[pid] = item; self.roles[pid] = 'unknown'
+            for _ in range(len(self.owned) + 1):
+                changed = False
+                for pid, item in observed.items():
+                    if base.same_process(item, self.owned.get(pid)) and self.roles.get(item['ppid']) == 'product' and self.roles.get(pid) != 'product':
+                        self.roles[pid] = 'product'; changed = True
+                if not changed: break
+        return observed
+
+    def signal(self, item, sig):
+        require(item.get('uid') == os.getuid() and
+                (base.process_identity(item['pid']) or {}).get('uid') == os.getuid(),
+                'TUN ordinary supervisor cannot signal foreign UID')
+        require((item['pid'], item['startTime']) not in self.quarantine and
+                not same_birth(item, self.controller_descendants.get(item['pid'])),
+                'privileged observer must not gain signal authority')
+        return super().signal(item, sig)
+
+    def close(self, normal):
+        if self.window or any(key not in self.confirmed for key in self.quarantine):
+            self.unknown.append('unconfirmed-privileged-GUI-lineage')
+        for item in self.quarantine.values():
+            current = base.process_identity(item['pid'])
+            if base.same_process(item, current) and current['state'] != 'Z':
+                self.unknown.append('privileged-GUI-descendant-not-reaped')
+        # The fixed root controller must finish before ordinary tool cleanup.
+        for item in self.controller_descendants.values():
+            current = base.process_identity(item['pid'])
+            if base.same_process(item, current) and current['state'] != 'Z':
+                self.unknown.append('root-controller-descendant-not-reaped')
+        return super().close(normal)
+
+
+TUN_OBSERVER = r'''
+const state={rows:[],cursor:0,failed:false};
+const callbacks=window.__TAURI_INTERNALS__?.callbacks, prior=callbacks?.get;
+if(!(callbacks instanceof Map)||typeof prior!=='function'||window.__tunObservation) throw Error('TUN callback observer unavailable');
+Object.defineProperty(callbacks,'get',{configurable:true,value:function(id){
+ const callback=Reflect.apply(prior,this,[id]); if(typeof callback!=='function')return callback;
+ return function(...args){try{const raw=args[0],d=raw?.data;
+  if(typeof d?.success==='boolean'&&typeof d?.status?.installed==='boolean'&&typeof d?.status?.supported==='boolean')
+   state.rows.push({sequence:++state.cursor,kind:'helper',envelopeSuccess:raw.success===true,success:d.success,
+     installed:d.status.installed,ready:d.status.ready===true,supported:d.status.supported});
+  if(typeof d?.status==='string'&&typeof d?.pendingApply==='boolean'&&Array.isArray(d.reasons))
+   state.rows.push({sequence:++state.cursor,kind:'apply',status:d.status,
+    reasons:d.reasons.map(r=>({code:r.code,path:r.path}))});
+  if(state.rows.length>256)state.rows.shift();
+ }catch(_){state.failed=true;}return Reflect.apply(callback,this,args);};
+}});Object.defineProperty(window,'__tunObservation',{value:state});return true;
+'''
+
+
+def direct_driver(supervisor):
+    candidates = [p for pid, p in supervisor.owned.items()
+                  if pid in supervisor.children and supervisor.roles.get(pid) == 'driver']
+    require(len(candidates) == 1 and base.same_process(candidates[0], base.process_identity(candidates[0]['pid'])),
+            'one direct registered tauri-driver birth required')
+    return candidates[0]
+
+
+class Controller:
+    """Bounded JSON-line IPC to the independently frozen, narrow root broker."""
+    def __init__(self, launch, sources, supervisor, env):
+        import root_controller
+        self.seq, self.closed = 0, False
+        self.read_buffer = bytearray()
+        self.lock = threading.Lock()
+        envelope = {'launch': launch, 'files': {name: base64.b64encode(data).decode() for name, data in sources.items()}}
+        with supervisor.lock:
+            self.child = subprocess.Popen(['sudo', '-n', '/usr/bin/env', '-i',
+                'PATH=/usr/sbin:/usr/bin:/sbin:/bin', '/usr/bin/python3', '-I', '-c', root_controller.BOOTSTRAP],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env=env, start_new_session=True)
+            identity = base.process_identity(self.child.pid)
+            require(identity, 'root controller birth unavailable')
+            supervisor.controller_birth = identity
+            supervisor.controller_descendants[identity['pid']] = identity
+        self._write(envelope)
+        self.ready = self._read(30)
+        require(self.ready.get('ready') is True and self.ready.get('runId') == launch['runId'], 'root controller preparation blocked or failed')
+
+    def _write(self, value):
+        raw = (json.dumps(value, separators=(',', ':')) + '\n').encode()
+        require(len(raw) < 4 * 1024 * 1024, 'controller request bound')
+        fd = self.child.stdin.fileno(); deadline = time.monotonic() + 15
+        os.set_blocking(fd, False)
+        try:
+            at = 0
+            while at < len(raw):
+                remaining = deadline - time.monotonic()
+                require(remaining > 0 and select.select([], [fd], [], remaining)[1], 'controller request timeout')
+                try: written = os.write(fd, raw[at:at + 65536])
+                except BlockingIOError: continue
+                require(written > 0, 'controller pipe closed')
+                at += written
+        finally:
+            os.set_blocking(fd, True)
+
+    def _read(self, timeout):
+        deadline = time.monotonic() + timeout
+        while b'\n' not in self.read_buffer:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0 and select.select([self.child.stdout], [], [], remaining)[0],
+                    'controller response timeout')
+            chunk = os.read(self.child.stdout.fileno(), 65536)
+            require(chunk, 'controller closed without response')
+            self.read_buffer.extend(chunk)
+            require(len(self.read_buffer) <= 4 * 1024 * 1024, 'controller bounded response required')
+        line, _, remainder = self.read_buffer.partition(b'\n')
+        self.read_buffer = bytearray(remainder)
+        return json.loads(line)
+
+    def call(self, action, **args):
+        with self.lock:
+            require(not self.closed, 'controller already closed')
+            self.seq += 1
+            self._write({'seq': self.seq, 'action': action, **args})
+            value = self._read(90 if action in ('cleanup', 'finish') else 45)
+            require(value.get('seq') == self.seq and value.get('ok') is True, 'root controller action failed')
+            return value['result']
+
+    def finish(self):
+        value = self.call('finish')
+        self.closed = True
+        self.child.stdin.close()
+        require(self.child.wait(timeout=15) == 0, 'root controller did not exit normally')
+        return value
+
+
+CONNECTIVITY_PROBE = r'''
+import hashlib, http.client, json, socket, ssl, time
+host = 'api.github.com'
+started = time.time_ns()
+addresses = sorted({r[4][0] for r in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)})
+if not addresses or len(addresses) > 64: raise RuntimeError('DNS proof unavailable')
+context = ssl.create_default_context()
+if context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname: raise RuntimeError('TLS verification unavailable')
+connection = http.client.HTTPSConnection(host, 443, timeout=5, context=context)
+try:
+    connection.request('GET', '/meta', headers={'User-Agent': 'Polaris-package-TUN-acceptance', 'Connection': 'close'})
+    response = connection.getresponse()
+    if response.status != 200: raise RuntimeError('control HTTPS unavailable')
+    prefix = response.read(8192)
+    print(json.dumps({'host': host, 'dnsResolved': True, 'httpsStatus': response.status,
+        'tlsVerified': True, 'addresses': addresses, 'boundedResponseBytes': len(prefix),
+        'boundedResponseSha256': hashlib.sha256(prefix).hexdigest(),
+        'readStartedUnixNs': str(started), 'readFinishedUnixNs': str(time.time_ns()),
+        'scope': 'fresh DNS and verified HTTPS control connectivity; not zero DNS side effects'}))
+finally:
+    connection.close()
+'''
+
+
+class GuiConfigAdapter(fixture.ConfigAdapter):
+    def close(self):
+        # Adapter owns no sockets/processes. Root controller, not this no-op,
+        # supplies all actual fixture cleanup evidence.
+        return None
+
+
+class TunCarrierRun(base.CarrierRun):
+    def __init__(self, item, package, workspace, evidence_dir, rpc_client, admission, bound, launch_options):
+        self.run_id = os.urandom(6).hex()
+        self.controller = None
+        self.admission, self.bound, self.launch_options = admission, bound, launch_options
+        self.pending_streams, self.dns_before, self.dns_after = {}, [], []
+        self.network_observations = []
+        self.stopped = False
+        self.root_cleanup = None
+        super().__init__(item, package, workspace, evidence_dir, rpc_client, fixture)
+        self.result.update(scope='same-final-carrier', publicationEligible=False,
+            networkBoundary={'fixtureDataPlane': 'isolated nonloopback TUN; one backend netns',
+                             'backgroundReadOnlyInternet': 'allowed and observed; not zero-egress'})
+
+    def create_network(self):
+        return GuiConfigAdapter(self.run_id, control=self.fixture_control)
+
+    def create_supervisor(self):
+        return TunSupervisor()
+
+    def fixture_control(self, role, request):
+        return self.controller.call('fixture', role=role, operation=request['action'],
+                                    **{k: v for k, v in request.items() if k != 'action'})
+
+    def record(self, key, **evidence):
+        require(key in tun.CASE_IDS and evidence, 'mandatory TUN evidence required')
+        tun.validate_case(key, evidence)
+        self.result['cases'][key] = {'status': 'passed', 'evidence': evidence}
+
+    def launch(self):
+        initial = super().launch()
+        self.app = app_execution_identity(self.app)
+        self.driver.execute(TUN_OBSERVER)
+        return initial
+
+    def tun_observations(self):
+        return self.driver.execute("if(window.__tunObservation.failed) throw Error('TUN observer failed'); return window.__tunObservation.rows;")
+
+    def helper_action(self, kind):
+        require(kind in ('install', 'uninstall'), 'only genuine helper action')
+        self.driver.click('.side .nav-item', self.text('sidebar.settings'))
+        self.driver.click('.set-nav', self.text('settings.nav.helper'))
+        cursor = max((r['sequence'] for r in self.tun_observations()), default=0)
+        self.supervisor.begin_window(kind, self.app)
+        self.controller.call('transaction_begin', kind=kind)
+        if kind == 'install':
+            self.driver.click('.helper-state[data-s="none"] button', self.text('helper.installAction'))
+        else:
+            self.driver.click('.helper-state[data-s="installed"] button', self.text('helper.uninstall'))
+            self.driver.click('.helper-state button.confirming', self.text('helper.uninstallConfirmAgain'))
+        def result():
+            self.controller.call('transaction_scan')
+            rows = [r for r in self.tun_observations() if r['sequence'] > cursor and r['kind'] == 'helper']
+            return rows[0] if rows else None
+        reply = base.wait_for(result, timeout=80)
+        require(reply.get('envelopeSuccess') and reply.get('success') and
+                reply.get('installed') == (kind == 'install') and reply.get('ready') == (kind == 'install'),
+                'actual helper GUI action failed')
+        proof = self.controller.call('transaction_end')
+        self.supervisor.end_window(proof['owned'])
+        self.driver.click('.side .nav-item', self.text('settings.nav.back'))
+        return {'callback': reply, 'authorization': proof}
+
+    def connect(self):
+        """TUN-only override: never weakens base CarrierRun.connect."""
+        require(not self.status().get('running'), 'TUN connect requires stopped core')
+        self.driver.click('#connect-btn')
+        status = base.wait_for(self.status, lambda s: s.get('running') is True and not s.get('starting'), timeout=75)
+        require(status.get('startedViaHelper') is True, 'real production helper path required')
+        self.controller.call('register_core')
+        attested = self.controller.call('core_attest')
+        self.core = {**attested['identity'], 'sha256': attested['executable']['sha256']}
+        require(status.get('pid') == self.core['pid'] and self.core['sha256'] == self.members['core']['sha256'],
+                'App/core frozen helper identity differs')
+        self.runtime_path = base.regular(self.runtime_path, self.home)
+        require(self.runtime_path.name == 'singbox-runtime.json', 'actual private runtime path required')
+        runtime = self.runtime_identity()
+        require(runtime['sha256'] == attested['runtime']['sha256'], 'root/core actual runtime differs')
+        graph = json.loads(self.runtime_path.read_bytes())
+        inbounds = [i for i in graph.get('inbounds', []) if i.get('type') == 'tun']
+        require(len(inbounds) == 1 and inbounds[0].get('interface_name') == 'polaris-tun0', 'original TUN interface graph required')
+        api = [i for i in graph.get('services', []) if i.get('type') == 'api']
+        require(len(api) == 1 and api[0].get('listen') == '127.0.0.1' and api[0].get('listen_port') == self.control
+                and api[0].get('secret') == self.secret, 'private real API differs')
+        self.controller.call('tun_register')
+        self.stopped = False
+        self.result['execution'] = {'uid': os.getuid(), 'defaultSandbox': True, 'originalEntry': True,
+            'automation': 'tauri-driver 2.0.5', 'app': {k: self.app[k] for k in ('pid', 'startTime', 'sha256', 'exeDev', 'exeInode')},
+            'core': self.core, 'startedViaHelper': True, 'rootAttestation': attested,
+            'rpcScope': 'capabilities/status only; not six-RPC TUN acceptance'}
+        self.result['configIdentity'] = runtime
+        return status
+
+    def same_core(self, baseline):
+        actual = self.controller.call('core_attest')
+        require(same_birth(baseline, actual['identity']) and self.status().get('pid') == baseline['pid'],
+                'TUN hot operation replaced owned core')
+        return actual
+
+    def rpc(self, action, request=None):
+        require(action in ('capabilities', 'status'), 'TUN sideclient only observes capabilities/status')
+        args = {'method': action}
+        if action == 'status':
+            require(isinstance(request, dict) and set(request) == {'transactionId', 'runtimeIncarnation'},
+                    'exact original transaction lookup required')
+            args.update(request)
+        else:
+            require(request is None, 'capabilities has no request payload')
+        envelope = self.controller.call('rpc', **args)
+        require(envelope.get('schema') == 'polaris-package-rpc-probe-v1' and
+                envelope.get('ok') is True and envelope.get('action') == 'tun-' + action,
+                'root-attested restricted native RPC failed')
+        return envelope['result']
+
+    def socket(self, label):
+        stream = fixture.direct_connect(self.network.plan)
+        self.sockets.append(stream)
+        return stream, self.exchange(stream, label)
+
+    def exchange(self, stream, label):
+        proof = fixture.exchange(stream, label, os.urandom(18).hex())
+        self.pending_streams[proof['nonceSha256']] = proof
+        return proof
+
+    def boundary(self, label):
+        row = self.controller.call('network_observe')
+        self.network_observations.append({'case': label, 'observation': row})
+        return row
+
+    def preference(self, wanted):
+        require(type(wanted) is bool, 'boolean preference required')
+        if self.config().get('interruptConnectionsOnSwitch') == wanted:
+            return
+        self.driver.click('.side .nav-item', self.text('sidebar.settings'))
+        self.driver.click('.set-nav', self.text('settings.nav.network'))
+        switch = self.driver.execute(r'''
+const rows=[...document.querySelectorAll('.set-row')].filter(e=>e.textContent.includes(arguments[0]));
+const controls=rows.flatMap(e=>[...e.querySelectorAll('button[role=switch]')]);return controls.length===1?controls[0]:null;
+''', self.text('settings.network.interruptOnSwitch'))
+        require(switch and base.ELEMENT in switch, 'real preference control unavailable')
+        self.driver.request('POST', self.driver.path('/element/' + switch[base.ELEMENT] + '/click'), {})
+        if self.driver.element('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn')):
+            self.driver.click('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn'))
+        base.wait_for(self.config, lambda c: c.get('interruptConnectionsOnSwitch') == wanted)
+        self.driver.click('.side .nav-item', self.text('settings.nav.back'))
+
+    def graph_case(self):
+        self.stage = 'graph_apply'; self.boundary(self.stage)
+        initial = dict(self.core); before_active = self.rpc('capabilities')['active']
+        old, before = self.socket('A')
+        base.save_fixture(self.driver, self.network.changed_graph(self.config()))
+        applied = self.apply()
+        require(applied.get('transactionId'), 'real GUI Apply transaction required')
+        status = self.native_status(applied['transactionId'])
+        operation = status['operation']
+        after = self.rpc('capabilities')['active']
+        require(status.get('lookupState') == 1 and operation.get('durable') is True,
+                'original GUI transaction not durably applied')
+        self.same_core(initial)
+        _, new = self.socket('B')
+        self.dns_after = [{**fixture.nonce_dns_query(self.network.plan, os.urandom(16).hex(), mode),
+                           'expectedBackend': 'B'} for mode in ('udp', 'tcp')]
+        self.result['cases']['graph_apply'] = {'status': 'pending-capture', 'evidence': dict(
+                    beforeCore=initial, afterCore=dict(self.core),
+                    beforeActive=before_active, afterActive=after, appStatus=applied['status'],
+                    operationDurable=operation['durable'], transactionId=applied['transactionId'],
+                    oldBefore=before, oldAfter=self.exchange(old, 'A'), newConnection=new,
+                    screenshot=self.snapshot('tun-applied-b'))}
+        # Remove only the explicit fixture routing rules through genuine Apply;
+        # subsequent ordinary user selection acts on the default selector.
+        wanted = self.config()
+        for key in ('trafficRules', 'policyRules', 'customRules', 'routeRuleOrder'): wanted[key] = []
+        base.save_fixture(self.driver, wanted)
+        self.apply(); self.same_core(initial)
+
+    def daily_case(self):
+        self.stage = 'daily_switch'; self.boundary(self.stage)
+        self.pick('A'); _, first = self.socket('A'); initial = dict(self.core)
+        self.pick('B'); _, fresh = self.socket('B'); self.same_core(initial)
+        self.record('daily_switch', beforeCore=initial, afterCore=dict(self.core),
+                    firstConnection=first, newConnection=fresh, selected='node-b')
+
+    def auto_case(self):
+        self.stage = 'auto_preserves'; self.boundary(self.stage)
+        self.preference(False)
+        self.network.set_latency('A', 0); self.network.set_latency('B', 0.15)
+        self.pick('A'); self.driver.click('#node-trigger')
+        self.driver.click('[data-auto-select-scope="global"] .auto-choice-pick')
+        base.wait_for(self.config, lambda c: c.get('selectionIntent') is not None)
+        base.wait_for(self.status, lambda s: s.get('actualServerId') == 'node-a', timeout=35)
+        old, before = self.socket('A'); initial = dict(self.core)
+        # A remains alive and continues the old stream; only health latency changes.
+        self.network.set_latency('A', 1.5); self.network.set_latency('B', 0)
+        deadline = time.monotonic() + 340
+        while time.monotonic() < deadline:
+            self.exchange(old, 'A')
+            if self.status().get('actualServerId') == 'node-b': break
+            time.sleep(3)
+        require(self.status().get('actualServerId') == 'node-b' and self.config().get('selectionIntent'),
+                'real native Auto failed to choose B on unchanged timer')
+        self.same_core(initial); _, fresh = self.socket('B')
+        live = self.fixture_control('A', {'action': 'snapshot'})
+        require(not live.get('errors') and live.get('closed') is not True, 'old backend must remain alive')
+        self.record('auto_preserves', beforeCore=initial, afterCore=dict(self.core),
+            oldBefore=before, oldAfter=self.exchange(old, 'A'), newConnection=fresh,
+            autoSelected='node-b', backendAAlive=True, nativeIntervalMinutes=5, screenshot=self.snapshot('tun-auto-b'))
+        self.network.set_latency('A', 0); self.network.set_latency('B', 0.15)
+
+    def manual_cases(self):
+        for interrupt, name in ((False, 'manual_preserve'), (True, 'manual_disconnect')):
+            self.stage = name; self.boundary(name); self.preference(interrupt)
+            self.pick('A'); old, before = self.socket('A'); initial = dict(self.core)
+            self.pick('B'); self.same_core(initial); _, fresh = self.socket('B')
+            evidence = dict(beforeCore=initial, afterCore=dict(self.core), oldBefore=before,
+                            newConnection=fresh, interruptConnectionsOnSwitch=interrupt)
+            if not interrupt:
+                evidence['oldAfter'] = self.exchange(old, 'A')
+            else:
+                def closed():
+                    try:
+                        old.settimeout(0.25)
+                        result = old.recv(1)
+                        require(not result, 'unexpected bytes after complete nonce response')
+                        return True
+                    except (BrokenPipeError, ConnectionResetError): return True
+                    except socket.timeout: return False
+                base.wait_for(closed, timeout=12)
+                live = self.fixture_control('A', {'action': 'snapshot'})
+                require(not live.get('errors') and live.get('closed') is not True, 'backend A died instead of preference disconnect')
+                evidence.update(oldConnectionClosed=True, backendAAlive=True)
+            self.record(name, **evidence)
+
+    def uncovered_case(self):
+        self.stage = 'uncovered_target_restart'; self.boundary(self.stage)
+        self.preference(False); self.pick('B')
+        old, _ = self.socket('B'); initial = dict(self.core)
+        active = self.rpc('capabilities')['active']; accepted = self.config()
+        wanted = copy.deepcopy(accepted)
+        # This candidate cannot be dialled: the route-binding admission must stop
+        # the Apply before runtime publication and the user explicitly declines.
+        next(n for n in wanted['servers'] if n['id'] == 'node-b')['address'] = '10.231.240.4'
+        base.save_fixture(self.driver, wanted)
+        cursor = max((r['sequence'] for r in self.tun_observations()), default=0)
+        applied = self.apply('restartRequired')
+        rows = [r for r in self.tun_observations() if r['sequence'] > cursor and r['kind'] == 'apply']
+        require(rows and {'code': 'structuralChange', 'path': 'outbounds.physical_route_binding'} in rows[-1]['reasons'],
+                'uncovered route must return original structural reason')
+        self.driver.click('dialog button', self.text('home.restartApplyKeepConnection'))
+        self.same_core(initial); after = self.rpc('capabilities')['active']
+        preserved = self.exchange(old, 'B')
+        self.record('uncovered_target_restart', beforeCore=initial, afterCore=dict(self.core),
+            appStatus=applied['status'], reasonPath='outbounds.physical_route_binding', reason='structuralChange',
+            restartDeclined=True, beforeActive=active, afterActive=after, oldConnectionPreserved=bool(preserved))
+        base.save_fixture(self.driver, accepted)
+
+    def disconnect(self):
+        require(self.status().get('running'), 'TUN OFF requires running core')
+        self.driver.click('#connect-btn')
+        base.wait_for(self.status, lambda s: s.get('running') is False and not s.get('starting'), timeout=45)
+        proof = self.controller.call('core_stopped')
+        require(proof.get('stopped') is True and same_birth(proof['identity'], self.core), 'OFF did not reap exact root-ledger core')
+        self.stopped = True
+        return proof
+
+    def quit_product(self):
+        require(self.stopped and not self.status().get('running'), 'quit requires verified TUN OFF')
+        require(base.same_process(self.app, base.process_identity(self.app['pid'])), 'GUI exited before tray quit')
+        marker = self.runtime_path.parent / 'clean-exit.marker'
+        require(not marker.exists() and not marker.is_symlink(), 'stale clean exit marker')
+        requested = time.time_ns(); self.driver.quit_shortcut()
+        base.wait_for(lambda: base.process_identity(self.app['pid']),
+            lambda p: not base.same_process(p, self.app) or p['state'] == 'Z', timeout=45)
+        base.wait_for(lambda: self.supervisor.living('product'), lambda p: not p, timeout=15)
+        proof = base.clean_exit_marker(marker, requested)
+        try: self.driver.close()
+        except (ValueError, OSError): self.driver.session = None
+        self.normal_quit = True
+        return {'app': birth(self.app), 'coreAlreadyStopped': birth(self.core), 'cleanExitMarker': proof}
+
+    def start_controller(self):
+        import root_controller
+        driver = direct_driver(self.supervisor)
+        directory = Path(self.env['XDG_CONFIG_HOME']) / 'com.polaris.app' / 'polaris'
+        require(directory.is_dir() and not directory.is_symlink(), 'real App config directory unavailable')
+        self.runtime_path = directory / 'singbox-runtime.json'
+        sources = {name: base.regular(HERE / name).read_bytes() for name in root_controller.FILES}
+        launch = {'schema': root_controller.SCHEMA, 'runId': self.run_id, 'guiUid': os.getuid(),
+            'driver': birth(driver), 'guiHome': str(self.home), 'helperScriptDir': str(directory),
+            'runtimePath': str(self.runtime_path), 'appSha256': self.members['app']['sha256'],
+            'helperSha256': self.bound['helperBinding']['helper']['sha256'],
+            'coreSha256': self.members['core']['sha256'], 'carrierSha256': self.item['sha256'],
+            'kernelCommit': tun.KERNEL_COMMIT, 'originalAdmission': 'verified',
+            'vmContext': {'githubHosted': os.environ.get('GITHUB_ACTIONS') == 'true' and
+                          os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'dedicatedVM': True},
+            'materialsDownloaded': True, 'codeHashes': {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()},
+            'rpcProbePath': str(self.rpc_client), 'rpcProbeSha256': base.sha(self.rpc_client),
+            **self.launch_options}
+        root_controller.validate_launch(launch)
+        self.controller = Controller(launch, sources, self.supervisor, self.env)
+        self.result['rootGuiBinding'] = verify_gui_binding(self.app, self.controller.call('bind_gui', pid=self.app['pid']))
+        self.result['rootPreparation'] = self.controller.call('prepare')
+        # CredentialLease, if explicitly authorized, opens/closes inside each
+        # controller transaction_begin/end. No password action is exposed here.
+
+    def control_connectivity(self, label):
+        require(label in ('before', 'after'), 'bounded control proof position')
+        child = self.supervisor.spawn(['/usr/bin/python3', '-I', '-c', CONNECTIVITY_PROBE],
+                                      self.env, 'control-connectivity', stdout=subprocess.PIPE)
+        identity = self.supervisor.owned[child.pid]
+        try:
+            raw = child.communicate(timeout=15)[0]
+        except subprocess.TimeoutExpired:
+            self.supervisor.forced.append({**birth(identity), 'reason': 'control-connectivity-timeout'})
+            self.supervisor.signal(identity, signal.SIGKILL); child.wait(timeout=5)
+            raise ValueError('bounded fresh control connectivity timed out') from None
+        require(child.returncode == 0 and 0 < len(raw) < 32768, 'fresh control connectivity failed')
+        value = json.loads(raw)
+        require(value.get('host') == 'api.github.com' and value.get('dnsResolved') is True and
+                value.get('httpsStatus') == 200 and value.get('tlsVerified') is True,
+                'fresh DNS/HTTPS proof unavailable')
+        require(int(value['readFinishedUnixNs']) >= int(value['readStartedUnixNs']), 'control observation clock differs')
+        return {**value, 'position': label, 'freshProcess': birth(identity)}
+
+    def special_reply(self):
+        with socket.create_connection((self.network.plan['special'], self.network.plan['ports']['special']), timeout=5) as stream:
+            value = b''
+            while not value.endswith(b'\n') and len(value) <= 64:
+                part = stream.recv(64)
+                require(part, 'synthetic route reply incomplete')
+                value += part
+        require(value == b'synthetic-route-only\n', 'synthetic route reply differs')
+        return value.decode().strip()
+
+    def capture_results(self):
+        self.stage = 'capture-analysis'
+        proof = self.controller.call('capture_stop')
+        target = self.workspace / 'private-capture.pcap'
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        offset, expected = 0, None
+        with os.fdopen(fd, 'wb') as stream:
+            while True:
+                row = self.controller.call('capture_read', offset=offset)
+                identity = (row['sha256'], row['bytes'])
+                require(expected in (None, identity) and row['offset'] == offset, 'root capture identity/offset drift')
+                expected = identity
+                raw = base64.b64decode(row['base64'], validate=True)
+                require(row['nextOffset'] == offset + len(raw) and 0 < len(raw) <= 32768, 'bounded capture chunk differs')
+                stream.write(raw); offset += len(raw)
+                require(offset <= row['bytes'] <= 16 * 1024 * 1024, 'capture size bound')
+                if row['eof']:
+                    require(offset == row['bytes'], 'capture EOF differs'); break
+        require(base.sha(target) == expected[0], 'transferred capture byte hash differs')
+        analysis = fixture.analyze_capture(target, self.network.plan, supervisor=self.supervisor)
+        require(analysis['captureSha256'] == expected[0], 'analysis no longer bound to root capture')
+        snapshots = {role: self.fixture_control(role, {'action': 'snapshot'}) for role in ('A', 'B', 'O')}
+        joined, dns = join_capture(analysis, snapshots, self.pending_streams, self.dns_before + self.dns_after, self.network.plan)
+        # Every business-case nonce must join the actual packet/origin evidence,
+        # not merely two convenient streams used for the summary case.
+        require(len(joined) == len(self.pending_streams), 'some GUI-case stream not captured')
+        self.result['dataPlaneEvidence'] = {'capture': {'sha256': expected[0], 'bytes': expected[1]},
+            'analysis': analysis, 'joinedStreams': joined, 'backendSnapshots': snapshots,
+            'captureStop': proof}
+        selected = {}
+        for label in ('A', 'B'):
+            selected[label] = next(row for row in joined.values() if row['exit'] == label)
+        before_names = {r['name'] for r in self.dns_before}
+        dns_before = [r for r in dns if r['name'] in before_names]
+        dns_after = [r for r in dns if r['name'] not in before_names]
+        graph = self.result['cases']['graph_apply']['evidence']
+        self.record('graph_apply', **graph, dnsBefore=dns_before, dnsAfter=dns_after)
+        self.record('tun_data_plane', **selected, dns=dns_after)
+
+    def run(self):
+        root_finish = None
+        cleanup = {'state': 'failed', 'forced': False, 'unknown': ['normal-closure-not-established']}
+        try:
+            self.stage = 'native-launch'
+            self.start_tools(); initial = self.launch()
+            require(initial.get('singboxDashboard') is True and initial.get('hardwareAcceleration') is not False,
+                    'empty HOME original dashboard/graphics default differs')
+            self.result['defaultObservation'] = {'emptyHome': True, 'dashboardEnabled': True,
+                                                 'screenshot': self.snapshot('tun-default')}
+            desired = copy.deepcopy(initial)
+            desired.update(language='en-US', autoConnect=False)
+            base.save_fixture(self.driver, desired)
+            base.wait_for(lambda: self.driver.execute('return document.documentElement.lang'), lambda s: s.startswith('en'))
+            self.stage = 'baseline-control-connectivity'
+            self.result['controlConnectivity'] = {'before': self.control_connectivity('before')}
+            self.stage = 'root-preparation'
+            self.start_controller()
+            self.stage = 'helper-install'
+            self.result['helperInstall'] = self.helper_action('install')
+            self.result['helperIdentity'] = self.controller.call('register_helper')
+            self.stage = 'fixture-network'
+            network = self.controller.call('network_start')
+            require(network['topology'] == self.network.plan, 'root fixture topology differs')
+            before = self.boundary('synthetic-before')
+            self.special_reply()
+            patch = self.network.config_patch(self.mixed, self.control, self.secret)
+            patch.update(language='en-US', autoConnect=False, autoSelectEnabled=True,
+                         periodicSpeedTestEnabled=False, interruptConnectionsOnSwitch=False)
+            patch['subscriptions'] = [{'id': 'package-fixture', 'name': 'Package isolated TUN',
+                'url': self.network.health_url, 'autoUpdate': False, 'createdAt': '2026-01-01T00:00:00Z',
+                'periodicSpeedTest': False, 'speedTestIntervalMinutes': 5}]
+            for node in patch['servers']: node['subscriptionId'] = 'package-fixture'
+            desired = self.config(); desired.update(patch); base.save_fixture(self.driver, desired)
+            self.stage = 'default-graph'
+            self.pick('A'); status = self.connect()
+            runtime = self.runtime_identity()
+            self.record('default_graph', dashboardEnabled=True, defaultSandbox=True, guiUid=os.getuid(),
+                startedViaHelper=status['startedViaHelper'], kernelCommit=tun.KERNEL_COMMIT,
+                originalEntry=True, stableDoubleRead=runtime['stableDoubleRead'], actualGraphSha256=runtime['sha256'],
+                screenshot=self.snapshot('tun-started'))
+            self.controller.call('capture_start')
+            during = self.boundary('synthetic-during'); reply = self.special_reply()
+            self.socket('A')
+            self.dns_before = [{**fixture.nonce_dns_query(self.network.plan, os.urandom(16).hex(), mode),
+                                'expectedBackend': 'A'} for mode in ('udp', 'tcp')]
+            self.graph_case(); self.daily_case(); self.auto_case(); self.manual_cases(); self.uncovered_case()
+            for stream in self.sockets: stream.close()
+            self.sockets.clear()
+            self.capture_results()
+            self.stage = 'gui-off'
+            self.result['off'] = self.disconnect()
+            after = self.boundary('synthetic-after'); self.special_reply()
+            self.record('synthetic_route', destination=self.network.plan['special'],
+                before=before['specialRoute'], during=during['specialRoute'], after=after['specialRoute'],
+                actualReply=reply, claim='synthetic-specific-route-only')
+            self.stage = 'helper-uninstall'
+            self.result['helperUninstall'] = self.helper_action('uninstall')
+            self.result['productUninstalled'] = self.controller.call('product_uninstalled')
+            self.stage = 'tray-quit'
+            self.result['trayQuit'] = self.quit_product()
+            self.stage = 'fixture-normal-stop'
+            for role in ('A', 'B', 'O'):
+                closed = self.fixture_control(role, {'action': 'stop'})
+                require(closed.get('closed') is True and not closed.get('errors'), 'fixture failed normal native shutdown')
+            self.stage = 'authentication-close'
+            self.result['authenticationClosed'] = self.controller.call('auth_close')
+            self.stage = 'root-normal-cleanup'
+            cleanup = self.controller.call('cleanup')
+            self.stage = 'root-finish'
+            root_finish = self.controller.finish()
+            # Evidence booleans originate only from controller postconditions.
+            cleanup = {**cleanup, 'watchdogCancelled': root_finish['watchdogCancelled'],
+                       'authenticationWindowClosed': root_finish['authWindowClosed']}
+            self.root_cleanup = cleanup
+            self.stage = 'restored-control-connectivity'
+            self.result['controlConnectivity']['after'] = self.control_connectivity('after')
+        except BaseException as error:
+            self.result['failure'] = {'stage': self.stage, 'kind': type(error).__name__}
+            if self.controller and not self.controller.closed:
+                try:
+                    recovery = self.controller.call('abort')
+                    cleanup = {'state': 'failed', 'forced': True,
+                               'unknown': recovery.get('unknown', []) or ['exception-required-recovery']}
+                    self.controller.child.stdin.close()
+                    self.controller.child.wait(timeout=20)
+                    self.controller.closed = True
+                except BaseException:
+                    cleanup = {'state': 'failed', 'forced': True, 'unknown': ['root-recovery-unconfirmed']}
+        finally:
+            for stream in self.sockets:
+                try: stream.close()
+                except OSError: pass
+            ordinary = self.supervisor.close(self.normal_quit and root_finish is not None)
+            self.result['ordinaryCleanup'] = ordinary
+            self.result['ownedNetworkObservation'] = self.supervisor.network_evidence()
+            self.result['networkObservations'] = self.network_observations
+            if ordinary['state'] != 'normal':
+                cleanup = {**cleanup, 'state': 'failed',
+                           'unknown': list(cleanup.get('unknown', [])) + ['ordinary-product-or-tool-cleanup-failed']}
+            if cleanup.get('state') == 'normal' and 'failure' not in self.result:
+                self.record('normal_cleanup', **cleanup)
+            result = tun.report_result(self.result['cases'], cleanup, 'same-final-carrier')
+            self.result.update(result)
+        return self.result
+
+
+def node_environment(environ):
+    # Preserve ALL source/gate flags (including empty/0 legacy values) so the
+    # original formal gate rejects them; never sanitize an invalid run to valid.
+    prefixes = ('GITHUB_', 'RUNNER_', 'PACKAGE_ACCEPTANCE_', 'PACKAGE_TUN_',
+                'POLARIS_', 'CORE_', 'ADMITTED_')
+    env = {k: v for k, v in environ.items() if k.startswith(prefixes)
+           and not any(word in k for word in ('TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL'))}
+    env.update(PATH=environ.get('PATH', '/usr/bin:/bin'), HOME=str(Path.home()))
+    return env
+
+
+def run_node(args, supervisor, stdin=None):
+    # Context is inherited only by admission tools, never App/root environments.
+    env = node_environment(os.environ)
+    with supervisor.lock:
+        child = subprocess.Popen(['node', str(HERE / 'tun_transport.mjs'), *map(str, args)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=base.ROOT)
+        identity = base.process_identity(child.pid)
+        require(identity, 'transport process birth unavailable')
+        supervisor.children[child.pid] = child; supervisor.owned[child.pid] = identity
+        supervisor.roles[child.pid] = 'admission'
+    raw = None if stdin is None else json.dumps(stdin).encode()
+    try: output = child.communicate(raw, timeout=45)[0]
+    except subprocess.TimeoutExpired:
+        supervisor.forced.append({**birth(identity), 'reason': 'transport-timeout'})
+        supervisor.signal(identity, signal.SIGKILL); child.wait(timeout=5)
+        raise ValueError('transport operation timeout') from None
+    require(child.returncode == 0 and len(output) < 1024 * 1024, 'real transport admission failed')
+    return json.loads(output) if output.strip() else None
+
+
+def run_all(args):
+    import pwd
+    admission_path = base.regular(args.admission)
+    admission = json.loads(admission_path.read_bytes())
+    require(admission.get('schema') == 'polaris-linux-tun-admission-v1' and
+            admission.get('kernelCommit') == tun.KERNEL_COMMIT and
+            admission.get('sourceScope') == 'same-final-carrier' and admission.get('publicationEligible') is False,
+            'real final-carrier TUN admission required')
+    require(base.sha(base.regular(args.transport)) == admission['transportSha256'], 'original transport changed')
+    item = admission['carrier']; require(item['kind'] == args.kind, 'one fresh VM per carrier required')
+    package = base.carrier_path(Path(args.packages), item)
+    output = Path(args.output).absolute(); output.parent.mkdir(parents=True, exist_ok=True)
+    require(not output.is_symlink(), 'redirected report prohibited')
+    previous = {sig: signal.signal(sig, base.cancellation) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        with tempfile.TemporaryDirectory(prefix='polaris-tun-', dir='/tmp') as temp:
+            workspace = Path(temp); workspace.chmod(0o700)
+            run = TunCarrierRun(item, package, workspace, output.parent, base.regular(args.rpc_client), admission, None, {})
+            try:
+                inspection_path = workspace / 'inspection.json'
+                inspection_path.write_text(json.dumps(inspect_helper(run.payload, run.members)))
+                bound_path = workspace / 'bound.json'
+                run_node(['bind-helper', admission_path, inspection_path, bound_path], run.supervisor)
+                bound_bytes = bound_path.read_bytes()
+                run.bound = json.loads(bound_bytes)
+                require(run.bound['schema'] == 'polaris-linux-tun-bound-v1' and run.bound['admission'] == admission,
+                        'helper binding changed admission')
+                run.launch_options = run_node(['authorize', admission_path], run.supervisor,
+                    {'runToken': run.run_id, 'guiUid': os.getuid(), 'account': pwd.getpwuid(os.getuid()).pw_name})
+                result = run.run()
+                require(base.sha(package) == item['sha256'], 'carrier bytes drifted during TUN run')
+                binding_copy = output.parent / (args.kind + '-bound.json')
+                require(not binding_copy.exists() and not binding_copy.is_symlink(), 'fresh public binding copy required')
+                binding_copy.write_bytes(bound_bytes)
+                result.update(binding=run.bound, bindingFile=binding_copy.name,
+                    admissionSha256=base.sha(admission_path), bindingSha256=base.sha(binding_copy),
+                    transportSha256=admission['transportSha256'], carrierKind=item['kind'], carrierSha256=item['sha256'],
+                    context=admission['context'], scope='same-final-carrier', publicationEligible=False)
+            except BaseException as error:
+                # No authentication action can occur before authorize returns.
+                ordinary = run.supervisor.close(False)
+                result = tun.report_result({}, {'state': 'failed', 'forced': False,
+                    'unknown': ['admission-or-authorization-unconfirmed']}, 'same-final-carrier')
+                result.update(failure={'kind': type(error).__name__}, ordinaryCleanup=ordinary)
+            output.write_text(json.dumps(result, indent=2) + '\n')
+            return result
+    finally:
+        for sig, old in previous.items(): signal.signal(sig, old)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    run = sub.add_parser('run')
+    for name in ('admission', 'transport', 'packages', 'rpc-client', 'output'):
+        run.add_argument('--' + name, required=True)
+    run.add_argument('--kind', choices=('deb', 'AppImage'), required=True)
+    args = parser.parse_args()
+    result = run_all(args)
+    raise SystemExit(0 if result['result'] == 'success' else 1)
+
+
+if __name__ == '__main__':
+    main()

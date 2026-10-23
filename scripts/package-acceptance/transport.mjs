@@ -138,7 +138,7 @@ export function verifyMetadata(api, context, expected) {
   'Exact current-run artifact ID/name/digest/head/repository differs');
   return api;
 }
-function apiJson(path, env, run) {
+export function apiJson(path, env, run) {
   return JSON.parse(run('gh', ['api', path], { env, encoding: 'utf8', maxBuffer: 8 * 1024 ** 2, timeout: 60_000 }));
 }
 export function checkRun(api, context, env) {
@@ -148,7 +148,7 @@ export function checkRun(api, context, env) {
     && api.path === '.github/workflows/package.yml' && api.status === 'in_progress' && api.conclusion === null,
   'Actual Package run/attempt/caller differs');
 }
-function download(root, expected, context, destination, env, run) {
+export function download(root, expected, context, destination, env, run) {
   const api = verifyMetadata(apiJson(`/repos/${context.repository}/actions/artifacts/${expected.id}`, env, run), context, expected);
   const scratch = mkdtempSync(join(dirname(resolve(destination)), '.package-download-'));
   try {
@@ -184,7 +184,7 @@ function runtimeIdentity(value) {
   return value && hex(value.effectiveDigest) && typeof value.incarnation === 'string'
     && value.incarnation.length > 0 && Number.isSafeInteger(value.appliedRevision) && value.appliedRevision >= 0;
 }
-function runtimeBytes(value) {
+export function runtimeBytes(value) {
   demand(value && hex(value.sha256) && positive(value.bytes) && positive(value.pid) && positive(value.startTime)
     && value.stableDoubleRead === true && value.sameInodeAndMetadata === true
     && value.dashboardEnabled === true && value.dashboardDetourMatchesFinal === true

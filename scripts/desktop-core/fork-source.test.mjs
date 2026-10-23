@@ -272,12 +272,12 @@ test('desktop Go pin reads the selected desktop manifest, rejects mobile role an
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test('actual six workflow Go pin commands reject wrong source bytes, mobile role and missing pin', () => {
+test('actual seven workflow Go pin commands reject wrong source bytes, mobile role and missing pin', () => {
   const commands = ['desktop-core', 'package', 'release-risk'].flatMap((name) =>
     readFileSync(join(repo, '.github/workflows', `${name}.yml`), 'utf8').split('\n')
       .filter((line) => line.includes('run: node') && line.includes('version='))
       .map((line) => line.trim().slice('run: '.length)));
-  assert.equal(commands.length, 6);
+  assert.equal(commands.length, 7);
   const f = fixture();
   try {
     copyFileSync(join(repo, 'scripts/desktop-core/source-graph.mjs'), join(f.root, 'scripts/desktop-core/source-graph.mjs'));

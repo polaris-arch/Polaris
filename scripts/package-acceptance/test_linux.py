@@ -194,7 +194,7 @@ class PrimitiveTests(unittest.TestCase):
 
     def test_pidfd_prevents_signal_pid_reuse_window(self):
         supervisor = M.Supervisor.__new__(M.Supervisor)
-        item = {'pid': 9, 'startTime': 'old'}
+        item = {'pid': 9, 'startTime': 'old', 'uid': os.getuid()}
         supervisor.owned = {9: item}
         with patch.object(M, 'process_identity', return_value=item), patch.object(M.os, 'pidfd_open', return_value=27) as opened, patch.object(M.signal, 'pidfd_send_signal') as sent, patch.object(M.os, 'close') as closed:
             supervisor.signal(item, 15)
@@ -209,7 +209,7 @@ class PrimitiveTests(unittest.TestCase):
 
     def test_signal_requires_owned_starttime_and_lineage(self):
         supervisor = M.Supervisor.__new__(M.Supervisor)
-        item = {'pid': 9, 'startTime': 'old'}
+        item = {'pid': 9, 'startTime': 'old', 'uid': os.getuid()}
         supervisor.owned = {9: item}
         with patch.object(M, 'process_identity', return_value={'pid': 9, 'startTime': 'new'}), patch.object(M.os, 'kill') as kill:
             with self.assertRaises(ValueError):
@@ -220,6 +220,15 @@ class PrimitiveTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 supervisor.signal(item, 15)
             kill.assert_not_called()
+
+    def test_same_birth_uid_change_blocks_pidfd_signal(self):
+        supervisor = M.Supervisor.__new__(M.Supervisor)
+        item = {'pid': 9, 'startTime': 'old', 'uid': os.getuid()}
+        elevated = {**item, 'uid': 0 if os.getuid() else 1}
+        supervisor.owned = {9: item}
+        with patch.object(M, 'process_identity', side_effect=[item, elevated]), patch.object(M.os, 'pidfd_open', return_value=28), patch.object(M.signal, 'pidfd_send_signal') as sent, patch.object(M.os, 'close') as closed:
+            with self.assertRaises(ValueError): supervisor.signal(item, 15)
+            sent.assert_not_called(); closed.assert_called_once_with(28)
 
     def test_click_uses_webdriver_input_not_synthetic_events(self):
         driver = M.WebDriver(4444)

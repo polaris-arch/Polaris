@@ -120,12 +120,140 @@ fn uid(text: &str) -> Option<&str> {
 fn read(path: impl AsRef<Path>) -> ProbeResult<String> {
     fs::read_to_string(path).map_err(|_| json!({"kind":"owned-process-evidence-unavailable"}))
 }
+fn authority(action: &str, own_uid: &str, gui_uid: Option<u64>) -> ProbeResult<bool> {
+    let tun = matches!(action, "tun-capabilities" | "tun-status");
+    if tun {
+        check(
+            own_uid == "0" && gui_uid.is_some_and(|uid| uid > 0 && uid <= u32::MAX as u64),
+            "root-read-only-tun-probe-required",
+        )?;
+    } else {
+        check(own_uid != "0", "non-root-probe-required")?;
+    }
+    Ok(tun)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_tun_owned(
+    input: &Value,
+    base: &str,
+    exe: &Path,
+    own_gui_uid: u64,
+    port: u16,
+) -> ProbeResult<()> {
+    use std::os::unix::fs::MetadataExt;
+    let owned = input.get("owned").ok_or_else(invalid)?;
+    check(
+        exe.starts_with("/usr/local/lib/polaris/core")
+            && exe.file_name().is_some_and(|v| v == "sing-box"),
+        "protected-installed-core-required",
+    )?;
+    for path in exe.ancestors() {
+        let st = fs::symlink_metadata(path).map_err(|_| invalid())?;
+        check(
+            !st.file_type().is_symlink() && st.uid() == 0 && st.mode() & 0o022 == 0,
+            "root-owned-protected-core-required",
+        )?;
+    }
+    let st = fs::metadata(exe).map_err(|_| invalid())?;
+    let running = fs::metadata(format!("{base}/exe")).map_err(|_| invalid())?;
+    check(
+        st.is_file()
+            && st.dev() == running.dev()
+            && st.ino() == running.ino()
+            && st.dev() == number(owned, "exeDev")?
+            && st.ino() == number(owned, "exeInode")?,
+        "protected-core-inode-changed",
+    )?;
+    let status = read(format!("{base}/status"))?;
+    for key in ["CapEff:", "CapAmb:"] {
+        let value = status
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| u64::from_str_radix(v, 16).ok());
+        check(value == Some(0x3400), "production-core-capabilities-differ")?;
+    }
+    check(
+        read(format!("{base}/cgroup"))?.trim() == "0::/system.slice/polaris-helper.service",
+        "production-helper-cgroup-required",
+    )?;
+    let runtime_path = Path::new(string(owned, "runtimeConfig")?);
+    check(
+        runtime_path.is_absolute()
+            && runtime_path
+                .file_name()
+                .is_some_and(|v| v == "singbox-runtime.json"),
+        "actual-runtime-path-required",
+    )?;
+    let st = fs::symlink_metadata(runtime_path).map_err(|_| invalid())?;
+    check(
+        st.is_file()
+            && !st.file_type().is_symlink()
+            && st.uid() as u64 == own_gui_uid
+            && st.size() <= 8 * 1024 * 1024,
+        "private-gui-runtime-required",
+    )?;
+    let canonical = fs::canonicalize(runtime_path).map_err(|_| invalid())?;
+    check(canonical == runtime_path, "linked-runtime-path")?;
+    let cmdline = fs::read(format!("{base}/cmdline")).map_err(|_| invalid())?;
+    let args: Vec<_> = cmdline
+        .split(|b| *b == 0)
+        .filter_map(|v| std::str::from_utf8(v).ok())
+        .collect();
+    let configs: Vec<_> = args
+        .windows(2)
+        .filter(|w| matches!(w[0], "-c" | "--config"))
+        .map(|w| w[1])
+        .collect();
+    check(
+        configs.len() == 1 && Path::new(configs[0]) == runtime_path,
+        "runtime-path-not-in-core-command",
+    )?;
+    let raw = read(runtime_path)?;
+    let config: Value = serde_json::from_str(&raw).map_err(|_| invalid())?;
+    let apis: Vec<_> = config["services"]
+        .as_array()
+        .ok_or_else(invalid)?
+        .iter()
+        .filter(|s| s["type"] == "api")
+        .collect();
+    check(
+        apis.len() == 1
+            && apis[0]["listen"] == "127.0.0.1"
+            && apis[0]["listen_port"] == port
+            && apis[0]["secret"].as_str() == Some(string(input, "secret")?),
+        "actual-core-api-differs",
+    )?;
+    check(
+        config["inbounds"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r["type"] == "tun" && r["interface_name"] == "polaris-tun0")
+        }),
+        "actual-production-tun-required",
+    )?;
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+fn verify_tun_owned(_: &Value, _: &str, _: &Path, _: u64, _: u16) -> ProbeResult<()> {
+    Err(invalid())
+}
+
 fn verify_owned(input: &Value, port: u16, verify_content: bool) -> ProbeResult<()> {
     check(cfg!(target_os = "linux"), "linux-only-probe")?;
     let own_status = read("/proc/self/status")?;
     let own_uid = uid(&own_status).ok_or_else(invalid)?;
-    check(own_uid != "0", "non-root-probe-required")?;
     let owned = input.get("owned").ok_or_else(invalid)?;
+    let tun = authority(
+        string(input, "action")?,
+        own_uid,
+        owned.get("guiUid").and_then(Value::as_u64),
+    )?;
+    let expected_uid = if tun {
+        number(owned, "guiUid")?.to_string()
+    } else {
+        own_uid.to_owned()
+    };
     let pid = number(owned, "pid")?;
     check(pid > 1 && pid <= i32::MAX as u64, "invalid-owned-pid")?;
     let base = format!("/proc/{pid}");
@@ -136,12 +264,15 @@ fn verify_owned(input: &Value, port: u16, verify_content: bool) -> ProbeResult<(
         "owned-process-changed",
     )?;
     check(
-        uid(&read(format!("{base}/status"))?) == Some(own_uid),
+        uid(&read(format!("{base}/status"))?) == Some(expected_uid.as_str()),
         "owned-process-uid-differs",
     )?;
     let exe = fs::read_link(format!("{base}/exe")).map_err(|_| invalid())?;
     let expected_exe = fs::canonicalize(string(owned, "exe")?).map_err(|_| invalid())?;
     check(exe == expected_exe, "owned-executable-differs")?;
+    if tun {
+        verify_tun_owned(input, &base, &exe, number(owned, "guiUid")?, port)?;
+    }
     let local = format!("0100007F:{port:04X}");
     let inodes: BTreeSet<String> = read(format!("{base}/net/tcp"))?
         .lines()
@@ -470,7 +601,7 @@ async fn execute(input: &Value) -> ProbeResult<Value> {
     let empty_request = Value::Null;
     let request = input.get("request").unwrap_or(&empty_request);
     let result = match string(input, "action")? {
-        "capabilities" => capabilities(
+        "capabilities" | "tun-capabilities" => capabilities(
             &client
                 .get_runtime_capabilities()
                 .await
@@ -483,7 +614,7 @@ async fn execute(input: &Value) -> ProbeResult<Value> {
                 .map_err(error_info)?,
         ),
         "apply" => operation(&apply_once(&client, apply_request(request)?).await?),
-        "status" => status(
+        "status" | "tun-status" => status(
             &client
                 .get_runtime_config_status(status_request(
                     string(request, "transactionId")?,
@@ -558,6 +689,8 @@ async fn main() {
                 "retry",
                 "ack",
                 "suite",
+                "tun-capabilities",
+                "tun-status",
             ]
             .contains(s)
         })
@@ -585,6 +718,28 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tun_authority_is_root_only_and_read_only() {
+        for action in [
+            "capabilities",
+            "plan",
+            "apply",
+            "status",
+            "retry",
+            "ack",
+            "suite",
+        ] {
+            assert!(authority(action, "0", Some(1001)).is_err());
+            assert_eq!(authority(action, "1001", None).unwrap(), false);
+        }
+        for action in ["tun-capabilities", "tun-status"] {
+            assert_eq!(authority(action, "0", Some(1001)).unwrap(), true);
+            for uid in [None, Some(0), Some(u64::MAX)] {
+                assert!(authority(action, "0", uid).is_err());
+            }
+            assert!(authority(action, "1001", Some(1001)).is_err());
+        }
+    }
     #[test]
     fn proc_identity_parser_handles_parenthesized_names() {
         let stat = format!(

@@ -48,7 +48,7 @@ const ALL_WORKFLOWS = ['ci.yml', 'ui.yml', 'package.yml', 'release-risk.yml'] as
 // Strict native Package setup also checks out the exact candidate and uses Node 26
 // to validate its published contract before admitting the matrix.
 const NODE_JOBS = [
-  ['ci.yml', 7], ['ui.yml', 1], ['package.yml', 6], ['release-risk.yml', 3],
+  ['ci.yml', 7], ['ui.yml', 1], ['package.yml', 7], ['release-risk.yml', 3],
 ] as const;
 // cheap_format owns Node 26 for exact candidate and input-mode admission;
 // the reusable candidate call has no local checkout or Node steps. Windows native acceptance
@@ -56,7 +56,7 @@ const NODE_JOBS = [
 // The manual-only launcher diagnostic independently checks out the same two sources
 // and now owns Node 26 for exact loopback-input admission before kernel validation.
 // Source/mock and opt-in real loopback jobs each own a checkout and Node setup.
-const CHECKOUT_COUNTS = { 'ci.yml': 9, 'ui.yml': 1, 'package.yml': 6, 'release-risk.yml': 3 } as const;
+const CHECKOUT_COUNTS = { 'ci.yml': 9, 'ui.yml': 1, 'package.yml': 7, 'release-risk.yml': 3 } as const;
 const CHECKOUT_TOTAL = Object.values(CHECKOUT_COUNTS).reduce((sum, count) => sum + count, 0);
 const NODE_JOBS_TOTAL = NODE_JOBS.reduce((sum, [, count]) => sum + count, 0);
 

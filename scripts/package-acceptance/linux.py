@@ -301,6 +301,8 @@ class Supervisor:
                 changed = False
                 for pid, item in observed.items():
                     if same_process(item, self.owned.get(pid)):
+                        require(item['uid'] == os.getuid() and self.owned[pid]['uid'] == os.getuid(),
+                                'owned birth changed UID unexpectedly')
                         continue
                     parent = observed.get(item['ppid'])
                     if same_process(parent, self.owned.get(item['ppid'])):
@@ -381,10 +383,10 @@ class Supervisor:
                 parent = self.owned.get(parent['ppid'])
         self.scan()
 
-    def spawn(self, command, env, role, *, stdout=subprocess.DEVNULL, pass_fds=()):
+    def spawn(self, command, env, role, *, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=()):
         with self.lock:
             child = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
-                                     stdout=stdout, stderr=subprocess.DEVNULL,
+                                     stdout=stdout, stderr=stderr,
                                      start_new_session=True, pass_fds=pass_fds)
             item = process_identity(child.pid)
             require(item is not None, 'spawned process vanished before identity capture')
@@ -415,15 +417,19 @@ class Supervisor:
         return matches[0]
 
     def signal(self, item, sig):
-        require(same_process(item, self.owned.get(item['pid'])) and
-                same_process(item, process_identity(item['pid'])), 'signal identity/lineage changed')
+        current = process_identity(item['pid'])
+        require(item.get('uid') == os.getuid() and (current or {}).get('uid') == os.getuid() and
+                same_process(item, self.owned.get(item['pid'])) and same_process(item, current),
+                'signal identity/lineage/UID changed')
         # pidfd pins the kernel task; a PID cannot be recycled between identity
-        # verification and delivery. Unsupported/unknown identity is never success.
+        # verification and delivery. Same birth cannot authorize a UID transition.
         require(hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal'), 'pidfd signaling required')
         fd = os.pidfd_open(item['pid'], 0)
         try:
-            require(same_process(item, self.owned.get(item['pid'])) and
-                    same_process(item, process_identity(item['pid'])), 'pidfd identity/lineage changed')
+            current = process_identity(item['pid'])
+            require(item.get('uid') == os.getuid() and (current or {}).get('uid') == os.getuid() and
+                    same_process(item, self.owned.get(item['pid'])) and same_process(item, current),
+                    'pidfd identity/lineage/UID changed')
             signal.pidfd_send_signal(fd, sig, None, 0)
         finally:
             os.close(fd)
@@ -687,12 +693,18 @@ class CarrierRun:
         self.core = None
         self.runtime_path = None
         self.translations = json.loads((ROOT / 'ui/src/i18n/locales/en-US.json').read_text())
-        self.network = fixtures.Network()
+        self.network = self.create_network()
         try:
-            self.supervisor = Supervisor()
+            self.supervisor = self.create_supervisor()
         except BaseException:
             self.network.close()
             raise
+
+    def create_network(self):
+        return self.fixtures.Network()
+
+    def create_supervisor(self):
+        return Supervisor()
 
     def text(self, path):
         value = self.translations

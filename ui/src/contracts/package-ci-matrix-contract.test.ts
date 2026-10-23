@@ -630,7 +630,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     // 判据挂在第一次 release mutation 上（桌面草稿 job）；门未过时连草稿都不写。
     // 2026-10-07：needs 多了 core_wire —— wire 契约从打包腿内的一步变成并行 job，
     // 「契约不成立就没有安装包」变成「契约不成立就写不进草稿」，判据必须在这里接回（见下）。
-    expect(release).toContain("needs: [setup, ci, ui, package, core_wire, linux_package_acceptance]");
+    expect(release).toContain("needs: [setup, ci, ui, package, core_wire, linux_package_acceptance, linux_tun_package_acceptance]");
     expect(release).toContain(
       "needs.ci.result == 'success' || needs.ci.result == 'skipped'",
     );
@@ -807,7 +807,7 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     );
     expect(android).toContain('secrets: inherit');
 
-    expect(release).toContain('needs: [release_desktop, android_release, linux_package_acceptance]');
+    expect(release).toContain('needs: [release_desktop, android_release, linux_package_acceptance, linux_tun_package_acceptance]');
     expect(release).toContain("needs.release_desktop.result == 'success'");
     expect(release).toContain("needs.android_release.result == 'success'");
     expect(release).not.toContain("needs.android_release.result != 'failure'");
