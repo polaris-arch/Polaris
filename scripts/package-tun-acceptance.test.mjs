@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { sha256 } from './package-acceptance/transport.mjs';
+import { admit, sha256 } from './package-acceptance/transport.mjs';
 import { selectedCoreManifest } from './lib/core-identity.mjs';
 import { AUTH_MODE, AUTH_PHRASE, CASES, KERNEL, VERSION, authorizationFacts, credentialAuthorization,
   stamp, tunSelection, unstamped, verifyAuthenticationAdmission, verifyAuthorization, verifyHelper, verifyKernel, verifyReport } from './package-acceptance/tun_transport.mjs';
@@ -19,7 +19,7 @@ const env = { GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'polaris-arch/Polaris',
 const context = { repository: env.GITHUB_REPOSITORY, repositoryId: env.GITHUB_REPOSITORY_ID,
   candidate: sha, tree, runId: '120', attempt: '1', workflowRef: env.GITHUB_WORKFLOW_REF };
 const event = { repository: { full_name: context.repository, id: Number(context.repositoryId) },
-  sender: { login: 'reviewer' }, ref: 'reviewed', inputs: { linux_acceptance_candidate: sha,
+  sender: { login: 'reviewer' }, ref: 'refs/heads/reviewed', inputs: { linux_acceptance_candidate: sha,
     linux_tun_acceptance: 'true', linux_package_acceptance: 'true', linux_tun_auth_mode: 'existing-session', linux_tun_credential_authorization: '' } };
 const clone = value => structuredClone(value);
 const core = { member: 'sing-box', bytes: 4, sha256: hash }, sidecar = { member: 'libcronet.so', bytes: 5, sha256: 'd'.repeat(64) };
@@ -92,6 +92,37 @@ test('TUN is separately selected direct dispatch and never a publication receipt
     { PACKAGE_ACCEPTANCE_LIGHT: 'true' }, { PACKAGE_ACCEPTANCE_NATIVE: 'true' },
     { PACKAGE_ACCEPTANCE_SKIP_QUALITY: 'true' }, { PACKAGE_ACCEPTANCE_BUNDLE: 'fake' },
     { RUNNER_ENVIRONMENT: 'self-hosted' } ]) assert.throws(() => tunSelection({ ...env, ...changed }));
+});
+test('actual full dispatch ref survives setup admission for both authentication modes', () => {
+  // Run the same pure admission chain as the CLI. Only Git reads are stubbed;
+  // the selected contract and workflow/event shape are the actual source inputs.
+  const git = (_program, args) => {
+    if (args[0] === 'status') return '';
+    if (args[0] === 'show') return readFileSync(join(ROOT, args[1].slice(5)), 'utf8');
+    return args[1] === 'HEAD' ? sha : tree;
+  };
+  for (const mode of ['existing-session', AUTH_MODE]) {
+    const actual = clone(event);
+    actual.inputs.linux_tun_auth_mode = mode;
+    actual.inputs.linux_tun_credential_authorization = mode === AUTH_MODE ? AUTH_PHRASE : '';
+    tunSelection(env);
+    const admitted = admit(ROOT, env, git);
+    const facts = authorizationFacts(admitted, actual, env);
+    assert.equal(facts.mode, mode);
+    assert.equal(facts.execution.sourceSha, sha);
+    assert.equal(facts.execution.sourceTree, tree);
+    assert.equal(facts.execution.githubRunId, env.GITHUB_RUN_ID);
+    assert.equal(facts.execution.githubRunAttempt, env.GITHUB_RUN_ATTEMPT);
+    for (const ref of ['reviewed', 'refs/heads/other', 'refs/tags/reviewed'])
+      assert.throws(() => authorizationFacts(admitted, { ...actual, ref }, env), /Actual dispatch payload/);
+  }
+  // Equal basenames are not equal refs in the other direction either.
+  const tagEnv = { ...env, GITHUB_REF: 'refs/tags/v1.0.0',
+    GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/package.yml@refs/tags/v1.0.0' };
+  const tagContext = admit(ROOT, tagEnv, git);
+  for (const ref of ['v1.0.0', 'refs/heads/v1.0.0'])
+    assert.throws(() => authorizationFacts(tagContext, { ...event, ref }, tagEnv), /Actual dispatch payload/);
+  assert.equal(authorizationFacts(tagContext, { ...event, ref: tagEnv.GITHUB_REF }, tagEnv).mode, 'existing-session');
 });
 test('old formal 814 or renamed version cannot satisfy TUN c6 admission', () => {
   assert.equal(verifyKernel(contract), contract);

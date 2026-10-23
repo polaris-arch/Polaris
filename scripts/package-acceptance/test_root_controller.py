@@ -66,6 +66,42 @@ def controller(mode='existing-session'):
     c.gui = identity(); return c
 
 
+class AbortLeaseRegressionTests(unittest.TestCase):
+    def test_existing_abort_fail_path_closes_lease_before_auth_and_product(self):
+        c = controller(m.AUTH_MODE); order = []
+        c.ledger.value['authentication']['accountMutated'] = True
+        c.lease = Mock()
+        def close_lease():
+            order.append('lease')
+            c.ledger.value['authentication']['accountMutated'] = False
+        c.lease.close.side_effect = close_lease
+        def auth(*args, **kwargs):
+            self.assertFalse(c.ledger.load()['authentication']['accountMutated'])
+            order.append('auth')
+        c.tun.cleanup.side_effect = lambda *a, **kw: order.append('product') or {'state': 'forced'}
+        with patch.object(m, 'close_auth', side_effect=auth), patch.object(m, 'close_transactions'):
+            result = c.abort()
+        self.assertEqual(order, ['lease', 'auth', 'product'])
+        self.assertEqual(result['state'], 'failed')
+        self.assertTrue(result['forced']); self.assertTrue(c.failed)
+        self.assertEqual(c.ledger.load()['result'], 'failed')
+
+    def test_relock_failure_does_not_claim_recovery_or_cancel_watchdog(self):
+        c = controller(m.AUTH_MODE)
+        c.ledger.value['authentication']['accountMutated'] = True
+        c.lease = Mock(); c.lease.close.side_effect = ValueError('relock unproved')
+        c.tun.cleanup.return_value = {'state': 'failed'}
+        with patch.object(m, 'close_transactions'):
+            result = c.abort()
+        c.lease.close.assert_called_once()
+        self.assertEqual(result['state'], 'failed')
+        self.assertIn('authentication-cleanup-unknown', result['unknown'])
+        self.assertTrue(c.ledger.load()['authentication']['accountMutated'])
+        self.assertTrue(c.ledger.load()['authenticationWatchdogActive'])
+        c.ops.run.assert_not_called()
+        c.tun.cleanup.assert_called_once_with(c.ledger, forced=True)
+
+
 class LaunchTests(unittest.TestCase):
     def test_valid_closed_default(self): self.assertIs(m.validate_launch(v := launch()), v)
     def test_valid_permission_is_not_authentication(self):

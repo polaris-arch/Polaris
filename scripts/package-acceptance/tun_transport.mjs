@@ -56,7 +56,7 @@ export function authorizationFacts(context, event, env = process.env) {
   demand(event?.repository?.full_name === context.repository
     && String(event.repository.id) === context.repositoryId
     && event.sender?.login === env.GITHUB_ACTOR && /^[A-Za-z0-9-]{1,39}$/.test(env.GITHUB_ACTOR ?? '')
-    && event.ref === env.GITHUB_REF.replace(/^refs\/(heads|tags)\//, '')
+    && event.ref === env.GITHUB_REF
     && event.inputs?.linux_acceptance_candidate === context.candidate
     && event.inputs?.linux_tun_acceptance === 'true' && event.inputs?.linux_package_acceptance === 'true',
   'Actual dispatch payload/repository/ref/actor/source differs');

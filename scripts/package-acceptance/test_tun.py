@@ -117,6 +117,48 @@ class MemorySocket:
 
 
 
+class AllTableObservationTests(unittest.TestCase):
+    def test_fresh_absent_table_uses_successful_empty_family_observations(self):
+        self.assertEqual(tun.tun_table_routes({'route4': [], 'route6': []}), [])
+
+    def test_exact_numeric_and_string_ids_in_both_families(self):
+        a = {'table': 2022, 'dst': '198.18.240.0/24'}
+        b = {'table': '2022', 'dst': 'fd00::/64'}
+        snapshot = {'route4': [a, {'table': '254'}, {}],
+                    'route6': [b, {'table': 254}, {'table': '20220'}]}
+        self.assertEqual(tun.tun_table_routes(snapshot), [a, b])
+        facts = good_facts(); facts['tunTableRoutes'] = tun.tun_table_routes(snapshot)
+        self.assertIn('productTunRuleOrTableAlreadyOwned',
+                      tun.preflight(facts, carrier(), True)['blocked'])
+
+    def test_incomplete_or_malformed_observations_are_not_empty_success(self):
+        for snapshot in ({'route4': []}, {'route4': [], 'route6': None},
+                         {'route4': [None], 'route6': []},
+                         {'route4': [{'table': True}], 'route6': []},
+                         {'route4': [], 'route6': [{'table': 2022.0}]},
+                         {'route4': [{'table': 'custom-alias'}], 'route6': []},
+                         {'route4': [{'table': '02022'}], 'route6': []}):
+            with self.subTest(snapshot=snapshot), self.assertRaises(ValueError):
+                tun.tun_table_routes(snapshot)
+
+    def test_real_snapshot_requests_numeric_all_tables_for_both_families(self):
+        ops = Mock(); ops.json.return_value = []; ops.run.return_value = 'resolved'
+        with patch.object(tun.Path, 'is_symlink', return_value=False), \
+             patch.object(tun.Path, 'read_bytes', return_value=b'fixture resolver'), \
+             patch.object(tun.Path, 'read_text', return_value='0'):
+            snapshot = tun.network_snapshot(ops)
+        self.assertEqual(tun.tun_table_routes(snapshot), [])
+        commands = [call.args[0] for call in ops.json.call_args_list]
+        for family in ('4', '6'):
+            self.assertIn([tun.IP, '-j', '-N', '-' + family, 'route', 'show', 'table', 'all'], commands)
+        self.assertFalse(any(command[-1] == '2022' for command in commands))
+
+    def test_failed_all_table_command_is_not_suppressed(self):
+        ops = Mock(); ops.json.side_effect = OSError('unavailable observation')
+        with self.assertRaises(OSError): tun.network_snapshot(ops)
+        self.assertNotIn("'show', 'table', '2022'", (HERE / 'tun.py').read_text())
+
+
 class PreflightTests(unittest.TestCase):
     def test_complete_is_preparation_not_pass(self):
         result = tun.preflight(good_facts(), carrier(), True)

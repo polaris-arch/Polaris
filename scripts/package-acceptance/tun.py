@@ -193,8 +193,8 @@ local to this controlled backend; this is NOT independent physical egress.
 def network_snapshot(ops):
     value = {'links': ops.json([IP, '-j', 'link', 'show']),
              'addresses': ops.json([IP, '-j', 'address', 'show']),
-             'route4': ops.json([IP, '-j', '-4', 'route', 'show', 'table', 'all']),
-             'route6': ops.json([IP, '-j', '-6', 'route', 'show', 'table', 'all']),
+             'route4': ops.json([IP, '-j', '-N', '-4', 'route', 'show', 'table', 'all']),
+             'route6': ops.json([IP, '-j', '-N', '-6', 'route', 'show', 'table', 'all']),
              'rule4': ops.json([IP, '-j', '-4', 'rule', 'show']),
              'rule6': ops.json([IP, '-j', '-6', 'rule', 'show']),
              'resolved': ops.run(['/usr/bin/resolvectl', 'status', '--no-pager']),
@@ -205,6 +205,27 @@ def network_snapshot(ops):
     value['forwarding'] = [int(Path(p).read_text()) for p in
         ('/proc/sys/net/ipv4/ip_forward', '/proc/sys/net/ipv6/conf/all/forwarding')]
     return value
+
+
+def tun_table_routes(snapshot):
+    """Select the owned table from successful all-table dumps of both families.
+
+    A fresh host need not have FIB table 2022 at all. Never turn a failed
+    observation into an empty table or coerce floats/bools into table IDs.
+    """
+    selected = []
+    for family in ('route4', 'route6'):
+        rows = snapshot.get(family)
+        require(type(rows) is list, 'complete all-table route observation required')
+        for row in rows:
+            require(type(row) is dict, 'route observation must be an object')
+            table = row.get('table')
+            require(table is None or type(table) in (int, str), 'route table identity differs')
+            require(type(table) is not str or (table.isascii() and table.isdecimal()
+                    and str(int(table)) == table), 'numeric table observation required')
+            if (type(table) is int and table == 2022) or (type(table) is str and table == '2022'):
+                selected.append(row)
+    return selected
 
 
 def collect_preflight(gui_uid, vm_context, materials_downloaded=False, ops=None):
@@ -239,7 +260,7 @@ def collect_preflight(gui_uid, vm_context, materials_downloaded=False, ops=None)
         facts['unsafeEnvironment'] = [key for key in forbidden if key in os.environ]
         facts['network'] = network_snapshot(ops)
         facts['routes'] = facts['network']['route4'] + facts['network']['route6']
-        facts['tunTableRoutes'] = ops.json([IP, '-j', 'route', 'show', 'table', '2022'])
+        facts['tunTableRoutes'] = tun_table_routes(facts['network'])
         facts['networkSnapshotComplete'] = True
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         facts['observationErrors'].append(type(error).__name__)
@@ -617,7 +638,9 @@ def recover_tun(ledger, value):
                 remaining = [r for r in ledger.ops.json([IP, '-j', '-' + family, 'rule', 'show']) if r.get('priority') == priority]
                 require(len(remaining) == len(expected_group) - 1 and all(r in expected_group for r in remaining), 'policy delete outcome unknown')
                 expected_group = remaining
-    require(not ledger.ops.json([IP, '-j', 'route', 'show', 'table', '2022']), 'remaining product route table requires VM disposal')
+    routes = {'route' + family: ledger.ops.json([IP, '-j', '-N', '-' + family,
+              'route', 'show', 'table', 'all']) for family in ('4', '6')}
+    require(not tun_table_routes(routes), 'remaining product route table requires VM disposal')
 
 
 def start_capture(ledger):
