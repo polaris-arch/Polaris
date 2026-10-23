@@ -186,8 +186,8 @@ class PureFixtures(unittest.TestCase):
                       'inputs': {'hot_consumer_candidate': self.sha, 'preserve_run': 'true'}}
 
     def test_final_kernel_identity_and_runtime_api_source_are_frozen(self):
-        self.assertEqual(hot.KERNEL_COMMIT, '9031509c75ade460fd631437decbc9045eccee2a')
-        self.assertEqual(hot.KERNEL_TREE, 'df3add1dee022eaf891ce0a762a5b04b5658a2f9')
+        self.assertEqual(hot.KERNEL_COMMIT, 'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a')
+        self.assertEqual(hot.KERNEL_TREE, '32c0e3d8c59ad5e41f5ccdbc68e14a644b503e94')
         self.assertEqual(hot.SOURCE_HASHES['experimental/libbox/command_runtime.go'],
                          '3041a85bbda753e961b2b9b19ce1881b5afe000e3bcd6352d786679118055dc9')
         self.assertEqual(hot.SOURCE_HASHES['daemon/runtime_config.proto'], hot.PROTO)
@@ -738,7 +738,7 @@ class RoutingContracts(unittest.TestCase):
         self.assertIn('build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimeProtocolAdmissionTest.xml', self.workflow)
 
     def test_pins_all_nine_source_vendor_roots_and_formal_untouched(self):
-        self.assertEqual(sum(row[2] for row in hot.VENDORS.values()), 2835)
+        self.assertEqual(sum(row[2] for row in hot.VENDORS.values()), 2838)
         self.assertEqual(len(hot.VENDORS), 9)
         self.assertEqual(hot.sha((hot.ROOT / 'scripts/mobile-core/source-contract.json').read_bytes()), hot.FORMAL_HASH)
         self.assertIn('trackedMirror', self.source)

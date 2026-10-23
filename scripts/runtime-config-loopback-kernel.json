@@ -5,16 +5,16 @@
   "source": {
     "repository": "polaris-arch/sing-box-polaris",
     "repositoryId": 1421657509,
-    "commit": "c76dd70d2ca90e3d6d2abc8df751744d0e232966",
-    "tree": "afe996e34beff4bfb3321e9819c606af41caf5c0",
+    "commit": "c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a",
+    "tree": "32c0e3d8c59ad5e41f5ccdbc68e14a644b503e94",
     "files": {
       "go.mod": "2c41a5a45e22341d2f8ca750134edeb5e09cf79d3366575a5a0966cc10a6162c",
       "go.sum": "04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa",
       "daemon/runtime_config.proto": "b6bb4642d1081f238e5b4f3563b7ddab8e5a1d66b65a306fbd215153164fac5f",
-      ".github/go-toolchains.json": "a8c915ab6df559ea359fccea5a289a5a9230fec8dd588c2e07f8db4cac8fca35",
+      ".github/go-toolchains.json": "2a787a7ea2a30b691161cd0376753e27fc56b4935b9efc6d3ae2be0931eb1018",
       "release/DEFAULT_BUILD_TAGS_OTHERS": "fb757062340529686ecd9d513c97172aee182cc782f12b021da0130ec4b71c35",
       "release/LDFLAGS": "d0a3a04eb9ac5f3018978515e4864ba61cca69d9a99101d11d7970e537a1991d",
-      "box_runtime_capabilities.go": "9e770f854d504aa2b484ae4b8d35befe55587cefb06a1c63ec1ae742f1feb051",
+      "box_runtime_capabilities.go": "d3277e34d8ec376416151d8ae83bf9ba1c3a3d43d1134ff08b7c629909016cd1",
       "box_runtime_types.go": "9b5670963717c6ca8ae4eb7a77563f0b20f34bd67798fbe979e3bed6899c363d",
       "box_runtime_apply.go": "5a9be78f46c5b75b1d4a0935ae05a4e5037fa66023a135370ba983d880b24c6c",
       "box_runtime_owner_ack.go": "74dd1f914850fecea80b745d5759ef0557933c87596c88cd62400aa97f83cadf",
@@ -69,14 +69,14 @@
       ],
       "github.com/database64128/tfo-go/v2": [
         "tfo-go",
-        "0a46fb2e32fa6082c6c993706fe7c8d03a76db84",
-        42
+        "97b124004140efa84aeb0f57d9bd41d238f0c9b5",
+        45
       ]
     }
   },
   "goVersion": "1.27.2",
   "tags": "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0,with_purego",
-  "version": "polaris-hot-loopback-c76dd70d2ca9",
+  "version": "polaris-hot-loopback-c6c0d8b3b83a",
   "protocol": "polaris-daily-runtime-v1",
   "platformBuild": "linux/amd64",
   "implementationManifestDigest": null,

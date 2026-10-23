@@ -30,8 +30,8 @@ REF = 'refs/heads/hot/app-runtime-consumer-20261020'
 WORKFLOW_REF = APP_REPOSITORY + '/.github/workflows/android.yml@' + REF
 KERNEL_REPOSITORY = 'polaris-arch/sing-box-polaris'
 KERNEL_REPOSITORY_ID = 1421657509
-KERNEL_COMMIT = '9031509c75ade460fd631437decbc9045eccee2a'
-KERNEL_TREE = 'df3add1dee022eaf891ce0a762a5b04b5658a2f9'
+KERNEL_COMMIT = 'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a'
+KERNEL_TREE = '32c0e3d8c59ad5e41f5ccdbc68e14a644b503e94'
 PROTO = 'b6bb4642d1081f238e5b4f3563b7ddab8e5a1d66b65a306fbd215153164fac5f'
 SOURCE_HASHES = {
     'go.mod': '2c41a5a45e22341d2f8ca750134edeb5e09cf79d3366575a5a0966cc10a6162c',
@@ -56,7 +56,7 @@ VENDORS = {
     'github.com/sagernet/sing': ('sing', 'bdc317ad143368210802cba500a414102f677125', 350),
     'github.com/sagernet/sing-quic': ('sing-quic', '35dca4b40ca8b33ac5d7f697271fac5f14aea9da', 81),
     'github.com/sagernet/wireguard-go': ('wireguard-go', '8f2e9708ac31b6453f94ce68837dca6f277c5fff', 85),
-    'github.com/database64128/tfo-go/v2': ('tfo-go', '0a46fb2e32fa6082c6c993706fe7c8d03a76db84', 42),
+    'github.com/database64128/tfo-go/v2': ('tfo-go', '97b124004140efa84aeb0f57d9bd41d238f0c9b5', 45),
 }
 
 TAGS = ('with_gvisor with_quic with_wireguard with_utls with_naive_outbound with_clash_api '
