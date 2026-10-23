@@ -245,7 +245,7 @@ fn make_deps<'a, PE: PeerCredProvider>(
     fp: &'a MockFreePort,
     systemd: &'a MockSystemd,
     ss: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
-    fwd: &'a (dyn Fn(bool) + Send + Sync),
+    _fwd: &'a (dyn Fn(bool) + Send + Sync),
 ) -> HandlerDeps<'a, PE, MockSpawner, MockFreePort, MockSystemd> {
     make_deps_with_resolved(
         core_dir,
@@ -255,7 +255,7 @@ fn make_deps<'a, PE: PeerCredProvider>(
         fp,
         systemd,
         ss,
-        fwd,
+        _fwd,
         &NOOP_RESOLVED_DNS,
     )
 }
@@ -269,7 +269,7 @@ fn make_deps_with_resolved<'a, PE: PeerCredProvider>(
     fp: &'a MockFreePort,
     systemd: &'a MockSystemd,
     ss: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
-    fwd: &'a (dyn Fn(bool) + Send + Sync),
+    _fwd: &'a (dyn Fn(bool) + Send + Sync),
     resolved_dns: &'a dyn ResolvedDnsOps,
 ) -> HandlerDeps<'a, PE, MockSpawner, MockFreePort, MockSystemd> {
     HandlerDeps {
@@ -282,7 +282,6 @@ fn make_deps_with_resolved<'a, PE: PeerCredProvider>(
         systemd,
         resolved_dns,
         ss_provider: ss,
-        set_forward: fwd,
     }
 }
 
@@ -957,10 +956,9 @@ fn stop_terminates_child_and_reports_pid() {
     handle(&state, &deps, &mut conn);
     assert_eq!(conn.writes(), vec!["OK stopped 555"]);
     assert_eq!(*spawner.terminate_calls.lock().unwrap(), vec![555]);
-    assert_eq!(
-        *fwd_called.lock().unwrap(),
-        vec![false],
-        "stop 应复位转发态"
+    assert!(
+        fwd_called.lock().unwrap().is_empty(),
+        "stop must preserve host router state"
     );
 }
 
@@ -1001,7 +999,7 @@ fn reap_safe_stop_retains_stopping_birth_until_exact_reap() {
     handle(&state, &deps, &mut reaped);
     assert_eq!(reaped.writes(), ["OK stopped 555"]);
     assert!(state.lock().unwrap().child.is_none());
-    assert_eq!(*fwd_called.lock().unwrap(), [false]);
+    assert!(fwd_called.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1386,8 +1384,8 @@ fn start_failure_reports_err_start_and_resets_forward() {
     );
     let w = &conn.writes()[0];
     assert!(w.starts_with("ERR start"), "got {w}");
-    // fwd=1 先设，spawn 失败后复位为 false。
-    assert_eq!(*fwd_called.lock().unwrap(), vec![true, false]);
+    // A failed start must not touch either host forwarding family.
+    assert!(fwd_called.lock().unwrap().is_empty());
 }
 
 // ===== cleanup =====

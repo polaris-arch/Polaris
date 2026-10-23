@@ -236,8 +236,8 @@ def tun_table_routes(snapshot):
 VM_STAGES = ('manager', 'pid1', 'namespaces', 'cgroup-mount', 'pidfd', 'privileges',
     'tun-device', 'forwarding', 'tools', 'product-paths', 'environment', 'network', 'route-tables', 'gate')
 VM_CHECKS = ('githubHosted', 'dedicatedVM', 'ordinaryGUI', 'rootManager', 'pid1Systemd',
-    'sameSystemNamespaces', 'pidfd', 'noNewPrivsZero', 'tunDevice', 'forwardingBaseline',
-    'toolsRootOwned', 'freshProductPaths', 'defaultEnvironment', 'networkSnapshotComplete', 'materialsDownloaded')
+    'sameSystemNamespaces', 'pidfd', 'noNewPrivsZero', 'tunDevice', 'forwardingBaselineValid',
+    'forwardingStable', 'toolsRootOwned', 'freshProductPaths', 'defaultEnvironment', 'networkSnapshotComplete', 'materialsDownloaded')
 VM_BLOCKS = frozenset(('githubHosted', 'dedicatedVM', 'pid1Systemd', 'rootManager', 'tunDevice', 'pidfd',
     'sameSystemNamespaces', 'toolsRootOwned', 'ordinaryGUI', 'VMPrivilegesOrForwardingBaseline',
     'freshProductAndDefaultSandbox', 'fixtureCIDRCollision', 'productTunRuleOrTableAlreadyOwned',
@@ -248,11 +248,15 @@ VM_PROBES = ('none', 'ip', 'systemctl', 'systemd-run', 'resolvectl', 'nft', 'pyt
 VM_ERRORS = ('none', 'OSError', 'ValueError', 'SubprocessError', 'TypeError', 'KeyError', 'other')
 
 
+def valid_forwarding(value):
+    return type(value) is list and len(value) == 2 and all(type(v) is int and v in (0, 1) for v in value)
+
+
 def vm_observation():
-    return {'schema': 'polaris-vm-preflight-observation-v1',
+    return {'schema': 'polaris-vm-preflight-observation-v2',
         'stages': {name: {'state': 'not-reached', 'error': 'none'} for name in VM_STAGES},
         'checks': {name: None for name in VM_CHECKS}, 'managerControlGroup': 'unknown',
-        'gate': 'not-reached', 'blocked': [], 'failedProbe': 'none'}
+        'gate': 'not-reached', 'blocked': [], 'failedProbe': 'none', 'forwarding': None}
 
 
 def vm_error(error):
@@ -262,15 +266,17 @@ def vm_error(error):
 
 
 def validate_vm_observation(value):
-    require(type(value) is dict and set(value) == {'schema', 'stages', 'checks', 'managerControlGroup', 'gate', 'blocked', 'failedProbe'},
+    require(type(value) is dict and set(value) == {'schema', 'stages', 'checks', 'managerControlGroup', 'gate', 'blocked', 'failedProbe', 'forwarding'},
             'fixed VM observation required')
-    require(value['schema'] == 'polaris-vm-preflight-observation-v1' and
+    require(value['schema'] == 'polaris-vm-preflight-observation-v2' and
         type(value['stages']) is dict and set(value['stages']) == set(VM_STAGES) and
         type(value['checks']) is dict and set(value['checks']) == set(VM_CHECKS), 'VM schema differs')
     for row in value['stages'].values():
         require(type(row) is dict and set(row) == {'state', 'error'} and
             row['state'] in ('observed', 'failed', 'not-reached') and row['error'] in VM_ERRORS and
             ((row['state'] == 'failed') == (row['error'] != 'none')), 'VM stage differs')
+    require(value['forwarding'] is None or valid_forwarding(value['forwarding']), 'bounded forwarding baseline required')
+    require(value['checks']['forwardingBaselineValid'] is not True or valid_forwarding(value['forwarding']), 'valid forwarding claim requires observation')
     require(value['failedProbe'] in VM_PROBES, 'fixed VM probe required')
     require(all(v is None or type(v) is bool for v in value['checks'].values()) and
         value['managerControlGroup'] in ('unknown', 'empty-root', 'root-slash', 'nonroot', 'missing') and
@@ -362,6 +368,7 @@ def collect_preflight(gui_uid, vm_context, materials_downloaded=False, ops=None)
         facts['unsafeEnvironment'] = [key for key in forbidden if key in os.environ]
         reached('network')
         facts['network'] = network_snapshot(ops, progress=probing)
+        facts['forwardingStable'] = valid_forwarding(facts['forwarding']) and facts['network'].get('forwarding') == facts['forwarding'] and valid_forwarding(facts['network'].get('forwarding'))
         facts['routes'] = facts['network']['route4'] + facts['network']['route6']
         reached('route-tables')
         facts['tunTableRoutes'] = tun_table_routes(facts['network'])
@@ -375,9 +382,12 @@ def collect_preflight(gui_uid, vm_context, materials_downloaded=False, ops=None)
     for name in VM_CHECKS:
         if name in facts and type(facts[name]) is bool: observation['checks'][name] = facts[name]
     observation['checks']['ordinaryGUI'] = type(gui_uid) is int and gui_uid > 0
-    for check, field, wanted in (('noNewPrivsZero', 'noNewPrivs', 0), ('forwardingBaseline', 'forwarding', [0, 0]),
+    for check, field, wanted in (('noNewPrivsZero', 'noNewPrivs', 0),
             ('freshProductPaths', 'existingProductPaths', []), ('defaultEnvironment', 'unsafeEnvironment', [])):
         if field in facts: observation['checks'][check] = facts[field] == wanted
+    if 'forwarding' in facts:
+        observation['checks']['forwardingBaselineValid'] = valid_forwarding(facts['forwarding'])
+        if valid_forwarding(facts['forwarding']): observation['forwarding'] = list(facts['forwarding'])
     validate_vm_observation(observation)
     return facts
 
@@ -440,7 +450,7 @@ This is not a second transport/formal verifier and cannot mint release receipts.
             blocked.append(field)
     if type(facts.get('guiUid')) is not int or facts['guiUid'] <= 0:
         blocked.append('ordinaryGUI')
-    if facts.get('noNewPrivs') != 0 or facts.get('forwarding') != [0, 0]:
+    if facts.get('noNewPrivs') != 0 or not valid_forwarding(facts.get('forwarding')) or facts.get('forwardingStable') is not True:
         blocked.append('VMPrivilegesOrForwardingBaseline')
     if facts.get('existingProductPaths') or facts.get('unsafeEnvironment'):
         blocked.append('freshProductAndDefaultSandbox')

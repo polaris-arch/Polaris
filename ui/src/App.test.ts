@@ -316,6 +316,17 @@ describe('handleProxyErrorEvent（代理错误分腿）', () => {
   });
 
   it.each([
+    ['LAN_GATEWAY_FORWARDING_REQUIRED', 'lanGatewayForwardingRequired'],
+    ['LAN_GATEWAY_FORWARDING_UNCONFIRMED', 'lanGatewayForwardingUnconfirmed'],
+  ])('%s surfaces localized gateway prerequisites, not native details', (errorCode, key) => {
+    handleProxyErrorEvent({ errorCode, message: '/private/proc/raw error' }, { t, refreshProxyStatus });
+    expect(isProxyErrorCode(errorCode)).toBe(true);
+    expect(refreshProxyStatus).toHaveBeenCalledTimes(1);
+    expect(toastErrorMock.mock.calls).toEqual([[`errors.${key}`]]);
+    expect(notifyDesktopMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['HELPER_CORE_OCCUPIED', 'helperCoreOccupied'],
     ['CORE_BUNDLE_MISMATCH', 'coreBundleMismatch'],
     ['HELPER_CORE_ABSENT', 'helperCoreAbsent'],

@@ -823,6 +823,7 @@
       "autoSwitchNode": "節點故障自動切換",
       "autoSwitchNodeDesc": "目前節點偵測到故障時自動切到可用節點。只走內網的組網節點不參與判定——沒有可替代的節點，不會被自動切走。",
       "disableLogFileDescFull": "關閉磁碟日誌後，即時日誌與日誌診斷將無法使用；崩潰偵測仍可使用。執行中需儲存後點「立即套用」；未執行時下次連線生效。",
+      "lanGatewayPrerequisite": "區域網共享僅開放代理監聽，Polaris 不修改主機 IP 轉送。路由型區域網 MAC 篩選需要預先設定閘道並開啟 TUN 位址族的轉送；條件缺失或無法讀取時拒絕啟動/套用。區域網短名解析不要求路由器模式。",
       "lanGateway": "區域網閘道",
       "neighborDomains": "區域網短名解析",
       "neighborDomainsHint": "每行一個後綴（自動補前導點）；對該後綴下無點的短名（如 nas.lan）走區域網裝置解析。",
@@ -1756,6 +1757,8 @@
     "createTaskRecoveredHint": "訂閱新增在背景執行，應用程式重新啟動後會在這裡繼續顯示進度。"
   },
   "errors": {
+    "lanGatewayForwardingRequired": "所需位址族的區域網閘道轉送未開啟。請在 Polaris 之外設定閘道，或關閉路由型區域網 MAC 篩選。未修改主機網路設定。",
+    "lanGatewayForwardingUnconfirmed": "無法確認所需的區域網閘道轉送狀態，已拒絕啟動/套用。請檢查閘道設定。未修改主機網路設定。",
     "dnsDependencyInvalid": "DNS 伺服器或群組的參照無效或仍被使用。請檢查 DNS 規則、預設 DNS 和群組參照後重試。",
     "iosSessionActive": "系統中已有 Polaris VPN 工作階段，請先在 iOS 系統設定中停止該工作階段，再連線。",
     "operationFailed": "操作失敗，請稍後重試",

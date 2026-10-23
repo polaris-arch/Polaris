@@ -2,7 +2,7 @@ import { useEffect, useRef, type Dispatch, type RefObject, type SetStateAction }
 import { api } from '@/ipc';
 import { normalizePendingChanges, useAppStore } from '@/store/app-store';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
-import { runtimeApplyConflictKey, runtimePersistenceRecoveryEnded, type ApplyState } from './pending-bar-logic';
+import { runtimeApplyRejectedKey, runtimeApplyConflictKey, runtimePersistenceRecoveryEnded, type ApplyState } from './pending-bar-logic';
 import { runtimeApplyPollDisposition, startRuntimeApplyPolling } from './runtime-apply-polling';
 
 interface Attempt {
@@ -44,7 +44,7 @@ export function useRuntimeApplyReconciliation(
           setApply((state) => state.transactionId === transactionId
             ? { ...state, phase: 'failed', reconciling: false,
               persistenceRecoveryEnded: state.persistenceOnly === true && runtimePersistenceRecoveryEnded(result.status, result.reasons),
-              reason: t.current(result.status === 'conflict' ? runtimeApplyConflictKey(result.reasons) : result.status === 'rejected' ? 'home.pendingHotRejected' : 'home.pendingHotUnconfirmed') }
+              reason: t.current(result.status === 'conflict' ? runtimeApplyConflictKey(result.reasons) : result.status === 'rejected' ? runtimeApplyRejectedKey(result.reasons) : 'home.pendingHotUnconfirmed') }
             : state);
           return true;
         }

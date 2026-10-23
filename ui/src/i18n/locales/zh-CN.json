@@ -823,6 +823,7 @@
       "autoSwitchNode": "节点故障自动切换",
       "autoSwitchNodeDesc": "当前节点检测到故障时自动切到可用节点。只走内网的组网节点不参与判定——没有可替代的节点，不会被自动切走。",
       "disableLogFileDescFull": "关闭磁盘日志后，实时日志与日志诊断不可用；崩溃检测仍可用。运行中需保存后点“立即应用”；未运行时下次连接生效。",
+      "lanGatewayPrerequisite": "局域网共享仅开放代理监听，Polaris 不修改主机 IP 转发。路由型局域网 MAC 过滤需要预先配置网关并开启 TUN 地址族的转发；条件缺失或无法读取时拒绝启动/应用。局域网短名解析不要求路由器模式。",
       "lanGateway": "局域网网关",
       "neighborDomains": "局域网短名解析",
       "neighborDomainsHint": "每行一个后缀（自动补前导点）；对该后缀下无点的短名（如 nas.lan）走局域网设备解析。",
@@ -1756,6 +1757,8 @@
     "createTaskRecoveredHint": "订阅添加在后台执行，应用重启后会在这里继续显示进度。"
   },
   "errors": {
+    "lanGatewayForwardingRequired": "所需地址族的局域网网关转发未开启。请在 Polaris 之外配置网关，或关闭路由型局域网 MAC 过滤。未修改主机网络设置。",
+    "lanGatewayForwardingUnconfirmed": "无法确认所需的局域网网关转发状态，已拒绝启动/应用。请检查网关配置。未修改主机网络设置。",
     "dnsDependencyInvalid": "DNS 服务器或分组的引用无效或仍被使用。请检查 DNS 规则、默认 DNS 和分组引用后重试。",
     "iosSessionActive": "系统中已有 Polaris VPN 会话，请先在 iOS 系统设置中停止该会话，再连接。",
     "operationFailed": "操作失败，请稍后重试",

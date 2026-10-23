@@ -35,6 +35,8 @@ export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   EXIT_MISMATCH: 'home.proxyMisdirected',
   CORE_BINARY_MISMATCH: 'errors.coreBinaryMismatch',
   CORE_NOT_EXECUTABLE: 'errors.coreNotExecutable',
+  LAN_GATEWAY_FORWARDING_REQUIRED: 'errors.lanGatewayForwardingRequired',
+  LAN_GATEWAY_FORWARDING_UNCONFIRMED: 'errors.lanGatewayForwardingUnconfirmed',
   CORE_BUNDLE_MISMATCH: 'errors.coreBundleMismatch',
   HELPER_CORE_OCCUPIED: 'errors.helperCoreOccupied',
   HELPER_CORE_ABSENT: 'errors.helperCoreAbsent',

@@ -84,6 +84,13 @@ export function runtimePersistenceRecoveryEnded(status: ApplyStatus | null | und
   return status === 'conflict' && reasons?.some(reason => reason.code === 'OWNER_STATE_SUPERSEDED' && reason.path === 'desired') === true;
 }
 
+export function runtimeApplyRejectedKey(reasons?: PendingApplyResult['reasons']): string {
+  const gateway = reasons?.find(reason => reason.path === 'inbounds.tun.gateway.forwarding' &&
+    (reason.code === 'LAN_GATEWAY_FORWARDING_REQUIRED' || reason.code === 'LAN_GATEWAY_FORWARDING_UNCONFIRMED'));
+  return gateway?.code === 'LAN_GATEWAY_FORWARDING_REQUIRED' ? 'errors.lanGatewayForwardingRequired'
+    : gateway ? 'errors.lanGatewayForwardingUnconfirmed' : 'home.pendingHotRejected';
+}
+
 export function applyOutcome(status: ApplyStatus | null | undefined, reasons?: PendingApplyResult['reasons']): ApplyOutcome {
   switch (status) {
     case 'applied':
@@ -98,7 +105,7 @@ export function applyOutcome(status: ApplyStatus | null | undefined, reasons?: P
     case 'conflict':
       return { phase: 'failed', toast: { kind: 'error', key: runtimeApplyConflictKey(reasons) } };
     case 'rejected':
-      return { phase: 'failed', toast: { kind: 'error', key: 'home.pendingHotRejected' } };
+      return { phase: 'failed', toast: { kind: 'error', key: runtimeApplyRejectedKey(reasons) } };
     case 'unconfirmed':
       return { phase: 'failed', toast: { kind: 'error', key:
         reasons?.some(reason => reason.code === 'CORE_BUNDLE_MISMATCH' && reason.path === 'runtime.protocol')

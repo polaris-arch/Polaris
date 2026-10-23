@@ -823,6 +823,7 @@
       "autoSwitchNode": "Auto-Switch Node on Failure",
       "autoSwitchNodeDesc": "Switches to a working node automatically when the current one is detected as faulty. Intranet-only mesh nodes are excluded: nothing can substitute for them, so they are never switched away.",
       "disableLogFileDescFull": "Turning off disk logs disables live logs and log diagnostics; crash detection remains available. While connected, save and tap Apply Now; otherwise it takes effect on the next connection.",
+      "lanGatewayPrerequisite": "LAN sharing only exposes proxy listeners. Polaris does not change host IP forwarding. Routed LAN MAC filtering requires an already configured gateway and forwarding for the TUN address families; unmet or unreadable prerequisites block Start/Apply. LAN short-name resolution does not require router mode.",
       "lanGateway": "LAN Gateway",
       "neighborDomains": "LAN short-name resolution",
       "neighborDomainsHint": "One suffix per line (leading dot added automatically); dot-less short names under it (e.g. nas.lan) resolve via LAN devices.",
@@ -1756,6 +1757,8 @@
     "createTaskRecoveredHint": "The subscription is added in the background; its progress resumes here after the app restarts."
   },
   "errors": {
+    "lanGatewayForwardingRequired": "LAN gateway forwarding is disabled for a required address family. Configure the gateway outside Polaris, or turn off routed LAN MAC filtering. No host network settings were changed.",
+    "lanGatewayForwardingUnconfirmed": "Cannot confirm the required LAN gateway forwarding state. Start/Apply was rejected; check the gateway configuration. No host network settings were changed.",
     "dnsDependencyInvalid": "This DNS server or group has invalid references or is still in use. Check DNS rules, defaults, and group references before saving.",
     "iosSessionActive": "A Polaris VPN session is already active in the system. Stop that session in iOS Settings before connecting.",
     "operationFailed": "Operation failed, please try again later",

@@ -73,8 +73,6 @@ pub struct HandlerDeps<'a, P: PeerCredProvider, S: CoreSpawner, D: FreePortDeps,
     /// ss 命令的输出提供者（freeport 用 `ss -ltnp` 找 LISTEN 持有者）。
     /// 抽象为闭包便于测试；生产用 `ss` 子进程。
     pub ss_provider: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
-    /// IP 转发开关的副作用闭包（生产 set_forward_prod，测试可记录调用）。
-    pub set_forward: &'a (dyn Fn(bool) + Send + Sync),
 }
 
 /// 连接抽象（trait 便于测试 mock；生产用 tokio::net::UnixStream 经 adapter）。
@@ -650,7 +648,6 @@ fn handle_birth_stop<P, S, D, SD>(
             if same_current {
                 let handle = state.child.as_ref().unwrap().handle().clone();
                 state.retire_birth(&handle);
-                (deps.set_forward)(false);
             }
             LinuxBirthStop::Stopped { target }
         }
@@ -721,7 +718,7 @@ fn handle_stop<P, S, D, SD>(
             {
                 state.retire_birth(&handle);
             }
-            (deps.set_forward)(false);
+
             let response = Response::Ok(ResponseKind::Stop(Stop::Stopped { pid }));
             let _ = conn.write_line(&response.to_wire_line());
         }
@@ -755,7 +752,7 @@ fn handle_cleanup<P, S, D, SD>(
         deps.spawner.kill(&h);
         state.child = Some(ManagedChild::Stopping(h));
     }
-    (deps.set_forward)(false);
+
     // Legacy cleanup has no authority over other same-user processes.
     // Only the retained child above may be stopped; never rediscover by name/PID.
     let _ = conn.write_line("OK cleaned");
@@ -952,9 +949,8 @@ fn handle_start<P, S, D, SD>(
         }
     };
     let total_started = Instant::now();
-    let forwarding_started = Instant::now();
-    (deps.set_forward)(params.common.fwd);
-    let forwarding_ms = crate::elapsed_ms(forwarding_started);
+    // Retain wire timing, but never manage host router state.
+    let forwarding_ms = 0;
     let process_prepare_started = Instant::now();
     let req = SpawnCoreRequest {
         birth: Some(birth),
@@ -995,7 +991,6 @@ fn handle_start<P, S, D, SD>(
             }
         }
         Err(SpawnError::Spawn { detail }) => {
-            (deps.set_forward)(false);
             let _ = conn.write_line(&format!("ERR start {detail}"));
         }
     }

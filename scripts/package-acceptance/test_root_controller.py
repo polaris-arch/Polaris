@@ -904,7 +904,7 @@ class StartupLifecycleTests(unittest.TestCase):
                 c.tun.collect_preflight.return_value = {'systemNamespaces': {}, 'network': {}, 'vmPreflight': vm_tun.vm_observation()}
                 obs=c.tun.collect_preflight.return_value['vmPreflight']
                 obs['stages']={name:{'state':'observed','error':'none'} for name in vm_tun.VM_STAGES}
-                obs['checks']=dict.fromkeys(vm_tun.VM_CHECKS,True);obs['managerControlGroup']='empty-root'
+                obs['checks']=dict.fromkeys(vm_tun.VM_CHECKS,True);obs['managerControlGroup']='empty-root';obs['forwarding']=[0,0]
                 c.tun.preflight.return_value = {'blocked': ['realPkexecAuthenticationPendingConfirmation']}
                 if fault == 'vm-preflight': c.tun.preflight.return_value = {'blocked': ['rootManager']}
                 c.tun.file_identity.side_effect = ValueError('PRIVATE') if fault == 'tool-identities' else None

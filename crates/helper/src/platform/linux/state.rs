@@ -105,7 +105,7 @@ pub struct SpawnedCore {
 /// start 命令的 spawn 请求（对照 Go `exec.Command(coreBin(), "run", "-c", cfg)` + Credential + AmbientCaps，:431-442）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCoreRequest {
-    /// Exact start supplies a token minted before any forwarding or spawn.
+    /// Exact start supplies a token minted before spawn.
     pub birth: Option<HelperBirthToken>,
     /// sing-box 二进制路径（已校验 == coreDir/sing-box）。
     pub binary: PathBuf,
@@ -113,7 +113,7 @@ pub struct SpawnCoreRequest {
     pub config: PathBuf,
     /// 日志文件路径（None = 不重定向）。
     pub log: Option<PathBuf>,
-    /// allowLan 转发开关。
+    /// Legacy wire compatibility only; does not authorize host router changes.
     pub fwd: bool,
     /// 父 app PID（父死看护；None = 不启看护）。
     pub parent_pid: Option<u32>,

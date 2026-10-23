@@ -414,25 +414,23 @@ fn start_failure_returns_err_start() {
 }
 
 #[test]
-fn start_with_fwd_calls_enable_ip_forwarding() {
-    let proc_ops = MockProcOps::new();
-    let snap_before = proc_ops.snapshot();
-    let h = make_helper(proc_ops.clone(), MockNetTableOps::new());
-    let _ = handle_selected(
-        &h,
-        "real-token",
-        pinned_start(
-            &h,
-            StartParams {
-                cfg: r"C:\Users\polaris\config\c.json".to_owned(),
-                log: String::new(),
-                fwd: true, // 应触发 enable_ip_forwarding
-                parent_pid: None,
-            },
-        ),
-    );
-    let snap_after = proc_ops.snapshot();
-    assert!(snap_after.ip_forward_calls > snap_before.ip_forward_calls);
+fn legacy_fwd_boolean_does_not_create_a_router_operation() {
+    use crate::platform::windows::ops::ProcOps;
+    for fwd in [false, true] {
+        for fail in [false, true] {
+            let ops = MockProcOps::new();
+            if fail {
+                ops.set_start_error(std::io::Error::other("injected spawn failure"));
+            }
+            let result = ops.start_singbox("fixture-core", "fixture-config", "", fwd);
+            assert_eq!(result.is_err(), fail);
+            if let Ok(start) = result {
+                assert_eq!(start.timing.forwarding_ms, 0);
+            }
+            assert_eq!(ops.snapshot().start_calls, 1);
+            assert_eq!(ops.snapshot().route_calls, 0);
+        }
+    }
 }
 
 // ===== stop =====

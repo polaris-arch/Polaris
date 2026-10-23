@@ -89,7 +89,7 @@ fn both_windows_cache_producers_use_native_work_and_the_app_requests_the_new_cap
         .split("fnflush_dns(")
         .nth(1)
         .unwrap()
-        .split("fnenable_ip_forwarding(")
+        .split("fnread_object_security(")
         .next()
         .unwrap();
     assert!(flush.contains("windows_dns::begin_flush"));

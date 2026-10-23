@@ -34,6 +34,11 @@ use super::system_takeover::should_clear_system_proxy_between_restart;
 use super::{ProxyRuntime, ProxyStatus, StartError};
 use crate::runtime::config::LegacyStartLease;
 
+fn gateway_start_preflight(config: &Value) -> Result<(), StartError> {
+    super::lan_gateway::check_user_config(config, super::platform_tag())
+        .map_err(|code| StartError::coded(code.to_owned(), code))
+}
+
 pub(super) enum StartLeg {
     Finished(Result<ProxyStatus, StartError>, Option<u64>),
     Superseded,
@@ -615,6 +620,7 @@ impl ProxyRuntime {
     ///
     /// **边界**：系统代理 enable / TUN / helper 提权起核**不在本批次**——见模块级声明。
     pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {
+        gateway_start_preflight(&config)?;
         self.wait_start_completion(self.explicit_start_completion(config)?)
             .await
     }
@@ -624,6 +630,7 @@ impl ProxyRuntime {
         config: Value,
         admission: super::prerequisite::StartupAdmission,
     ) -> Result<ProxyStatus, StartError> {
+        gateway_start_preflight(&config)?;
         self.wait_start_completion(self.startup_start_completion(config, admission)?)
             .await
     }
@@ -662,6 +669,12 @@ impl ProxyRuntime {
         expected_generation: Option<u64>,
         attribution: LifecycleAttribution,
     ) -> StartLeg {
+        if expected_generation.is_some_and(|generation| self.gate.generation() != generation) {
+            return StartLeg::Superseded;
+        }
+        if let Err(error) = gateway_start_preflight(&config) {
+            return StartLeg::Finished(Err(error), None);
+        }
         let (mut receiver, claim) =
             match self.guarded_start_completion(&config, expected_generation) {
                 Ok(completion) => completion,
@@ -731,6 +744,12 @@ impl ProxyRuntime {
         completion: Option<&super::prerequisite::NormalStartClaim>,
         attribution: LifecycleAttribution,
     ) -> StartLeg {
+        if expected_generation.is_some_and(|generation| self.gate.generation() != generation) {
+            return StartLeg::Superseded;
+        }
+        if let Err(error) = gateway_start_preflight(&config) {
+            return StartLeg::Finished(Err(error), None);
+        }
         if !cfg!(target_os = "android") {
             match self.desktop_shutdown.lock() {
                 Ok(closing) if *closing || self.system_proxy.session_query_active() => {
@@ -1571,6 +1590,12 @@ impl ProxyRuntime {
         config: Value,
         expected_generation: Option<u64>,
     ) -> RestartLeg {
+        if expected_generation.is_some_and(|generation| self.gate.generation() != generation) {
+            return RestartLeg::Superseded;
+        }
+        if let Err(error) = gateway_start_preflight(&config) {
+            return RestartLeg::Finished(Err(error), None);
+        }
         if !cfg!(target_os = "android") {
             match self.desktop_shutdown.lock() {
                 Ok(closing) if *closing || self.system_proxy.session_query_active() => {
@@ -1725,6 +1750,14 @@ impl ProxyRuntime {
         claim: StopClaim<'_>,
         attribution: LifecycleAttribution,
     ) -> RestartLeg {
+        if let Err(error) = gateway_start_preflight(&config) {
+            let generation = match &claim {
+                StopClaim::AlreadyClaimed(generation)
+                | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
+                StopClaim::Request(_) => None,
+            };
+            return RestartLeg::Finished(Err(error), generation);
+        }
         let already_claimed = match &claim {
             StopClaim::AlreadyClaimed(generation)
             | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
@@ -2077,6 +2110,18 @@ impl ProxyRuntime {
                         // snapshot appeared after a plain timer decided. Leave the new owner intact.
                         _ => return None,
                     };
+                    // Reject the exact selected snapshot before claiming a generation or
+                    // stopping the existing child; final generation checks again at Start.
+                    if let Err(error) =
+                        gateway_start_preflight(snapshot.as_ref().unwrap_or(desired))
+                    {
+                        self.publish_owned_restart_failure(
+                            &error,
+                            LifecycleAttribution::restart(force_id),
+                            scheduled_generation,
+                        );
+                        return None;
+                    }
                     let generation = self
                         .gate
                         .try_begin_restart(scheduled_generation, force_id)?;

@@ -893,6 +893,14 @@ impl ProxyRuntime {
             }
             _ => return self.remember_runtime_result(RuntimeApplyResult::status("rejected")),
         };
+        if let Err(code) = super::lan_gateway::check(&outcome.config, &deps.platform) {
+            let mut result = RuntimeApplyResult::status("rejected");
+            result.reasons.push(RuntimeApplyReason {
+                code,
+                path: "inbounds.tun.gateway.forwarding".into(),
+            });
+            return self.remember_runtime_result(result);
+        }
         let network_canary = outcome.network_canary;
         let mut generated = outcome.config;
         generated.polaris_windows_directory = baseline.generated.polaris_windows_directory.clone();

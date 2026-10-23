@@ -44,6 +44,7 @@ mod tls_capabilities;
 pub(crate) mod core_log;
 mod dns_takeover;
 mod hot_switch;
+mod lan_gateway;
 mod lifecycle;
 mod login_fallback;
 mod management_api;
@@ -427,6 +428,8 @@ pub mod code {
     /// Another content id/user or pending native custody occupies the helper.
     pub const HELPER_CORE_OCCUPIED: &str = "HELPER_CORE_OCCUPIED";
     /// The package payload does not match its compiled content identity.
+    pub const LAN_GATEWAY_FORWARDING_REQUIRED: &str = "LAN_GATEWAY_FORWARDING_REQUIRED";
+    pub const LAN_GATEWAY_FORWARDING_UNCONFIRMED: &str = "LAN_GATEWAY_FORWARDING_UNCONFIRMED";
     pub const CORE_BUNDLE_MISMATCH: &str = "CORE_BUNDLE_MISMATCH";
     /// The selected content id has not been installed by an administrator.
     pub const HELPER_CORE_ABSENT: &str = "HELPER_CORE_ABSENT";

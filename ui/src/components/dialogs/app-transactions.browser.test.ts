@@ -8,7 +8,9 @@ import enUS from '@/i18n/locales/en-US.json';
 // The real UI consumers run against deferred, synthetic API receipts. No native mutation/network.
 const root = path.resolve(import.meta.dirname, '../../..');
 const entry = `
-import React, { useState } from 'react';
+import React, { useState, useLayoutEffect } from 'react';
+import { flushSync } from 'react-dom';
+import { NodeMenu } from '/src/components/screens/home/NodeMenu';
 import { createRoot } from 'react-dom/client';
 import { DialogHost } from '/src/components/dialogs/DialogHost';
 import { useDialogStore } from '/src/components/dialogs/dialog-store';
@@ -232,7 +234,23 @@ function Selection() {
   test.visible = (ids) => setVisible(ids.map(id => ({ id })));
   return <><button id="select-all" onClick={actions.selectAll}>Select all</button><NodesBatchBar t={key => key} selectedIds={selectedIds} visibleServers={visible} selectAll={actions.selectAll} testSelected={() => {}} testing={false} isSubTab copyLinksBatch={() => {}} confirmArmed={null} nodeDeletion={{ deleteBatch: () => {} }} exitBatch={() => {}} /></>;
 }
+// Real React lifecycle + production NodeMenu/grouping/reveal/store components.
+// Only props are synthetic; no DOM injection, hook mock, or native IPC is used.
+function NodeMenuLifecycle() {
+  const fixtureServers = ['a', 'b'].map(id => ({id: 'node-' + id, name: 'Loop ' + id.toUpperCase(), protocol: 'socks', address: '127.0.0.1', port: 1, subscriptionId: 'fixture'}));
+  const fixtureSubscriptions = [{id: 'fixture', name: 'Package loopback', url: 'https://fixture.invalid'}];
+  const [props, setProps] = useState({open: true, servers: new URLSearchParams(location.search).has('initialGroups') ? fixtureServers : [], subscriptions: fixtureSubscriptions, selectedServerId: 'node-a', latencies: {}});
+  test.menuCommits ??= [];
+  test.menuSnapshot = () => [...document.querySelectorAll('.ns-grp')].map(el => ({label: el.querySelector('span:not(.ns-c)')?.textContent, expanded: el.getAttribute('aria-expanded')}));
+  test.menuPatch = patch => flushSync(() => setProps(prev => ({...prev, ...patch})));
+  test.menuLoad = () => test.menuPatch({servers: fixtureServers, subscriptions: fixtureSubscriptions});
+  test.menuEqualConfig = () => flushSync(() => setProps(prev => ({...prev, servers: structuredClone(prev.servers), subscriptions: structuredClone(prev.subscriptions)})));
+  test.menuNewGroup = () => flushSync(() => setProps(prev => ({...prev, selectedServerId: 'node-c', servers: [...prev.servers, {...fixtureServers[0], id: 'node-c', name: 'Loop C', subscriptionId: 'later'}], subscriptions: [...prev.subscriptions, {id: 'later', name: 'Later group', url: 'https://fixture.invalid'}]})));
+  useLayoutEffect(() => { test.menuCommits.push(test.menuSnapshot()); });
+  return <NodeMenu {...props} blockDisabledReason={null} onPick={id => {test.menuPicked = id;}} onPickDirect={() => {}} onPickBlock={() => {}} onTestAll={() => {}} onManage={() => {}} />;
+}
 createRoot(document.getElementById('root')).render(<><DialogHost />
+  {mode === 'node-menu' && <NodeMenuLifecycle />}
   {mode === 'apply' && <PendingChangesBar />}
   {mode === 'mobile-apply' && <main className="mobile-root"><MobilePendingBar /></main>}
   {mode === 'selection' && <Selection />}
@@ -267,6 +285,83 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     browser = await chromium.launch({ chromiumSandbox: true, headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
   }, 30_000);
   afterAll(async () => { await browser?.close(); await server?.close(); });
+
+  it('node menu first committed render already expands the selected group', async () => {
+    const page = await browser.newPage();
+    await page.goto(origin + '/__transactions?mode=node-menu&initialGroups=1');
+    await page.waitForFunction('window.__transactions.menuCommits?.length > 0');
+    expect(await page.evaluate('window.__transactions.menuCommits[0]')).toEqual([{label: 'Package loopback', expanded: 'true'}]);
+    await page.close();
+  });
+
+  it('node menu initializes async groups before commit and preserves explicit choices across config/status publications', async () => {
+    const page = await browser.newPage();
+    await page.goto(origin + '/__transactions?mode=node-menu');
+    await page.waitForFunction('!!window.__transactions.menuLoad');
+    await page.evaluate('window.__transactions.menuLoad()');
+    // Parent layout effect observes the committed child BEFORE passive effects.
+    // The old empty-Set + useEffect reset commits a collapsed selected group here.
+    expect(await page.evaluate('window.__transactions.menuCommits.at(-1)')).toEqual([{label: 'Package loopback', expanded: 'true'}]);
+    const group = page.locator('.ns-grp').filter({hasText: 'Package loopback'});
+    await group.click();
+    expect(await group.getAttribute('aria-expanded')).toBe('false');
+    await page.evaluate('window.__transactions.menuEqualConfig()');
+    await page.waitForFunction('window.__transactions.menuCommits.length >= 3');
+    expect(await group.getAttribute('aria-expanded')).toBe('false');
+    await page.evaluate('window.__transactions.menuPatch({selectedServerId:null,latencies:{}})');
+    expect(await group.getAttribute('aria-expanded')).toBe('false');
+    await group.click();
+    await page.evaluate('window.__transactions.menuEqualConfig()');
+    await page.evaluate('window.__transactions.menuPatch({selectedServerId:"node-b"})');
+    expect(await group.getAttribute('aria-expanded')).toBe('true');
+    await page.getByRole('option', {name: /Loop B/}).click();
+    expect(await page.evaluate('window.__transactions.menuPicked')).toBe('node-b');
+    await page.close();
+  });
+
+  it('node menu initializes only unseen async groups and resets on close/reopen', async () => {
+    const page = await browser.newPage();
+    await page.goto(origin + '/__transactions?mode=node-menu');
+    await page.waitForFunction('!!window.__transactions.menuLoad');
+    await page.evaluate('window.__transactions.menuLoad()');
+    const first = page.locator('.ns-grp').filter({hasText: 'Package loopback'});
+    await first.click();
+    await page.evaluate('window.__transactions.menuNewGroup()');
+    await page.waitForFunction('document.querySelectorAll(".ns-grp").length === 2');
+    expect(await first.getAttribute('aria-expanded')).toBe('false');
+    expect(await page.locator('.ns-grp').filter({hasText: 'Later group'}).getAttribute('aria-expanded')).toBe('true');
+    expect(await page.evaluate('window.__transactions.menuCommits.at(-1)')).toEqual([{label: 'Package loopback', expanded: 'false'}, {label: 'Later group', expanded: 'true'}]);
+    await page.locator('.ns-grp').filter({hasText: 'Later group'}).click();
+    await page.evaluate('window.__transactions.menuPatch({open:false})');
+    expect(await page.locator('#node-menu').getAttribute('hidden')).not.toBeNull();
+    await page.evaluate('window.__transactions.menuPatch({open:true})');
+    expect(await page.evaluate('window.__transactions.menuCommits.at(-1)')).toEqual([{label: 'Package loopback', expanded: 'false'}, {label: 'Later group', expanded: 'true'}]);
+    await page.close();
+  });
+
+  it('node menu search temporarily expands without destroying saved collapse intent', async () => {
+    const page = await browser.newPage();
+    await page.goto(origin + '/__transactions?mode=node-menu');
+    await page.waitForFunction('!!window.__transactions.menuLoad');
+    await page.evaluate('window.__transactions.menuLoad()');
+    // Eight real fixture rows expose the production search input.
+    await page.evaluate('window.__transactions.menuPatch({servers:Array.from({length:8},(_,i)=>({id:"node-"+i,name:"Loop "+i,protocol:"socks",address:"127.0.0.1",port:1,subscriptionId:"fixture"})),selectedServerId:null})');
+    const group = page.locator('.ns-grp');
+    // Existing group preserves its initial true state until explicitly collapsed.
+    await group.click();
+    expect(await group.getAttribute('aria-expanded')).toBe('false');
+    await page.locator('#nm-search-inp').fill('Loop 1');
+    expect(await group.getAttribute('aria-expanded')).toBe('true');
+    expect(await page.getByRole('option').count()).toBe(1);
+    await page.locator('#nm-search-inp').fill('');
+    expect(await group.getAttribute('aria-expanded')).toBe('false');
+    await page.locator('#nm-search-inp').fill('Loop');
+    await page.evaluate('window.__transactions.menuPatch({open:false})');
+    await page.evaluate('window.__transactions.menuPatch({open:true})');
+    expect(await page.locator('#nm-search-inp').inputValue()).toBe('');
+    expect(await group.getAttribute('aria-expanded')).toBe('false');
+    await page.close();
+  });
 
   it('late VPN success closes its own instance, never a new challenge on top', async () => {
     const page = await browser.newPage();

@@ -1613,6 +1613,16 @@ impl ProxyRuntime {
                         self.set_error(&e, code::MESH_INBOUND_SYSTEM_INTERFACE);
                         return Err(StartError::coded(e, code::MESH_INBOUND_SYSTEM_INTERFACE));
                     }
+                    if let Some(gateway_code) = [
+                        code::LAN_GATEWAY_FORWARDING_REQUIRED,
+                        code::LAN_GATEWAY_FORWARDING_UNCONFIRMED,
+                    ]
+                    .into_iter()
+                    .find(|code| e == *code)
+                    {
+                        self.set_error(&e, gateway_code);
+                        return Err(StartError::coded(e, gateway_code));
+                    }
                     return Err(e.into());
                 }
             };
@@ -2828,7 +2838,7 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         _binary: &Path,
         config_path: &Path,
-        user_config: &UserConfig,
+        _user_config: &UserConfig,
         my_gen: u64,
         main_reservation: &mut crate::runtime::tailscale_login_core::MainReservation<'_, '_>,
     ) -> Result<Option<u32>, StartError> {
@@ -2906,8 +2916,8 @@ impl ProxyRuntime {
             .map_err(|error| error.to_string())??
         };
         let log_path = self.config.join(SINGBOX_STARTUP_LOG);
-        // fwd = allowLan（helper 侧开 IP 转发；上游 `forward = !!currentConfig.allowLan`）。
-        let fwd = user_config.allow_lan.unwrap_or(false);
+        // Legacy wire field: LAN proxy listening never owns host router state.
+        let fwd = false;
         // 父死看护：把 app pid 交 helper，app 崩溃时 helper 收割受管核（防孤儿）。
         let ppid = Some(std::process::id());
         let helper = Arc::clone(&self.helper);
@@ -4117,6 +4127,7 @@ impl ProxyRuntime {
                 &mut gen_out.config,
                 self.config.dir(),
             )?;
+            super::lan_gateway::check(&gen_out.config, &deps.platform).map_err(str::to_owned)?;
             capabilities.validate_config(
                 &serde_json::to_value(&gen_out.config).map_err(|e| e.to_string())?,
             )?;

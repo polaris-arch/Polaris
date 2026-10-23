@@ -607,3 +607,16 @@ describe('durable desired owner conflicts', () => {
     }
   });
 });
+
+
+describe('routed LAN prerequisites remain localized and fail closed', () => {
+  it.each([
+    ['LAN_GATEWAY_FORWARDING_REQUIRED', 'errors.lanGatewayForwardingRequired'],
+    ['LAN_GATEWAY_FORWARDING_UNCONFIRMED', 'errors.lanGatewayForwardingUnconfirmed'],
+  ])('%s maps only the exact gateway reason', (code, key) => {
+    expect(applyOutcome('rejected', [{ code, path: 'inbounds.tun.gateway.forwarding' }]))
+      .toEqual({ phase: 'failed', toast: { kind: 'error', key } });
+    expect(applyOutcome('rejected', [{ code, path: 'unrelated' }]))
+      .toEqual({ phase: 'failed', toast: { kind: 'error', key: 'home.pendingHotRejected' } });
+  });
+});

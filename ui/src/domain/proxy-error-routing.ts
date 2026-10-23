@@ -240,6 +240,11 @@ export function handleProxyErrorEvent(
   // 提权助手里的内核与本应用不配套（或确认不了）：起核前被拒绝，或起核后被自证停掉 —— 两种都是
   // 核**不在跑**（终态）⇒ 必须 refreshProxyStatus。起核前那一种是后端**双出口**，处置与上一支逐条
   // 相同（认领期内让位给发起方的 await 腿）；起核后停核那一种发生在后台，没有人 await，只有这里报。
+  if (data.errorCode === 'LAN_GATEWAY_FORWARDING_REQUIRED' || data.errorCode === 'LAN_GATEWAY_FORWARDING_UNCONFIRMED') {
+    void refreshProxyStatus();
+    if (!isProxyStartClaimed()) toast.error(proxyErrorText(data, t));
+    return;
+  }
   const contentErrorNotification: Readonly<Record<string, string>> = {
     CORE_BUNDLE_MISMATCH: 'coreBundleMismatch',
     HELPER_CORE_OCCUPIED: 'helperCoreOccupied',

@@ -49,7 +49,6 @@ use std::time::Duration;
 
 use crate::platform::accept_retry::{LogThrottle, ACCEPT_LOG_INTERVAL};
 use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
-use crate::platform::linux::ops::set_forward_prod;
 use crate::platform::linux::state::{
     BirthAdmission, CoreHandle, CoreSpawner, HandlerState, ManagedChild, ReapBlockerState,
     SpawnCoreRequest, SpawnError, SpawnedCore, StartAdmission, StopReap,
@@ -171,11 +170,6 @@ pub fn ss_lookup(port: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// IP 转发开关闭包（生产 = set_forward_prod，对齐 Go setForward）。
-pub fn forward_fn() -> fn(bool) {
-    set_forward_prod
 }
 
 // ===== L16 AmbientCaps 常量 + 集（对照 Go `helper-linux/helper.go:51-55,441`）=====
@@ -1319,9 +1313,7 @@ impl ConnServer {
             let _permit = permit;
             let peer = CapturedPeerCred(cred);
             let ss_fn = ss_lookup;
-            let fwd_fn = set_forward_prod;
             let ss: &(dyn Fn(&str) -> Option<String> + Send + Sync) = &ss_fn;
-            let fwd: &(dyn Fn(bool) + Send + Sync) = &fwd_fn;
             let deps = HandlerDeps {
                 #[cfg(test)]
                 test_core: None,
@@ -1333,7 +1325,6 @@ impl ConnServer {
                 systemd: &this.systemd,
                 resolved_dns: &this.resolved_dns,
                 ss_provider: ss,
-                set_forward: fwd,
             };
             let state: &Mutex<HandlerState> = &this.state;
             let mut conn = LineConn::new(std_stream);
@@ -1342,7 +1333,7 @@ impl ConnServer {
     }
 
     /// SIGTERM 退出兜底（Go main reaper，`main.go:46-54`）：同步 terminate 当前 child（TERM→≤5s→KILL）+
-    /// waitReaps 等在途后台 terminate 归零。调用方随后 `set_forward_prod(false)`（对齐 `main.go:55`）。
+    /// waitReaps 等在途后台 terminate 归零。No host forwarding mutation is performed.
     pub fn reap_on_shutdown(&self) -> bool {
         let child = {
             let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);

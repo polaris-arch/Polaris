@@ -42,7 +42,7 @@ def good_facts():
     return {'githubHosted': True, 'dedicatedVM': True, 'pid1Systemd': True,
             'rootManager': True, 'tunDevice': True, 'pidfd': True,
             'sameSystemNamespaces': True, 'toolsRootOwned': True,
-            'guiUid': 1001, 'noNewPrivs': 0, 'forwarding': [0, 0],
+            'guiUid': 1001, 'noNewPrivs': 0, 'forwarding': [0, 0], 'forwardingStable': True,
             'existingProductPaths': [], 'unsafeEnvironment': [], 'routes': [],
             'networkSnapshotComplete': True, 'materialsDownloaded': True}
 
@@ -176,7 +176,7 @@ class PreflightTests(unittest.TestCase):
         c = carrier(); c['kernelCommit'] = '8' * 40
         self.assertIn('c6CompleteCarrierAdmission', tun.preflight(good_facts(), c, True)['blocked'])
     def test_root_gui_sandbox_and_sysctl_rejected(self):
-        facts = good_facts(); facts.update(guiUid=0, forwarding=[1, 0], unsafeEnvironment=['LD_PRELOAD'])
+        facts = good_facts(); facts.update(guiUid=0, forwarding=[2, 0], unsafeEnvironment=['LD_PRELOAD'])
         result = tun.preflight(facts, carrier(), True)
         self.assertIn('ordinaryGUI', result['blocked']); self.assertIn('freshProductAndDefaultSandbox', result['blocked'])
     def test_existing_reserved_rules_table_and_tun_block(self):
@@ -474,7 +474,7 @@ class VMObservationTests(unittest.TestCase):
             hit('network')
             if fault and fault.startswith('network:'):
                 kwargs['progress'](fault.split(':')[1]); raise ValueError('PRIVATE')
-            return {'route4': [], 'route6': []}
+            return {'route4': [], 'route6': [], 'forwarding': [0,0]}
         def tables(*args): hit('route-tables'); return []
         ops = Mock()
         def manager(*args): hit('manager'); return 'ControlGroup=\n'
@@ -558,10 +558,21 @@ class VMObservationTests(unittest.TestCase):
         obs['stages']['gate']={'state':'observed','error':'none'}
         with self.assertRaises(ValueError):tun.validate_vm_observation(obs)
         obs['stages']={name:{'state':'observed','error':'none'} for name in tun.VM_STAGES}
-        obs['checks']=dict.fromkeys(tun.VM_CHECKS,True);obs['managerControlGroup']='empty-root'
+        obs['checks']=dict.fromkeys(tun.VM_CHECKS,True);obs['managerControlGroup']='empty-root';obs['forwarding']=[0,0]
         tun.validate_vm_observation(obs)
         obs['checks']['networkSnapshotComplete']=None
         with self.assertRaises(ValueError):tun.validate_vm_observation(obs)
+
+    def test_supported_baselines_are_not_normalized_and_invalid_or_drift_is_blocked(self):
+        for initial in ([0,0],[1,0],[0,1],[1,1]):
+            facts=good_facts();facts['forwarding']=list(initial)
+            self.assertEqual(tun.preflight(facts,carrier())['blocked'],['realPkexecAuthenticationPendingConfirmation'])
+            self.assertEqual(facts['forwarding'],initial)
+        for invalid in (None,[],[0],[0,0,0],[True,0],[1.0,0],[2,0],['1',0]):
+            facts=good_facts();facts['forwarding']=invalid
+            self.assertIn('VMPrivilegesOrForwardingBaseline',tun.preflight(facts,carrier())['blocked'])
+        facts=good_facts();facts['forwardingStable']=False
+        self.assertIn('VMPrivilegesOrForwardingBaseline',tun.preflight(facts,carrier())['blocked'])
 
     def test_exception_classes_are_fixed(self):
         for e,wanted in ((FileNotFoundError('PRIVATE'),'OSError'),(subprocess.TimeoutExpired('secret',1),'SubprocessError'),
