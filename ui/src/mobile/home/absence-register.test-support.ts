@@ -282,6 +282,14 @@ export const HOME_PARITY: ScreenParityRegister = {
       note: '出口选择面板。桌面是下拉，移动端是从底部升起的 sheet（带搜索），承担同一件事。',
     },
     {
+      id: 'OpenNodeMenu',
+      disposition: {
+        kind: 'ported',
+        mobile: { file: 'ui/src/mobile/home/HomeNodePickerList.tsx', mustContain: 'groupServersBySubscription' },
+      },
+      note: 'NodeMenu 打开期间的内部内容与分组状态所有者，不是新增能力面。移动端同一出口选择 sheet 的 HomeNodePickerList 承载真实来源分组、搜索和节点选择；桌面关闭卸载内部状态、重开初始化默认展开，不豁免这一实际数据块。',
+    },
+    {
       id: 'ReverseRoutingBadge',
       disposition: {
         kind: 'ported',

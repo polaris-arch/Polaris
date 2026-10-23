@@ -1127,5 +1127,71 @@ process.stdout.write(JSON.stringify(value));
         self.assertNotIn('button[role=switch]',source)
         self.assertNotIn('dispatchEvent(',source)
 
+
+class DriverObservationTests(unittest.TestCase):
+    def test_disconnect_is_retained_without_retry_and_later_read_does_not_erase_it(self):
+        import http.client
+        driver = M.WebDriver(1); driver.session = 'SECRET-SESSION'
+        with patch.object(driver, '_request', side_effect=[http.client.RemoteDisconnected('SECRET-REMOTE'), 'synthetic-image']) as request:
+            with self.assertRaises(http.client.RemoteDisconnected):
+                driver.invoke('proxy_get_status', {'secret': 'SECRET-ARG'})
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(driver.request('GET', driver.path('/screenshot')), 'synthetic-image')
+        first = driver.observation['firstFailure']
+        self.assertEqual((first['route'], first['command'], first['error']),
+                         ('/execute/async', 'proxy_get_status', 'RemoteDisconnected'))
+        self.assertEqual(first['callback'], 'not-observed')
+        self.assertEqual(driver.observation['requests'][1]['state'], 'decoded')
+        self.assertNotIn('SECRET', json.dumps(driver.observation))
+        self.assertIsNone(driver._observed_command)
+
+    def test_http_error_retains_status_and_whitelisted_protocol_without_remote_text(self):
+        import io
+        driver = M.WebDriver(1); driver.session = 'SECRET-SESSION'
+        error = M.urllib.error.HTTPError('http://SECRET', 500, 'SECRET', {},
+            io.BytesIO(json.dumps({'value': {'error': 'script timeout', 'message': 'SECRET'}}).encode()))
+        with patch.object(M.urllib.request, 'build_opener') as opener:
+            opener.return_value.open.side_effect = error
+            with self.assertRaises(M.GuiFailure): driver.invoke('proxy_get_status')
+        row = driver.observation['firstFailure']
+        self.assertEqual((row['httpStatus'], row['protocol']), (500, 'script timeout'))
+        self.assertNotIn('SECRET', json.dumps(driver.observation))
+
+    def test_stopped_bridge_read_is_not_treated_as_a_transport_failure(self):
+        driver = M.WebDriver(1); driver.session = 'private'
+        status = {'running': False, 'actualServerId': None}
+        with patch.object(driver, '_request', return_value={'ok': True, 'data': status}):
+            self.assertEqual(driver.invoke('proxy_get_status'), status)
+        row = driver.observation['requests'][0]
+        self.assertEqual((row['state'], row['callback']), ('decoded', 'returned'))
+        self.assertNotIn('firstFailure', driver.observation)
+
+    def test_observation_budget_keeps_first_failure_beyond_request_budget(self):
+        import http.client
+        driver = M.WebDriver(1); driver.session = 'private'
+        with patch.object(driver, '_request', return_value=None):
+            for _ in range(130): driver.request('GET', '/status')
+        with patch.object(driver, '_request', side_effect=http.client.RemoteDisconnected()):
+            with self.assertRaises(http.client.RemoteDisconnected): driver.request('GET', '/status')
+        self.assertEqual(len(driver.observation['requests']), 128)
+        self.assertTrue(driver.observation['truncated'])
+        self.assertEqual(driver.observation['firstFailure']['error'], 'RemoteDisconnected')
+
+    def test_failure_process_snapshot_never_adopts_signals_or_records_raw_process_fields(self):
+        import threading
+        item = {'pid': 123, 'startTime': '42', 'uid': 1001, 'ppid': 1, 'cmdline': 'SECRET'}
+        child = Mock(); child.poll.return_value = None
+        run = M.CarrierRun.__new__(M.CarrierRun); run.result = {}; run.driver = M.WebDriver(1)
+        run.supervisor = SimpleNamespace(lock=threading.RLock(), owned={123:item},
+                                        roles={123:'driver'}, children={123:child})
+        with patch.object(M, 'process_identity', return_value=item): run.capture_driver_failure()
+        row = run.result['failureProcessObservation']['processes'][0]
+        self.assertEqual(row, {'pid':123,'startTime':'42','role':'driver','identity':'same-birth-uid','childState':'running'})
+        self.assertNotIn('SECRET', json.dumps(run.result))
+        child.kill.assert_not_called(); child.terminate.assert_not_called()
+        with patch.object(M, 'process_identity', side_effect=OSError('SECRET')): run.capture_driver_failure()
+        self.assertEqual(run.result['failureProcessObservation']['processes'][0]['identity'], 'unknown')
+        self.assertNotIn('SECRET', json.dumps(run.result))
+
 if __name__ == '__main__':
     unittest.main()

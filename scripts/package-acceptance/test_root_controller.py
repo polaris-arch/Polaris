@@ -412,7 +412,7 @@ class CredentialTests(unittest.TestCase):
              patch.object(m, 'setting_intent'), patch.object(m, 'independent_record'), \
              patch.object(m.subprocess, 'Popen', return_value=writer), patch.object(m.os, 'pidfd_open', return_value=99), \
              patch.object(m.os, 'close'), patch.object(m.signal, 'pidfd_send_signal') as stop, \
-             patch.object(m, 'relock_account', return_value={'finalPasswordStatus': 'L'}) as relock:
+             patch.object(m, 'relock_account', return_value=credential_proof()) as relock:
             with self.assertRaises(subprocess.TimeoutExpired): lease.open()
             stop.assert_called_once_with(99, signal.SIGKILL); relock.assert_called_once()
             self.assertTrue(lease.closed); self.assertFalse(lease.secret)
@@ -426,7 +426,7 @@ class CredentialTests(unittest.TestCase):
     def test_lease_close_locks_before_broken_ledger(self):
         c = controller(m.AUTH_MODE); lease = m.CredentialLease(c, 'install'); lease.attempted = True; lease.secret = bytearray(b'private')
         c.ledger.mutate = Mock(side_effect=OSError('ledger unavailable'))
-        with patch.object(m, 'relock_account', return_value={'finalPasswordStatus': 'L'}) as relock:
+        with patch.object(m, 'relock_account', return_value=credential_proof()) as relock:
             with self.assertRaises(OSError): lease.close()
             relock.assert_called_once(); self.assertFalse(lease.secret)
     def test_auth_cleanup_never_kills_other_birth(self):
@@ -631,20 +631,20 @@ class EntryAndConcurrencyTests(unittest.TestCase):
             lease.pump()
         write.assert_not_called();lease.close.assert_called_once();self.assertFalse(lease.authenticated)
     def test_close_concurrency_is_serial_and_no_duplicate_relock(self):
-        c=controller(m.AUTH_MODE);lease=m.CredentialLease(c,'install');lease.attempted=True
+        c=controller(m.AUTH_MODE);c.auth_reached('lease-account','install');lease=m.CredentialLease(c,'install');lease.attempted=True
         c.ledger.value['authentication']['lease']={};c.ops.run.return_value='inactive'
-        with patch.object(m,'relock_account',return_value={'finalPasswordStatus':'L'}) as relock:
+        with patch.object(m,'relock_account',return_value=credential_proof()) as relock:
             lease.close();lease.close()
         relock.assert_called_once();self.assertTrue(lease.closed)
     def test_stuck_private_worker_still_relocks_before_failure(self):
-        c=controller(m.AUTH_MODE);lease=m.CredentialLease(c,'install');lease.attempted=True;lease.secret=bytearray(b'private')
+        c=controller(m.AUTH_MODE);c.auth_reached('lease-account','install');lease=m.CredentialLease(c,'install');lease.attempted=True;lease.secret=bytearray(b'private')
         lease.thread=Mock();lease.thread.is_alive.return_value=True;c.ops.run.return_value='inactive'
         c.ledger.value['authentication']['lease']={}
-        with patch.object(m,'relock_account',return_value={'finalPasswordStatus':'L'}) as relock:
+        with patch.object(m,'relock_account',return_value=credential_proof()) as relock:
             with self.assertRaises(ValueError):lease.close()
-        relock.assert_called_once();self.assertFalse(lease.secret);self.assertFalse(lease.closed)
+        relock.assert_called_once();self.assertFalse(lease.secret);self.assertFalse(lease.closed);c.ops.run.assert_not_called()
     def main_fixture(self, dispatch_error=False, finish=False):
-        c=Mock();c.finished=False;c.seq=1
+        c=Mock();c.finished=False;c.seq=1;c.auth_snapshot.return_value=m.auth_runtime_observation('existing-session')
         def dispatch(_):
             if dispatch_error:raise ValueError('PRIVATE SECRET MUST NOT BE PRINTED')
             if finish:c.finished=True
@@ -1020,9 +1020,19 @@ class GroupLeaseAuthorityTests(unittest.TestCase):
             spawn.assert_not_called()
 
 
+
+def credential_proof():
+    return {'account':'runner','guiUid':1001,'finalPasswordStatus':'L','emptyPasswordRestored':False,
+            'plaintextPersisted':False,'temporaryPasswordHash':'locked until disposable VM destruction'}
+
+def membership_proof():
+    return {'schema':'polaris-sudo-membership-recovery-v1','account':'runner','guiUid':1001,
+            'group':'sudo','groupGid':451,'originalMembership':'absent','finalMembership':'absent',
+            'removedOnlyAddedMembership':True,'writerStopped':True,'maxLeaseSeconds':90}
+
 class GroupLeaseRecoveryTests(unittest.TestCase):
     def lease(self):
-        c=group_controller();lease=m.CredentialLease(c,'install');c.lease=lease
+        c=group_controller();c.auth_reached('lease-account','install');lease=m.CredentialLease(c,'install');c.lease=lease
         lease.attempted=True;lease.group_intent_written=True;lease.group_timer_verified=True
         c.ledger.value['authentication']['lease']={};c.ops.run.return_value='inactive'
         return c,lease
@@ -1030,15 +1040,15 @@ class GroupLeaseRecoveryTests(unittest.TestCase):
     def test_relock_remove_independent_and_failure_keeps_timer(self):
         for fail in ('lock','remove','lineage'):
             c,lease=self.lease();events=[];c.auth_observer=Mock()
-            c.auth_observer.close.side_effect=ValueError('PRIVATE') if fail=='lineage' else lambda:events.append('lineage') or {'ownedBirths':[]}
+            c.auth_observer.close.side_effect=ValueError('PRIVATE') if fail=='lineage' else lambda:events.append('lineage') or {'ownedBirths':[],'unknownAdoptedChildren':[],'forced':False}
             def lock(*a):
                 events.append('lock')
                 if fail=='lock':raise ValueError('PRIVATE')
-                return {'finalPasswordStatus':'L'}
+                return credential_proof()
             def remove(*a):
                 events.append('remove')
                 if fail=='remove':raise ValueError('PRIVATE')
-                return {'finalMembership':'absent'}
+                return membership_proof()
             with patch.object(m,'relock_account',side_effect=lock),patch.object(m,'recover_group_membership',side_effect=remove):
                 with self.subTest(fail=fail),self.assertRaises(ValueError):lease.close()
             self.assertLess(events.index('lock'),events.index('remove'));c.ops.run.assert_not_called()
@@ -1047,17 +1057,17 @@ class GroupLeaseRecoveryTests(unittest.TestCase):
 
     def test_success_closes_timer_only_after_both_proofs(self):
         c,lease=self.lease();events=[]
-        with patch.object(m,'relock_account',side_effect=lambda *a:events.append('lock') or {'finalPasswordStatus':'L'}), \
-             patch.object(m,'recover_group_membership',side_effect=lambda *a:events.append('remove') or {'finalMembership':'absent'}), \
+        with patch.object(m,'relock_account',side_effect=lambda *a:events.append('lock') or credential_proof()), \
+             patch.object(m,'recover_group_membership',side_effect=lambda *a:events.append('remove') or membership_proof()), \
              patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}),patch.object(m,'write_group_closed'):
             lease.close()
         self.assertEqual(events,['lock','remove']);self.assertTrue(lease.closed)
-        self.assertEqual(c.ledger.value['authentication']['lease']['groupRecovery'],{'finalMembership':'absent'})
+        self.assertEqual(c.ledger.value['authentication']['lease']['groupRecovery'],membership_proof())
         self.assertEqual(c.ops.run.call_args_list[0].args[0][1],'stop')
 
     def test_group_restore_without_password_intent_does_not_lock(self):
         c,lease=self.lease();lease.attempted=False
-        with patch.object(m,'relock_account') as lock,patch.object(m,'recover_group_membership',return_value={'finalMembership':'absent'}) as remove:
+        with patch.object(m,'relock_account') as lock,patch.object(m,'recover_group_membership',return_value=membership_proof()) as remove:
             lease.close();lock.assert_not_called();remove.assert_called_once()
 
     def test_missing_writer_evidence_cannot_be_clean(self):
@@ -1077,7 +1087,7 @@ class GroupLeaseRecoveryTests(unittest.TestCase):
             self.assertEqual(writer.call_args.args[-2],'remove')
 
     def test_old_close_never_reads_or_writes_groups(self):
-        c=controller(m.AUTH_MODE);lease=m.CredentialLease(c,'install');c.ops.run.return_value='inactive'
+        c=controller(m.AUTH_MODE);c.auth_reached('lease-account','install');lease=m.CredentialLease(c,'install');c.ops.run.return_value='inactive'
         with patch.object(m,'group_binding') as binding,patch.object(m,'run_group_writer') as writer,patch.object(m,'recover_group_membership') as recover:
             lease.close();binding.assert_not_called();writer.assert_not_called();recover.assert_not_called()
 
@@ -1334,7 +1344,7 @@ class FixedJointBudgetTests(unittest.TestCase):
 
     def test_overdue_normal_recovery_never_cancels_timer_or_writes_closed(self):
         c,lease=GroupLeaseRecoveryTests().lease();lease.group_deadline=time.monotonic()-1
-        with patch.object(m,'relock_account',return_value={'finalPasswordStatus':'L'}), \
+        with patch.object(m,'relock_account',return_value=credential_proof()), \
              patch.object(m,'recover_group_membership',return_value={'finalMembership':'absent'}),patch.object(m,'write_group_closed') as closed:
             with self.assertRaises(ValueError):lease.close()
         self.assertIn('joint-lease-deadline-exceeded',c.recovery_unknown)
@@ -1477,7 +1487,7 @@ class VMPreparationDiagnosticTests(unittest.TestCase):
         with self.assertRaises(ValueError):m.validate_abort_receipt(r,vm_validator=vm_tun.validate_vm_observation)
 
     def test_root_ipc_preserves_safe_observation(self):
-        c=Mock();c.finished=False;c.seq=1;c.readonly_auth=None;c.stage='vm-preflight'
+        c=Mock();c.finished=False;c.seq=1;c.auth_snapshot.return_value=m.auth_runtime_observation('existing-session');c.readonly_auth=None;c.stage='vm-preflight'
         c.vm_preflight=vm_tun.vm_observation();c.vm_preflight['gate']='failed'
         c.vm_preflight['stages']['gate']={'state':'failed','error':'ValueError'}
         c.tun.validate_vm_observation=vm_tun.validate_vm_observation
@@ -1492,5 +1502,173 @@ class VMPreparationDiagnosticTests(unittest.TestCase):
         self.assertEqual(response['error']['vmPreflight'],c.vm_preflight)
         self.assertNotIn('PRIVATE',out.getvalue());c.abort.assert_called_once()
 
+
+class AuthenticationRecoveryObservationTests(unittest.TestCase):
+    def grouped(self):
+        c=group_controller();c.auth_reached('password-writer','install')
+        c.lease=m.CredentialLease(c,'install');c.lease.attempted=True
+        c.lease.group_intent_written=True;c.lease.group_timer_verified=True
+        c.ledger.value['authentication']['lease']={};c.ops.run.return_value='inactive'
+        return c,c.lease
+
+    def test_diagnostics_failure_never_blocks_lease_recovery(self):
+        c=controller(m.AUTH_MODE);c.lease=Mock()
+        with patch.object(c,'auth_failed',side_effect=ValueError('PRIVATE')):c.fail()
+        c.lease.close.assert_called_once()
+        self.assertIn('authentication-recovery-record-unknown',c.recovery_unknown)
+
+    def test_partial_proofs_survive_lineage_failure_and_abort(self):
+        c,l=self.grouped();c.auth_observer=Mock();c.auth_observer.close.side_effect=ValueError('PRIVATE')
+        c.tun.cleanup.return_value={'state':'failed'}
+        with patch.object(m,'relock_account',return_value=credential_proof()), \
+             patch.object(m,'recover_group_membership',return_value=membership_proof()),patch.object(m,'close_transactions'):
+            result=c.abort()
+        observed=result['authenticationRuntime'];m.validate_auth_runtime_observation(observed)
+        self.assertEqual(observed['credentialRecovery'],credential_proof())
+        self.assertEqual(observed['groupRecovery'],membership_proof())
+        self.assertEqual(result['state'],'failed');self.assertTrue(result['unknown'])
+        self.assertEqual(observed['firstFailure'],{'stage':'password-writer','code':'abort-requested'})
+        self.assertNotIn('PRIVATE',json.dumps(result));c.ops.run.assert_not_called()
+
+    def test_late_writer_requires_fresh_relock_on_second_close(self):
+        c,l=self.grouped();l.writer=Mock();l.writer.poll.return_value=None;l.writer_fd=77
+        l.writer.wait.side_effect=[TimeoutError('PRIVATE'),0];l.group_deadline=time.monotonic()+80
+        with patch.object(m.signal,'pidfd_send_signal'),patch.object(m.os,'close'), \
+             patch.object(m,'relock_account',return_value=credential_proof()) as lock, \
+             patch.object(m,'recover_group_membership',return_value=membership_proof()) as remove, \
+             patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}),patch.object(m,'write_group_closed'):
+            with self.assertRaises(ValueError):l.close()
+            # First lock/absence proof predates a possible late writer: never use it to skip work.
+            l.writer_fd=78
+            l.close()
+        self.assertEqual(lock.call_count,2);self.assertEqual(remove.call_count,2)
+        self.assertTrue(l.closed);self.assertIn('credential-writer-stop-unproved',c.recovery_unknown)
+
+    def test_ledger_failure_keeps_independent_remove_and_timer(self):
+        c,l=self.grouped();c.ledger.mutate=Mock(side_effect=OSError('PRIVATE'))
+        with patch.object(m,'relock_account',return_value=credential_proof()) as lock, \
+             patch.object(m,'recover_group_membership',return_value=membership_proof()) as remove:
+            with self.assertRaises(ValueError):l.close()
+        lock.assert_called_once();remove.assert_called_once();c.ops.run.assert_not_called()
+        observed=c.auth_snapshot();self.assertEqual(observed['persistence'],'unknown')
+        self.assertEqual(observed['groupRecovery'],membership_proof())
+
+    def test_each_restoration_failure_does_not_skip_other(self):
+        for broken in ('credential','group'):
+            c,l=self.grouped()
+            with self.subTest(broken=broken), \
+                 patch.object(m,'relock_account',side_effect=ValueError('PRIVATE') if broken=='credential' else lambda *a:credential_proof()) as lock, \
+                 patch.object(m,'recover_group_membership',side_effect=ValueError('PRIVATE') if broken=='group' else lambda *a:membership_proof()) as remove:
+                with self.assertRaises(ValueError):l.close()
+            lock.assert_called_once();remove.assert_called_once();c.ops.run.assert_not_called()
+            self.assertEqual(c.auth_snapshot()['recovery'][broken],'unknown')
+
+    def test_abort_observer_failure_still_attempts_exact_agent_auth_product(self):
+        for broken in ('observer','retention'):
+            c=controller(m.AUTH_MODE);c.auth_reached('lineage-start','install');events=[]
+            c.auth_observer=Mock();c.auth_observer.close.return_value={'ownedBirths':[],'unknownAdoptedChildren':[],'forced':True}
+            if broken=='observer':c.auth_observer.close.side_effect=ValueError('PRIVATE')
+            c.tun.cleanup.side_effect=lambda *a,**kw:events.append('product') or {'state':'failed'}
+            with self.subTest(broken=broken),patch.object(c,'retain_auth_lineage',side_effect=ValueError('PRIVATE')), \
+                 patch.object(c,'fence_registered_agent',side_effect=lambda:events.append('fence')), \
+                 patch.object(m,'close_auth',side_effect=lambda *a,**kw:events.append('auth')),patch.object(m,'close_transactions'):
+                result=c.abort()
+            self.assertEqual(events,['fence','auth','product']);self.assertTrue(result['unknown'])
+
+    def test_initial_scan_failure_never_joins_unstarted_or_claims_complete(self):
+        c=controller(m.AUTH_MODE);c.ledger.value['authentication']['agent']={'identity':identity(80)}
+        observer=m.AuthObserver(c,'install')
+        with patch.object(observer,'scan',side_effect=ValueError('PRIVATE')):
+            with self.assertRaises(ValueError):observer.start()
+        with patch.object(observer,'scan'),patch.object(observer.thread,'join') as join, \
+             patch.object(m,'stop_recorded') as stop,patch.object(m.Path,'iterdir',return_value=[]):
+            with self.assertRaises(ValueError):observer.close()
+        join.assert_not_called();stop.assert_called_once();self.assertTrue(observer.stop.is_set())
+
+    def test_intentional_agent_exit_not_natural_early_exit(self):
+        for deliberate in (False,True):
+            c=controller(m.AUTH_MODE);c.auth_reached('lineage-start','install');old=identity(80)
+            c.agent=Mock(pid=80);c.agent.wait.return_value=-signal.SIGTERM
+            c.ledger.value['authentication']['agent']={'identity':old}
+            with patch.object(m,'stop_recorded',return_value=False),patch.object(m,'proc_absent',return_value=True):
+                if deliberate:c.fence_registered_agent()
+                if deliberate:m.close_auth(c.ledger,c.tun,forced=True)
+                else:
+                    with self.assertRaises(ValueError):m.close_auth(c.ledger,c.tun,forced=True)
+            self.assertEqual('authentication-agent-exited-early' in c.ledger.value['unknown'],not deliberate)
+
+    def test_first_failure_survives_abort_and_failed_persistence(self):
+        c=controller(m.AUTH_MODE);c.auth_reached('agent-notify','install');c.auth_failed()
+        c.lease=Mock();c.lease.close.side_effect=ValueError('PRIVATE');c.tun.cleanup.return_value={'state':'failed'}
+        with patch.object(m,'close_transactions'):
+            first=c.abort();second=c.abort()
+        self.assertEqual(first['authenticationRuntime']['firstFailure'],second['authenticationRuntime']['firstFailure'])
+        self.assertEqual(second['authenticationRuntime']['firstFailure']['stage'],'agent-notify')
+        self.assertTrue(second['unknown']);self.assertEqual(second['state'],'failed')
+
+    def test_last_timer_diagnostic_persistence_failure_permanently_blocks_finish(self):
+        c,l=self.grouped();original=c.ledger.mutate
+        def mutate(change):
+            if c.auth_runtime['recovery']['timer']=='completed':raise OSError('PRIVATE')
+            return original(change)
+        c.ledger.mutate=mutate
+        with patch.object(m,'relock_account',return_value=credential_proof()), \
+             patch.object(m,'recover_group_membership',return_value=membership_proof()), \
+             patch.object(m,'read_group_intent',return_value={'binding':c.group_binding}),patch.object(m,'write_group_closed'):
+            l.close()
+        self.assertTrue(l.closed);self.assertIn('authentication-recovery-record-unknown',c.recovery_unknown)
+        c.ledger.value.update(phase='closed',forcedCleanup=False,unknown=[])
+        c.ledger.value['authentication']['closed']=True
+        with self.assertRaises(ValueError):c.finish()
+        c.tun.cancel_watchdog.assert_not_called()
+        with self.assertRaises(ValueError):c.auth_reached('transaction-guard','uninstall')
+        self.assertEqual(c.auth_snapshot()['persistence'],'unknown')
+
+    def test_fresh_recovery_failure_invalidates_previous_current_proof(self):
+        c,l=self.grouped();c.auth_observer=Mock();c.auth_observer.close.side_effect=ValueError('lineage')
+        with patch.object(m,'relock_account',return_value=credential_proof()), \
+             patch.object(m,'recover_group_membership',return_value=membership_proof()):
+            with self.assertRaises(ValueError):l.close()
+        self.assertEqual(c.auth_snapshot()['recovery']['credential'],'completed')
+        with patch.object(m,'relock_account',side_effect=ValueError('PRIVATE')), \
+             patch.object(m,'recover_group_membership',side_effect=ValueError('PRIVATE')):
+            with self.assertRaises(ValueError):l.close()
+        snap=c.auth_snapshot()
+        for key in ('credential','group'):
+            self.assertEqual(snap['recovery'][key],'unknown');self.assertIsNone(snap[key+'Recovery'])
+        c.ops.run.assert_not_called()
+
+    def test_transaction_begin_failure_boundaries_do_not_start_later_steps(self):
+        for broken in ('agent','record','lineage','lease','transaction'):
+            c=controller(m.AUTH_MODE);c.ledger.value['authentication']['agent']={'identity':identity(80)}
+            with self.subTest(broken=broken),patch.object(c,'agent_register') as agent, \
+                 patch.object(m,'independent_record') as record,patch.object(m,'AuthObserver') as lineage, \
+                 patch.object(m,'CredentialLease') as lease,patch.object(m,'TransactionObserver') as transaction:
+                targets=[agent,record,lineage.return_value.start,lease.return_value.open,transaction.return_value.start]
+                targets[('agent','record','lineage','lease','transaction').index(broken)].side_effect=ValueError('PRIVATE')
+                with self.assertRaises(ValueError):c.transaction_begin('install')
+                for later in targets[('agent','record','lineage','lease','transaction').index(broken)+1:]:later.assert_not_called()
+            self.assertFalse(c.auth_snapshot()['recovery']['credential']=='completed')
+
+    def test_strict_observation_mode_kind_proof_and_raw_injection(self):
+        base=m.auth_runtime_observation(m.AUTH_GROUP_MODE);base['kind']='install'
+        for change in (lambda v:v.update(raw='PRIVATE'),lambda v:v['recovery'].update(credential='completed'),
+                       lambda v:v.update(groupRecovery=membership_proof()),lambda v:v.update(lastReached='PRIVATE')):
+            value=copy.deepcopy(base);change(value)
+            with self.assertRaises(ValueError):m.validate_auth_runtime_observation(value)
+        value=m.auth_runtime_observation('existing-session');value['recovery']['credential']='attempted'
+        with self.assertRaises(ValueError):m.validate_auth_runtime_observation(value)
+        value=m.auth_runtime_observation(m.AUTH_MODE);value['recovery']['agent']='completed'
+        with self.assertRaises(ValueError):m.validate_auth_runtime_observation(value)
+
+    def test_transaction_begin_failed_initial_scan_never_opens_lease(self):
+        c=controller(m.AUTH_MODE)
+        with patch.object(c,'agent_register'),patch.object(m,'independent_record'), \
+             patch.object(m,'AuthObserver') as observer,patch.object(m,'CredentialLease') as lease:
+            observer.return_value.start.side_effect=ValueError('PRIVATE')
+            c.ledger.value['authentication']['agent']={'identity':identity(80)}
+            with self.assertRaises(ValueError):c.transaction_begin('install')
+        lease.assert_not_called();self.assertIsNotNone(c.auth_observer)
+        self.assertEqual(c.auth_snapshot()['lastReached'],'lineage-start')
 
 if __name__ == '__main__': unittest.main(verbosity=2)

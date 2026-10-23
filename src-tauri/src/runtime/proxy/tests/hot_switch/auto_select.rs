@@ -2556,3 +2556,69 @@ fn native_measure_frame_rechecks_current_identity_and_membership_without_publish
         );
     }
 }
+
+#[tokio::test]
+async fn public_owned_status_projects_native_exit_and_read_time_lifecycle_fields() {
+    let (rt, _dir, _sink, _) = native_fixture(None, false);
+    rt.native_auto_status().await;
+    assert_eq!(rt.status.read().unwrap().actual_server_id, None);
+    let observed = rt.status_with_owned_stop_context().unwrap();
+    assert_eq!(observed.actual_server_id.as_deref(), Some("node-a"));
+    assert_eq!(observed.actual_server_id, rt.status().actual_server_id);
+    assert_eq!(observed.main_generation, rt.core_generation());
+    assert_eq!(
+        observed
+            .owned_stop_context
+            .unwrap()
+            .selected_server_id
+            .as_deref(),
+        Some("node-a")
+    );
+    let wire = serde_json::to_value(rt.status_with_owned_stop_context().unwrap()).unwrap();
+    assert_eq!(wire["actualServerId"], "node-a");
+    assert_eq!(wire["mainGeneration"], rt.core_generation());
+
+    // A stopped/starting core must never inherit the last native observation.
+    rt.status.write().unwrap().running = false;
+    rt.start_inflight.store(1, Ordering::SeqCst);
+    let starting = rt.status_with_owned_stop_context().unwrap();
+    assert!(!starting.running && starting.starting);
+    assert_eq!(starting.actual_server_id, None);
+    rt.start_inflight.store(0, Ordering::SeqCst);
+    let stopped = rt.status_with_owned_stop_context().unwrap();
+    assert!(!stopped.running && !stopped.starting);
+    assert_eq!(stopped.actual_server_id, None);
+}
+
+#[tokio::test]
+async fn public_owned_status_rejects_old_generation_groups_without_recursive_gate_lock() {
+    let (rt, _dir, sink, _) = native_fixture(None, false);
+    rt.native_auto_status().await;
+    let old_generation = rt.core_generation();
+    let old_revision = rt.native_observation_revision();
+    let mut old_snapshot = rt.status.read().unwrap().clone();
+    let groups = sink.native_groups.lock().unwrap().clone().unwrap();
+    rt.bump_generation();
+    assert!(rt
+        .publish_native_groups(old_generation, old_revision, groups.clone())
+        .is_none());
+    let stale = rt.status_with_owned_stop_context().unwrap();
+    assert_eq!(stale.main_generation, old_generation + 1);
+    assert_eq!(stale.actual_server_id, None);
+    assert!(stale.owned_stop_context.is_some());
+    let revision = rt.native_observation_revision();
+    assert!(rt
+        .publish_native_groups(rt.core_generation(), revision, groups)
+        .is_some());
+    let current = rt.status_with_owned_stop_context().unwrap();
+    assert_eq!(current.actual_server_id.as_deref(), Some("node-a"));
+    assert_eq!(current.main_generation, old_generation + 1);
+    // Deterministic interleave: status captured its generation/snapshot, then a
+    // newer incarnation published groups before read-time projection resumed.
+    rt.project_status_memory(&mut old_snapshot, old_generation);
+    assert_eq!(old_snapshot.main_generation, old_generation);
+    assert_eq!(old_snapshot.actual_server_id, None);
+    // Existing internal status callers may already hold this non-reentrant guard.
+    let _publication = rt.gate.lock_generation_publication();
+    assert_eq!(rt.status().actual_server_id, current.actual_server_id);
+}

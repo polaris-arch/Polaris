@@ -596,7 +596,9 @@ export function HomeScreen() {
         );
         return;
       }
-      if (code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID) {
+      if (code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID ||
+          code === ProxyErrorCode.LAN_GATEWAY_FORWARDING_REQUIRED ||
+          code === ProxyErrorCode.LAN_GATEWAY_FORWARDING_UNCONFIRMED) {
         toast.error(proxyErrorText({ errorCode: code }, key => t(key)));
         return;
       }

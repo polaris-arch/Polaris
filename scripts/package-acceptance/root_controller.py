@@ -361,7 +361,73 @@ def validate_group_observation(value):
     return value
 
 
-ABORT_UNKNOWN_CODES = frozenset(('root-preparation-incomplete', 'root-ledger-failure-unconfirmed',
+AUTH_OPERATION_STAGES = ('idle', 'transaction-guard', 'agent-spawn', 'agent-notify', 'agent-identity', 'agent-record',
+    'lineage-start', 'lease-account', 'lease-budget', 'group-intent', 'lease-timer-start',
+    'lease-timer-verify', 'group-add', 'setting-intent', 'password-writer', 'password-readback',
+    'dialogue', 'dialogue-identity', 'dialogue-password', 'dialogue-complete', 'transaction-observer',
+    'transaction-finish', 'controller-input')
+AUTH_FAILURE_CODES = ('operation-failed', 'abort-requested', 'input-ended', 'recovery-failed')
+AUTH_RECOVERY_STEPS = ('agent', 'credential', 'group', 'lineage', 'timer')
+
+
+def auth_runtime_observation(mode):
+    return {'schema': 'polaris-auth-runtime-observation-v1', 'mode': mode, 'kind': None,
+            'lastReached': 'idle', 'firstFailure': None,
+            'recovery': {key: 'not-reached' for key in AUTH_RECOVERY_STEPS},
+            'credentialRecovery': None, 'groupRecovery': None, 'persistence': 'not-attempted'}
+
+
+def validate_auth_runtime_observation(value):
+    exact(value, ('schema', 'mode', 'kind', 'lastReached', 'firstFailure', 'recovery',
+                  'credentialRecovery', 'groupRecovery', 'persistence'))
+    require(value['schema'] == 'polaris-auth-runtime-observation-v1' and
+            value['mode'] in ('existing-session', 'pkttyagent-observe', *CREDENTIAL_MODES) and
+            value['kind'] in (None, 'install', 'uninstall') and
+            value['lastReached'] in AUTH_OPERATION_STAGES and
+            value['persistence'] in ('not-attempted', 'recorded', 'unknown'), 'fixed auth observation required')
+    failure = value['firstFailure']
+    if failure is not None:
+        exact(failure, ('stage', 'code'))
+        require(failure['stage'] in AUTH_OPERATION_STAGES and failure['code'] in AUTH_FAILURE_CODES,
+                'fixed first authentication failure required')
+    exact(value['recovery'], AUTH_RECOVERY_STEPS)
+    require(all(state in ('not-reached', 'attempted', 'completed', 'unknown')
+                for state in value['recovery'].values()), 'fixed recovery state required')
+    if value['mode'] not in CREDENTIAL_MODES:
+        require(value['recovery']['credential'] == 'not-reached', 'credential recovery outside authority')
+    if value['kind'] is None:
+        require(all(v == 'not-reached' for v in value['recovery'].values()), 'recovery without transaction')
+    proof = value['credentialRecovery']
+    if proof is not None:
+        exact(proof, ('account', 'guiUid', 'finalPasswordStatus', 'emptyPasswordRestored',
+                      'plaintextPersisted', 'temporaryPasswordHash'))
+        require(value['mode'] in CREDENTIAL_MODES and value['kind'] is not None and
+                type(proof['account']) is str and re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', proof['account']) and
+                type(proof['guiUid']) is int and proof['guiUid'] > 0 and proof['finalPasswordStatus'] == 'L' and
+                proof['emptyPasswordRestored'] is False and proof['plaintextPersisted'] is False and
+                proof['temporaryPasswordHash'] == 'locked until disposable VM destruction', 'fixed credential recovery proof required')
+    require((proof is not None) == (value['recovery']['credential'] == 'completed'), 'credential proof/state differs')
+    group = value['groupRecovery']
+    if group is not None:
+        exact(group, ('schema', 'account', 'guiUid', 'group', 'groupGid', 'originalMembership',
+                      'finalMembership', 'removedOnlyAddedMembership', 'writerStopped', 'maxLeaseSeconds'))
+        require(value['mode'] == AUTH_GROUP_MODE and value['kind'] is not None and
+                group['schema'] == 'polaris-sudo-membership-recovery-v1' and group['account'] == 'runner' and
+                type(group['guiUid']) is int and group['guiUid'] == 1001 and group['group'] == 'sudo' and
+                type(group['groupGid']) is int and group['groupGid'] > 0 and group['originalMembership'] == 'absent' and
+                group['finalMembership'] == 'absent' and group['removedOnlyAddedMembership'] is True and
+                group['writerStopped'] is True and type(group['maxLeaseSeconds']) is int and group['maxLeaseSeconds'] == 90,
+                'fixed group recovery proof required')
+    require((group is not None) == (value['recovery']['group'] == 'completed'), 'group proof/state differs')
+    if value['mode'] != AUTH_GROUP_MODE:
+        require(value['recovery']['group'] == 'not-reached' and group is None, 'group recovery outside authority')
+    elif proof is not None:
+        require(proof['account'] == 'runner' and proof['guiUid'] == 1001, 'joint credential subject differs')
+    return value
+
+
+ABORT_UNKNOWN_CODES = frozenset(('root-preparation-incomplete', 'root-ledger-failure-unconfirmed', 'authentication-lease-recovery-unknown',
+    'authentication-recovery-record-unknown',
     'root-ledger-recovery-unconfirmed', 'authentication-subtree-cleanup-unknown', 'authentication-cleanup-unknown',
     'privilege-transaction-cleanup-unknown', 'product-cleanup-unknown', 'owned-secret-controller-stop-unproved',
     'credential-setting-intent-unknown', 'setting-writer-not-yet-recorded', 'credential-writer-stop-unproved',
@@ -380,7 +446,9 @@ def validate_abort_receipt(value, vm_validator=None):
     fields = ('schema', 'state', 'forced', 'prepared', 'actualReadOnlyAuth', 'unknown')
     require(type(value) is dict, 'typed abort receipt required')
     exact(value, fields + (('productCleanup',) if 'productCleanup' in value else ()) +
-          (('vmPreflight',) if 'vmPreflight' in value else ()))
+          (('vmPreflight',) if 'vmPreflight' in value else ()) +
+          (('authenticationRuntime',) if 'authenticationRuntime' in value else ()))
+    if 'authenticationRuntime' in value: validate_auth_runtime_observation(value['authenticationRuntime'])
     if 'vmPreflight' in value:
         require(callable(vm_validator), 'VM observation validator required')
         vm_validator(value['vmPreflight'])
@@ -932,7 +1000,10 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
         self.thread = threading.Thread(target=self.loop, name='owned-auth-lineage', daemon=True)
 
     def start(self):
-        self.scan(); self.thread.start()
+        try: self.scan(); self.thread.start()
+        except Exception:
+            self.error = 'initial-observation-incomplete'
+            raise
 
     def loop(self):
         while not self.stop.wait(0.005):
@@ -962,10 +1033,11 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
                 {'runId': self.c.launch['runId'], 'kind': self.kind, 'processes': list(self.rows.values()), 'observationError': self.error})
 
     def close(self, forced=False):
-        self.stop.set(); self.thread.join(timeout=3)
+        self.stop.set()
+        if self.thread.ident is not None: self.thread.join(timeout=3)
         require(not self.thread.is_alive(), 'authentication lineage observer stuck')
-        self.scan()
-        require(self.error is None, 'authentication lineage observation incomplete')
+        try: self.scan()
+        except Exception: self.error = 'closure-observation-incomplete'
         # Signal only root-observed, exact births; children before their parent.
         for old in reversed(list(self.rows.values())):
             needed_force = stop_recorded(self.c.ops, self.c.tun, old)
@@ -987,6 +1059,7 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
                     require(result[0] == p['pid'], 'adopted authentication helper was not reaped')
             elif p['ppid'] == os.getpid() and p['pid'] not in allowed:
                 unknown.append({'pid': p['pid'], 'startTime': p['startTime']})
+        require(self.error is None, 'authentication lineage observation incomplete')
         require(not unknown, 'unobserved adopted child: authentication closure unknown')
         return {'ownedBirths': [list(k) for k in self.rows], 'unknownAdoptedChildren': [], 'forced': forced}
 
@@ -1005,20 +1078,22 @@ observably active before a password-setting attempt. Each transaction re-locks.
         self.timer = 'polaris-tun-lease-' + controller.launch['runId'] + '-' + kind
         self.grouped = controller.launch['authenticationMode'] == AUTH_GROUP_MODE
         self.group_intent_written = False; self.group_timer_verified = False; self.group_recovery = None
-        self.group_deadline = None
+        self.group_deadline = None; self.credential_recovery = None
 
     def open(self):
         try: return self._open()
         except BaseException:
+            self.c.auth_note('auth_failed')
             if self.grouped:
                 try: self.close()
                 except BaseException: pass  # original failure retained; fixed cleanup unknown is recorded
             raise
 
     def _open(self):
-        c = self.c; p = validate_permission(c.launch)
+        c = self.c; c.auth_reached('lease-account', self.kind); p = validate_permission(c.launch)
         self.user, original = credential_account(c.launch, c.tun, **({'group_pending': True} if self.grouped else {}))
         require(c.agent and c.ledger.load()['authentication'].get('registered') is True, 'real agent must register first')
+        c.auth_reached('lease-budget')
         window = min(p['maxLeaseSeconds'], int(c.ledger.load()['deadlineMonotonic'] - time.monotonic()) - 35)
         require(window >= (90 if self.grouped else 15), 'not enough guarded time for another credential lease')
         self.window = window
@@ -1034,6 +1109,7 @@ observably active before a password-setting attempt. Each transaction re-locks.
             require(getattr(c, 'group_binding', None) is not None, 'initial group identity not bound')
             binding, _ = group_binding(c.launch, expected_member=False, original=c.group_binding)
             self.group_deadline = started + window
+            c.auth_reached('group-intent')
             group_intent(c.directory, self.kind, c.launch, binding, self.group_deadline)
             self.group_intent_written = True
         argv = ['/usr/bin/env', '-i', 'PATH=' + ENV['PATH'], 'LANG=C', '/usr/bin/python3', '-I',
@@ -1043,16 +1119,19 @@ observably active before a password-setting attempt. Each transaction re-locks.
             timer_started = time.monotonic()
             timer_seconds = int(self.group_deadline - GROUP_RECOVERY_RESERVE - timer_started) - 2
             require(timer_seconds >= 1, 'no time remains to arm joint recovery')
+        c.auth_reached('lease-timer-start')
         c.ops.run(['/usr/bin/systemd-run', '--unit=' + self.timer, '--on-active=' + str(timer_seconds) + 's', '--timer-property=AccuracySec=1s',
             '--property=Type=oneshot', '--property=TimeoutStartSec=' + str(GROUP_RECOVERY_SERVICE_SECONDS if self.grouped else 20) + 's', '/usr/bin/env', '-i', 'PATH=' + ENV['PATH'], 'LANG=C',
             '/usr/bin/python3', '-I', str(c.directory / 'root_controller.py'), 'watch-lease', '--run-id', c.launch['runId'],
             '--transaction', self.kind])
+        c.auth_reached('lease-timer-verify')
         timer_proof = verify_timer(c.ops, c.tun, self.timer, argv, timer_seconds, timer_started,
                      **({'recovery_seconds': GROUP_RECOVERY_SERVICE_SECONDS} if self.grouped else {}))
         if self.grouped:
             require(timer_proof['deadlineMonotonic'] <= self.group_deadline - GROUP_RECOVERY_RESERVE,
                     'actual recovery timer leaves insufficient joint-deadline reserve')
             self.group_timer_verified = True
+            c.auth_reached('group-add')
             run_group_writer(c.launch, c.tun, c.directory, self.kind, 'add', c.ops)
             self.user, original = credential_account(c.launch, c.tun)
             require(time.monotonic() < self.group_deadline - GROUP_RECOVERY_RESERVE - 5, 'joint lease deadline exhausted')
@@ -1064,8 +1143,10 @@ observably active before a password-setting attempt. Each transaction re-locks.
             if self.grouped: require(time.monotonic() < self.group_deadline - GROUP_RECOVERY_RESERVE - 5, 'joint lease deadline exhausted')
             original_now = account_status(self.user.pw_name)
             require(original_now in ('L', 'NP'), 'account changed before setting')
+            c.auth_reached('setting-intent')
             setting_intent(c.directory, self.kind, c.launch, original_now)
             self.attempted = True  # only the durable fresh-status intent grants re-lock recovery
+            c.auth_reached('password-writer')
             self.writer = subprocess.Popen(['/usr/sbin/chpasswd', '--crypt-method', 'SHA512', '--sha-rounds', '100000'], env=ENV, stdin=subprocess.PIPE,
                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.writer_fd = os.pidfd_open(self.writer.pid, 0)
@@ -1077,12 +1158,14 @@ observably active before a password-setting attempt. Each transaction re-locks.
             # No secret reaches chpasswd before its exact birth is durably recoverable.
             self.writer.communicate(input=self.user.pw_name.encode() + b':' + bytes(self.secret) + b'\n', timeout=10)
             require(self.writer.returncode == 0, 'credential writer failed')
+            c.auth_reached('password-readback')
             require(account_status(self.user.pw_name) == 'P', 'temporary password installation not observed')
             c.ledger.mutate(lambda v: (v['authentication'].update(accountMutated=True),
                                       v['authentication']['lease'].update(state='active')))
             self.thread = threading.Thread(target=self.pump, name='owned-private-auth-pty', daemon=True)
             self.thread.start()
         except BaseException:
+            c.auth_note('auth_failed')
             self.close(); raise
         return {'permissionBound': True, 'agentRegistered': True, 'authenticated': False,
                 'maxLeaseSeconds': 90, 'passwordInArgvOrEnvironment': False}
@@ -1093,6 +1176,7 @@ observably active before a password-setting attempt. Each transaction re-locks.
         user = self.user
         display = user.pw_name if not user.pw_gecos or user.pw_gecos == user.pw_name else user.pw_gecos + ' (' + user.pw_name + ')'
         try:
+            self.c.auth_reached('dialogue')
             while not self.stop.is_set() and time.monotonic() < deadline:
                 if not select.select([self.c.pty], [], [], 0.05)[0]: continue
                 part = os.read(self.c.pty, 1024); require(part, 'owned authentication PTY closed')
@@ -1100,6 +1184,7 @@ observably active before a password-setting attempt. Each transaction re-locks.
                 text = re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]', b'', bytes(data)).decode('utf-8', 'strict').replace('\r', '')
                 require('AUTHENTICATION FAILED' not in text and 'AUTHENTICATION CANCELED' not in text, 'actual authentication rejected')
                 require('AUTHENTICATING FOR org.freedesktop.policykit.exec' in text or not ('Password:' in text), 'unexpected polkit action')
+                self.c.auth_reached('dialogue-identity')
                 if 'Choose identity to authenticate as' in text and not selected:
                     matches = re.findall(r'^ ([0-9]+)\.  ' + re.escape(display) + r'$', text, re.M)
                     require(len(matches) == 1, 'approved existing identity not uniquely offered')
@@ -1109,6 +1194,7 @@ observably active before a password-setting attempt. Each transaction re-locks.
                     require(all(name == display for name in offered), 'authentication changed to another identity')
                 identity_ok = selected or ('Authenticating as: ' + display + '\n') in text
                 if 'Password:' in text and not self.sent:
+                    self.c.auth_reached('dialogue-password')
                     require(identity_ok, 'password requested for another identity')
                     # pkttyagent prints the prompt just before disabling echo; wait
                     # for the actual terminal state, never sleep-and-assume it.
@@ -1119,9 +1205,11 @@ observably active before a password-setting attempt. Each transaction re-locks.
                     os.write(self.c.pty, bytes(self.secret) + b'\n'); self.sent = True
                 if '==== AUTHENTICATION COMPLETE ====' in text:
                     require(self.sent and identity_ok, 'authentication completion lacks owned credential exchange')
+                    self.c.auth_reached('dialogue-complete')
                     self.authenticated = True; return
             raise ValueError('authentication request did not complete within lease')
         except BaseException as error:
+            self.c.auth_note('auth_failed')
             self.error = type(error).__name__
             try: self.close()
             except BaseException: self.error = 'CredentialRelockFailed'
@@ -1142,15 +1230,25 @@ observably active before a password-setting attempt. Each transaction re-locks.
                 signal.pidfd_send_signal(self.writer_fd, signal.SIGKILL)
                 self.writer.wait(timeout=5)
             if self.attempted:
-                proof = relock_account(self.c.launch, self.c.tun)
+                self.c.auth_note('auth_recovery_step', 'credential', 'attempted')
+                try:
+                    self.credential_recovery = relock_account(self.c.launch, self.c.tun)
+                    proof = self.credential_recovery
+                    self.c.auth_note('auth_recovery_step', 'credential', 'completed', proof)
+                except Exception:
+                    self.c.auth_note('auth_recovery_step', 'credential', 'unknown'); raise
                 # Recovery happens before this potentially failing ledger write.
                 self.c.ledger.mutate(lambda v: (v['authentication'].update(accountMutated=False),
                     v['authentication']['lease'].update(state='closed', recovery=proof)))
+            require(worker_stopped, 'private credential worker did not stop')
+            require('authentication-recovery-record-unknown' not in self.c.recovery_unknown, 'recovery persistence unknown')
+            self.c.auth_note('auth_recovery_step', 'timer', 'attempted')
+            require('authentication-recovery-record-unknown' not in self.c.recovery_unknown, 'recovery persistence unknown')
             self.c.ops.run([self.c.tun.SYSTEMCTL, 'stop', self.timer + '.timer'])
             for unit in (self.timer + '.timer', self.timer + '.service'):
                 require(self.c.ops.run([self.c.tun.SYSTEMCTL, 'show', unit, '--property=ActiveState', '--value']).strip() == 'inactive',
                         'credential watchdog fired or did not close')
-            require(worker_stopped, 'private credential worker did not stop')
+            self.c.auth_note('auth_recovery_step', 'timer', 'completed')
             self.closed = True
         finally:
             for i in range(len(self.secret)): self.secret[i] = 0
@@ -1160,7 +1258,7 @@ observably active before a password-setting attempt. Each transaction re-locks.
 
     def close_group(self):
         self.stop.set()
-        errors = []; proof = None
+        errors = []; proof = self.credential_recovery
         if self.thread and self.thread is not threading.current_thread():
             self.thread.join(timeout=3)
             if self.thread.is_alive(): errors.append('credential-writer-stop-unproved')
@@ -1173,25 +1271,39 @@ observably active before a password-setting attempt. Each transaction re-locks.
                     signal.pidfd_send_signal(self.writer_fd, signal.SIGKILL); self.writer.wait(timeout=5)
             except Exception: errors.append('credential-writer-stop-unproved')
             try:
-                agent = self.c.ledger.load()['authentication'].get('agent')
-                if agent:
-                    require(not stop_recorded(self.c.ops, self.c.tun, agent['identity']), 'agent required emergency fence')
-                    if self.c.agent: self.c.agent.wait(timeout=5)
+                self.c.fence_registered_agent()
             except Exception: errors.append('authentication-lineage-stop-unproved')
             # These independent restorations must both be attempted, even if either fails.
             if self.attempted:
-                try: proof = relock_account(self.c.launch, self.c.tun)
-                except Exception: errors.append('credential-relock-unproved')
+                self.c.auth_note('auth_recovery_step', 'credential', 'attempted')
+                try:
+                    self.credential_recovery = relock_account(self.c.launch, self.c.tun)
+                    proof = self.credential_recovery
+                    self.c.auth_note('auth_recovery_step', 'credential', 'completed', proof)
+                except Exception:
+                    errors.append('credential-relock-unproved')
+                    self.c.auth_note('auth_recovery_step', 'credential', 'unknown')
+                else:
+                    try: self.c.ledger.mutate(lambda v: v['authentication'].update(accountMutated=False))
+                    except Exception: errors.append('authentication-recovery-record-unknown')
             if self.group_intent_written:
-                try: self.group_recovery = recover_group_membership(self.c.launch, self.c.tun, self.c.directory, self.kind, self.c.ops)
-                except Exception: errors.append('group-membership-recovery-unproved')
+                self.c.auth_note('auth_recovery_step', 'group', 'attempted')
+                try:
+                    self.group_recovery = recover_group_membership(self.c.launch, self.c.tun, self.c.directory, self.kind, self.c.ops)
+                    self.c.auth_note('auth_recovery_step', 'group', 'completed', self.group_recovery)
+                except Exception:
+                    errors.append('group-membership-recovery-unproved')
+                    self.c.auth_note('auth_recovery_step', 'group', 'unknown')
             if self.group_deadline is not None and time.monotonic() > self.group_deadline:
                 errors.append('joint-lease-deadline-exceeded')
             try:
                 if self.c.auth_observer:
                     lineage = self.c.auth_observer.close()
                     self.c.group_lineage_closed = lineage; self.c.auth_observer = None
+                    self.c.retain_auth_lineage(lineage)
             except Exception: errors.append('authentication-lineage-stop-unproved')
+            if 'authentication-recovery-record-unknown' in self.c.recovery_unknown:
+                errors.append('authentication-recovery-record-unknown')
             if errors:
                 self.c.recovery_unknown.extend(errors)
                 raise ValueError('joint credential/group recovery unproved')
@@ -1203,10 +1315,13 @@ observably active before a password-setting attempt. Each transaction re-locks.
                 self.c.ledger.mutate(lambda v: (v['authentication'].update(accountMutated=False),
                     v['authentication']['lease'].update(state='closed', recovery=proof, groupRecovery=self.group_recovery)))
             if self.group_timer_verified:
+                self.c.auth_note('auth_recovery_step', 'timer', 'attempted')
+                require('authentication-recovery-record-unknown' not in self.c.recovery_unknown, 'recovery persistence unknown')
                 self.c.ops.run([self.c.tun.SYSTEMCTL, 'stop', self.timer + '.timer'])
                 for unit in (self.timer + '.timer', self.timer + '.service'):
                     require(self.c.ops.run([self.c.tun.SYSTEMCTL, 'show', unit, '--property=ActiveState', '--value']).strip() == 'inactive',
                             'joint lease watchdog not inactive')
+                self.c.auth_note('auth_recovery_step', 'timer', 'completed')
             self.closed = True
         finally:
             for i in range(len(self.secret)): self.secret[i] = 0
@@ -1313,12 +1428,71 @@ class Controller:
         self.stage = 'idle'; self.preparation_pending = False; self.recovery_unknown = []
         self.readonly_auth = None
         self.vm_preflight = None
+        self.auth_runtime = auth_runtime_observation(self.launch['authenticationMode'])
+        self.auth_runtime_lock = threading.RLock()
 
-    def fail(self):
+    def auth_snapshot(self):
+        with self.auth_runtime_lock:
+            return json.loads(json.dumps(validate_auth_runtime_observation(self.auth_runtime)))
+
+    def auth_checkpoint(self):
+        # A partial successful action remains an observed fact if later cleanup fails.
+        # Persistence failure is independently permanent; never turn it into clean closure.
+        with self.auth_runtime_lock:
+            if self.ledger is None: return
+            try:
+                if self.auth_runtime['persistence'] != 'unknown': self.auth_runtime['persistence'] = 'recorded'
+                snapshot = self.auth_snapshot()
+                self.ledger.mutate(lambda v: v['authentication'].update(runtimeObservation=snapshot))
+            except Exception:
+                self.auth_runtime['persistence'] = 'unknown'
+                self.recovery_unknown.append('authentication-recovery-record-unknown')
+
+    def auth_reached(self, stage, kind=None):
+        require(stage in AUTH_OPERATION_STAGES and kind in (None, 'install', 'uninstall'), 'fixed auth stage required')
+        with self.auth_runtime_lock:
+            if kind is not None and self.auth_runtime['kind'] != kind:
+                # Keep the first overall failure permanent; a new successful transaction
+                # starts a new per-transaction recovery view only on the normal path.
+                require(self.auth_runtime['firstFailure'] is None and not self.recovery_unknown, 'failed authentication cannot restart')
+                self.auth_runtime = auth_runtime_observation(self.launch['authenticationMode'])
+                self.auth_runtime['kind'] = kind
+            self.auth_runtime['lastReached'] = stage
+        self.auth_checkpoint()
+
+    def auth_failed(self, code='operation-failed'):
+        require(code in AUTH_FAILURE_CODES, 'fixed auth failure code required')
+        with self.auth_runtime_lock:
+            if self.auth_runtime['firstFailure'] is None:
+                self.auth_runtime['firstFailure'] = {'stage': self.auth_runtime['lastReached'], 'code': code}
+        self.auth_checkpoint()
+
+    def auth_recovery_step(self, step, state, proof=None):
+        require(step in AUTH_RECOVERY_STEPS and state in ('attempted', 'completed', 'unknown'), 'fixed recovery step required')
+        with self.auth_runtime_lock:
+            # Re-entering idempotent cleanup does not erase a completed action/proof.
+            if self.auth_runtime['recovery'][step] == 'completed' and state == 'attempted': return
+            updated = json.loads(json.dumps(self.auth_runtime))
+            updated['recovery'][step] = state
+            if step in ('credential', 'group'):
+                updated[step + 'Recovery'] = proof if state == 'completed' else None
+            validate_auth_runtime_observation(updated)
+            self.auth_runtime = updated
+        self.auth_checkpoint()
+
+    def auth_note(self, method, *args):
+        # Diagnostic persistence is never a prerequisite for emergency recovery.
+        try: return getattr(self, method)(*args)
+        except Exception:
+            self.recovery_unknown.append('authentication-recovery-record-unknown')
+
+    def fail(self, reason='operation-failed'):
+        self.auth_note('auth_failed', reason)
         self.failed = True
         if self.lease:
             try: self.lease.close()
-            except Exception: pass  # independent fixed lease watchdog remains armed
+            except Exception:
+                self.recovery_unknown.append('authentication-lease-recovery-unknown')  # watchdog remains armed
         if self.ledger:
             try: self.ledger.mutate(lambda v: v.update(result='failed'))
             except Exception: self.recovery_unknown.append('root-ledger-failure-unconfirmed')
@@ -1441,6 +1615,7 @@ class Controller:
                 'controllerDeadlineMarginSeconds': 30}
 
     def agent_register(self):
+        self.auth_reached('agent-spawn')
         self.guard()
         require(self.launch['authenticationMode'] in ('pkttyagent-observe', *CREDENTIAL_MODES) and self.agent is None,
                 'owned observer agent not requested or already started')
@@ -1452,12 +1627,14 @@ class Controller:
                 '--regid=' + str(user.pw_gid), '--clear-groups', '--bounding-set=-all', '--inh-caps=-all', '--ambient-caps=-all',
                 '/usr/bin/pkttyagent', '--process', str(self.gui['pid']) + ',' + self.gui['startTime'],
                 '--notify-fd', str(notify_fd), '--fallback']
-        self.ledger.mutate(lambda v: v['authentication'].update(agentSpawnPending=True, lineageClosed=None))
+        self.ledger.mutate(lambda v: v['authentication'].update(agentSpawnPending=True, lineageClosed=None, agentStopObserved=None))
         try:
             child = subprocess.Popen(argv, env=ENV, stdin=slave, stdout=slave, stderr=slave, pass_fds=(notify_fd,))
             self.agent = child; self.pty = master
             os.close(slave); slave = -1; os.close(notify_fd); notify_fd = -1
+            self.auth_reached('agent-notify')
             require(select.select([read_fd], [], [], 10)[0] and os.read(read_fd, 1) == b'', 'agent registration not notified')
+            self.auth_reached('agent-identity')
             row = self.ops.proc(child.pid)
             require(child.poll() is None and row and row['ppid'] == os.getpid() and row['uid'] == user.pw_uid and
                     row['namespaces'] == self.gui['namespaces'] and
@@ -1480,6 +1657,7 @@ class Controller:
                 if fd >= 0: os.close(fd)
 
     def transaction_begin(self, kind):
+        self.auth_reached('transaction-guard', kind)
         value = self.guard()
         require(kind in ('install', 'uninstall') and self.observer is None, 'single fixed transaction required')
         require(not value['authentication']['closed'], 'authentication window closed')
@@ -1487,14 +1665,18 @@ class Controller:
                 (kind == 'uninstall' and value.get('helper') and value.get('capture')), 'transaction order differs')
         if self.launch['authenticationMode'] in CREDENTIAL_MODES:
             self.agent_register()
+            self.auth_reached('agent-record')
             independent_record(self.directory, 'agent-' + kind + '.json',
                                self.ledger.load()['authentication']['agent']['identity'])
+            self.auth_reached('lineage-start')
             self.auth_observer = AuthObserver(self, kind); self.auth_observer.start()
             self.lease = CredentialLease(self, kind); self.lease.open()
+        self.auth_reached('transaction-observer')
         self.observer = TransactionObserver(self, kind); self.observer.start()
         return {'observing': kind}
 
     def transaction_end(self):
+        self.auth_reached('transaction-finish')
         require(self.observer is not None, 'no active transaction')
         result = self.observer.finish(); self.observer = None
         if self.lease:
@@ -1642,21 +1824,43 @@ class Controller:
         return {'offset': offset, 'nextOffset': self.capture_offset, 'eof': self.capture_offset == size,
                 'bytes': size, 'sha256': proof['sha256'], 'base64': base64.b64encode(data).decode()}
 
-    def stop_agent(self, close_window=True):
-        lineage = self.auth_observer.close() if self.auth_observer else getattr(self, 'group_lineage_closed', None)
-        self.group_lineage_closed = None
+    def fence_registered_agent(self):
+        agent = self.ledger.load()['authentication'].get('agent')
+        if not agent: return
+        needed_force = stop_recorded(self.ops, self.tun, agent['identity'])
+        require(self.agent is not None and self.agent.pid == agent['identity']['pid'], 'registered agent handle missing')
+        status = self.agent.wait(timeout=5)
+        require(proc_absent(agent['identity']['pid']), 'registered agent not reaped')
+        require(not needed_force and status == -signal.SIGTERM, 'agent required emergency fence')
+        self.ledger.mutate(lambda v: v['authentication'].update(agentStopObserved=agent['identity']))
+        self.auth_note('auth_recovery_step', 'agent', 'completed')
+
+    def retain_auth_lineage(self, lineage):
+        exact(lineage, ('ownedBirths', 'unknownAdoptedChildren', 'forced'))
+        require(lineage['unknownAdoptedChildren'] == [] and type(lineage['forced']) is bool,
+                'authentication lineage closure incomplete')
+        if self.agent:
+            require(self.agent.wait(timeout=5) == -signal.SIGTERM, 'owned agent shutdown differs')
+        for pid, start in lineage['ownedBirths']:
+            require(proc_absent(pid), 'authentication descendant not actually reaped or PID reused')
+        self.ledger.mutate(lambda v: v['authentication'].update(lineageClosed=lineage))
+        self.auth_note('auth_recovery_step', 'agent', 'completed')
+        self.auth_note('auth_recovery_step', 'lineage', 'completed')
+        return lineage
+
+    def stop_agent(self, close_window=True, forced=False):
+        lineage = self.auth_observer.close(forced=forced) if self.auth_observer else getattr(self, 'group_lineage_closed', None)
         if lineage:
-            self.ledger.mutate(lambda v: v['authentication'].update(lineageClosed=lineage))
+            self.group_lineage_closed = lineage
+            self.retain_auth_lineage(lineage)
         self.auth_observer = None
-        result = close_auth(self.ledger, self.tun, forced=False, close_window=close_window)
+        result = close_auth(self.ledger, self.tun, forced=forced, close_window=close_window)
         if self.agent:
             require(self.agent.wait(timeout=5) == -signal.SIGTERM, 'owned agent shutdown differs')
         if self.pty is not None: os.close(self.pty); self.pty = None
         self.agent = None
         if lineage:
             result['authLineage'] = lineage
-            for pid, start in lineage['ownedBirths']:
-                require(proc_absent(pid), 'authentication descendant not actually reaped or PID reused')
             result['authDescendantsReaped'] = True
         return result
 
@@ -1674,7 +1878,7 @@ class Controller:
 
     def finish(self):
         value = self.guard()
-        require(not self.failed and value['phase'] == 'closed' and value['authentication']['closed'] and
+        require(not self.failed and not self.recovery_unknown and value['phase'] == 'closed' and value['authentication']['closed'] and
                 not value.get('forcedCleanup') and not value.get('unknown'), 'normal proven closure required')
         require(value.get('controllerGui') and proc_absent(value['controllerGui']['pid']), 'original GUI has not exited or PID reused')
         self.tun.cancel_watchdog(self.ledger)
@@ -1741,23 +1945,34 @@ class Controller:
         return {'seq': seq, 'ok': True, 'result': result}
 
     def abort(self):
-        self.fail()
+        self.fail('abort-requested')
         if self.observer:
-            self.observer.stop.set(); self.observer.thread.join(timeout=3); self.observer = None
+            try:
+                self.observer.stop.set()
+                if self.observer.thread.ident is not None: self.observer.thread.join(timeout=3)
+                require(not self.observer.thread.is_alive(), 'transaction observer remains live')
+                self.observer = None
+            except Exception: self.recovery_unknown.append('privilege-transaction-cleanup-unknown')
         if not self.ledger:
             return {'schema': 'polaris-root-abort-v1', 'state': 'failed', 'forced': True,
                 'prepared': None if self.preparation_pending else False, 'actualReadOnlyAuth': self.readonly_auth,
+                'authenticationRuntime': self.auth_snapshot(),
                 **({'vmPreflight': self.tun.validate_vm_observation(self.vm_preflight)} if self.vm_preflight is not None else {}),
                 'unknown': sorted(set(self.recovery_unknown +
                 (['root-preparation-incomplete'] if self.preparation_pending else [])))}
         # Auth recovery is independent and attempted even if product cleanup raises.
         errors = list(self.recovery_unknown)
-        if self.auth_observer:
-            try: self.auth_observer.close(forced=True)
+        try: self.stop_agent(forced=True)
+        except Exception:
+            errors.append('authentication-cleanup-unknown')
+            # Incomplete lineage must not skip the independent exact registered-agent fence.
+            try: self.fence_registered_agent()
             except Exception: errors.append('authentication-subtree-cleanup-unknown')
-            self.auth_observer = None
-        try: close_auth(self.ledger, self.tun, forced=True)
-        except Exception: errors.append('authentication-cleanup-unknown')
+            try: close_auth(self.ledger, self.tun, forced=True)
+            except Exception: errors.append('authentication-cleanup-unknown')
+            try:
+                if self.pty is not None: os.close(self.pty); self.pty = None
+            except Exception: errors.append('authentication-cleanup-unknown')
         try: close_transactions(self.ledger, self.tun)
         except Exception: errors.append('privilege-transaction-cleanup-unknown')
         try: result = self.tun.cleanup(self.ledger, forced=True)
@@ -1766,7 +1981,8 @@ class Controller:
             self.ledger.mutate(lambda v: v.update(unknown=sorted(set(v['unknown'] + errors)), result='failed'))
         except Exception: errors.append('root-ledger-recovery-unconfirmed')
         return {'schema': 'polaris-root-abort-v1', 'state': 'failed', 'forced': True, 'prepared': True,
-                'actualReadOnlyAuth': self.readonly_auth, 'unknown': sorted(set(errors)), 'productCleanup': result,
+                'actualReadOnlyAuth': self.readonly_auth, 'unknown': sorted(set(errors + self.recovery_unknown)), 'productCleanup': result,
+                'authenticationRuntime': self.auth_snapshot(),
                 **({'vmPreflight': self.tun.validate_vm_observation(self.vm_preflight)} if self.vm_preflight is not None else {})}
 
 
@@ -1796,7 +2012,7 @@ def close_auth(ledger, tun, forced, close_window=True):
             require(tun.same_process(old, now), 'authentication agent birth changed')
             if not ledger.ops.signal_owned(old, signal.SIGTERM):
                 ledger.ops.signal_owned(old, signal.SIGKILL); errors.append('authentication-agent-required-force-kill')
-        elif not auth.get('closed') and not auth.get('lineageClosed'):
+        elif not auth.get('closed') and not auth.get('lineageClosed') and auth.get('agentStopObserved') != old:
             errors.append('authentication-agent-exited-early')
     def save(v):
         v['authentication'].update(closed=(not errors and close_window), accountMutated=False)
@@ -1848,7 +2064,10 @@ def main():
     try:
         while not controller.finished:
             # Input timeout is bounded by the reserved watchdog margin as well.
-            raw = read_line(sys.stdin.buffer, timeout=570)
+            try: raw = read_line(sys.stdin.buffer, timeout=570)
+            except BaseException:
+                controller.auth_note('auth_failed', 'input-ended')
+                raise
             try:
                 response = controller.dispatch(json.loads(raw))
             except Exception as error:
@@ -1859,6 +2078,7 @@ def main():
                                       'kind': type(error).__name__,
                                       'stage': controller.stage if controller.stage in CONTROLLER_STAGES else 'dispatch',
                                       'message': 'fixed operation failed; no acceptance or authentication success'}}
+                response['error']['authenticationRuntime'] = controller.auth_snapshot()
                 if controller.vm_preflight is not None:
                     response['error']['vmPreflight'] = controller.tun.validate_vm_observation(controller.vm_preflight)
                 if controller.readonly_auth is not None:

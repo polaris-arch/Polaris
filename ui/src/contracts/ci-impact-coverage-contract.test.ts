@@ -367,6 +367,8 @@ describe('CI 影响分类器的完备性（fail-open 根治）', () => {
       'scripts/gate-node-test.sh',
       'scripts/macos-nested-code.sh',
       'scripts/native-payload-input.mjs',
+      'scripts/package-acceptance/transport.mjs',
+      'scripts/package-acceptance/tun_transport.mjs',
       'scripts/postprocess-appimage.mjs',
       'scripts/prepare-core-identity.mjs',
       'scripts/release-assets.mjs',

@@ -497,13 +497,30 @@ class Controller:
             require(not self.closed, 'controller already closed')
             self.seq += 1
             self.lifecycle['lastAction'] = action
-            self._write({'seq': self.seq, 'action': action, **args})
-            value = self._read(90 if action in ('cleanup', 'finish') else 45)
-            if isinstance(value, dict) and value.get('ok') is False:
+            boundary = 'request-write'
+            try:
+                self._write({'seq': self.seq, 'action': action, **args})
+                boundary = 'response-read'
+                value = self._read(90 if action in ('cleanup', 'finish') else 45)
+            except Exception:
+                self.lifecycle.setdefault('rootBoundaryFailure', {'stage': boundary, 'action': action if action in
+                    ('transaction_begin', 'transaction_scan', 'transaction_end', 'auth_close', 'abort') else 'other',
+                    'code': 'ROOT_IPC_UNCONFIRMED'})
+                raise
+            if not (isinstance(value, dict) and type(value.get('seq')) is int and value['seq'] == self.seq
+                    and type(value.get('ok')) is bool):
+                self.lifecycle.setdefault('rootBoundaryFailure', {'stage': 'response-envelope', 'action': action if action in
+                    ('transaction_begin', 'transaction_scan', 'transaction_end', 'auth_close', 'abort') else 'other',
+                    'code': 'ROOT_IPC_UNCONFIRMED'})
+                raise ValueError('controller response sequence/schema unconfirmed')
+            if value.get('ok') is False:
                 error = value.get('error', {})
                 import root_controller
                 if error.get('stage') in root_controller.CONTROLLER_STAGES and error.get('code') in ('CONTROLLER_FAILED', 'AUTHENTICATION_NOT_READY'):
-                    self.lifecycle['rootOperationFailure'] = {'stage': error['stage'], 'code': error['code']}
+                    self.lifecycle.setdefault('rootOperationFailure', {'stage': error['stage'], 'code': error['code']})
+                    if 'authenticationRuntime' in error:
+                        self.lifecycle['rootOperationFailure']['authenticationRuntime'] = copy.deepcopy(
+                            root_controller.validate_auth_runtime_observation(error['authenticationRuntime']))
                     if 'vmPreflight' in error:
                         self.lifecycle['rootOperationFailure']['vmPreflight'] = copy.deepcopy(tun.validate_vm_observation(error['vmPreflight']))
                     if 'actualReadOnlyAuth' in error:
@@ -596,11 +613,15 @@ class TunCarrierRun(base.CarrierRun):
     def helper_action(self, kind):
         self.gui_phase('helper-begin')
         require(kind in ('install', 'uninstall'), 'only genuine helper action')
+        self.gui_phase('helper-navigation')
         self.driver.click('.side .nav-item', self.text('sidebar.settings'))
         self.driver.click('.set-nav', self.text('settings.nav.helper'))
         cursor = max((r['sequence'] for r in self.tun_observations()), default=0)
+        self.gui_phase('helper-window')
         self.supervisor.begin_window(kind, self.app)
+        self.gui_phase('helper-transaction-begin')
         self.controller.call('transaction_begin', kind=kind)
+        self.gui_phase('helper-click')
         if kind == 'install':
             self.driver.click('.helper-state[data-s="none"] button', self.text('helper.installAction'))
         else:
@@ -610,10 +631,14 @@ class TunCarrierRun(base.CarrierRun):
             self.controller.call('transaction_scan')
             rows = [r for r in self.tun_observations() if r['sequence'] > cursor and r['kind'] == 'helper']
             return rows[0] if rows else None
+        self.gui_phase('helper-callback')
         reply = base.wait_for(result, timeout=80)
+        self.result['helperCallback'] = {key: reply.get(key) if type(reply.get(key)) is bool else None
+            for key in ('envelopeSuccess', 'success', 'installed', 'ready')}
         require(reply.get('envelopeSuccess') and reply.get('success') and
                 reply.get('installed') == (kind == 'install') and reply.get('ready') == (kind == 'install'),
                 'actual helper GUI action failed')
+        self.gui_phase('helper-transaction-end')
         proof = self.controller.call('transaction_end')
         if self.launch_options.get('authenticationMode') == AUTH_GROUP_MODE:
             subject = self.launch_options['authorization']
@@ -1034,6 +1059,7 @@ class TunCarrierRun(base.CarrierRun):
             self.result['controlConnectivity']['after'] = self.control_connectivity('after')
         except BaseException as error:
             self.result['failure'] = {'stage': self.stage, 'kind': type(error).__name__, 'code': 'TUN_RUNTIME_FAILED', 'guiFailure': base.gui_failure(error)}
+            self.capture_driver_failure()
             if self.controller and not self.controller.closed:
                 cleanup = self.controller.recover()
         finally:

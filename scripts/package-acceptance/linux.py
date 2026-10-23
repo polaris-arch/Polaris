@@ -893,12 +893,56 @@ class WebDriver:
         self.session = None
 
     def request(self, method, path, data=None, timeout=25):
+        # Fixed route/command vocabulary only: never retain scripts, arguments,
+        # session IDs, response bodies, remote messages or transport URLs.
+        routes = ('/timeouts', '/execute/sync', '/execute/async', '/screenshot', '/actions', '/element')
+        route = path if path in ('/status', '/session') else next(
+            (suffix for suffix in routes if self.session and path == '/session/' + self.session + suffix), 'other')
+        if route == 'other' and self.session and path.startswith(self.path('/element/')) and path.endswith('/click'):
+            route = '/element/:element/click'
+        command = getattr(self, '_observed_command', None)
+        if command not in ('config_get', 'config_save', 'proxy_get_status', 'proxy_runtime_apply_status', 'auto_select_status'):
+            command = 'none'
+        row = {'targetRole': 'tauri-driver', 'method': method if method in ('GET', 'POST', 'DELETE') else 'other',
+               'route': route, 'command': command, 'state': 'sent', 'callback': 'not-observed'}
+        observation = getattr(self, 'observation', None)
+        if observation is None:
+            observation = self.observation = {'schema': 'polaris-webdriver-observation-v1', 'requests': [], 'truncated': False}
+        if len(observation['requests']) < 128:
+            observation['requests'].append(row)
+        else:
+            observation['truncated'] = True
+        started = time.monotonic()
+        self._http_status = None
+        try:
+            value = self._request(method, path, data, timeout)
+            row['state'] = 'decoded'
+            if route == '/execute/async' and command != 'none':
+                row['callback'] = 'returned'
+            return value
+        except Exception as error:
+            row['state'] = 'failed'
+            allowed = ('RemoteDisconnected', 'ConnectionResetError', 'ConnectionRefusedError',
+                       'BrokenPipeError', 'TimeoutError', 'URLError', 'HTTPError', 'GuiFailure',
+                       'JSONDecodeError', 'IncompleteRead', 'BadStatusLine')
+            row['error'] = type(error).__name__ if type(error).__name__ in allowed else 'other'
+            if isinstance(error, GuiFailure):
+                row.update(gui_failure(error))
+            observation.setdefault('firstFailure', row)
+            raise
+        finally:
+            if type(self._http_status) is int and 100 <= self._http_status <= 599:
+                row['httpStatus'] = self._http_status
+            row['elapsedMs'] = max(0, int((time.monotonic() - started) * 1000))
+
+    def _request(self, method, path, data=None, timeout=25):
         raw = None if data is None else json.dumps(data).encode()
         request = urllib.request.Request(self.url + path, data=raw, method=method,
                                          headers={'Content-Type': 'application/json'})
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(request, timeout=timeout) as response:
+                self._http_status = getattr(response, 'status', None)
                 body = json.load(response)
         except urllib.error.HTTPError as error:
             # Never echo remote response strings: they may contain fixture secrets.
@@ -938,7 +982,9 @@ class WebDriver:
         # replacement for connect/selection/Auto/Apply/retry/quit GUI controls.
         require(command in ('config_get', 'config_save', 'proxy_get_status',
                             'proxy_runtime_apply_status', 'auto_select_status'), 'IPC not allowed to bypass GUI')
-        value = self.request('POST', self.path('/execute/async'), {'script': r'''
+        self._observed_command = command
+        try:
+            value = self.request('POST', self.path('/execute/async'), {'script': r'''
 const [command, args, done] = arguments;
 if (!window.__TAURI_INTERNALS__?.invoke) {done({error:'not-native'});return;}
 window.__TAURI_INTERNALS__.invoke(command,args).then(raw => {
@@ -946,6 +992,8 @@ window.__TAURI_INTERNALS__.invoke(command,args).then(raw => {
  else done({ok:true,data:raw.data ?? null});
 },()=>done({error:'native-command-failed'}));
 ''', 'args': [command, args or {}]})
+        finally:
+            self._observed_command = None
         if value and value.get('rejected') is True:
             raise NativeRejected('actual native fixture/read rejection')
         gui_require(value and value.get('ok') is True, 'native-ipc-unconfirmed')
@@ -1257,6 +1305,42 @@ class CarrierRun:
                 'product inherited automation escape or runner credentials')
         self.app = app
         return self.driver.invoke('config_get')
+
+    def capture_driver_failure(self):
+        # Diagnostic only. No scan/adoption/signal, and no authority is inferred
+        # from an unconfirmed live PID. Keep the original failure even if this
+        # snapshot itself cannot be collected.
+        try:
+            if isinstance(getattr(self, 'driver', None), WebDriver):
+                self.result['webdriverObservation'] = copy.deepcopy(getattr(self.driver, 'observation', {}))
+        except Exception:
+            self.result['webdriverObservation'] = {'state': 'unknown'}
+        evidence = {'state': 'observed', 'processes': [], 'truncated': False}
+        try:
+            supervisor = self.supervisor
+            with supervisor.lock:
+                known = list(supervisor.owned.values())
+                for item in known[:64]:
+                    role = supervisor.roles.get(item['pid'], 'unknown')
+                    if role not in ('driver', 'product', 'xvfb', 'dbus', 'tool-probe'):
+                        role = 'unknown'
+                    row = {'pid': item['pid'], 'startTime': item['startTime'], 'role': role, 'identity': 'unknown'}
+                    try:
+                        current = process_identity(item['pid'])
+                        row['identity'] = 'same-birth-uid' if same_process(item, current) else 'not-observed' if current is None else 'changed'
+                        child = supervisor.children.get(item['pid'])
+                        if child is not None:
+                            code = child.poll()
+                            row['childState'] = 'running' if code is None else 'exited'
+                            if type(code) is int:
+                                row['exitCode'] = code
+                    except Exception:
+                        pass
+                    evidence['processes'].append(row)
+                evidence['truncated'] = len(known) > 64
+        except Exception:
+            evidence['state'] = 'unknown'
+        self.result['failureProcessObservation'] = evidence
 
     def snapshot(self, label):
         return self.driver.screenshot(self.evidence_dir / f'{self.item["kind"]}-{label}.png')
@@ -1827,6 +1911,7 @@ class CarrierRun:
                         normalProductExit=True, **exited)
         except Exception as error:
             self.result['failure'] = {'stage': self.stage, 'type': type(error).__name__, **gui_failure(error)}
+            self.capture_driver_failure()
             if self.driver and self.driver.session:
                 try:
                     self.result['failure']['screenshot'] = self.snapshot('failed')

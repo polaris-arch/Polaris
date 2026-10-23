@@ -965,6 +965,13 @@ class SharedGuiAndVmContracts(unittest.TestCase):
         self.assertEqual(run.pending_streams['a'*64],proof)
         self.assertEqual(run.result['streamObservation']['exchanges'][0]['state'],'validated')
 
+    def test_tun_failure_captures_shared_driver_evidence_before_recovery(self):
+        source=Path(M.__file__).read_text()
+        failure=source.index("'code': 'TUN_RUNTIME_FAILED'")
+        capture=source.index('self.capture_driver_failure()', failure)
+        recover=source.index('self.controller.recover()', failure)
+        self.assertLess(capture, recover)
+
     def test_vm_preflight_error_is_validated_and_preserved_not_promoted(self):
         import root_controller
         for invalid in (False,True):
@@ -994,6 +1001,70 @@ class SharedGuiAndVmContracts(unittest.TestCase):
             if invalid:self.assertNotIn('abortReceipt',client.lifecycle)
             else:self.assertEqual(client.lifecycle['abortReceipt']['vmPreflight'],observation)
             self.assertNotIn('PRIVATE',json.dumps(client.lifecycle))
+
+class AuthenticationRuntimeConsumerTests(unittest.TestCase):
+    def test_ipc_first_boundary_failure_survives_abort_without_raw_error(self):
+        for stage in ('request-write','response-read'):
+            client=M.Controller();client.closed=False
+            with patch.object(client,'_write',side_effect=ValueError('PRIVATE') if stage=='request-write' else None), \
+                 patch.object(client,'_read',side_effect=ValueError('PRIVATE')):
+                with self.assertRaises(ValueError):client.call('transaction_begin',kind='install')
+                with self.assertRaises(ValueError):client.call('abort')
+            self.assertEqual(client.lifecycle['rootBoundaryFailure'],{'stage':stage,'action':'transaction_begin','code':'ROOT_IPC_UNCONFIRMED'})
+            self.assertNotIn('PRIVATE',json.dumps(client.lifecycle))
+
+    def test_wrong_sequence_error_is_not_current_operation_evidence(self):
+        for seq in (None,True,0,2):
+            client=M.Controller();client.closed=False
+            value={'seq':seq,'ok':False,'error':{'stage':'dispatch','code':'CONTROLLER_FAILED'}}
+            with patch.object(client,'_write'),patch.object(client,'_read',return_value=value):
+                with self.assertRaises(ValueError):client.call('transaction_begin',kind='install')
+            self.assertNotIn('rootOperationFailure',client.lifecycle)
+            self.assertEqual(client.lifecycle['rootBoundaryFailure']['stage'],'response-envelope')
+
+    def test_operation_error_strictly_preserves_safe_auth_runtime(self):
+        import root_controller
+        for invalid in (False,True):
+            value=root_controller.auth_runtime_observation(root_controller.AUTH_GROUP_MODE)
+            value['kind']='install';value['lastReached']='lineage-start'
+            value['firstFailure']={'stage':'lineage-start','code':'operation-failed'}
+            if invalid:value['secret']='PRIVATE'
+            client=M.Controller();client.closed=False
+            payload={'seq':1,'ok':False,'error':{'stage':'dispatch','code':'CONTROLLER_FAILED','authenticationRuntime':value}}
+            with patch.object(client,'_write'),patch.object(client,'_read',return_value=payload):
+                with self.assertRaises(ValueError):client.call('transaction_begin',kind='install')
+            saved=client.lifecycle['rootOperationFailure']
+            if invalid:self.assertNotIn('authenticationRuntime',saved)
+            else:self.assertEqual(saved['authenticationRuntime'],value)
+            self.assertNotIn('PRIVATE',json.dumps(client.lifecycle))
+
+    def test_abort_keeps_safe_partial_proof_without_promoting_failure(self):
+        import root_controller
+        observation=root_controller.auth_runtime_observation(root_controller.AUTH_GROUP_MODE)
+        observation['kind']='install';observation['lastReached']='password-writer'
+        observation['firstFailure']={'stage':'password-writer','code':'operation-failed'}
+        observation['recovery']['credential']='unknown'
+        receipt={'schema':'polaris-root-abort-v1','state':'failed','forced':True,'prepared':True,
+            'actualReadOnlyAuth':None,'unknown':['authentication-lease-recovery-unknown'],
+            'authenticationRuntime':observation,'productCleanup':{'state':'forced','forced':True,'unknown':[],
+                'publicationEligible':False}}
+        client=M.Controller();client.child=Mock();client.child.wait.return_value=1
+        client.lifecycle.update(ready=True,spawned=True)
+        with patch.object(client,'call',return_value=receipt):result=client.recover()
+        self.assertEqual(result['state'],'failed')
+        self.assertEqual(client.lifecycle['abortReceipt']['authenticationRuntime'],observation)
+
+    def test_helper_callback_failure_preserves_only_fixed_booleans(self):
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.app={}
+        run.driver=Mock();run.supervisor=Mock();run.controller=Mock();run.text=lambda key:key
+        replies=iter([[],[{'sequence':1,'kind':'helper','envelopeSuccess':True,'success':False,
+                         'installed':False,'ready':False,'error':'PRIVATE'}]])
+        run.tun_observations=lambda:next(replies)
+        with self.assertRaises(ValueError):run.helper_action('install')
+        self.assertEqual(run.result['guiObservation']['phase'],'helper-callback')
+        self.assertEqual(run.result['helperCallback'],{'envelopeSuccess':True,'success':False,'installed':False,'ready':False})
+        self.assertNotIn('PRIVATE',json.dumps(run.result))
+        self.assertNotIn('transaction_end',[call.args[0] for call in run.controller.call.call_args_list])
 
 if __name__ == '__main__':
     unittest.main()

@@ -729,7 +729,10 @@ describe('门 5 · 首页出口选单：折叠分组整棵子树不挂载', () =
 
   it('检索真值不受影响：搜索态强制展开那条腿仍在，且「全部测速」读数据不读 DOM', () => {
     // `isOpen` 同时是 map 的门与搜索态的出口 —— 两者必须是同一个变量，否则搜出来的节点会被折叠吃掉。
-    expect(MENU).toContain('const isOpen = searching || openGroups.has(g.id);');
+    // Expansion is now a Map that remembers explicit false as well as true.
+    // Merely checking Map.has would reopen an explicitly collapsed known group.
+    expect(MENU).toContain('useState<Map<string, boolean>>');
+    expect(MENU).toContain('const isOpen = searching || openGroups.get(g.id) === true;');
     expect(MENU).toContain('{isOpen && items.map((s) => {');
     expect(MENU).toContain('onTestAll(filteredGroups.flatMap((g) => g.servers.map((s) => s.id)))');
   });

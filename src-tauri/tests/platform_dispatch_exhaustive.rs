@@ -2379,7 +2379,7 @@ const CFG_REGISTRY: &[CfgSite] = &[
     ("src-tauri/src/commands/proxy.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "Rule-pattern admission explicitly reports unavailable on iOS; Android keeps its actual native checker."),
     ("src-tauri/src/runtime/proxy/android_bridge.rs", "any(target_os = \"android\", test)", 1, IosSide::DiffersRight, "Android lifecycle_observation is shared by native consumption and host state tests; iOS keeps its own NE lifecycle, not Android observation types."),
     ("src-tauri/src/runtime/proxy/lifecycle.rs", "target_os = \"android\"", 2, IosSide::DiffersRight, "Android core_running and writer_may_be_live add native-running observation and a conservative writer bit; iOS retains its existing NE/host status contract, not a new device proof."),
-    ("src-tauri/src/runtime/proxy/lifecycle.rs", "not(target_os = \"android\")", 1, IosSide::DiffersRight, "Non-Android core_running preserves the existing ready-state source; Android alone adds JNI observation, with no reclassification of existing iOS debts."),
+    ("src-tauri/src/runtime/proxy/lifecycle.rs", "not(target_os = \"android\")", 2, IosSide::DiffersRight, "Non-Android core_running preserves the existing ready-state source; shared status platform projection is a no-op outside Android. Android alone adds JNI observation; existing iOS debts are unchanged."),
     // Retained CLI-observation evidence, from the b84e correction batch.
     (
         "src-tauri/src/runtime/proxy/startup.rs",
@@ -3218,9 +3218,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "target_os = \"android\"",
-        8,
+        7,
         IosSide::DiffersUndecided,
-        "八处 Android reconnect、主核 claim/drain/stop 含新增 owned Stop 状态的 reconnect marker 投影；原 JNI instance 分派保持。iOS 启停租约与扩展宿主尚无实现，延续本文件未裁定而不将它标为已支持。",
+        "七处 Android reconnect、主核 claim/drain/stop；普通与 owned Stop 状态共用同一 guard 外 reconnect/native bridge 投影，不保留重复平台分支。原 JNI instance 分派保持。iOS 启停租约与扩展宿主尚无实现，延续本文件未裁定而不将它标为已支持。",
     ),
     (
         "src-tauri/src/runtime/proxy/process_supervision.rs",

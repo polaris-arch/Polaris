@@ -1323,11 +1323,26 @@ impl ProxyRuntime {
         if !self.core_running() {
             return None;
         }
+        self.native_actual_server_id_memory(self.core_generation())
+    }
+
+    /// Memory-only projection for a captured status generation. In particular,
+    /// do not consult Android's native bridge while saved/intent guards are held.
+    pub(super) fn native_actual_server_id_memory(&self, generation: u64) -> Option<String> {
+        if self.core_generation() != generation
+            || !self
+                .status
+                .read()
+                .map(|status| status.running)
+                .unwrap_or(false)
+        {
+            return None;
+        }
         let state = self
             .native_observation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.generation != self.core_generation() {
+        if state.generation != generation {
             return None;
         }
         let snapshot = self.switch_snapshot.read().ok()?;

@@ -675,8 +675,22 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
     // 完整真值表（含取消态）在 scripts/desktop-core-ci-wiring.test.mjs 里按表达式求值。
     for (const [name, block] of [['package', pkgJob], ['core_wire', executable(jobBlock(pkg, 'core_wire'))]] as const) {
       const condition = foldedJobIf(block, name);
-      expect(condition.startsWith('!cancelled() && '), `${name} 的 if 不以 !cancelled() 起头：${condition}`).toBe(true);
+      const prefix = 'inputs.linux_auth_preflight_only != true && (';
+      expect(condition.startsWith(prefix) && condition.endsWith(')'), `${name} 必须先排除只读预检`).toBe(true);
+      const ordinary = condition.slice(prefix.length, -1);
+      expect(ordinary).toBe("!cancelled() && needs.setup.result == 'success' && (needs.desktop_core.result == 'success' || (needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''))");
       expect(condition, `${name} 的 if 里出现了 always() —— 它对取消免疫`).not.toContain('always()');
+      for (const preflight of [false, '', true]) for (const cancelled of [false, true]) {
+        for (const setup of ['success', 'failure', 'cancelled', 'skipped']) {
+          for (const core of ['success', 'failure', 'cancelled', 'skipped']) for (const artifact of ['', 'bound-artifact']) {
+            const context = { inputs: { linux_auth_preflight_only: preflight, core_bundle_artifact: artifact },
+              needs: { setup: { result: setup }, desktop_core: { result: core } }, cancelled: () => cancelled };
+            const expected = preflight !== true && !cancelled && setup === 'success' &&
+              (core === 'success' || (core === 'skipped' && artifact !== ''));
+            expect(runInNewContext(condition, context), `${name}: ${JSON.stringify({ preflight, cancelled, setup, core, artifact })}`).toBe(expected);
+          }
+        }
+      }
     }
     // needs 即等待。package 一旦能读到 needs.ci/needs.ui，就说明它在等两门，并行拓扑已被推翻。
     expect(

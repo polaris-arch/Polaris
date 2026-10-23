@@ -406,14 +406,40 @@ impl ProxyRuntime {
     /// `uptime` 在此**现算**（`now - start_time`，秒）而非读存储值：存储的 uptime 写于起核那一刻，
     /// 读可能在几小时后 → 存了必假。见 [`ProxyStatus`] 文档。
     pub fn status(&self) -> ProxyStatus {
+        let generation = self.gate.generation();
         let mut snap = self.status.read().map(|g| g.clone()).unwrap_or_default();
-        snap.main_generation = self.gate.generation();
-        snap.actual_server_id = self.native_actual_server_id();
+        self.project_status_memory(&mut snap, generation);
+        self.project_status_platform(&mut snap);
+        snap
+    }
+
+    /// Shared read-time fields; no publication lock is acquired here because
+    /// internal callers may already own it. Never attach a native observation
+    /// from a newer incarnation to the captured main generation.
+    pub(super) fn project_status_memory(&self, snap: &mut ProxyStatus, generation: u64) {
+        snap.main_generation = generation;
+        snap.actual_server_id = if snap.running {
+            self.native_actual_server_id_memory(generation)
+        } else {
+            None
+        };
+        if self.gate.generation() != generation
+            || !self
+                .status
+                .read()
+                .map(|status| status.running)
+                .unwrap_or(false)
+        {
+            snap.actual_server_id = None;
+        }
         snap.uptime = snap
             .start_time
             .map(|t0| now_ms().saturating_sub(t0) / 1_000);
-        // 读时投影（同 uptime）：起核腿在飞 ⇒ starting=true。存储态恒 false，故读这一处即全部真值。
         snap.starting = self.start_inflight.load(Ordering::SeqCst) > 0;
+    }
+
+    /// Platform observations remain outside saved-config/intent/publication guards.
+    fn project_status_platform(&self, snap: &mut ProxyStatus) {
         #[cfg(target_os = "android")]
         {
             snap.reconnect_required = native_reconnect_required(self.config.dir());
@@ -427,7 +453,8 @@ impl ProxyRuntime {
                 snap.actual_server_id = None;
             }
         }
-        snap
+        #[cfg(not(target_os = "android"))]
+        let _ = snap;
     }
 
     /// Actual ready-core snapshot, updated only after startup succeeds; saved/pending configuration is separate.
@@ -1233,13 +1260,17 @@ impl ProxyRuntime {
             .config
             .try_with_saved_commit(|config| {
                 self.selector_reconcile.with_intent_claim(|intent| {
+                    // Same config -> intent -> publication order as owned Stop.
+                    // The native groups and main generation are captured together;
+                    // no awaited read or event callback runs under these guards.
+                    let _publication = self.gate.lock_generation_publication();
+                    let generation = self.gate.generation();
                     let mut status = self
                         .status
                         .read()
                         .map_err(|_| "proxy status unavailable".to_owned())?
                         .clone();
-                    status.main_generation = self.gate.generation();
-                    status.starting = self.start_inflight.load(Ordering::SeqCst) > 0;
+                    self.project_status_memory(&mut status, generation);
                     status.owned_stop_context = Some(OwnedStopContext {
                         selected_server_id: config
                             .get("selectedServerId")
@@ -1251,13 +1282,7 @@ impl ProxyRuntime {
                 })
             })
             .map_err(|error| error.to_string())??;
-        status.uptime = status
-            .start_time
-            .map(|t0| now_ms().saturating_sub(t0) / 1_000);
-        #[cfg(target_os = "android")]
-        {
-            status.reconnect_required = native_reconnect_required(self.config.dir());
-        }
+        self.project_status_platform(&mut status);
         Ok(status)
     }
 

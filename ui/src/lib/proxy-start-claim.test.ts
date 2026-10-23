@@ -288,6 +288,22 @@ describe('两条出口成对守卫 —— 事件腿让位的码，await 腿必�
     expect(Object.keys(NOT_ON_DESKTOP_HOME).filter((c) => !gated.includes(c))).toEqual([]);
   });
 
+  it.each(['LAN_GATEWAY_FORWARDING_REQUIRED', 'LAN_GATEWAY_FORWARDING_UNCONFIRMED'])(
+    '%s：Home 认领的 await 腿使用专属本地化映射并立即返回，事件腿不再重复报错', async (code) => {
+      const { routing, home } = await sources();
+      expect(claimGatedCodes(routing)).toContain(code);
+      const leg = homeAwaitLeg(home)!;
+      const at = leg.indexOf(`code === ProxyErrorCode.${code}`);
+      expect(at).toBeGreaterThanOrEqual(0);
+      const branch = leg.slice(at, leg.indexOf('return;', at) + 'return;'.length);
+      expect(branch).toContain('toast.error(proxyErrorText({ errorCode: code }, key => t(key)))');
+      expect(branch.match(/toast\./g)?.length).toBe(1);
+      expect(branch).not.toContain('notifyDesktop');
+      expect(branch).not.toContain('String(err)');
+      expect(branch.trimEnd().endsWith('return;')).toBe(true);
+    },
+  );
+
   it('HELPER_CORE_MISMATCH：await 腿报的是本码专属文案并就此返回，不落到通用兜底', async () => {
     const { home } = await sources();
     const leg = homeAwaitLeg(home)!;
