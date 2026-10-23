@@ -4,12 +4,13 @@ The native node DNS generator requires the corresponding kernel implementation.
 Source-only success, an absent kernel or a previous kernel cannot establish the
 new policy's runtime compatibility.
 
-## Published alpha.12.1 selection
+## Published alpha.12.2 selection
 
-The final 814 source is selected using actual public immutable Release 421066315,
-published on 2026-10-22 at 18:47:54Z, and the four independently matched public
+The final c6 source is selected using actual public immutable Release 421642341,
+published on 2026-10-23 at 09:19:32Z, and the four independently matched public
 asset identities below. The original All producer index, exact automatic source
 archive, annotated tag and producer identity are bound in one exact contract.
+The prior 814 desktop contract/index and observations remain unchanged in Git history at App commit `bce3056c600f1738468acb7810cf2c086279aa5a`; they are not relabeled as c6.
 The a4d085 desktop contract and observations remain available unchanged at App
 commit 42706a1fc096b91f9a4186c0a4c68b0cdc88591b; the older c002/fe182 material and
 mobile a4d snapshot retain their own identities. No prior package, runtime or
@@ -25,17 +26,17 @@ repair an App consumer failure.
 canonical `scripts/desktop-core/release-contract.json` bytes:
 
 - Repository: `polaris-arch/sing-box-polaris`.
-- Source: `814da362838e96e54f904836a92c2b0d8c3ae29b`.
-- Tree: `ad574f93026557b49edecb492bd7ecdb851057c1`.
-- Version/tag: `1.15.0-polaris-alpha.12.1` / `v1.15.0-polaris-alpha.12.1`.
-- Annotated tag object: `8ecda357ea755a1295336a35ec7eaf1fe2daebc2`.
-- Public asset names use `sing-box-polaris-1.15.0-alpha.12.1-*`; the tag,
-  original archive filename/root and BuildInfo retain `1.15.0-polaris-alpha.12.1`.
+- Source: `c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a`.
+- Tree: `32c0e3d8c59ad5e41f5ccdbc68e14a644b503e94`.
+- Version/tag: `1.15.0-polaris-alpha.12.2` / `v1.15.0-polaris-alpha.12.2`.
+- Annotated tag object: `db094db3498ea6982ccc601289acbd0c8adcecac`.
+- Public asset names use `sing-box-polaris-1.15.0-alpha.12.2-*`; the tag,
+  original archive filename/root and BuildInfo retain `1.15.0-polaris-alpha.12.2`.
   The original producer index and provenance retain their historical name
   annotations; public renaming changes neither their bytes nor payload pins.
-- Public prerelease: `421066315`; producer run `39787021317`, attempt 1.
-- Exact four archive IDs: Linux `666747193`, Windows `666748404`, Intel macOS
-  `666739498`, Apple Silicon macOS `666754500`.
+- Public prerelease: `421642341`; producer run `39885482830`, attempt 1.
+- Exact four archive IDs: Linux `668605252`, Windows `668606220`, Intel macOS
+  `668597681`, Apple Silicon macOS `668599445`.
 
 This is a real upstream-layout formal release contract, not a relabeled staging
 index. The exact historical 577d contract is retained as
@@ -53,15 +54,15 @@ asset is needed by this selection.
 
 The entire unchanged original index is committed at
 `scripts/desktop-core/release-asset-index.json`, with SHA-256
-`1b5c1ae5a83a452cd14cda6ea608f3964f4e1ee1ee1face98b40ee400fe47cb5215`.
+`40bd2c1a48b5ef8129e0fd1d5dcf80f9bd9a77d7639c7f8709f6f49a60c29004`.
 The consumer checks its byte count, hash and all selected original rows against
 the canonical contract. It does not obtain the index from cross-repository
 Actions credentials or accept a replacement environment path.
 
 Source transport is the fixed commit URL
-`https://github.com/polaris-arch/sing-box-polaris/archive/814da362838e96e54f904836a92c2b0d8c3ae29b.tar.gz`.
-The actual 12,673,355 bytes have SHA-256
-`f66a790d43b7a229299928d521141a99588b80535fe2dea3445f3bc436b96fe9`.
+`https://github.com/polaris-arch/sing-box-polaris/archive/c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a.tar.gz`.
+The actual 15,648,955 bytes have SHA-256
+`7a734c45a7765ec45fe389f09976808c5a7a6e7caadd6689b840889e6335d775`.
 Only its exact same-commit codeload redirect is admitted. The existing archive
 verifier checks the complete expanded Git tree, separately observed gitlinks,
 module hashes, all nine reviewed local replacement trees (2,838 tracked files) and every
@@ -127,8 +128,9 @@ Its exact compiled source and canonical contract digest select the same
 PlainTcpCheckV1 semantics. No compiled source/hash pair can borrow c002 or fe182
 admission. Sealed-runtime evidence remains pending.
 
-A fifth private 814da row binds the current source and canonical contract to
-Linux ELF `363261029cea32333adcdd67288b23e4ae4084efa96b7f2b157af6e9d39946ee`.
+The fifth private 814da row remains historical and cannot match the new compiled contract.
+A sixth private c6c0d8 row binds the current source and canonical contract to
+Linux ELF `80e21e78875f2f1cbfb1356dd977d6043a7776179df61f57897a4d811eaa1eaf`.
 It rejects cross-paired historical sources/contracts and explicitly records runtime evidence pending. It permits the existing
 Linux Test gate to collect its own sealed check evidence; no prior probe is
 claimed or required as a circular prerequisite to that gate. Check success never

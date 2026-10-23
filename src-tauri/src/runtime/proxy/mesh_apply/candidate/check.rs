@@ -34,7 +34,7 @@ struct ReviewedCheckIdentity {
     memfd_name: &'static str,
 }
 
-static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 5] = [
+static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 6] = [
     ReviewedCheckIdentity {
         source_commit: "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
         contract_sha256: None,
@@ -103,6 +103,20 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 5] = [
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-814da",
     },
+    // Exact c6 producer bytes and final public contract are independently bound. This row
+    // admits only the existing check semantics to collect fresh runtime evidence;
+    // no historical observation transfers and no managed launch is granted.
+    ReviewedCheckIdentity {
+        source_commit: "c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a",
+        contract_sha256: Some("976a9535eea2149ec7630956a3fb8ae9183c0167b732182b2bb42de65f4045d6"),
+        evidence_label: "linux-x86_64-c6c0d8:runtime-evidence-pending:env-empty:cwd-root:sealed-fd0:--disable-color check -c /proc/self/fd/0",
+        #[cfg(target_os = "linux")]
+        binary_sha256: "80e21e78875f2f1cbfb1356dd977d6043a7776179df61f57897a4d811eaa1eaf",
+        #[cfg(target_os = "linux")]
+        input_profile: LinuxInputProfile::C6C0D8,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        memfd_name: "polaris-strict-check-c6c0d8",
+    },
 ];
 
 /// Check/preparation identity only. The private rows cannot be constructed from
@@ -121,6 +135,8 @@ impl LinuxCheckProfile {
     pub(super) const A4D085: Self = Self(&REVIEWED_CHECK_IDENTITIES[3]);
     #[cfg(test)]
     pub(super) const E814DA: Self = Self(&REVIEWED_CHECK_IDENTITIES[4]);
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    pub(super) const C6C0D8: Self = Self(&REVIEWED_CHECK_IDENTITIES[5]);
 
     pub(super) const fn execution_profile(self) -> &'static str {
         self.0.evidence_label

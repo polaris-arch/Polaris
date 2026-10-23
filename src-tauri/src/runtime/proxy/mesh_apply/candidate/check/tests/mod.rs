@@ -270,15 +270,16 @@ mod linux_tests {
             Ok(LinuxCheckProfile::E814DA)
         );
         let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
-        assert_eq!(
-            polaris_updater::verify::sha256_hex(binding.as_bytes()),
-            contract
+        let current_digest = polaris_updater::verify::sha256_hex(binding.as_bytes());
+        assert_ne!(
+            current_digest, contract,
+            "historical contract is not current"
         );
         let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
-        assert_eq!(binding["sourceCommit"], replacement.source_commit);
+        assert_ne!(binding["sourceCommit"], replacement.source_commit);
         assert_eq!(
-            binding["platforms"]["linux"]["core"]["sha256"],
-            replacement.binary_sha256
+            reviewed_compiled_profile(replacement.source_commit, &current_digest),
+            Err(CandidateCheckError::Unsupported)
         );
         assert_eq!(
             LinuxCheckProfile::E814DA.binary_sha256(),
@@ -315,6 +316,87 @@ mod linux_tests {
             REVIEWED_CHECK_IDENTITIES[1].source_commit,
             REVIEWED_CHECK_IDENTITIES[2].source_commit,
             REVIEWED_CHECK_IDENTITIES[3].source_commit,
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(source, contract),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        assert_eq!(
+            reviewed_compiled_profile(&replacement.source_commit.to_ascii_uppercase(), contract),
+            Err(CandidateCheckError::Unsupported)
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, &contract.to_ascii_uppercase()),
+            Err(CandidateCheckError::Unsupported)
+        );
+    }
+    #[test]
+    fn next_patch_requires_its_exact_source_contract_and_actual_elf() {
+        use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
+        use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
+        let replacement = &REVIEWED_CHECK_IDENTITIES[5];
+        assert_eq!(
+            replacement.source_commit,
+            "c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a"
+        );
+        let contract = replacement.contract_sha256.unwrap();
+        assert_eq!(
+            contract,
+            "976a9535eea2149ec7630956a3fb8ae9183c0167b732182b2bb42de65f4045d6"
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, contract),
+            Ok(LinuxCheckProfile::C6C0D8)
+        );
+        let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
+        assert_eq!(
+            polaris_updater::verify::sha256_hex(binding.as_bytes()),
+            contract
+        );
+        let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
+        assert_eq!(binding["sourceCommit"], replacement.source_commit);
+        assert_eq!(
+            binding["platforms"]["linux"]["core"]["sha256"],
+            replacement.binary_sha256
+        );
+        assert_eq!(
+            LinuxCheckProfile::C6C0D8.binary_sha256(),
+            "80e21e78875f2f1cbfb1356dd977d6043a7776179df61f57897a4d811eaa1eaf"
+        );
+        assert_eq!(
+            LinuxCheckProfile::C6C0D8.input_profile(),
+            LinuxInputProfile::C6C0D8
+        );
+        assert!(matches!(
+            LinuxCheckProfile::C6C0D8.input_profile(),
+            LinuxInputProfile::PlainTcpCheckV1(_)
+        ));
+        assert!(LinuxCheckProfile::C6C0D8
+            .execution_profile()
+            .contains("c6c0d8:runtime-evidence-pending"));
+        for digest in [
+            "",
+            "unknown",
+            replacement.binary_sha256,
+            REVIEWED_CHECK_IDENTITIES[1].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[2].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[3].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[4].contract_sha256.unwrap(),
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(replacement.source_commit, digest),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        for source in [
+            "",
+            "unknown",
+            REVIEWED_CHECK_IDENTITIES[0].source_commit,
+            REVIEWED_CHECK_IDENTITIES[1].source_commit,
+            REVIEWED_CHECK_IDENTITIES[2].source_commit,
+            REVIEWED_CHECK_IDENTITIES[3].source_commit,
+            REVIEWED_CHECK_IDENTITIES[4].source_commit,
         ] {
             assert_eq!(
                 reviewed_compiled_profile(source, contract),

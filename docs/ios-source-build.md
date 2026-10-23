@@ -8,7 +8,7 @@
 
 当前内核来源为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)，移动端固定输入由 source-contract 锁定。来源选择不表示 App 运行验收完成，也不提供已发布 IPA 下载；核心仓的原始组件不能替代 App 构建器生成并核验的组件收据。
 
-核心来源以 [source-contract.json](../scripts/mobile-core/source-contract.json) 为准，当前是 sing-box-polaris `v1.15.0-polaris-alpha.12.1` 的固定 commit `814da362838e96e54f904836a92c2b0d8c3ae29b`（annotated tag 对象 `8ecda357ea755a1295336a35ec7eaf1fe2daebc2`，tree `ad574f93026557b49edecb492bd7ecdb851057c1`）。`--source` 指向保存对应 tag/commit/tree 的核心 checkout，不是 Polaris应用目录；不应用历史六片补丁。先准备组件所需现行工具/来源，完整约束见 [移动内核构建说明](../scripts/mobile-core/README.md)。 新输入采用 v2 九 vendor 源闭包；旧 a4d 输入原字节只保留为历史 desktop 关联断言，不能替代本次组件。移动源构建无需等待桌面公开 Release，但必须核验这个真实 tag/object/commit/tree；实际 ObjC/Swift importer、App 与 PacketTunnel 编译和原始组件/载体收据仍须本次生成。输入合同中的 artifactPins/producerReceipt 继续为 null，所有验收标志保持 false，不能据 source pin 宣称已验收或提供设备运行结果。
+核心来源以 [source-contract.json](../scripts/mobile-core/source-contract.json) 为准，当前是 sing-box-polaris `v1.15.0-polaris-alpha.12.2` 的固定 commit `c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a`（annotated tag 对象 `db094db3498ea6982ccc601289acbd0c8adcecac`，tree `32c0e3d8c59ad5e41f5ccdbc68e14a644b503e94`）。`--source` 指向保存对应 tag/commit/tree 的核心 checkout，不是 Polaris应用目录；不应用历史六片补丁。先准备组件所需现行工具/来源，完整约束见 [移动内核构建说明](../scripts/mobile-core/README.md)。 新输入采用 v2 九 vendor 源闭包；旧 a4d 输入原字节只保留为历史 desktop 关联断言，不能替代本次组件。移动源构建无需等待桌面公开 Release，但必须核验这个真实 tag/object/commit/tree；实际 ObjC/Swift importer、App 与 PacketTunnel 编译和原始组件/载体收据仍须本次生成。输入合同中的 artifactPins/producerReceipt 继续为 null，所有验收标志保持 false，不能据 source pin 宣称已验收或提供设备运行结果。
 
 构建前还须运行 `node scripts/fetch-protoc.mjs`，将输出的 `bin` 目录加入当前 shell 的 PATH，并核对 `protoc --version`（当前 `libprotoc 35.1`）。本地脚本不自动修改 PATH；Rust 的 `singbox-grpc` 构建需要该工具。仅在修改 `project.yml` 后重新生成工程时需要 XcodeGen。
 
