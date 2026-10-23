@@ -261,50 +261,139 @@ def validate_execution(value):
             'actual workflow/run attempt required')
 
 
-def validate_permission(launch, now=None, recovery=False):
+AUTH_GUARDS = ('permission-schema', 'permission-mode', 'permission-binding', 'permission-actions',
+    'permission-window', 'permission-time', 'account-unique', 'account-login', 'account-groups',
+    'tool-passwd', 'tool-chpasswd', 'tool-pkttyagent', 'tool-setsid', 'tool-setpriv',
+    'status-command', 'status-format', 'status-existing-password', 'complete')
+
+
+def auth_observation():
+    return {'schema': 'polaris-auth-readiness-observation-v1', 'guard': 'permission-schema',
+            'code': 'AUTH_PERMISSION_SCHEMA', 'passwordStatus': 'unknown', 'completed': False,
+            'scope': 'read-only-check-observation-not-account-restoration'}
+
+
+def auth_mark(observation, guard):
+    if observation is not None:
+        require(guard in AUTH_GUARDS, 'fixed authentication guard required')
+        observation.update(guard=guard, code='AUTH_' + guard.upper().replace('-', '_'))
+
+
+def validate_auth_observation(value):
+    exact(value, ('schema', 'guard', 'code', 'passwordStatus', 'completed', 'scope'))
+    require(value['schema'] == 'polaris-auth-readiness-observation-v1' and value['guard'] in AUTH_GUARDS and
+            value['code'] == 'AUTH_' + value['guard'].upper().replace('-', '_') and
+            value['passwordStatus'] in ('L', 'NP', 'P', 'unknown') and type(value['completed']) is bool and
+            value['completed'] == (value['guard'] == 'complete') and
+            value['scope'] == 'read-only-check-observation-not-account-restoration', 'authentication observation differs')
+    require(not value['completed'] or value['passwordStatus'] in ('L', 'NP'), 'usable existing password is never admitted')
+    return value
+
+
+ABORT_UNKNOWN_CODES = frozenset(('root-preparation-incomplete', 'root-ledger-failure-unconfirmed',
+    'root-ledger-recovery-unconfirmed', 'authentication-subtree-cleanup-unknown', 'authentication-cleanup-unknown',
+    'privilege-transaction-cleanup-unknown', 'product-cleanup-unknown', 'owned-secret-controller-stop-unproved',
+    'credential-setting-intent-unknown', 'setting-writer-not-yet-recorded', 'credential-writer-stop-unproved',
+    'authentication-lineage-stop-unproved', 'credential-relock-unproved', 'product-ledger-recovery-incomplete',
+    'transaction-birth-or-exec-changed', 'transaction-required-force-kill', 'authentication-agent-spawn-unknown',
+    'authentication-agent-required-force-kill', 'authentication-agent-exited-early', 'earlier-failure-is-permanent',
+    'helper-emergency-stop-unknown', 'unregistered-product-installation', 'owned-process-cleanup-unknown',
+    'registered-process-still-live', 'native-child-spawn-outcome-unknown', 'partial-network-command-unknown',
+    'product-network-recovery-unproved', 'network-restoration-unproved', 'route-removal-unknown'))
+
+
+def validate_abort_receipt(value):
+    """Parse failure evidence only; an empty unknown list grants no authority."""
+    fields = ('schema', 'state', 'forced', 'prepared', 'actualReadOnlyAuth', 'unknown')
+    require(type(value) is dict, 'typed abort receipt required')
+    exact(value, fields + (('productCleanup',) if 'productCleanup' in value else ()))
+    require(value['schema'] == 'polaris-root-abort-v1' and value['state'] == 'failed' and value['forced'] is True and
+            (value['prepared'] is None or type(value['prepared']) is bool), 'abort failure scope differs')
+    if value['actualReadOnlyAuth'] is not None: validate_auth_observation(value['actualReadOnlyAuth'])
+    def codes(rows):
+        require(type(rows) is list and len(rows) <= 128, 'bounded abort unknown codes required')
+        for code in rows:
+            require(type(code) is str and len(code) <= 96 and (code in ABORT_UNKNOWN_CODES or
+                re.fullmatch(r'(namespace-identity-or-live-members|namespace-removal-unknown):pt[0-9a-f]{8}n', code) or
+                re.fullmatch(r'link-removal-unknown:pt[0-9a-f]{8}v0', code)), 'fixed abort unknown code required')
+    codes(value['unknown'])
+    require(('productCleanup' in value) == (value['prepared'] is True), 'abort preparation/outcome differs')
+    if value['prepared'] is None:
+        require('root-preparation-incomplete' in value['unknown'], 'partial preparation cannot claim clean closure')
+    if 'productCleanup' in value:
+        product = value['productCleanup']
+        require(type(product) is dict, 'typed product cleanup required')
+        if set(product) == {'state'}:
+            require(product['state'] == 'failed' and 'product-cleanup-unknown' in value['unknown'], 'missing cleanup evidence')
+        else:
+            exact(product, ('state', 'forced', 'unknown', 'publicationEligible'))
+            require(product['state'] in ('forced', 'failed') and product['forced'] is True and
+                    product['publicationEligible'] is False, 'abort cannot claim normal cleanup')
+            codes(product['unknown'])
+    return value
+
+
+def validate_permission(launch, now=None, recovery=False, observation=None):
     """Frozen real-event admission is authority, NEVER pkexec authentication proof."""
+    auth_mark(observation, 'permission-schema')
     p = launch.get('authorization')
     exact(p, ('schema', 'phrase', 'authMode', 'execution', 'runToken', 'guiUid', 'account',
               'transactions', 'notBeforeUnix', 'expiresUnix', 'maxLeaseSeconds'))
+    auth_mark(observation, 'permission-mode')
     require(p['schema'] == 'polaris-tun-credential-lease-v1' and p['phrase'] == AUTH_PHRASE and
             p['authMode'] == AUTH_MODE and launch['authenticationMode'] == AUTH_MODE, 'specific credential authorization absent')
+    auth_mark(observation, 'permission-binding')
     require(p['execution'] == launch['execution'] and launch['execution']['githubRunAttempt'] == '1' and p['runToken'] == launch['runId'] and
             p['guiUid'] == launch['guiUid'] and type(p['guiUid']) is int, 'credential execution/UID binding differs')
+    auth_mark(observation, 'permission-actions')
     require(re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', p['account']) and p['transactions'] == ['install', 'uninstall'] and
             p['maxLeaseSeconds'] == 90, 'fixed existing-account actions required')
+    auth_mark(observation, 'permission-window')
     require(type(p['notBeforeUnix']) is int and type(p['expiresUnix']) is int and
             0 < p['expiresUnix'] - p['notBeforeUnix'] <= 900, 'bounded credential authority required')
     if not recovery:
+        auth_mark(observation, 'permission-time')
         now = int(time.time()) if now is None else now
         require(p['notBeforeUnix'] <= now and now + p['maxLeaseSeconds'] <= p['expiresUnix'],
                 'credential permission not yet valid or expired')
     return p
 
 
-def account_status(name):
+def account_status(name, observation=None):
+    auth_mark(observation, 'status-command')
     result = subprocess.run(['/usr/bin/passwd', '-S', name], env=ENV, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=True)
+    auth_mark(observation, 'status-format')
+    require(len(result.stdout) <= 4096, 'bounded account status required')
     words = result.stdout.decode('ascii', 'strict').split()
     require(len(words) == 7 and words[0] == name and words[1] in ('L', 'NP', 'P'), 'account status ambiguous')
     return words[1]
 
 
-def credential_account(launch, tun, recovery=False):
+def credential_account(launch, tun, recovery=False, observation=None):
     import grp
-    p = validate_permission(launch, recovery=recovery)
+    p = validate_permission(launch, recovery=recovery, observation=observation)
+    auth_mark(observation, 'account-unique')
     users = [u for u in pwd.getpwall() if u.pw_uid == p['guiUid']]
     require(len(users) == 1 and users[0].pw_name == p['account'] and pwd.getpwnam(p['account']).pw_uid == p['guiUid'],
             'unique existing approved account required')
     user = users[0]
     if not recovery:
+        auth_mark(observation, 'account-login')
         require(user.pw_shell in ('/bin/bash', '/usr/bin/bash') and user.pw_dir.startswith('/home/'), 'existing runner login account required')
+    auth_mark(observation, 'account-groups')
     groups = [g.gr_name for g in grp.getgrall() if user.pw_name in g.gr_mem or g.gr_gid == user.pw_gid]
     if not recovery:
         require('sudo' in groups or 'admin' in groups, 'existing administrator group required; no group changes allowed')
     for path in ('/usr/bin/passwd', '/usr/sbin/chpasswd', '/usr/bin/pkttyagent', '/usr/bin/setsid', '/usr/bin/setpriv'):
+        auth_mark(observation, 'tool-' + Path(path).name)
         tun.file_identity(Path(path).resolve())
-    status = account_status(user.pw_name)
+    status = account_status(user.pw_name, observation=observation)
+    if observation is not None: observation['passwordStatus'] = status
+    auth_mark(observation, 'status-existing-password')
     if not recovery: require(status in ('L', 'NP'), 'existing usable password must never be overwritten')
+    if observation is not None:
+        auth_mark(observation, 'complete'); observation['completed'] = True
     return user, status
 
 
@@ -794,6 +883,7 @@ class Controller:
         self.gui = None; self.ledger = None; self.observer = None; self.fixtures = {}; self.capture_offset = 0
         self.agent = None; self.pty = None; self.tools = {}; self.lease = None; self.auth_observer = None
         self.stage = 'idle'; self.preparation_pending = False; self.recovery_unknown = []
+        self.readonly_auth = None
 
     def fail(self):
         self.failed = True
@@ -851,7 +941,8 @@ class Controller:
     def authentication_readiness(self):
         mode = self.launch['authenticationMode']
         if mode == AUTH_MODE:
-            user, status = credential_account(self.launch, self.tun)
+            self.readonly_auth = auth_observation()
+            user, status = credential_account(self.launch, self.tun, observation=self.readonly_auth)
             return {'kind': 'exact-dispatch-credential-authority', 'account': user.pw_name,
                     'originalPasswordStatus': status, 'authenticated': False}
         require(mode == 'existing-session', 'observer-only agent cannot authorize mutation')
@@ -1197,7 +1288,9 @@ class Controller:
         if self.observer:
             self.observer.stop.set(); self.observer.thread.join(timeout=3); self.observer = None
         if not self.ledger:
-            return {'state': 'failed', 'prepared': None if self.preparation_pending else False, 'unknown': sorted(set(self.recovery_unknown +
+            return {'schema': 'polaris-root-abort-v1', 'state': 'failed', 'forced': True,
+                'prepared': None if self.preparation_pending else False, 'actualReadOnlyAuth': self.readonly_auth,
+                'unknown': sorted(set(self.recovery_unknown +
                 (['root-preparation-incomplete'] if self.preparation_pending else [])))}
         # Auth recovery is independent and attempted even if product cleanup raises.
         errors = list(self.recovery_unknown)
@@ -1214,7 +1307,8 @@ class Controller:
         try:
             self.ledger.mutate(lambda v: v.update(unknown=sorted(set(v['unknown'] + errors)), result='failed'))
         except Exception: errors.append('root-ledger-recovery-unconfirmed')
-        return {'state': 'failed', 'forced': True, 'unknown': sorted(set(errors)), 'productCleanup': result}
+        return {'schema': 'polaris-root-abort-v1', 'state': 'failed', 'forced': True, 'prepared': True,
+                'actualReadOnlyAuth': self.readonly_auth, 'unknown': sorted(set(errors)), 'productCleanup': result}
 
 
 def close_transactions(ledger, tun, signal_live=True):
@@ -1301,6 +1395,8 @@ def main():
                                       'kind': type(error).__name__,
                                       'stage': controller.stage if controller.stage in CONTROLLER_STAGES else 'dispatch',
                                       'message': 'fixed operation failed; no acceptance or authentication success'}}
+                if controller.readonly_auth is not None:
+                    response['error']['actualReadOnlyAuth'] = validate_auth_observation(controller.readonly_auth)
                 if not_ready:
                     response['error'].update(mutated=False, mutationScope='product-network-account')
             print(json.dumps(response, separators=(',', ':')), flush=True)

@@ -257,6 +257,112 @@ class TimerTests(unittest.TestCase):
             with self.assertRaises(ValueError): self.timer(timer={field: value})
 
 
+class ReadinessObservationTests(unittest.TestCase):
+    def exercise(self, fault=None, status='L'):
+        from contextlib import ExitStack
+        c = controller(m.AUTH_MODE); c.ledger = None
+        user = types.SimpleNamespace(pw_uid=1001, pw_name='runner', pw_shell='/bin/bash', pw_dir='/home/runner', pw_gid=1001, pw_gecos='PRIVATE')
+        group = types.SimpleNamespace(gr_name='sudo', gr_mem=['runner'], gr_gid=2)
+        if fault == 'permission-schema': c.launch['authorization']['extra'] = 'PRIVATE'
+        if fault == 'permission-mode': c.launch['authorization']['phrase'] = 'PRIVATE'
+        if fault == 'permission-binding': c.launch['authorization']['guiUid'] = 1002
+        if fault == 'permission-actions': c.launch['authorization']['maxLeaseSeconds'] = 91
+        if fault == 'permission-window': c.launch['authorization']['expiresUnix'] += 1000
+        if fault == 'permission-time': c.launch['authorization']['notBeforeUnix'] -= 2000; c.launch['authorization']['expiresUnix'] -= 2000
+        if fault == 'account-login': user.pw_shell = '/sbin/nologin'
+        if fault == 'account-groups': group.gr_name = 'users'
+        def tool(path):
+            if fault == 'tool-' + Path(path).name: raise ValueError('PRIVATE')
+            return {'dev': 1, 'inode': 2, 'sha256': H}
+        c.tun.file_identity.side_effect = tool
+        output = b'PRIVATE malformed' if fault == 'status-format' else ('runner ' + status + ' 2026-01-01 0 99999 7 -1\n').encode()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(m.pwd, 'getpwall', return_value=[user,user] if fault == 'account-unique' else [user]))
+            stack.enter_context(patch.object(m.pwd, 'getpwnam', return_value=user))
+            stack.enter_context(patch('grp.getgrall', return_value=[group]))
+            run = stack.enter_context(patch.object(m.subprocess, 'run', return_value=types.SimpleNamespace(stdout=output),
+                side_effect=OSError('PRIVATE') if fault == 'status-command' else None))
+            spawn = stack.enter_context(patch.object(m.subprocess, 'Popen'))
+            lease = stack.enter_context(patch.object(m.CredentialLease, 'open'))
+            if fault or status == 'P':
+                with self.assertRaises(Exception): c.prepare()
+                c.tun.prepare_root.assert_not_called(); c.tun.collect_preflight.assert_not_called()
+                self.assertEqual(c.stage, 'authentication-readiness')
+            else:
+                self.assertFalse(c.authentication_readiness()['authenticated'])
+            spawn.assert_not_called(); lease.assert_not_called()
+            for call in run.call_args_list:
+                self.assertEqual(call.args[0], ['/usr/bin/passwd', '-S', 'runner'])
+            receipt = c.abort(); m.validate_abort_receipt(receipt)
+            self.assertFalse(receipt['prepared']); self.assertNotIn('productCleanup', receipt)
+        self.assertNotIn('PRIVATE', json.dumps(receipt))
+        return c.readonly_auth
+
+    def test_every_readiness_guard_has_fixed_nonsecret_failure_observation(self):
+        for fault in m.AUTH_GUARDS[:-2]:
+            with self.subTest(fault=fault):
+                value = self.exercise(fault)
+                m.validate_auth_observation(value)
+                self.assertEqual(value['guard'], fault); self.assertFalse(value['completed'])
+
+    def test_p_remains_rejected_l_np_are_readiness_only(self):
+        value = self.exercise(status='P')
+        self.assertEqual(value['guard'], 'status-existing-password')
+        self.assertEqual(value['passwordStatus'], 'P'); self.assertFalse(value['completed'])
+        for status in ('L', 'NP'):
+            value = self.exercise(status=status); self.assertEqual(value['passwordStatus'], status)
+            self.assertTrue(value['completed'])
+
+    def test_status_parser_errors_never_echo_raw_bytes(self):
+        for raw in (b'PRIVATE', b'runner PRIVATE a b c d e', b'other L a b c d e', b'\xff', b'x'*4097):
+            observation = m.auth_observation()
+            with patch.object(m.subprocess, 'run', return_value=types.SimpleNamespace(stdout=raw)):
+                with self.assertRaises(Exception): m.account_status('runner', observation=observation)
+            self.assertEqual(observation['guard'], 'status-format')
+            self.assertEqual(observation['passwordStatus'], 'unknown')
+            self.assertNotIn('PRIVATE', json.dumps(observation))
+
+    def test_status_timeout_and_command_failure_stay_unknown(self):
+        for error in (m.subprocess.TimeoutExpired('fixed-passwd-status', 5), m.subprocess.CalledProcessError(1, 'fixed-passwd-status'), OSError('PRIVATE')):
+            observation = m.auth_observation()
+            with patch.object(m.subprocess, 'run', side_effect=error):
+                with self.assertRaises(Exception): m.account_status('runner', observation=observation)
+            self.assertEqual(observation['guard'], 'status-command')
+            self.assertEqual(observation['passwordStatus'], 'unknown')
+            self.assertNotIn('PRIVATE', json.dumps(observation))
+
+    def test_prepared_abort_keeps_product_unknown_and_no_normal_claim(self):
+        c = controller(); product = {'state': 'forced', 'forced': True,
+            'unknown': ['earlier-failure-is-permanent', 'namespace-removal-unknown:pt01234567n'], 'publicationEligible': False}
+        c.tun.cleanup.return_value = product
+        with patch.object(m, 'close_auth'), patch.object(m, 'close_transactions'):
+            receipt = c.abort()
+        self.assertIs(m.validate_abort_receipt(receipt), receipt)
+        self.assertTrue(receipt['prepared']); self.assertEqual(receipt['productCleanup'], product)
+        self.assertEqual(receipt['state'], 'failed')
+        c = controller(); c.tun.cleanup.side_effect = ValueError('PRIVATE')
+        with patch.object(m, 'close_auth'), patch.object(m, 'close_transactions'):
+            receipt = c.abort()
+        m.validate_abort_receipt(receipt)
+        self.assertEqual(receipt['productCleanup'], {'state': 'failed'})
+        self.assertIn('product-cleanup-unknown', receipt['unknown'])
+        self.assertNotIn('PRIVATE', json.dumps(receipt))
+
+    def test_abort_receipt_validation_preserves_failure_and_rejects_injected_fields(self):
+        c = controller(); c.ledger = None; c.preparation_pending = True
+        value = c.abort(); self.assertIs(m.validate_abort_receipt(value), value)
+        self.assertIsNone(value['prepared']); self.assertIn('root-preparation-incomplete', value['unknown'])
+        for change in ({'state': 'normal'}, {'unknown': []}, {'extra': 'PRIVATE'}, {'actualReadOnlyAuth': {'raw': 'PRIVATE'}}, {'prepared': 0}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                m.validate_abort_receipt({**value, **change})
+        c.preparation_pending = False; value = c.abort()
+        self.assertEqual(value['unknown'], []); self.assertEqual(value['state'], 'failed')
+        prepared = {**value, 'prepared': True, 'productCleanup': {'state': 'forced', 'forced': True, 'unknown': ['earlier-failure-is-permanent'], 'publicationEligible': False}}
+        self.assertIs(m.validate_abort_receipt(prepared), prepared)
+        for bad in ({'state': 'normal', 'forced': False, 'unknown': [], 'publicationEligible': False}, {'state': 'failed'}, {'state': 'forced', 'forced': True, 'unknown': ['PRIVATE'], 'publicationEligible': False}):
+            with self.assertRaises(ValueError): m.validate_abort_receipt({**prepared, 'productCleanup': bad})
+
+
 class CredentialTests(unittest.TestCase):
     def account(self, status='L', duplicate=False, admin=True, recovery=False):
         user = types.SimpleNamespace(pw_uid=1001, pw_name='runner', pw_shell='/bin/bash', pw_dir='/home/runner', pw_gid=1001, pw_gecos='')
@@ -538,6 +644,7 @@ class EntryAndConcurrencyTests(unittest.TestCase):
             if dispatch_error:raise ValueError('PRIVATE SECRET MUST NOT BE PRINTED')
             if finish:c.finished=True
             return {'seq':1,'ok':True,'result':{}}
+        c.readonly_auth = None
         c.dispatch.side_effect=dispatch
         lines=[b'{"seq":1,"action":"prepare"}\n',ValueError('EOF')]
         out=io.StringIO()
@@ -779,7 +886,9 @@ class StartupLifecycleTests(unittest.TestCase):
         self.assertEqual(c.stage, 'bind-gui')
         self.assertIsNone(c.ledger)
         c.tun.prepare_root.assert_not_called()
-        self.assertEqual(c.abort(), {'state': 'failed', 'prepared': False, 'unknown': []})
+        receipt = c.abort(); m.validate_abort_receipt(receipt)
+        self.assertFalse(receipt['prepared']); self.assertEqual(receipt['unknown'], [])
+        self.assertIsNone(receipt['actualReadOnlyAuth'])
 
     def test_prepare_failure_matrix_preserves_original_guards_and_partial_ledger_unknown(self):
         for fault in ('authentication-readiness', 'vm-preflight', 'tool-identities', 'root-ledger',

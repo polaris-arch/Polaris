@@ -394,7 +394,9 @@ class Controller:
         unknown = []
         if self.lifecycle['ready'] and not self.closed:
             try:
-                recovery = self.call('abort')
+                import root_controller
+                recovery = root_controller.validate_abort_receipt(self.call('abort'))
+                self.lifecycle['abortReceipt'] = copy.deepcopy(recovery)
                 unknown.extend(recovery.get('unknown', []))
                 self.lifecycle['abortAcknowledged'] = True
             except Exception:
@@ -460,6 +462,9 @@ class Controller:
                 import root_controller
                 if error.get('stage') in root_controller.CONTROLLER_STAGES and error.get('code') in ('CONTROLLER_FAILED', 'AUTHENTICATION_NOT_READY'):
                     self.lifecycle['rootOperationFailure'] = {'stage': error['stage'], 'code': error['code']}
+                    if 'actualReadOnlyAuth' in error:
+                        observed = root_controller.validate_auth_observation(error['actualReadOnlyAuth'])
+                        self.lifecycle['rootOperationFailure']['actualReadOnlyAuth'] = copy.deepcopy(observed)
             require(isinstance(value, dict) and value.get('seq') == self.seq and value.get('ok') is True, 'root controller action failed')
             return value['result']
 

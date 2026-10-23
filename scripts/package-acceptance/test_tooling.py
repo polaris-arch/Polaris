@@ -102,15 +102,23 @@ class ToolingTests(unittest.TestCase):
 
     def test_shared_actual_start_tools_uses_proved_paths_and_supported_args(self):
         facts = self.prepare(); obj = object.__new__(L.CarrierRun)
-        obj.env = {'PATH': '/usr/bin:/bin'}; obj.result = {}; obj.supervisor = Mock()
+        obj.env = {'PATH': '/usr/bin:/bin'}; obj.result = {}; obj.supervisor = Mock(); obj.workspace = self.root
+        config = self.root / 'session.conf'; config.write_text('fixed fixture configuration')
         bus = Mock(); bus.stdout = io.BytesIO(b'unix:path=/tmp/mock-private-bus\n')
         obj.supervisor.spawn.side_effect = [Mock(), bus, Mock()]
         web = Mock(); web.request.return_value = {'ready': True}
-        with patch.object(L, 'verified_tools', return_value=facts), patch.object(L.os, 'read', return_value=b'99\n'), \
+        with patch.object(L, 'verified_tools', return_value=facts) as verified, patch.object(L.os, 'read', return_value=b'99\n'), \
+             patch.object(L, 'private_session_config', return_value=(config, self.root / 'bus')), \
+             patch.object(L, 'private_bus_address', return_value='unix:path=/tmp/mock-private-bus'), \
+             patch.object(L, 'verify_private_session', return_value={'state': 'observed'}) as boundary, \
              patch('select.select', return_value=([1], [], [])), patch.object(L, 'free_port', side_effect=[14444,14445]), \
              patch.object(L, 'WebDriver', return_value=web):
             obj.start_tools()
+        verified.assert_called_once_with(obj.supervisor)
+        boundary.assert_called_once_with(obj.supervisor, obj.env, 'unix:path=/tmp/mock-private-bus', self.root / 'bus')
         commands = [c.args[0] for c in obj.supervisor.spawn.call_args_list]
+        self.assertEqual(commands[1], ['/usr/bin/dbus-daemon', '--config-file=' + str(config), '--nofork', '--print-address=1'])
+        self.assertEqual(obj.result['sessionBoundary']['configSha256'], L.sha(config))
         self.assertEqual(commands[-1], [str(self.driver), '--port', '14444', '--native-port', '14445', '--native-driver', str(self.native)])
         self.assertFalse(any('--version' in command or '--help' in command for command in commands))
         self.assertEqual(obj.result['tools']['identity'], facts)

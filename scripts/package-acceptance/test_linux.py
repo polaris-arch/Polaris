@@ -571,6 +571,211 @@ class PrimitiveTests(unittest.TestCase):
             self.assertEqual(entry.read_text(), '#!/bin/sh\noriginal-hooks\n')
             self.assertEqual((destination / 'apprun-hooks/linuxdeploy-plugin-gtk.sh').read_text(), 'original-hook')
 
+    def test_private_session_xml_is_closed_and_same_uid(self):
+        import xml.etree.ElementTree as ET
+        with tempfile.TemporaryDirectory(prefix='session-') as tmp:
+            config, endpoint = M.private_session_config(Path(tmp))
+            root = ET.fromstring(config.read_text())
+            self.assertEqual([node.tag for node in root], ['type', 'keep_umask', 'listen', 'auth', 'policy'])
+            self.assertEqual(root.findtext('listen'), 'unix:path=' + str(endpoint))
+            self.assertEqual(root.findtext('auth'), 'EXTERNAL')
+            self.assertEqual([node.attrib for node in root.find('policy')][:2], [{'user': '*'}, {'user': str(os.getuid())}])
+            self.assertEqual([node.tag for node in root.find('policy')][:2], ['deny', 'allow'])
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(config.parent.stat().st_mode & 0o777, 0o700)
+            with self.assertRaises(FileExistsError):
+                M.private_session_config(Path(tmp))
+        source = Path(M.__file__).read_text()
+        self.assertNotIn("'--session'", source)
+        self.assertIn("module.verify(run=lambda argv: supervisor.query(", source)
+        self.assertNotIn("DBUS_SYSTEM_BUS_ADDRESS'] =", source)
+
+    def test_private_session_path_rejects_injection_or_long_socket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ('comma,service', 'xml&injection', 'x' * 110):
+                directory = Path(tmp) / name
+                directory.mkdir()
+                with self.assertRaises(ValueError):
+                    M.private_session_config(directory)
+
+    def test_private_session_real_method_contract_and_failures(self):
+        endpoint = Path('/tmp/private/bus')
+        address = 'unix:path=/tmp/private/bus,guid=' + 'a' * 32
+        good = ["(['org.freedesktop.DBus'],)", "('" + 'b' * 32 + "',)"]
+        supervisor = Mock()
+        with patch.object(Path, 'lstat', return_value=SimpleNamespace(st_mode=M.stat.S_IFSOCK | 0o600, st_uid=os.getuid())):
+            supervisor.query.side_effect = good
+            result = M.verify_private_session(supervisor, {}, address, endpoint)
+            self.assertEqual(result['activation'], 'none')
+            self.assertEqual(result['notTested'], M.PORTAL_NOT_TESTED)
+            self.assertEqual(supervisor.query.call_count, 2)
+            for empty in ('(@as [],)', '([],)'):
+                supervisor.query.side_effect = [empty, good[1]]
+                self.assertEqual(M.verify_private_session(supervisor, {}, address, endpoint)['activatableNames'], [])
+            for output in ("(['org.freedesktop.portal.Documents'],)", "(['org.freedesktop.DBus', 'other'],)", "('not-a-list',)", "private malformed"):
+                supervisor.query.side_effect = [output]
+                with self.assertRaises((ValueError, SyntaxError)):
+                    M.verify_private_session(supervisor, {}, address, endpoint)
+            supervisor.query.reset_mock()
+            for bad in ('unix:abstract=other', address + ';tcp:host=localhost', 'unix:path=/tmp/other,guid=' + 'a' * 32):
+                with self.assertRaises(ValueError):
+                    M.verify_private_session(supervisor, {}, bad, endpoint)
+            supervisor.query.assert_not_called()
+        with patch.object(Path, 'lstat', return_value=SimpleNamespace(st_mode=M.stat.S_IFREG, st_uid=os.getuid())):
+            with self.assertRaises(ValueError):
+                M.verify_private_session(supervisor, {}, address, endpoint)
+
+    def test_bus_address_read_is_bounded_and_rejects_eof(self):
+        stream = Mock()
+        with patch.object(M.select, 'select', return_value=([stream], [], [])), patch.object(M.os, 'read', side_effect=[b'a', b'\n']):
+            self.assertEqual(M.private_bus_address(stream), 'a')
+        for blocks in ([b''], [b'x'] * 4096):
+            with patch.object(M.select, 'select', return_value=([stream], [], [])), patch.object(M.os, 'read', side_effect=blocks):
+                with self.assertRaises(ValueError):
+                    M.private_bus_address(stream)
+        with patch.object(M.select, 'select', return_value=([], [], [])):
+            with self.assertRaises(ValueError):
+                M.private_bus_address(stream)
+
+    def probe_supervisor(self):
+        supervisor = M.Supervisor.__new__(M.Supervisor)
+        child = Mock(pid=913)
+        child.poll.return_value = None
+        child.wait.return_value = 0
+        supervisor.spawn = Mock(return_value=child)
+        supervisor.signal = Mock()
+        supervisor.owned = {913: {'pid': 913, 'startTime': '17', 'uid': os.getuid()}}
+        supervisor.forced, supervisor.unknown = [], []
+        return supervisor, child
+
+    def test_supervised_probe_success_reaped_without_signal(self):
+        supervisor, child = self.probe_supervisor()
+        with patch.object(M.select, 'select', return_value=([child.stdout], [], [])), patch.object(M.os, 'read', side_effect=[b'custody\n', b'']):
+            self.assertEqual(supervisor.query(['/usr/bin/dpkg-query'], {}), 'custody\n')
+        supervisor.spawn.assert_called_once_with(['/usr/bin/dpkg-query'], {}, 'tool-probe', stdout=M.subprocess.PIPE)
+        supervisor.signal.assert_not_called()
+        child.wait.assert_called_once()
+        child.stdout.close.assert_called_once()
+
+    def test_supervised_probe_timeout_output_and_exit_failure_reap(self):
+        for failure in ('timeout', 'bound', 'exit', 'decode'):
+            supervisor, child = self.probe_supervisor()
+            child.wait.return_value = 1 if failure == 'exit' else 0
+            reads = [b'abcdef'] if failure == 'bound' else [b'\xff', b''] if failure == 'decode' else [b'']
+            ready = [] if failure == 'timeout' else [child.stdout]
+            with patch.object(M.select, 'select', return_value=(ready, [], [])), patch.object(M.os, 'read', side_effect=reads):
+                with self.assertRaises(ValueError):
+                    supervisor.query(['probe'], {}, limit=5)
+            supervisor.signal.assert_called_once_with(supervisor.owned[913], M.signal.SIGKILL)
+            self.assertEqual(child.wait.call_args.kwargs['timeout'], 5)
+            child.stdout.close.assert_called_once()
+
+    def test_supervised_probe_unknown_signal_remains_failure(self):
+        supervisor, child = self.probe_supervisor()
+        supervisor.signal.side_effect = ValueError('UID changed')
+        child.wait.side_effect = M.subprocess.TimeoutExpired('probe', 5)
+        with patch.object(M.select, 'select', return_value=([], [], [])):
+            with self.assertRaisesRegex(ValueError, 'timed out'):
+                supervisor.query(['probe'], {})
+        self.assertEqual(supervisor.unknown, ['tool-probe-signal-unconfirmed', 'tool-probe-wait-timeout'])
+        child.stdout.close.assert_called_once()
+        for kwargs in ({'timeout': 16}, {'limit': 16385}, {'limit': 0}):
+            with self.assertRaises(ValueError):
+                supervisor.query(['probe'], {}, **kwargs)
+
+    def test_inventory_failure_closes_only_direct_ordinary_bus_still_unknown(self):
+        supervisor, bus = self.probe_supervisor()
+        supervisor.children = {913: bus, 914: Mock()}
+        supervisor.roles = {913: 'dbus', 914: 'root-controller'}
+        supervisor._close_owned = Mock(side_effect=ValueError('foreign UID'))
+        supervisor.stop, supervisor.thread = Mock(), Mock()
+        supervisor.thread.is_alive.return_value = False
+        result = supervisor.close(True)
+        supervisor.signal.assert_called_once_with(supervisor.owned[913], M.signal.SIGTERM)
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(result['remainingAssessment'], 'unknown')
+        self.assertIn('cleanup-inventory-unconfirmed', result['unknown'])
+        supervisor.children[914].poll.assert_not_called()
+        supervisor.thread.join.assert_called_once_with(2)
+
+
+    def test_spawn_registers_direct_probe_under_lock_before_scan(self):
+        import threading
+        supervisor = M.Supervisor.__new__(M.Supervisor)
+        supervisor.lock = threading.RLock()
+        supervisor.children, supervisor.owned, supervisor.roles = {}, {}, {}
+        child = Mock(pid=913)
+        item = {'pid': 913, 'startTime': '17', 'uid': os.getuid()}
+        with patch.object(M.subprocess, 'Popen', return_value=child), patch.object(M, 'process_identity', return_value=item):
+            self.assertIs(supervisor.spawn(['probe'], {}, 'tool-probe'), child)
+        self.assertIs(supervisor.children[913], child)
+        self.assertEqual(supervisor.owned[913], item)
+        self.assertEqual(supervisor.roles[913], 'tool-probe')
+
+    def test_spawn_capture_failure_retains_handle_without_signal_authority(self):
+        import threading
+        for identity in (None, PermissionError('private proc denied')):
+            for exited in (True, False):
+                supervisor = M.Supervisor.__new__(M.Supervisor)
+                supervisor.lock = threading.RLock()
+                supervisor.children, supervisor.owned, supervisor.roles = {}, {}, {}
+                supervisor.unknown = []
+                supervisor.signal = Mock()
+                child = Mock(pid=913)
+                child.poll.return_value = 0 if exited else None
+                with patch.object(M.subprocess, 'Popen', return_value=child), patch.object(M, 'process_identity', side_effect=identity if isinstance(identity, Exception) else None, return_value=identity):
+                    with self.assertRaises((ValueError, PermissionError)):
+                        supervisor.spawn(['probe'], {}, 'tool-probe', stdout=M.subprocess.PIPE)
+                self.assertIs(supervisor.children[913], child)
+                self.assertEqual(supervisor.owned, {})
+                self.assertEqual(supervisor.roles, {})
+                self.assertIn('spawn-identity-unconfirmed', supervisor.unknown)
+                supervisor.signal.assert_not_called()
+                child.stdout.close.assert_called_once()
+                child.stderr.close.assert_called_once()
+                if exited:
+                    child.wait.assert_called_once_with(timeout=0)
+                else:
+                    child.wait.assert_not_called()
+
+    def test_spawn_secondary_reap_pipe_failures_preserve_capture_failure(self):
+        import threading
+        supervisor = M.Supervisor.__new__(M.Supervisor)
+        supervisor.lock = threading.RLock()
+        supervisor.children, supervisor.owned, supervisor.roles = {}, {}, {}
+        supervisor.unknown = []
+        child = Mock(pid=913)
+        child.poll.return_value = 0
+        child.wait.side_effect = M.subprocess.TimeoutExpired('probe', 0)
+        child.stdout.close.side_effect = OSError('pipe private detail')
+        with patch.object(M.subprocess, 'Popen', return_value=child), patch.object(M, 'process_identity', side_effect=PermissionError('capture failure')):
+            with self.assertRaisesRegex(PermissionError, 'capture failure'):
+                supervisor.query(['probe'], {})
+        self.assertEqual(supervisor.unknown, ['spawn-identity-unconfirmed', 'spawn-reap-unconfirmed', 'spawn-pipe-close-unconfirmed'])
+        child.stderr.close.assert_called_once()
+        self.assertEqual(supervisor.owned, {})
+
+    def test_verified_tools_injects_only_supervised_fixed_environment_probe(self):
+        supervisor, module, spec = Mock(), Mock(), Mock()
+        module.verify.side_effect = lambda *, run: run(['/usr/bin/dpkg-query', '-S', '/usr/bin/WebKitWebDriver'])
+        with patch.object(M.importlib.util, 'spec_from_file_location', return_value=spec), patch.object(M.importlib.util, 'module_from_spec', return_value=module):
+            M.verified_tools(supervisor)
+        supervisor.query.assert_called_once_with(['/usr/bin/dpkg-query', '-S', '/usr/bin/WebKitWebDriver'], {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+
+    def test_inventory_fallback_cannot_bypass_uid_rejection(self):
+        supervisor, bus = self.probe_supervisor()
+        supervisor.children, supervisor.roles = {913: bus}, {913: 'dbus'}
+        supervisor._close_owned = Mock(side_effect=ValueError('inventory rejected'))
+        supervisor.signal.side_effect = ValueError('current uid root')
+        supervisor.stop, supervisor.thread = Mock(), Mock()
+        supervisor.thread.is_alive.return_value = False
+        result = supervisor.close(True)
+        self.assertIn('private-session-close-unconfirmed', result['unknown'])
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(result['remainingAssessment'], 'unknown')
+        bus.wait.assert_not_called()
+        supervisor.thread.join.assert_called_once_with(2)
+
 
 if __name__ == '__main__':
     unittest.main()

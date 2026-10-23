@@ -617,6 +617,60 @@ class PrivateProbeContracts(unittest.TestCase):
 
 
 class ControllerLifecycleContracts(unittest.TestCase):
+    def test_abort_full_validated_receipt_retained_but_never_success(self):
+        import root_controller
+        receipt = {'schema': 'polaris-root-abort-v1', 'state': 'failed', 'forced': True, 'prepared': False,
+                   'actualReadOnlyAuth': root_controller.auth_observation(), 'unknown': []}
+        for fault in (None, 'extra', 'normal', 'unknown', 'missing', 'nested'):
+            with self.subTest(fault=fault):
+                value = copy.deepcopy(receipt)
+                if fault == 'extra': value['secret'] = 'PRIVATE'
+                if fault == 'normal': value['state'] = 'normal'
+                if fault == 'unknown': value['unknown'] = ['PRIVATE']
+                if fault == 'missing': del value['prepared']
+                if fault == 'nested': value['actualReadOnlyAuth']['secret'] = 'PRIVATE'
+                client = M.Controller(); client.child = Mock(); client.child.wait.return_value = 1
+                client.lifecycle.update(ready=True, spawned=True)
+                with patch.object(client, 'call', return_value=value): result = client.recover()
+                self.assertEqual(result['state'], 'failed'); self.assertTrue(result['forced'])
+                self.assertNotIn('privilegedProcessesReaped', result)
+                if fault:
+                    self.assertIn('root-abort-unconfirmed', result['unknown'])
+                    self.assertNotIn('abortReceipt', client.lifecycle)
+                else:
+                    self.assertEqual(client.lifecycle['abortReceipt'], receipt)
+                    self.assertTrue(client.lifecycle['abortAcknowledged'])
+                    self.assertIn('exception-required-recovery', result['unknown'])
+                self.assertNotIn('PRIVATE', json.dumps(client.lifecycle))
+
+    def test_prepared_and_partial_abort_outcomes_are_not_discarded(self):
+        for prepared in (True, None):
+            with self.subTest(prepared=prepared):
+                receipt = {'schema': 'polaris-root-abort-v1', 'state': 'failed', 'forced': True,
+                    'prepared': prepared, 'actualReadOnlyAuth': None,
+                    'unknown': [] if prepared else ['root-preparation-incomplete']}
+                if prepared: receipt['productCleanup'] = {'state': 'forced', 'forced': True,
+                    'unknown': ['network-restoration-unproved'], 'publicationEligible': False}
+                client = M.Controller(); client.child = Mock(); client.child.wait.return_value = 1
+                client.lifecycle.update(ready=True, spawned=True)
+                with patch.object(client, 'call', return_value=receipt): result = client.recover()
+                self.assertEqual(client.lifecycle['abortReceipt'], receipt)
+                self.assertEqual(result['state'], 'failed'); self.assertTrue(result['forced'])
+                self.assertNotIn('privilegedProcessesReaped', result)
+
+    def test_auth_failure_observation_is_strictly_validated_without_raw_error(self):
+        import root_controller
+        for bad in (False, True):
+            client = M.Controller(); observation = root_controller.auth_observation()
+            if bad: observation['raw'] = 'PRIVATE'
+            response = {'seq': 1, 'ok': False, 'error': {'stage': 'authentication-readiness', 'code': 'CONTROLLER_FAILED',
+                'actualReadOnlyAuth': observation, 'message': 'PRIVATE'}}
+            with patch.object(client, '_write'), patch.object(client, '_read', return_value=response):
+                with self.assertRaises(ValueError): client.call('prepare')
+            exported = client.lifecycle['rootOperationFailure']
+            self.assertEqual('actualReadOnlyAuth' in exported, not bad)
+            self.assertNotIn('PRIVATE', json.dumps(client.lifecycle))
+
     def test_allocation_never_spawns(self):
         with patch.object(M.subprocess, 'Popen') as popen:
             client = M.Controller()

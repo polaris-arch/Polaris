@@ -6,6 +6,7 @@ Only fixture setup uses config_save; every user action uses native WebDriver.
 No root, FUSE, system installation, helper, TUN or sandbox workarounds.
 """
 import argparse
+import select
 import base64
 import copy
 import ctypes
@@ -594,12 +595,64 @@ class Supervisor:
             child = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                                      stdout=stdout, stderr=stderr,
                                      start_new_session=True, pass_fds=pass_fds)
-            item = process_identity(child.pid)
-            require(item is not None, 'spawned process vanished before identity capture')
+            # Keep the Popen handle before fallible /proc capture. Handle
+            # custody alone grants neither lineage nor signal authority.
             self.children[child.pid] = child
-            self.owned[child.pid] = item
-            self.roles[child.pid] = role
-            return child
+            try:
+                item = process_identity(child.pid)
+                require(item is not None, 'spawned process vanished before identity capture')
+                self.owned[child.pid] = item
+                self.roles[child.pid] = role
+                return child
+            except BaseException:
+                self.unknown.append('spawn-identity-unconfirmed')
+                try:
+                    if child.poll() is not None:
+                        child.wait(timeout=0)
+                except (OSError, subprocess.TimeoutExpired):
+                    self.unknown.append('spawn-reap-unconfirmed')
+                finally:
+                    for stream in (child.stdout, child.stderr):
+                        if stream is not None:
+                            try:
+                                stream.close()
+                            except Exception:
+                                self.unknown.append('spawn-pipe-close-unconfirmed')
+                raise
+
+    def query(self, command, env, role='tool-probe', *, timeout=15, limit=16384):
+        """Registered direct child; bounded bytes/time; no output in exceptions."""
+        require(0 < timeout <= 15 and 0 < limit <= 16384, 'tool probe bounds differ')
+        child = self.spawn(command, env, role, stdout=subprocess.PIPE)
+        deadline, output = time.monotonic() + timeout, bytearray()
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, 'tool probe timed out')
+                require(select.select([child.stdout], [], [], remaining)[0], 'tool probe timed out')
+                block = os.read(child.stdout.fileno(), min(4096, limit + 1 - len(output)))
+                if not block:
+                    break
+                output.extend(block)
+                require(len(output) <= limit, 'tool probe output bound')
+            require(child.wait(timeout=max(0, deadline - time.monotonic())) == 0, 'tool probe failed')
+            return output.decode('utf-8', errors='strict')
+        except BaseException:
+            # Only our registered same-birth/same-UID child is signalable. A
+            # failed identity check remains unknown, never a name exemption.
+            if child.poll() is None:
+                self.forced.append({'pid': child.pid, 'reason': 'tool-probe-aborted'})
+                try:
+                    self.signal(self.owned[child.pid], signal.SIGKILL)
+                except (OSError, ValueError, KeyError):
+                    self.unknown.append('tool-probe-signal-unconfirmed')
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.unknown.append('tool-probe-wait-timeout')
+            raise
+        finally:
+            child.stdout.close()
 
     def living(self, role=None):
         observed = self.scan()
@@ -649,6 +702,17 @@ class Supervisor:
         except Exception as error:
             self.unknown.append('cleanup-inventory-unconfirmed')
             cleanup['failure'] = {'stage': 'supervisor-close', 'type': type(error).__name__}
+            # An inventory refusal must not prevent the exact direct session
+            # bus from receiving TERM. This does not authorize any descendant,
+            # especially a privileged helper, or change the failed assessment.
+            for pid, child in list(self.children.items()):
+                if self.roles.get(pid) != 'dbus' or child.poll() is not None:
+                    continue
+                try:
+                    self.signal(self.owned[pid], signal.SIGTERM)
+                    child.wait(timeout=5)
+                except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+                    self.unknown.append('private-session-close-unconfirmed')
         finally:
             self.stop.set()
             self.thread.join(2)
@@ -875,12 +939,82 @@ def load_fixtures():
     return module
 
 
-def verified_tools():
+def verified_tools(supervisor):
     # The harness reads runner custody; none of this context enters private_env.
     spec = importlib.util.spec_from_file_location('package_tooling', Path(__file__).with_name('tooling.py'))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.verify()
+    return module.verify(run=lambda argv: supervisor.query(
+        argv, {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}))
+
+
+PORTAL_NOT_TESTED = ['portal', 'filechooser', 'document-export', 'screenshare']
+
+
+def private_session_config(workspace):
+    """A real, non-activating session bus; never reads host session policy."""
+    directory = Path(workspace) / 'session-bus'
+    directory.mkdir(mode=0o700)
+    endpoint = directory / 'bus'
+    path = str(endpoint.absolute())
+    require(re.fullmatch(r'/[A-Za-z0-9_./-]+', path) and len(os.fsencode(path)) <= 100,
+            'private DBus socket path unsupported')
+    xml = f'''<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <keep_umask/>
+  <listen>unix:path={path}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <deny user="*"/>
+    <allow user="{os.getuid()}"/>
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+'''
+    config = directory / 'session.conf'
+    with config.open('x') as stream:
+        os.chmod(config, 0o600)
+        stream.write(xml)
+    return config, endpoint
+
+
+def private_bus_address(stream):
+    deadline, output = time.monotonic() + 15, bytearray()
+    while len(output) < 4096:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0 and select.select([stream], [], [], remaining)[0], 'private DBus unavailable')
+        block = os.read(stream.fileno(), 1)
+        require(block, 'private DBus closed before address')
+        if block == b'\n':
+            return output.decode('ascii', errors='strict')
+        output.extend(block)
+    raise ValueError('private DBus address bound')
+
+
+def verify_private_session(supervisor, env, address, endpoint):
+    require(re.fullmatch(re.escape('unix:path=' + str(endpoint.absolute())) + r',guid=[0-9a-f]{32}', address),
+            'private DBus address differs')
+    info = endpoint.lstat()
+    require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid(), 'private DBus socket differs')
+    def call(method):
+        return supervisor.query(['/usr/bin/gdbus', 'call', '--address', address,
+            '--dest', 'org.freedesktop.DBus', '--object-path', '/org/freedesktop/DBus',
+            '--method', 'org.freedesktop.DBus.' + method], env, 'dbus-probe')
+    names_reply = call('ListActivatableNames').strip()
+    # GVariant annotates an empty string array; either empty or only the bus
+    # itself is acceptable. No external activatable name is admitted.
+    require(names_reply in ("(['org.freedesktop.DBus'],)", "(@as [],)", "([],)"),
+            'private DBus activation differs')
+    names = ['org.freedesktop.DBus'] if 'org.freedesktop.DBus' in names_reply else []
+    require(re.fullmatch(r"\('[0-9a-f]{32}',\)", call('GetId').strip()),
+            'private DBus identity unavailable')
+    return {'state': 'observed', 'auth': 'EXTERNAL', 'peerUid': os.getuid(), 'activation': 'none',
+            'activatableNames': names, 'systemBus': 'unchanged',
+            'notTested': list(PORTAL_NOT_TESTED)}
 
 
 def save_fixture(driver, desired):
@@ -952,7 +1086,8 @@ class CarrierRun:
         self.result['cases'][key] = {'status': 'passed', 'evidence': evidence}
 
     def start_tools(self):
-        tools = verified_tools()
+        self.result['sessionBoundary'] = {'state': 'unconfirmed', 'notTested': list(PORTAL_NOT_TESTED)}
+        tools = verified_tools(self.supervisor)
         import select
         read_fd, write_fd = os.pipe()
         try:
@@ -968,11 +1103,16 @@ class CarrierRun:
             os.close(read_fd)
             if write_fd >= 0:
                 os.close(write_fd)
-        bus = self.supervisor.spawn(['dbus-daemon', '--session', '--nofork', '--print-address=1'],
+        config, endpoint = private_session_config(self.workspace)
+        bus = self.supervisor.spawn(['/usr/bin/dbus-daemon', '--config-file=' + str(config), '--nofork', '--print-address=1'],
                                    self.env, 'dbus', stdout=subprocess.PIPE)
-        require(select.select([bus.stdout], [], [], 15)[0], 'private DBus unavailable')
-        address = bus.stdout.readline(4096).decode().strip()
-        require(address.startswith('unix:') and len(address) < 4096, 'private DBus address differs')
+        try:
+            address = private_bus_address(bus.stdout)
+        finally:
+            bus.stdout.close()
+        boundary = verify_private_session(self.supervisor, self.env, address, endpoint)
+        boundary['configSha256'] = sha(config)
+        self.result['sessionBoundary'] = boundary
         self.env['DBUS_SESSION_BUS_ADDRESS'] = address
         driver = tools['automation']['binary']['path']
         native = tools['nativeDriver']['binary']['path']

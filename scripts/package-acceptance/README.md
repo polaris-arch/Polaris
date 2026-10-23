@@ -183,3 +183,20 @@ prerequisites and runs the actual packages with default production behavior.
 
 The callback observer is deliberately matched to the immutable properties and
 public callback Map in [Tauri 2.11.5 core.js](https://github.com/tauri-apps/tauri/blob/tauri-v2.11.5/crates/tauri/scripts/core.js); a changed or non-extensible bridge fails closed.
+
+### Private session bus acceptance boundary
+
+Both Linux GUI lanes use a real, directly supervised session DBus with a
+workspace-local `0700` socket directory, `EXTERNAL` authentication and only the
+current UID admitted. Its fixed configuration retains ordinary session message
+policy, but imports no host policy, service directories, or automatic activation
+services. Bounded real `ListActivatableNames` and `GetId` calls verify the bus;
+no portal responses are mocked. The system bus and polkit path, WebKit sandbox,
+and product GTK/GDK settings are unchanged. This headless GUI/TUN boundary does
+**not** validate desktop portals, file chooser, document export, or screen sharing.
+If a tested product operation needs an absent service, its original assertion
+still fails; those capabilities are not reported as passed. Tool-custody dpkg
+queries are direct registered children with bounded output, timeout and reaping,
+not adopted-process name exemptions. On an inventory failure, only the exact
+registered ordinary session bus can still receive identity-checked TERM; unknown
+processes remain failed and prevent workspace removal.
