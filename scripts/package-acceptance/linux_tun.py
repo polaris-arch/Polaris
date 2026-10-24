@@ -802,11 +802,20 @@ class TunCarrierRun(base.CarrierRun):
         require(not self.status().get('running'), 'TUN connect requires stopped core')
         self.connect_phase('gui-click')
         self.driver.click('#connect-btn')
+        return self.observe_ready_core()
+
+    def retire_applied_core(self, previous):
+        proof = self.controller.call('core_stopped')
+        require(proof.get('stopped') is True and same_birth(proof.get('identity'), previous), 'old TUN core exit unconfirmed')
+        self.stopped = True
+
+    def observe_ready_core(self, timeout=75, register=True):
         self.connect_phase('status-ready')
-        status = base.wait_for(self.connect_status, lambda s: s.get('running') is True and not s.get('starting'), timeout=75)
+        status = base.wait_for(self.connect_status, lambda s: s.get('running') is True and not s.get('starting'), timeout=timeout)
         self.connect_phase('core-birth', status)
         require(status.get('startedViaHelper') is True, 'real production helper path required')
-        self.controller.call('register_core')
+        if register:
+            self.controller.call('register_core')
         attested = self.controller.call('core_attest')
         self.core = {**attested['identity'], 'sha256': attested['executable']['sha256']}
         require(status.get('pid') == self.core['pid'] and self.core['sha256'] == self.members['core']['sha256'],
@@ -822,7 +831,8 @@ class TunCarrierRun(base.CarrierRun):
         self.api_endpoint = endpoint
         self.connect_phase('owned-api-probe')
         self.rpc('capabilities')  # Root's existing frozen probe owns LISTEN-inode verification.
-        self.controller.call('tun_register')
+        if register:
+            self.controller.call('tun_register')
         self.stopped = False
         self.connect_phase('receipt')
         self.result['apiEndpoint'] = {**endpoint, 'ownedListenerProbe': True}
@@ -916,6 +926,7 @@ class TunCarrierRun(base.CarrierRun):
         self.gui_phase('auto-begin')
         self.stage = 'auto_preserves'; self.boundary(self.stage)
         self.preference(False)
+        self.activate_saved_preference(False)
         self.network.set_latency('A', 0); self.network.set_latency('B', 0.15)
         self.pick('A'); self.driver.click('#node-trigger')
         self.driver.click('[data-auto-select-scope="global"] .auto-choice-pick')
@@ -941,7 +952,9 @@ class TunCarrierRun(base.CarrierRun):
 
     def manual_cases(self):
         for interrupt, name in ((False, 'manual_preserve'), (True, 'manual_disconnect')):
-            self.stage = name; self.boundary(name); self.preference(interrupt)
+            self.stage = name; self.boundary(name)
+            self.pick('A')  # Clear Auto intent before accepting a manual-policy graph.
+            self.preference(interrupt); self.activate_saved_preference(interrupt)
             self.pick('A'); old, before = self.socket('A'); initial = dict(self.core)
             self.pick('B'); self.same_core(initial); _, fresh = self.socket('B')
             evidence = dict(beforeCore=initial, afterCore=dict(self.core), oldBefore=before,
@@ -965,7 +978,7 @@ class TunCarrierRun(base.CarrierRun):
 
     def uncovered_case(self):
         self.stage = 'uncovered_target_restart'; self.boundary(self.stage)
-        self.preference(False); self.pick('B')
+        self.preference(False); self.activate_saved_preference(False); self.pick('B')
         old, _ = self.socket('B'); initial = dict(self.core)
         active = self.rpc('capabilities')['active']; accepted = self.config()
         wanted = copy.deepcopy(accepted)

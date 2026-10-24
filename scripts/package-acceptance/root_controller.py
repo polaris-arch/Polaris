@@ -1050,7 +1050,9 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
     def __init__(self, c, kind):
         self.c = c; self.kind = kind; self.rows = {}; self.error = None
         self.stop = threading.Event(); self.lock = threading.Lock()
+        self.parent_stop_requested = threading.Event(); self.parent_stop_ack = threading.Event()
         agent = c.ledger.load()['authentication']['agent']['identity']; self.rows[birth(agent)] = agent
+        self.parent_identity = agent
         self.thread = threading.Thread(target=self.loop, name='owned-auth-lineage', daemon=True)
 
     def start(self):
@@ -1061,8 +1063,23 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
 
     def loop(self):
         while not self.stop.wait(0.005):
-            try: self.scan()
-            except Exception as e: self.error = type(e).__name__; return
+            final_requested = self.parent_stop_requested.is_set()
+            try:
+                if final_requested: self.require_live_parent()
+                self.scan()
+                if final_requested: self.require_live_parent()
+            except Exception as e:
+                self.error = self.error or type(e).__name__
+                if self.parent_stop_requested.is_set(): self.parent_stop_ack.set()
+                return
+            if final_requested:
+                self.parent_stop_ack.set(); return
+
+    def require_live_parent(self):
+        current = self.c.ops.proc(self.parent_identity['pid'])
+        require(current and current['state'] != 'Z' and
+                self.c.tun.same_process(self.parent_identity, current),
+                'pre-stop registered authentication parent unavailable')
 
     def scan(self):
         values = {}
@@ -1081,6 +1098,8 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
                     require(p and birth(p) == key and p['ppid'] == light['ppid'], 'auth candidate topology changed')
                     if key not in self.rows:
                         require(self.c.tun.same_process(self.rows[birth(parent)], self.c.ops.proc(parent['pid'])), 'auth parent changed')
+                    if key == birth(self.parent_identity):
+                        require(self.c.tun.same_process(self.parent_identity, p), 'registered authentication parent changed')
                     require(p['uid'] in (0, self.c.launch['guiUid']) and p['namespaces'] == self.c.gui['namespaces'] and
                             p['cgroup'] == self.rows[next(iter(self.rows))]['cgroup'], 'auth helper escaped native lineage')
                     if self.rows.get(key) != p:
@@ -1088,6 +1107,25 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
                 if not changed: break
             write_recovery_snapshot(self.c.directory, 'auth-lineage-' + self.kind + '.json',
                 {'runId': self.c.launch['runId'], 'kind': self.kind, 'processes': list(self.rows.values()), 'observationError': self.error})
+
+    def prepare_parent_stop(self, deadline=None):
+        """Bounded ack from the existing observer; no procfs/fsync on this thread.
+
+        A late snapshot only updates auth-lineage evidence, never final ledger,
+        closed or recovery receipts. Timeout remains permanently unknown even
+        if the observer later finishes. This is not a fork barrier.
+        """
+        try:
+            require(self.thread.ident is not None and self.error is None, 'authentication observer unavailable')
+            self.parent_stop_requested.set()
+            remaining = 3 if deadline is None else max(0, min(3, deadline - time.monotonic()))
+            require(self.parent_stop_ack.wait(timeout=remaining), 'pre-stop lineage snapshot timed out')
+            require(self.error is None, 'pre-stop lineage snapshot failed')
+        except Exception:
+            self.error = self.error or 'pre-stop-observation-incomplete'
+            raise
+        finally:
+            self.stop.set()
 
     def close(self, forced=False):
         self.stop.set()
@@ -1353,6 +1391,12 @@ observably active before a password-setting attempt. Each transaction re-locks.
         if self.thread and self.thread is not threading.current_thread():
             self.thread.join(timeout=3)
             if self.thread.is_alive(): errors.append('credential-writer-stop-unproved')
+        # No closure/observer/ledger lock is held during this bounded wait.
+        # Failure never skips the independent existing recovery actions below.
+        try:
+            if not self.closed and self.c.auth_observer:
+                self.c.auth_observer.prepare_parent_stop(self.group_deadline)
+        except Exception: errors.append('authentication-lineage-stop-unproved')
         require(self.close_lock.acquire(timeout=15), 'credential closure concurrency unknown')
         try:
             if self.closed: return
@@ -1704,7 +1748,9 @@ class Controller:
         require(path.parent == Path(self.launch['helperScriptDir']) and
                 re.fullmatch(r'[0-9a-f]{24}-polaris-helper-' + kind + r'\.sh', path.name), 'original product script path differs')
         data, proof = private_bytes(path, self.launch['guiUid'], self.launch['guiHome'], 1024 * 1024)
-        require(data.startswith(b'#!/bin/bash'), 'original shell script required')
+        # The real shared Unix producer emits this one header. The product
+        # explicitly invokes /bin/bash; this is not generic shebang authorization.
+        require(data.startswith(b'#!/bin/sh\nset -eu\n'), 'original Linux script header required')
         return proof
 
     def bind_gui(self, pid):

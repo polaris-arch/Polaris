@@ -2027,3 +2027,149 @@ class RelatedInventoryTests(unittest.TestCase):
             with self.assertRaises(ValueError):o.credential_fence(before+0.02,threading.Event())
             self.assertLess(time.monotonic()-before,0.5)
         finally:o.lock.release()
+
+class RealProducerScriptTests(unittest.TestCase):
+    def fixture(self, kind):
+        return (HERE/'fixtures'/('linux-helper-'+kind+'.sh')).read_bytes()
+    def test_complete_actual_producer_install_and_uninstall_are_accepted(self):
+        for kind in ('install','uninstall'):
+            data=self.fixture(kind)
+            self.assertTrue(data.startswith(b'#!/bin/sh\nset -eu\n'))
+            with tempfile.TemporaryDirectory() as home:
+                base=Path(home);base.chmod(0o700);directory=base/'config';directory.mkdir(mode=0o700)
+                path=directory/('a'*24+'-polaris-helper-'+kind+'.sh');path.write_bytes(data);path.chmod(0o700)
+                c=controller();c.launch.update(guiUid=os.getuid(),guiHome=home,helperScriptDir=str(directory))
+                proof=c.verify_script(path,kind)
+                self.assertEqual(proof['bytes'],len(data));self.assertEqual(proof['sha256'],m.sha(data))
+                self.assertEqual(proof['inode'],path.stat().st_ino);self.assertTrue(proof['stableDoubleRead'])
+                self.assertNotIn('eeeeeeee',json.dumps(proof))
+    def test_old_bash_other_shebang_crlf_and_wrong_kind_still_rejected(self):
+        data=self.fixture('install')
+        with tempfile.TemporaryDirectory() as home:
+            base=Path(home);base.chmod(0o700);path=base/('a'*24+'-polaris-helper-install.sh')
+            c=controller();c.launch.update(guiUid=os.getuid(),guiHome=home,helperScriptDir=home)
+            for value in (data.replace(b'#!/bin/sh',b'#!/bin/bash',1),data.replace(b'#!/bin/sh',b'#!/usr/bin/env sh',1),data.replace(b'\n',b'\r\n'),b'\xef\xbb\xbf'+data):
+                path.write_bytes(value);path.chmod(0o700)
+                with self.assertRaises(ValueError):c.verify_script(path,'install')
+            path.write_bytes(data)
+            with self.assertRaises(ValueError):c.verify_script(path,'uninstall')
+    def test_unlinked_script_held_fd_is_not_a_live_private_path_proof(self):
+        data=self.fixture('install')
+        with tempfile.TemporaryDirectory() as home:
+            base=Path(home);base.chmod(0o700);path=base/('a'*24+'-polaris-helper-install.sh');path.write_bytes(data);path.chmod(0o700)
+            c=controller();c.launch.update(guiUid=os.getuid(),guiHome=home,helperScriptDir=home)
+            with path.open('rb') as held:
+                path.unlink();self.assertEqual(held.read(),data)
+                with self.assertRaises(FileNotFoundError):c.verify_script(path,'install')
+    def test_actual_fixture_shared_dynamic_fields_remain_escaped(self):
+        for kind in ('install','uninstall'):
+            text=self.fixture(kind).decode()
+            self.assertIn("'/tmp/producer fixture/用户'\\''s stage/polaris-helper'",text)
+        self.assertIn("'u1001'",self.fixture('install').decode())
+
+class PreParentStopLineageTests(unittest.TestCase):
+    def observer(self):
+        c=controller();agent=identity(90);child={**identity(91,0),'ppid':90}
+        c.ledger.value['authentication']['agent']={'identity':copy.deepcopy(agent)}
+        rows={90:agent,91:child};c.ops.proc.side_effect=lambda pid:copy.deepcopy(rows.get(pid))
+        o=m.AuthObserver(c,'install');return c,o,rows
+    def test_existing_child_snapshot_is_durable_while_parent_alive(self):
+        c,o,rows=self.observer();events=[]
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc/90'),Path('/proc/91')]), \
+             patch.object(m,'proc_stat',side_effect=lambda pid:rows.get(pid)), \
+             patch.object(m,'write_recovery_snapshot',side_effect=lambda *a:events.append(copy.deepcopy(a[2]))):
+            o.thread.start();o.prepare_parent_stop();o.thread.join(timeout=1)
+        self.assertTrue(o.stop.is_set());self.assertEqual(len(events),1)
+        self.assertEqual({x['pid'] for x in events[0]['processes']},{90,91});self.assertIsNone(o.error)
+    def test_snapshot_error_timeout_or_persistence_never_skips_independent_recovery(self):
+        for error in (ValueError('PRIVATE'),TimeoutError('PRIVATE'),OSError('PRIVATE')):
+            c,l=GroupLeaseRecoveryTests().lease();events=[];c.auth_observer=Mock();observer=c.auth_observer
+            def snapshot(*args):
+                self.assertTrue(l.close_lock.acquire(False));l.close_lock.release()
+                events.append('snapshot');raise error
+            c.auth_observer.prepare_parent_stop.side_effect=snapshot
+            c.auth_observer.close.return_value={'ownedBirths':[],'unknownAdoptedChildren':[],'forced':False}
+            c.fence_registered_agent=Mock(side_effect=lambda:events.append('fence'))
+            with patch.object(m,'relock_account',side_effect=lambda *a:events.append('relock') or credential_proof()), \
+                 patch.object(m,'recover_group_membership',side_effect=lambda *a:events.append('remove') or membership_proof()):
+                with self.assertRaises(ValueError):l.close()
+            self.assertEqual(events,['snapshot','fence','relock','remove'])
+            observer.close.assert_called_once();c.ops.run.assert_not_called()
+            self.assertFalse(l.closed);self.assertIn('authentication-lineage-stop-unproved',c.recovery_unknown)
+    def test_unknown_later_fork_not_authorized_by_prior_snapshot(self):
+        c,o,rows=self.observer()
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc/90'),Path('/proc/91')]), \
+             patch.object(m,'proc_stat',side_effect=lambda pid:rows.get(pid)),patch.object(m,'write_recovery_snapshot'):
+            o.thread.start();o.prepare_parent_stop();o.thread.join(timeout=1)
+        orphan={**identity(92,0),'ppid':os.getpid()};rows.clear();rows[92]=orphan
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc/92')]), \
+             patch.object(m,'proc_stat',side_effect=lambda pid:rows.get(pid)),patch.object(m,'write_recovery_snapshot'), \
+             patch.object(m,'stop_recorded',return_value=False) as stop:
+            with self.assertRaisesRegex(ValueError,'unobserved adopted child'):o.close()
+        self.assertNotIn(92,[call.args[2]['pid'] for call in stop.call_args_list])
+    def test_pre_stop_unstarted_or_unacknowledged_thread_fails_closed(self):
+        for started in (False,True):
+            c,o,r=self.observer()
+            if started:o.thread=Mock();o.thread.ident=1
+            with self.assertRaises(ValueError):o.prepare_parent_stop(time.monotonic()+0.01)
+            self.assertEqual(o.error,'pre-stop-observation-incomplete')
+    def test_successful_ack_is_idempotent_but_never_clears_prior_failure(self):
+        c,o,r=self.observer();o.thread=Mock();o.thread.ident=1;o.parent_stop_ack.set()
+        o.prepare_parent_stop();o.prepare_parent_stop();self.assertIsNone(o.error)
+        o.error='pre-stop-observation-incomplete'
+        with self.assertRaises(ValueError):o.prepare_parent_stop()
+    def test_real_hung_snapshot_cannot_block_fence_relock_remove(self):
+        c,l=GroupLeaseRecoveryTests().lease();agent=identity(90)
+        c.ledger.value['authentication']['agent']={'identity':agent}
+        o=m.AuthObserver(c,'install');c.auth_observer=o
+        entered=threading.Event();release=threading.Event();events=[];late=[]
+        def blocked():
+            entered.set();release.wait();late.append('observation-only')
+        o.scan=blocked
+        c.fence_registered_agent=Mock(side_effect=lambda:events.append('fence'))
+        o.thread.start();self.assertTrue(entered.wait(1))
+        l.group_deadline=time.monotonic()+0.03
+        try:
+            with patch.object(m,'relock_account',side_effect=lambda *a:events.append('relock') or credential_proof()), \
+                 patch.object(m,'recover_group_membership',side_effect=lambda *a:events.append('remove') or membership_proof()), \
+                 patch.object(o.thread,'join',return_value=None):
+                before=time.monotonic()
+                with self.assertRaises(ValueError):l.close()
+                self.assertLess(time.monotonic()-before,0.5)
+            self.assertFalse(release.is_set());self.assertEqual(events,['fence','relock','remove'])
+            self.assertFalse(l.closed);self.assertIsNone(c.ledger.value['authentication']['lease'].get('state'))
+            self.assertTrue(c.recovery_unknown);c.ops.run.assert_not_called()
+            old_unknown=list(c.recovery_unknown)
+        finally:release.set();o.thread.join(timeout=1)
+        self.assertEqual(late,['observation-only']);self.assertEqual(c.recovery_unknown,old_unknown)
+        self.assertEqual(o.error,'pre-stop-observation-incomplete');self.assertFalse(l.closed)
+    def test_request_during_old_tick_needs_next_durable_scan(self):
+        c,o,r=self.observer();entered=threading.Event();release=threading.Event();calls=[]
+        def scan():
+            calls.append(len(calls)+1)
+            if len(calls)==1:entered.set();release.wait()
+        o.scan=scan;o.thread.start();self.assertTrue(entered.wait(1))
+        o.parent_stop_requested.set();self.assertFalse(o.parent_stop_ack.is_set());release.set()
+        self.assertTrue(o.parent_stop_ack.wait(1));o.thread.join(timeout=1)
+        self.assertEqual(calls,[1,2])
+
+
+class FinalSnapshotParentTests(unittest.TestCase):
+    def test_missing_reused_or_exited_parent_cannot_ack_success(self):
+        for mode in ('missing','reused','zombie'):
+            c,o,rows=PreParentStopLineageTests().observer()
+            if mode=='missing': rows.pop(90)
+            elif mode=='reused': rows[90]['startTime']='999'
+            else: rows[90]['state']='Z'
+            o.scan=Mock();o.parent_stop_requested.set();o.thread.start()
+            try:
+                with self.assertRaises(ValueError):o.prepare_parent_stop(time.monotonic()+1)
+            finally:o.thread.join(timeout=1)
+            self.assertIsNotNone(o.error);o.scan.assert_not_called()
+    def test_parent_disappears_during_final_snapshot_is_unknown(self):
+        c,o,rows=PreParentStopLineageTests().observer()
+        o.scan=Mock(side_effect=lambda:rows.pop(90));o.parent_stop_requested.set();o.thread.start()
+        try:
+            with self.assertRaises(ValueError):o.prepare_parent_stop(time.monotonic()+1)
+        finally:o.thread.join(timeout=1)
+        self.assertIsNotNone(o.error);o.scan.assert_called_once()

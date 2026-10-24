@@ -847,9 +847,11 @@ class PrimitiveTests(unittest.TestCase):
                   'mainGeneration': 5, 'mixedPort': 41234, 'secret': 'private-test-secret', 'config': 'never public'}
         run.status = Mock(return_value=status)
         for _ in range(500): run.connect_status()
-        for phase in M.CONNECT_PHASES[1:]: run.connect_phase(phase, status)
+        for phase in M.CONNECT_PHASES:
+            if phase in ('stopped-check','apply-ready'): continue
+            run.connect_phase(phase, status)
         observation = run.result['connectObservation']
-        self.assertEqual(len(observation['phases']), len(M.CONNECT_PHASES))
+        self.assertEqual(len(observation['phases']), len(M.CONNECT_PHASES)-1)
         self.assertEqual(observation['lastStatus']['clashApiPort'], 41321)
         self.assertNotIn('private-test-secret', json.dumps(observation))
         self.assertNotIn('never public', json.dumps(observation))
@@ -920,7 +922,7 @@ class PrimitiveTests(unittest.TestCase):
 
     def test_every_connect_phase_failure_keeps_fixed_redacted_phase(self):
         core, secret, graph, status = self.api_fixture()
-        for failed_phase in M.CONNECT_PHASES:
+        for failed_phase in (p for p in M.CONNECT_PHASES if p!='apply-ready'):
             run = M.CarrierRun.__new__(M.CarrierRun)
             run.result = {'cases':{'default_dashboard':{'evidence':{}}}}
             run.secret, run.home, run.workspace, run.payload = secret, Path('/tmp'), Path('/tmp'), Path('/payload')
@@ -1305,6 +1307,7 @@ class SelectionStageTests(unittest.TestCase):
 
     def test_full_selection_sequence_has_fixed_current_operation_stages(self):
         run = M.CarrierRun.__new__(M.CarrierRun); run.core = {'pid': 1}
+        run.result={'preferenceActivations':[{'wanted':True}]}
         seen = []
         def observed(name, result=None):
             def call(*args, **kwargs):
@@ -1317,15 +1320,16 @@ class SelectionStageTests(unittest.TestCase):
         run.socket = observed('socket', (Mock(), {}))
         run.exchange = observed('exchange', {})
         run.preference = observed('preference')
+        run.activate_saved_preference=observed('activation');run.same_core=observed('same-core')
         run.disconnect = observed('disconnect')
         run.config = observed('config', {'selectedServerId': 'node-b'})
         run.record = observed('record'); run.snapshot = observed('snapshot')
         with patch.object(M, 'wait_for', return_value=True), patch.object(M, 'same_process', return_value=False):
             run.selection_cases()
         self.assertEqual([stage for name, stage in seen if name == 'socket'],
-            ['selection-initial-traffic', 'selection-new-traffic', 'selection-restored-traffic'])
+            ['selection-initial-traffic', 'selection-new-traffic', 'selection-interrupt-baseline', 'selection-restored-traffic'])
         self.assertEqual([stage for name, stage in seen if name == 'pick'],
-            ['gui-selection', 'selection-switch-b', 'selection-interrupt-switch', 'selection-restore-b'])
+            ['gui-selection', 'selection-switch-b', 'selection-interrupt-baseline', 'selection-interrupt-switch', 'selection-restore-b'])
         self.assertIn(('exchange', 'selection-preserved-traffic'), seen)
         self.assertIn(('disconnect', 'selection-off'), seen)
         self.assertIn(('config', 'selection-on-readback'), seen)
@@ -1695,6 +1699,148 @@ class AppIdentityProducerTests(unittest.TestCase):
         body=tun.split('def app_execution_identity(app):',1)[1].split('def verify_gui_binding',1)[0]
         self.assertIn('return base.app_execution_identity(app)',body)
         self.assertNotIn('tun.process_identity',body.split('return',1)[1])
+
+
+class PreferenceApplyTests(unittest.TestCase):
+    def fixture(self, outcome='restartRequired'):
+        run=M.CarrierRun.__new__(M.CarrierRun)
+        run.result={};run.core={'pid':10,'startTime':'100'}
+        run.preference_disk=Mock(return_value={'value':True,'sha256':'a'*64})
+        run.status=Mock(return_value={'running':True,'mainGeneration':1,'pid':10})
+        run.gui_phase=Mock();run.connect_phase=Mock();run.same_core=Mock();run.retire_applied_core=Mock()
+        run.pending_apply_control=Mock(side_effect=[{'bars':1,'buttons':1,'disabled':False},{'bars':0,'buttons':0,'disabled':False}])
+        run.apply=Mock(return_value={'status':outcome,'transactionId':'tx','ok':outcome=='hotApplied'})
+        run.text=lambda key:key;run.driver=Mock()
+        self.ready={'sequence':3,'source':'original-lifecycle-event','phase':'ready','kind':'restart','mainGeneration':2,'terminal':True,'applyId':7}
+        scheduled={'sequence':2,'source':'original-native-callback','success':True,'ok':True,'status':'applied','applyId':7}
+        run.driver.observations.side_effect=[[],[scheduled,self.ready],[scheduled,self.ready]]
+        def observe(**kwargs):
+            if kwargs.get('register',True):run.core={'pid':11,'startTime':'101'}
+            return {'running':True,'mainGeneration':2,'pid':run.core['pid']}
+        run.observe_ready_core=Mock(side_effect=observe)
+        run.preference_runtime=Mock(return_value={'wanted':True,'selectorInterrupt':True,'runtime':{'sha256':'b'*64}})
+        run.native_status=Mock(return_value={'lookupState':1,'operation':{'durable':True,'persistenceMode':'exact_configuration_file','active':{'revision':2}}})
+        run.rpc=Mock(return_value={'active':{'revision':2}})
+        return run
+
+    @staticmethod
+    def once(read, condition=bool, **kwargs):
+        value=read();M.gui_require(condition(value),'observation-timeout');return value
+
+    def test_restart_scheduled_is_not_ready_and_binds_exact_terminal_new_core(self):
+        run=self.fixture()
+        with patch.object(M,'wait_for',side_effect=self.once):proof=run.activate_saved_preference(True)
+        self.assertTrue(proof['restartConfirmed']);self.assertEqual(proof['lifecycle']['mainGeneration'],2)
+        run.retire_applied_core.assert_called_once_with({'pid':10,'startTime':'100'})
+        run.observe_ready_core.assert_called_once();self.assertEqual(run.driver.click.call_count,1)
+        self.assertEqual(run.driver.click.call_args.args[1],'home.restartApplyConfirm')
+        run.preference_runtime.assert_called_once_with(True)
+        self.assertEqual(run.result['preferenceActivations'],[proof])
+
+    def test_restart_bad_callback_terminal_or_generation_never_accepted(self):
+        for fault in ('callback','wrong-id','failed','newer-event','same-core','generation'):
+            run=self.fixture()
+            if fault=='callback':run.driver.observations.side_effect=[[],[{'sequence':2,'source':'original-native-callback','success':True,'ok':True,'status':'applied'}]]
+            elif fault in ('wrong-id','failed','newer-event'):
+                rows=[{**self.ready,'applyId':8 if fault=='wrong-id' else 7,'phase':'failed' if fault=='failed' else 'ready'}]
+                if fault=='newer-event':rows.append({**self.ready,'applyId':8,'mainGeneration':3})
+                run.driver.observations.side_effect=[[],[{'sequence':2,'source':'original-native-callback','success':True,'ok':True,'status':'applied','applyId':7}],rows]
+            elif fault=='same-core':run.observe_ready_core.side_effect=lambda **kwargs:{'mainGeneration':2}
+            else:run.observe_ready_core.side_effect=lambda **kwargs:{'mainGeneration':3}
+            with self.subTest(fault=fault),patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):
+                run.activate_saved_preference(True)
+            self.assertNotIn('preferenceActivations',run.result)
+            self.assertLessEqual(run.driver.click.call_count,1)
+
+    def test_hot_apply_requires_actual_durable_exact_file_receipt(self):
+        for invalid in (False,True):
+            run=self.fixture('hotApplied')
+            if invalid:run.native_status.return_value['operation']['persistenceMode']='app_authoritative_regeneration'
+            with patch.object(M,'wait_for',side_effect=self.once):
+                if invalid:
+                    with self.assertRaises(M.GuiFailure):run.activate_saved_preference(True)
+                else:
+                    proof=run.activate_saved_preference(True)
+                    self.assertEqual(proof['hotReceipt']['active'],{'revision':2})
+            run.driver.click.assert_not_called();run.retire_applied_core.assert_not_called()
+            self.assertFalse(run.observe_ready_core.call_args.kwargs['register'])
+
+    def test_absent_pending_still_requires_actual_runtime_value(self):
+        run=self.fixture();run.pending_apply_control.return_value={'bars':0,'buttons':0,'disabled':False}
+        run.pending_apply_control.side_effect=None
+        run.preference_runtime.side_effect=M.GuiFailure('preference-runtime-value-differs')
+        with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.activate_saved_preference(True)
+        run.apply.assert_not_called();run.driver.click.assert_not_called()
+        self.assertNotIn('preferenceActivations',run.result)
+
+    def test_no_pending_success_still_reads_current_runtime_and_never_clicks(self):
+        run=self.fixture();run.pending_apply_control.side_effect=None
+        run.pending_apply_control.return_value={'bars':0,'buttons':0,'disabled':False}
+        with patch.object(M,'wait_for',side_effect=self.once):proof=run.activate_saved_preference(True)
+        self.assertEqual(proof['apply'],'not-needed');run.preference_runtime.assert_called_once_with(True)
+        run.apply.assert_not_called();run.driver.click.assert_not_called();run.observe_ready_core.assert_not_called()
+
+    def test_hot_receipt_wrong_lookup_durability_or_active_fails(self):
+        for fault in ('lookup','durability','active','ok'):
+            run=self.fixture('hotApplied')
+            if fault=='lookup':run.native_status.return_value['lookupState']=True
+            elif fault=='durability':run.native_status.return_value['operation']['durable']=False
+            elif fault=='active':run.rpc.return_value={'active':{'revision':3}}
+            else:run.apply.return_value['ok']=False
+            with self.subTest(fault=fault),patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.activate_saved_preference(True)
+            self.assertNotIn('preferenceActivations',run.result)
+
+    def test_actual_apply_event_and_runtime_producer_contracts(self):
+        runtime=(SOURCE/'src-tauri/src/runtime/proxy/runtime_config.rs').read_text()
+        lifecycle=(SOURCE/'src-tauri/src/runtime/proxy/lifecycle.rs').read_text()
+        proto=(SOURCE/'crates/singbox-grpc/proto/runtime_config.proto').read_text()
+        builder=(SOURCE/'crates/config-engine/src/builder/outbounds.rs').read_text()
+        self.assertIn('pub ok: bool',runtime);self.assertIn('pub apply_id: Option<u64>',runtime)
+        self.assertIn('serde(rename_all = "camelCase")',runtime)
+        self.assertIn('pub main_generation: u64',lifecycle);self.assertIn('pub terminal: bool',lifecycle)
+        self.assertIn('FOUND = 1',proto)
+        self.assertIn('auto_members.is_empty() && config.interrupt_connections_on_switch == Some(true)',builder)
+        desktop=(SOURCE/'ui/src/components/layout/PendingChangesBar.tsx').read_text()
+        mobile=(SOURCE/'ui/src/mobile/MobilePendingBar.tsx').read_text()
+        self.assertIn('onApply(restartPrompt.token)',desktop);self.assertIn('onApply(restartPrompt.token)',mobile)
+
+    def test_disabled_dirty_and_changed_saved_file_fail_without_replaying(self):
+        for fault in ('disabled','no-apply','disk'):
+            run=self.fixture()
+            if fault=='disabled':run.pending_apply_control.side_effect=[{'bars':1,'buttons':1,'disabled':True}]
+            elif fault=='no-apply':run.pending_apply_control.side_effect=[{'bars':1,'buttons':0,'disabled':False}]
+            else:run.preference_disk.side_effect=[{'value':True,'sha256':'a'*64},{'value':False,'sha256':'b'*64}]
+            with self.subTest(fault=fault),patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.activate_saved_preference(True)
+            if fault!='disk':run.apply.assert_not_called()
+            self.assertLessEqual(run.driver.click.call_count,1)
+
+    def test_runtime_evidence_is_actual_bound_selector_not_saved_desire(self):
+        run=M.CarrierRun.__new__(M.CarrierRun);run.core={'pid':10,'startTime':'100'};run.api_endpoint={'port':1234}
+        for field,wanted,good in [(True,True,True),(False,False,True),(None,False,True),(None,True,False),(False,True,False),('true',True,False)]:
+            selector={'tag':'proxy-selector','type':'selector'}
+            if field is not None:selector['interrupt_exist_connections']=field
+            run.observed_api_endpoint=Mock(return_value=(run.api_endpoint,{'sha256':'a'*64},{'outbounds':[selector],'secret':'PRIVATE'}))
+            if good:self.assertNotIn('PRIVATE',json.dumps(run.preference_runtime(wanted)))
+            else:
+                with self.assertRaises(M.GuiFailure):run.preference_runtime(wanted)
+        for invalid in (None, 0, 1, 'false'):
+            run.observed_api_endpoint.return_value=(run.api_endpoint,{}, {'outbounds':[{'tag':'proxy-selector','type':'selector','interrupt_exist_connections':invalid}]})
+            with self.assertRaises(M.GuiFailure):run.preference_runtime(False)
+
+    def test_lifecycle_original_callback_projection_is_fixed_and_preserves_callback(self):
+        import subprocess
+        event={'event':'event:proxyLifecycle','id':123,'payload':{'phase':'ready','kind':'restart','mainGeneration':2,'terminal':True,'applyId':7,'message':'PRIVATE','token':'PRIVATE'}}
+        script=('const callbacks=new Map([[1,x=>42]]);global.window={};const internals={};'
+            'Object.defineProperty(internals,"invoke",{value:()=>{}});Object.defineProperty(internals,"callbacks",{value:callbacks});'
+            'window.__TAURI_INTERNALS__=internals;new Function('+json.dumps(M.OBSERVER)+')();'
+            'const result=callbacks.get(1)('+json.dumps(event)+');process.stdout.write(JSON.stringify({result,rows:window.__packageObservation.rows}));')
+        result=json.loads(subprocess.check_output(['node','-e',script],text=True))
+        self.assertEqual(result['result'],42);row=result['rows'][0]
+        self.assertEqual(set(row),{'sequence','source','phase','kind','mainGeneration','terminal','applyId'})
+        self.assertNotIn('PRIVATE',json.dumps(result));self.assertEqual(M.preference_restart_terminal([row],7,1),row)
+        for bad in ({**row,'mainGeneration':True},{**row,'secret':'PRIVATE'}):
+            with self.assertRaises(M.GuiFailure):M.preference_restart_terminal([bad],7,1)
+        self.assertIsNone(M.preference_restart_terminal([{**row,'applyId':8}],7,1))
 
 
 if __name__ == '__main__':

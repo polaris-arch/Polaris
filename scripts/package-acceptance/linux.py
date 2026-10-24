@@ -252,7 +252,7 @@ def safe_connect_status(status):
     return safe
 
 
-CONNECT_PHASES = ('stopped-check', 'gui-click', 'status-ready', 'core-birth',
+CONNECT_PHASES = ('apply-ready', 'stopped-check', 'gui-click', 'status-ready', 'core-birth',
                   'runtime-path', 'runtime-api', 'owned-api-probe', 'cronet-map', 'receipt')
 
 
@@ -962,6 +962,17 @@ const observe = function(id) {
   return function(...args) {
     try {
       const raw = args[0], data = raw?.data;
+      const event = raw?.payload;
+      if (raw?.event === 'event:proxyLifecycle' &&
+          ['ready','stopped','failed'].includes(event?.phase) &&
+          ['start','stop','restart','unknown'].includes(event?.kind) &&
+          Number.isSafeInteger(event?.mainGeneration) && event.mainGeneration > 0 &&
+          typeof event?.terminal === 'boolean') {
+        observation.rows.push({sequence:++observation.cursor,source:'original-lifecycle-event',
+          phase:event.phase,kind:event.kind,mainGeneration:event.mainGeneration,terminal:event.terminal,
+          applyId:Number.isSafeInteger(event.applyId)&&event.applyId>0?event.applyId:null});
+        if(observation.rows.length>512) observation.rows.shift();
+      }
       // SaveOutcome remains shape-only. The UI click window and independent
       // private-file read prove this preference without replaying a write/read IPC.
       if (data?.status === 'saved' || data?.status === 'conflict') {
@@ -978,7 +989,8 @@ const observe = function(id) {
           Array.isArray(data.reasons)) {
         observation.rows.push({sequence: ++observation.cursor,
           source:'original-native-callback', success:raw?.success === true,
-          status:data.status, transactionId:data.transactionId,
+          status:data.status, ok:data.ok, transactionId:data.transactionId,
+          ...(Number.isSafeInteger(data.applyId)&&data.applyId>0?{applyId:data.applyId}:{}),
           runtimeGeneration:data.runtimeGeneration, selectionIntentGeneration:data.selectionIntentGeneration,
           persistenceMode:data.persistenceMode, restartRequired:data.restartRequired});
         if (observation.rows.length > 512) observation.rows.shift();
@@ -1068,6 +1080,26 @@ def native_bridge_state(value, command=None):
     if value['diagnostic'] in ('saved-state-unavailable', 'proxy-status-unavailable') and command != 'proxy_get_status':
         return 'invalid-bridge'
     return value['state']
+
+
+def preference_restart_terminal(rows, apply_id, previous_generation):
+    gui_require(type(previous_generation) is int and previous_generation>0, 'preference-restart-generation-invalid')
+    floor=previous_generation
+    for row in rows:
+        gui_require(set(row)=={'sequence','source','phase','kind','mainGeneration','terminal','applyId'} and
+                    type(row['mainGeneration']) is int and 0<row['mainGeneration']<=2**53-1 and
+                    type(row['sequence']) is int and row['sequence']>0 and
+                    type(row['terminal']) is bool and row['phase'] in ('ready','stopped','failed') and
+                    row['kind'] in ('start','stop','restart','unknown') and
+                    (row['applyId'] is None or type(row['applyId']) is int and 0<row['applyId']<=2**53-1),
+                    'preference-lifecycle-schema-invalid')
+        floor=max(floor,row['mainGeneration'])
+        if row['kind']=='stop' and row['terminal'] and row['phase']=='stopped' and row['mainGeneration']>previous_generation:
+            raise GuiFailure('preference-restart-cancelled')
+    owned=[r for r in rows if r['applyId']==apply_id and r['kind']=='restart' and r['terminal'] and
+           r['mainGeneration']==floor and r['mainGeneration']>previous_generation]
+    gui_require(not any(r['phase']=='failed' for r in owned),'preference-restart-failed')
+    return next((r for r in reversed(owned) if r['phase']=='ready'),None)
 
 
 class WebDriver:
@@ -1575,7 +1607,7 @@ class CarrierRun:
 
     def connect_phase(self, phase, status=None):
         require(phase in CONNECT_PHASES, 'fixed connect phase required')
-        if phase == 'stopped-check':
+        if phase in ('stopped-check', 'apply-ready'):
             self.api_endpoint = None
             self.result.pop('apiEndpoint', None)
             self._connect_started = time.monotonic()
@@ -1614,8 +1646,12 @@ class CarrierRun:
         require(not self.status().get('running'), 'connect requires stopped core')
         self.connect_phase('gui-click')
         self.driver.click('#connect-btn')
+        return self.observe_ready_core()
+
+    def observe_ready_core(self, timeout=75, register=True):
+        # Observe the original ready core; never click or replay a start here.
         self.connect_phase('status-ready')
-        status = wait_for(self.connect_status, lambda s: s.get('running') is True and not s.get('starting'), timeout=75)
+        status = wait_for(self.connect_status, lambda s: s.get('running') is True and not s.get('starting'), timeout=timeout)
         self.connect_phase('core-birth', status)
         require(status.get('startedViaHelper') is not True, 'privileged helper prohibited')
         core = self.supervisor.executable(self.payload / self.members['core']['path'])
@@ -1752,6 +1788,101 @@ class CarrierRun:
         same_app()
         return value
 
+    def preference_runtime(self, wanted):
+        endpoint, proof, graph = self.observed_api_endpoint()
+        gui_require(endpoint == self.api_endpoint, 'preference-runtime-endpoint-changed')
+        selectors = [o for o in graph.get('outbounds', []) if o.get('tag') == 'proxy-selector']
+        gui_require(len(selectors) == 1 and selectors[0].get('type') == 'selector', 'preference-runtime-selector-invalid')
+        # Fixed core SelectorOutboundOptions uses bool/omitempty: canonical
+        # exact-file HOT persistence omits false. Null/non-bool is not absence.
+        value = selectors[0].get('interrupt_exist_connections', False)
+        gui_require(type(value) is bool and value is wanted, 'preference-runtime-value-differs')
+        return {'wanted': wanted, 'selectorInterrupt': value, 'runtime': proof,
+                'core': {k: self.core[k] for k in ('pid','startTime')}}
+
+    def pending_apply_control(self):
+        return self.driver.execute(r"""
+const visible=e=>e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden';
+const bars=[...document.querySelectorAll('.pending-bar')].filter(visible);
+const buttons=bars.flatMap(b=>[...b.querySelectorAll('.pb-acts button')]).filter(e=>visible(e)&&e.textContent.trim()===arguments[0]);
+return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disabled||e.getAttribute('aria-disabled')==='true')};
+""", self.text('home.pendingApplyBtn'))
+
+    def retire_applied_core(self, previous):
+        current = process_identity(previous['pid'])
+        gui_require(not same_process(previous, current) or current['state'] == 'Z', 'preference-old-core-still-running')
+
+    def activate_saved_preference(self, wanted):
+        # Saved D, accepted R, and the subsequent selection are separate proofs.
+        self.gui_phase('preference-activation-begin')
+        deadline = time.monotonic() + 75
+        def remaining():
+            left = deadline-time.monotonic()
+            gui_require(left > 0, 'observation-timeout')
+            return left
+        disk = self.preference_disk()
+        gui_require(disk['value'] is wanted, 'preference-saved-value-differs')
+        previous = dict(self.core); before_status = self.status()
+        control = self.pending_apply_control()
+        gui_require(type(control) is dict and set(control) == {'bars','buttons','disabled'} and
+                    type(control['bars']) is int and type(control['buttons']) is int and
+                    type(control['disabled']) is bool and control['bars'] in (0,1) and control['buttons'] in (0,1),
+                    'preference-apply-control-invalid')
+        proof = {'wanted':wanted,'saved':disk,'apply':'not-needed','restartConfirmed':False}
+        if control['buttons']:
+            gui_require(not control['disabled'], 'preference-apply-disabled')
+            self.gui_phase('preference-apply-click')
+            result = self.apply(('hotApplied','restartRequired'), timeout=min(65,remaining()))
+            proof['apply'] = result['status']
+            if result['status'] == 'restartRequired':
+                cursor = max((r['sequence'] for r in self.driver.observations()), default=0)
+                self.gui_phase('preference-restart-confirm')
+                self.driver.click('dialog[open][aria-labelledby="restart-apply-title"] button', self.text('home.restartApplyConfirm'))
+                def callback():
+                    rows=[r for r in self.driver.observations() if r.get('sequence',0)>cursor and r.get('source')=='original-native-callback']
+                    gui_require(len(rows)<=1,'preference-apply-callback-ambiguous')
+                    return rows[0] if rows else None
+                scheduled=wait_for(callback,timeout=remaining())
+                gui_require(scheduled.get('success') is True and scheduled.get('ok') is True and scheduled.get('status')=='applied' and
+                            type(scheduled.get('applyId')) is int and scheduled['applyId']>0,'preference-restart-not-scheduled')
+                apply_id=scheduled['applyId']
+                def terminal():
+                    rows=[r for r in self.driver.observations() if r.get('sequence',0)>cursor and r.get('source')=='original-lifecycle-event']
+                    return preference_restart_terminal(rows,apply_id,before_status.get('mainGeneration'))
+                ready=wait_for(terminal,timeout=remaining())
+                self.retire_applied_core(previous)
+                self.connect_phase('apply-ready')
+                status=self.observe_ready_core(timeout=remaining())
+                gui_require(status.get('mainGeneration')==ready['mainGeneration'] and not same_process(previous,self.core),
+                            'preference-restart-generation-differs')
+                proof.update(restartConfirmed=True,applyId=apply_id,lifecycle=ready)
+                self.gui_phase('preference-restart-ready',status)
+            else:
+                gui_require(result.get('ok') is True, 'preference-hot-rejected')
+                self.same_core(previous)
+                self.connect_phase('apply-ready')
+                self.observe_ready_core(timeout=remaining(),register=False)
+                self.same_core(previous)
+                transaction=result.get('transactionId')
+                gui_require(type(transaction) is str and bool(transaction),'preference-hot-transaction-missing')
+                lookup=self.native_status(transaction)
+                gui_require(type(lookup.get('lookupState')) is int and lookup['lookupState']==1 and type(lookup.get('operation')) is dict, 'preference-hot-lookup-unconfirmed')
+                operation=lookup['operation']
+                gui_require(operation.get('durable') is True and operation.get('persistenceMode')=='exact_configuration_file'
+                            and operation.get('active')==self.rpc('capabilities')['active'], 'preference-hot-durability-unconfirmed')
+                proof['hotReceipt']={'transactionId':transaction,'durable':True,
+                    'persistenceMode':'exact_configuration_file','active':operation['active']}
+        else:
+            gui_require(control['bars']==0, 'preference-pending-without-apply')
+            self.same_core(previous)
+        gui_require(self.preference_disk()==disk, 'preference-saved-file-changed')
+        self.gui_phase('preference-runtime-proof')
+        proof['acceptedRuntime']=self.preference_runtime(wanted)
+        wait_for(self.pending_apply_control, lambda value: value=={'bars':0,'buttons':0,'disabled':False}, timeout=remaining())
+        remaining()
+        self.result.setdefault('preferenceActivations',[]).append(proof)
+        return proof
+
     def preference_pending_save(self):
         count = self.driver.execute(r'''
 const visible=e=>e.getClientRects().length && getComputedStyle(e).visibility!=='hidden';
@@ -1886,7 +2017,7 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
         self.revalidate_api_endpoint()
         return result['result']
 
-    def apply(self, expected='hotApplied', retry=None):
+    def apply(self, expected='hotApplied', retry=None, timeout=65):
         self.gui_phase('apply-begin')
         observations = self.driver.observations()
         cursor = max((row['sequence'] for row in observations), default=0)
@@ -1901,14 +2032,14 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
                 matches = [row for row in matches if row.get('transactionId') == retry]
             return matches[0] if matches else None
         self.gui_phase('apply-original-callback')
-        result = wait_for(changed, timeout=65)
+        result = wait_for(changed, timeout=timeout)
         require(result.get('success') is True, 'GUI Apply outcome unknown; no automatic resubmission')
         transaction = result.get('transactionId')
         if result.get('status') == 'unconfirmed':
             require(transaction, 'unknown Apply without transaction is terminal failure')
             result = wait_for(lambda: self.driver.invoke('proxy_runtime_apply_status', {'transactionId': transaction}),
                               lambda row: row.get('status') != 'unconfirmed', timeout=60)
-        require(result.get('status') == expected, 'GUI Apply did not reach required outcome')
+        require(result.get('status') in ((expected,) if type(expected) is str else expected), 'GUI Apply did not reach required outcome')
         if retry:
             require(transaction == retry, 'GUI retried another transaction')
         return result
@@ -1939,8 +2070,16 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
                     newConnection=second_proof, screenshot=self.snapshot('selected-b'))
         self.stage = 'selection-interrupt-preference'
         self.preference(True)
+        self.activate_saved_preference(True)
+        # Apply/restart closure is not node-switch evidence. Establish a fresh
+        # B stream only after the accepted preference runtime is proved.
+        self.stage = 'selection-interrupt-baseline'
+        self.pick('B')
+        second, interrupt_before = self.socket('B')
+        interrupt_core = dict(self.core)
         self.stage = 'selection-interrupt-switch'
         self.pick('A')
+        self.same_core(interrupt_core)
         self.stage = 'selection-old-stream-close'
         def closed():
             try:
@@ -1953,7 +2092,9 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
                 return False
         wait_for(closed, timeout=12)
         self.record('gui_manual_disconnect_preference', gracefulOldConnection=old_after,
-                    interruptPreferenceObserved=True, oldBClosed=True)
+                    interruptPreferenceObserved=True, oldBClosed=True,
+                    interruptionBaseline=interrupt_before, interruptionCore=interrupt_core,
+                    preferenceActivation=self.result['preferenceActivations'][-1])
         self.stage = 'selection-restore-b'
         self.pick('B')
         saved = self.config()['selectedServerId']

@@ -868,6 +868,56 @@ class ControllerLifecycleContracts(unittest.TestCase):
             run.connect()
             self.assertEqual(run.api_endpoint['port'],45002)
 
+    def test_apply_restart_retires_old_registration_before_binding_new_core_and_tun(self):
+        run,status,endpoint,graph=self.tun_connect_fixture()
+        previous=identity(9);calls=[]
+        attested=run.controller.call.return_value
+        def call(action):
+            calls.append(action)
+            return {'stopped':True,'identity':previous} if action=='core_stopped' else attested
+        run.controller.call.side_effect=call
+        run.retire_applied_core(previous)
+        run.connect_phase('apply-ready')
+        with patch.object(M.base,'wait_for',return_value=status),patch.object(M.base,'regular',side_effect=lambda p,*a:p):
+            run.observe_ready_core(timeout=10)
+        self.assertEqual(calls,['core_stopped','register_core','core_attest','tun_register'])
+        self.assertEqual(run.api_endpoint,endpoint);run.driver.click.assert_not_called()
+        self.assertFalse(run.stopped)
+        run.controller.call.side_effect=None;run.controller.call.return_value={'stopped':True,'identity':identity(99)}
+        with self.assertRaises(ValueError):run.retire_applied_core(previous)
+
+    def test_hot_apply_reobserves_existing_core_without_duplicate_registration(self):
+        run,status,endpoint,graph=self.tun_connect_fixture()
+        run.connect_phase('apply-ready')
+        with patch.object(M.base,'wait_for',return_value=status),patch.object(M.base,'regular',side_effect=lambda p,*a:p):
+            run.observe_ready_core(timeout=10,register=False)
+        self.assertEqual([c.args[0] for c in run.controller.call.call_args_list],['core_attest'])
+        run.rpc.assert_called_once_with('capabilities');run.driver.click.assert_not_called()
+
+    def test_manual_policy_activation_precedes_new_stream_and_keeps_same_core_switch_assertion(self):
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.core={'pid':10,'startTime':'1'};calls=[]
+        run.boundary=Mock();run.record=Mock();run.exchange=Mock(return_value={'matched':True})
+        run.fixture_control=Mock(return_value={'errors':[],'closed':False})
+        run.pick=lambda label:calls.append(('pick',label))
+        run.preference=lambda wanted:calls.append(('save',wanted))
+        def activate(wanted):
+            calls.append(('activate',wanted));run.core={'pid':11 if wanted else 10,'startTime':'2' if wanted else '1'}
+        run.activate_saved_preference=activate
+        def stream(label):
+            calls.append(('socket',label,run.core['pid']));sock=Mock();sock.recv.return_value=b''
+            return sock,{'backend':label}
+        run.socket=stream;run.same_core=lambda baseline:calls.append(('same-core',baseline['pid']))
+        with patch.object(M.base,'wait_for',side_effect=lambda read,**kwargs:read()):run.manual_cases()
+        self.assertEqual([v for v in calls if v[0]=='socket'],[('socket','A',10),('socket','B',10),('socket','A',11),('socket','B',11)])
+        self.assertLess(calls.index(('pick','A')),calls.index(('activate',False)))
+        self.assertLess(calls.index(('activate',True)),calls.index(('socket','A',11)))
+        self.assertIn(('same-core',11),calls)
+        source=Path(M.__file__).read_text()
+        for method in ('auto_case','uncovered_case'):
+            body=source.split('    def '+method+'(',1)[1].split('    def ',1)[0]
+            self.assertIn('self.activate_saved_preference(False)',body)
+            self.assertLess(body.index('self.activate_saved_preference(False)'),body.index('self.socket('))
+
     def test_tun_connect_rejects_attestation_graph_and_listener_failures(self):
         for failure in ('root-runtime', 'tun-graph', 'owned-listener'):
             run, status, endpoint, graph = self.tun_connect_fixture()

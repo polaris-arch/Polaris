@@ -1135,6 +1135,16 @@ jobs:
       # mac 两腿显式传 `--target`（尤其 x64 不可跟随 arm64 宿主）；Linux/Windows 先核宿主再共享 App target。
       # 平台目录名的真值在 scripts/verify-packaging.mjs 的 LABEL_TO_CORE；这里的 case 是它的影子，
       # 故默认分支硬失败 —— 新增平台忘了补这里，得到的是红，不是一个静默少 helper 的包。
+      - name: Verify real Linux helper script producer fixtures
+        if: matrix.label == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_name=manager::tests::linux_script_producer_matches_package_acceptance_fixtures
+          cargo test --locked -p polaris-helper-client "$test_name" -- --exact | tee "$RUNNER_TEMP/linux-helper-producer-test.log"
+          grep -F "test $test_name ... ok" "$RUNNER_TEMP/linux-helper-producer-test.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/linux-helper-producer-test.log"
+
       - name: Build and stage privileged helper
         shell: bash
         run: |

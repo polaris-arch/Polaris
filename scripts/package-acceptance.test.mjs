@@ -356,7 +356,12 @@ test('read-only auth preflight is one existing setup job and default DAG is byte
   // dependencies, matrices, original conditions (including always), and bodies.
   // N5 adds only one opt-in choice and two exact descriptions. Reverse those
   // literals first; retain the original f20ce byte hash rather than widening it.
-  let projected = workflow
+  // N13 adds one Linux-only pure producer test before helper build.
+  const producerStep = workflow.match(/      - name: Verify real Linux helper script producer fixtures\n[\s\S]*?(?=      - name: Build and stage privileged helper\n)/)?.[0];
+  assert.equal(sha256(producerStep ?? ''), '054d8f2d6eaa79f6bfda33c4dbaa90975b36231ef4fe4dced454239ecc960d0f');
+  assert.equal(workflow.split('      - name: Verify real Linux helper script producer fixtures\n').length, 2);
+  assert.ok(workflow.indexOf('      - name: Install Rust stable (preinstalled rustup)') < workflow.indexOf(producerStep));
+  let projected = workflow.replace(producerStep, '')
     .replace('          - temporary-existing-runner-password-and-sudo-group\n', '')
     .replace("        description: 'Temporary password/group modes require separate exact-SHA approval; existing session remains default'",
       "        description: 'Temporary password mode requires separate explicit approval for this exact dispatch'")

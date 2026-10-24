@@ -2113,3 +2113,68 @@ fn retained_windows_helper_requires_framing_before_service_or_registration_chang
     assert!(source.contains("retained newer helper capability unavailable while stopped"));
     assert!(source.contains(".Hash.ToLowerInvariant() -cne '{helper_hash}'"));
 }
+
+/// Both fixtures are complete outputs from the real split Unix producers, with
+/// synthetic values only. Never execute these administrator script bytes.
+#[test]
+fn linux_script_producer_matches_package_acceptance_fixtures() {
+    let paths = InstallPaths::linux();
+    let stage = PathBuf::from("/tmp/producer fixture/用户's stage");
+    let mut params = install_params(
+        PathBuf::from("/tmp/producer fixture/用户's config"),
+        stage.join("polaris-helper"),
+    );
+    params.conf_dir = params.script_dir.clone();
+    params.uid = 1001;
+    params.user_identity = polaris_helper_proto::core_protocol::CallerIdentity::Unix(1001);
+    let install = build_linux_install_script(&paths, &params, &"e".repeat(64));
+    let utility = MaintenanceUtility {
+        src_binary: stage.join("polaris-helper"),
+        helper_sha256: "a".repeat(64),
+    };
+    let uninstall = uninstall_unix::build_linux_uninstall_script(&paths, &utility);
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/package-acceptance/fixtures");
+    for (kind, bytes) in [
+        ("install", install.as_bytes()),
+        ("uninstall", uninstall.as_bytes()),
+    ] {
+        let expected = std::fs::read(fixtures.join(format!("linux-helper-{kind}.sh"))).unwrap();
+        assert_eq!(
+            bytes,
+            expected.as_slice(),
+            "complete {kind} producer bytes differ"
+        );
+        assert!(bytes.starts_with(b"#!/bin/sh\nset -eu\n"));
+        assert!(!bytes.starts_with(b"#!/bin/bash"));
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert!(text.contains(&shell_quote(&utility.src_binary.to_string_lossy())));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let name = format!("polaris-helper-{kind}.sh");
+            let path = write_secure_script(dir.path(), &name, text).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                path.file_name().unwrap().to_str().unwrap().len(),
+                25 + name.len()
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            // Model run_privileged_script's finally unlink without executing it.
+            let mut held = std::fs::File::open(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let mut still_held = Vec::new();
+            std::io::Read::read_to_end(&mut held, &mut still_held).unwrap();
+            assert_eq!(still_held, bytes);
+            assert!(!path.exists());
+        }
+    }
+}
