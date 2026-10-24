@@ -243,7 +243,7 @@ VM_BLOCKS = frozenset(('githubHosted', 'dedicatedVM', 'pid1Systemd', 'rootManage
     'freshProductAndDefaultSandbox', 'fixtureCIDRCollision', 'productTunRuleOrTableAlreadyOwned',
     'localEvidenceAndMaterials', 'c6CompleteCarrierAdmission', 'completeCarrierHashes',
     'realPkexecAuthenticationPendingConfirmation'))
-VM_PROBES = ('none', 'ip', 'systemctl', 'systemd-run', 'resolvectl', 'nft', 'python', 'setpriv', 'tcpdump', 'tshark',
+VM_PROBES = ('pid1-hierarchy', 'pid1-unit', 'pid1-membership', 'pid1-stability', 'none', 'ip', 'systemctl', 'systemd-run', 'resolvectl', 'nft', 'python', 'setpriv', 'tcpdump', 'tshark',
     'links', 'addresses', 'route4', 'route6', 'rule4', 'rule6', 'resolved', 'firewall', 'resolv-conf', 'network-forwarding')
 VM_ERRORS = ('none', 'OSError', 'ValueError', 'SubprocessError', 'TypeError', 'KeyError', 'other')
 
@@ -306,15 +306,33 @@ def manager_root(ops, observation):
     return os.geteuid() == 0 and value in ('', '/')
 
 
-def pid1_root_cgroup(ops):
-    # Match the production Linux manager proof. systemd v249 removes the
-    # init.scope suffix before exposing manager ControlGroup and stores root as
-    # empty; no arbitrary nested scope or absent property is equivalent.
+def pid1_root_cgroup(ops, progress=lambda _: None):
+    # Unit no-record is not manager root. Independently anchor to PID1's kernel
+    # membership; the caller must still require root mount and system namespaces.
+    progress('pid1-hierarchy')
     rows = Path('/proc/1/cgroup').read_text().splitlines()
     require(len(rows) == 1 and rows[0] in ('0::/', '0::/init.scope'), 'PID1 hierarchy root unconfirmed')
+    directory = Path('/sys/fs/cgroup')
     if rows[0] == '0::/init.scope':
-        value = ops.run([SYSTEMCTL, '--system', 'show', '--all', '--property=ControlGroup', 'init.scope'])
-        require(value.splitlines() == ['ControlGroup=/init.scope'], 'PID1 scope identity unconfirmed')
+        progress('pid1-unit')
+        props = {}
+        for key in ('LoadState', 'ActiveState', 'ControlGroup'):
+            value = ops.run([SYSTEMCTL, '--system', 'show', '--all', '--property=' + key, 'init.scope'])
+            lines = value.splitlines()
+            require(len(lines) == 1 and lines[0].startswith(key + '='), 'PID1 explicit unit property required')
+            props[key] = lines[0][len(key) + 1:]
+        require(props['LoadState'] == 'loaded' and props['ActiveState'] == 'active' and
+                props['ControlGroup'] in ('', '/init.scope'), 'PID1 scope identity unconfirmed')
+        directory /= 'init.scope'
+    progress('pid1-membership')
+    require(directory.is_dir() and not directory.is_symlink() and
+            not (directory / 'cgroup.procs').is_symlink(), 'PID1 directory unconfirmed')
+    for _ in range(2):
+        members = (directory / 'cgroup.procs').read_text().splitlines()
+        require(all(re.fullmatch(r'[1-9][0-9]*', item) for item in members) and '1' in members,
+                'PID1 kernel membership unconfirmed')
+    progress('pid1-stability')
+    require(Path('/proc/1/cgroup').read_text().splitlines() == rows, 'PID1 membership changed')
     return True
 
 
@@ -341,7 +359,7 @@ def collect_preflight(gui_uid, vm_context, materials_downloaded=False, ops=None)
         facts['rootManager'] = manager_root(ops, observation)
         reached('pid1')
         facts['pid1Systemd'] = (Path('/proc/1/comm').read_text().strip() == 'systemd' and
-                               Path('/proc/1').stat().st_uid == 0 and pid1_root_cgroup(ops))
+                               Path('/proc/1').stat().st_uid == 0 and pid1_root_cgroup(ops, probing))
         reached('namespaces')
         ns = {name: (Path('/proc/1/ns') / name).stat().st_ino for name in ('net', 'mnt', 'pid', 'cgroup')}
         facts['systemNamespaces'] = ns

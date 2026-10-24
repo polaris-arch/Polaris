@@ -77,6 +77,17 @@ echo polaris-helper-uninstall-ok
         ("PID1_GROUP", "0::/init.scope\n0::/init.scope", false),
         ("PID1_GROUP", "", false),
         ("INIT_GROUP", "/foreign", false),
+        ("INIT_GROUP", "", true),
+        ("INIT_GROUP", "/", false),
+        ("INIT_LOAD", "not-found", false),
+        ("INIT_STATE", "inactive", false),
+        ("INIT_FORM", "missing", false),
+        ("INIT_FORM", "duplicate", false),
+        ("PID1_MEMBERS", "2", false),
+        ("PID1_MEMBERS", "PRIVATE", false),
+        ("PID1_MEMBERS_RC", "1", false),
+        ("PID1_SECOND_MISSING", "1", false),
+        ("PID1_CHANGED", "1", false),
         ("MANAGER_GROUP", "/subtree", false),
         ("MANAGER_QUERY_RC", "1", false),
         ("MOUNT_ROOT", "/subtree", false),
@@ -96,6 +107,9 @@ echo polaris-helper-uninstall-ok
     ] {
         run_linux_proof_fixture(&script, key, value, succeeds, &[]);
     }
+    // Reproduce the N16 observed empty-manager/empty-unit pair. Namespace and
+    // mount evidence here is an additional strong fixture, not ordinary authority.
+    run_linux_proof_fixture(&script, "INIT_GROUP", "", true, &[("MANAGER_GROUP", "")]);
 }
 
 #[cfg(target_os = "linux")]
@@ -125,6 +139,7 @@ fn run_linux_proof_fixture(
     if matches!(key, "ABSENT_CGROUP" | "ABSENT_FIND_FAIL") {
         std::fs::remove_dir_all(&cgroup).unwrap();
     }
+    std::fs::create_dir_all(fixture.path().join("cgroup/init.scope")).unwrap();
     let commands = [
         ("systemctl", r#"[ "$1" != --system ] || shift
 case "$1" in
@@ -134,7 +149,11 @@ if [ "$#" -eq 3 ]; then
   case "$MOCK_MANAGER_FORM" in missing) exit 0;; duplicate) echo "$PROPERTY=/";; foreign) echo Other=; exit 0;; esac
   echo "$PROPERTY=$MOCK_MANAGER_GROUP"; exit "$MOCK_MANAGER_QUERY_RC"
 fi
-if [ "$4" = init.scope ]; then echo "$PROPERTY=$MOCK_INIT_GROUP"; exit "$MOCK_INIT_QUERY_RC"; fi
+if [ "$4" = init.scope ]; then
+  case "$MOCK_INIT_FORM" in missing) exit 0;; duplicate) echo "$PROPERTY=";; esac
+  case "$PROPERTY" in ControlGroup) VALUE=$MOCK_INIT_GROUP;; LoadState) VALUE=$MOCK_INIT_LOAD;; ActiveState) VALUE=$MOCK_INIT_STATE;; *) exit 90;; esac
+  echo "$PROPERTY=$VALUE"; exit "$MOCK_INIT_QUERY_RC"
+fi
 [ "$PROPERTY" != "$MOCK_MISSING_PROPERTY" ] || exit 0
 if [ "$PROPERTY" = "$MOCK_DUPLICATE_PROPERTY" ]; then echo "$PROPERTY=one"; echo "$PROPERTY=two"; exit 0; fi
 if [ "$PROPERTY" = "$MOCK_FOREIGN_PROPERTY" ]; then echo Foreign=value; exit 0; fi
@@ -168,7 +187,14 @@ esac
         ("stat", "case \"$1:$2\" in -c:%u) echo \"$MOCK_OWNER\";; -c:%a) echo \"$MOCK_MODE\";; -f:-c) echo \"$MOCK_CGTYPE\";; *) exit 90;; esac\n"),
         ("cat", r#"case "$1" in
   /proc/1/comm) echo "$MOCK_MANAGER"; exit 0;;
-  /proc/1/cgroup) [ "$MOCK_PID1_READ_RC" = 0 ] || exit 1; printf '%s\n' "$MOCK_PID1_GROUP"; exit 0;;
+  /proc/1/cgroup) [ "$MOCK_PID1_READ_RC" = 0 ] || exit 1
+    if [ "$MOCK_PID1_CHANGED" = 1 ] && [ -f "$MOCK_MEMBERS_SEEN" ]; then echo '0::/'; exit 0; fi
+    printf '%s\n' "$MOCK_PID1_GROUP"; exit 0;;
+  "$MOCK_CGROOT/cgroup.procs"|"$MOCK_CGROOT/init.scope/cgroup.procs")
+    [ "$MOCK_PID1_MEMBERS_RC" = 0 ] || exit 1
+    if [ "$MOCK_PID1_SECOND_MISSING" = 1 ] && [ -f "$MOCK_MEMBERS_SEEN" ]; then echo 2; exit 0; fi
+    : > "$MOCK_MEMBERS_SEEN"
+    printf '%s\n' "$MOCK_PID1_MEMBERS"; exit 0;;
   /proc/self/mountinfo)
 [ "$MOCK_MOUNT_READ_RC" = 0 ] || exit 1
 [ "$MOCK_MOUNT_MISSING" = 0 ] || exit 0
@@ -212,7 +238,10 @@ exec /usr/bin/find "$@"
             ),
         );
     let mut command = std::process::Command::new("/bin/sh");
-    command.args(["-c", &script]).env("PATH", fixture.path());
+    command
+        .args(["-c", &script])
+        .env("PATH", fixture.path())
+        .env("MOCK_MEMBERS_SEEN", fixture.path().join("members-seen"));
     for (name, value) in [
         ("LOAD", "loaded"),
         ("STATE", "inactive"),
@@ -226,6 +255,13 @@ exec /usr/bin/find "$@"
         ("MANAGER_GROUP", "/"),
         ("PID1_GROUP", "0::/init.scope"),
         ("INIT_GROUP", "/init.scope"),
+        ("INIT_LOAD", "loaded"),
+        ("INIT_STATE", "active"),
+        ("INIT_FORM", "normal"),
+        ("PID1_MEMBERS", "1\n2"),
+        ("PID1_MEMBERS_RC", "0"),
+        ("PID1_SECOND_MISSING", "0"),
+        ("PID1_CHANGED", "0"),
         ("MANAGER_QUERY_RC", "0"),
         ("MANAGER_FORM", "normal"),
         ("INIT_QUERY_RC", "0"),

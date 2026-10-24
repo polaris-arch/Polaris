@@ -454,19 +454,26 @@ class ReportTests(unittest.TestCase):
 
 class VMObservationTests(unittest.TestCase):
     def collect(self, fault=None):
+        hierarchy_reads = [0]
         def hit(stage):
             if stage == fault: raise ValueError('PRIVATE raw host data')
         def text(path, *args, **kwargs):
             value = str(path)
             if value == '/proc/1/comm': hit('pid1'); return 'systemd\n'
-            if value == '/proc/1/cgroup': return '0::/init.scope\n'
+            if value == '/proc/1/cgroup':
+                hierarchy_reads[0] += 1
+                hit('pid1-hierarchy' if hierarchy_reads[0] == 1 else 'pid1-stability')
+                return '0::/init.scope\n'
+            if value == '/sys/fs/cgroup/init.scope/cgroup.procs': hit('pid1-membership'); return '1\n'
             if value == '/proc/self/mountinfo':
                 hit('cgroup-mount'); return '1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n'
             if value == '/proc/self/status': hit('privileges'); return 'NoNewPrivs: 0\n'
             hit('forwarding'); return '0'
         def stat_(path, *args, **kwargs):
             if str(path) == '/proc/1': return SimpleNamespace(st_uid=0)
-            if '/ns/' in str(path): hit('namespaces'); return SimpleNamespace(st_ino=1)
+            if '/ns/' in str(path):
+                if fault=='namespace-permission': raise PermissionError('PRIVATE')
+                hit('namespaces'); return SimpleNamespace(st_ino=1)
             hit('tun-device'); return SimpleNamespace(st_mode=0o020600, st_rdev=os.makedev(10,200))
         def paths(path, *args, **kwargs): hit('product-paths'); return False
         tool_names=iter(('ip','systemctl','systemd-run','resolvectl','nft','python','setpriv','tcpdump','tshark'))
@@ -480,13 +487,16 @@ class VMObservationTests(unittest.TestCase):
         def tables(*args): hit('route-tables'); return []
         ops = Mock()
         def manager(*args):
-            if args[0][-1] == 'init.scope': return 'ControlGroup=/init.scope\n'
+            if args[0][-1] == 'init.scope':
+                hit('pid1-unit')
+                key=args[0][-2].split('=',1)[1]
+                return key+'='+{'ControlGroup':'','LoadState':'loaded','ActiveState':'active'}[key]+'\n'
             hit('manager'); return 'ControlGroup=\n'
         ops.run.side_effect = manager
         with ExitStack() as stack:
             for target, kwargs in ((('read_text'), {'autospec':True,'side_effect':text}),
                     ('stat', {'autospec':True,'side_effect':stat_}),
-                    ('exists', {'autospec':True,'side_effect':paths}), ('is_symlink', {'return_value':False})):
+                    ('exists', {'autospec':True,'side_effect':paths}), ('is_dir', {'return_value':True}), ('is_symlink', {'return_value':False})):
                 stack.enter_context(patch.object(tun.Path,target,**kwargs))
             stack.enter_context(patch.object(tun,'root_path',side_effect=root))
             stack.enter_context(patch.object(tun,'network_snapshot',side_effect=network))
@@ -724,13 +734,67 @@ class OwnedTerminalTests(unittest.TestCase):
                         with self.assertRaises(ValueError):tun.terminal_identity(old)
                 else:
                     with self.assertRaises((ValueError,OSError)):tun.terminal_identity(old)
+    def test_original_readonly_sample_is_unit_counterexample_not_root_authority(self):
+        sample=json.loads((Path(__file__).parent/'fixtures/n16-readonly-host-cgroup.json').read_text())
+        self.assertEqual(sample['context']['runId'],'40074321479')
+        host=sample['hostFacts']['observations']
+        self.assertEqual(host['initScope']['value'],{'active':'active','controlGroup':'explicit-empty','load':'loaded'})
+        # The original exact /init.scope equality necessarily rejects explicit empty.
+        self.assertNotEqual(host['initScope']['value']['controlGroup'],'init-scope')
+        for key in ('pidNamespace','mntNamespace','cgroupNamespace'):
+            self.assertEqual(host[key],{'error':'permission','state':'unknown','value':None})
+        # Supplemented root fixture passes; ordinary permission sample alone does not.
+        strong=VMObservationTests().collect()['vmPreflight']
+        self.assertEqual(strong['checks']['pid1Systemd'],True)
+        self.assertEqual(strong['checks']['sameSystemNamespaces'],True)
+        unknown_facts=VMObservationTests().collect('namespace-permission')
+        unknown_gate=tun.preflight(unknown_facts,carrier())
+        unknown=unknown_facts['vmPreflight']
+        self.assertEqual(unknown['stages']['namespaces'],{'state':'failed','error':'OSError'})
+        self.assertEqual(unknown['checks']['sameSystemNamespaces'],None)
+        self.assertIn('sameSystemNamespaces',unknown_gate['blocked'])
+        for probe in ('pid1-hierarchy','pid1-unit','pid1-membership','pid1-stability'):
+            value=VMObservationTests().collect(probe)['vmPreflight']
+            self.assertEqual(value['failedProbe'],probe)
+            self.assertEqual(tun.validate_vm_observation(value),value)
+
     def test_pid1_root_cgroup_exact_semantics(self):
-        for raw,reply,expected in [('0::/\n',None,True),('0::/init.scope\n','ControlGroup=/init.scope\n',True),
-                ('0::/nested/init.scope\n',None,False),('0::/init.scope\n','',False),
-                ('0::/init.scope\n','ControlGroup=\n',False),('0::/init.scope\n','ControlGroup=/other\n',False),
-                ('0::/init.scope\n0::/\n',None,False)]:
-            with patch.object(Path,'read_text',return_value=raw):
-                ops=Mock(run=Mock(return_value=reply))
+        cases = [('0::/','', '1\n',True), ('0::/','','2\n',False), ('0::/init.scope','','1\n2\n',True),
+            ('0::/init.scope','/init.scope','1\n',True), ('0::/nested/init.scope','','1\n',False),
+            ('0::/init.scope','/','1\n',False), ('0::/init.scope','/other','1\n',False),
+            ('0::/init.scope','','2\n',False), ('0::/init.scope','','PRIVATE\n',False),
+            ('0::/init.scope\n0::/','','1\n',False)]
+        for raw,group,members,expected in cases:
+            def read(path):return members if str(path).endswith('cgroup.procs') else raw+'\n'
+            def query(argv):
+                key=argv[-2].split('=',1)[1]
+                return key+'='+{'ControlGroup':group,'LoadState':'loaded','ActiveState':'active'}[key]+'\n'
+            with self.subTest(raw=raw,group=group,members=members), \
+                 patch.object(Path,'read_text',autospec=True,side_effect=read), \
+                 patch.object(Path,'is_dir',return_value=True),patch.object(Path,'is_symlink',return_value=False):
+                ops=Mock(run=Mock(side_effect=query))
                 if expected:self.assertTrue(tun.pid1_root_cgroup(ops))
                 else:
                     with self.assertRaises(ValueError):tun.pid1_root_cgroup(ops)
+
+    def test_pid1_unit_missing_duplicate_errors_and_kernel_changes_reject(self):
+        for fault in ('missing','duplicate','inactive','not-found','query','permission','second-members','changed','symlink'):
+            calls={'group':0,'members':0}
+            def read(path):
+                if str(path).endswith('cgroup.procs'):
+                    calls['members']+=1
+                    if fault=='permission':raise PermissionError('PRIVATE')
+                    return '2\n' if fault=='second-members' and calls['members']==2 else '1\n'
+                calls['group']+=1
+                return '0::/\n' if fault=='changed' and calls['group']==2 else '0::/init.scope\n'
+            def query(argv):
+                key=argv[-2].split('=',1)[1]
+                if fault=='query':raise RuntimeError('PRIVATE')
+                if fault=='missing':return ''
+                value={'ControlGroup':'','LoadState':'not-found' if fault=='not-found' else 'loaded',
+                       'ActiveState':'inactive' if fault=='inactive' else 'active'}[key]
+                return (key+'='+value+'\n')*(2 if fault=='duplicate' else 1)
+            with self.subTest(fault=fault),patch.object(Path,'read_text',autospec=True,side_effect=read), \
+                 patch.object(Path,'is_dir',return_value=True),patch.object(Path,'is_symlink',return_value=fault=='symlink'):
+                with self.assertRaises((ValueError,OSError,RuntimeError)):
+                    tun.pid1_root_cgroup(Mock(run=Mock(side_effect=query)))

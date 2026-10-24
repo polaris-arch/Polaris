@@ -218,15 +218,6 @@ linux_cgroup_view() {
   # systemd stores the hierarchy root without its trailing slash, including
   # the root itself. An explicit empty property is not a missing record.
   case "$MANAGER_GROUP" in ''|/) ;; *) return 1;; esac
-  INSTALL_STAGE=pid1-cgroup
-  PID1_GROUP=$(cat /proc/1/cgroup) || return 1
-  case "$PID1_GROUP" in
-    '0::/') ;;
-    '0::/init.scope')
-      INIT_GROUP=$(linux_systemd_property ControlGroup init.scope) || return 1
-      [ "$INIT_GROUP" = /init.scope ] || return 1;;
-    *) return 1;;
-  esac
   INSTALL_STAGE=cgroup-mount
   CGROOT=/sys/fs/cgroup
   [ -d "$CGROOT" ] && [ ! -L "$CGROOT" ] || return 1
@@ -244,7 +235,37 @@ linux_cgroup_view() {
   done <<POLARIS_MOUNTINFO
 $MOUNTS
 POLARIS_MOUNTINFO
-  [ "$MATCHES" -eq 1 ]
+  [ "$MATCHES" -eq 1 ] || return 1
+  INSTALL_STAGE=pid1-cgroup
+  PID1_GROUP=$(cat /proc/1/cgroup) || return 1
+  case "$PID1_GROUP" in
+    '0::/') PID1_DIRECTORY=$CGROOT;;
+    '0::/init.scope')
+      PID1_DIRECTORY=$CGROOT/init.scope
+      INIT_LOAD=$(linux_systemd_property LoadState init.scope) || return 1
+      INIT_STATE=$(linux_systemd_property ActiveState init.scope) || return 1
+      INIT_GROUP=$(linux_systemd_property ControlGroup init.scope) || return 1
+      [ "$INIT_LOAD:$INIT_STATE" = loaded:active ] || return 1
+      # Unit empty means no realized unit path record, NOT the manager root.
+      # Kernel membership below independently proves the exact PID1 directory.
+      case "$INIT_GROUP" in ''|/init.scope) ;; *) return 1;; esac;;
+    *) return 1;;
+  esac
+  [ -d "$PID1_DIRECTORY" ] && [ ! -L "$PID1_DIRECTORY" ] || return 1
+  [ ! -L "$PID1_DIRECTORY/cgroup.procs" ] || return 1
+  for PID1_SAMPLE in 1 2; do
+    PID1_MEMBERS=$(cat "$PID1_DIRECTORY/cgroup.procs") || return 1
+    PID1_FOUND=0
+    while IFS= read -r MEMBER; do
+      case "$MEMBER" in ''|*[!0-9]*|0|0*) return 1;; esac
+      [ "$MEMBER" != 1 ] || PID1_FOUND=1
+    done <<POLARIS_PID1_MEMBERS
+$PID1_MEMBERS
+POLARIS_PID1_MEMBERS
+    [ "$PID1_FOUND" -eq 1 ] || return 1
+  done
+  PID1_AFTER=$(cat /proc/1/cgroup) || return 1
+  [ "$PID1_AFTER" = "$PID1_GROUP" ]
 }
 linux_validate_service() {
   linux_cgroup_view || return 1
