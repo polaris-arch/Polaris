@@ -21,10 +21,17 @@ EXECUTION_MARKERS = ('unknown', 'notSetuidRoot', 'noAuthenticationAgent', 'notAu
 EXECUTION_SCHEMA = 'polaris-helper-execution-diagnostic-v1'
 EXECUTION_SCOPE = 'child-stderr-marker-not-verified-emitter'
 
+INSTALLER_STAGES = ('preparation', 'directories', 'staging', 'lease', 'journal', 'core-install', 'policy',
+    'service-snapshot', 'manager-identity', 'manager-property', 'pid1-cgroup', 'cgroup-mount', 'unit-config',
+    'service-stop', 'service-closure', 'registration', 'service-install', 'service-start', 'takeover',
+    'uninstall-remove', 'cleanup', 'rollback', 'unknown')
+INSTALLER_RECOVERY = ('not-started', 'cleanup-returned', 'rollback-returned', 'recovery-unconfirmed')
+
 # A pure expression for the existing callback Map.get observer. It neither
 # replaces invoke nor reads callback ids, arguments, exceptions or native state.
 PROJECTOR_JS = r'''((raw) => {
  const codes=__CODES__, bools=__BOOLS__, cores=__CORES__, markers=__MARKERS__;
+ const stages=__STAGES__, recoveries=__RECOVERIES__;
  const obj=v=>v!==null&&typeof v==='object'&&!Array.isArray(v);
  const own=(v,k)=>obj(v)&&Object.hasOwn(v,k);
  const b=v=>typeof v==='boolean'?v:null;
@@ -37,7 +44,9 @@ PROJECTOR_JS = r'''((raw) => {
  const s=action?d.status:status?d:null;
  const e=action?d.executionDiagnostic:null;
  const ePresent=action&&own(d,'executionDiagnostic')&&e!==null;
- const eValid=ePresent&&d.success===false&&obj(e)&&Object.keys(e).length===4&&
+ const f=own(e,'installerFailure')?e.installerFailure:undefined;
+ const fValid=f===undefined||(e.exitCode!==0&&obj(f)&&Object.keys(f).length===3&&f.schema==='polaris-helper-installer-failure-v1'&&stages.includes(f.stage)&&recoveries.includes(f.recovery));
+ const eValid=ePresent&&d.success===false&&obj(e)&&[4,5].includes(Object.keys(e).length)&&Object.keys(e).every(k=>['schema','exitCode','marker','scope','installerFailure'].includes(k))&&fValid&&
   e.schema==='polaris-helper-execution-diagnostic-v1'&&e.scope==='child-stderr-marker-not-verified-emitter'&&
   Number.isInteger(e.exitCode)&&e.exitCode>=-1&&e.exitCode<=255&&markers.includes(e.marker)&&
   (e.exitCode===127||e.marker==='unknown');
@@ -45,7 +54,7 @@ PROJECTOR_JS = r'''((raw) => {
   association:kind==='outerFailure'?'uncorrelated':'shape-only',
   envelopeSuccess:b(raw.success),actionSuccess:action?b(d.success):null,
   executionDiagnosticState:!action?'not-applicable':!ePresent?'absent':eValid?'valid':'malformed',
-  executionDiagnostic:eValid?{schema:e.schema,exitCode:e.exitCode,marker:e.marker,scope:e.scope}:null,
+  executionDiagnostic:eValid?{schema:e.schema,exitCode:e.exitCode,marker:e.marker,scope:e.scope,...(f?{installerFailure:{schema:f.schema,stage:f.stage,recovery:f.recovery}}:{})}:null,
   errorCode:!action?'not-applicable':!own(d,'errorCode')?'missing':d.errorCode===null?'none':codes.includes(d.errorCode)?d.errorCode:'unknown',
   statusShape:s===null?'not-applicable':bools.slice(0,3).every(k=>typeof s[k]==='boolean')?'valid':'malformed',
   status:Object.fromEntries(bools.map(k=>[k,s===null?null:b(s[k])])),
@@ -54,7 +63,7 @@ PROJECTOR_JS = r'''((raw) => {
   expectedProtocolVersion:s&&Number.isInteger(s.expectedProtocolVersion)&&s.expectedProtocolVersion>=0&&s.expectedProtocolVersion<=4294967295?s.expectedProtocolVersion:null,
   buildIdentityMatches:s&&typeof s.helperBuildId==='string'&&typeof s.expectedBuildId==='string'?s.helperBuildId===s.expectedBuildId:null};
  return out;
-})'''.replace('__CODES__', json.dumps(ERROR_CODES)).replace('__BOOLS__', json.dumps(STATUS_BOOLS)).replace('__CORES__', json.dumps(CORE_STATES)).replace('__MARKERS__', json.dumps(EXECUTION_MARKERS))
+})'''.replace('__CODES__', json.dumps(ERROR_CODES)).replace('__BOOLS__', json.dumps(STATUS_BOOLS)).replace('__CORES__', json.dumps(CORE_STATES)).replace('__MARKERS__', json.dumps(EXECUTION_MARKERS)).replace('__STAGES__', json.dumps(INSTALLER_STAGES)).replace('__RECOVERIES__', json.dumps(INSTALLER_RECOVERY))
 
 
 def validate_projection(value):
@@ -79,7 +88,12 @@ def validate_projection(value):
     need(state in (('absent', 'valid', 'malformed') if action else ('not-applicable',)))
     if state == 'valid':
         need(value['actionSuccess'] is False and type(execution) is dict and
-             set(execution) == {'schema', 'exitCode', 'marker', 'scope'})
+             set(execution) in ({'schema', 'exitCode', 'marker', 'scope'}, {'schema', 'exitCode', 'marker', 'scope', 'installerFailure'}))
+        if 'installerFailure' in execution:
+            f = execution['installerFailure']
+            need(type(f) is dict and set(f) == {'schema', 'stage', 'recovery'} and
+                 f['schema'] == 'polaris-helper-installer-failure-v1' and
+                 f['stage'] in INSTALLER_STAGES and f['recovery'] in INSTALLER_RECOVERY and execution['exitCode'] != 0)
         need(execution['schema'] == EXECUTION_SCHEMA and execution['scope'] == EXECUTION_SCOPE and
              type(execution['exitCode']) is int and -1 <= execution['exitCode'] <= 255 and
              execution['marker'] in EXECUTION_MARKERS and
@@ -101,4 +115,4 @@ def validate_projection(value):
         need(value['selectedCoreState'] == 'missing')
         need(all(value[k] is None for k in ('protocolVersion', 'expectedProtocolVersion', 'buildIdentityMatches')))
     return {**value, 'status': dict(value['status']),
-            'executionDiagnostic': dict(execution) if execution is not None else None}
+            'executionDiagnostic': json.loads(json.dumps(execution)) if execution is not None else None}

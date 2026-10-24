@@ -1,5 +1,18 @@
 #!/bin/sh
 set -eu
+
+POLARIS_DIAGNOSTICS=1
+INSTALL_STAGE=preparation
+diagnostic_failure() {
+  [ "$1" -ne 0 ] || return 0
+  case "$2" in
+    preparation|directories|staging|lease|journal|core-install|policy|service-snapshot|manager-identity|manager-property|pid1-cgroup|cgroup-mount|unit-config|service-stop|service-closure|registration|service-install|service-start|takeover|uninstall-remove|cleanup|rollback) STAGE=$2;;
+    *) STAGE=unknown;;
+  esac
+  case "$3" in not-started|cleanup-returned|rollback-returned|recovery-unconfirmed) RECOVERY=$3;; *) RECOVERY=recovery-unconfirmed;; esac
+  printf 'POLARIS_HELPER_FAILURE_V1:%s:%s\n' "$STAGE" "$RECOVERY" >&2
+}
+trap 'rc=$?; diagnostic_failure "$rc" "$INSTALL_STAGE" not-started || :; exit "$rc"' EXIT
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 umask 077
@@ -16,12 +29,26 @@ BOOT=$(/usr/bin/mktemp -d /tmp/polaris-helper-bootstrap.XXXXXXXX)
 BOOT_ID=$(/usr/bin/stat -Lc '%d:%i' "$BOOT") || exit 1
 [ -n "$BOOT_ID" ] || exit 1
 close_bootstrap() {
-  exec 8<&-
+  exec 8<&- || return 1
   if [ -d "$BOOT" ] && [ ! -L "$BOOT" ] && [ "$(/usr/bin/stat -Lc '%d:%i' "$BOOT")" = "$BOOT_ID" ]; then
-    /bin/rm -rf "$BOOT"
+    /bin/rm -rf "$BOOT" || return 1
   else echo HELPER_BOOTSTRAP_IDENTITY_CHANGED >&2; return 1; fi
 }
-trap close_bootstrap EXIT
+bootstrap_cleanup() {
+  rc=$?
+  trap - EXIT HUP INT TERM
+  FAILED_STAGE=${INSTALL_STAGE-preparation}
+  if [ "$rc" -eq 0 ]; then FAILED_STAGE=cleanup; fi
+  diagnostic_failure "$rc" "$FAILED_STAGE" recovery-unconfirmed || :
+  RECOVERY=cleanup-returned
+  if ! close_bootstrap; then
+    RECOVERY=recovery-unconfirmed
+    [ "$rc" -ne 0 ] || rc=1
+  fi
+  diagnostic_failure "$rc" "$FAILED_STAGE" "$RECOVERY" || :
+  exit "$rc"
+}
+trap bootstrap_cleanup EXIT
 /bin/chmod 0700 "$BOOT"
 [ "$(/usr/bin/stat -Lc '%d:%i' "$BOOT")" = "$BOOT_ID" ] || exit 1
 for OBJECT in "$BOOT"/* "$BOOT"/.[!.]* "$BOOT"/..?*; do
@@ -75,8 +102,16 @@ TXDIR=''
 TXDIR_ID=''
 FINAL_STATE=unchanged
 FINISHED=0
+cleanup_failure() {
+  FAILURE_RC=$?
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then diagnostic_failure "$FAILURE_RC" "$FAILED_STAGE" recovery-unconfirmed || :; fi
+  exit "$FAILURE_RC"
+}
 cleanup() {
   rc=$?
+  FAILED_STAGE=${INSTALL_STAGE-preparation}
+  if [ "$rc" -eq 0 ]; then FAILED_STAGE=cleanup; fi
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then diagnostic_failure "$rc" "$FAILED_STAGE" recovery-unconfirmed || :; fi
   trap - EXIT HUP INT TERM
   if [ "$FINISHED" -ne 1 ]; then
     # Only this invocation's positively unchanged Mac preflight is disposable.
@@ -100,17 +135,24 @@ cleanup() {
   fi
   # The parent directory and lease inode survive uninstall. Do not unlink,
   # rename or explicitly unlock it while this shell owns inherited fd 9.
-  exec 9>&-
-  close_bootstrap || rc=1
+  exec 9>&- || cleanup_failure
+  BOOTSTRAP_CLOSED=1
+  close_bootstrap || { rc=1; BOOTSTRAP_CLOSED=0; }
   if [ "$FINISHED" -eq 1 ] && [ "$rc" -eq 0 ]; then
     echo "polaris-helper-uninstall-state=$FINAL_STATE"
     if [ -n "$TXDIR" ]; then echo "polaris-helper-uninstall-journal=$TXDIR"; fi
     echo polaris-helper-uninstall-ok
   fi
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then
+    RECOVERY=recovery-unconfirmed
+    if [ "$FINISHED" -eq 1 ] && [ "$BOOTSTRAP_CLOSED" -eq 1 ]; then RECOVERY=cleanup-returned; fi
+    diagnostic_failure "$rc" "$FAILED_STAGE" "$RECOVERY" || :
+  fi
   exit "$rc"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+INSTALL_STAGE=lease
 admin lease-acquire --lock "$LOCK" --fd 9 || { echo HELPER_INSTALL_TRANSACTION_BUSY >&2; exit 75; }
 # Old receipts are evidence only. This operation neither resumes nor deletes
 # an interrupted install/uninstall, and never treats a prior stop as authority.
@@ -119,6 +161,7 @@ for OLD in "$SUPPORT"/helper-upgrade.*; do
   echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2
   exit 75
 done
+INSTALL_STAGE=journal
 TXDIR=$(mktemp -d "$SUPPORT/helper-admission.XXXXXXXX")
 chmod 0700 "$TXDIR"
 # Match the existing migration guard's journal and receipt binding exactly.
@@ -158,6 +201,7 @@ linux_service_property() {
   linux_systemd_property "$1" "$SERVICE"
 }
 linux_cgroup_view() {
+  INSTALL_STAGE=manager-identity
   # A cgroup2 filesystem can be a subtree/bind view. Anchor this view to the
   # system manager's namespaces, and require the mount's real hierarchy root.
   MANAGER_NAME=$(cat /proc/1/comm) || return 1
@@ -169,8 +213,21 @@ linux_cgroup_view() {
     MANAGER_NAMESPACE=$(readlink "/proc/1/ns/$NAMESPACE") || return 1
     [ -n "$OUR_NAMESPACE" ] && [ "$OUR_NAMESPACE" = "$MANAGER_NAMESPACE" ] || return 1
   done
+  INSTALL_STAGE=manager-property
   MANAGER_GROUP=$(linux_systemd_property ControlGroup) || return 1
-  [ "$MANAGER_GROUP" = / ] || return 1
+  # systemd stores the hierarchy root without its trailing slash, including
+  # the root itself. An explicit empty property is not a missing record.
+  case "$MANAGER_GROUP" in ''|/) ;; *) return 1;; esac
+  INSTALL_STAGE=pid1-cgroup
+  PID1_GROUP=$(cat /proc/1/cgroup) || return 1
+  case "$PID1_GROUP" in
+    '0::/') ;;
+    '0::/init.scope')
+      INIT_GROUP=$(linux_systemd_property ControlGroup init.scope) || return 1
+      [ "$INIT_GROUP" = /init.scope ] || return 1;;
+    *) return 1;;
+  esac
+  INSTALL_STAGE=cgroup-mount
   CGROOT=/sys/fs/cgroup
   [ -d "$CGROOT" ] && [ ! -L "$CGROOT" ] || return 1
   CGTYPE=$(stat -f -c %T "$CGROOT") || return 1
@@ -191,6 +248,7 @@ POLARIS_MOUNTINFO
 }
 linux_validate_service() {
   linux_cgroup_view || return 1
+  INSTALL_STAGE=unit-config
   LOAD=$(linux_service_property LoadState) || return 1
   case "$LOAD" in
     not-found) return 0;;
@@ -226,6 +284,7 @@ linux_service_closed() {
   # Recheck the effective configuration and hierarchy after the stop job. The
   # pre-stop snapshot cannot authorize removal if unit properties have changed.
   linux_validate_service || return 1
+  INSTALL_STAGE=service-closure
   STATE=$(linux_service_property ActiveState) || return 1
   PID=$(linux_service_property MainPID) || return 1
   case "$STATE:$PID" in inactive:0|failed:0) ;; *) return 1;; esac
@@ -266,6 +325,7 @@ POLARIS_CGROUP_EVENTS
 set_phase uninstall-stop-started
 FINAL_STATE=stop-unconfirmed
 linux_validate_service || { echo HELPER_UNINSTALL_SERVICE_STATE_UNKNOWN >&2; exit 1; }
+INSTALL_STAGE=service-stop
 if [ "$LOAD" = loaded ]; then systemctl --system disable --now "$SERVICE"; fi
 linux_service_closed || { echo HELPER_UNINSTALL_SERVICE_NOT_STOPPED >&2; exit 1; }
 set_phase uninstall-removal

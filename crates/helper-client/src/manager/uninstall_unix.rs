@@ -9,8 +9,16 @@ TXDIR=''
 TXDIR_ID=''
 FINAL_STATE=unchanged
 FINISHED=0
+cleanup_failure() {
+  FAILURE_RC=$?
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then diagnostic_failure "$FAILURE_RC" "$FAILED_STAGE" recovery-unconfirmed || :; fi
+  exit "$FAILURE_RC"
+}
 cleanup() {
   rc=$?
+  FAILED_STAGE=${INSTALL_STAGE-preparation}
+  if [ "$rc" -eq 0 ]; then FAILED_STAGE=cleanup; fi
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then diagnostic_failure "$rc" "$FAILED_STAGE" recovery-unconfirmed || :; fi
   trap - EXIT HUP INT TERM
   if [ "$FINISHED" -ne 1 ]; then
     # Only this invocation's positively unchanged Mac preflight is disposable.
@@ -34,17 +42,24 @@ cleanup() {
   fi
   # The parent directory and lease inode survive uninstall. Do not unlink,
   # rename or explicitly unlock it while this shell owns inherited fd 9.
-  exec 9>&-
-  close_bootstrap || rc=1
+  exec 9>&- || cleanup_failure
+  BOOTSTRAP_CLOSED=1
+  close_bootstrap || { rc=1; BOOTSTRAP_CLOSED=0; }
   if [ "$FINISHED" -eq 1 ] && [ "$rc" -eq 0 ]; then
     echo "polaris-helper-uninstall-state=$FINAL_STATE"
     if [ -n "$TXDIR" ]; then echo "polaris-helper-uninstall-journal=$TXDIR"; fi
     echo polaris-helper-uninstall-ok
   fi
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then
+    RECOVERY=recovery-unconfirmed
+    if [ "$FINISHED" -eq 1 ] && [ "$BOOTSTRAP_CLOSED" -eq 1 ]; then RECOVERY=cleanup-returned; fi
+    diagnostic_failure "$rc" "$FAILED_STAGE" "$RECOVERY" || :
+  fi
   exit "$rc"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+INSTALL_STAGE=lease
 admin lease-acquire --lock "$LOCK" --fd 9 || { echo HELPER_INSTALL_TRANSACTION_BUSY >&2; exit 75; }
 # Old receipts are evidence only. This operation neither resumes nor deletes
 # an interrupted install/uninstall, and never treats a prior stop as authority.
@@ -53,6 +68,7 @@ for OLD in "$SUPPORT"/helper-upgrade.*; do
   echo "HELPER_INSTALL_RECOVERY_REQUIRED $OLD" >&2
   exit 75
 done
+INSTALL_STAGE=journal
 TXDIR=$(mktemp -d "$SUPPORT/helper-admission.XXXXXXXX")
 chmod 0700 "$TXDIR"
 # Match the existing migration guard's journal and receipt binding exactly.
@@ -82,6 +98,7 @@ admin sync-install-path --path "$TXDIR/migration-preserve"
 admin sync-install-path --path "$TXDIR"
 # Capture names before stop; migration-stop binds the same actual objects and
 # rejects cross-device renames before it changes launchd state.
+INSTALL_STAGE=uninstall-remove
 for OBJECT in "$DEST" "$DESCRIPTOR" "$RECORD"; do
   if [ -L "$OBJECT" ] || { [ -e "$OBJECT" ] && [ ! -f "$OBJECT" ]; }; then
     echo HELPER_UNINSTALL_OBJECT_INVALID >&2; exit 1
@@ -130,6 +147,7 @@ const LINUX_REMOVAL: &str = r#"
 set_phase uninstall-stop-started
 FINAL_STATE=stop-unconfirmed
 linux_validate_service || { echo HELPER_UNINSTALL_SERVICE_STATE_UNKNOWN >&2; exit 1; }
+INSTALL_STAGE=service-stop
 if [ "$LOAD" = loaded ]; then systemctl --system disable --now "$SERVICE"; fi
 linux_service_closed || { echo HELPER_UNINSTALL_SERVICE_NOT_STOPPED >&2; exit 1; }
 set_phase uninstall-removal
@@ -159,7 +177,7 @@ fn maintenance_header(paths: &InstallPaths, utility: &MaintenanceUtility, mac: b
     format!(
         r#"#!/bin/sh
 set -eu
-PATH=/usr/bin:/bin:/usr/sbin:/sbin
+{diagnostics}PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 umask 077
 DEST={destination}
@@ -174,6 +192,11 @@ RECORD="$SUPPORT/helper-installed.json"
 secure_dir {descriptor_parent}
 secure_dir "$SUPPORT"
 {lease_open}{set_phase}{transaction}"#,
+        diagnostics = if mac {
+            ""
+        } else {
+            super::linux_service_stop::DIAGNOSTICS
+        },
         destination = shell_quote(&paths.binary.to_string_lossy()),
         descriptor = shell_quote(&descriptor.to_string_lossy()),
         support = shell_quote(if mac {

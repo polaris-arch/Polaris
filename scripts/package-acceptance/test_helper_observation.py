@@ -158,3 +158,26 @@ class ExecutionDiagnosticProjectionTests(unittest.TestCase):
         self.assertEqual(source.count('result.execution_diagnostic ='),2)
         command=(root/'src-tauri/src/commands/helper.rs').read_text()
         self.assertEqual(command.count('execution_diagnostic: None'),2)
+
+class InstallerStageProjectionTests(unittest.TestCase):
+    def raw(self):
+        value=action(code='installerFailed')
+        value['data']['executionDiagnostic']={'schema':h.EXECUTION_SCHEMA,'scope':h.EXECUTION_SCOPE,
+            'exitCode':1,'marker':'unknown','installerFailure':{'schema':'polaris-helper-installer-failure-v1',
+            'stage':'manager-property','recovery':'recovery-unconfirmed'}}
+        return value
+    def test_all_stages_fixed_and_detached(self):
+        for stage in h.INSTALLER_STAGES:
+            raw=self.raw();raw['data']['executionDiagnostic']['installerFailure']['stage']=stage
+            value=h.validate_projection(project(raw));copy_=h.validate_projection(value)
+            value['executionDiagnostic']['installerFailure']['stage']='SECRET'
+            self.assertEqual(copy_['executionDiagnostic']['installerFailure']['stage'],stage)
+    def test_malformed_unknown_and_success_do_not_leak(self):
+        for change in (lambda e:e.update(exitCode=0),lambda e:e.update(installerFailure=None),
+                       lambda e:e['installerFailure'].update(stage='SECRET'),lambda e:e['installerFailure'].update(secret='SECRET')):
+            raw=self.raw();change(raw['data']['executionDiagnostic'])
+            value=h.validate_projection(project(raw))
+            self.assertEqual(value['executionDiagnosticState'],'malformed')
+            self.assertNotIn('SECRET',json.dumps(value))
+        value=h.validate_projection(project({'success':False,'data':None,'error':'SECRET'}))
+        self.assertEqual(value['kind'],'outerFailure');self.assertNotIn('SECRET',json.dumps(value))

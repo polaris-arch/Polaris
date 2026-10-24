@@ -1515,3 +1515,30 @@ fn helper_execution_optional_field_does_not_change_legacy_action_json() {
     assert_eq!(value["errorCode"], "cancelled");
     assert_eq!(value["success"], false);
 }
+
+#[test]
+fn installer_failure_stage_is_bounded_non_authorizing_and_preserves_recovery_unknown() {
+    let early = "POLARIS_HELPER_FAILURE_V1:manager-property:recovery-unconfirmed";
+    let finished = format!("{early}\nPOLARIS_HELPER_FAILURE_V1:manager-property:rollback-returned");
+    for (text, expected) in [
+        (early, "recovery-unconfirmed"),
+        (finished.as_str(), "rollback-returned"),
+    ] {
+        let diagnostic = helper_execution_diagnostic(Platform::Linux, 1, text).unwrap();
+        assert_eq!(diagnostic.scope, "child-stderr-marker-not-verified-emitter");
+        let failure = diagnostic.installer_failure.unwrap();
+        assert_eq!(failure.stage, "manager-property");
+        assert_eq!(failure.recovery, expected);
+    }
+    for text in ["POLARIS_HELPER_FAILURE_V1:secret-path:cleanup-returned",
+        "POLARIS_HELPER_FAILURE_V1:manager-property:SECRET",
+        "POLARIS_HELPER_FAILURE_V1:manager-property:cleanup-returned:secret",
+        "POLARIS_HELPER_FAILURE_V1:lease:recovery-unconfirmed\nPOLARIS_HELPER_FAILURE_V1:manager-property:rollback-returned"] {
+        assert!(helper_installer_failure(text).is_none());
+    }
+    assert!(helper_installer_failure(&"x".repeat(16385)).is_none());
+    assert!(helper_execution_diagnostic(Platform::Linux, 0, early)
+        .unwrap()
+        .installer_failure
+        .is_none());
+}

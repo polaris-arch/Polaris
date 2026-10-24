@@ -2283,3 +2283,42 @@ class CandidateExtraBoundariesTests(unittest.TestCase):
         with self.assertRaises(OSError):self.scan(o,r)
         self.assertNotIn(m.birth(r[61]),o.rows)
         self.assertEqual(o.error,'ledger')
+
+
+class OwnedTerminalReconciliationTests(unittest.TestCase):
+    setup_observer = TransactionFenceTests.setup_observer
+    scan = TransactionFenceTests.scan
+    def test_only_durable_strong_owned_birth_can_be_terminal(self):
+        for known in (False,True):
+            c,o,r=self.setup_observer()
+            if known:self.scan(o,r)
+            c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError('unconfirmed'))
+            c.tun.terminal_identity.return_value={'pid':60,'startTime':r[60]['startTime'],'state':'absent','scope':'sampled-terminal-not-execution-identity'}
+            if known:
+                self.scan(o,r)
+                self.assertIn(m.birth(r[60]),o.terminals)
+                self.assertFalse(o.snapshot()['authorizationObserved'])
+                with self.assertRaises(ValueError):
+                    o.thread=Mock();o.thread.is_alive.return_value=False;o.finish()
+            else:
+                with self.assertRaises(ValueError):self.scan(o,r)
+                c.tun.terminal_identity.assert_not_called()
+    def test_owned_permission_or_live_reuse_is_never_reconciled(self):
+        for error in (vm_tun.TransactionIdentityError('identity-before',PermissionError(13,'hidden')),
+                      vm_tun.TransactionIdentityError('snapshot-consistency',ValueError('changed'))):
+            c,o,r=self.setup_observer();self.scan(o,r)
+            c.tun.transaction_identity.side_effect=error
+            with self.assertRaises(ValueError):self.scan(o,r)
+            c.tun.terminal_identity.assert_not_called()
+        c,o,r=self.setup_observer();self.scan(o,r)
+        c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError('gone'))
+        c.tun.terminal_identity.side_effect=ValueError('reused')
+        with self.assertRaises(ValueError):self.scan(o,r)
+        self.assertFalse(o.terminals)
+    def test_terminal_ledger_failure_remains_failure(self):
+        c,o,r=self.setup_observer();self.scan(o,r)
+        c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError('gone'))
+        c.tun.terminal_identity.return_value={'pid':60,'startTime':r[60]['startTime'],'state':'zombie','scope':'sampled-terminal-not-execution-identity'}
+        c.ledger.mutate=Mock(side_effect=OSError('disk'))
+        with self.assertRaises(OSError):self.scan(o,r)
+        self.assertFalse(o.terminals)

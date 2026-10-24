@@ -1,5 +1,18 @@
 #!/bin/sh
 set -eu
+
+POLARIS_DIAGNOSTICS=1
+INSTALL_STAGE=preparation
+diagnostic_failure() {
+  [ "$1" -ne 0 ] || return 0
+  case "$2" in
+    preparation|directories|staging|lease|journal|core-install|policy|service-snapshot|manager-identity|manager-property|pid1-cgroup|cgroup-mount|unit-config|service-stop|service-closure|registration|service-install|service-start|takeover|uninstall-remove|cleanup|rollback) STAGE=$2;;
+    *) STAGE=unknown;;
+  esac
+  case "$3" in not-started|cleanup-returned|rollback-returned|recovery-unconfirmed) RECOVERY=$3;; *) RECOVERY=recovery-unconfirmed;; esac
+  printf 'POLARIS_HELPER_FAILURE_V1:%s:%s\n' "$STAGE" "$RECOVERY" >&2
+}
+trap 'rc=$?; diagnostic_failure "$rc" "$INSTALL_STAGE" not-started || :; exit "$rc"' EXIT
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 umask 077
@@ -33,6 +46,7 @@ secure_dir() {
   [ "$((0$MODE & 022))" -eq 0 ] || { echo HELPER_INSTALL_DIRECTORY_WRITABLE >&2; exit 1; }
 }
 
+INSTALL_STAGE=directories
 secure_dir '/usr/local/lib/polaris'
 secure_dir "$SUPPORT"
 secure_dir "$COREDIR"
@@ -55,19 +69,30 @@ WAS_ACTIVE=0
 REQUIRE_CLOSURE=1
 WAS_ENABLED=0
 RECORD="$SUPPORT/helper-installed.json"
+cleanup_failure() {
+  FAILURE_RC=$?
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then diagnostic_failure "$FAILURE_RC" "$FAILED_STAGE" recovery-unconfirmed || :; fi
+  exit "$FAILURE_RC"
+}
 cleanup() {
   rc=$?
+  FAILED_STAGE=${INSTALL_STAGE-preparation}
+  if [ "$rc" -eq 0 ]; then FAILED_STAGE=cleanup; fi
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then diagnostic_failure "$rc" "$FAILED_STAGE" recovery-unconfirmed || :; fi
+  RECOVERY=cleanup-returned
   trap - EXIT HUP INT TERM
-  if [ "$ADMITTED" -eq 1 ]; then admin cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || { touch "$TXDIR/recovery-required"; rc=1; }; fi
+  if [ "$ADMITTED" -eq 1 ]; then admin cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || { touch "$TXDIR/recovery-required"; rc=1; RECOVERY=recovery-unconfirmed; }; fi
   # Cleanup is part of the lease transaction. Closing fd 9 releases the kernel
   # lease only after the journal has disappeared; the helper lives in TXDIR.
-  if [ -n "$TXDIR" ] && [ ! -e "$TXDIR/recovery-required" ]; then rm -rf "$TXDIR"; fi
-  exec 9>&-
-  if [ -n "$BOOT" ]; then close_bootstrap || rc=1; fi
+  if [ -n "$TXDIR" ] && [ ! -e "$TXDIR/recovery-required" ]; then rm -rf "$TXDIR" || cleanup_failure; fi
+  exec 9>&- || cleanup_failure
+  if [ -n "$BOOT" ]; then close_bootstrap || { rc=1; RECOVERY=recovery-unconfirmed; }; fi
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then diagnostic_failure "$rc" "$FAILED_STAGE" "$RECOVERY" || :; fi
   exit "$rc"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+INSTALL_STAGE=staging
 TXDIR=$(mktemp -d "$SUPPORT/helper-admission.XXXXXX")
 chmod 0700 "$TXDIR"
 cp '/tmp/producer fixture/用户'\''s stage/polaris-helper' "$TXDIR/helper"
@@ -78,8 +103,10 @@ hash_file() { sha256sum "$1" | awk '{print $1}'; }
 owner_mode() { stat -c '%u:%a' "$1"; }
 [ "$(hash_file "$TXDIR/helper")" = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ] || { echo HELPER_BUNDLE_MISMATCH >&2; exit 1; }
 [ "$(hash_file "$TXDIR/core-manifest.json")" = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ] || { echo CORE_BUNDLE_MISMATCH >&2; exit 1; }
+INSTALL_STAGE=lease
 admin lease-acquire --lock "$LOCK" --fd 9 || { echo HELPER_INSTALL_TRANSACTION_BUSY >&2; exit 75; }
 LEASED=1
+INSTALL_STAGE=journal
 # Admission bytes live outside the recovery namespace until the lease is held.
 # Publish the initialized journal by same-directory rename, never mkdir there.
 printf '%s\n' polaris-helper-upgrade-v1 > "$TXDIR/transaction-kind"
@@ -149,6 +176,7 @@ if [ "$MIGRATION" -eq 1 ]; then
 fi
 printf '%s' 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' > "$TXDIR/user-token"
 chmod 0600 "$TXDIR/user-token"
+INSTALL_STAGE=core-install
 admin core-install --root "$COREDIR" --source '/tmp/producer fixture/用户'\''s stage' --manifest "$TXDIR/core-manifest.json" --source-owner 'u1001'
 snapshot_registration() {
   admin snapshot-user --support "$SUPPORT" --identity 'u1001' --backup "$TXDIR/registration.rollback"
@@ -156,6 +184,7 @@ snapshot_registration() {
 register_user() {
   set_phase registration
   REGISTRATION_CHANGED=1
+  INSTALL_STAGE=registration
   admin register-user --support "$SUPPORT" --identity 'u1001' --confdir '/tmp/producer fixture/用户'\''s config' --token-file "$TXDIR/user-token"
 }
 restore_registration() {
@@ -164,6 +193,7 @@ restore_registration() {
     REGISTRATION_CHANGED=0
   fi
 }
+INSTALL_STAGE=policy
 AUTHFILE='/var/lib/polaris/authorized-uids'
 HAD_AUTH=0
 AUTH_SNAPSHOTTED=0
@@ -213,6 +243,9 @@ done
 admin sync-install-path --path "$TXDIR"
 rollback() {
   rc=$?
+  FAILED_STAGE=${INSTALL_STAGE-preparation}
+  if [ "$rc" -eq 0 ]; then FAILED_STAGE=cleanup; fi
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then diagnostic_failure "$rc" "$FAILED_STAGE" recovery-unconfirmed || :; fi
   trap - EXIT HUP INT TERM
   OK=1
   if [ "$MUTATED" -eq 1 ]; then
@@ -221,8 +254,8 @@ rollback() {
       # native connections. Preserve all recovery material for a later action.
       touch "$TXDIR/recovery-required"
       echo HELPER_ROLLBACK_STOP_UNCONFIRMED >&2
-      exec 9>&-
-      if [ -n "$BOOT" ]; then close_bootstrap || rc=1; fi
+      exec 9>&- || cleanup_failure
+      if [ -n "$BOOT" ]; then close_bootstrap || { rc=1; OK=0; }; fi
       exit 1
     fi
     if [ "$KEEP_HELPER" -eq 0 ]; then
@@ -247,9 +280,14 @@ rollback() {
   restore_authorization || OK=0
   restore_registration || OK=0
   rm -f "$DEST.new.$$" "$DESCRIPTOR.new.$$" "$RECORD.new.$$"
-  if [ "$OK" -eq 1 ]; then rm -rf "$TXDIR"; else touch "$TXDIR/recovery-required"; echo "helper rollback incomplete; recovery transaction retained: $TXDIR" >&2; fi
-  exec 9>&-
-  if [ -n "$BOOT" ]; then close_bootstrap || rc=1; fi
+  if [ "$OK" -eq 1 ]; then rm -rf "$TXDIR" || cleanup_failure; else touch "$TXDIR/recovery-required"; echo "helper rollback incomplete; recovery transaction retained: $TXDIR" >&2; fi
+  exec 9>&- || cleanup_failure
+  if [ -n "$BOOT" ]; then close_bootstrap || { rc=1; OK=0; }; fi
+  if [ "${POLARIS_DIAGNOSTICS-0}" = 1 ]; then
+    RECOVERY=recovery-unconfirmed
+    if [ "$OK" -eq 1 ]; then RECOVERY=rollback-returned; fi
+    diagnostic_failure "$rc" "$FAILED_STAGE" "$RECOVERY" || :
+  fi
   exit "$rc"
 }
 
@@ -270,6 +308,7 @@ linux_service_property() {
   linux_systemd_property "$1" "$SERVICE"
 }
 linux_cgroup_view() {
+  INSTALL_STAGE=manager-identity
   # A cgroup2 filesystem can be a subtree/bind view. Anchor this view to the
   # system manager's namespaces, and require the mount's real hierarchy root.
   MANAGER_NAME=$(cat /proc/1/comm) || return 1
@@ -281,8 +320,21 @@ linux_cgroup_view() {
     MANAGER_NAMESPACE=$(readlink "/proc/1/ns/$NAMESPACE") || return 1
     [ -n "$OUR_NAMESPACE" ] && [ "$OUR_NAMESPACE" = "$MANAGER_NAMESPACE" ] || return 1
   done
+  INSTALL_STAGE=manager-property
   MANAGER_GROUP=$(linux_systemd_property ControlGroup) || return 1
-  [ "$MANAGER_GROUP" = / ] || return 1
+  # systemd stores the hierarchy root without its trailing slash, including
+  # the root itself. An explicit empty property is not a missing record.
+  case "$MANAGER_GROUP" in ''|/) ;; *) return 1;; esac
+  INSTALL_STAGE=pid1-cgroup
+  PID1_GROUP=$(cat /proc/1/cgroup) || return 1
+  case "$PID1_GROUP" in
+    '0::/') ;;
+    '0::/init.scope')
+      INIT_GROUP=$(linux_systemd_property ControlGroup init.scope) || return 1
+      [ "$INIT_GROUP" = /init.scope ] || return 1;;
+    *) return 1;;
+  esac
+  INSTALL_STAGE=cgroup-mount
   CGROOT=/sys/fs/cgroup
   [ -d "$CGROOT" ] && [ ! -L "$CGROOT" ] || return 1
   CGTYPE=$(stat -f -c %T "$CGROOT") || return 1
@@ -303,6 +355,7 @@ POLARIS_MOUNTINFO
 }
 linux_validate_service() {
   linux_cgroup_view || return 1
+  INSTALL_STAGE=unit-config
   LOAD=$(linux_service_property LoadState) || return 1
   case "$LOAD" in
     not-found) return 0;;
@@ -338,6 +391,7 @@ linux_service_closed() {
   # Recheck the effective configuration and hierarchy after the stop job. The
   # pre-stop snapshot cannot authorize removal if unit properties have changed.
   linux_validate_service || return 1
+  INSTALL_STAGE=service-closure
   STATE=$(linux_service_property ActiveState) || return 1
   PID=$(linux_service_property MainPID) || return 1
   case "$STATE:$PID" in inactive:0|failed:0) ;; *) return 1;; esac
@@ -376,15 +430,19 @@ POLARIS_CGROUP_EVENTS
 }
 stop_service() {
   linux_validate_service || return 1
+  INSTALL_STAGE=service-stop
   if [ "$LOAD" = loaded ]; then systemctl --system stop "$SERVICE" || return 1; fi
   linux_service_closed
 }
 restore_service() {
+  linux_cgroup_view || return 1
   systemctl daemon-reload || return 1
+  linux_validate_service || return 1
   if [ "$WAS_ENABLED" -eq 1 ]; then systemctl enable "$SERVICE" || return 1;
   elif [ "$HAD_DESCRIPTOR" -eq 1 ]; then systemctl disable "$SERVICE" || return 1; fi
   if [ "$WAS_ACTIVE" -eq 1 ]; then systemctl restart "$SERVICE" || return 1; fi
 }
+INSTALL_STAGE=service-snapshot
 INITIAL_STATE=$(linux_service_property ActiveState) || { echo HELPER_SERVICE_STATE_UNKNOWN >&2; exit 1; }
 case "$INITIAL_STATE" in
   active) WAS_ACTIVE=1;;
@@ -440,9 +498,11 @@ install -o root -g "$GROUP" -m 0644 "$TXDIR/descriptor" "$DESCRIPTOR.new.$$"
 mv -f "$DESCRIPTOR.new.$$" "$DESCRIPTOR"
 if [ "$KEEP_HELPER" -eq 0 ]; then admin helper-record --binary "$DEST" --metadata "$RECORD"; fi
 merge_authorization
+INSTALL_STAGE=service-start
 systemctl daemon-reload
 systemctl enable "$SERVICE"
 systemctl restart "$SERVICE"
+INSTALL_STAGE=takeover
 TAKEOVER_OK=0
 WAIT=50
 while [ "$WAIT" -gt 0 ]; do

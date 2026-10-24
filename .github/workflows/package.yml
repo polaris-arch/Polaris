@@ -1149,6 +1149,11 @@ jobs:
           grep -F "test $test_name ... ok" "$RUNNER_TEMP/config-auto-authority-test.log"
           grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/config-auto-authority-test.log"
 
+          test_name=runtime::helper::tests::installer_failure_stage_is_bounded_non_authorizing_and_preserves_recovery_unknown
+          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/helper-installer-diagnostic-test.log"
+          grep -F "test $test_name ... ok" "$RUNNER_TEMP/helper-installer-diagnostic-test.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/helper-installer-diagnostic-test.log"
+
       - name: Build and stage privileged helper
         shell: bash
         run: |

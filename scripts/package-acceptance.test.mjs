@@ -359,8 +359,10 @@ test('read-only auth preflight is one existing setup job and default DAG is byte
   // N13 adds one Linux-only pure producer test before helper build.
   const producerStep = workflow.match(/      - name: Verify real Linux helper script producer fixtures\n[\s\S]*?(?=      - name: Build and stage privileged helper\n)/)?.[0];
   const authorityTest = "          test_name=commands::config::tests::backend_authoritative_tests::ordinary_save_mirrors_auto_authority_and_returns_actual_saved_config\n          cargo test --locked -p polaris --lib \"$test_name\" -- --exact | tee \"$RUNNER_TEMP/config-auto-authority-test.log\"\n          grep -F \"test $test_name ... ok\" \"$RUNNER_TEMP/config-auto-authority-test.log\"\n          grep -F 'test result: ok. 1 passed;' \"$RUNNER_TEMP/config-auto-authority-test.log\"\n";
+  const diagnosticTest = "          test_name=runtime::helper::tests::installer_failure_stage_is_bounded_non_authorizing_and_preserves_recovery_unknown\n          cargo test --locked -p polaris --lib \"$test_name\" -- --exact | tee \"$RUNNER_TEMP/helper-installer-diagnostic-test.log\"\n          grep -F \"test $test_name ... ok\" \"$RUNNER_TEMP/helper-installer-diagnostic-test.log\"\n          grep -F 'test result: ok. 1 passed;' \"$RUNNER_TEMP/helper-installer-diagnostic-test.log\"\n\n";
+  assert.equal(workflow.split(diagnosticTest).length, 2);
   assert.equal(workflow.split(authorityTest).length, 2);
-  assert.equal(sha256((producerStep ?? '').replace(authorityTest, '')), '054d8f2d6eaa79f6bfda33c4dbaa90975b36231ef4fe4dced454239ecc960d0f');
+  assert.equal(sha256((producerStep ?? '').replace(authorityTest, '').replace(diagnosticTest, '')), '054d8f2d6eaa79f6bfda33c4dbaa90975b36231ef4fe4dced454239ecc960d0f');
   assert.equal(workflow.split('      - name: Verify real Linux helper script producer fixtures\n').length, 2);
   assert.ok(workflow.indexOf('      - name: Install Rust stable (preinstalled rustup)') < workflow.indexOf(producerStep));
   let projected = workflow.replace(producerStep, '')

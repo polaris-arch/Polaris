@@ -459,11 +459,13 @@ class VMObservationTests(unittest.TestCase):
         def text(path, *args, **kwargs):
             value = str(path)
             if value == '/proc/1/comm': hit('pid1'); return 'systemd\n'
+            if value == '/proc/1/cgroup': return '0::/init.scope\n'
             if value == '/proc/self/mountinfo':
                 hit('cgroup-mount'); return '1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n'
             if value == '/proc/self/status': hit('privileges'); return 'NoNewPrivs: 0\n'
             hit('forwarding'); return '0'
         def stat_(path, *args, **kwargs):
+            if str(path) == '/proc/1': return SimpleNamespace(st_uid=0)
             if '/ns/' in str(path): hit('namespaces'); return SimpleNamespace(st_ino=1)
             hit('tun-device'); return SimpleNamespace(st_mode=0o020600, st_rdev=os.makedev(10,200))
         def paths(path, *args, **kwargs): hit('product-paths'); return False
@@ -477,7 +479,9 @@ class VMObservationTests(unittest.TestCase):
             return {'route4': [], 'route6': [], 'forwarding': [0,0]}
         def tables(*args): hit('route-tables'); return []
         ops = Mock()
-        def manager(*args): hit('manager'); return 'ControlGroup=\n'
+        def manager(*args):
+            if args[0][-1] == 'init.scope': return 'ControlGroup=/init.scope\n'
+            hit('manager'); return 'ControlGroup=\n'
         ops.run.side_effect = manager
         with ExitStack() as stack:
             for target, kwargs in ((('read_text'), {'autospec':True,'side_effect':text}),
@@ -689,3 +693,44 @@ class TransactionDiagnosticTests(unittest.TestCase):
     def test_executable_growth_has_read_stage(self):
         with self.assertRaises(tun.TransactionIdentityError) as caught:self.observe(grow=True)
         self.assertEqual(caught.exception.phase,'executable-read')
+
+
+class OwnedTerminalTests(unittest.TestCase):
+    child = TransactionRealProcTests.child
+    close_child = staticmethod(TransactionRealProcTests.close_child)
+    def test_owned_exit_and_zombie_use_whole_directory_or_stable_stat(self):
+        import time
+        process=self.child('sys.exit(0)');old=tun.transaction_identity(process.pid)['identity']
+        process.stdin.write(b'x');process.stdin.flush()
+        end=time.monotonic()+3
+        while Path('/proc',str(process.pid),'stat').read_text().split(') ',1)[1][0]!='Z':
+            self.assertLess(time.monotonic(),end);time.sleep(.001)
+        self.assertEqual(tun.terminal_identity(old)['state'],'zombie')
+        process.wait(timeout=3)
+        self.assertEqual(tun.terminal_identity(old)['state'],'absent')
+    def test_reuse_permission_partial_file_disappearance_and_reparent_rejected(self):
+        old=identity();fields=['Z',str(old['ppid'])]+['0']*17+[old['startTime']]
+        raw=f"{old['pid']} (fixture) "+' '.join(fields)
+        for fault in ('permission','partial','reuse','reparent','changed'):
+            bad=list(fields)
+            if fault=='reuse':bad[19]='9999'
+            if fault=='reparent':bad[1]='9999'
+            text=f"{old['pid']} (fixture) "+' '.join(bad)
+            with patch.object(Path,'lstat',side_effect=PermissionError(13,'hidden') if fault=='permission' else [Mock(),Mock()]), \
+                 patch.object(Path,'read_text',side_effect=FileNotFoundError(2,'stat') if fault=='partial' else [raw,text] if fault=='changed' else [text,text]):
+                if fault=='changed':
+                    # First directory absent then present is not stable absence.
+                    with patch.object(Path,'lstat',side_effect=[FileNotFoundError(2,'directory'),Mock()]):
+                        with self.assertRaises(ValueError):tun.terminal_identity(old)
+                else:
+                    with self.assertRaises((ValueError,OSError)):tun.terminal_identity(old)
+    def test_pid1_root_cgroup_exact_semantics(self):
+        for raw,reply,expected in [('0::/\n',None,True),('0::/init.scope\n','ControlGroup=/init.scope\n',True),
+                ('0::/nested/init.scope\n',None,False),('0::/init.scope\n','',False),
+                ('0::/init.scope\n','ControlGroup=\n',False),('0::/init.scope\n','ControlGroup=/other\n',False),
+                ('0::/init.scope\n0::/\n',None,False)]:
+            with patch.object(Path,'read_text',return_value=raw):
+                ops=Mock(run=Mock(return_value=reply))
+                if expected:self.assertTrue(tun.pid1_root_cgroup(ops))
+                else:
+                    with self.assertRaises(ValueError):tun.pid1_root_cgroup(ops)

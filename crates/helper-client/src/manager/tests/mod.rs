@@ -2118,6 +2118,15 @@ fn retained_windows_helper_requires_framing_before_service_or_registration_chang
 /// synthetic values only. Never execute these administrator script bytes.
 #[test]
 fn linux_script_producer_matches_package_acceptance_fixtures() {
+    // Existing Package exact-test entry also executes the shared service proof
+    // with inert command fixtures, never the generated administrator payload.
+    #[cfg(target_os = "linux")]
+    {
+        linux_uninstall::linux_uninstall_requires_effective_unit_and_hierarchical_closure();
+        linux_uninstall::linux_install_inactive_snapshot_still_requires_production_closure();
+        linux_uninstall::linux_cleanup_failure_markers_do_not_change_success_or_recovery();
+        linux_uninstall::linux_maintenance_traps_keep_success_silent_and_cleanup_unknown();
+    }
     let paths = InstallPaths::linux();
     let stage = PathBuf::from("/tmp/producer fixture/用户's stage");
     let mut params = install_params(

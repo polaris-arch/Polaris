@@ -299,6 +299,75 @@ pub struct HelperExecutionDiagnostic {
     pub exit_code: i32,
     pub marker: HelperExecutionMarker,
     pub scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installer_failure: Option<HelperInstallerFailure>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HelperInstallerFailure {
+    pub schema: &'static str,
+    pub stage: &'static str,
+    pub recovery: &'static str,
+}
+
+fn helper_installer_failure(stderr: &str) -> Option<HelperInstallerFailure> {
+    if stderr.len() > 16 * 1024 {
+        return None;
+    }
+    let mut result: Option<HelperInstallerFailure> = None;
+    for line in stderr.lines() {
+        let Some(value) = line.strip_prefix("POLARIS_HELPER_FAILURE_V1:") else {
+            continue;
+        };
+        let Some((stage, recovery)) = value.split_once(':') else {
+            return None;
+        };
+        let stage = match stage {
+            "preparation" => "preparation",
+            "directories" => "directories",
+            "staging" => "staging",
+            "lease" => "lease",
+            "journal" => "journal",
+            "core-install" => "core-install",
+            "policy" => "policy",
+            "service-snapshot" => "service-snapshot",
+            "manager-identity" => "manager-identity",
+            "manager-property" => "manager-property",
+            "pid1-cgroup" => "pid1-cgroup",
+            "cgroup-mount" => "cgroup-mount",
+            "unit-config" => "unit-config",
+            "service-stop" => "service-stop",
+            "service-closure" => "service-closure",
+            "registration" => "registration",
+            "service-install" => "service-install",
+            "service-start" => "service-start",
+            "takeover" => "takeover",
+            "uninstall-remove" => "uninstall-remove",
+            "cleanup" => "cleanup",
+            "rollback" => "rollback",
+            "unknown" => "unknown",
+            _ => return None,
+        };
+        let recovery = match recovery {
+            "not-started" => "not-started",
+            "cleanup-returned" => "cleanup-returned",
+            "rollback-returned" => "rollback-returned",
+            "recovery-unconfirmed" => "recovery-unconfirmed",
+            _ => return None,
+        };
+        if let Some(prior) = &result {
+            if prior.stage != stage || prior.recovery != "recovery-unconfirmed" {
+                return None;
+            }
+        }
+        result = Some(HelperInstallerFailure {
+            schema: "polaris-helper-installer-failure-v1",
+            stage,
+            recovery,
+        });
+    }
+    result
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
@@ -358,6 +427,11 @@ fn helper_execution_diagnostic(
         exit_code: code,
         marker,
         scope: "child-stderr-marker-not-verified-emitter",
+        installer_failure: if code != 0 {
+            helper_installer_failure(stderr)
+        } else {
+            None
+        },
     })
 }
 

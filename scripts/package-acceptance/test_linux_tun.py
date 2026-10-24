@@ -1349,6 +1349,36 @@ class AuthenticationAndExecutionConsumerTests(unittest.TestCase):
         self.assertEqual(run.result['firstBusinessFailure']['projection']['executionDiagnostic']['exitCode'],127)
         self.assertFalse(run.result['helperCallback']['success'])
         self.assertNotIn('transaction_end',[c.args[0] for c in run.controller.call.call_args_list])
+    def test_actual_installer_projector_to_consumer_preserves_safe_failure_only(self):
+        failure={'schema':'polaris-helper-installer-failure-v1','stage':'manager-property','recovery':'recovery-unconfirmed'}
+        diagnostic={'schema':M.helper_observation.EXECUTION_SCHEMA,'exitCode':1,'marker':'unknown',
+                    'scope':M.helper_observation.EXECUTION_SCOPE,'installerFailure':failure}
+        raw={'success':True,'data':{'success':False,'errorCode':'installerFailed','message':'PRIVATE',
+             'status':{'supported':True,'installed':False,'ready':False},'executionDiagnostic':diagnostic}}
+        for fault in (None,'stage','extra','null','exit-zero'):
+            payload=copy.deepcopy(raw)
+            if fault=='stage':payload['data']['executionDiagnostic']['installerFailure']['stage']='PRIVATE'
+            elif fault=='extra':payload['data']['executionDiagnostic']['installerFailure']['raw']='PRIVATE'
+            elif fault=='null':payload['data']['executionDiagnostic']['installerFailure']=None
+            elif fault=='exit-zero':payload['data']['executionDiagnostic']['exitCode']=0
+            script='const project='+M.helper_observation.PROJECTOR_JS+';console.log(JSON.stringify(project('+json.dumps(payload)+')));'
+            projection=json.loads(subprocess.check_output(['node','-e',script],text=True))
+            row=helper_row(False,'installerFailed');row['projection']=projection
+            run=HelperObservationConsumerTests().run_fixture(row)
+            with self.assertRaises(ValueError):run.helper_action('install')
+            observed=run.result['firstBusinessFailure']['projection']
+            self.assertNotIn('PRIVATE',json.dumps(run.result))
+            self.assertNotIn('transaction_end',[c.args[0] for c in run.controller.call.call_args_list])
+            if fault is None:
+                self.assertEqual(observed['executionDiagnostic']['installerFailure'],failure)
+                self.assertEqual(observed['association'],'shape-only')
+                self.assertFalse(run.result['helperCallback']['success'])
+                projection['executionDiagnostic']['installerFailure']['stage']='PRIVATE'
+                self.assertEqual(observed['executionDiagnostic']['installerFailure'],failure)
+            else:
+                self.assertEqual(observed['executionDiagnosticState'],'malformed')
+                self.assertIsNone(observed['executionDiagnostic'])
+
     def test_contradictory_success_with_execution_diagnostic_is_not_success(self):
         row=helper_row();row['projection']['executionDiagnosticState']='malformed'
         run=HelperObservationConsumerTests().run_fixture(row)

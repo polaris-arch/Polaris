@@ -2156,50 +2156,103 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
             json.dumps(servers,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
 
     def auto_runtime(self, wanted):
-        gui_require(wanted is True, 'auto-runtime-value-invalid')
+        observation={'schema':'polaris-auto-runtime-observation-v1','phase':'begin','state':'checking','checks':{}}
+        self.result['autoRuntimeObservation']=observation
+        try:
+            return self._auto_runtime(wanted,observation)
+        except Exception:
+            observation['state']='failed'
+            raise
+
+    def _auto_runtime(self, wanted, observation):
+        def check(phase, ok, code, facts=None):
+            observation.update(phase=phase,state='observed' if ok else 'failed')
+            observation['checks'][phase]={'passed':bool(ok),**(facts or {})}
+            gui_require(ok,code)
+        check('requested-mode',wanted is True,'auto-runtime-value-invalid')
+        observation.update(phase='runtime-capture',state='checking')
         endpoint, proof, graph = self.observed_api_endpoint()
-        gui_require(endpoint==self.api_endpoint, 'auto-runtime-endpoint-changed')
-        outbounds=graph.get('outbounds',[])
-        def one(tag,kind):
+        check('endpoint',endpoint==self.api_endpoint,'auto-runtime-endpoint-changed')
+        outbounds=graph.get('outbounds')
+        check('outbound-schema',type(outbounds) is list and all(type(o) is dict for o in outbounds), 'auto-runtime-outbound-schema-invalid')
+        def one(tag,kind,role):
             rows=[o for o in outbounds if o.get('tag')==tag]
-            gui_require(len(rows)==1 and rows[0].get('type')==kind,'auto-runtime-group-invalid')
+            check(role,len(rows)==1 and rows[0].get('type')==kind,'auto-runtime-'+role+'-invalid',{'count':len(rows)})
             return rows[0]
-        selector=one('proxy-selector','selector')
-        wrapper=one('polaris-auto-global','selector')
-        native=one('polaris-auto-global-test','urltest')
-        gui_require(selector.get('default')=='polaris-auto-global' and
-                    'polaris-auto-global' in selector.get('outbounds',[]) and
-                    'polaris-auto-global-test' in wrapper.get('outbounds',[]) and
-                    wrapper.get('default')=='polaris-auto-global-test', 'auto-runtime-reference-invalid')
-        for group in (selector,wrapper,native):
+        selector=one('proxy-selector','selector','main-selector')
+        wrapper=one('polaris-auto-global','selector','auto-wrapper')
+        native=one('polaris-auto-global-test','urltest','native-urltest')
+        for role,group in (('main-selector',selector),('auto-wrapper',wrapper),('native-urltest',native)):
+            members=group.get('outbounds')
+            check(role+'-members-schema',type(members) is list and all(type(t) is str and 0<len(t)<=512 for t in members)
+                  and len(members)==len(set(members)), 'auto-runtime-'+role+'-members-schema-invalid')
+        check('references',selector.get('default')=='polaris-auto-global' and
+              'polaris-auto-global' in selector['outbounds'] and
+              'polaris-auto-global-test' in wrapper['outbounds'] and
+              wrapper.get('default')=='polaris-auto-global-test','auto-runtime-reference-invalid')
+        for role,group in (('main-selector',selector),('auto-wrapper',wrapper),('native-urltest',native)):
             value=group.get('interrupt_exist_connections',False)
-            gui_require(type(value) is bool and value is False,'auto-runtime-interrupt-invalid')
-        config=self.config(); tags=[]
-        for node in config.get('servers',[]):
+            check(role+'-interrupt',type(value) is bool and value is False,'auto-runtime-interrupt-invalid',
+                  {'encoding':'omitted-false' if 'interrupt_exist_connections' not in group else 'explicit-boolean' if type(value) is bool else 'invalid'})
+        observation.update(phase='saved-config-read',state='checking')
+        config=self.config(); servers=config.get('servers');tags=[]
+        check('fixture-members',type(servers) is list and len(servers)==2 and all(type(n) is dict for n in servers)
+              and {n.get('id') for n in servers}=={'node-a','node-b'},'auto-runtime-fixture-members-invalid')
+        for node in servers:
             matches=[o for o in outbounds if o.get('type')=='socks' and
-                     o.get('server')==node.get('address') and o.get('server_port')==node.get('port')]
-            gui_require(len(matches)==1,'auto-runtime-member-invalid');tags.append(matches[0]['tag'])
-        gui_require(len(tags)==2 and len(set(tags))==2 and set(native.get('outbounds',[]))==set(tags)
-                    and native.get('interval')=='5m' and native.get('url')==self.network.health_url,
-                    'auto-runtime-members-differ')
+                     o.get('server')==node.get('address') and type(o.get('server_port')) is int and
+                     type(node.get('port')) is int and o['server_port']==node['port']]
+            check('physical-'+node['id'][-1],len(matches)==1 and type(matches[0].get('tag')) is str
+                  and 0<len(matches[0]['tag'])<=512,'auto-runtime-member-invalid',{'count':len(matches)})
+            tags.append(matches[0]['tag'])
+        digest=lambda values:hashlib.sha256(json.dumps(sorted(values),separators=(',',':')).encode()).hexdigest()
+        members=native['outbounds']
+        check('member-set',len(set(tags))==2 and set(members)==set(tags),'auto-runtime-member-set-differs',
+              {'physicalCount':len(tags),'nativeCount':len(members),'physicalSha256':digest(tags),'nativeSha256':digest(members)})
+        expected_wrapper=set(tags)|{'polaris-auto-global-test'}
+        check('wrapper-member-set',set(wrapper['outbounds'])==expected_wrapper,'auto-runtime-wrapper-member-set-differs',
+              {'expectedCount':len(expected_wrapper),'actualCount':len(wrapper['outbounds']),
+               'expectedSha256':digest(expected_wrapper),'actualSha256':digest(wrapper['outbounds'])})
+        interval=native.get('interval')
+        # The fixed Rust producer emits 5m. The fixed Go badoption.Duration
+        # MarshalJSON uses time.Duration.String and emits 5m0s. Both are exactly
+        # 300 seconds; no tolerance, arbitrary parser, missing/default, or new cadence.
+        duration_kind='rust-5m' if type(interval) is str and interval=='5m' else 'go-5m0s' if type(interval) is str and interval=='5m0s' else 'invalid'
+        check('interval',duration_kind!='invalid','auto-runtime-interval-differs',
+              {'encoding':duration_kind,'seconds':300 if duration_kind!='invalid' else None})
+        url=native.get('url')
+        check('health-url',type(url) is str and url==self.network.health_url,'auto-runtime-health-url-differs',
+              {'matchesFixture':type(url) is str and url==self.network.health_url})
+        observation.update(phase='status-read',state='checking')
         status=self.status()
+        observation.update(phase='native-confirmation',state='checking')
         def observed():
             value=self.driver.invoke('auto_select_status')
-            gui_require(type(value) is dict,'auto-status-schema-invalid')
-            groups=value.get('nativeAutoGroups')
-            gui_require(type(groups) is list,'auto-status-schema-invalid')
-            matches=[g for g in groups if g.get('target')=={'scope':'global'}]
-            return value if (value.get('featureEnabled') is True and
-                type(value.get('generation')) is int and value.get('generation')==status.get('mainGeneration') and
-                value.get('actualServerId')=='node-a' and len(matches)==1 and
-                matches[0].get('confirmed') is True and matches[0].get('state')=='auto' and matches[0].get('actualServerId')=='node-a') else None
-        native_status=wait_for(observed,timeout=35)
+            check('native-status-schema',type(value) is dict and type(value.get('nativeAutoGroups')) is list
+                  and all(type(g) is dict for g in value['nativeAutoGroups']),'auto-status-schema-invalid')
+            groups=value['nativeAutoGroups'];matches=[g for g in groups if g.get('target')=={'scope':'global'}]
+            confirmed=(value.get('featureEnabled') is True and type(value.get('generation')) is int and
+                value['generation']==status.get('mainGeneration') and value.get('actualServerId')=='node-a' and
+                len(matches)==1 and matches[0].get('confirmed') is True and matches[0].get('state')=='auto'
+                and matches[0].get('actualServerId')=='node-a')
+            observation.update(phase='native-confirmation',state='observed' if confirmed else 'waiting')
+            observation['checks']['native-confirmation']={'passed':confirmed,'globalGroupCount':len(matches),
+                'generationMatches':type(value.get('generation')) is int and value['generation']==status.get('mainGeneration')}
+            return value if confirmed else None
+        try:
+            native_status=wait_for(observed,timeout=35)
+        except Exception:
+            observation['state']='failed'
+            raise
+        observation.update(phase='generation-read',state='checking')
         current=self.status()
-        gui_require(current.get('pid')==self.core['pid'] and current.get('mainGeneration')==status.get('mainGeneration')
-                    and current.get('actualServerId')=='node-a', 'auto-status-generation-changed')
+        check('generation',current.get('pid')==self.core['pid'] and current.get('mainGeneration')==status.get('mainGeneration')
+              and current.get('actualServerId')=='node-a','auto-status-generation-changed')
+        observation.update(phase='runtime-recapture',state='checking')
         after=self.runtime_identity()
-        gui_require(after['sha256']==proof['sha256'] and after['pid']==proof['pid'] and
-                    after['startTime']==proof['startTime'], 'auto-runtime-changed')
+        check('stable-runtime',after['sha256']==proof['sha256'] and after['pid']==proof['pid'] and
+              after['startTime']==proof['startTime'],'auto-runtime-changed')
+        observation.update(phase='complete',state='observed')
         return {'runtime':proof,'globalConfirmed':True,'actualServerId':'node-a',
                 'mainGeneration':native_status['generation'],'selectorInterrupt':False,'intervalMinutes':5}
 

@@ -244,24 +244,39 @@ test('root probe only adds read-only TUN names without changing original six met
 });
 
 test('actual controller transaction schema survives actual GUI adapter and Node gate', () => {
-  // Pure schema integration: no subprocess, privilege, account or product action.
+  // Pure schema integration: no privileged subprocess, account or product action.
   // Use real observer.finish and helper_action bodies; only OS/driver operations
   // are fakes. This guards producer/consumer field drift, not runtime coverage.
   const program = `import json,sys,threading,types,subprocess
-from unittest.mock import Mock
+from unittest.mock import Mock,patch
 sys.path.insert(0,sys.argv[1])
 import root_controller as root
+import tun as actual_tun
 import linux_tun as gui
 import helper_observation as helper
 app={'pid':100,'startTime':'123','uid':1001}
 results=[]
 for kind in ('install','uninstall'):
-    controller=types.SimpleNamespace(gui=app,launch={'authenticationMode':'existing-session'},ops=types.SimpleNamespace(proc=lambda pid:None))
+    controller=types.SimpleNamespace(gui=app,launch={'authenticationMode':'existing-session'},ops=types.SimpleNamespace(proc=lambda pid:None),tun=actual_tun)
     observer=root.TransactionObserver(controller,kind)
     observer.thread=Mock(); observer.thread.is_alive.return_value=False
     row={'pid':102,'startTime':'125','uid':0,'ppid':100}
     observer.rows={(102,'125'):row}; observer.pkexec={(102,'125'):row}; observer.shells={(102,'125'):row}
-    closed=observer.finish()
+    # Real terminal producer: only whole-directory ENOENT proves sampled absence.
+    def missing(path):
+        assert str(path)=='/proc/102'
+        raise FileNotFoundError(2,'synthetic absent directory')
+    with patch.object(actual_tun.Path,'lstat',autospec=True,side_effect=missing) as terminal_reads:
+        closed=observer.finish()
+        assert terminal_reads.call_count==2
+    with patch.object(actual_tun.Path,'lstat',side_effect=PermissionError(13,'synthetic denial')):
+        try: observer.finish()
+        except PermissionError: pass
+        else: raise AssertionError('permission failure must not prove terminal closure')
+    with patch.object(actual_tun.Path,'lstat',return_value=Mock()), patch.object(actual_tun.Path,'read_text',side_effect=FileNotFoundError(2,'synthetic missing stat')):
+        try: observer.finish()
+        except FileNotFoundError: pass
+        else: raise AssertionError('missing proc subfile must not prove terminal closure')
     run=object.__new__(gui.TunCarrierRun)
     run.result={}; run.env={}
     run.app=app; run.driver=Mock(); run.supervisor=Mock(); run.controller=Mock(); run.launch_options={'authenticationMode':'existing-session'}

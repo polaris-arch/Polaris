@@ -306,6 +306,18 @@ def manager_root(ops, observation):
     return os.geteuid() == 0 and value in ('', '/')
 
 
+def pid1_root_cgroup(ops):
+    # Match the production Linux manager proof. systemd v249 removes the
+    # init.scope suffix before exposing manager ControlGroup and stores root as
+    # empty; no arbitrary nested scope or absent property is equivalent.
+    rows = Path('/proc/1/cgroup').read_text().splitlines()
+    require(len(rows) == 1 and rows[0] in ('0::/', '0::/init.scope'), 'PID1 hierarchy root unconfirmed')
+    if rows[0] == '0::/init.scope':
+        value = ops.run([SYSTEMCTL, '--system', 'show', '--all', '--property=ControlGroup', 'init.scope'])
+        require(value.splitlines() == ['ControlGroup=/init.scope'], 'PID1 scope identity unconfirmed')
+    return True
+
+
 def collect_preflight(gui_uid, vm_context, materials_downloaded=False, ops=None):
     """Read-only target-VM observations; no sudo, device creation or auth probe."""
     ops = ops or Commands()
@@ -328,7 +340,8 @@ def collect_preflight(gui_uid, vm_context, materials_downloaded=False, ops=None)
         reached('manager')
         facts['rootManager'] = manager_root(ops, observation)
         reached('pid1')
-        facts['pid1Systemd'] = Path('/proc/1/comm').read_text().strip() == 'systemd'
+        facts['pid1Systemd'] = (Path('/proc/1/comm').read_text().strip() == 'systemd' and
+                               Path('/proc/1').stat().st_uid == 0 and pid1_root_cgroup(ops))
         reached('namespaces')
         ns = {name: (Path('/proc/1/ns') / name).stat().st_ino for name in ('net', 'mnt', 'pid', 'cgroup')}
         facts['systemNamespaces'] = ns
@@ -466,6 +479,31 @@ def transaction_identity(pid):
             os.close(fd)
     except (OSError, ValueError, StopIteration, KeyError, IndexError) as error:
         raise TransactionIdentityError(phase, error) from None
+
+
+def terminal_identity(old):
+    """Only a caller-held strong birth may use this sampled terminal proof.
+
+    A missing exe/status file is never process absence. This grants no signal,
+    executable identity, descendant closure, or transaction completion.
+    """
+    require(type(old) is dict and type(old.get('pid')) is int and old['pid'] > 1 and
+            type(old.get('startTime')) is str and old['startTime'].isdigit(), 'held birth required')
+    directory = Path('/proc') / str(old['pid'])
+    observed = []
+    for _ in range(2):
+        try:
+            directory.lstat()
+        except FileNotFoundError:
+            observed.append(('absent', None)); continue
+        raw = (directory / 'stat').read_text()
+        fields = raw[raw.rindex(')') + 2:].split()
+        require(fields[19] == old['startTime'] and fields[0] == 'Z' and
+                int(fields[1]) == old['ppid'], 'held process not same-birth terminal')
+        observed.append(('zombie', (fields[19], int(fields[1]))))
+    require(observed[0] == observed[1], 'terminal observation changed')
+    return {'pid': old['pid'], 'startTime': old['startTime'], 'state': observed[0][0],
+            'scope': 'sampled-terminal-not-execution-identity'}
 
 
 def service_properties(ops):

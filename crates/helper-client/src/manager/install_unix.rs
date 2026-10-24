@@ -12,12 +12,12 @@ BOOT=$(/usr/bin/mktemp -d {temporary}/polaris-helper-bootstrap.XXXXXXXX)
 BOOT_ID=$({stat_identity} "$BOOT") || exit 1
 [ -n "$BOOT_ID" ] || exit 1
 close_bootstrap() {{
-  exec 8<&-
+  exec 8<&- || return 1
   if [ -d "$BOOT" ] && [ ! -L "$BOOT" ] && [ "$({stat_identity} "$BOOT")" = "$BOOT_ID" ]; then
-    /bin/rm -rf "$BOOT"
+    /bin/rm -rf "$BOOT" || return 1
   else echo HELPER_BOOTSTRAP_IDENTITY_CHANGED >&2; return 1; fi
 }}
-trap close_bootstrap EXIT
+{bootstrap_trap}
 {clear_directory_acl}/bin/chmod 0700 "$BOOT"
 [ "$({stat_identity} "$BOOT")" = "$BOOT_ID" ] || exit 1
 for OBJECT in "$BOOT"/* "$BOOT"/.[!.]* "$BOOT"/..?*; do
@@ -34,6 +34,25 @@ BOOT_FD_ID=$({stat_identity} /dev/fd/8) || exit 1
 BOOT_FILE_ID=$({stat_identity} "$BOOT/helper") || exit 1
 [ -n "$BOOT_FD_ID" ] && [ -n "$BOOT_FILE_ID" ] && [ "$BOOT_FD_ID" = "$BOOT_FILE_ID" ] || {{ echo HELPER_BOOTSTRAP_IDENTITY_CHANGED >&2; exit 1; }}
 "#,
+        bootstrap_trap = if mac {
+            "trap close_bootstrap EXIT"
+        } else {
+            r#"bootstrap_cleanup() {
+  rc=$?
+  trap - EXIT HUP INT TERM
+  FAILED_STAGE=${INSTALL_STAGE-preparation}
+  if [ "$rc" -eq 0 ]; then FAILED_STAGE=cleanup; fi
+  diagnostic_failure "$rc" "$FAILED_STAGE" recovery-unconfirmed || :
+  RECOVERY=cleanup-returned
+  if ! close_bootstrap; then
+    RECOVERY=recovery-unconfirmed
+    [ "$rc" -ne 0 ] || rc=1
+  fi
+  diagnostic_failure "$rc" "$FAILED_STAGE" "$RECOVERY" || :
+  exit "$rc"
+}
+trap bootstrap_cleanup EXIT"#
+        },
         source = shell_quote(&source.to_string_lossy()),
         hash = shell_quote(helper_sha256),
         temporary = if mac { "/private/tmp" } else { "/tmp" },
@@ -182,14 +201,14 @@ migration_activate() {
       committed-closed|activation-pending|completed|unknown)
         touch "$TXDIR/recovery-required"
         echo HELPER_MIGRATION_ACTIVATION_PENDING >&2
-        exec 9>&-
+        exec 9>&- || cleanup_failure
         close_bootstrap || :
         exit 1;;
     esac
     if [ -e "$TXDIR/migration-stop.started" ] && [ ! -f "$TXDIR/migration-stop.complete" ]; then
       touch "$TXDIR/recovery-required"
       echo HELPER_MIGRATION_STOP_UNCONFIRMED >&2
-      exec 9>&-
+      exec 9>&- || cleanup_failure
       close_bootstrap || :
       exit 1
     fi
@@ -197,7 +216,7 @@ migration_activate() {
       if ! admin migration-rollback --journal "$TXDIR"; then
         touch "$TXDIR/recovery-required"
         echo HELPER_ROLLBACK_STOP_UNCONFIRMED >&2
-        exec 9>&-
+        exec 9>&- || cleanup_failure
         close_bootstrap || :
         exit 1
       fi
@@ -233,8 +252,8 @@ migration_activate() {
       fi
       if [ "$OK" -ne 1 ]; then touch "$TXDIR/recovery-required"; fi
     fi
-    if [ -n "$TXDIR" ] && [ ! -e "$TXDIR/recovery-required" ]; then rm -rf "$TXDIR"; fi
-    exec 9>&-
+    if [ -n "$TXDIR" ] && [ ! -e "$TXDIR/recovery-required" ]; then rm -rf "$TXDIR" || cleanup_failure; fi
+    exec 9>&- || cleanup_failure
     close_bootstrap || :
     exit "$rc"
   fi
@@ -242,7 +261,7 @@ migration_activate() {
     let header = format!(
         r#"#!/bin/sh
 set -eu
-PATH=/usr/bin:/bin:/usr/sbin:/sbin
+{diagnostics}PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 umask 077
 DEST={dest}
@@ -256,6 +275,7 @@ MIGRATION={migration_flag}
   if [ -n "$BOOT" ]; then "$BOOT/helper" "$@"; else "$TXDIR/helper" "$@"; fi
 }}
 {secure_directories}
+INSTALL_STAGE=directories
 secure_dir {parent}
 secure_dir "$SUPPORT"
 secure_dir "$COREDIR"
@@ -273,19 +293,30 @@ WAS_ACTIVE=0
 REQUIRE_CLOSURE={require_closure}
 WAS_ENABLED=0
 RECORD="$SUPPORT/helper-installed.json"
-{migration_helpers}cleanup() {{
+{migration_helpers}cleanup_failure() {{
+  FAILURE_RC=$?
+  if [ "${{POLARIS_DIAGNOSTICS-0}}" = 1 ]; then diagnostic_failure "$FAILURE_RC" "$FAILED_STAGE" recovery-unconfirmed || :; fi
+  exit "$FAILURE_RC"
+}}
+cleanup() {{
   rc=$?
+  FAILED_STAGE=${{INSTALL_STAGE-preparation}}
+  if [ "$rc" -eq 0 ]; then FAILED_STAGE=cleanup; fi
+  if [ "${{POLARIS_DIAGNOSTICS-0}}" = 1 ]; then diagnostic_failure "$rc" "$FAILED_STAGE" recovery-unconfirmed || :; fi
+  RECOVERY=cleanup-returned
   trap - EXIT HUP INT TERM
-  if [ "$ADMITTED" -eq 1 ]; then admin cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || {{ touch "$TXDIR/recovery-required"; rc=1; }}; fi
+  if [ "$ADMITTED" -eq 1 ]; then admin cancel-upgrade --support "$SUPPORT" >/dev/null 2>&1 || {{ touch "$TXDIR/recovery-required"; rc=1; RECOVERY=recovery-unconfirmed; }}; fi
   # Cleanup is part of the lease transaction. Closing fd 9 releases the kernel
   # lease only after the journal has disappeared; the helper lives in TXDIR.
-  if [ -n "$TXDIR" ] && [ ! -e "$TXDIR/recovery-required" ]; then rm -rf "$TXDIR"; fi
-  exec 9>&-
-  if [ -n "$BOOT" ]; then close_bootstrap || rc=1; fi
+  if [ -n "$TXDIR" ] && [ ! -e "$TXDIR/recovery-required" ]; then rm -rf "$TXDIR" || cleanup_failure; fi
+  exec 9>&- || cleanup_failure
+  if [ -n "$BOOT" ]; then close_bootstrap || {{ rc=1; RECOVERY=recovery-unconfirmed; }}; fi
+  if [ "${{POLARIS_DIAGNOSTICS-0}}" = 1 ]; then diagnostic_failure "$rc" "$FAILED_STAGE" "$RECOVERY" || :; fi
   exit "$rc"
 }}
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+INSTALL_STAGE=staging
 TXDIR=$(mktemp -d "$SUPPORT/helper-admission.XXXXXX")
 chmod 0700 "$TXDIR"
 cp {source} "$TXDIR/helper"
@@ -296,8 +327,10 @@ hash_file() {{ {hash_command}; }}
 owner_mode() {{ {owner_mode}; }}
 [ "$(hash_file "$TXDIR/helper")" = {helper_hash} ] || {{ echo HELPER_BUNDLE_MISMATCH >&2; exit 1; }}
 [ "$(hash_file "$TXDIR/core-manifest.json")" = {manifest_hash} ] || {{ echo CORE_BUNDLE_MISMATCH >&2; exit 1; }}
+INSTALL_STAGE=lease
 admin lease-acquire --lock "$LOCK" --fd 9 || {{ echo HELPER_INSTALL_TRANSACTION_BUSY >&2; exit 75; }}
 LEASED=1
+INSTALL_STAGE=journal
 # Admission bytes live outside the recovery namespace until the lease is held.
 # Publish the initialized journal by same-directory rename, never mkdir there.
 printf '%s\n' polaris-helper-upgrade-v1 > "$TXDIR/transaction-kind"
@@ -361,6 +394,7 @@ if [ "$MIGRATION" -eq 1 ]; then
 fi
 printf '%s' {token} > "$TXDIR/user-token"
 chmod 0600 "$TXDIR/user-token"
+INSTALL_STAGE=core-install
 admin core-install --root "$COREDIR" --source {payload} --manifest "$TXDIR/core-manifest.json" --source-owner {identity}{preserve}
 snapshot_registration() {{
   admin snapshot-user --support "$SUPPORT" --identity {identity} --backup "$TXDIR/registration.rollback"
@@ -368,6 +402,7 @@ snapshot_registration() {{
 register_user() {{
   set_phase registration
   REGISTRATION_CHANGED=1
+  INSTALL_STAGE=registration
   admin register-user --support "$SUPPORT" --identity {identity} --confdir {config} --token-file "$TXDIR/user-token"
 }}
 restore_registration() {{
@@ -376,6 +411,7 @@ restore_registration() {{
     REGISTRATION_CHANGED=0
   fi
 }}
+INSTALL_STAGE=policy
 POLICY=$(admin helper-policy --binary "$DEST" --metadata "$RECORD")
 case "$POLICY" in
   'helper-policy retain') KEEP_HELPER=1;;
@@ -394,6 +430,9 @@ done
 admin sync-install-path --path "$TXDIR"
 rollback() {{
   rc=$?
+  FAILED_STAGE=${{INSTALL_STAGE-preparation}}
+  if [ "$rc" -eq 0 ]; then FAILED_STAGE=cleanup; fi
+  if [ "${{POLARIS_DIAGNOSTICS-0}}" = 1 ]; then diagnostic_failure "$rc" "$FAILED_STAGE" recovery-unconfirmed || :; fi
   trap - EXIT HUP INT TERM
   OK=1
 {migration_rollback}  if [ "$MUTATED" -eq 1 ]; then
@@ -402,8 +441,8 @@ rollback() {{
       # native connections. Preserve all recovery material for a later action.
       touch "$TXDIR/recovery-required"
       echo HELPER_ROLLBACK_STOP_UNCONFIRMED >&2
-      exec 9>&-
-      if [ -n "$BOOT" ]; then close_bootstrap || rc=1; fi
+      exec 9>&- || cleanup_failure
+      if [ -n "$BOOT" ]; then close_bootstrap || {{ rc=1; OK=0; }}; fi
       exit 1
     fi
     if [ "$KEEP_HELPER" -eq 0 ]; then
@@ -426,15 +465,25 @@ rollback() {{
   fi
   restore_registration || OK=0
   rm -f "$DEST.new.$$" "$DESCRIPTOR.new.$$" "$RECORD.new.$$"
-  if [ "$OK" -eq 1 ]; then rm -rf "$TXDIR"; else touch "$TXDIR/recovery-required"; echo "helper rollback incomplete; recovery transaction retained: $TXDIR" >&2; fi
-  exec 9>&-
-  if [ -n "$BOOT" ]; then close_bootstrap || rc=1; fi
+  if [ "$OK" -eq 1 ]; then rm -rf "$TXDIR" || cleanup_failure; else touch "$TXDIR/recovery-required"; echo "helper rollback incomplete; recovery transaction retained: $TXDIR" >&2; fi
+  exec 9>&- || cleanup_failure
+  if [ -n "$BOOT" ]; then close_bootstrap || {{ rc=1; OK=0; }}; fi
+  if [ "${{POLARIS_DIAGNOSTICS-0}}" = 1 ]; then
+    RECOVERY=recovery-unconfirmed
+    if [ "$OK" -eq 1 ]; then RECOVERY=rollback-returned; fi
+    diagnostic_failure "$rc" "$FAILED_STAGE" "$RECOVERY" || :
+  fi
   exit "$rc"
 }}
 "#,
         migration_flag = if migration { 1 } else { 0 },
         migration_helpers = if migration { migration_helpers } else { "" },
         migration_rollback = if migration { migration_rollback } else { "" },
+        diagnostics = if mac {
+            ""
+        } else {
+            linux_service_stop::DIAGNOSTICS
+        },
         bootstrap = bootstrap,
         require_closure = u8::from(!mac),
         secure_directories = secure_directory_functions(mac),
@@ -572,15 +621,19 @@ POLARIS_DESCRIPTOR_EOF
         format!(
             r#"stop_service() {{
   linux_validate_service || return 1
+  INSTALL_STAGE=service-stop
   if [ "$LOAD" = loaded ]; then systemctl --system stop "$SERVICE" || return 1; fi
   linux_service_closed
 }}
 restore_service() {{
+  linux_cgroup_view || return 1
   systemctl daemon-reload || return 1
+  linux_validate_service || return 1
   if [ "$WAS_ENABLED" -eq 1 ]; then systemctl enable "$SERVICE" || return 1;
   elif [ "$HAD_DESCRIPTOR" -eq 1 ]; then systemctl disable "$SERVICE" || return 1; fi
   if [ "$WAS_ACTIVE" -eq 1 ]; then systemctl restart "$SERVICE" || return 1; fi
 }}
+INSTALL_STAGE=service-snapshot
 INITIAL_STATE=$(linux_service_property ActiveState) || {{ echo HELPER_SERVICE_STATE_UNKNOWN >&2; exit 1; }}
 case "$INITIAL_STATE" in
   active) WAS_ACTIVE=1;;
@@ -665,9 +718,11 @@ launchctl bootstrap system "$DESCRIPTOR"
 launchctl print "system/$SERVICE" >/dev/null
 "#
     } else {
-        r#"systemctl daemon-reload
+        r#"INSTALL_STAGE=service-start
+systemctl daemon-reload
 systemctl enable "$SERVICE"
 systemctl restart "$SERVICE"
+INSTALL_STAGE=takeover
 TAKEOVER_OK=0
 WAIT=50
 while [ "$WAIT" -gt 0 ]; do

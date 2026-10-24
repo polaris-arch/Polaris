@@ -1888,7 +1888,7 @@ class AutoPreparationTests(unittest.TestCase):
             self.assertEqual(run.driver.click.call_count,3);run.activate_saved_graph.assert_not_called()
 
     def runtime(self):
-        run=M.CarrierRun.__new__(M.CarrierRun);run.core={'pid':10,'startTime':'1'};run.api_endpoint={'port':1}
+        run=M.CarrierRun.__new__(M.CarrierRun);run.result={};run.core={'pid':10,'startTime':'1'};run.api_endpoint={'port':1}
         run.network=SimpleNamespace(health_url='http://fixture/health')
         proof={'pid':10,'startTime':'1','sha256':'a'*64}
         graph={'outbounds':[
@@ -1919,6 +1919,48 @@ class AutoPreparationTests(unittest.TestCase):
             elif fault=='file':run.runtime_identity.return_value={**run.runtime_identity.return_value,'sha256':'b'*64}
             else:run.api_endpoint={'port':2}
             with self.subTest(fault=fault),patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.auto_runtime(True)
+
+    def test_actual_go_canonical_duration_and_false_omission_keep_exact_300_seconds(self):
+        # Actual fixed option/group.go declaration + actual sing badoption/json
+        # produced this JSON in N15 verification/canonical-duration/output.log.
+        canonical=json.loads('{"outbounds":["A","B"],"url":"http://127.0.0.1:1234/health","interval":"5m0s","idle_timeout":"30m0s"}')
+        self.assertNotEqual(canonical['interval'],'5m')  # Old literal gate fails real canonical output.
+        run,graph=self.runtime();run.network.health_url=canonical['url']
+        graph['outbounds'][2]={**canonical,'type':'urltest','tag':'polaris-auto-global-test'}
+        with patch.object(M,'wait_for',side_effect=self.once):run.auto_runtime(True)
+        self.assertEqual(run.result['autoRuntimeObservation']['checks']['interval'],{'passed':True,'encoding':'go-5m0s','seconds':300})
+        for value in ('5m1s','4m59s','1m','30m','300s','PRIVATE',None,300,True):
+            run,graph=self.runtime();graph['outbounds'][2]['interval']=value
+            with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure) as raised:run.auto_runtime(True)
+            self.assertEqual(raised.exception.code,'auto-runtime-interval-differs')
+            self.assertNotIn('PRIVATE',json.dumps(run.result))
+
+    def test_auto_each_combined_field_has_specific_safe_failed_evidence(self):
+        for fault,code,phase in [('members','auto-runtime-member-set-differs','member-set'),
+                                 ('url','auto-runtime-health-url-differs','health-url'),
+                                 ('interval','auto-runtime-interval-differs','interval'),
+                                 ('wrapper','auto-runtime-wrapper-member-set-differs','wrapper-member-set'),
+                                 ('duplicate','auto-runtime-native-urltest-members-schema-invalid','native-urltest-members-schema')]:
+            run,graph=self.runtime();native=graph['outbounds'][2]
+            if fault=='members':native['outbounds']=['A','PRIVATE']
+            elif fault=='url':native['url']='http://PRIVATE/secret'
+            elif fault=='interval':native['interval']='PRIVATE'
+            elif fault=='wrapper':graph['outbounds'][1]['outbounds'].append('PRIVATE')
+            else:native['outbounds']=['A','A']
+            with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure) as raised:run.auto_runtime(True)
+            self.assertEqual(raised.exception.code,code)
+            observation=run.result['autoRuntimeObservation']
+            self.assertEqual((observation['phase'],observation['state']),(phase,'failed'))
+            self.assertNotIn('PRIVATE',json.dumps(observation))
+        # Generated tags are opaque identities, not user IDs or assumed prefixes.
+        run,graph=self.runtime()
+        for ob in graph['outbounds']:
+            if ob.get('tag')=='A':ob['tag']='proxy-opaque-a'
+            if ob.get('tag')=='B':ob['tag']='stable-opaque-b'
+        graph['outbounds'][1]['outbounds']=['polaris-auto-global-test','proxy-opaque-a','stable-opaque-b']
+        graph['outbounds'][2]['outbounds']=['stable-opaque-b','proxy-opaque-a']
+        with patch.object(M,'wait_for',side_effect=self.once):run.auto_runtime(True)
+        self.assertTrue(run.result['autoRuntimeObservation']['checks']['member-set']['passed'])
 
     def test_auto_uses_same_hot_and_restart_lifecycle_gate_before_runtime_proof(self):
         for outcome in ('hotApplied','restartRequired'):

@@ -1496,6 +1496,7 @@ class TransactionObserver:
         self.c = controller; self.kind = kind; self.rows = {}; self.pkexec = {}; self.shells = {}
         self.error = None; self.stop = threading.Event(); self.lock = threading.Lock()
         self.error_lock = threading.Lock()
+        self.terminals = {}
         self.thread = threading.Thread(target=self.loop, name='owned-pkexec-observer', daemon=True)
 
     def start(self):
@@ -1585,7 +1586,21 @@ class TransactionObserver:
             'relation': 'gui-direct' if direct else 'owned-child',
             'parent': {k: parent[k] for k in ('pid', 'startTime')} if parent else None}
         self.candidate_phase = 'identity-before'; self.candidate_outcome = 'unconfirmed'
-        self.boundary = 'candidate'; observation = self.candidate(light['pid'], light, budget, diagnose=True)
+        self.boundary = 'candidate'
+        try:
+            observation = self.candidate(light['pid'], light, budget, diagnose=True)
+        except (OSError, ValueError) as error:
+            if not (getattr(error, 'phase', None) == 'identity-before' and
+                    getattr(error, 'error', None) in ('contract', 'enoent')):
+                raise
+            # Rows enter this map only after full strong validation AND durable
+            # ledger mutation. Never reconcile an unobserved child disappearance.
+            held = self.rows.get(birth(light))
+            if held is None: raise
+            proof = tun.terminal_identity(held)
+            c.ledger.mutate(lambda v: v.setdefault('transactionTerminals', []).append(proof))
+            self.terminals[birth(light)] = proof
+            return
         p = observation['identity']; key = birth(p)
         if direct:
             self.candidate_phase = 'gui-parent'
@@ -1698,8 +1713,7 @@ class TransactionObserver:
         result = self.snapshot()
         require(len(self.pkexec) == len(self.shells) == 1, 'real pkexec authorization unavailable or not fully observed')
         for row in self.rows.values():
-            now = self.c.ops.proc(row['pid'])
-            require(not now or (birth(now) == birth(row) and now['state'] == 'Z'), 'privilege transaction still live or reused')
+            self.c.tun.terminal_identity(row)
         result['closed'] = True
         return result
 

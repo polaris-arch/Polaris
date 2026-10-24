@@ -19,6 +19,7 @@ linux_service_property() {
   linux_systemd_property "$1" "$SERVICE"
 }
 linux_cgroup_view() {
+  INSTALL_STAGE=manager-identity
   # A cgroup2 filesystem can be a subtree/bind view. Anchor this view to the
   # system manager's namespaces, and require the mount's real hierarchy root.
   MANAGER_NAME=$(cat /proc/1/comm) || return 1
@@ -30,8 +31,21 @@ linux_cgroup_view() {
     MANAGER_NAMESPACE=$(readlink "/proc/1/ns/$NAMESPACE") || return 1
     [ -n "$OUR_NAMESPACE" ] && [ "$OUR_NAMESPACE" = "$MANAGER_NAMESPACE" ] || return 1
   done
+  INSTALL_STAGE=manager-property
   MANAGER_GROUP=$(linux_systemd_property ControlGroup) || return 1
-  [ "$MANAGER_GROUP" = / ] || return 1
+  # systemd stores the hierarchy root without its trailing slash, including
+  # the root itself. An explicit empty property is not a missing record.
+  case "$MANAGER_GROUP" in ''|/) ;; *) return 1;; esac
+  INSTALL_STAGE=pid1-cgroup
+  PID1_GROUP=$(cat /proc/1/cgroup) || return 1
+  case "$PID1_GROUP" in
+    '0::/') ;;
+    '0::/init.scope')
+      INIT_GROUP=$(linux_systemd_property ControlGroup init.scope) || return 1
+      [ "$INIT_GROUP" = /init.scope ] || return 1;;
+    *) return 1;;
+  esac
+  INSTALL_STAGE=cgroup-mount
   CGROOT=/sys/fs/cgroup
   [ -d "$CGROOT" ] && [ ! -L "$CGROOT" ] || return 1
   CGTYPE=$(stat -f -c %T "$CGROOT") || return 1
@@ -52,6 +66,7 @@ POLARIS_MOUNTINFO
 }
 linux_validate_service() {
   linux_cgroup_view || return 1
+  INSTALL_STAGE=unit-config
   LOAD=$(linux_service_property LoadState) || return 1
   case "$LOAD" in
     not-found) return 0;;
@@ -87,6 +102,7 @@ linux_service_closed() {
   # Recheck the effective configuration and hierarchy after the stop job. The
   # pre-stop snapshot cannot authorize removal if unit properties have changed.
   linux_validate_service || return 1
+  INSTALL_STAGE=service-closure
   STATE=$(linux_service_property ActiveState) || return 1
   PID=$(linux_service_property MainPID) || return 1
   case "$STATE:$PID" in inactive:0|failed:0) ;; *) return 1;; esac
@@ -123,4 +139,20 @@ $EVENTS
 POLARIS_CGROUP_EVENTS
   [ "$POPULATED" = empty ]
 }
+"#;
+
+/// Fixed failure-only observation; never authorization or cleanup proof.
+pub(super) const DIAGNOSTICS: &str = r#"
+POLARIS_DIAGNOSTICS=1
+INSTALL_STAGE=preparation
+diagnostic_failure() {
+  [ "$1" -ne 0 ] || return 0
+  case "$2" in
+    preparation|directories|staging|lease|journal|core-install|policy|service-snapshot|manager-identity|manager-property|pid1-cgroup|cgroup-mount|unit-config|service-stop|service-closure|registration|service-install|service-start|takeover|uninstall-remove|cleanup|rollback) STAGE=$2;;
+    *) STAGE=unknown;;
+  esac
+  case "$3" in not-started|cleanup-returned|rollback-returned|recovery-unconfirmed) RECOVERY=$3;; *) RECOVERY=recovery-unconfirmed;; esac
+  printf 'POLARIS_HELPER_FAILURE_V1:%s:%s\n' "$STAGE" "$RECOVERY" >&2
+}
+trap 'rc=$?; diagnostic_failure "$rc" "$INSTALL_STAGE" not-started || :; exit "$rc"' EXIT
 "#;
