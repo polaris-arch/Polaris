@@ -1989,13 +1989,15 @@ class AutoPreparationTests(unittest.TestCase):
     def prepared(self,enabled=False):
         run=M.CarrierRun.__new__(M.CarrierRun);run.result={};run.core={'pid':10,'startTime':'1'}
         run.gui_phase=Mock();run.text=lambda x:x;run.pick=Mock();run.driver=Mock()
+        run.driver.session='existing-session';run.readiness_observation_fence=Mock();run.same_core=Mock()
         run.pending_apply_control=Mock(return_value={'bars':0,'buttons':0,'disabled':False});run.preference_pending_save=Mock(return_value=False)
         run.status=Mock(return_value={'pid':10,'mainGeneration':3,'running':True})
         row={'count':1,'checked':'true' if enabled else 'false','disabled':False,'busy':'false'}
-        run.driver.execute.side_effect=[row]+([] if enabled else [{'count':1,'checked':'true','disabled':False,'busy':'false'}])+['false']
-        run.config=Mock(side_effect=[{'autoSelectEnabled':enabled}]+([] if enabled else [{'autoSelectEnabled':True}])+[{'autoSelectEnabled':True,'selectionIntent':{'mode':'auto','scope':'global'}}])
+        run.driver.execute.side_effect=[row]+([] if enabled else [{'count':1,'checked':'true','disabled':False,'busy':'false'}])+['false',{'count':1,'pressed':'true','disabled':False,'busy':'false'}]
+        run.config=Mock(side_effect=[{'autoSelectEnabled':enabled}]+([] if enabled else [{'autoSelectEnabled':True}])+[{'autoSelectEnabled':True,'selectionIntent':{'mode':'auto','scope':'global'}}]*2)
         receipt={'sequence':1,'source':'original-auto-mode-callback','success':True,'intentApplied':True,'featureEnabled':True,'generation':3,'applyOutcome':'applied'}
-        run.driver.observations.side_effect=([] if enabled else [[],[receipt]]) + [[receipt],[receipt,{**receipt,'sequence':2,'applyOutcome':'deferred'}]]
+        intent={'sequence':2,'source':'original-auto-intent-compatible-callback','success':True,'intentApplied':True,'featureEnabled':True,'generation':3}
+        run.driver.observations.side_effect=([] if enabled else [[],[receipt]]) + [[receipt],[receipt,intent],[receipt,intent]]
         run.driver.invoke.return_value={'featureEnabled':True,'generation':3}
         run.activate_saved_graph=Mock(return_value={'acceptedRuntime':True})
         return run
@@ -2029,8 +2031,8 @@ class AutoPreparationTests(unittest.TestCase):
     def test_global_intent_receipt_rejection_ambiguity_and_generation_fail_without_apply(self):
         for fault in ('rejected','generation','ambiguous','unknown-outcome'):
             run=self.prepared(True)
-            row={'sequence':2,'source':'original-auto-mode-callback','success':True,'intentApplied':True,
-                 'featureEnabled':True,'generation':3,'applyOutcome':'deferred'}
+            row={'sequence':2,'source':'original-auto-intent-compatible-callback','success':True,'intentApplied':True,
+                 'featureEnabled':True,'generation':3}
             if fault=='rejected':row['success']=False
             elif fault=='generation':row['generation']=4
             elif fault=='unknown-outcome':row['applyOutcome']='PRIVATE'
@@ -2040,6 +2042,120 @@ class AutoPreparationTests(unittest.TestCase):
             run.activate_saved_graph.assert_not_called()
             self.assertEqual([c.args[0] for c in run.driver.click.call_args_list].count('#node-menu [data-auto-select-scope="global"] .auto-choice-pick'),1)
             self.assertNotIn('PRIVATE',json.dumps(run.result))
+
+    def test_native_receipt_complete_command_serialization_matrix(self):
+        import subprocess
+        status={'featureEnabled':True,'generation':3,'nativeAutoGroups':[],
+                'nativeMeasurements':[],'actualServerId':'node-a'}
+        cases={
+            'setEnabled':{'success':True,'data':{'intentApplied':True,'status':dict(status,applyOutcome='applied')}},
+            'disable':{'success':True,'data':{'intentApplied':True,'status':dict(status,featureEnabled=False,applyOutcome='saved')}},
+            'enable-hot':{'success':True,'data':{'intentApplied':True,'status':status}},
+            'enable-deferred':{'success':True,'data':{'intentApplied':True,'status':dict(status,nativeAutoGroups=[])}},
+            'enable-stopped':{'success':True,'data':{'intentApplied':True,'status':dict(status,generation=0,actualServerId=None)}},
+            'switchNow':{'success':True,'data':{'intentApplied':False,'status':status}},
+            'status':{'success':True,'data':status},
+            'outer-rejected':{'success':False,'data':None,'message':'PRIVATE'},
+        }
+        for field in ('featureEnabled','generation','nativeAutoGroups','nativeMeasurements','actualServerId'):
+            bad=dict(status);del bad[field]
+            cases['missing-'+field]={'success':True,'data':{'intentApplied':True,'status':bad}}
+        for field,value in [('generation',True),('generation',-1),('featureEnabled',1),('nativeAutoGroups',{}),
+                            ('nativeMeasurements',None),('actualServerId',7),('applyOutcome',None),('applyOutcome','PRIVATE')]:
+            cases['invalid-'+field+str(value)]={'success':True,'data':{'intentApplied':True,'status':dict(status,**{field:value})}}
+        cases['invalid-intent']={'success':True,'data':{'intentApplied':1,'status':status}}
+        cases['invalid-envelope']={'success':1,'data':{'intentApplied':True,'status':status}}
+        script=('const cases='+json.dumps(cases)+';const out={};for(const [key,value] of Object.entries(cases)) {'
+            'const callbacks=new Map([[1,x=>42]]);global.window={};const i={};Object.defineProperty(i,"invoke",{value:()=>{}});'
+            'Object.defineProperty(i,"callbacks",{value:callbacks});window.__TAURI_INTERNALS__=i;new Function('+json.dumps(M.OBSERVER)+')();'
+            'out[key]={returned:callbacks.get(1)(value),rows:window.__packageObservation.rows,failed:window.__packageObservation.failed};}'
+            'console.log(JSON.stringify(out));')
+        result=json.loads(subprocess.check_output(['node','-e',script],text=True))
+        for key,value in result.items():
+            self.assertEqual(value['returned'],42);self.assertFalse(value['failed'])
+            rows=value['rows']
+            if key in ('status','outer-rejected'):self.assertEqual(rows,[]);continue
+            self.assertEqual(len(rows),1)
+            if key.startswith(('missing-','invalid-')):
+                self.assertEqual(rows,[{'sequence':1,'source':'original-auto-receipt-invalid'}]);continue
+            if key in ('setEnabled','disable'):
+                self.assertEqual(rows[0]['source'],'original-auto-mode-callback');self.assertIn('applyOutcome',rows[0])
+            else:
+                self.assertEqual(rows[0]['source'],'original-auto-intent-compatible-callback');self.assertNotIn('applyOutcome',rows[0])
+        self.assertFalse(result['switchNow']['rows'][0]['intentApplied'])
+        self.assertNotIn('PRIVATE',json.dumps(list(result.values())));self.assertNotIn('node-a',json.dumps(list(result.values())))
+        source=(SOURCE/'src-tauri/src/runtime/proxy/native_auto.rs').read_text()
+        select=source.split('pub(crate) async fn native_auto_select_default(',1)[1].split('pub(super) async fn native_manual_exit(',1)[0]
+        self.assertIn('Ok(self.native_auto_status().await)',select)
+        self.assertNotIn('apply_outcome =',select)
+        self.assertIn('#[serde(skip_serializing_if = "Option::is_none")]',source)
+        self.assertIn('status.apply_outcome = Some(apply_outcome)',source)
+        commands=(SOURCE/'src-tauri/src/commands/server.rs').read_text()
+        self.assertIn('native_response(state.proxy().native_auto_retest().await, false)',commands)
+
+    def test_intent_callback_never_promotes_poll_retest_mode_or_malformed_to_success(self):
+        valid={'sequence':2,'source':'original-auto-intent-compatible-callback','success':True,
+               'intentApplied':True,'featureEnabled':True,'generation':3}
+        variants=[{**valid,'intentApplied':False},{**valid,'featureEnabled':False},{**valid,'generation':True},
+                  {**valid,'generation':0},{**valid,'source':'original-auto-mode-callback','applyOutcome':'applied'},
+                  {'sequence':2,'source':'original-auto-receipt-invalid'}]
+        for row in variants:
+            run=self.prepared(True);run.driver.observations.side_effect=[[],[row]]
+            with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.prepare_auto()
+            run.activate_saved_graph.assert_not_called()
+            self.assertEqual([c.args[0] for c in run.driver.click.call_args_list].count('#node-menu [data-auto-select-scope="global"] .auto-choice-pick'),1)
+
+    def test_intent_saved_state_and_owner_fences_precede_apply_no_mutation_replay(self):
+        for fault in ('saved','session-or-app','core','generation'):
+            run=self.prepared(True)
+            if fault=='saved':run.config.side_effect=[{'autoSelectEnabled':True}]+[{'autoSelectEnabled':True,'selectionIntent':None}]*2
+            elif fault=='session-or-app':run.readiness_observation_fence.side_effect=[None,M.GuiFailure('status-readiness-session-changed')]
+            elif fault=='core':run.same_core.side_effect=[None,M.GuiFailure('core-identity-changed')]
+            else:run.status.side_effect=[{'pid':10,'mainGeneration':3,'running':True}]*3+[{'pid':10,'mainGeneration':4,'running':True}]
+            with self.subTest(fault=fault),patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.prepare_auto()
+            run.activate_saved_graph.assert_not_called()
+            self.assertEqual([c.args[0] for c in run.driver.click.call_args_list].count('#node-menu [data-auto-select-scope="global"] .auto-choice-pick'),1)
+
+    def test_intent_readback_requires_unique_visible_selected_settled_control(self):
+        for control in ({'count':0},{'count':2},
+                        {'count':1,'pressed':'false','disabled':False,'busy':'false'},
+                        {'count':1,'pressed':'true','disabled':True,'busy':'false'},
+                        {'count':1,'pressed':'true','disabled':False,'busy':'true'}):
+            run=self.prepared(True)
+            run.driver.execute.side_effect=[{'count':1,'checked':'true','disabled':False,'busy':'false'},'false',control]
+            with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.prepare_auto()
+            run.activate_saved_graph.assert_not_called()
+            self.assertEqual([c.args[0] for c in run.driver.click.call_args_list].count('#node-menu [data-auto-select-scope="global"] .auto-choice-pick'),1)
+
+    def test_intent_typed_busy_discards_whole_readback_without_reclick(self):
+        run=self.prepared(True)
+        ready={'pid':10,'mainGeneration':3,'running':True}
+        run.status.side_effect=[ready,ready,ready,M.NativeRejected('PRIVATE','status-writer-busy'),ready]
+        desired={'autoSelectEnabled':True,'selectionIntent':{'mode':'auto','scope':'global'}}
+        run.config.side_effect=[{'autoSelectEnabled':True},desired,desired,desired]
+        settled={'count':1,'pressed':'true','disabled':False,'busy':'false'}
+        run.driver.execute.side_effect=[{'count':1,'checked':'true','disabled':False,'busy':'false'},'false',settled,settled]
+        def bounded(read,condition=bool,**kwargs):
+            for _ in range(3):
+                value=read()
+                if condition(value):return value
+            raise M.GuiFailure('observation-timeout')
+        with patch.object(M,'wait_for',side_effect=bounded):run.prepare_auto()
+        self.assertEqual(run.config.call_count,4)
+        self.assertEqual([c.args[0] for c in run.driver.click.call_args_list].count('#node-menu [data-auto-select-scope="global"] .auto-choice-pick'),1)
+        run.activate_saved_graph.assert_called_once()
+        self.assertEqual(run.result['statusWaitObservations'][0]['savedStateObservation']['busyCount'],1)
+
+    def test_intent_window_closes_against_late_duplicate_invalid_or_replaced_receipt(self):
+        selected={'sequence':2,'source':'original-auto-intent-compatible-callback','success':True,
+                  'intentApplied':True,'featureEnabled':True,'generation':3}
+        for late in ([selected,{**selected,'sequence':3}],
+                     [selected,{'sequence':3,'source':'original-auto-receipt-invalid'}],
+                     [{**selected,'sequence':3}],[]):
+            run=self.prepared(True);run.driver.observations.side_effect=[[],[selected],late]
+            with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.prepare_auto()
+            run.activate_saved_graph.assert_not_called()
+            self.assertEqual([c.args[0] for c in run.driver.click.call_args_list].count('#node-menu [data-auto-select-scope="global"] .auto-choice-pick'),1)
 
     def runtime(self):
         run=M.CarrierRun.__new__(M.CarrierRun);run.result={};run.core={'pid':10,'startTime':'1'};run.api_endpoint={'port':1}
@@ -2176,7 +2292,7 @@ class AutoPreparationTests(unittest.TestCase):
 
     def test_actual_auto_callback_projection_and_render_producers(self):
         import subprocess
-        payload={'success':True,'data':{'intentApplied':True,'status':{'featureEnabled':True,'generation':3,'applyOutcome':'applied','secret':'PRIVATE'}}}
+        payload={'success':True,'data':{'intentApplied':True,'status':{'featureEnabled':True,'generation':3,'applyOutcome':'applied','nativeAutoGroups':[],'nativeMeasurements':[],'actualServerId':None,'secret':'PRIVATE'}}}
         script=('const callbacks=new Map([[1,x=>42]]);global.window={};const i={};Object.defineProperty(i,"invoke",{value:()=>{}});'
                 'Object.defineProperty(i,"callbacks",{value:callbacks});window.__TAURI_INTERNALS__=i;new Function('+json.dumps(M.OBSERVER)+')();'
                 'const result=callbacks.get(1)('+json.dumps(payload)+');console.log(JSON.stringify({result,rows:window.__packageObservation.rows}));')

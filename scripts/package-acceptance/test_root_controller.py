@@ -4,6 +4,7 @@ import ast
 import base64
 import builtins
 import stat
+import sys
 import importlib.util
 import io
 import json
@@ -1891,7 +1892,6 @@ class OwnedProcessAgentPreferenceTests(unittest.TestCase):
             c=group_controller() if mode==m.AUTH_GROUP_MODE else controller(mode)
             self.assertEqual(m.validate_permission(c.launch)['maxLeaseSeconds'],90)
 
-if __name__ == '__main__': unittest.main(verbosity=2)
 
 
 class TransactionFenceTests(unittest.TestCase):
@@ -2813,3 +2813,234 @@ class AuxiliaryWholeAbsenceAndMandatoryContracts(unittest.TestCase):
         self.assertEqual(proof['auxiliaryTerminals'][0]['terminal']['state'],'zombie')
         self.assertFalse(proof['auxiliaryTerminals'][0]['identityVerified'])
         self.assertNotIn('reaped',proof['auxiliaryTerminals'][0])
+
+
+AUTH_REAL_EVENTS=[]
+AUTH_PARENT_PROGRAM='''import subprocess,sys
+p=subprocess.Popen([sys.executable,'-c','import time; print("ready",flush=True); time.sleep(60)'],stdout=subprocess.PIPE,text=True)
+assert p.stdout.readline().strip()=="ready"
+print(p.pid,flush=True)
+for line in sys.stdin:
+ if line.strip()=="reap":
+  p.terminate(); p.wait(); print("reaped",flush=True)
+ elif line.strip()=="quit":break
+if p.poll() is None:p.terminate();p.wait()
+'''
+class AuthLifecycleRealFamily:
+ def __enter__(self):
+  self.dir=tempfile.TemporaryDirectory();self.p=subprocess.Popen([sys.executable,'-c',AUTH_PARENT_PROGRAM],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+  self.child=int(self.p.stdout.readline());self.reaped=False
+  self.parent=vm_tun.process_identity(self.p.pid);self.child_identity=vm_tun.process_identity(self.child)
+  assert self.parent and self.child_identity and self.child_identity['ppid']==self.p.pid
+  ledger=Ledger();ledger.value['authentication']['agent']={'identity':self.parent}
+  self.signals=[]
+  def send(old,sig):
+   now=vm_tun.process_identity(old['pid']);assert now and now['uid']==os.getuid() and vm_tun.same_process(old,now)
+   assert old['pid'] in (self.p.pid,self.child)
+   self.signals.append((old['pid'],int(sig)));os.kill(old['pid'],sig)
+   if old['pid']==self.p.pid:self.p.wait(timeout=2)
+   return True
+  ops=types.SimpleNamespace(proc=vm_tun.process_identity,signal_owned=send)
+  self.c=types.SimpleNamespace(ledger=ledger,launch={'runId':'0123456789ab','guiUid':os.getuid()},gui=vm_tun.process_identity(os.getpid()),ops=ops,tun=vm_tun,directory=Path(self.dir.name),agent=self.p,lease=None,auth_note=Mock())
+  self.c._retain_auth_lineage=lambda lineage:m.Controller._retain_auth_lineage(self.c,lineage)
+  self.o=m.AuthObserver(self.c,'install');return self
+ def reap(self):
+  if not self.reaped:
+   self.p.stdin.write('reap\n');self.p.stdin.flush();assert self.p.stdout.readline().strip()=='reaped';self.reaped=True
+ def __exit__(self,*args):
+  self.o.stop.set()
+  if self.o.thread.ident:self.o.thread.join(2)
+  if self.p.poll() is None:
+   self.reap();self.p.stdin.write('quit\n');self.p.stdin.flush();self.p.wait(timeout=2)
+  self.p.stdin.close();self.p.stdout.close();self.dir.cleanup()
+@unittest.skipIf(os.getuid() == 0, "requires ordinary same-user subprocesses")
+class AuthLifecycleRealTests(unittest.TestCase):
+ def test_normal_live_final_durable_close_and_retain(self):
+  with AuthLifecycleRealFamily() as f:
+   events=[];real_parent=f.o.require_live_parent;real_write=m.write_recovery_snapshot;real_ack=f.o.parent_stop_ack.set
+   def parent():real_parent();events.append('before' if 'before' not in events else 'after')
+   def write(*a):
+    real_write(*a);saved=json.loads((f.c.directory/a[1]).read_text());self.assertEqual({x['pid'] for x in saved['processes']},{f.p.pid,f.child});events.append('durable')
+   def ack():events.append('ack');real_ack()
+   f.o.require_live_parent=parent;f.o.parent_stop_ack.set=ack;f.o.parent_stop_requested.set()
+   with patch.object(m,'write_recovery_snapshot',side_effect=write):
+    f.o.thread.start();f.o.prepare_parent_stop(time.monotonic()+2);f.o.thread.join(2)
+   self.assertEqual(events,['before','durable','after','ack'])
+   f.reap();lineage=f.o.close();m.Controller.retain_auth_lineage(f.c,lineage)
+   self.assertEqual(f.p.returncode,-signal.SIGTERM);self.assertEqual(lineage['unknownAdoptedChildren'],[])
+   self.assertTrue(f.c.ledger.load()['authentication']['lineageClosed']);AUTH_REAL_EVENTS.append({'case':'normal','events':events,'realUid':os.getuid(),'ownedBirths':lineage['ownedBirths']})
+ def test_child_exit_between_light_and_full_identity_unknown_and_known(self):
+  for known in (False,True):
+   with self.subTest(known=known),AuthLifecycleRealFamily() as f:
+    if known:f.o.scan();self.assertIn(m.birth(f.child_identity),f.o.rows)
+    real_stat=m.proc_stat;fired=[]
+    def barrier(pid):
+     value=real_stat(pid)
+     if pid==f.child and value and not fired:fired.append(True);f.reap()
+     return value
+    with patch.object(m,'proc_stat',side_effect=barrier):
+     if known: f.o.scan()
+     else:
+      with self.assertRaisesRegex(ValueError,'auth terminal requires durable child identity'):f.o.scan()
+    if known:
+     self.assertEqual(f.o.terminals[m.birth(f.child_identity)]['state'],'absent')
+     saved=json.loads((f.c.directory/'auth-lineage-install.json').read_text())
+     self.assertEqual(saved['terminals'][0]['state'],'absent')
+    self.assertTrue(fired);self.assertFalse(Path('/proc',str(f.child)).exists())
+    self.assertEqual(m.birth(f.child_identity) in f.o.rows,known)
+    AUTH_REAL_EVENTS.append({'case':'auth-child-exit-after-light','priorOwned':known,'actualWholePidAbsent':True,'newResult':'PASS' if known else 'FAIL','signals':f.signals})
+ def test_post_stop_scan_known_exit_stops_exact_parent_and_closes(self):
+  with AuthLifecycleRealFamily() as f:
+   f.o.scan();real_stat=m.proc_stat;fired=[]
+   def barrier(pid):
+    value=real_stat(pid)
+    if pid==f.child and value and not fired:fired.append(True);f.reap()
+    return value
+   with patch.object(m,'proc_stat',side_effect=barrier):
+    proof=f.o.close()
+    self.assertEqual(proof['unknownAdoptedChildren'],[])
+   self.assertEqual(f.p.returncode,-signal.SIGTERM)
+   self.assertEqual(f.signals,[(f.p.pid,int(signal.SIGTERM))])
+   self.assertIsNone(f.o.error)
+   AUTH_REAL_EVENTS.append({'case':'post-stop-scan-known-child-exit','newResult':'PASS','exactAgentStopped':True,'childWholeAbsent':True,'unknownSignal':False})
+ def test_retain_ledger_failure_does_not_create_completed_receipt(self):
+  with AuthLifecycleRealFamily() as f:
+   f.o.scan();f.reap();lineage=f.o.close()
+   with patch.object(f.c.ledger,'mutate',side_effect=OSError('injected-storage-error')):
+    with self.assertRaises(OSError):m.Controller.retain_auth_lineage(f.c,lineage)
+   self.assertNotIn('lineageClosed',f.c.ledger.load()['authentication'])
+   f.c.auth_note.assert_called_once_with('auth_lineage_failure',
+       {'stage':'retain','probe':'retain','error':'other-os','priorOwned':True})
+   AUTH_REAL_EVENTS.append({'case':'retain-ledger-error','exactAgentStopped':True,'closedReceipt':False,'result':'FAIL'})
+ def test_parent_exits_before_final_request_ack_fails(self):
+  with AuthLifecycleRealFamily() as f:
+   f.o.scan();f.reap();f.p.stdin.write('quit\n');f.p.stdin.flush();f.p.wait(2)
+   f.o.parent_stop_requested.set();f.o.thread.start()
+   with self.assertRaises(ValueError):f.o.prepare_parent_stop(time.monotonic()+1)
+   f.o.thread.join(2);self.assertIsNotNone(f.o.error);AUTH_REAL_EVENTS.append({'case':'parent-gone-before-final','result':'FAIL','ackNotSuccess':f.o.parent_stop_ack.is_set()})
+ def test_durable_write_failure_ack_not_success(self):
+  with AuthLifecycleRealFamily() as f:
+   f.o.parent_stop_requested.set()
+   with patch.object(m,'write_recovery_snapshot',side_effect=OSError('injected-private-storage-failure')):
+    f.o.thread.start()
+    with self.assertRaises(ValueError):f.o.prepare_parent_stop(time.monotonic()+1)
+    f.o.thread.join(2)
+   self.assertIsNotNone(f.o.error);self.assertFalse((f.c.directory/'auth-lineage-install.json').exists())
+   AUTH_REAL_EVENTS.append({'case':'durable-write-error','errorAck':f.o.parent_stop_ack.is_set(),'result':'FAIL'})
+ def test_real_zombie_to_absent_between_two_samples(self):
+  p=subprocess.Popen([sys.executable,'-c','import sys; print("ready",flush=True);sys.stdin.read(1)'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+  try:
+   self.assertEqual(p.stdout.readline().strip(),'ready');old=vm_tun.process_identity(p.pid);p.stdin.write('x');p.stdin.flush()
+   end=time.monotonic()+2
+   while m.proc_stat(p.pid)['state']!='Z':
+    self.assertLess(time.monotonic(),end);time.sleep(.001)
+   self.assertEqual(vm_tun.terminal_identity(old)['state'],'zombie')
+   actual=Path.read_text;reads=[]
+   def read(path,*a,**kw):
+    data=actual(path,*a,**kw)
+    if path==Path('/proc',str(p.pid),'stat') and not reads:reads.append(data);p.wait(2)
+    return data
+   with patch.object(Path,'read_text',read):
+    self.assertEqual(vm_tun.unverified_terminal_identity(old)['state'],'absent')
+   self.assertEqual(vm_tun.terminal_identity(old)['state'],'absent')
+   AUTH_REAL_EVENTS.append({'case':'real-zombie-to-absent','first':'same-birth-Z','barrier':'held-Popen.wait reaps','second':'whole-directory-ENOENT','newResult':'PASS','stableZ':'PASS','stableAbsent':'PASS'})
+  finally:
+   if p.poll() is None:p.terminate();p.wait(2)
+   p.stdin.close();p.stdout.close()
+
+
+class AuthDurableTerminalContracts(unittest.TestCase):
+    def setup_observer(self):
+        c, o, rows = PreParentStopLineageTests().observer()
+        c.auth_reached('lineage-start', 'install')
+        c.tun.terminal_identity.side_effect = lambda old: {'pid':old['pid'], 'startTime':old['startTime'],
+            'state':'absent', 'scope':'sampled-terminal-not-execution-identity'}
+        return c, o, rows
+
+    def test_failed_snapshot_cannot_promote_in_memory_child(self):
+        c,o,rows=self.setup_observer()
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc/90'),Path('/proc/91')]), \
+             patch.object(m,'proc_stat',side_effect=lambda pid:copy.deepcopy(rows.get(pid))), \
+             patch.object(m,'write_recovery_snapshot',side_effect=OSError('private')):
+            with self.assertRaises(OSError):o.scan()
+        self.assertIn(m.birth(rows[91]),o.rows)
+        self.assertNotIn(m.birth(rows[91]),o.durable_rows)
+        c.ops.proc.side_effect=lambda pid:copy.deepcopy(rows[90]) if pid==90 else None
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc/90'),Path('/proc/91')]), \
+             patch.object(m,'proc_stat',side_effect=lambda pid:copy.deepcopy(rows.get(pid))), \
+             patch.object(m,'write_recovery_snapshot'):
+            with self.assertRaises(ValueError):o.scan()
+        c.tun.terminal_identity.assert_not_called()
+
+    def test_prior_error_and_parent_change_never_become_terminal_success(self):
+        for fault in ('prior-error','reparent','uid','image','namespace','permission'):
+            c,o,rows=self.setup_observer()
+            with patch.object(m.Path,'iterdir',return_value=[Path('/proc/90'),Path('/proc/91')]), \
+                 patch.object(m,'proc_stat',side_effect=lambda pid:copy.deepcopy(rows.get(pid))), \
+                 patch.object(m,'write_recovery_snapshot'):
+                o.scan()
+                child=copy.deepcopy(rows[91]);child['state']='Z'
+                if fault=='prior-error':o.error='earlier-observation-incomplete'
+                if fault=='reparent':child['ppid']=92;rows[91]['ppid']=92
+                if fault=='uid':child['uid']=999
+                if fault=='image':child['exeInode']+=1
+                if fault=='namespace':child['namespaces']['pid']+=1
+                def proc(pid):
+                    if pid==91 and fault=='permission':raise PermissionError(13,'private')
+                    return copy.deepcopy(child if pid==91 else rows.get(pid))
+                c.ops.proc.side_effect=proc
+                with self.assertRaises((ValueError,PermissionError)):o.scan()
+            self.assertFalse(o.terminals)
+
+    def test_fixed_lineage_first_failure_is_independent_and_strict(self):
+        c=controller(m.AUTH_MODE);c.auth_reached('transaction-finish','install')
+        first={'stage':'pre-stop','probe':'candidate-identity','error':'enoent','priorOwned':True}
+        c.auth_lineage_failure(first)
+        c.auth_lineage_failure({**first,'stage':'close','probe':'reap'})
+        value=c.auth_snapshot();self.assertEqual(value['lineageFailure'],first)
+        self.assertIsNone(value['firstFailure']);self.assertIsNone(value['execution']['pump']['firstFailure'])
+        for key,bad in [('stage','RAW-SECRET'),('probe','RAW-SECRET'),('error','RAW-SECRET'),('priorOwned',1)]:
+            invalid=copy.deepcopy(value);invalid['lineageFailure'][key]=bad
+            with self.assertRaises(ValueError):m.validate_auth_runtime_observation(invalid)
+        invalid=copy.deepcopy(value);invalid['lineageFailure']['raw']='SECRET'
+        with self.assertRaises(ValueError):m.validate_auth_runtime_observation(invalid)
+
+    def test_auxiliary_child_terminal_failure_has_own_phase(self):
+        h=LayeredAuxiliaryTerminalContracts();c,o,rows,errors=h.setup()
+        c.auth_runtime=m.auth_runtime_observation(m.AUTH_GROUP_MODE)
+        c.auth_note=types.MethodType(m.Controller.auth_note,c);c.auth_reached('transaction-observer','install')
+        c.tun.unverified_terminal_identity.side_effect=vm_tun.TerminalIdentityError('terminal-live','fixed')
+        with self.assertRaises(ValueError):h.scan(o,rows)
+        failure=c.auth_snapshot()['candidateFailure']
+        self.assertEqual(failure['phase'],'auxiliary-terminal')
+        self.assertEqual(failure['probe'],'terminal-live')
+        self.assertFalse(o.auxiliary)
+
+
+class AuthLineageDiagnosticOriginTests(unittest.TestCase):
+    def test_unknown_orphan_is_never_labelled_prior_owned(self):
+        c,o,rows=PreParentStopLineageTests().observer()
+        orphan={**identity(92,0),'ppid':os.getpid()}
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc/92')]), \
+             patch.object(m,'proc_stat',return_value=orphan), \
+             patch.object(m,'write_recovery_snapshot'),patch.object(m,'stop_recorded',return_value=False):
+            with self.assertRaisesRegex(ValueError,'unobserved adopted child'):o.close()
+        self.assertEqual(o.first_failure, {'stage':'close','probe':'orphan-census','error':'contract','priorOwned':False})
+
+    def test_failure_record_does_not_wait_for_auth_or_ledger_and_snapshot_keeps_first(self):
+        c=controller(m.AUTH_MODE);c.auth_reached('lineage-start','install')
+        c.ledger.value['authentication']['agent']={'identity':identity(90)}
+        o=m.AuthObserver(c,'install');c.auth_observer=o
+        o.stage='pre-stop';o.probe='snapshot'
+        with patch.object(c,'auth_note') as note,patch.object(c.ledger,'mutate') as mutate:
+            o.note_failure(OSError('PRIVATE'))
+            o.note_failure(ValueError('PRIVATE'),'close','prior-error')
+            note.assert_not_called();mutate.assert_not_called()
+        value=c.auth_snapshot()
+        self.assertEqual(value['lineageFailure'],{'stage':'pre-stop','probe':'snapshot','error':'other-os','priorOwned':False})
+        self.assertIsNone(value['firstFailure'])
+        c.auth_failed('transaction-finish-credential-unconfirmed')
+        self.assertEqual(c.auth_snapshot()['lineageFailure'],value['lineageFailure'])
+
+if __name__ == '__main__': unittest.main(verbosity=2)
+

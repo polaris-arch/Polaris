@@ -594,8 +594,6 @@ class VMObservationTests(unittest.TestCase):
             self.assertEqual(tun.vm_error(e),wanted)
 
 
-if __name__ == '__main__':
-    unittest.main()
 
 class TransactionIdentityTests(unittest.TestCase):
     def observe(self, *, change=None, second_argv=None, second_uid=None, grow=False):
@@ -871,3 +869,37 @@ class OrdinaryExitCaptureProbeMatrix(unittest.TestCase):
             with self.assertRaises(tun.TransactionIdentityError) as caught:tun.transaction_identity(99999)
         self.assertEqual(caught.exception.error,'eacces')
         self.assertNotIn('private',str(caught.exception))
+
+
+class MonotonicTerminalContracts(unittest.TestCase):
+    def test_exact_zombie_then_two_whole_directory_absences(self):
+        old=identity();raw=f"{old['pid']} (fixture) "+' '.join(['Z',str(old['ppid'])]+['0']*17+[old['startTime']])
+        with patch.object(Path,'lstat',side_effect=[Mock(),FileNotFoundError(2,'directory'),FileNotFoundError(2,'directory')]) as dirs, \
+             patch.object(Path,'read_text',return_value=raw):
+            proof=tun.terminal_identity(old)
+        self.assertEqual(proof['state'],'absent');self.assertEqual(dirs.call_count,3)
+        self.assertNotIn('reaped',proof)
+
+    def test_transition_negative_matrix_has_fixed_probe_or_errno(self):
+        old=identity();fields=['Z',str(old['ppid'])]+['0']*17+[old['startTime']]
+        raw=lambda v:f"{old['pid']} (fixture) "+' '.join(v)
+        cases=[('live',['S']+fields[1:],'terminal-live'),
+               ('reuse',fields[:19]+['9999'],'terminal-birth'),
+               ('reparent',[fields[0],'9999']+fields[2:],'terminal-parent'),
+               ('malformed',[],'terminal-format')]
+        for _,v,probe in cases:
+            with patch.object(Path,'lstat',return_value=Mock()),patch.object(Path,'read_text',return_value=raw(v)):
+                with self.assertRaises(tun.TerminalIdentityError) as error:tun.terminal_identity(old)
+            self.assertEqual(error.exception.probe,probe)
+        for last in (Mock(),PermissionError(13,'private')):
+            with patch.object(Path,'lstat',side_effect=[Mock(),FileNotFoundError(2,'directory'),last]), \
+                 patch.object(Path,'read_text',return_value=raw(fields)):
+                with self.assertRaises((tun.TerminalIdentityError,PermissionError)):tun.terminal_identity(old)
+        with patch.object(Path,'lstat',side_effect=[FileNotFoundError(2,'directory'),Mock()]), \
+             patch.object(Path,'read_text',return_value=raw(fields)):
+            with self.assertRaises(tun.TerminalIdentityError) as error:tun.terminal_identity(old)
+        self.assertEqual(error.exception.probe,'terminal-transition')
+        with patch.object(Path,'lstat',return_value=Mock()),patch.object(Path,'read_text',side_effect=FileNotFoundError(2,'stat')):
+            with self.assertRaises(FileNotFoundError):tun.terminal_identity(old)
+
+if __name__ == '__main__': unittest.main()

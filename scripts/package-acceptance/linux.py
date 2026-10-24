@@ -973,13 +973,22 @@ const observe = function(id) {
           applyId:Number.isSafeInteger(event.applyId)&&event.applyId>0?event.applyId:null});
         if(observation.rows.length>512) observation.rows.shift();
       }
-      // NativeAutoReceipt is shape-only, never a command identity claim.
-      if (typeof data?.intentApplied==='boolean' && typeof data?.status?.featureEnabled==='boolean' &&
-          Number.isSafeInteger(data.status.generation) && data.status.generation>0 &&
-          ['saved','applied','pending','deferred'].includes(data.status.applyOutcome)) {
-        observation.rows.push({sequence:++observation.cursor,source:'original-auto-mode-callback',
-          success:raw?.success===true,intentApplied:data.intentApplied,featureEnabled:data.status.featureEnabled,
-          generation:data.status.generation,applyOutcome:data.status.applyOutcome});
+      // NativeAutoReceipt is shape-only: status polling lacks intentApplied.
+      // Mode actions add applyOutcome; selecting a default/retest does not.
+      // Absence is a serialization fact, never a fabricated pending/applied result.
+      if (data && typeof data==='object' && Object.hasOwn(data,'intentApplied')) {
+        const status=data.status, hasOutcome=status && typeof status==='object' && Object.hasOwn(status,'applyOutcome');
+        const valid=typeof raw?.success==='boolean' && typeof data.intentApplied==='boolean' &&
+          status && typeof status==='object' && !Array.isArray(status) &&
+          typeof status.featureEnabled==='boolean' && Number.isSafeInteger(status.generation) && status.generation>=0 &&
+          Array.isArray(status.nativeAutoGroups) && Array.isArray(status.nativeMeasurements) &&
+          (status.actualServerId===null || typeof status.actualServerId==='string') &&
+          (!hasOutcome || ['saved','applied','restarting','pending','deferred'].includes(status.applyOutcome));
+        observation.rows.push(valid ? {sequence:++observation.cursor,
+          source:hasOutcome?'original-auto-mode-callback':'original-auto-intent-compatible-callback',
+          success:raw.success,intentApplied:data.intentApplied,featureEnabled:status.featureEnabled,
+          generation:status.generation,...(hasOutcome?{applyOutcome:status.applyOutcome}:{})}
+          : {sequence:++observation.cursor,source:'original-auto-receipt-invalid'});
         if(observation.rows.length>512) observation.rows.shift();
       }
       // SaveOutcome remains shape-only. The UI click window and independent
@@ -2532,11 +2541,12 @@ return {count:1,checked:e.getAttribute('aria-checked'),disabled:!!e.disabled||e.
             wait_for(feature,lambda v:v=={'count':1,'checked':'true','disabled':False,'busy':'false'})
             wait_for(self.config,lambda c:c.get('autoSelectEnabled') is True)
             def mode_receipt():
-                rows=[r for r in self.driver.observations() if r.get('sequence',0)>cursor and r.get('source')=='original-auto-mode-callback']
+                rows=[r for r in self.driver.observations() if r.get('sequence',0)>cursor and r.get('source') in ('original-auto-mode-callback','original-auto-intent-compatible-callback','original-auto-receipt-invalid')]
                 gui_require(len(rows)<=1,'auto-feature-callback-ambiguous')
                 return rows[0] if rows else None
             receipt=wait_for(mode_receipt)
-            gui_require(receipt.get('success') is True and receipt.get('intentApplied') is True and
+            gui_require(receipt.get('source')=='original-auto-mode-callback' and
+                        receipt.get('success') is True and receipt.get('intentApplied') is True and
                         receipt.get('featureEnabled') is True and receipt.get('applyOutcome')=='applied' and
                         receipt.get('generation')==before.get('mainGeneration'),'auto-feature-mode-unconfirmed')
             preparation['modeReceipt']={k:receipt[k] for k in ('success','intentApplied','featureEnabled','generation','applyOutcome')}
@@ -2553,24 +2563,55 @@ return {count:1,checked:e.getAttribute('aria-checked'),disabled:!!e.disabled||e.
         expanded=self.driver.execute("return document.querySelector('#node-trigger')?.getAttribute('aria-expanded');")
         gui_require(expanded in ('true','false'),'auto-menu-state-invalid')
         if expanded=='false':self.driver.click('#node-trigger')
+        # Fence the existing user action, not a new session or mutation retry.
+        action_session=self.driver.session
+        action_fence={}
+        self.readiness_observation_fence(action_session,action_fence)
+        action_core=dict(self.core)
+        action_status=self.status()
+        self.same_core(action_core,status=action_status)
+        gui_require(action_status.get('mainGeneration')==before.get('mainGeneration'), 'auto-intent-generation-changed')
         cursor=max((r['sequence'] for r in self.driver.observations()),default=0)
         self.gui_phase('auto-enable-click')
         self.driver.click('#node-menu [data-auto-select-scope="global"] .auto-choice-pick')
         self.gui_phase('auto-intent-callback')
         def intent_receipt():
-            rows=[r for r in self.driver.observations() if r.get('sequence',0)>cursor and r.get('source')=='original-auto-mode-callback']
+            rows=[r for r in self.driver.observations() if r.get('sequence',0)>cursor and r.get('source') in ('original-auto-mode-callback','original-auto-intent-compatible-callback','original-auto-receipt-invalid')]
             gui_require(len(rows)<=1,'auto-intent-callback-ambiguous')
             return rows[0] if rows else None
         receipt=wait_for(intent_receipt)
-        gui_require(receipt.get('success') is True and receipt.get('intentApplied') is True and
-                    receipt.get('featureEnabled') is True and receipt.get('applyOutcome') in ('applied','pending','deferred') and
-                    type(receipt.get('generation')) is int and receipt['generation']==before.get('mainGeneration'),
-                    'auto-intent-unconfirmed')
+        preparation['intentCallbackClass']=receipt.get('source') if receipt.get('source') in (
+            'original-auto-mode-callback','original-auto-intent-compatible-callback','original-auto-receipt-invalid') else 'unknown'
+        gui_require(receipt.get('source')=='original-auto-intent-compatible-callback' and 'applyOutcome' not in receipt and
+                    receipt.get('success') is True and receipt.get('intentApplied') is True and
+                    receipt.get('featureEnabled') is True and type(receipt.get('generation')) is int and
+                    receipt['generation']==before.get('mainGeneration'), 'auto-intent-unconfirmed')
         preparation['intentAssociation']='shape-only-click-window'
-        preparation['intentReceipt']={k:receipt[k] for k in ('success','intentApplied','featureEnabled','generation','applyOutcome')}
+        preparation['intentReceipt']={k:receipt[k] for k in ('success','intentApplied','featureEnabled','generation')}
         self.gui_phase('auto-intent-readback')
-        wait_for(self.config,lambda c:c.get('autoSelectEnabled') is True and
-                 c.get('selectionIntent')=={'mode':'auto','scope':'global'})
+        intent_wait=self.new_status_observation('auto',time.monotonic()+30)
+        def intent_readback():
+            self.readiness_observation_fence(action_session,action_fence)
+            config=self.config()
+            control=self.driver.execute("""
+const rows=[...document.querySelectorAll('#node-menu [data-auto-select-scope="global"] .auto-choice-pick')].filter(e=>e.getClientRects().length&&getComputedStyle(e).visibility==='visible');
+if(rows.length!==1)return {count:rows.length};const e=rows[0];
+return {count:1,pressed:e.getAttribute('aria-pressed'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',busy:e.closest('[data-auto-select-controls]').getAttribute('aria-busy')};
+""")
+            current=self.status()
+            self.same_core(action_core,status=current)
+            gui_require(current.get('mainGeneration')==action_status.get('mainGeneration'), 'auto-intent-generation-changed')
+            saved=self.config()
+            gui_require(saved==config,'auto-intent-saved-state-changed')
+            self.readiness_observation_fence(action_session,action_fence)
+            if (config.get('autoSelectEnabled') is True and
+                    config.get('selectionIntent')=={'mode':'auto','scope':'global'} and
+                    control=={'count':1,'pressed':'true','disabled':False,'busy':'false'}):
+                gui_require(intent_receipt()==receipt,'auto-intent-callback-changed')
+                return True
+            return None
+        self.wait_status_proof(intent_wait,intent_readback)
+        preparation['intentReadback']={'savedGlobal':True,'selectedControl':True,'settled':True}
         self.gui_phase('auto-graph-activation')
         proof=self.activate_saved_graph(True,self.auto_saved,self.auto_runtime,'autoActivations',phase_prefix='auto')
         self.gui_phase('auto-baseline-ready')

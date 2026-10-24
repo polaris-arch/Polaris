@@ -1231,6 +1231,36 @@ class AuthenticationRuntimeConsumerTests(unittest.TestCase):
         self.assertEqual(result['state'],'failed')
         self.assertEqual(client.lifecycle['abortReceipt']['authenticationRuntime']['candidateFailure'],failure)
 
+    def test_lineage_failure_real_producer_to_error_and_abort_consumer(self):
+        import root_controller, threading, copy
+        producer=root_controller.Controller.__new__(root_controller.Controller)
+        producer.auth_runtime_lock=threading.RLock();producer.auth_checkpoint=Mock()
+        producer.auth_runtime=root_controller.auth_runtime_observation(root_controller.AUTH_GROUP_MODE)
+        producer.auth_runtime['kind']='install';producer.auth_runtime['lastReached']='transaction-observer'
+        producer.auth_runtime['firstFailure']={'stage':'transaction-observer','code':'transaction-candidate-unconfirmed'}
+        failure={'stage':'pre-stop','probe':'final-parent','error':'contract','priorOwned':True}
+        producer.auth_lineage_failure(failure)
+        for fault in (None,'stage','probe','error','extra','priorOwned'):
+            observation=copy.deepcopy(producer.auth_runtime)
+            if fault is not None:observation['lineageFailure'][fault]='PRIVATE'
+            client=M.Controller();client.closed=False
+            payload={'seq':1,'ok':False,'error':{'stage':'dispatch','code':'CONTROLLER_FAILED','authenticationRuntime':observation}}
+            with patch.object(client,'_write'),patch.object(client,'_read',return_value=payload):
+                with self.assertRaises(ValueError):client.call('transaction_scan',kind='install')
+            saved=client.lifecycle['rootOperationFailure']
+            if fault is None:self.assertEqual(saved['authenticationRuntime']['lineageFailure'],failure)
+            else:self.assertNotIn('authenticationRuntime',saved)
+            self.assertNotIn('PRIVATE',json.dumps(client.lifecycle))
+        receipt={'schema':'polaris-root-abort-v1','state':'failed','forced':True,'prepared':True,
+            'actualReadOnlyAuth':None,'unknown':['authentication-lease-recovery-unknown'],
+            'authenticationRuntime':producer.auth_runtime,'productCleanup':{'state':'forced','forced':True,'unknown':[],
+                'publicationEligible':False}}
+        client=M.Controller();client.child=Mock();client.child.wait.return_value=1
+        client.lifecycle.update(ready=True,spawned=True)
+        with patch.object(client,'call',return_value=receipt):result=client.recover()
+        self.assertEqual(result['state'],'failed')
+        self.assertEqual(client.lifecycle['abortReceipt']['authenticationRuntime']['lineageFailure'],failure)
+
     def test_abort_keeps_safe_partial_proof_without_promoting_failure(self):
         import root_controller
         observation=root_controller.auth_runtime_observation(root_controller.AUTH_GROUP_MODE)

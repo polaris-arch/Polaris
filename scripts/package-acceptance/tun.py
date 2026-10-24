@@ -534,6 +534,15 @@ def transaction_identity(pid):
         raise TransactionIdentityError(phase, error, probe, identities, uid_reads) from None
 
 
+TERMINAL_PROBES = ('terminal-live', 'terminal-birth', 'terminal-parent', 'terminal-format',
+                   'terminal-transition', 'terminal-reappeared')
+
+class TerminalIdentityError(ValueError):
+    def __init__(self, probe, message):
+        super().__init__(message)
+        self.probe = probe
+
+
 def terminal_identity(old):
     """Only a caller-held strong birth may use this sampled terminal proof.
 
@@ -550,12 +559,32 @@ def terminal_identity(old):
         except FileNotFoundError:
             observed.append(('absent', None)); continue
         raw = (directory / 'stat').read_text()
-        fields = raw[raw.rindex(')') + 2:].split()
-        require(fields[19] == old['startTime'] and fields[0] == 'Z' and
-                int(fields[1]) == old['ppid'], 'held process not same-birth terminal')
+        try:
+            fields = raw[raw.rindex(')') + 2:].split()
+            if len(fields) < 20 or not fields[19].isdigit() or not fields[1].isdigit():
+                raise ValueError('malformed stat')
+        except (ValueError, IndexError):
+            raise TerminalIdentityError('terminal-format', 'terminal stat malformed') from None
+        if fields[19] != old['startTime']:
+            raise TerminalIdentityError('terminal-birth', 'held process not same-birth terminal')
+        if int(fields[1]) != old['ppid']:
+            raise TerminalIdentityError('terminal-parent', 'held process not same-birth terminal')
+        if fields[0] != 'Z':
+            raise TerminalIdentityError('terminal-live', 'held process not same-birth terminal')
         observed.append(('zombie', (fields[19], int(fields[1]))))
-    require(observed[0] == observed[1], 'terminal observation changed')
-    return {'pid': old['pid'], 'startTime': old['startTime'], 'state': observed[0][0],
+    if observed[0][0] == 'zombie' and observed[1][0] == 'absent':
+        # A held same-birth/parent zombie can only disappear after reaping.
+        # Confirm whole-directory absence again; never infer it from an exe or
+        # stat read failure, and never accept the reverse or a live observation.
+        try: directory.lstat()
+        except FileNotFoundError: pass
+        else: raise TerminalIdentityError('terminal-reappeared', 'terminal directory reappeared')
+        state = 'absent'
+    else:
+        if observed[0] != observed[1]:
+            raise TerminalIdentityError('terminal-transition', 'terminal observation changed')
+        state = observed[0][0]
+    return {'pid': old['pid'], 'startTime': old['startTime'], 'state': state,
             'scope': 'sampled-terminal-not-execution-identity'}
 
 
