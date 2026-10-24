@@ -1801,4 +1801,81 @@ class AuthenticationSnapshotConcurrencyTests(unittest.TestCase):
         p=c.auth_snapshot()['execution']['pump'];self.assertEqual(p['firstFailure']['code'],'activity-deadline')
         self.assertEqual(p['stoppedBy'],'deadline');self.assertFalse(lease.authenticated);lease.close.assert_called_once()
 
+
+class OwnedProcessAgentPreferenceTests(unittest.TestCase):
+    def registration(self, mode, *, notify=True, exited=None, bad_identity=False, transaction=False):
+        from contextlib import ExitStack
+        c=group_controller() if mode==m.AUTH_GROUP_MODE else controller(mode)
+        c.auth_reached('transaction-guard','install')
+        child=Mock(pid=90);child.poll.return_value=exited;child.wait.return_value=exited
+        c.tools['pkttyagent']={'sha256':H}
+        c.tun.executable_identity.return_value={'sha256':H}
+        row={**identity(90),'ppid':os.getpid(),'uid':1001}
+        if bad_identity:row['namespaces']={**row['namespaces'],'net':999}
+        c.ops.proc.return_value=row
+        with ExitStack() as stack:
+            for target,value in (('pty.openpty',(901,902)),('os.pipe',(903,904))):
+                stack.enter_context(patch(target,return_value=value))
+            stack.enter_context(patch.object(m.pwd,'getpwuid',return_value=types.SimpleNamespace(pw_uid=1001,pw_gid=1001)))
+            stack.enter_context(patch.object(m.os,'fchown'));stack.enter_context(patch.object(m.os,'fchmod'))
+            close=stack.enter_context(patch.object(m.os,'close'))
+            stack.enter_context(patch.object(m.os,'read',return_value=b''))
+            stack.enter_context(patch.object(m.select,'select',return_value=([903],[],[]) if notify else ([],[],[])))
+            spawn=stack.enter_context(patch.object(m.subprocess,'Popen',return_value=child))
+            lease=stack.enter_context(patch.object(m,'CredentialLease'))
+            error=None
+            try:result=c.transaction_begin('install') if transaction else c.agent_register()
+            except Exception as exc:error=exc;result=None
+        return c,child,spawn,lease,close,result,error
+    def test_complete_argv_modes_exact_subject_and_private_notify(self):
+        for mode in (m.AUTH_MODE,m.AUTH_GROUP_MODE,'pkttyagent-observe'):
+            with self.subTest(mode=mode):
+                c,child,spawn,lease,close,result,error=self.registration(mode)
+                self.assertIsNone(error);self.assertTrue(result['registered']);self.assertFalse(result['authenticated'])
+                expected=['/usr/bin/setsid','--ctty','/usr/bin/setpriv','--reuid=1001','--regid=1001',
+                    '--clear-groups','--bounding-set=-all','--inh-caps=-all','--ambient-caps=-all',
+                    '/usr/bin/pkttyagent','--process',str(c.gui['pid'])+','+c.gui['startTime'],'--notify-fd','904']
+                if mode!=m.AUTH_GROUP_MODE:expected.append('--fallback')
+                self.assertEqual(spawn.call_args.args[0],expected)
+                self.assertEqual(spawn.call_args.kwargs,{'env':m.ENV,'stdin':902,'stdout':902,'stderr':902,'pass_fds':(904,)})
+                self.assertEqual(c.ledger.load()['authentication']['subject'],{'pid':c.gui['pid'],'startTime':c.gui['startTime']})
+                self.assertTrue(c.auth_snapshot()['execution']['agent']['registrationLive'])
+                child.kill.assert_not_called();lease.assert_not_called()
+                self.assertEqual([call.args[0] for call in close.call_args_list],[902,904,903])
+    def test_existing_session_and_duplicate_local_handle_do_not_spawn(self):
+        for mode in ('existing-session',m.AUTH_MODE,m.AUTH_GROUP_MODE):
+            c=group_controller() if mode==m.AUTH_GROUP_MODE else controller(mode)
+            if mode!='existing-session':c.agent=Mock()
+            with patch('pty.openpty') as pty_open,patch.object(m.subprocess,'Popen') as spawn:
+                with self.assertRaises(ValueError):c.agent_register()
+            pty_open.assert_not_called();spawn.assert_not_called()
+    def test_existing_subject_registration_rejection_never_opens_lease_or_replaces_agent(self):
+        # Polkit's duplicate-subject rejection is an agent exit, not permission
+        # to unregister the existing process/session agent or retry registration.
+        for mode in (m.AUTH_MODE,m.AUTH_GROUP_MODE):
+            c,child,spawn,lease,close,result,error=self.registration(mode,exited=127,transaction=True)
+            self.assertIsInstance(error,ValueError);spawn.assert_called_once();lease.assert_not_called()
+            child.kill.assert_called_once();child.wait.assert_called_once_with(timeout=5)
+            self.assertTrue(c.failed);self.assertNotIn('registered',c.ledger.load()['authentication'])
+            c.ops.run.assert_not_called()
+    def test_notify_and_exact_birth_identity_failure_still_reap_without_lease(self):
+        for mode in (m.AUTH_MODE,m.AUTH_GROUP_MODE):
+            for options in ({'notify':False},{'bad_identity':True}):
+                with self.subTest(mode=mode,options=options):
+                    c,child,spawn,lease,close,result,error=self.registration(mode,transaction=True,**options)
+                    self.assertIsInstance(error,ValueError);lease.assert_not_called()
+                    child.kill.assert_called_once();child.wait.assert_called_once_with(timeout=5)
+                    self.assertTrue(c.failed)
+    def test_preference_change_does_not_add_policy_or_budget_actions(self):
+        import inspect
+        block=inspect.getsource(m.Controller.agent_register)
+        self.assertNotIn('unregister',block.split('        try:',1)[1])
+        self.assertNotIn('systemctl',block);self.assertNotIn('pkexec',block)
+        self.assertEqual(m.GROUP_ACTIVITY_SECONDS,20)
+        self.assertEqual(m.GROUP_RECOVERY_RESERVE,70)
+        self.assertEqual(m.GROUP_RECOVERY_SERVICE_SECONDS,70)
+        for mode in (m.AUTH_MODE,m.AUTH_GROUP_MODE):
+            c=group_controller() if mode==m.AUTH_GROUP_MODE else controller(mode)
+            self.assertEqual(m.validate_permission(c.launch)['maxLeaseSeconds'],90)
+
 if __name__ == '__main__': unittest.main(verbosity=2)

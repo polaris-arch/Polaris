@@ -1730,7 +1730,13 @@ class Controller:
         argv = ['/usr/bin/setsid', '--ctty', '/usr/bin/setpriv', '--reuid=' + str(user.pw_uid),
                 '--regid=' + str(user.pw_gid), '--clear-groups', '--bounding-set=-all', '--inh-caps=-all', '--ambient-caps=-all',
                 '/usr/bin/pkttyagent', '--process', str(self.gui['pid']) + ',' + self.gui['startTime'],
-                '--notify-fd', str(notify_fd), '--fallback']
+                '--notify-fd', str(notify_fd)]
+        # The approved joint credential mode uses this exact GUI agent, not a
+        # session-selected fallback. Normal process registration still rejects
+        # an existing same-subject agent; never unregister or replace one.
+        # Password-only and passive observation retain their prior preference.
+        if self.launch['authenticationMode'] != AUTH_GROUP_MODE:
+            argv.append('--fallback')
         self.ledger.mutate(lambda v: v['authentication'].update(agentSpawnPending=True, lineageClosed=None, agentStopObserved=None))
         try:
             child = subprocess.Popen(argv, env=ENV, stdin=slave, stdout=slave, stderr=slave, pass_fds=(notify_fd,))

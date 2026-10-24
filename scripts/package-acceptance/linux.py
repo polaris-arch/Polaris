@@ -27,8 +27,7 @@ import subprocess
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
+import http.client
 
 SCHEMA = 'polaris-linux-package-acceptance-v1'
 CASES = ('default_dashboard', 'gui_selection', 'gui_on_off',
@@ -997,7 +996,8 @@ def native_bridge_state(value, command=None):
 
 class WebDriver:
     def __init__(self, port):
-        self.url = f'http://127.0.0.1:{port}'
+        require(type(port) is int and 0 < port < 65536, 'native driver port required')
+        self.port = port
         self.session = None
 
     def request(self, method, path, data=None, timeout=25):
@@ -1049,29 +1049,67 @@ class WebDriver:
             row['elapsedMs'] = max(0, int((time.monotonic() - started) * 1000))
 
     def _request(self, method, path, data=None, timeout=25):
+        require(type(timeout) in (int, float) and 0 < timeout < float('inf'), 'finite request timeout required')
         raw = None if data is None else json.dumps(data).encode()
-        request = urllib.request.Request(self.url + path, data=raw, method=method,
-                                         headers={'Content-Type': 'application/json'})
+        deadline = time.monotonic() + timeout
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=timeout)
+        response = None
+        wire = None
+        def budget(touch_wire=True):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('native driver request budget exhausted')
+            connection.timeout = remaining
+            if touch_wire and wire is not None:
+                wire.settimeout(remaining)
         try:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(request, timeout=timeout) as response:
-                self._http_status = getattr(response, 'status', None)
-                body = json.load(response)
-        except urllib.error.HTTPError as error:
-            # Never echo remote response strings: they may contain fixture secrets.
-            protocol = None
+            budget()
+            # Fresh direct connection, no proxy, pooling, redirect or replay.
+            # Do not propagate urllib's hop-by-hop Connection:close upstream.
+            connection.request(method, path, body=raw, headers={'Content-Type': 'application/json'})
+            wire = connection.sock
+            budget()
+            response = connection.getresponse()
+            self._http_status = response.status
+            budget(False)
+            chunks = []
+            error_remaining = None if 200 <= response.status < 300 else 16385
+            while not response.isclosed() and error_remaining != 0:
+                budget()
+                chunk = response.read1(65536 if error_remaining is None else min(65536, error_remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if error_remaining is not None:
+                    error_remaining -= len(chunk)
+            budget(False)
+            if error_remaining is None and response.length not in (None, 0):
+                raise http.client.IncompleteRead(b'', response.length)
+            body = b''.join(chunks)
+            if error_remaining is not None:
+                protocol = None
+                try:
+                    if len(body) <= 16384:
+                        protocol = json.loads(body).get('value', {}).get('error')
+                except (ValueError, AttributeError, TypeError):
+                    pass
+                raise GuiFailure('webdriver-http-error', response.status, protocol)
+            value = json.loads(body).get('value')
+            budget(False)
+            if isinstance(value, dict) and 'error' in value:
+                raise GuiFailure('webdriver-protocol-error', protocol=value.get('error'))
+            return value
+        finally:
+            # getresponse may detach a closing socket from HTTPConnection.
+            # Close both holders even when parsing/protocol/budget checks fail.
             try:
-                raw = error.read(16385)
-                if len(raw) <= 16384:
-                    parsed = json.loads(raw)
-                    protocol = parsed.get('value', {}).get('error')
-            except Exception:
-                pass
-            raise GuiFailure('webdriver-http-error', error.code, protocol) from None
-        value = body.get('value')
-        if isinstance(value, dict) and 'error' in value:
-            raise GuiFailure('webdriver-protocol-error', protocol=value.get('error'))
-        return value
+                if response is not None:
+                    response.close()
+            finally:
+                connection.close()
+        # Socket timeouts bound individual blocking operations. Header parsing
+        # inside getresponse is stdlib-owned; elapsed checks reject late returns,
+        # not a claim of a preemptive hard wall-clock bound for slow-drip headers.
 
     def start(self, entry):
         value = self.request('POST', '/session', {'capabilities': {'alwaysMatch': {

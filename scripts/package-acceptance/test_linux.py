@@ -543,7 +543,8 @@ class PrimitiveTests(unittest.TestCase):
         self.assertIn("invalid_result = self.apply('rejected')", source)
         self.assertIn("'candidateSetup': 'native-config-save-fixture'", source)
         self.assertIn("'zeroEgressClaim': False", source)
-        self.assertIn('ProxyHandler({})', source)
+        self.assertIn("http.client.HTTPConnection('127.0.0.1', self.port", source)
+        self.assertNotIn('urllib.request', source)
         self.assertNotIn("except NativeRejected:", source)
         self.assertIn("self.restart_case(wanted)", source)
         self.assertLess(source.index('self.restart_case(wanted)'), source.index("rpc = self.rpc('suite'"))
@@ -1109,9 +1110,9 @@ process.stdout.write(JSON.stringify(value));
         for remote, expected in [('element click intercepted','element click intercepted'),('secret-value','unknown'),({'secret':'value'},'unknown')]:
             driver=M.WebDriver(1)
             raw=json.dumps({'value':{'error':remote,'message':'SECRET','stacktrace':'SECRET'}}).encode()
-            error=M.urllib.error.HTTPError('http://localhost',400,'SECRET',{},io.BytesIO(raw))
-            opener=Mock();opener.open.side_effect=error
-            with patch.object(M.urllib.request,'build_opener',return_value=opener):
+            response=Mock(status=400, length=0); response.isclosed.return_value=False; response.read1.side_effect=[raw,b'']
+            connection=Mock(); connection.getresponse.return_value=response
+            with patch.object(M.http.client,'HTTPConnection',return_value=connection):
                 with self.assertRaises(M.GuiFailure) as raised:driver.request('POST','/safe',{})
             self.assertEqual(M.gui_failure(raised.exception),{'code':'webdriver-http-error','httpStatus':400,'protocol':expected})
             self.assertNotIn('SECRET',str(raised.exception))
@@ -1154,10 +1155,10 @@ class DriverObservationTests(unittest.TestCase):
     def test_http_error_retains_status_and_whitelisted_protocol_without_remote_text(self):
         import io
         driver = M.WebDriver(1); driver.session = 'SECRET-SESSION'
-        error = M.urllib.error.HTTPError('http://SECRET', 500, 'SECRET', {},
-            io.BytesIO(json.dumps({'value': {'error': 'script timeout', 'message': 'SECRET'}}).encode()))
-        with patch.object(M.urllib.request, 'build_opener') as opener:
-            opener.return_value.open.side_effect = error
+        response = Mock(status=500, length=0); response.isclosed.return_value = False
+        response.read1.side_effect = [json.dumps({'value': {'error': 'script timeout', 'message': 'SECRET'}}).encode(), b'']
+        connection = Mock(); connection.getresponse.return_value = response
+        with patch.object(M.http.client, 'HTTPConnection', return_value=connection):
             with self.assertRaises(M.GuiFailure): driver.invoke('proxy_get_status')
         row = driver.observation['firstFailure']
         self.assertEqual((row['httpStatus'], row['protocol']), (500, 'script timeout'))
@@ -1477,6 +1478,118 @@ class SavedPreferenceTests(unittest.TestCase):
         source=Path(M.__file__).read_text();body=source.split('    def preference(self, wanted):',1)[1].split('    def socket(',1)[0]
         self.assertNotIn('self.config(',body);self.assertNotIn('invoke(',body)
         self.assertIn('wait_for(closed, timeout=12)',source)
+
+
+class DriverWireTests(unittest.TestCase):
+    def fixture(self, mode):
+        import contextlib
+        import time
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        @contextlib.contextmanager
+        def serve():
+            rows=[]; closed=threading.Event()
+            class Handler(BaseHTTPRequestHandler):
+                protocol_version='HTTP/1.1'
+                def log_message(self,*args): pass
+                def do_POST(self):
+                    body=self.rfile.read(int(self.headers.get('Content-Length','0')))
+                    rows.append({'headers':dict(self.headers),'body':body,'path':self.path})
+                    if mode=='eof': self.close_connection=True; return
+                    if mode=='timeout': time.sleep(.3);self.close_connection=True;return
+                    code=200; value={'ok':True,'padding':'x'*100000}
+                    if mode in ('http','w3c'): value={'error':'invalid session id','message':'PRIVATE'}
+                    if mode in ('http','huge-error'):code=404
+                    if mode=='redirect':code=302
+                    raw=json.dumps({'value':value}).encode() if mode!='json' else b'not-json'
+                    self.send_response(code)
+                    if mode in ('chunked','chunked-incomplete'):
+                        self.send_header('Transfer-Encoding','chunked')
+                    else:
+                        self.send_header('Content-Length',str(len(raw)+(10 if mode=='valid-json-truncated' else 0)))
+                    if mode=='close':self.send_header('Connection','close')
+                    if mode=='redirect':self.send_header('Location','http://127.0.0.1:1/private')
+                    self.end_headers()
+                    try:
+                        if mode in ('chunked','chunked-incomplete'):
+                            self.wfile.write(('%x\r\n'%len(raw)).encode()+raw+b'\r\n')
+                            if mode=='chunked':self.wfile.write(b'0\r\n\r\n')
+                            else:self.close_connection=True
+                            self.wfile.flush();return
+                        if mode=='valid-json-truncated':
+                            self.wfile.write(raw);self.wfile.flush();self.close_connection=True;return
+                        if mode=='partial':
+                            self.wfile.write(raw[:5]);self.wfile.flush();self.close_connection=True;return
+                        if mode=='slow':
+                            for chunk in (raw[:1],raw[1:2],raw[2:3],raw[3:]):
+                                self.wfile.write(chunk);self.wfile.flush();time.sleep(.06)
+                        else:self.wfile.write(raw);self.wfile.flush()
+                    except (BrokenPipeError,ConnectionResetError):pass
+                def finish(self):
+                    try:super().finish()
+                    finally:closed.set()
+            server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+            thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            try:yield server.server_port,rows,closed
+            finally:server.shutdown();server.server_close();thread.join(2)
+        return serve()
+
+    def test_real_wire_success_and_server_close_consume_full_body_without_hop_header(self):
+        for mode in ('success','close','chunked'):
+            with self.subTest(mode=mode),self.fixture(mode) as (port,rows,closed):
+                driver=M.WebDriver(port)
+                value=driver.request('POST','/session/fixed/execute/sync',{'fixture':True},timeout=1)
+                self.assertTrue(value['ok']);self.assertEqual(len(value['padding']),100000)
+                self.assertTrue(closed.wait(1));self.assertEqual(len(rows),1)
+                self.assertNotIn('connection',{k.lower() for k in rows[0]['headers']})
+                self.assertEqual(json.loads(rows[0]['body']),{'fixture':True})
+
+    def test_real_wire_errors_fail_once_without_replay_or_redirect(self):
+        for mode,error in [('eof',M.http.client.RemoteDisconnected),('timeout',TimeoutError),
+            ('slow',TimeoutError),('http',M.GuiFailure),('huge-error',M.GuiFailure),('w3c',M.GuiFailure),
+            ('redirect',M.GuiFailure),('json',json.JSONDecodeError),('partial',M.http.client.IncompleteRead),
+            ('valid-json-truncated',M.http.client.IncompleteRead),('chunked-incomplete',M.http.client.IncompleteRead)]:
+            with self.subTest(mode=mode),self.fixture(mode) as (port,rows,closed):
+                driver=M.WebDriver(port);driver.session='fixed'
+                with self.assertRaises(error):
+                    driver.request('POST',driver.path('/execute/async'),{'fixture':True},timeout=.12)
+                self.assertTrue(closed.wait(1));self.assertEqual(len(rows),1)
+                self.assertNotIn('connection',{k.lower() for k in rows[0]['headers']})
+                self.assertEqual(driver.observation['firstFailure']['state'],'failed')
+                self.assertNotIn('PRIVATE',json.dumps(driver.observation))
+
+    def test_error_body_bound_closes_without_reading_remaining_bytes(self):
+        driver=M.WebDriver(1);response=Mock(status=500,length=999999)
+        response.isclosed.return_value=False
+        response.read1.return_value=b'x'*16385
+        connection=Mock();connection.getresponse.return_value=response
+        with patch.object(M.http.client,'HTTPConnection',return_value=connection):
+            with self.assertRaises(M.GuiFailure) as error:driver.request('POST','/fixed',{})
+        response.read1.assert_called_once_with(16385)
+        response.close.assert_called_once();connection.close.assert_called_once()
+        self.assertEqual(M.gui_failure(error.exception),{'code':'webdriver-http-error','httpStatus':500,'protocol':'unknown'})
+
+    def test_invalid_budget_never_connects(self):
+        for timeout in (0,-1,True,float('inf'),float('nan'),'25'):
+            with self.subTest(timeout=timeout),patch.object(M.http.client,'HTTPConnection') as create:
+                with self.assertRaises(ValueError):M.WebDriver(1)._request('POST','/fixed',{},timeout)
+                create.assert_not_called()
+
+    def test_header_return_over_budget_is_failed_and_all_handles_closed(self):
+        driver=M.WebDriver(1);response=Mock(status=200,length=0)
+        connection=Mock();connection.getresponse.return_value=response
+        with patch.object(M.http.client,'HTTPConnection',return_value=connection), \
+             patch.object(M.time,'monotonic',side_effect=[0,0,0,26]):
+            with self.assertRaises(TimeoutError):driver._request('POST','/fixed',{},timeout=25)
+        connection.request.assert_called_once();response.close.assert_called_once();connection.close.assert_called_once()
+
+    def test_http_connection_is_fresh_for_every_mutation_and_read(self):
+        for command in ('config_get','config_save','proxy_get_status'):
+            driver=M.WebDriver(1);driver.session='fixed';conn=Mock()
+            conn.getresponse.side_effect=M.http.client.RemoteDisconnected()
+            with patch.object(M.http.client,'HTTPConnection',return_value=conn) as create:
+                with self.assertRaises(M.http.client.RemoteDisconnected):driver.invoke(command)
+            create.assert_called_once();conn.request.assert_called_once();conn.close.assert_called_once()
 
 
 if __name__ == '__main__':
