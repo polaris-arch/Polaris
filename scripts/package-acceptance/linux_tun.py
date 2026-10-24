@@ -25,6 +25,7 @@ import time
 import linux as base
 import tun
 import tun_fixtures as fixture
+import helper_observation
 
 require = base.require
 HERE = Path(__file__).resolve().parent
@@ -347,22 +348,32 @@ root ledger confirms every observed birth. Missing observations fail forever.
 
 
 TUN_OBSERVER = r'''
-const state={rows:[],cursor:0,failed:false};
+const state={rows:[],cursor:0,failed:false,started:performance.now(),firstHelperFailure:null,firstOuterFailure:null,firstUnclassified:null,context:null};
+const project=__HELPER_PROJECTOR__;
 const callbacks=window.__TAURI_INTERNALS__?.callbacks, prior=callbacks?.get;
 if(!(callbacks instanceof Map)||typeof prior!=='function'||window.__tunObservation) throw Error('TUN callback observer unavailable');
 Object.defineProperty(callbacks,'get',{configurable:true,value:function(id){
  const callback=Reflect.apply(prior,this,[id]); if(typeof callback!=='function')return callback;
  return function(...args){try{const raw=args[0],d=raw?.data;
-  if(typeof d?.success==='boolean'&&typeof d?.status?.installed==='boolean'&&typeof d?.status?.supported==='boolean')
-   state.rows.push({sequence:++state.cursor,kind:'helper',envelopeSuccess:raw.success===true,success:d.success,
-     installed:d.status.installed,ready:d.status.ready===true,supported:d.status.supported});
+  const projected=project(raw);
+  if(projected){
+   const row={sequence:++state.cursor,kind:'helperObservation',observedElapsedMs:Math.max(0,Math.floor(performance.now()-state.started)),projection:projected};
+   state.rows.push(row);
+   if(projected.kind==='helperAction'&&projected.actionSuccess===false&&!state.firstHelperFailure)state.firstHelperFailure=row;
+   if(projected.kind==='outerFailure'&&!state.firstOuterFailure)state.firstOuterFailure=row;
+  }else if(state.context!==null){
+   const type=raw===null?'null':Array.isArray(raw)?'array':typeof raw;
+   const row={sequence:++state.cursor,kind:'unclassifiedCallback',observedElapsedMs:Math.max(0,Math.floor(performance.now()-state.started)),
+    valueType:['null','array','object','string','number','boolean','undefined'].includes(type)?type:'other'};
+   state.rows.push(row);if(!state.firstUnclassified)state.firstUnclassified=row;
+  }
   if(typeof d?.status==='string'&&typeof d?.pendingApply==='boolean'&&Array.isArray(d.reasons))
    state.rows.push({sequence:++state.cursor,kind:'apply',status:d.status,
     reasons:d.reasons.map(r=>({code:r.code,path:r.path}))});
   if(state.rows.length>256)state.rows.shift();
  }catch(_){state.failed=true;}return Reflect.apply(callback,this,args);};
 }});Object.defineProperty(window,'__tunObservation',{value:state});return true;
-'''
+'''.replace('__HELPER_PROJECTOR__', helper_observation.PROJECTOR_JS)
 
 
 def direct_driver(supervisor):
@@ -608,7 +619,90 @@ class TunCarrierRun(base.CarrierRun):
         return initial
 
     def tun_observations(self):
-        return self.driver.execute("if(window.__tunObservation.failed) throw Error('TUN observer failed'); return window.__tunObservation.rows;")
+        return self.driver.execute("const s=window.__tunObservation;if(s.failed) throw Error('TUN observer failed');const rows=s.rows.slice();for(const first of [s.firstHelperFailure,s.firstOuterFailure,s.firstUnclassified])if(first&&!rows.some(r=>r.sequence===first.sequence))rows.unshift(first);return rows;")
+
+    def helper_observations(self, kind, cursor, rows):
+        # Click context is not native command identity; never attribute an outer
+        # failure to helper authorization solely because it arrived in this window.
+        require(kind in ('install', 'uninstall') and type(rows) is list and len(rows) <= 259,
+                'bounded helper observation required')
+        saved = []; actions = []; sequences = set()
+        for row in rows:
+            require(type(row) is dict, 'fixed callback row required')
+            if row.get('kind') == 'unclassifiedCallback':
+                require(set(row) == {'sequence','kind','observedElapsedMs','valueType'} and
+                        type(row['sequence']) is int and row['sequence'] > 0 and
+                        type(row['observedElapsedMs']) is int and 0 <= row['observedElapsedMs'] <= 86400000 and
+                        row['valueType'] in ('null','array','object','string','number','boolean','undefined','other'),
+                        'fixed uncorrelated callback observation required')
+                if row['sequence'] <= cursor: continue
+                require(row['sequence'] not in sequences, 'duplicate callback observation')
+                sequences.add(row['sequence'])
+                saved.append({'sequence':row['sequence'],'callbackObservedElapsedMs':row['observedElapsedMs'],
+                    'kind':'unclassifiedCallback','association':'uncorrelated','valueType':row['valueType']})
+                continue
+            if row.get('kind') != 'helperObservation': continue
+            require(set(row) == {'sequence', 'kind', 'observedElapsedMs', 'projection'} and
+                    type(row['sequence']) is int and row['sequence'] > 0 and
+                    type(row['observedElapsedMs']) is int and 0 <= row['observedElapsedMs'] <= 86400000,
+                    'fixed helper callback observation required')
+            if row['sequence'] <= cursor: continue
+            require(row['sequence'] not in sequences, 'duplicate callback observation')
+            sequences.add(row['sequence'])
+            projection = helper_observation.validate_projection(row['projection'])
+            observed = {'sequence': row['sequence'], 'callbackObservedElapsedMs': row['observedElapsedMs'],
+                        'projection': projection}
+            saved.append(observed)
+            if projection['kind'] == 'helperAction':
+                actions.append(observed)
+                if projection['actionSuccess'] is False:
+                    self.result.setdefault('firstBusinessFailure', {'source': 'native-helper-action-shape',
+                        'requestedActionContext': kind, **copy.deepcopy(observed)})
+        self.result['helperObservation'] = {'schema': 'polaris-helper-observation-v1',
+            'requestedActionContext': kind, 'commandIdentityClaimed': False,
+            'completeHistoryClaimed': False, 'rows': saved}
+        require(len(actions) <= 1, 'ambiguous helper action callbacks')
+        return actions[0] if actions else None
+
+    def record_transaction_observation(self, value, kind):
+        # This is the already-returned read-only snapshot, never a replacement
+        # for transaction_end or evidence admitting ordinary root signals.
+        keys = {'kind', 'subject', 'authenticationMode', 'pkexecBirths', 'rootShellBirths',
+                'owned', 'authorizationObserved', 'credentialPromptClaimed'}
+        require(type(value) is dict and set(value) == keys and value['kind'] == kind and
+                value['authenticationMode'] == self.launch_options['authenticationMode'],
+                'fixed transaction observation required')
+        subject = value['subject']
+        require(type(subject) is dict and set(subject) == {'pid', 'startTime', 'uid'} and
+                type(subject['pid']) is int and subject['pid'] == self.app['pid'] and
+                type(subject['startTime']) is str and subject['startTime'] == self.app['startTime'] and
+                type(subject['uid']) is int and subject['uid'] == self.app['uid'],
+                'transaction observation subject differs')
+        def births(rows):
+            require(type(rows) is list and len(rows) <= 256, 'bounded transaction births required')
+            result = []
+            for row in rows:
+                require(type(row) is list and len(row) == 2 and type(row[0]) is int and row[0] > 1 and
+                        type(row[1]) is str and row[1].isascii() and row[1].isdigit() and 0 < len(row[1]) <= 24,
+                        'fixed transaction birth required')
+                require(row not in result, 'duplicate transaction birth'); result.append(list(row))
+            return result
+        pkexec = births(value['pkexecBirths']); shells = births(value['rootShellBirths'])
+        require(type(value['owned']) is list and len(value['owned']) <= 256, 'bounded owned observation required')
+        owned = []
+        for row in value['owned']:
+            require(type(row) is dict and type(row.get('uid')) is int and row['uid'] in (0, subject['uid']),
+                    'transaction observed UID differs')
+            owned.extend(births([[row.get('pid'), row.get('startTime')]]))
+        owned = births(owned)
+        require(all(row in owned for row in pkexec + shells) and all(row in pkexec for row in shells) and
+                type(value['authorizationObserved']) is bool and value['authorizationObserved'] == bool(shells) and
+                value['credentialPromptClaimed'] is False, 'transaction observation claims differ')
+        self.result['rootTransactionObservation'] = {'schema': 'polaris-root-transaction-observation-v1',
+            'kind': kind, 'subject': dict(subject), 'pkexecBirths': pkexec, 'rootShellBirths': shells,
+            'ownedBirths': owned, 'authorizationObserved': value['authorizationObserved'],
+            'credentialPromptClaimed': False, 'scope': 'root-observed-births-not-transaction-completion-or-cleanup',
+            'receivedElapsedMs': max(0, int((time.monotonic() - self._gui_started) * 1000))}
 
     def helper_action(self, kind):
         self.gui_phase('helper-begin')
@@ -621,6 +715,7 @@ class TunCarrierRun(base.CarrierRun):
         self.supervisor.begin_window(kind, self.app)
         self.gui_phase('helper-transaction-begin')
         self.controller.call('transaction_begin', kind=kind)
+        self.driver.execute("window.__tunObservation.context=arguments[0];return true;", kind)
         self.gui_phase('helper-click')
         if kind == 'install':
             self.driver.click('.helper-state[data-s="none"] button', self.text('helper.installAction'))
@@ -628,15 +723,40 @@ class TunCarrierRun(base.CarrierRun):
             self.driver.click('.helper-state[data-s="installed"] button', self.text('helper.uninstall'))
             self.driver.click('.helper-state button.confirming', self.text('helper.uninstallConfirmAgain'))
         def result():
-            self.controller.call('transaction_scan')
-            rows = [r for r in self.tun_observations() if r['sequence'] > cursor and r['kind'] == 'helper']
-            return rows[0] if rows else None
+            self.gui_phase('helper-transaction-scan')
+            scan_error = None
+            try:
+                observed = self.controller.call('transaction_scan')
+                self.record_transaction_observation(observed, kind)
+            except Exception as error:
+                scan_error = error
+                self.result.setdefault('helperObservationFailure', {'stage':'root-transaction-scan','code':'ROOT_TRANSACTION_OBSERVATION_FAILED'})
+            # Both existing read-only observations are independent. A root scan
+            # error must not erase an already-delivered native business failure.
+            try:
+                self.gui_phase('helper-callback-read')
+                reply = self.helper_observations(kind, cursor, self.tun_observations())
+            except Exception:
+                if scan_error is not None:
+                    self.gui_phase('helper-transaction-scan-failed')
+                    raise scan_error
+                raise
+            if scan_error is not None:
+                self.gui_phase('helper-transaction-scan-failed')
+                raise scan_error
+            return reply
         self.gui_phase('helper-callback')
         reply = base.wait_for(result, timeout=80)
-        self.result['helperCallback'] = {key: reply.get(key) if type(reply.get(key)) is bool else None
-            for key in ('envelopeSuccess', 'success', 'installed', 'ready')}
-        require(reply.get('envelopeSuccess') and reply.get('success') and
-                reply.get('installed') == (kind == 'install') and reply.get('ready') == (kind == 'install'),
+        self.gui_phase('helper-callback-observed')
+        projection = reply['projection']
+        callback = {'envelopeSuccess': projection['envelopeSuccess'], 'success': projection['actionSuccess'],
+                    'installed': projection['status']['installed'], 'ready': projection['status']['ready']}
+        self.result['helperCallback'] = {**callback, 'errorCode': projection['errorCode'],
+            'association': projection['association'], 'requestedActionContext': kind,
+            'callbackObservedElapsedMs': reply['callbackObservedElapsedMs'], 'projection': copy.deepcopy(projection)}
+        require(projection['statusShape'] == 'valid' and projection['errorCode'] in ('none', 'missing') and
+                projection['status']['supported'] is True and callback['envelopeSuccess'] is True and callback['success'] is True and
+                callback['installed'] == (kind == 'install') and callback['ready'] == (kind == 'install'),
                 'actual helper GUI action failed')
         self.gui_phase('helper-transaction-end')
         proof = self.controller.call('transaction_end')
@@ -645,8 +765,9 @@ class TunCarrierRun(base.CarrierRun):
             recovered = verify_joint_recovery(proof, subject, getattr(self, 'membership_gid', None))
             self.membership_gid = recovered['groupGid']
         self.supervisor.end_window(proof['owned'])
+        self.driver.execute("window.__tunObservation.context=null;return true;")
         self.driver.click('.side .nav-item', self.text('settings.nav.back'))
-        return {'callback': reply, 'authorization': proof}
+        return {'callback': self.result['helperCallback'], 'authorization': proof}
 
     def connect(self):
         self.gui_phase('connect-begin')

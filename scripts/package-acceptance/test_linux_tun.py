@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -19,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 SUPPORT = Path(os.environ.get('POLARIS_TUN_SUPPORT_DIR', HERE))
 BASE = Path(os.environ.get('POLARIS_ACCEPTANCE_TEST_SOURCE_ROOT', HERE.parents[1])) / 'scripts/package-acceptance'
 TEMP = tempfile.TemporaryDirectory(prefix='polaris-tun-gui-unit-')
-for name, directory in (('linux_tun.py', HERE), ('linux.py', HERE), ('tun.py', SUPPORT),
+for name, directory in (('linux_tun.py', HERE), ('linux.py', HERE), ('helper_observation.py', HERE), ('tun.py', SUPPORT),
                         ('tun_fixtures.py', HERE if (HERE / 'tun_fixtures.py').exists() else SUPPORT), ('fixtures.py', BASE)):
     shutil.copyfile(directory / name, Path(TEMP.name) / name)
 sys.path.insert(0, TEMP.name)
@@ -33,6 +34,21 @@ def identity(pid=10, uid=1001, parent=9):
     return {'pid': pid, 'startTime': '1234', 'state': 'S', 'ppid': parent, 'uid': uid,
             'exeDev': 1, 'exeInode': pid + 100, 'exe': '/usr/bin/sing-box',
             'namespaces': {'net': 5, 'mnt': 6, 'pid': 7, 'cgroup': 8}, 'cgroup': '0::/test.slice'}
+
+
+def helper_row(success=True, code='missing', installed=None, ready=None):
+    status={key:None for key in M.helper_observation.STATUS_BOOLS}
+    status.update(supported=True,installed=success if installed is None else installed,ready=success if ready is None else ready)
+    return {'sequence':1,'kind':'helperObservation','observedElapsedMs':735,
+        'projection':{'schema':M.helper_observation.SCHEMA,'kind':'helperAction','association':'shape-only',
+            'envelopeSuccess':True,'actionSuccess':success,'errorCode':code,'statusShape':'valid','status':status,
+            'selectedCoreState':'missing','protocolVersion':None,'expectedProtocolVersion':None,'buildIdentityMatches':None}}
+
+
+def scan_snapshot(run,kind='install'):
+    return {'kind':kind,'subject':{key:run.app[key] for key in ('pid','startTime','uid')},
+        'authenticationMode':run.launch_options['authenticationMode'],'pkexecBirths':[], 'rootShellBirths':[],
+        'owned':[],'authorizationObserved':False,'credentialPromptClaimed':False}
 
 
 def supervisor():
@@ -927,13 +943,13 @@ class ControllerLifecycleContracts(unittest.TestCase):
                'jointLease':{'credentialRecovery':dict(credential),'groupRecovery':self.membership_recovery()}}
         for valid in (True,False):
             run=M.TunCarrierRun.__new__(M.TunCarrierRun); run.result={}
-            run.app={'pid':100,'startTime':'123'};run.driver=Mock();run.supervisor=Mock();run.controller=Mock()
+            run.app={'pid':100,'startTime':'123','uid':1001};run.driver=Mock();run.supervisor=Mock();run.controller=Mock()
             run.launch_options={'authenticationMode':M.AUTH_GROUP_MODE,'authorization':{'guiUid':1001,'account':'runner'}}
             result=copy.deepcopy(proof)
             if not valid: result['jointLease']['groupRecovery']['writerStopped']=False
-            run.controller.call.side_effect=lambda command,**args:result if command=='transaction_end' else {}
+            run.controller.call.side_effect=lambda command,**args:result if command=='transaction_end' else scan_snapshot(run) if command=='transaction_scan' else {}
             run.text=lambda key:key
-            replies=iter([[],[{'sequence':1,'kind':'helper','envelopeSuccess':True,'success':True,'installed':True,'ready':True}]])
+            replies=iter([[],[helper_row()]])
             run.tun_observations=lambda:next(replies)
             if valid:
                 self.assertEqual(run.helper_action('install')['authorization'],result)
@@ -1055,16 +1071,154 @@ class AuthenticationRuntimeConsumerTests(unittest.TestCase):
         self.assertEqual(client.lifecycle['abortReceipt']['authenticationRuntime'],observation)
 
     def test_helper_callback_failure_preserves_only_fixed_booleans(self):
-        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.app={}
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.app={'pid':100,'startTime':'123','uid':1001}
+        run.launch_options={'authenticationMode':'existing-session'}
         run.driver=Mock();run.supervisor=Mock();run.controller=Mock();run.text=lambda key:key
-        replies=iter([[],[{'sequence':1,'kind':'helper','envelopeSuccess':True,'success':False,
-                         'installed':False,'ready':False,'error':'PRIVATE'}]])
+        run.controller.call.side_effect=lambda command,**kw:scan_snapshot(run) if command=='transaction_scan' else {}
+        replies=iter([[],[helper_row(False,'installerFailed')]])
         run.tun_observations=lambda:next(replies)
         with self.assertRaises(ValueError):run.helper_action('install')
-        self.assertEqual(run.result['guiObservation']['phase'],'helper-callback')
-        self.assertEqual(run.result['helperCallback'],{'envelopeSuccess':True,'success':False,'installed':False,'ready':False})
+        self.assertEqual(run.result['guiObservation']['phase'],'helper-callback-observed')
+        self.assertEqual({k:run.result['helperCallback'][k] for k in ('envelopeSuccess','success','installed','ready')},{'envelopeSuccess':True,'success':False,'installed':False,'ready':False})
+        self.assertEqual(run.result['helperCallback']['errorCode'],'installerFailed')
         self.assertNotIn('PRIVATE',json.dumps(run.result))
         self.assertNotIn('transaction_end',[call.args[0] for call in run.controller.call.call_args_list])
+
+class HelperObservationConsumerTests(unittest.TestCase):
+    def run_fixture(self,row=None):
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.app={'pid':100,'startTime':'123','uid':1001}
+        run.launch_options={'authenticationMode':'existing-session'};run.driver=Mock();run.supervisor=Mock();run.controller=Mock()
+        run.text=lambda key:key
+        run.controller.call.side_effect=lambda command,**kw:scan_snapshot(run) if command=='transaction_scan' else {'owned':[]} if command=='transaction_end' else {}
+        rows=iter([[],[helper_row() if row is None else row]])
+        run.tun_observations=lambda:next(rows)
+        return run
+
+    def test_success_preserves_original_gate_and_observed_completion(self):
+        run=self.run_fixture();out=run.helper_action('install')
+        self.assertTrue(out['callback']['success']);self.assertEqual(out['callback']['association'],'shape-only')
+        self.assertEqual(out['callback']['callbackObservedElapsedMs'],735)
+        self.assertFalse(run.result['helperObservation']['commandIdentityClaimed'])
+        self.assertNotIn('firstBusinessFailure',run.result)
+        run.supervisor.end_window.assert_called_once_with([])
+
+    def test_failure_cancel_partial_and_each_typed_code_stays_failure(self):
+        for code in M.helper_observation.ERROR_CODES:
+            run=self.run_fixture(helper_row(False,code))
+            with self.subTest(code=code),self.assertRaises(ValueError):run.helper_action('install')
+            self.assertEqual(run.result['firstBusinessFailure']['projection']['errorCode'],code)
+            self.assertEqual(run.result['guiObservation']['phase'],'helper-callback-observed')
+            self.assertEqual(run.result['rootTransactionObservation']['pkexecBirths'],[])
+            run.supervisor.end_window.assert_not_called()
+            self.assertNotIn('transaction_end',[c.args[0] for c in run.controller.call.call_args_list])
+
+    def test_outer_failure_is_uncorrelated_not_business_failure(self):
+        row=helper_row();p=row['projection'];p.update(kind='outerFailure',association='uncorrelated',envelopeSuccess=False,
+            actionSuccess=None,errorCode='not-applicable',statusShape='not-applicable')
+        p['status']={k:None for k in p['status']}
+        run=self.run_fixture()
+        self.assertIsNone(run.helper_observations('install',0,[row]))
+        self.assertEqual(run.result['helperObservation']['rows'][0]['projection']['association'],'uncorrelated')
+        self.assertNotIn('firstBusinessFailure',run.result)
+
+    def test_unknown_malformed_projection_and_duplicate_never_pass(self):
+        for change in (lambda r:r['projection'].update(schema='other'),lambda r:r['projection'].update(secret='PRIVATE'),
+                       lambda r:r['projection'].update(errorCode='PRIVATE'),lambda r:r.update(observedElapsedMs=-1)):
+            row=helper_row();change(row);run=self.run_fixture(row)
+            with self.assertRaises(ValueError):run.helper_action('install')
+            run.supervisor.end_window.assert_not_called();self.assertNotIn('PRIVATE',json.dumps(run.result))
+        run=self.run_fixture();row=helper_row();other=copy.deepcopy(row);other['sequence']=2
+        with self.assertRaises(ValueError):run.helper_observations('install',0,[row,other])
+
+    def test_contradictory_success_or_unknown_fields_cannot_become_acceptance(self):
+        for change in (lambda r:r['projection'].update(errorCode='cancelled'),
+                       lambda r:r['projection'].update(errorCode='unknown'),
+                       lambda r:r['projection']['status'].update(supported=False),
+                       lambda r:r['projection'].update(statusShape='malformed')):
+            row=helper_row();change(row);run=self.run_fixture(row)
+            with self.assertRaises(ValueError):run.helper_action('install')
+            run.supervisor.end_window.assert_not_called()
+            self.assertNotIn('transaction_end',[c.args[0] for c in run.controller.call.call_args_list])
+
+    def test_scan_failure_and_end_failure_have_distinct_fixed_phase(self):
+        for command,phase in (('transaction_scan','helper-transaction-scan-failed'),('transaction_end','helper-transaction-end')):
+            run=self.run_fixture();prior=run.controller.call.side_effect
+            def call(action,**kw):
+                if action==command:raise ValueError('PRIVATE')
+                return prior(action,**kw)
+            run.controller.call.side_effect=call
+            with self.assertRaises(ValueError):run.helper_action('install')
+            self.assertEqual(run.result['guiObservation']['phase'],phase)
+            run.supervisor.end_window.assert_not_called();self.assertNotIn('PRIVATE',json.dumps(run.result))
+
+    def test_scan_failure_still_preserves_already_delivered_business_failure(self):
+        run=self.run_fixture(helper_row(False,'authorizationIncomplete'));prior=run.controller.call.side_effect
+        original=ValueError('PRIVATE')
+        def call(command,**kw):
+            if command=='transaction_scan':raise original
+            return prior(command,**kw)
+        run.controller.call.side_effect=call
+        with self.assertRaises(ValueError) as failed:run.helper_action('install')
+        self.assertIs(failed.exception,original)
+        self.assertEqual(run.result['firstBusinessFailure']['projection']['errorCode'],'authorizationIncomplete')
+        self.assertEqual(run.result['helperObservationFailure']['stage'],'root-transaction-scan')
+        self.assertNotIn('PRIVATE',json.dumps(run.result));run.supervisor.end_window.assert_not_called()
+
+    def test_unclassified_callback_is_type_only_not_authorization(self):
+        run=self.run_fixture()
+        for name in ('null','array','object','string','number','boolean','undefined','other'):
+            row={'sequence':1,'kind':'unclassifiedCallback','observedElapsedMs':2,'valueType':name}
+            self.assertIsNone(run.helper_observations('install',0,[row]))
+            self.assertEqual(run.result['helperObservation']['rows'][0]['association'],'uncorrelated')
+            self.assertNotIn('firstBusinessFailure',run.result)
+        row['valueType']='PRIVATE'
+        with self.assertRaises(ValueError):run.helper_observations('install',0,[row])
+        self.assertNotIn('PRIVATE',json.dumps(run.result))
+
+    def test_root_snapshot_is_diagnostic_only_exact_subject_and_bounded_births(self):
+        run=self.run_fixture();run.gui_phase('helper-transaction-scan');value=scan_snapshot(run)
+        value.update(pkexecBirths=[[200,'456']],owned=[{'pid':200,'startTime':'456','uid':0,'exe':'PRIVATE'}])
+        run.record_transaction_observation(value,'install')
+        self.assertEqual(run.result['rootTransactionObservation']['pkexecBirths'],[[200,'456']])
+        self.assertNotIn('PRIVATE',json.dumps(run.result));run.supervisor.end_window.assert_not_called()
+        for change in (lambda v:v.update(kind='uninstall'),lambda v:v['subject'].update(pid=101),
+                       lambda v:v.update(authorizationObserved=True),lambda v:v.update(raw='PRIVATE')):
+            bad=copy.deepcopy(value);change(bad)
+            with self.assertRaises(ValueError):run.record_transaction_observation(bad,'install')
+
+    @unittest.skipUnless(shutil.which('node'), 'pure JS interpreter unavailable')
+    def test_actual_observer_preserves_sealed_invoke_original_callback_return_and_throw(self):
+        source = r"""
+const callbacks=new Map();let received=null;const originalInvoke=()=>{};
+globalThis.window={__TAURI_INTERNALS__:{}};
+Object.defineProperty(window.__TAURI_INTERNALS__,'invoke',{value:originalInvoke,writable:false,configurable:false});
+Object.defineProperty(window.__TAURI_INTERNALS__,'callbacks',{value:callbacks,writable:false,configurable:false});
+callbacks.set(1,function(raw){received=raw;return 73;});
+const thrown=new Error('PRIVATE');callbacks.set(2,()=>{throw thrown;});
+new Function(SCRIPT)();window.__tunObservation.context='install';
+const raw={success:true,data:{success:false,errorCode:'cancelled',diagnostic:'PRIVATE',status:{supported:true,installed:false,ready:false}}};
+const returned=callbacks.get(1)(raw);let exactThrow=false;
+try{callbacks.get(2)('PRIVATE');}catch(e){exactThrow=e===thrown;}
+callbacks.get(1)({success:false,error:'PRIVATE'});
+console.log(JSON.stringify({invokeUnchanged:window.__TAURI_INTERNALS__.invoke===originalInvoke,returned,exactThrow,
+ firstCode:window.__tunObservation.firstHelperFailure.projection.errorCode,
+ rows:window.__tunObservation.rows,originalReceived:received.success===false}));
+""".replace('SCRIPT',json.dumps(M.TUN_OBSERVER))
+        result=subprocess.run(['node','-e',source],capture_output=True,text=True,timeout=10,check=True)
+        value=json.loads(result.stdout)
+        self.assertTrue(value['invokeUnchanged']);self.assertTrue(value['exactThrow']);self.assertEqual(value['returned'],73)
+        self.assertEqual(value['firstCode'],'cancelled');self.assertTrue(value['originalReceived'])
+        self.assertEqual(value['rows'][1]['kind'],'unclassifiedCallback')
+        self.assertEqual(value['rows'][1]['valueType'],'string')
+        self.assertEqual(value['rows'][2]['projection']['association'],'uncorrelated')
+        self.assertNotIn('PRIVATE',result.stdout)
+
+    def test_first_business_failure_is_not_overwritten_by_later_cleanup_context(self):
+        run=self.run_fixture();run.helper_observations('install',0,[helper_row(False,'cancelled')])
+        first=copy.deepcopy(run.result['firstBusinessFailure'])
+        later=helper_row(False,'partialCleanup');later['sequence']=2
+        run.helper_observations('uninstall',1,[later])
+        self.assertEqual(run.result['firstBusinessFailure'],first)
 
 if __name__ == '__main__':
     unittest.main()

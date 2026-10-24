@@ -253,10 +253,10 @@ class PrimitiveTests(unittest.TestCase):
     def test_native_rejection_is_not_unknown(self):
         driver = M.WebDriver(4444)
         driver.session = 'native'
-        driver.request = Mock(return_value={'error': 'native-command-rejected', 'rejected': True})
+        driver.request = Mock(return_value={'schema': M.NATIVE_BRIDGE_SCHEMA, 'state': 'envelope-rejected', 'data': None, 'diagnostic': 'unknown'})
         with self.assertRaises(M.NativeRejected):
             driver.invoke('config_save', {})
-        driver.request.return_value = {'error': 'native-command-failed'}
+        driver.request.return_value = {'schema': M.NATIVE_BRIDGE_SCHEMA, 'state': 'promise-rejected', 'data': None, 'diagnostic': 'none'}
         with self.assertRaises(ValueError) as caught:
             driver.invoke('config_get')
         self.assertNotIsInstance(caught.exception, M.NativeRejected)
@@ -1160,7 +1160,7 @@ class DriverObservationTests(unittest.TestCase):
     def test_stopped_bridge_read_is_not_treated_as_a_transport_failure(self):
         driver = M.WebDriver(1); driver.session = 'private'
         status = {'running': False, 'actualServerId': None}
-        with patch.object(driver, '_request', return_value={'ok': True, 'data': status}):
+        with patch.object(driver, '_request', return_value={'schema': M.NATIVE_BRIDGE_SCHEMA, 'state': 'returned', 'data': status, 'diagnostic': 'none'}):
             self.assertEqual(driver.invoke('proxy_get_status'), status)
         row = driver.observation['requests'][0]
         self.assertEqual((row['state'], row['callback']), ('decoded', 'returned'))
@@ -1192,6 +1192,137 @@ class DriverObservationTests(unittest.TestCase):
         with patch.object(M, 'process_identity', side_effect=OSError('SECRET')): run.capture_driver_failure()
         self.assertEqual(run.result['failureProcessObservation']['processes'][0]['identity'], 'unknown')
         self.assertNotIn('SECRET', json.dumps(run.result))
+
+
+class NativeBridgeNamespaceTests(unittest.TestCase):
+    def test_actual_http_200_native_envelopes_do_not_collide_with_protocol(self):
+        import http.server
+        import threading
+        class Handler(http.server.BaseHTTPRequestHandler):
+            value = None
+            count = 0
+            def do_POST(self):
+                type(self).count += 1
+                self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                data = json.dumps({'value': type(self).value}).encode()
+                self.send_response(200); self.send_header('Content-Length', str(len(data)))
+                self.end_headers(); self.wfile.write(data)
+            def log_message(self, *args): pass
+        server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try:
+            d = M.WebDriver(server.server_port); d.session = 'private'
+            for cmd in ('config_get', 'config_save', 'proxy_get_status', 'proxy_runtime_apply_status', 'auto_select_status'):
+                Handler.value = {'schema': M.NATIVE_BRIDGE_SCHEMA, 'state': 'envelope-rejected', 'data': None, 'diagnostic': 'unknown'}
+                before = Handler.count
+                with self.subTest(cmd=cmd), self.assertRaises(M.NativeRejected): d.invoke(cmd)
+                self.assertEqual(Handler.count, before + 1)
+                self.assertEqual(d.observation['requests'][-1]['nativeBridge'], 'envelope-rejected')
+            self.assertEqual(d.observation['firstNativeFailure']['nativeBridge'], 'envelope-rejected')
+            self.assertNotIn('firstFailure', d.observation)
+            # Retain fail-closed handling of an actual protocol-shaped error too.
+            Handler.value = {'error': 'javascript error', 'message': 'SECRET'}
+            with self.assertRaises(M.GuiFailure) as caught: d.invoke('proxy_get_status')
+            self.assertEqual(caught.exception.protocol, 'javascript error')
+            self.assertNotIn('SECRET', json.dumps(d.observation))
+        finally:
+            server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_every_fixed_bridge_failure_and_polluted_envelope_fails_without_retry(self):
+        for state in ('unavailable', 'invalid-envelope', 'promise-rejected', 'invoke-threw', 'SECRET'):
+            d = M.WebDriver(1); d.session = 'private'
+            with patch.object(d, '_request', return_value={'schema': M.NATIVE_BRIDGE_SCHEMA, 'state': state, 'data': None, 'diagnostic': 'none'}) as req:
+                with self.assertRaises(M.GuiFailure) as caught: d.invoke('proxy_get_status')
+                self.assertEqual(req.call_count, 1)
+                self.assertNotIn('SECRET', json.dumps(M.gui_failure(caught.exception)))
+        for bad in ({'ok': True, 'data': None}, {'schema': M.NATIVE_BRIDGE_SCHEMA, 'state': 'returned', 'data': None, 'secret': 1},
+                    {'schema': M.NATIVE_BRIDGE_SCHEMA, 'state': 'promise-rejected', 'data': 'SECRET'}):
+            self.assertEqual(M.native_bridge_state(bad), 'invalid-bridge')
+
+    def test_real_javascript_bridge_all_native_outcomes(self):
+        import subprocess
+        # Runs the exact JS hook with real promises, no IPC/product/browser.
+        cases = [
+            ('undefined', 'unavailable'),
+            ('()=>{throw Error("SECRET")}', 'invoke-threw'),
+            ('()=>42', 'invalid-envelope'),
+            ('()=>Promise.reject(Error("SECRET"))', 'promise-rejected'),
+            ('()=>Promise.resolve(null)', 'invalid-envelope'),
+            ('()=>Promise.resolve({success:false,error:"SECRET"})', 'envelope-rejected'),
+            ('()=>Promise.resolve({success:true,data:{running:false,actualServerId:null}})', 'returned'),
+        ]
+        for invoke, expected in cases:
+            script = ('global.window={__TAURI_INTERNALS__:{invoke:' + invoke + '}};'
+                      'const fn=new Function(' + json.dumps(M.NATIVE_BRIDGE_JS) + ');'
+                      'fn("proxy_get_status",{},v=>process.stdout.write(JSON.stringify(v)));')
+            raw = json.loads(subprocess.check_output(['node', '-e', script], text=True))
+            self.assertEqual(M.native_bridge_state(raw), expected)
+            self.assertNotIn('SECRET', json.dumps(raw))
+
+class NativeStatusDiagnosticTests(unittest.TestCase):
+    def test_only_exact_production_status_errors_are_projected(self):
+        import subprocess
+        messages = [('config validation failed: saved commit unavailable', 'saved-state-unavailable'),
+                    ('proxy status unavailable', 'proxy-status-unavailable'),
+                    ('proxy status unavailable SECRET', 'unknown'),
+                    (' config validation failed: saved commit unavailable', 'unknown'),
+                    ('SECRET', 'unknown')]
+        for command in ('proxy_get_status', 'config_get', 'config_save', 'auto_select_status', 'proxy_runtime_apply_status'):
+            for message, diagnostic in messages:
+                script = ('global.window={__TAURI_INTERNALS__:{invoke:()=>Promise.resolve(' +
+                    json.dumps({'success': False, 'error': message}) + ')}};const fn=new Function(' +
+                    json.dumps(M.NATIVE_BRIDGE_JS) + ');fn(' + json.dumps(command) +
+                    ',{},v=>process.stdout.write(JSON.stringify(v)));')
+                value = json.loads(subprocess.check_output(['node', '-e', script], text=True))
+                expected = diagnostic if command == 'proxy_get_status' else 'unknown'
+                self.assertEqual(value['diagnostic'], expected)
+                self.assertEqual(M.native_bridge_state(value, command), 'envelope-rejected')
+                self.assertNotIn('SECRET', json.dumps(value))
+                driver = M.WebDriver(1); driver.session = 'private'
+                with patch.object(driver, '_request', return_value=value):
+                    with self.assertRaises(M.NativeRejected) as caught: driver.invoke(command)
+                self.assertEqual(M.gui_failure(caught.exception)['nativeDiagnostic'], expected)
+        forged = {'schema': M.NATIVE_BRIDGE_SCHEMA, 'state': 'envelope-rejected', 'data': None,
+                  'diagnostic': 'saved-state-unavailable'}
+        self.assertEqual(M.native_bridge_state(forged, 'config_save'), 'invalid-bridge')
+
+
+class SelectionStageTests(unittest.TestCase):
+    def test_connect_status_failure_is_not_attributed_to_completed_pick(self):
+        run = M.CarrierRun.__new__(M.CarrierRun)
+        run.result = {}; run.stage = 'gui-selection'
+        run.status = Mock(side_effect=ValueError('fixed test'))
+        with self.assertRaises(ValueError): run.connect()
+        self.assertEqual(run.stage, 'gui-connect')
+        self.assertEqual(run.result['connectObservation']['phase'], 'stopped-check')
+
+    def test_full_selection_sequence_has_fixed_current_operation_stages(self):
+        run = M.CarrierRun.__new__(M.CarrierRun); run.core = {'pid': 1}
+        seen = []
+        def observed(name, result=None):
+            def call(*args, **kwargs):
+                seen.append((name, run.stage)); return result
+            return call
+        run.pick = observed('pick')
+        def connect():
+            run.stage = 'gui-connect'; seen.append(('connect', run.stage))
+        run.connect = connect
+        run.socket = observed('socket', (Mock(), {}))
+        run.exchange = observed('exchange', {})
+        run.preference = observed('preference')
+        run.disconnect = observed('disconnect')
+        run.config = observed('config', {'selectedServerId': 'node-b'})
+        run.record = observed('record'); run.snapshot = observed('snapshot')
+        with patch.object(M, 'wait_for', return_value=True), patch.object(M, 'same_process', return_value=False):
+            run.selection_cases()
+        self.assertEqual([stage for name, stage in seen if name == 'socket'],
+            ['selection-initial-traffic', 'selection-new-traffic', 'selection-restored-traffic'])
+        self.assertEqual([stage for name, stage in seen if name == 'pick'],
+            ['gui-selection', 'selection-switch-b', 'selection-interrupt-switch', 'selection-restore-b'])
+        self.assertIn(('exchange', 'selection-preserved-traffic'), seen)
+        self.assertIn(('disconnect', 'selection-off'), seen)
+        self.assertIn(('config', 'selection-on-readback'), seen)
+
 
 if __name__ == '__main__':
     unittest.main()

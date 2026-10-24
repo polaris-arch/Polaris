@@ -875,6 +875,8 @@ def gui_failure(error):
         result['httpStatus'] = error.http_status
     if isinstance(error, GuiFailure) and error.code.startswith('webdriver-'):
         result['protocol'] = error.protocol
+    if isinstance(error, NativeRejected):
+        result['nativeDiagnostic'] = error.diagnostic
     return result
 
 
@@ -885,6 +887,48 @@ def gui_require(ok, code):
 
 class NativeRejected(ValueError):
     """Actual native failure envelope, not timeout or unknown outcome."""
+    def __init__(self, message, diagnostic='unknown'):
+        super().__init__(message)
+        self.diagnostic = diagnostic if diagnostic in ('saved-state-unavailable', 'proxy-status-unavailable') else 'unknown'
+
+
+
+NATIVE_BRIDGE_SCHEMA = 'polaris-native-read-bridge-v1'
+NATIVE_BRIDGE_JS = r'''
+const [command, args, done] = arguments;
+const finish=(state,data=null,diagnostic='none')=>done({schema:'polaris-native-read-bridge-v1',state,data,diagnostic});
+if (typeof window.__TAURI_INTERNALS__?.invoke !== 'function') {finish('unavailable');return;}
+try {
+ const pending=window.__TAURI_INTERNALS__.invoke(command,args);
+ if (!pending || typeof pending.then !== 'function') {finish('invalid-envelope');return;}
+ pending.then(raw => {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || typeof raw.success !== 'boolean') finish('invalid-envelope');
+  else if (raw.success === false) {
+   let diagnostic='unknown';
+   if(command==='proxy_get_status') {
+    if(raw.error==='config validation failed: saved commit unavailable') diagnostic='saved-state-unavailable';
+    else if(raw.error==='proxy status unavailable') diagnostic='proxy-status-unavailable';
+   }
+   finish('envelope-rejected',null,diagnostic);
+  }
+  else finish('returned',raw.data ?? null);
+ },()=>finish('promise-rejected'));
+} catch (_) {finish('invoke-threw');}
+'''
+
+
+def native_bridge_state(value, command=None):
+    if (type(value) is not dict or set(value) != {'schema', 'state', 'data', 'diagnostic'} or
+            value.get('schema') != NATIVE_BRIDGE_SCHEMA or
+            value.get('state') not in ('returned', 'unavailable', 'invalid-envelope',
+                                      'envelope-rejected', 'promise-rejected', 'invoke-threw') or
+            (value.get('state') != 'returned' and value.get('data') is not None) or
+            value.get('diagnostic') not in (('unknown', 'saved-state-unavailable', 'proxy-status-unavailable')
+                if value.get('state') == 'envelope-rejected' else ('none',))):
+        return 'invalid-bridge'
+    if value['diagnostic'] in ('saved-state-unavailable', 'proxy-status-unavailable') and command != 'proxy_get_status':
+        return 'invalid-bridge'
+    return value['state']
 
 
 class WebDriver:
@@ -919,6 +963,11 @@ class WebDriver:
             row['state'] = 'decoded'
             if route == '/execute/async' and command != 'none':
                 row['callback'] = 'returned'
+                row['nativeBridge'] = native_bridge_state(value, command)
+                if row['nativeBridge'] == 'envelope-rejected':
+                    row['nativeDiagnostic'] = value['diagnostic']
+                if row['nativeBridge'] != 'returned':
+                    observation.setdefault('firstNativeFailure', row)
             return value
         except Exception as error:
             row['state'] = 'failed'
@@ -984,20 +1033,15 @@ class WebDriver:
                             'proxy_runtime_apply_status', 'auto_select_status'), 'IPC not allowed to bypass GUI')
         self._observed_command = command
         try:
-            value = self.request('POST', self.path('/execute/async'), {'script': r'''
-const [command, args, done] = arguments;
-if (!window.__TAURI_INTERNALS__?.invoke) {done({error:'not-native'});return;}
-window.__TAURI_INTERNALS__.invoke(command,args).then(raw => {
- if(raw?.success !== true) done({error:'native-command-rejected',rejected:raw?.success === false});
- else done({ok:true,data:raw.data ?? null});
-},()=>done({error:'native-command-failed'}));
-''', 'args': [command, args or {}]})
+            value = self.request('POST', self.path('/execute/async'),
+                                 {'script': NATIVE_BRIDGE_JS, 'args': [command, args or {}]})
         finally:
             self._observed_command = None
-        if value and value.get('rejected') is True:
-            raise NativeRejected('actual native fixture/read rejection')
-        gui_require(value and value.get('ok') is True, 'native-ipc-unconfirmed')
-        return value.get('data')
+        bridge = native_bridge_state(value, command)
+        if bridge == 'envelope-rejected':
+            raise NativeRejected('actual native fixture/read rejection', value['diagnostic'])
+        gui_require(bridge == 'returned', 'native-bridge-' + bridge)
+        return value['data']
 
     def element(self, selector, text=None):
         # Returning an element then using /click produces a real WebDriver input,
@@ -1387,6 +1431,7 @@ class CarrierRun:
         return proof
 
     def connect(self):
+        self.stage = 'gui-connect'
         self.connect_phase('stopped-check')
         require(not self.status().get('running'), 'connect requires stopped core')
         self.connect_phase('gui-click')
@@ -1644,14 +1689,21 @@ class CarrierRun:
         self.stage = 'gui-selection'
         self.pick('A')
         self.connect()
+        self.stage = 'selection-initial-traffic'
         first, first_proof = self.socket('A')
+        self.stage = 'selection-switch-b'
         self.pick('B')
+        self.stage = 'selection-preserved-traffic'
         old_after = self.exchange(first, 'A')
+        self.stage = 'selection-new-traffic'
         second, second_proof = self.socket('B')
         self.record('gui_selection', selected='node-b', before=first_proof,
                     newConnection=second_proof, screenshot=self.snapshot('selected-b'))
+        self.stage = 'selection-interrupt-preference'
         self.preference(True)
+        self.stage = 'selection-interrupt-switch'
         self.pick('A')
+        self.stage = 'selection-old-stream-close'
         def closed():
             try:
                 second.settimeout(0.3)
@@ -1664,13 +1716,17 @@ class CarrierRun:
         wait_for(closed, timeout=12)
         self.record('gui_manual_disconnect_preference', gracefulOldConnection=old_after,
                     interruptPreferenceObserved=True, oldBClosed=True)
+        self.stage = 'selection-restore-b'
         self.pick('B')
         saved = self.config()['selectedServerId']
         old_core = dict(self.core)
+        self.stage = 'selection-off'
         self.disconnect()
         require(self.config()['selectedServerId'] == saved, 'OFF changed selection')
         self.connect()
+        self.stage = 'selection-on-readback'
         require(self.config()['selectedServerId'] == saved and not same_process(old_core, self.core), 'ON did not restore selection')
+        self.stage = 'selection-restored-traffic'
         _, proof = self.socket('B')
         self.record('gui_on_off', selected=saved, newProcess=True, restoredConnection=proof)
 
