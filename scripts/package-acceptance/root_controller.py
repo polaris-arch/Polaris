@@ -420,23 +420,48 @@ def validate_auth_execution(value):
     return value
 
 
+CANDIDATE_PHASES = ('identity-before', 'executable-open', 'executable-initial', 'inputs-before',
+    'executable-read', 'inputs-after', 'identity-after', 'snapshot-consistency', 'topology',
+    'gui-parent', 'owned-parent', 'parent-transition')
+
+
+def validate_candidate_failure(value):
+    exact(value, ('schema', 'phase', 'inventory', 'relation', 'parent', 'outcome', 'error'))
+    require(value['schema'] == 'polaris-transaction-candidate-failure-v1' and
+            value['phase'] in CANDIDATE_PHASES and value['relation'] in ('gui-direct', 'owned-child') and
+            value['outcome'] in ('unconfirmed', 'different-birth', 'different-parent', 'identity-mismatch') and
+            value['error'] in ('enoent', 'eacces', 'eperm', 'esrch', 'other-os', 'decode', 'contract'),
+            'fixed candidate failure required')
+    def identity(v, parent=False):
+        exact(v, ('pid', 'startTime') if parent else ('pid', 'startTime', 'ppid'))
+        require(type(v['pid']) is int and v['pid'] > 1 and type(v['startTime']) is str and
+                re.fullmatch(r'[1-9][0-9]{0,19}', v['startTime']) and
+                (parent or type(v['ppid']) is int and v['ppid'] > 0), 'inventory birth required')
+    identity(value['inventory'])
+    if value['parent'] is not None: identity(value['parent'], True)
+    return value
+
+
 def auth_runtime_observation(mode):
     return {'schema': 'polaris-auth-runtime-observation-v2', 'mode': mode, 'kind': None,
             'lastReached': 'idle', 'firstFailure': None,
             'recovery': {key: 'not-reached' for key in AUTH_RECOVERY_STEPS},
             'credentialRecovery': None, 'groupRecovery': None, 'persistence': 'not-attempted',
-            'execution': auth_execution_observation()}
+            'execution': auth_execution_observation(), 'candidateFailure': None}
 
 
 def validate_auth_runtime_observation(value):
     exact(value, ('schema', 'mode', 'kind', 'lastReached', 'firstFailure', 'recovery',
-                  'credentialRecovery', 'groupRecovery', 'persistence', 'execution'))
+                  'credentialRecovery', 'groupRecovery', 'persistence', 'execution', 'candidateFailure'))
     require(value['schema'] == 'polaris-auth-runtime-observation-v2' and
             value['mode'] in ('existing-session', 'pkttyagent-observe', *CREDENTIAL_MODES) and
             value['kind'] in (None, 'install', 'uninstall') and
             value['lastReached'] in AUTH_OPERATION_STAGES and
             value['persistence'] in ('not-attempted', 'recorded', 'unknown'), 'fixed auth observation required')
     validate_auth_execution(value['execution'])
+    if value['candidateFailure'] is not None:
+        validate_candidate_failure(value['candidateFailure'])
+        require(value['kind'] is not None, 'candidate without transaction')
     if value['mode'] not in CREDENTIAL_MODES or value['kind'] is None:
         require(value['execution']['pump'] == auth_execution_observation()['pump'], 'credential dialogue outside authority')
     failure = value['firstFailure']
@@ -1488,22 +1513,31 @@ class TransactionObserver:
             try: self.scan()
             except Exception: return  # scan retains the first fixed boundary
 
-    def candidate(self, pid, light):
+    def candidate(self, pid, light, budget=None, diagnose=False):
+        budget = [3] if budget is None else budget
         for attempt in range(3):
             try:
+                require(budget[0] > 0, 'candidate read budget exhausted')
+                budget[0] -= 1
                 value = self.c.tun.transaction_identity(pid)
                 p = value['identity']
+                if diagnose:
+                    self.candidate_phase = 'topology'
+                    self.candidate_outcome = ('different-birth' if birth(p) != birth(light) else
+                                              'different-parent' if p['ppid'] != light['ppid'] else 'unconfirmed')
                 require(birth(p) == birth(light) and p['ppid'] == light['ppid'], 'candidate topology changed')
                 return value
-            except (OSError, ValueError):
-                if attempt == 2: raise
+            except (OSError, ValueError) as error:
+                if diagnose and getattr(error, 'phase', None) in CANDIDATE_PHASES:
+                    self.candidate_phase = error.phase
+                if attempt == 2 or budget[0] <= 0: raise
                 time.sleep(0.001)
 
     def scan(self):
-        c = self.c; tun = c.tun; boundary = 'gui'
+        c = self.c; tun = c.tun; self.boundary = 'gui'; self.failure_context = None
         try:
             require(tun.same_process(c.gui, c.ops.proc(c.gui['pid'])), 'GUI birth changed during privilege transaction')
-            boundary = 'inventory'; values = {}
+            self.boundary = 'inventory'; values = {}
             # No full exe/namespace/cmdline reads for unrelated system processes.
             for item in Path('/proc').iterdir():
                 if item.name.isdigit() and int(item.name) > 1:
@@ -1522,54 +1556,95 @@ class TransactionObserver:
                     direct = parent and birth(parent) == birth(c.gui)
                     child = parent and birth(parent) in self.rows
                     if not direct and not child: continue
-                    boundary = 'candidate'; observation = self.candidate(light['pid'], light)
-                    p = observation['identity']; key = birth(p)
-                    if direct:
-                        require(tun.same_process(c.gui, c.ops.proc(c.gui['pid'])), 'GUI parent changed')
-                    else:
-                        require(tun.same_process(self.rows[birth(parent)], c.ops.proc(parent['pid'])), 'owned parent changed')
-                    argv = observation['argv']; uids = observation['uids']; executable = observation['executable']
-                    if direct:
-                        if p['exe'] == str(Path('/usr/bin/pkexec').resolve()):
-                            boundary = 'pkexec-argv'
-                            require(argv[:2] == ['/usr/bin/pkexec', '/bin/bash'] and len(argv) == 3, 'unexpected GUI pkexec argv')
-                            boundary = 'pkexec-uid'
-                            initial = uids == (c.launch['guiUid'], 0, 0, 0)
-                            require(initial or (uids == (0, 0, 0, 0) and key in self.pkexec), 'pkexec UID transition differs')
-                            boundary = 'script'; proof = c.verify_script(argv[2], self.kind)
-                            if key in self.pkexec:
-                                require(argv[2] == self.pkexec[key]['script'] and proof == self.pkexec[key]['proof'], 'original script changed')
-                            boundary = 'pkexec-executable'; require(executable == c.tools['pkexec'], 'pkexec object changed')
-                            boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'pkexec namespace/cgroup differs')
-                            pending = {'identity': p, 'script': argv[2], 'proof': proof}
-                        elif p['exe'] == str(Path('/bin/bash').resolve()) and uids == (0, 0, 0, 0):
-                            boundary = 'shell-prior'; require(key in self.pkexec, 'root bash without original pkexec birth')
-                            boundary = 'shell-argv'; require(argv == ['/bin/bash', self.pkexec[key]['script']], 'root bash argv differs')
-                            boundary = 'shell-executable'; require(executable == c.tools['bash'], 'root bash object changed')
-                            boundary = 'script'; proof = c.verify_script(argv[1], self.kind)
-                            require(proof == self.pkexec[key]['proof'], 'original script changed')
-                            boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'root shell escaped GUI')
-                            pending = None
-                        else:
-                            boundary = 'ordinary-uid'; require(uids[0] == c.launch['guiUid'] and uids[1] == c.launch['guiUid'], 'unobserved privileged GUI child')
-                            continue
-                    else:
-                        boundary = 'descendant-uid'; require(uids == (0, 0, 0, 0), 'privileged descendant UID differs')
-                        boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'privileged descendant escaped GUI')
-                        pending = None
-                    boundary = 'ledger'
-                    def record(v):
-                        records = v.setdefault('transactionProcesses', [])
-                        old = next((r for r in records if birth(r['identity']) == key), None)
-                        if old: old['identity'] = p
-                        else: records.append({'role': 'privilege-transaction', 'identity': p})
-                    c.ledger.mutate(record)
-                    self.rows[key] = p
-                    if direct and p['exe'] == str(Path('/usr/bin/pkexec').resolve()): self.pkexec[key] = pending
-                    elif direct: self.shells[key] = proof
-        except Exception:
-            self.fail_boundary(boundary)
+                    self.observe_candidate(light, values)
+        except Exception as error:
+            if self.boundary == 'candidate' and self.failure_context is not None:
+                value = dict(self.failure_context)
+                value.update(phase=self.candidate_phase, outcome=self.candidate_outcome,
+                             error=self.candidate_error(error))
+                c.auth_note('auth_candidate_failure', value)
+            self.fail_boundary(self.boundary)
             raise
+
+    @staticmethod
+    def candidate_error(error):
+        return ('enoent' if isinstance(error, OSError) and error.errno == 2 else
+                'eacces' if isinstance(error, OSError) and error.errno == 13 else
+                'eperm' if isinstance(error, OSError) and error.errno == 1 else
+                'esrch' if isinstance(error, OSError) and error.errno == 3 else
+                'other-os' if isinstance(error, OSError) else
+                getattr(error, 'error', 'contract') if getattr(error, 'error', 'contract') in
+                ('enoent', 'eacces', 'eperm', 'esrch', 'other-os', 'decode', 'contract') else 'contract')
+
+    def observe_candidate(self, light, values, retries=0, budget=None):
+        budget = [3] if budget is None else budget
+        c = self.c; tun = c.tun; parent = values.get(light['ppid'])
+        direct = parent and birth(parent) == birth(c.gui)
+        self.failure_context = {'schema': 'polaris-transaction-candidate-failure-v1',
+            'inventory': {k: light[k] for k in ('pid', 'startTime', 'ppid')},
+            'relation': 'gui-direct' if direct else 'owned-child',
+            'parent': {k: parent[k] for k in ('pid', 'startTime')} if parent else None}
+        self.candidate_phase = 'identity-before'; self.candidate_outcome = 'unconfirmed'
+        self.boundary = 'candidate'; observation = self.candidate(light['pid'], light, budget, diagnose=True)
+        p = observation['identity']; key = birth(p)
+        if direct:
+            self.candidate_phase = 'gui-parent'
+            self.candidate_outcome = 'identity-mismatch'
+            require(tun.same_process(c.gui, c.ops.proc(c.gui['pid'])), 'GUI parent changed')
+        else:
+            self.candidate_phase = 'owned-parent'; self.candidate_outcome = 'unconfirmed'
+            current = c.ops.proc(parent['pid'])
+            require(current and current['ppid'] == parent['ppid'], 'owned parent topology changed')
+            if not tun.same_process(self.rows[birth(parent)], current):
+                self.candidate_phase = 'owned-parent'; self.candidate_outcome = 'identity-mismatch'
+                # Only a previously verified direct pkexec birth may take the
+                # existing strict exec-state transition. Re-read the whole child
+                # after durable parent evidence; never infer from a name or UID.
+                require(retries < 2 and current and birth(current) == birth(parent) and
+                        birth(parent) in self.pkexec and current['ppid'] == c.gui['pid'] and
+                        parent['ppid'] == c.gui['pid'], 'owned parent changed')
+                self.candidate_phase = 'parent-transition'
+                self.observe_candidate(parent, values, retries + 1, budget)
+                return self.observe_candidate(light, values, retries + 1, budget)
+        argv = observation['argv']; uids = observation['uids']; executable = observation['executable']
+        if direct:
+            if p['exe'] == str(Path('/usr/bin/pkexec').resolve()):
+                self.boundary = 'pkexec-argv'
+                require(argv[:2] == ['/usr/bin/pkexec', '/bin/bash'] and len(argv) == 3, 'unexpected GUI pkexec argv')
+                self.boundary = 'pkexec-uid'
+                initial = uids == (c.launch['guiUid'], 0, 0, 0)
+                require(initial or (uids == (0, 0, 0, 0) and key in self.pkexec), 'pkexec UID transition differs')
+                self.boundary = 'script'; proof = c.verify_script(argv[2], self.kind)
+                if key in self.pkexec:
+                    require(argv[2] == self.pkexec[key]['script'] and proof == self.pkexec[key]['proof'], 'original script changed')
+                self.boundary = 'pkexec-executable'; require(executable == c.tools['pkexec'], 'pkexec object changed')
+                self.boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'pkexec namespace/cgroup differs')
+                pending = {'identity': p, 'script': argv[2], 'proof': proof}
+            elif p['exe'] == str(Path('/bin/bash').resolve()) and uids == (0, 0, 0, 0):
+                self.boundary = 'shell-prior'; require(key in self.pkexec, 'root bash without original pkexec birth')
+                self.boundary = 'shell-argv'; require(argv == ['/bin/bash', self.pkexec[key]['script']], 'root bash argv differs')
+                self.boundary = 'shell-executable'; require(executable == c.tools['bash'], 'root bash object changed')
+                self.boundary = 'script'; proof = c.verify_script(argv[1], self.kind)
+                require(proof == self.pkexec[key]['proof'], 'original script changed')
+                self.boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'root shell escaped GUI')
+                pending = None
+            else:
+                self.boundary = 'ordinary-uid'; require(uids[0] == c.launch['guiUid'] and uids[1] == c.launch['guiUid'], 'unobserved privileged GUI child')
+                return
+        else:
+            self.boundary = 'descendant-uid'; require(uids == (0, 0, 0, 0), 'privileged descendant UID differs')
+            self.boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'privileged descendant escaped GUI')
+            pending = None
+        self.boundary = 'ledger'
+        def record(v):
+            records = v.setdefault('transactionProcesses', [])
+            old = next((r for r in records if birth(r['identity']) == key), None)
+            if old: old['identity'] = p
+            else: records.append({'role': 'privilege-transaction', 'identity': p})
+        c.ledger.mutate(record)
+        self.rows[key] = p
+        if direct and p['exe'] == str(Path('/usr/bin/pkexec').resolve()): self.pkexec[key] = pending
+        elif direct: self.shells[key] = proof
 
     def credential_fence(self, deadline, stopped):
         # No lock is held while waiting, reading procfs or persisting observations.
@@ -1675,6 +1750,13 @@ class Controller:
         with self.auth_runtime_lock:
             if self.auth_runtime['firstFailure'] is None:
                 self.auth_runtime['firstFailure'] = {'stage': self.auth_runtime['lastReached'], 'code': code}
+        self.auth_checkpoint()
+
+    def auth_candidate_failure(self, value):
+        validate_candidate_failure(value)
+        with self.auth_runtime_lock:
+            if self.auth_runtime['candidateFailure'] is None:
+                self.auth_runtime['candidateFailure'] = json.loads(json.dumps(value))
         self.auth_checkpoint()
 
     def auth_recovery_step(self, step, state, proof=None):

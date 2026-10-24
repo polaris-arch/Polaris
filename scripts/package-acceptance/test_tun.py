@@ -614,3 +614,78 @@ class TransactionIdentityTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.observe(second_uid='Uid:\t0\t0\t0\t0\n')
     def test_growing_file_is_bounded_and_rejected(self):
         with self.assertRaises(ValueError):self.observe(grow=True)
+
+
+class TransactionRealProcTests(unittest.TestCase):
+    """Owned ordinary test children only: no pkexec, helper, account or product."""
+    def child(self, action):
+        import sys
+        code="import os,sys; print('ready',flush=True); sys.stdin.buffer.read(1); "+action
+        process=subprocess.Popen([sys.executable,'-I','-c',code],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        self.addCleanup(self.close_child,process)
+        self.assertEqual(process.stdout.readline(),b'ready\n')
+        return process
+    @staticmethod
+    def close_child(process):
+        if process.poll() is None:process.terminate()
+        process.wait(timeout=3)
+        if process.stdin:process.stdin.close()
+        if process.stdout:process.stdout.close()
+    def test_real_same_birth_exec_changes_strong_identity_without_pid_reuse(self):
+        import time
+        process=self.child("os.execv('/bin/sleep',['/bin/sleep','20'])")
+        before=tun.transaction_identity(process.pid)
+        process.stdin.write(b'x');process.stdin.flush()
+        deadline=time.monotonic()+3
+        while True:
+            try:after=tun.transaction_identity(process.pid)
+            except tun.TransactionIdentityError:
+                if time.monotonic()>=deadline:raise
+                continue
+            if after['identity']['exeInode']!=before['identity']['exeInode']:break
+            self.assertLess(time.monotonic(),deadline);time.sleep(.001)
+        self.assertEqual(before['identity']['startTime'],after['identity']['startTime'])
+        self.assertEqual(before['identity']['pid'],after['identity']['pid'])
+        self.assertFalse(tun.same_process(before['identity'],after['identity']))
+        self.assertEqual(after['argv'],['/bin/sleep','20'])
+        self.assertEqual(after['uids'],(os.getuid(),)*4)
+    def test_real_exit_after_inventory_remains_unconfirmed_not_admitted(self):
+        process=self.child('sys.exit(0)')
+        before=tun.transaction_identity(process.pid)
+        process.stdin.write(b'x');process.stdin.flush();process.wait(timeout=3)
+        self.assertGreater(before['identity']['pid'],1)
+        with self.assertRaises(tun.TransactionIdentityError) as caught:tun.transaction_identity(process.pid)
+        self.assertEqual(caught.exception.phase,'identity-before')
+        self.assertEqual(str(caught.exception),'transaction candidate observation unconfirmed')
+    def test_real_zombie_before_reap_remains_unconfirmed(self):
+        import time
+        process=self.child('sys.exit(0)')
+        before=tun.transaction_identity(process.pid)
+        process.stdin.write(b'x');process.stdin.flush()
+        deadline=time.monotonic()+3
+        while True:
+            raw=Path('/proc',str(process.pid),'stat').read_text()
+            fields=raw[raw.rindex(')')+2:].split()
+            if fields[0]=='Z':break
+            self.assertLess(time.monotonic(),deadline);time.sleep(.001)
+        self.assertEqual(fields[19],before['identity']['startTime'])
+        with self.assertRaises(tun.TransactionIdentityError):tun.transaction_identity(process.pid)
+        process.wait(timeout=3)
+
+
+class TransactionDiagnosticTests(unittest.TestCase):
+    observe = TransactionIdentityTests.observe
+    def test_fixed_stage_matrix_never_includes_original_exception(self):
+        for error,expected in ((PermissionError(13,'secret-path'),'eacces'),(FileNotFoundError(2,'secret-path'),'enoent'),
+                               (ProcessLookupError(3,'secret-path'),'esrch'),(ValueError('secret-path'),'contract')):
+            with patch.object(tun,'process_identity',side_effect=error):
+                with self.assertRaises(tun.TransactionIdentityError) as caught:tun.transaction_identity(123)
+            self.assertEqual(caught.exception.phase,'identity-before');self.assertEqual(caught.exception.error,expected)
+            self.assertNotIn('secret-path',str(caught.exception))
+    def test_input_change_and_exec_change_have_consistency_stage(self):
+        for options in ({'change':{'exeInode':999}},{'second_argv':b'/other\0'}):
+            with self.assertRaises(tun.TransactionIdentityError) as caught:self.observe(**options)
+            self.assertEqual(caught.exception.phase,'snapshot-consistency')
+    def test_executable_growth_has_read_stage(self):
+        with self.assertRaises(tun.TransactionIdentityError) as caught:self.observe(grow=True)
+        self.assertEqual(caught.exception.phase,'executable-read')

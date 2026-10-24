@@ -405,43 +405,67 @@ def executable_identity(pid):
     finally: os.close(fd)
 
 
-def transaction_identity(pid):
-    """One bounded, held-executable observation; never infer an exec history.
+TRANSACTION_IDENTITY_PHASES = ('identity-before', 'executable-open', 'executable-initial',
+    'inputs-before', 'executable-read', 'inputs-after', 'identity-after', 'snapshot-consistency')
 
-    All argv/UID/proc observations must describe the same live executable birth.
-    A transition during reads fails closed; callers may retry reads, not mutation.
-    """
-    before = process_identity(pid)
-    require(before is not None and before['state'] != 'Z', 'live transaction candidate required')
-    root = Path('/proc') / str(pid)
-    fd = os.open(root / 'exe', os.O_RDONLY | os.O_CLOEXEC)
+
+class TransactionIdentityError(ValueError):
+    def __init__(self, phase, error):
+        super().__init__('transaction candidate observation unconfirmed')
+        self.phase = phase
+        self.error = ('enoent' if isinstance(error, OSError) and error.errno == 2 else
+                      'eacces' if isinstance(error, OSError) and error.errno == 13 else
+                      'eperm' if isinstance(error, OSError) and error.errno == 1 else
+                      'esrch' if isinstance(error, OSError) and error.errno == 3 else
+                      'other-os' if isinstance(error, OSError) else
+                      'decode' if isinstance(error, UnicodeError) else 'contract')
+
+
+def transaction_identity(pid):
+    """Bounded held-executable observation, with fixed non-secret failure stages."""
+    phase = 'identity-before'
     try:
-        info = os.fstat(fd)
-        require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 128 * 1024 * 1024 and
-                (info.st_dev, info.st_ino) == (before['exeDev'], before['exeInode']), 'transaction executable changed')
-        def inputs():
-            status = (root / 'status').read_text()
-            uids = tuple(int(v) for v in next(x for x in status.splitlines() if x.startswith('Uid:')).split()[1:])
-            raw = (root / 'cmdline').read_bytes()
-            require(len(uids) == 4 and 0 < len(raw) <= 1024 * 1024 and raw.endswith(b'\0'), 'transaction inputs unavailable')
-            return uids, [x.decode('utf-8', 'strict') for x in raw[:-1].split(b'\0')]
-        uids, argv = inputs(); digest = hashlib.sha256()
-        remaining = info.st_size
-        while remaining:
-            block = os.read(fd, min(1024 * 1024, remaining))
-            require(block, 'transaction executable shortened')
-            remaining -= len(block); digest.update(block)
-        require(not os.read(fd, 1), 'transaction executable grew')
-        second_inputs = inputs()
-        after = process_identity(pid); last = os.fstat(fd)
-        require(same_process(before, after) and before['ppid'] == after['ppid'] and
-                before['exe'] == after['exe'] and before['uid'] == uids[0] and second_inputs == (uids, argv) and
-                (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
-                (last.st_dev, last.st_ino, last.st_size, last.st_mtime_ns, last.st_ctime_ns), 'transaction observation changed')
-        return {'identity': before, 'uids': uids, 'argv': argv,
-                'executable': {'dev': info.st_dev, 'inode': info.st_ino, 'sha256': digest.hexdigest()}}
-    finally:
-        os.close(fd)
+        phase = 'identity-before'
+        before = process_identity(pid)
+        require(before is not None and before['state'] != 'Z', 'live transaction candidate required')
+        phase = 'executable-open'
+        root = Path('/proc') / str(pid)
+        fd = os.open(root / 'exe', os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            phase = 'executable-initial'
+            info = os.fstat(fd)
+            require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 128 * 1024 * 1024 and
+                    (info.st_dev, info.st_ino) == (before['exeDev'], before['exeInode']), 'transaction executable changed')
+            def inputs():
+                status = (root / 'status').read_text()
+                uids = tuple(int(v) for v in next(x for x in status.splitlines() if x.startswith('Uid:')).split()[1:])
+                raw = (root / 'cmdline').read_bytes()
+                require(len(uids) == 4 and 0 < len(raw) <= 1024 * 1024 and raw.endswith(b'\0'), 'transaction inputs unavailable')
+                return uids, [x.decode('utf-8', 'strict') for x in raw[:-1].split(b'\0')]
+            phase = 'inputs-before'
+            uids, argv = inputs(); digest = hashlib.sha256()
+            phase = 'executable-read'
+            remaining = info.st_size
+            while remaining:
+                block = os.read(fd, min(1024 * 1024, remaining))
+                require(block, 'transaction executable shortened')
+                remaining -= len(block); digest.update(block)
+            require(not os.read(fd, 1), 'transaction executable grew')
+            phase = 'inputs-after'
+            second_inputs = inputs()
+            phase = 'identity-after'
+            after = process_identity(pid); last = os.fstat(fd)
+            phase = 'snapshot-consistency'
+            require(same_process(before, after) and before['ppid'] == after['ppid'] and
+                    before['exe'] == after['exe'] and before['uid'] == uids[0] and second_inputs == (uids, argv) and
+                    (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
+                    (last.st_dev, last.st_ino, last.st_size, last.st_mtime_ns, last.st_ctime_ns), 'transaction observation changed')
+            return {'identity': before, 'uids': uids, 'argv': argv,
+                    'executable': {'dev': info.st_dev, 'inode': info.st_ino, 'sha256': digest.hexdigest()}}
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, StopIteration, KeyError, IndexError) as error:
+        raise TransactionIdentityError(phase, error) from None
 
 
 def service_properties(ops):

@@ -973,6 +973,15 @@ const observe = function(id) {
           applyId:Number.isSafeInteger(event.applyId)&&event.applyId>0?event.applyId:null});
         if(observation.rows.length>512) observation.rows.shift();
       }
+      // NativeAutoReceipt is shape-only, never a command identity claim.
+      if (typeof data?.intentApplied==='boolean' && typeof data?.status?.featureEnabled==='boolean' &&
+          Number.isSafeInteger(data.status.generation) && data.status.generation>0 &&
+          ['saved','applied','pending','deferred'].includes(data.status.applyOutcome)) {
+        observation.rows.push({sequence:++observation.cursor,source:'original-auto-mode-callback',
+          success:raw?.success===true,intentApplied:data.intentApplied,featureEnabled:data.status.featureEnabled,
+          generation:data.status.generation,applyOutcome:data.status.applyOutcome});
+        if(observation.rows.length>512) observation.rows.shift();
+      }
       // SaveOutcome remains shape-only. The UI click window and independent
       // private-file read prove this preference without replaying a write/read IPC.
       if (data?.status === 'saved' || data?.status === 'conflict') {
@@ -1435,8 +1444,30 @@ def save_fixture(driver, desired):
     before = driver.invoke('config_get')
     value = driver.invoke('config_save', {'config': desired, 'deferRestart': True,
                                           'baseVersion': config_version(before)})
-    require(value and value.get('status') == 'saved', 'fixture config save conflicted')
-    return value['config']
+    require(type(value) is dict and value.get('status') == 'saved' and type(value.get('config')) is dict,
+            'fixture config save conflicted')
+    saved=value['config']
+    # Actual full-save producer mirrors these backend-owned fields. These
+    # fixtures do not delete live Auto references; such a deletion needs its
+    # dedicated user selection path, not an invented successful whole save.
+    for key in ('recentServerIds','builtinGeoMeta','meshRoutePolicy','meshRouteState',
+                'selectionIntent','autoSelectEnabled','autoSelectPins'):
+        gui_require((key in saved)==(key in before) and saved.get(key)==before.get(key),
+                    'fixture-authoritative-field-differs')
+    for key in ('language','autoConnect','interruptConnectionsOnSwitch','logLevel','mixedPort',
+                'controlPort','clashApiSecret','selectedServerId'):
+        if key in desired:
+            gui_require(type(saved.get(key)) is type(desired[key]) and saved.get(key)==desired[key],
+                        'fixture-writable-field-differs')
+    if 'servers' in desired:
+        wanted=desired['servers'];actual=saved.get('servers')
+        gui_require(type(wanted) is list and type(actual) is list and len(actual)==len(wanted),
+                    'fixture-servers-differ')
+        for node in wanted:
+            rows=[row for row in actual if row.get('id')==node.get('id')]
+            gui_require(len(rows)==1 and all(type(rows[0].get(k)) is type(node.get(k)) and rows[0].get(k)==node.get(k) for k in
+                        ('id','name','protocol','address','port','subscriptionId')), 'fixture-servers-differ')
+    return saved
 
 
 def carrier_path(directory, item):
@@ -1813,14 +1844,18 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
         gui_require(not same_process(previous, current) or current['state'] == 'Z', 'preference-old-core-still-running')
 
     def activate_saved_preference(self, wanted):
+        return self.activate_saved_graph(wanted, self.preference_disk, self.preference_runtime, 'preferenceActivations')
+
+    def activate_saved_graph(self, wanted, saved_read, runtime_read, receipt_key, phase_prefix='preference'):
+        gui_require(phase_prefix in ('preference','auto'), 'activation-context-invalid')
         # Saved D, accepted R, and the subsequent selection are separate proofs.
-        self.gui_phase('preference-activation-begin')
+        self.gui_phase(phase_prefix+'-activation-begin')
         deadline = time.monotonic() + 75
         def remaining():
             left = deadline-time.monotonic()
             gui_require(left > 0, 'observation-timeout')
             return left
-        disk = self.preference_disk()
+        disk = saved_read()
         gui_require(disk['value'] is wanted, 'preference-saved-value-differs')
         previous = dict(self.core); before_status = self.status()
         control = self.pending_apply_control()
@@ -1831,12 +1866,12 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
         proof = {'wanted':wanted,'saved':disk,'apply':'not-needed','restartConfirmed':False}
         if control['buttons']:
             gui_require(not control['disabled'], 'preference-apply-disabled')
-            self.gui_phase('preference-apply-click')
+            self.gui_phase(phase_prefix+'-apply-click')
             result = self.apply(('hotApplied','restartRequired'), timeout=min(65,remaining()))
             proof['apply'] = result['status']
             if result['status'] == 'restartRequired':
                 cursor = max((r['sequence'] for r in self.driver.observations()), default=0)
-                self.gui_phase('preference-restart-confirm')
+                self.gui_phase(phase_prefix+'-restart-confirm')
                 self.driver.click('dialog[open][aria-labelledby="restart-apply-title"] button', self.text('home.restartApplyConfirm'))
                 def callback():
                     rows=[r for r in self.driver.observations() if r.get('sequence',0)>cursor and r.get('source')=='original-native-callback']
@@ -1856,7 +1891,7 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
                 gui_require(status.get('mainGeneration')==ready['mainGeneration'] and not same_process(previous,self.core),
                             'preference-restart-generation-differs')
                 proof.update(restartConfirmed=True,applyId=apply_id,lifecycle=ready)
-                self.gui_phase('preference-restart-ready',status)
+                self.gui_phase(phase_prefix+'-restart-ready',status)
             else:
                 gui_require(result.get('ok') is True, 'preference-hot-rejected')
                 self.same_core(previous)
@@ -1875,12 +1910,12 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
         else:
             gui_require(control['bars']==0, 'preference-pending-without-apply')
             self.same_core(previous)
-        gui_require(self.preference_disk()==disk, 'preference-saved-file-changed')
-        self.gui_phase('preference-runtime-proof')
-        proof['acceptedRuntime']=self.preference_runtime(wanted)
+        gui_require(saved_read()==disk, 'preference-saved-file-changed')
+        self.gui_phase(phase_prefix+'-runtime-proof')
+        proof['acceptedRuntime']=runtime_read(wanted)
         wait_for(self.pending_apply_control, lambda value: value=={'bars':0,'buttons':0,'disabled':False}, timeout=remaining())
         remaining()
-        self.result.setdefault('preferenceActivations',[]).append(proof)
+        self.result.setdefault(receipt_key,[]).append(proof)
         return proof
 
     def preference_pending_save(self):
@@ -2109,16 +2144,130 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
         _, proof = self.socket('B')
         self.record('gui_on_off', selected=saved, newProcess=True, restoredConnection=proof)
 
+    def auto_saved(self):
+        config = self.config()
+        gui_require(config.get('autoSelectEnabled') is True and
+                    config.get('selectionIntent') == {'mode':'auto','scope':'global'}, 'auto-saved-intent-invalid')
+        servers = config.get('servers')
+        gui_require(type(servers) is list and len(servers)==2 and
+                    {s.get('id') for s in servers}=={'node-a','node-b'}, 'auto-members-invalid')
+        # Private comparison only; never return full config or subscription credentials.
+        return {'value':True,'intent':'global','membersSha256':hashlib.sha256(
+            json.dumps(servers,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
+
+    def auto_runtime(self, wanted):
+        gui_require(wanted is True, 'auto-runtime-value-invalid')
+        endpoint, proof, graph = self.observed_api_endpoint()
+        gui_require(endpoint==self.api_endpoint, 'auto-runtime-endpoint-changed')
+        outbounds=graph.get('outbounds',[])
+        def one(tag,kind):
+            rows=[o for o in outbounds if o.get('tag')==tag]
+            gui_require(len(rows)==1 and rows[0].get('type')==kind,'auto-runtime-group-invalid')
+            return rows[0]
+        selector=one('proxy-selector','selector')
+        wrapper=one('polaris-auto-global','selector')
+        native=one('polaris-auto-global-test','urltest')
+        gui_require(selector.get('default')=='polaris-auto-global' and
+                    'polaris-auto-global' in selector.get('outbounds',[]) and
+                    'polaris-auto-global-test' in wrapper.get('outbounds',[]) and
+                    wrapper.get('default')=='polaris-auto-global-test', 'auto-runtime-reference-invalid')
+        for group in (selector,wrapper,native):
+            value=group.get('interrupt_exist_connections',False)
+            gui_require(type(value) is bool and value is False,'auto-runtime-interrupt-invalid')
+        config=self.config(); tags=[]
+        for node in config.get('servers',[]):
+            matches=[o for o in outbounds if o.get('type')=='socks' and
+                     o.get('server')==node.get('address') and o.get('server_port')==node.get('port')]
+            gui_require(len(matches)==1,'auto-runtime-member-invalid');tags.append(matches[0]['tag'])
+        gui_require(len(tags)==2 and len(set(tags))==2 and set(native.get('outbounds',[]))==set(tags)
+                    and native.get('interval')=='5m' and native.get('url')==self.network.health_url,
+                    'auto-runtime-members-differ')
+        status=self.status()
+        def observed():
+            value=self.driver.invoke('auto_select_status')
+            gui_require(type(value) is dict,'auto-status-schema-invalid')
+            groups=value.get('nativeAutoGroups')
+            gui_require(type(groups) is list,'auto-status-schema-invalid')
+            matches=[g for g in groups if g.get('target')=={'scope':'global'}]
+            return value if (value.get('featureEnabled') is True and
+                type(value.get('generation')) is int and value.get('generation')==status.get('mainGeneration') and
+                value.get('actualServerId')=='node-a' and len(matches)==1 and
+                matches[0].get('confirmed') is True and matches[0].get('state')=='auto' and matches[0].get('actualServerId')=='node-a') else None
+        native_status=wait_for(observed,timeout=35)
+        current=self.status()
+        gui_require(current.get('pid')==self.core['pid'] and current.get('mainGeneration')==status.get('mainGeneration')
+                    and current.get('actualServerId')=='node-a', 'auto-status-generation-changed')
+        after=self.runtime_identity()
+        gui_require(after['sha256']==proof['sha256'] and after['pid']==proof['pid'] and
+                    after['startTime']==proof['startTime'], 'auto-runtime-changed')
+        return {'runtime':proof,'globalConfirmed':True,'actualServerId':'node-a',
+                'mainGeneration':native_status['generation'],'selectorInterrupt':False,'intervalMinutes':5}
+
+    def prepare_auto(self):
+        gui_require(self.pending_apply_control()=={'bars':0,'buttons':0,'disabled':False},'auto-prior-pending-conflict')
+        self.gui_phase('auto-feature-navigation')
+        self.driver.click('.side .nav-item',self.text('sidebar.settings'))
+        self.driver.click('.set-nav',self.text('settings.nav.network'))
+        selector='[data-auto-select-scope="global"].auto-choice-switch button[role="switch"]'
+        def feature():
+            return self.driver.execute("""
+const rows=[...document.querySelectorAll(arguments[0])].filter(e=>e.getClientRects().length&&getComputedStyle(e).visibility==='visible');
+if(rows.length!==1)return {count:rows.length}; const e=rows[0];
+return {count:1,checked:e.getAttribute('aria-checked'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true',busy:e.closest('[data-auto-select-controls]').getAttribute('aria-busy')};
+""",selector)
+        value=feature()
+        gui_require(type(value) is dict and value.get('count')==1 and value.get('checked') in ('true','false')
+                    and value.get('disabled') is False and value.get('busy')=='false','auto-feature-control-invalid')
+        config=self.config()
+        gui_require(type(config.get('autoSelectEnabled')) is bool and
+                    config['autoSelectEnabled']==(value['checked']=='true'), 'auto-feature-state-conflict')
+        preparation={'featureBefore':config['autoSelectEnabled'],'featureClicked':False,'modeAssociation':'shape-only-click-window'}
+        self.result['autoPreparation']=preparation
+        before=self.status()
+        gui_require(before.get('running') is True and not before.get('starting'),'auto-feature-core-not-ready')
+        if value['checked']=='false':
+            cursor=max((r['sequence'] for r in self.driver.observations()),default=0)
+            self.gui_phase('auto-feature-enable')
+            self.driver.click(selector)
+            preparation['featureClicked']=True
+            wait_for(feature,lambda v:v=={'count':1,'checked':'true','disabled':False,'busy':'false'})
+            wait_for(self.config,lambda c:c.get('autoSelectEnabled') is True)
+            def mode_receipt():
+                rows=[r for r in self.driver.observations() if r.get('sequence',0)>cursor and r.get('source')=='original-auto-mode-callback']
+                gui_require(len(rows)<=1,'auto-feature-callback-ambiguous')
+                return rows[0] if rows else None
+            receipt=wait_for(mode_receipt)
+            gui_require(receipt.get('success') is True and receipt.get('intentApplied') is True and
+                        receipt.get('featureEnabled') is True and receipt.get('applyOutcome')=='applied' and
+                        receipt.get('generation')==before.get('mainGeneration'),'auto-feature-mode-unconfirmed')
+            preparation['modeReceipt']={k:receipt[k] for k in ('success','intentApplied','featureEnabled','generation','applyOutcome')}
+        preparation['featureAfter']=True
+        gui_require(not self.preference_pending_save(),'auto-feature-dirty-conflict')
+        native=self.driver.invoke('auto_select_status')
+        after=self.status()
+        gui_require(native.get('featureEnabled') is True and native.get('generation')==before.get('mainGeneration')
+                    and after.get('mainGeneration')==before.get('mainGeneration') and after.get('pid')==before.get('pid'),
+                    'auto-feature-generation-changed')
+        self.driver.click('.side .nav-item',self.text('settings.nav.back'))
+        gui_require(self.pending_apply_control()=={'bars':0,'buttons':0,'disabled':False},'auto-feature-pending-conflict')
+        self.pick('A')
+        expanded=self.driver.execute("return document.querySelector('#node-trigger')?.getAttribute('aria-expanded');")
+        gui_require(expanded in ('true','false'),'auto-menu-state-invalid')
+        if expanded=='false':self.driver.click('#node-trigger')
+        self.gui_phase('auto-enable-click')
+        self.driver.click('#node-menu [data-auto-select-scope="global"] .auto-choice-pick')
+        self.gui_phase('auto-intent-readback')
+        wait_for(self.config,lambda c:c.get('autoSelectEnabled') is True and
+                 c.get('selectionIntent')=={'mode':'auto','scope':'global'})
+        self.gui_phase('auto-graph-activation')
+        proof=self.activate_saved_graph(True,self.auto_saved,self.auto_runtime,'autoActivations',phase_prefix='auto')
+        self.gui_phase('auto-baseline-ready')
+        return proof
+
     def auto_case(self):
         self.gui_phase('auto-begin')
         self.stage = 'gui-auto'
-        self.pick('A')
-        self.driver.click('#node-trigger')
-        self.gui_phase('auto-enable-click')
-        self.driver.click('[data-auto-select-scope="global"] .auto-choice-pick')
-        self.gui_phase('auto-intent-readback')
-        wait_for(self.config, lambda c: c.get('selectionIntent') is not None)
-        wait_for(self.status, lambda s: s.get('actualServerId') == 'node-a', timeout=45)
+        self.prepare_auto()
         old, before = self.socket('A')
         initial = dict(self.core)
         self.network.a.set_admission(False)
@@ -2327,7 +2476,10 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
                 node['subscriptionId'] = 'package-fixture'
             desired = copy.deepcopy(initial)
             desired.update(selection_patch)
-            save_fixture(self.driver, desired)
+            saved_fixture=save_fixture(self.driver, desired)
+            gui_require(type(saved_fixture.get('autoSelectEnabled')) is bool,'fixture-auto-mode-schema-invalid')
+            self.result['fixtureAutoSetup']={'requested':True,'saved':saved_fixture['autoSelectEnabled'],
+                'authority':'backend-owned-not-config-save','sameAsRequested':saved_fixture['autoSelectEnabled'] is True}
             wait_for(lambda: self.driver.execute("return document.documentElement.lang"), lambda lang: lang.startswith('en'), timeout=15)
             self.selection_cases()
             self.auto_case()

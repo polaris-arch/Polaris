@@ -928,10 +928,7 @@ class TunCarrierRun(base.CarrierRun):
         self.preference(False)
         self.activate_saved_preference(False)
         self.network.set_latency('A', 0); self.network.set_latency('B', 0.15)
-        self.pick('A'); self.driver.click('#node-trigger')
-        self.driver.click('[data-auto-select-scope="global"] .auto-choice-pick')
-        base.wait_for(self.config, lambda c: c.get('selectionIntent') is not None)
-        base.wait_for(self.status, lambda s: s.get('actualServerId') == 'node-a', timeout=35)
+        self.prepare_auto()
         old, before = self.socket('A'); initial = dict(self.core)
         # A remains alive and continues the old stream; only health latency changes.
         self.network.set_latency('A', 1.5); self.network.set_latency('B', 0)
@@ -1168,7 +1165,10 @@ class TunCarrierRun(base.CarrierRun):
                 'url': self.network.health_url, 'autoUpdate': False, 'createdAt': '2026-01-01T00:00:00Z',
                 'periodicSpeedTest': False, 'speedTestIntervalMinutes': 5}]
             for node in patch['servers']: node['subscriptionId'] = 'package-fixture'
-            desired = self.config(); desired.update(patch); base.save_fixture(self.driver, desired)
+            desired = self.config(); desired.update(patch); saved_fixture=base.save_fixture(self.driver, desired)
+            base.gui_require(type(saved_fixture.get('autoSelectEnabled')) is bool,'fixture-auto-mode-schema-invalid')
+            self.result['fixtureAutoSetup']={'requested':True,'saved':saved_fixture['autoSelectEnabled'],
+                'authority':'backend-owned-not-config-save','sameAsRequested':saved_fixture['autoSelectEnabled'] is True}
             self.stage = 'default-graph'
             self.pick('A'); status = self.connect()
             runtime = self.runtime_identity()

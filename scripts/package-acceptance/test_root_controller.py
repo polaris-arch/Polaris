@@ -2173,3 +2173,113 @@ class FinalSnapshotParentTests(unittest.TestCase):
             with self.assertRaises(ValueError):o.prepare_parent_stop(time.monotonic()+1)
         finally:o.thread.join(timeout=1)
         self.assertIsNotNone(o.error);o.scan.assert_called_once()
+
+
+class CandidateReconciliationTests(unittest.TestCase):
+    setup_observer = TransactionFenceTests.setup_observer
+    scan = TransactionFenceTests.scan
+
+    def scenario(self, bad=None):
+        c,o,r=self.setup_observer(); self.scan(o,r)
+        r[61]={**identity(61,uid=0),'ppid':60,'exe':'/fixed-child'}
+        original=c.tun.transaction_identity.side_effect; changed=[False]
+        def observation(pid):
+            if pid==61:
+                if not changed[0]:
+                    changed[0]=True
+                    r[60].update(uid=0,exe=str(Path('/bin/bash').resolve()),exeInode=88)
+                    if bad=='reuse':r[60]['startTime']='9999'
+                    if bad=='namespace':r[60]['namespaces']={**r[60]['namespaces'],'mnt':99}
+                    if bad=='script':c.verify_script.return_value={**c.verify_script.return_value,'inode':999}
+                    if bad=='gone':r.pop(60)
+                return {'identity':copy.deepcopy(r[61]),'uids':(0,0,0,0),'argv':['/fixed-child'],
+                        'executable':{'dev':1,'inode':161,'sha256':H}}
+            value=original(pid)
+            if bad=='argv' and changed[0]:value['argv']=['/bin/bash','/wrong']
+            return value
+        c.tun.transaction_identity.side_effect=observation
+        c.tun.transaction_identity.reset_mock()
+        return c,o,r
+
+    def test_parent_same_birth_exec_during_child_read_revalidates_whole_chain(self):
+        c,o,r=self.scenario();self.scan(o,r)
+        self.assertTrue(o.snapshot()['authorizationObserved'])
+        self.assertIn(m.birth(r[61]),o.rows)
+        self.assertEqual([x.args[0] for x in c.tun.transaction_identity.call_args_list],[60,61,60,61])
+        recorded=c.ledger.value['transactionProcesses']
+        self.assertEqual(next(x['identity']['exeInode'] for x in recorded if x['identity']['pid']==60),88)
+
+    def test_changed_parent_never_relaxes_prior_script_argv_namespace_or_birth(self):
+        for bad in ('reuse','namespace','script','gone','argv'):
+            with self.subTest(bad=bad):
+                c,o,r=self.scenario(bad)
+                with self.assertRaises(ValueError):self.scan(o,r)
+                self.assertNotIn(m.birth(r[61]),o.rows)
+                self.assertIsNotNone(o.error)
+
+    def test_unknown_related_gone_or_zombie_still_permanent_failure(self):
+        for state in (None,'Z'):
+            c,o,r=self.setup_observer()
+            error=vm_tun.TransactionIdentityError('identity-before',ValueError('private-message'))
+            c.tun.transaction_identity.side_effect=error
+            with self.assertRaises(ValueError):self.scan(o,r)
+            self.assertFalse(o.rows);self.assertEqual(o.error,'candidate')
+            diagnostic=next(x.args[1] for x in c.auth_note.call_args_list if x.args[0]=='auth_candidate_failure')
+            self.assertEqual(diagnostic['phase'],'identity-before')
+            self.assertNotIn('private-message',json.dumps(diagnostic))
+            m.validate_candidate_failure(diagnostic)
+
+    def test_diagnostic_distinguishes_parent_reuse_from_candidate_io(self):
+        c,o,r=self.scenario('reuse')
+        with self.assertRaises(ValueError):self.scan(o,r)
+        d=next(x.args[1] for x in c.auth_note.call_args_list if x.args[0]=='auth_candidate_failure')
+        self.assertEqual((d['phase'],d['inventory']['pid'],d['parent']['pid']),('owned-parent',61,60))
+        c,o,r=self.setup_observer()
+        c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('executable-open',PermissionError(13,'private-path'))
+        with self.assertRaises(ValueError):self.scan(o,r)
+        d=next(x.args[1] for x in c.auth_note.call_args_list if x.args[0]=='auth_candidate_failure')
+        self.assertEqual((d['phase'],d['error']),('executable-open','eacces'))
+
+    def test_strict_candidate_schema_and_first_diagnostic_is_detached(self):
+        c=controller(m.AUTH_MODE);c.auth_runtime=m.auth_runtime_observation(m.AUTH_MODE)
+        c.auth_runtime['kind']='install';c.auth_runtime_lock=threading.RLock();c.auth_checkpoint=Mock()
+        d={'schema':'polaris-transaction-candidate-failure-v1','phase':'owned-parent',
+           'inventory':{'pid':61,'startTime':'1234','ppid':60},'relation':'owned-child',
+           'parent':{'pid':60,'startTime':'1234'},'outcome':'identity-mismatch','error':'contract'}
+        c.auth_candidate_failure(d);d['inventory']['pid']=999
+        self.assertEqual(c.auth_snapshot()['candidateFailure']['inventory']['pid'],61)
+        for key,value in (('phase','raw-secret'),('error','private-path'),('inventory',{'pid':True,'startTime':'1','ppid':2})):
+            bad=copy.deepcopy(c.auth_snapshot()['candidateFailure']);bad[key]=value
+            with self.assertRaises(ValueError):m.validate_candidate_failure(bad)
+
+    def test_candidate_shared_budget_and_fence_deadline_do_not_observe(self):
+        c,o,r=self.setup_observer();c.tun.transaction_identity.reset_mock()
+        with self.assertRaises(ValueError):o.candidate(60,r[60],budget=[0])
+        c.tun.transaction_identity.assert_not_called()
+        with self.assertRaises(ValueError):o.credential_fence(time.monotonic()-1,threading.Event())
+        c.tun.transaction_identity.assert_not_called()
+
+
+class CandidateExtraBoundariesTests(unittest.TestCase):
+    setup_observer = TransactionFenceTests.setup_observer
+    scan = TransactionFenceTests.scan
+    scenario = CandidateReconciliationTests.scenario
+    def test_parent_reparent_is_not_a_legal_exec_transition(self):
+        c,o,r=self.scenario();original=c.ops.proc.side_effect
+        def read(pid):
+            value=original(pid)
+            if pid==60 and value and value['uid']==0:return {**value,'ppid':999}
+            return value
+        c.ops.proc.side_effect=read
+        with self.assertRaises(ValueError):self.scan(o,r)
+        self.assertNotIn(m.birth(r[61]),o.rows)
+    def test_parent_transition_ledger_failure_never_admits_child(self):
+        c,o,r=self.scenario();original=c.ledger.mutate;calls=[0]
+        def mutate(fn):
+            calls[0]+=1
+            if calls[0]==2:raise OSError('not emitted')
+            return original(fn)
+        c.ledger.mutate=mutate
+        with self.assertRaises(OSError):self.scan(o,r)
+        self.assertNotIn(m.birth(r[61]),o.rows)
+        self.assertEqual(o.error,'ledger')

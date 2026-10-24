@@ -1843,5 +1843,135 @@ class PreferenceApplyTests(unittest.TestCase):
         self.assertIsNone(M.preference_restart_terminal([{**row,'applyId':8}],7,1))
 
 
+class AutoPreparationTests(unittest.TestCase):
+    @staticmethod
+    def once(read, condition=bool, **kwargs):
+        value=read();M.gui_require(condition(value),'observation-timeout');return value
+
+    def prepared(self,enabled=False):
+        run=M.CarrierRun.__new__(M.CarrierRun);run.result={};run.core={'pid':10,'startTime':'1'}
+        run.gui_phase=Mock();run.text=lambda x:x;run.pick=Mock();run.driver=Mock()
+        run.pending_apply_control=Mock(return_value={'bars':0,'buttons':0,'disabled':False});run.preference_pending_save=Mock(return_value=False)
+        run.status=Mock(return_value={'pid':10,'mainGeneration':3,'running':True})
+        row={'count':1,'checked':'true' if enabled else 'false','disabled':False,'busy':'false'}
+        run.driver.execute.side_effect=[row]+([] if enabled else [{'count':1,'checked':'true','disabled':False,'busy':'false'}])+['false']
+        run.config=Mock(side_effect=[{'autoSelectEnabled':enabled}]+([] if enabled else [{'autoSelectEnabled':True}])+[{'autoSelectEnabled':True,'selectionIntent':{'mode':'auto','scope':'global'}}])
+        run.driver.observations.side_effect=[[],[{'sequence':1,'source':'original-auto-mode-callback','success':True,'intentApplied':True,'featureEnabled':True,'generation':3,'applyOutcome':'applied'}]]
+        run.driver.invoke.return_value={'featureEnabled':True,'generation':3}
+        run.activate_saved_graph=Mock(return_value={'acceptedRuntime':True})
+        return run
+
+    def test_real_mode_before_global_then_apply_before_stream(self):
+        for enabled in (False,True):
+            run=self.prepared(enabled)
+            with patch.object(M,'wait_for',side_effect=self.once):run.prepare_auto()
+            clicks=[c.args[0] for c in run.driver.click.call_args_list]
+            mode='[data-auto-select-scope="global"].auto-choice-switch button[role="switch"]'
+            self.assertEqual(clicks.count(mode),0 if enabled else 1)
+            self.assertEqual(clicks.count('#node-menu [data-auto-select-scope="global"] .auto-choice-pick'),1)
+            run.activate_saved_graph.assert_called_once_with(True,run.auto_saved,run.auto_runtime,'autoActivations',phase_prefix='auto')
+        source=Path(M.__file__).read_text().split('    def auto_case(',1)[1].split('    def ',1)[0]
+        self.assertLess(source.index('self.prepare_auto()'),source.index('self.socket('))
+        self.assertIn('+ 370',source);self.assertIn("self.exchange(old, 'A')",source)
+
+    def test_feature_invalid_hidden_duplicate_disabled_dirty_and_callback_reject_no_replay(self):
+        bads=[{'count':0},{'count':2},{'count':1,'checked':'false','disabled':True,'busy':'false'},
+              {'count':1,'checked':'false','disabled':False,'busy':'true'}]
+        for row in bads:
+            run=self.prepared();run.driver.execute.side_effect=[row]
+            with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.prepare_auto()
+            self.assertEqual(run.driver.click.call_count,2);run.activate_saved_graph.assert_not_called()
+        for key,value in [('success',False),('intentApplied',False),('featureEnabled',False),('generation',4),('applyOutcome','pending')]:
+            run=self.prepared();row={'sequence':1,'source':'original-auto-mode-callback','success':True,'intentApplied':True,'featureEnabled':True,'generation':3,'applyOutcome':'applied'};row[key]=value
+            run.driver.observations.side_effect=[[],[row]]
+            with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.prepare_auto()
+            self.assertEqual(run.driver.click.call_count,3);run.activate_saved_graph.assert_not_called()
+
+    def runtime(self):
+        run=M.CarrierRun.__new__(M.CarrierRun);run.core={'pid':10,'startTime':'1'};run.api_endpoint={'port':1}
+        run.network=SimpleNamespace(health_url='http://fixture/health')
+        proof={'pid':10,'startTime':'1','sha256':'a'*64}
+        graph={'outbounds':[
+            {'tag':'proxy-selector','type':'selector','default':'polaris-auto-global','outbounds':['polaris-auto-global']},
+            {'tag':'polaris-auto-global','type':'selector','outbounds':['polaris-auto-global-test','A','B'],'default':'polaris-auto-global-test'},
+            {'tag':'polaris-auto-global-test','type':'urltest','outbounds':['A','B'],'interval':'5m','url':run.network.health_url},
+            {'tag':'A','type':'socks','server':'127.0.0.1','server_port':11},
+            {'tag':'B','type':'socks','server':'127.0.0.1','server_port':12}]}
+        run.observed_api_endpoint=Mock(return_value=(run.api_endpoint,proof,graph));run.runtime_identity=Mock(return_value=proof)
+        run.config=Mock(return_value={'servers':[{'id':'node-a','address':'127.0.0.1','port':11},{'id':'node-b','address':'127.0.0.1','port':12}]})
+        run.status=Mock(return_value={'pid':10,'mainGeneration':3,'actualServerId':'node-a'})
+        run.driver=Mock();run.driver.invoke.return_value={'featureEnabled':True,'generation':3,'actualServerId':'node-a',
+            'nativeAutoGroups':[{'target':{'scope':'global'},'confirmed':True,'state':'auto','actualServerId':'node-a'}]}
+        return run,graph
+
+    def test_runtime_requires_real_graph_and_current_native_confirmation_not_manual_actual_A(self):
+        run,graph=self.runtime()
+        with patch.object(M,'wait_for',side_effect=self.once):proof=run.auto_runtime(True)
+        self.assertTrue(proof['globalConfirmed']);self.assertNotIn('outbounds',proof)
+        for fault in ('missing','member','interval','interrupt','unconfirmed','generation','file','endpoint'):
+            run,graph=self.runtime()
+            if fault=='missing':graph['outbounds'].pop(2)
+            elif fault=='member':graph['outbounds'][2]['outbounds']=['A']
+            elif fault=='interval':graph['outbounds'][2]['interval']='1m'
+            elif fault=='interrupt':graph['outbounds'][0]['interrupt_exist_connections']=True
+            elif fault=='unconfirmed':run.driver.invoke.return_value['nativeAutoGroups'][0]['confirmed']=False
+            elif fault=='generation':run.driver.invoke.return_value['generation']=4
+            elif fault=='file':run.runtime_identity.return_value={**run.runtime_identity.return_value,'sha256':'b'*64}
+            else:run.api_endpoint={'port':2}
+            with self.subTest(fault=fault),patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.auto_runtime(True)
+
+    def test_auto_uses_same_hot_and_restart_lifecycle_gate_before_runtime_proof(self):
+        for outcome in ('hotApplied','restartRequired'):
+            run=PreferenceApplyTests().fixture(outcome)
+            saved=Mock(return_value={'value':True,'intent':'global','membersSha256':'a'*64})
+            runtime=Mock(return_value={'globalConfirmed':True})
+            with patch.object(M,'wait_for',side_effect=PreferenceApplyTests.once):
+                result=run.activate_saved_graph(True,saved,runtime,'autoActivations',phase_prefix='auto')
+            runtime.assert_called_once_with(True)
+            self.assertEqual(run.result['autoActivations'],[result])
+            self.assertEqual(result['restartConfirmed'],outcome=='restartRequired')
+            self.assertIn(('auto-runtime-proof',),[c.args for c in run.gui_phase.call_args_list])
+            run.preference_disk.assert_not_called();run.preference_runtime.assert_not_called()
+
+    def test_fixture_saved_receipt_mirrors_authority_not_submitted_request(self):
+        before={'autoSelectEnabled':False,'autoSelectPins':[],'interruptConnectionsOnSwitch':False,
+                'servers':[{'id':'node-a','name':'A','protocol':'socks','address':'127.0.0.1','port':1080}]}
+        requested={**before,'autoSelectEnabled':True,'selectionIntent':{'mode':'auto','scope':'global'},
+                   'interruptConnectionsOnSwitch':True}
+        actual={**before,'interruptConnectionsOnSwitch':True}
+        driver=Mock();driver.invoke.side_effect=[before,{'status':'saved','config':actual}]
+        self.assertEqual(M.save_fixture(driver,requested),actual)
+        self.assertFalse(actual['autoSelectEnabled']);self.assertNotIn('selectionIntent',actual)
+        for key,value in [('autoSelectEnabled',True),('autoSelectPins',[{'raw':'PRIVATE'}]),
+                          ('selectionIntent',{'mode':'auto','scope':'global'}),('interruptConnectionsOnSwitch',False)]:
+            driver=Mock();driver.invoke.side_effect=[before,{'status':'saved','config':{**actual,key:value}}]
+            with self.assertRaises(M.GuiFailure):M.save_fixture(driver,requested)
+            self.assertEqual(driver.invoke.call_count,2)
+        source=(SOURCE/'src-tauri/src/commands/config.rs').read_text()
+        body=source.split('fn config_save_core(',1)[1].split('fn sync_traffic_rules_projection(',1)[0]
+        self.assertLess(body.index('enforce_backend_authoritative_fields_from(current, &mut next)'),body.index('*current = next'))
+        self.assertIn('polaris_store::auto_select::ENABLED_KEY',source)
+        self.assertIn('polaris_store::auto_select::PINS_KEY',source)
+        rust=(SOURCE/'src-tauri/src/commands/config/tests/backend_authoritative_tests.rs').read_text()
+        self.assertIn('fn ordinary_save_mirrors_auto_authority_and_returns_actual_saved_config()',rust)
+        self.assertIn('config_save_core(&mgr, &mut requested, Some(&version), false)',rust)
+
+    def test_actual_auto_callback_projection_and_render_producers(self):
+        import subprocess
+        payload={'success':True,'data':{'intentApplied':True,'status':{'featureEnabled':True,'generation':3,'applyOutcome':'applied','secret':'PRIVATE'}}}
+        script=('const callbacks=new Map([[1,x=>42]]);global.window={};const i={};Object.defineProperty(i,"invoke",{value:()=>{}});'
+                'Object.defineProperty(i,"callbacks",{value:callbacks});window.__TAURI_INTERNALS__=i;new Function('+json.dumps(M.OBSERVER)+')();'
+                'const result=callbacks.get(1)('+json.dumps(payload)+');console.log(JSON.stringify({result,rows:window.__packageObservation.rows}));')
+        data=json.loads(subprocess.check_output(['node','-e',script],text=True));self.assertEqual(data['result'],42)
+        self.assertEqual(set(data['rows'][0]),{'source','sequence','success','intentApplied','featureEnabled','generation','applyOutcome'})
+        self.assertNotIn('PRIVATE',json.dumps(data))
+        control=(SOURCE/'ui/src/mobile/AutoSelectControls.tsx').read_text()
+        self.assertIn("variant !== 'switch' && (!featureEnabled || !members.length)",control)
+        self.assertIn("run({ kind: 'setEnabled', enabled: !featureEnabled })",control)
+        source=(SOURCE/'src-tauri/src/runtime/proxy/native_auto.rs').read_text()
+        self.assertIn('New reference adds native outbounds',source)
+        self.assertIn('self.defer_selected_projection(projected, core_generation, generation)',source)
+
+
 if __name__ == '__main__':
     unittest.main()

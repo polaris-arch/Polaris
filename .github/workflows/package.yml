@@ -1144,6 +1144,10 @@ jobs:
           cargo test --locked -p polaris-helper-client "$test_name" -- --exact | tee "$RUNNER_TEMP/linux-helper-producer-test.log"
           grep -F "test $test_name ... ok" "$RUNNER_TEMP/linux-helper-producer-test.log"
           grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/linux-helper-producer-test.log"
+          test_name=commands::config::tests::backend_authoritative_tests::ordinary_save_mirrors_auto_authority_and_returns_actual_saved_config
+          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/config-auto-authority-test.log"
+          grep -F "test $test_name ... ok" "$RUNNER_TEMP/config-auto-authority-test.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/config-auto-authority-test.log"
 
       - name: Build and stage privileged helper
         shell: bash

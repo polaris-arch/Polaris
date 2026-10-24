@@ -913,6 +913,9 @@ class ControllerLifecycleContracts(unittest.TestCase):
         self.assertLess(calls.index(('activate',True)),calls.index(('socket','A',11)))
         self.assertIn(('same-core',11),calls)
         source=Path(M.__file__).read_text()
+        auto=source.split('    def auto_case(',1)[1].split('    def ',1)[0]
+        self.assertLess(auto.index('self.prepare_auto()'),auto.index('self.socket('))
+        self.assertNotIn('auto-choice-pick',auto)
         for method in ('auto_case','uncovered_case'):
             body=source.split('    def '+method+'(',1)[1].split('    def ',1)[0]
             self.assertIn('self.activate_saved_preference(False)',body)
@@ -1125,6 +1128,39 @@ class AuthenticationRuntimeConsumerTests(unittest.TestCase):
             else:
                 self.assertNotIn('authenticationRuntime',saved)
                 self.assertNotIn('transaction-raw-secret',json.dumps(client.lifecycle))
+
+    def test_candidate_failure_real_producer_to_error_and_abort_consumer(self):
+        import root_controller, threading, copy
+        producer=root_controller.Controller.__new__(root_controller.Controller)
+        producer.auth_runtime_lock=threading.RLock();producer.auth_checkpoint=Mock()
+        producer.auth_runtime=root_controller.auth_runtime_observation(root_controller.AUTH_GROUP_MODE)
+        producer.auth_runtime['kind']='install';producer.auth_runtime['lastReached']='transaction-observer'
+        producer.auth_runtime['firstFailure']={'stage':'transaction-observer','code':'transaction-candidate-unconfirmed'}
+        failure={'schema':'polaris-transaction-candidate-failure-v1','phase':'owned-parent',
+                 'inventory':{'pid':61,'startTime':'1234','ppid':60},'relation':'owned-child',
+                 'parent':{'pid':60,'startTime':'1234'},'outcome':'identity-mismatch','error':'contract'}
+        producer.auth_candidate_failure(failure)
+        for fault in (None,'phase','extra'):
+            observation=copy.deepcopy(producer.auth_runtime)
+            if fault=='phase':observation['candidateFailure']['phase']='PRIVATE'
+            if fault=='extra':observation['candidateFailure']['raw']='PRIVATE'
+            client=M.Controller();client.closed=False
+            payload={'seq':1,'ok':False,'error':{'stage':'dispatch','code':'CONTROLLER_FAILED','authenticationRuntime':observation}}
+            with patch.object(client,'_write'),patch.object(client,'_read',return_value=payload):
+                with self.assertRaises(ValueError):client.call('transaction_scan',kind='install')
+            saved=client.lifecycle['rootOperationFailure']
+            if fault is None:self.assertEqual(saved['authenticationRuntime']['candidateFailure'],failure)
+            else:self.assertNotIn('authenticationRuntime',saved)
+            self.assertNotIn('PRIVATE',json.dumps(client.lifecycle))
+        receipt={'schema':'polaris-root-abort-v1','state':'failed','forced':True,'prepared':True,
+            'actualReadOnlyAuth':None,'unknown':['authentication-lease-recovery-unknown'],
+            'authenticationRuntime':producer.auth_runtime,'productCleanup':{'state':'forced','forced':True,'unknown':[],
+                'publicationEligible':False}}
+        client=M.Controller();client.child=Mock();client.child.wait.return_value=1
+        client.lifecycle.update(ready=True,spawned=True)
+        with patch.object(client,'call',return_value=receipt):result=client.recover()
+        self.assertEqual(result['state'],'failed')
+        self.assertEqual(client.lifecycle['abortReceipt']['authenticationRuntime']['candidateFailure'],failure)
 
     def test_abort_keeps_safe_partial_proof_without_promoting_failure(self):
         import root_controller
