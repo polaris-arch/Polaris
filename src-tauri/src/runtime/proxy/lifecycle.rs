@@ -32,7 +32,33 @@ use polaris_switch_engine::DebouncedOutcome;
 use super::route_replan::RuntimeBindingState;
 use super::system_takeover::should_clear_system_proxy_between_restart;
 use super::{ProxyRuntime, ProxyStatus, StartError};
-use crate::runtime::config::LegacyStartLease;
+use crate::runtime::config::{LegacyStartLease, SavedCommitError};
+
+/// Public status failure is not a partial status or an owned Stop capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyStatusReadError {
+    Saved(SavedCommitError),
+    StatusUnavailable,
+}
+
+impl ProxyStatusReadError {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Saved(SavedCommitError::WriterBusy) => "PROXY_STATUS_WRITER_BUSY",
+            Self::Saved(SavedCommitError::CacheBusy) => "PROXY_STATUS_CACHE_BUSY",
+            Self::Saved(SavedCommitError::WriterPoisoned) => "PROXY_STATUS_WRITER_POISONED",
+            Self::Saved(SavedCommitError::CachePoisoned) => "PROXY_STATUS_CACHE_POISONED",
+            Self::Saved(SavedCommitError::Cold) => "PROXY_STATUS_CACHE_COLD",
+            Self::StatusUnavailable => "PROXY_STATUS_UNAVAILABLE",
+        }
+    }
+}
+
+impl std::fmt::Display for ProxyStatusReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
 
 fn gateway_start_preflight(config: &Value) -> Result<(), StartError> {
     super::lan_gateway::check_user_config(config, super::platform_tag())
@@ -1255,10 +1281,12 @@ impl ProxyRuntime {
     /// real configuration writer is active or cache is unavailable: cache.read alone
     /// can pair old D with the intent already registered by an unpublished writer.
     /// The fence callback only reads memory; platform observations run after it.
-    pub(crate) fn status_with_owned_stop_context(&self) -> Result<ProxyStatus, String> {
+    pub(crate) fn status_with_owned_stop_context(
+        &self,
+    ) -> Result<ProxyStatus, ProxyStatusReadError> {
         let mut status = self
             .config
-            .try_with_saved_commit(|config| {
+            .try_with_saved_commit_classified(|config| {
                 self.selector_reconcile.with_intent_claim(|intent| {
                     // Same config -> intent -> publication order as owned Stop.
                     // The native groups and main generation are captured together;
@@ -1268,7 +1296,7 @@ impl ProxyRuntime {
                     let mut status = self
                         .status
                         .read()
-                        .map_err(|_| "proxy status unavailable".to_owned())?
+                        .map_err(|_| ProxyStatusReadError::StatusUnavailable)?
                         .clone();
                     self.project_status_memory(&mut status, generation);
                     status.owned_stop_context = Some(OwnedStopContext {
@@ -1278,10 +1306,10 @@ impl ProxyRuntime {
                             .map(str::to_owned),
                         selection_intent_generation: intent,
                     });
-                    Ok::<_, String>(status)
+                    Ok::<_, ProxyStatusReadError>(status)
                 })
             })
-            .map_err(|error| error.to_string())??;
+            .map_err(ProxyStatusReadError::Saved)??;
         self.project_status_platform(&mut status);
         Ok(status)
     }

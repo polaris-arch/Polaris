@@ -232,16 +232,88 @@ def private_bytes(path, uid, home, maximum=8 * 1024 * 1024):
         if parent == home:
             require(info.st_uid == uid and not info.st_mode & 0o077, 'HOME is not private')
             break
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as f:
         before = os.fstat(f.fileno())
         require(stat.S_ISREG(before.st_mode) and before.st_uid == uid and before.st_nlink == 1 and
                 not before.st_mode & 0o077 and 0 < before.st_size <= maximum, 'private regular bounded file required')
-        data = f.read(); f.seek(0); again = f.read(); after = os.fstat(f.fileno())
+        data = f.read(maximum + 1); f.seek(0); again = f.read(maximum + 1); after = os.fstat(f.fileno())
+        require(len(data) <= maximum and len(again) <= maximum, 'private file grew beyond bound')
         sig = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
         require(data == again and sig(before) == sig(after) == sig(path.lstat()), 'private file unstable or replaced')
     return data, {'sha256': sha(data), 'bytes': len(data), 'dev': before.st_dev, 'inode': before.st_ino,
                   'stableDoubleRead': True}
+
+
+class HeldScript:
+    """Read-only original object, never an authority to execute or signal."""
+    def __init__(self, path, uid, home):
+        self.path = Path(path); self.fd = None
+        data, self.proof = private_bytes(self.path, uid, home, 1024 * 1024)
+        require(data.startswith(b'#!/bin/sh\nset -eu\n'), 'original Linux script header required')
+        self.parents = [(parent, self.parent_signature(parent.lstat()))
+            for parent in (self.path.parent, *self.path.parent.parents)]
+        self.fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            self.initial = os.fstat(self.fd)
+            require(stat.S_ISREG(self.initial.st_mode) and self.initial.st_uid == uid and
+                    self.initial.st_nlink == 1 and not self.initial.st_mode & 0o077 and
+                    0 < self.initial.st_size <= 1024 * 1024, 'original script object required')
+            self.verify_linked()
+        except BaseException:
+            self.close(); raise
+
+    @staticmethod
+    def parent_signature(value):
+        return (value.st_dev, value.st_ino, value.st_uid, value.st_gid, value.st_mode)
+
+    @staticmethod
+    def signature(value, unlinked=False):
+        fields = (value.st_dev, value.st_ino, value.st_uid, value.st_gid,
+                  value.st_mode, value.st_size, value.st_mtime_ns)
+        return fields if unlinked else fields + (value.st_ctime_ns, value.st_nlink)
+
+    def ancestors(self):
+        for path, expected in self.parents:
+            require(self.parent_signature(path.lstat()) == expected, 'original script ancestor changed')
+
+    def sample(self, unlinked=False):
+        require(self.fd is not None, 'original script descriptor closed')
+        before = os.fstat(self.fd)
+        require(self.signature(before, unlinked) == self.signature(self.initial, unlinked) and
+                before.st_nlink == (0 if unlinked else 1), 'original script metadata changed')
+        data = os.pread(self.fd, self.initial.st_size + 1, 0)
+        again = os.pread(self.fd, self.initial.st_size + 1, 0)
+        after = os.fstat(self.fd)
+        require(data == again and len(data) == self.proof['bytes'] and sha(data) == self.proof['sha256'] and
+                (before.st_dev, before.st_ino) == (self.proof['dev'], self.proof['inode']) and
+                self.signature(before) == self.signature(after), 'original script content changed')
+        return dict(self.proof)
+
+    def verify_linked(self):
+        self.ancestors()
+        before = self.path.lstat()
+        require(self.signature(before) == self.signature(self.initial), 'original script path changed')
+        proof = self.sample()
+        require(self.signature(self.path.lstat()) == self.signature(before), 'original script path changed')
+        self.ancestors()
+        return proof
+
+    def verify_unlinked(self):
+        # Only the caller's already-proved root-shell terminal birth may use this.
+        # nlink 1->0 changes ctime legitimately; unchanged content/mtime/ownership
+        # is current object evidence, not a claim the object was never writable.
+        self.ancestors()
+        def absent():
+            try: self.path.lstat()
+            except FileNotFoundError: return
+            raise ValueError('original script path replaced or remains linked')
+        absent(); proof = self.sample(unlinked=True); absent(); self.ancestors()
+        return proof
+
+    def close(self):
+        fd, self.fd = self.fd, None
+        if fd is not None: os.close(fd)  # Never retry an uncertain close on a reused fd.
 
 
 AUTH_PHRASE = 'AUTHORIZE TEMPORARY RUNNER PASSWORD AND RELOCK FOR THIS RUN'
@@ -368,7 +440,8 @@ AUTH_OPERATION_STAGES = ('idle', 'transaction-guard', 'agent-spawn', 'agent-noti
     'transaction-finish', 'controller-input')
 TRANSACTION_BOUNDARIES = ('gui', 'inventory', 'candidate', 'pkexec-argv', 'pkexec-uid', 'script',
     'pkexec-executable', 'shell-prior', 'shell-argv', 'shell-executable', 'namespace', 'ordinary-uid',
-    'descendant-uid', 'ledger', 'credential-fence')
+    'descendant-uid', 'ledger', 'credential-fence', 'script-terminal',
+    'finish-observer', 'finish-terminal', 'finish-credential', 'finish-lineage', 'finish-ledger', 'finish-descriptor')
 AUTH_FAILURE_CODES = ('operation-failed', 'abort-requested', 'input-ended', 'recovery-failed') + tuple(
     'transaction-' + key + '-unconfirmed' for key in TRANSACTION_BOUNDARIES)
 AUTH_RECOVERY_STEPS = ('agent', 'credential', 'group', 'lineage', 'timer')
@@ -379,7 +452,7 @@ AUTH_PUMP_STAGES = ('not-started', 'waiting', 'bytes-observed', 'action-checked'
 AUTH_PUMP_CODES = ('pty-read-failed', 'pty-eof', 'dialogue-limit', 'dialogue-encoding',
     'action-mismatch', 'identity-not-unique', 'identity-mismatch', 'identity-write-failed',
     'echo-unconfirmed', 'pkexec-fence-unconfirmed', 'credential-write-failed', 'native-authentication-failed',
-    'native-authentication-canceled', 'completion-unconfirmed', 'activity-deadline', 'unexpected-error')
+    'native-authentication-canceled', 'completion-unconfirmed', 'multiple-prompts', 'activity-deadline', 'unexpected-error')
 AUTH_PUMP_FLAGS = ('ptyBytes', 'expectedAction', 'expectedIdentity', 'echoDisabled',
                    'credentialWriteCompleted', 'authenticationComplete')
 
@@ -1306,21 +1379,33 @@ observably active before a password-setting attempt. Each transaction re-locks.
             while not self.stop.is_set() and time.monotonic() < deadline:
                 failure_code = 'pty-read-failed'
                 if not select.select([self.c.pty], [], [], 0.05)[0]: continue
+                sent_before_part = self.sent
                 part = os.read(self.c.pty, 1024); check(part, 'pty-eof')
                 observe('bytes-observed', 'ptyBytes')
                 data += part; check(len(data) <= 16384, 'dialogue-limit')
                 failure_code = 'dialogue-encoding'
-                text = re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]', b'', bytes(data)).decode('utf-8', 'strict').replace('\r', '')
+                cleaned = re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]', b'', bytes(data))
+                try: text = cleaned.decode('utf-8', 'strict').replace('\r\n', '\n')
+                except UnicodeDecodeError as error:
+                    if error.reason == 'unexpected end of data' and error.end == len(cleaned): continue
+                    raise
                 check('AUTHENTICATION FAILED' not in text, 'native-authentication-failed')
-                check('AUTHENTICATION CANCELED' not in text, 'native-authentication-canceled')
-                check('AUTHENTICATING FOR org.freedesktop.policykit.exec' in text or not ('Password:' in text), 'action-mismatch')
-                if 'AUTHENTICATING FOR org.freedesktop.policykit.exec' in text: observe('action-checked', 'expectedAction')
+                check('AUTHENTICATION CANCELED' not in text and not re.search(r'^Cancelled\n', text, re.M), 'native-authentication-canceled')
+                if re.search(r'^==== AUTHENTICATION COMPLETE ===\n', text, re.M):
+                    check(sent_before_part, 'completion-unconfirmed')
+                actions = re.findall(r'^==== AUTHENTICATING FOR (.+) ===\n', text, re.M)
+                check(all(action == 'org.freedesktop.policykit.exec' for action in actions) and
+                      (actions == ['org.freedesktop.policykit.exec'] or 'Password:' not in text), 'action-mismatch')
+                if actions == ['org.freedesktop.policykit.exec']: observe('action-checked', 'expectedAction')
+                check(text.count('Password:') <= 1 and text.count('Choose identity to authenticate as') <= 1, 'multiple-prompts')
                 observe('identity-checked')
-                if 'Choose identity to authenticate as' in text and not selected:
+                if re.search(r'Choose identity to authenticate as \(1-[0-9]+\): ', text) and not selected:
+                    check(actions == ['org.freedesktop.policykit.exec'], 'action-mismatch')
                     matches = re.findall(r'^ ([0-9]+)\.  ' + re.escape(display) + r'$', text, re.M)
                     check(len(matches) == 1, 'identity-not-unique')
                     failure_code = 'identity-write-failed'
-                    os.write(self.c.pty, matches[0].encode() + b'\n'); selected = True
+                    selection = matches[0].encode() + b'\n'
+                    check(os.write(self.c.pty, selection) == len(selection), 'identity-write-failed'); selected = True
                 if self.grouped:
                     offered = re.findall(r'^Authenticating as: (.+)$', text, re.M)
                     check(all(name == display for name in offered), 'identity-mismatch')
@@ -1350,8 +1435,8 @@ observably active before a password-setting attempt. Each transaction re-locks.
                     written = os.write(self.c.pty, bytes(self.secret) + b'\n')
                     check(written == len(self.secret) + 1, 'credential-write-failed')
                     self.sent = True; observe(flag='credentialWriteCompleted')
-                if '==== AUTHENTICATION COMPLETE ====' in text:
-                    check(self.sent and identity_ok, 'completion-unconfirmed')
+                if re.search(r'^==== AUTHENTICATION COMPLETE ===\n', text, re.M):
+                    check(sent_before_part and self.sent and identity_ok, 'completion-unconfirmed')
                     observe('completion-observed', 'authenticationComplete')
                     self.authenticated = True; return
             if self.stop.is_set():
@@ -1639,9 +1724,19 @@ class TransactionObserver:
                 self.boundary = 'shell-prior'; require(key in self.pkexec, 'root bash without original pkexec birth')
                 self.boundary = 'shell-argv'; require(argv == ['/bin/bash', self.pkexec[key]['script']], 'root bash argv differs')
                 self.boundary = 'shell-executable'; require(executable == c.tools['bash'], 'root bash object changed')
-                self.boundary = 'script'; proof = c.verify_script(argv[1], self.kind)
-                require(proof == self.pkexec[key]['proof'], 'original script changed')
                 self.boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'root shell escaped GUI')
+                self.boundary = 'script'
+                try: proof = c.verify_script(argv[1], self.kind)
+                except FileNotFoundError:
+                    self.boundary = 'script-terminal'
+                    require(key in self.shells and key in self.rows, 'unlinked script without prior root shell')
+                    terminal = tun.terminal_identity(self.rows[key])
+                    require(c.verify_unlinked_script(argv[1], self.pkexec[key]['proof']) == self.pkexec[key]['proof'],
+                            'unlinked original script differs')
+                    c.ledger.mutate(lambda v: v.setdefault('transactionTerminals', []).append(terminal))
+                    self.terminals[key] = terminal
+                    return
+                require(proof == self.pkexec[key]['proof'], 'original script changed')
                 pending = None
             else:
                 self.boundary = 'ordinary-uid'; require(uids[0] == c.launch['guiUid'] and uids[1] == c.launch['guiUid'], 'unobserved privileged GUI child')
@@ -1713,7 +1808,16 @@ class TransactionObserver:
         result = self.snapshot()
         require(len(self.pkexec) == len(self.shells) == 1, 'real pkexec authorization unavailable or not fully observed')
         for row in self.rows.values():
-            self.c.tun.terminal_identity(row)
+            try: self.c.tun.terminal_identity(row)
+            except Exception:
+                self.fail_boundary('finish-terminal'); raise
+        for prior in self.pkexec.values():
+            try:
+                try: proof = self.c.verify_script(prior['script'], self.kind)
+                except FileNotFoundError: proof = self.c.verify_unlinked_script(prior['script'], prior['proof'])
+                require(proof == prior['proof'], 'terminal script object changed')
+            except Exception:
+                self.fail_boundary('script-terminal'); raise
         result['closed'] = True
         return result
 
@@ -1722,6 +1826,7 @@ class Controller:
     def __init__(self, launch, tun, directory):
         self.launch = validate_launch(launch); self.tun = tun; self.directory = directory
         self.ops = tun.Commands(); self.seq = 0; self.failed = False; self.finished = False
+        self.script_files = {}
         self.gui = None; self.ledger = None; self.observer = None; self.fixtures = {}; self.capture_offset = 0
         self.agent = None; self.pty = None; self.tools = {}; self.lease = None; self.auth_observer = None
         self.stage = 'idle'; self.preparation_pending = False; self.recovery_unknown = []
@@ -1843,11 +1948,37 @@ class Controller:
         path = Path(path)
         require(path.parent == Path(self.launch['helperScriptDir']) and
                 re.fullmatch(r'[0-9a-f]{24}-polaris-helper-' + kind + r'\.sh', path.name), 'original product script path differs')
-        data, proof = private_bytes(path, self.launch['guiUid'], self.launch['guiHome'], 1024 * 1024)
-        # The real shared Unix producer emits this one header. The product
-        # explicitly invokes /bin/bash; this is not generic shebang authorization.
-        require(data.startswith(b'#!/bin/sh\nset -eu\n'), 'original Linux script header required')
-        return proof
+        if path not in self.script_files:
+            candidate = HeldScript(path, self.launch['guiUid'], self.launch['guiHome'])
+            held = self.script_files.setdefault(path, candidate)
+            if held is not candidate: candidate.close()
+        return self.script_files[path].verify_linked()
+
+    def verify_unlinked_script(self, path, expected):
+        held = self.script_files.get(Path(path))
+        require(held is not None and held.proof == expected, 'original held script unavailable')
+        return held.verify_unlinked()
+
+    def close_script_files(self):
+        # A live observer retains its descriptors until process teardown; do not
+        # close/reuse them under an in-flight read or wait here before recovery.
+        try:
+            active = self.observer is not None and self.observer.thread.is_alive()
+            if self.lease is not None and self.lease.thread is not None:
+                active = active or self.lease.thread.is_alive()
+        except Exception: active = True
+        if active:
+            self.recovery_unknown.append('script-descriptor-close-unknown'); self.failed = True
+            return False
+        ok = True
+        for held in list(self.script_files.values()):
+            try: held.close()
+            except Exception: ok = False
+        self.script_files.clear()
+        if not ok:
+            self.recovery_unknown.append('script-descriptor-close-unknown'); self.failed = True
+        return ok
+
 
     def bind_gui(self, pid):
         self.stage = 'bind-gui'
@@ -2035,23 +2166,35 @@ class Controller:
 
     def transaction_end(self):
         self.auth_reached('transaction-finish')
-        require(self.observer is not None, 'no active transaction')
-        result = self.observer.finish(); self.observer = None
-        if self.lease:
-            self.lease.close()
-            require(self.lease.authenticated and self.lease.error is None, 'real credential authentication not proved')
-            result['credentialAuthenticationComplete'] = True
-            closed_auth = self.stop_agent(close_window=False)
-            result['credentialRecovery'] = self.ledger.load()['authentication']['lease']['recovery']
-            if self.launch['authenticationMode'] == AUTH_GROUP_MODE:
-                require(self.lease.group_recovery is not None, 'joint membership recovery absent')
-                self.group_recovery = self.lease.group_recovery
-                result['jointLease'] = {'credentialRecovery': result['credentialRecovery'], 'groupRecovery': self.group_recovery}
-            result['authDescendantsReaped'] = closed_auth['authDescendantsReaped']
-            self.lease = None
-        self.ledger.mutate(lambda v: (v.setdefault('transactions', []).append(result),
-                                     v['authentication'].update(authorized=True)))
-        return result
+        boundary = 'finish-observer'
+        try:
+            require(self.observer is not None, 'no active transaction')
+            result = self.observer.finish(); self.observer = None
+            if self.lease:
+                boundary = 'finish-credential'
+                self.lease.close()
+                require(self.lease.authenticated and self.lease.error is None, 'real credential authentication not proved')
+                result['credentialAuthenticationComplete'] = True
+                boundary = 'finish-lineage'
+                closed_auth = self.stop_agent(close_window=False)
+                result['credentialRecovery'] = self.ledger.load()['authentication']['lease']['recovery']
+                if self.launch['authenticationMode'] == AUTH_GROUP_MODE:
+                    require(self.lease.group_recovery is not None, 'joint membership recovery absent')
+                    self.group_recovery = self.lease.group_recovery
+                    result['jointLease'] = {'credentialRecovery': result['credentialRecovery'], 'groupRecovery': self.group_recovery}
+                result['authDescendantsReaped'] = closed_auth['authDescendantsReaped']
+                self.lease = None
+            boundary = 'finish-descriptor'
+            require(self.close_script_files(), 'original script descriptor closure unknown')
+            boundary = 'finish-ledger'
+            self.ledger.mutate(lambda v: (v.setdefault('transactions', []).append(result),
+                                         v['authentication'].update(authorized=True)))
+            return result
+        except BaseException:
+            self.auth_note('auth_failed', 'transaction-' + boundary + '-unconfirmed')
+            raise
+        finally:
+            self.close_script_files()
 
     def network_start(self):
         value = self.guard()
@@ -2318,6 +2461,7 @@ class Controller:
                 require(not self.observer.thread.is_alive(), 'transaction observer remains live')
                 self.observer = None
             except Exception: self.recovery_unknown.append('privilege-transaction-cleanup-unknown')
+        self.close_script_files()
         if not self.ledger:
             return {'schema': 'polaris-root-abort-v1', 'state': 'failed', 'forced': True,
                 'prepared': None if self.preparation_pending else False, 'actualReadOnlyAuth': self.readonly_auth,

@@ -1049,10 +1049,12 @@ class NativeRejected(ValueError):
     """Actual native failure envelope, not timeout or unknown outcome."""
     def __init__(self, message, diagnostic='unknown'):
         super().__init__(message)
-        self.diagnostic = diagnostic if diagnostic in ('saved-state-unavailable', 'proxy-status-unavailable') else 'unknown'
+        self.diagnostic = diagnostic if diagnostic in ('saved-state-unavailable', 'proxy-status-unavailable') + STATUS_BUSY_DIAGNOSTICS + STATUS_HARD_DIAGNOSTICS else 'unknown'
 
 
 
+STATUS_BUSY_DIAGNOSTICS = ('status-writer-busy', 'status-cache-busy')
+STATUS_HARD_DIAGNOSTICS = ('status-writer-poisoned', 'status-cache-poisoned', 'status-cache-cold')
 NATIVE_BRIDGE_SCHEMA = 'polaris-native-read-bridge-v1'
 NATIVE_BRIDGE_JS = r'''
 const [command, args, done] = arguments;
@@ -1066,7 +1068,11 @@ try {
   else if (raw.success === false) {
    let diagnostic='unknown';
    if(command==='proxy_get_status') {
-    if(raw.error==='config validation failed: saved commit unavailable') diagnostic='saved-state-unavailable';
+    const codes={PROXY_STATUS_WRITER_BUSY:'status-writer-busy',PROXY_STATUS_CACHE_BUSY:'status-cache-busy',
+     PROXY_STATUS_WRITER_POISONED:'status-writer-poisoned',PROXY_STATUS_CACHE_POISONED:'status-cache-poisoned',
+     PROXY_STATUS_CACHE_COLD:'status-cache-cold',PROXY_STATUS_UNAVAILABLE:'proxy-status-unavailable'};
+    if(typeof raw.code==='string' && Object.hasOwn(codes,raw.code) && raw.data==null) diagnostic=codes[raw.code];
+    else if(raw.error==='config validation failed: saved commit unavailable') diagnostic='saved-state-unavailable';
     else if(raw.error==='proxy status unavailable') diagnostic='proxy-status-unavailable';
    }
    finish('envelope-rejected',null,diagnostic);
@@ -1083,10 +1089,10 @@ def native_bridge_state(value, command=None):
             value.get('state') not in ('returned', 'unavailable', 'invalid-envelope',
                                       'envelope-rejected', 'promise-rejected', 'invoke-threw') or
             (value.get('state') != 'returned' and value.get('data') is not None) or
-            value.get('diagnostic') not in (('unknown', 'saved-state-unavailable', 'proxy-status-unavailable')
+            value.get('diagnostic') not in (('unknown', 'saved-state-unavailable', 'proxy-status-unavailable') + STATUS_BUSY_DIAGNOSTICS + STATUS_HARD_DIAGNOSTICS
                 if value.get('state') == 'envelope-rejected' else ('none',))):
         return 'invalid-bridge'
-    if value['diagnostic'] in ('saved-state-unavailable', 'proxy-status-unavailable') and command != 'proxy_get_status':
+    if value['diagnostic'] in ('saved-state-unavailable', 'proxy-status-unavailable') + STATUS_BUSY_DIAGNOSTICS + STATUS_HARD_DIAGNOSTICS and command != 'proxy_get_status':
         return 'invalid-bridge'
     return value['state']
 
@@ -1641,6 +1647,7 @@ class CarrierRun:
         if phase in ('stopped-check', 'apply-ready'):
             self.api_endpoint = None
             self.result.pop('apiEndpoint', None)
+            self._readiness_fence = None
             self._connect_started = time.monotonic()
             self.result['connectObservation'] = {'phases': []}
         record = {'phase': phase, 'elapsedMs': max(0, int((time.monotonic() - self._connect_started) * 1000))}
@@ -1649,8 +1656,67 @@ class CarrierRun:
         self.result['connectObservation']['phase'] = phase
         self.result['connectObservation']['phases'].append(record)
 
+    def readiness_observation_fence(self, session):
+        gui_require(type(session) is str and bool(session) and self.driver.session == session,
+                    'status-readiness-session-changed')
+        current = observe_app_executable(self.app)
+        gui_require((current.st_dev,current.st_ino)==(self.app['exeDev'],self.app['exeInode']),
+                    'status-readiness-app-changed')
+        fence = getattr(self, '_readiness_fence', None)
+        if fence is None:
+            with self.supervisor.lock:
+                drivers=[dict(value) for pid,value in self.supervisor.owned.items()
+                         if self.supervisor.roles.get(pid)=='driver']
+            gui_require(bool(drivers),'status-readiness-driver-unknown')
+            fence={'session':session,'drivers':drivers}
+            self._readiness_fence=fence
+        gui_require(fence['session']==session,'status-readiness-session-changed')
+        for expected in fence['drivers']:
+            actual=process_identity(expected['pid'])
+            gui_require(same_process(expected,actual) and actual.get('uid')==expected.get('uid')==os.getuid() and
+                        actual.get('state')!='Z', 'status-readiness-driver-changed')
+
+    def wait_ready_status(self, timeout):
+        gui_require(type(timeout) in (int,float) and 0<timeout<float('inf'), 'status-readiness-timeout-invalid')
+        self._readiness_deadline=time.monotonic()+timeout
+        try:
+            status=wait_for(self.connect_status,lambda s:s.get('running') is True and not s.get('starting'),timeout=timeout)
+            gui_require(time.monotonic()<self._readiness_deadline,'observation-timeout')
+            return status
+        finally:
+            self._readiness_deadline=None
+
+    def readiness_budget(self):
+        deadline=getattr(self,'_readiness_deadline',None)
+        if deadline is not None:
+            gui_require(time.monotonic()<deadline,'observation-timeout')
+
     def connect_status(self):
-        status = self.status()
+        # Only this existing readiness poll accepts the explicit producer's
+        # WouldBlock classification. Never replay Connect, fixture writes, or
+        # transport/unknown failures. The caller owns the original deadline.
+        self.readiness_budget()
+        session=getattr(getattr(self,'driver',None),'session',None)
+        try:
+            status = self.status()
+        except NativeRejected as error:
+            if error.diagnostic not in STATUS_BUSY_DIAGNOSTICS:
+                raise
+            self.readiness_budget()
+            self.readiness_observation_fence(session)
+            self.readiness_budget()
+            observation=self.result['connectObservation']
+            transient=observation.setdefault('savedStateObservation',{'state':'waiting','busyCount':0,
+                'firstDiagnostic':error.diagnostic,'lastDiagnostic':error.diagnostic})
+            transient['busyCount']+=1
+            transient['lastDiagnostic']=error.diagnostic
+            transient['state']='waiting'
+            return {}  # no invented running/starting/owned-stop values
+        self.readiness_budget()
+        if getattr(self,'_readiness_fence',None) is not None:
+            self.readiness_observation_fence(session)
+            self.result['connectObservation']['savedStateObservation']['state']='observed'
+        self.readiness_budget()
         self.result['connectObservation']['lastStatus'] = safe_connect_status(status)
         return status
 
@@ -1682,7 +1748,7 @@ class CarrierRun:
     def observe_ready_core(self, timeout=75, register=True):
         # Observe the original ready core; never click or replay a start here.
         self.connect_phase('status-ready')
-        status = wait_for(self.connect_status, lambda s: s.get('running') is True and not s.get('starting'), timeout=timeout)
+        status = self.wait_ready_status(timeout)
         self.connect_phase('core-birth', status)
         require(status.get('startedViaHelper') is not True, 'privileged helper prohibited')
         core = self.supervisor.executable(self.payload / self.members['core']['path'])

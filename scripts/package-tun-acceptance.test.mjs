@@ -247,7 +247,7 @@ test('actual controller transaction schema survives actual GUI adapter and Node 
   // Pure schema integration: no privileged subprocess, account or product action.
   // Use real observer.finish and helper_action bodies; only OS/driver operations
   // are fakes. This guards producer/consumer field drift, not runtime coverage.
-  const program = `import json,sys,threading,types,subprocess
+  const program = `import json,sys,threading,types,subprocess,tempfile,os
 from unittest.mock import Mock,patch
 sys.path.insert(0,sys.argv[1])
 import root_controller as root
@@ -258,25 +258,46 @@ app={'pid':100,'startTime':'123','uid':1001}
 results=[]
 for kind in ('install','uninstall'):
     controller=types.SimpleNamespace(gui=app,launch={'authenticationMode':'existing-session'},ops=types.SimpleNamespace(proc=lambda pid:None),tun=actual_tun)
+    private=tempfile.TemporaryDirectory()
+    home=actual_tun.Path(private.name);home.chmod(0o700)
+    script=home/('a'*24+'-polaris-helper-'+kind+'.sh')
+    script.write_bytes((actual_tun.Path(sys.argv[1])/'fixtures'/('linux-helper-'+kind+'.sh')).read_bytes())
+    script.chmod(0o700)
+    held=root.HeldScript(script,os.getuid(),home)
+    def verify_script(path,expected_kind):
+        assert path==str(script) and expected_kind==kind
+        return held.verify_linked()
+    controller.verify_script=verify_script;controller.auth_note=Mock()
     observer=root.TransactionObserver(controller,kind)
     observer.thread=Mock(); observer.thread.is_alive.return_value=False
     row={'pid':102,'startTime':'125','uid':0,'ppid':100}
-    observer.rows={(102,'125'):row}; observer.pkexec={(102,'125'):row}; observer.shells={(102,'125'):row}
+    observer.rows={(102,'125'):row}; observer.pkexec={(102,'125'):{'identity':row,'script':str(script),'proof':held.proof}}; observer.shells={(102,'125'):row}
     # Real terminal producer: only whole-directory ENOENT proves sampled absence.
+    real_lstat=actual_tun.Path.lstat
     def missing(path):
-        assert str(path)=='/proc/102'
-        raise FileNotFoundError(2,'synthetic absent directory')
+        if str(path)=='/proc/102':raise FileNotFoundError(2,'synthetic absent directory')
+        return real_lstat(path)
     with patch.object(actual_tun.Path,'lstat',autospec=True,side_effect=missing) as terminal_reads:
         closed=observer.finish()
-        assert terminal_reads.call_count==2
+        assert sum(str(call.args[0])=='/proc/102' for call in terminal_reads.call_args_list)==2
+    def negative_observer():
+        rejected=root.TransactionObserver(controller,kind)
+        rejected.thread=observer.thread;rejected.rows=dict(observer.rows)
+        rejected.pkexec=dict(observer.pkexec);rejected.shells=dict(observer.shells)
+        return rejected
+    denied=negative_observer()
     with patch.object(actual_tun.Path,'lstat',side_effect=PermissionError(13,'synthetic denial')):
-        try: observer.finish()
+        try: denied.finish()
         except PermissionError: pass
         else: raise AssertionError('permission failure must not prove terminal closure')
+    assert denied.error=='finish-terminal'
+    incomplete=negative_observer()
     with patch.object(actual_tun.Path,'lstat',return_value=Mock()), patch.object(actual_tun.Path,'read_text',side_effect=FileNotFoundError(2,'synthetic missing stat')):
-        try: observer.finish()
+        try: incomplete.finish()
         except FileNotFoundError: pass
         else: raise AssertionError('missing proc subfile must not prove terminal closure')
+    assert incomplete.error=='finish-terminal' and observer.error is None
+    held.close();private.cleanup()
     run=object.__new__(gui.TunCarrierRun)
     run.result={}; run.env={}
     run.app=app; run.driver=Mock(); run.supervisor=Mock(); run.controller=Mock(); run.launch_options={'authenticationMode':'existing-session'}

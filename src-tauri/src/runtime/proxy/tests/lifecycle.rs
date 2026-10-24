@@ -2434,7 +2434,14 @@ async fn actual_config_writer_barrier_excludes_mixed_owned_stop_capture_and_clai
     release_tx.send(()).unwrap();
     writer.join().unwrap().unwrap();
     assert_eq!(cached_selected.as_deref(), Some("node-a"));
-    assert!(captured_during_writer.is_err() && second_capture.is_err());
+    assert_eq!(
+        captured_during_writer.unwrap_err().code(),
+        "PROXY_STATUS_WRITER_BUSY"
+    );
+    assert_eq!(
+        second_capture.unwrap_err().code(),
+        "PROXY_STATUS_WRITER_BUSY"
+    );
     assert!(prior_stop.is_err() && mixed_stop.is_err());
     assert!(
         unchanged,
@@ -2623,4 +2630,40 @@ async fn current_proxy_cleanup_reuses_existing_restore_controller() {
     let (rt, _dir, calls) = test_runtime_recording();
     rt.clear_system_proxy_if_current(rt.gate.generation()).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn public_status_busy_envelope_never_contains_owned_stop_context() {
+    let (rt, dir, _) = test_runtime_recording();
+    let cold = crate::commands::proxy::proxy_status_response(&rt);
+    let cold = serde_json::to_value(cold).unwrap();
+    assert_eq!(cold["success"], false);
+    assert_eq!(cold["code"], "PROXY_STATUS_CACHE_COLD");
+    assert!(cold.get("data").is_none());
+    assert!(!dir.join("config.json").exists());
+    rt.config
+        .save_full(&two_node_config(7890, "node-a"))
+        .unwrap();
+    mark_running(&rt);
+    rt.bump_generation();
+    let before = rt.core_generation();
+    {
+        let _writer = rt.config.hold_write_lock_for_test();
+        let busy =
+            serde_json::to_value(crate::commands::proxy::proxy_status_response(&rt)).unwrap();
+        assert_eq!(busy["success"], false);
+        assert_eq!(busy["code"], "PROXY_STATUS_WRITER_BUSY");
+        assert!(busy.get("data").is_none());
+        assert_eq!(rt.core_generation(), before);
+    }
+    let ready = serde_json::to_value(crate::commands::proxy::proxy_status_response(&rt)).unwrap();
+    assert_eq!(ready["success"], true);
+    assert_eq!(ready["data"]["mainGeneration"], before);
+    assert_eq!(
+        ready["data"]["ownedStopContext"]["selectedServerId"],
+        "node-a"
+    );
+    assert!(ready.get("code").is_none());
+    // Existing real writer barrier proves no mixed tuple/Stop can escape.
+    // Covered by the separately targeted actual_config_writer_barrier test.
 }

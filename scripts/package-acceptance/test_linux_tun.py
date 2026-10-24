@@ -956,6 +956,20 @@ class ControllerLifecycleContracts(unittest.TestCase):
         self.assertTrue(result['acceptedRuntime']['selectorInterrupt'])
         run.apply.assert_not_called();run.controller.call.assert_not_called()
 
+    def test_tun_readiness_uses_shared_busy_deadline_without_root_or_start_replay(self):
+        self.assertIs(M.TunCarrierRun.wait_ready_status,M.base.CarrierRun.wait_ready_status)
+        self.assertIs(M.TunCarrierRun.connect_status,M.base.CarrierRun.connect_status)
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.connect_phase('stopped-check')
+        run.driver=Mock();run.driver.session='private-session';run.controller=Mock()
+        run.readiness_observation_fence=Mock()
+        run.status=Mock(side_effect=[M.base.NativeRejected('busy','status-cache-busy'),{'running':True,'starting':False,'mainGeneration':2,'pid':20}])
+        with patch.object(M.base.time,'sleep'):self.assertTrue(run.wait_ready_status(1)['running'])
+        self.assertEqual(run.result['connectObservation']['savedStateObservation']['busyCount'],1)
+        run.driver.click.assert_not_called();run.controller.call.assert_not_called()
+        run.status=Mock(side_effect=M.base.NativeRejected('unknown','saved-state-unavailable'))
+        with self.assertRaises(M.base.NativeRejected):run.wait_ready_status(1)
+        self.assertEqual(run.status.call_count,1)
+
     def test_tun_rpc_brackets_root_call_without_supplying_endpoint_authority(self):
         run = M.TunCarrierRun.__new__(M.TunCarrierRun)
         run.controller = Mock(); run.revalidate_api_endpoint = Mock()

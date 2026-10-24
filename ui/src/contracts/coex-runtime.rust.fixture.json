@@ -798,7 +798,7 @@
       "src-tauri/src/runtime/proxy/coex_observer.rs": "f3590eadebb44c3fc7f83aad3e2b645636b4751283cfe02c3df918353d6661b3",
       "src-tauri/src/runtime/proxy/coex_observer/tests/mod.rs": "c3e3571bc50b7fcd35a29911641539aa26400219dfef4531857617e5a8551e8a",
       "src-tauri/src/runtime/proxy.rs": "3d032a7cf252ef9fea8c6ab7d3ae526fb4474412b496408fa889ecc2ce6e997d",
-      "src-tauri/src/runtime/proxy/lifecycle.rs": "8abc910ee36660b01297c7fb42de279289a0170cbe8516ee621e19242c23d570",
+      "src-tauri/src/runtime/proxy/lifecycle.rs": "916c84db4dd6a85556cd4ec0c91bc509500bf752bd455c6ddb9cfa668faadc47",
       "src-tauri/src/runtime/proxy/startup.rs": "92bd8a7b2ff9461cf9ebe25c9f7251e238d8136f6d72091c73b5cac839060a6c",
       "src-tauri/src/runtime/proxy/hot_switch.rs": "1e6e57df675ec268018a6fe11939f73a2f2d2953663cf44d26f7519d09165c02",
       "src-tauri/src/runtime/proxy/recovery.rs": "4f9a9b11d902db65d472efdeea2a530114f6b95cee03fe661c5401cc8a61d659",
@@ -845,7 +845,7 @@
         "src-tauri/src/runtime/proxy/runtime_config.rs": "9796b940853b0e92bf17a27b2a3b2d79a5fbd1a94ed36ffef88ba506756c4129",
         "src-tauri/src/runtime/proxy/tests/hot_switch.rs": "39cfdf44dce468db436ac22774cf8d13dd5368bc03aa17ae1f00c5c968a39248",
         "src-tauri/src/runtime/proxy/tests/hot_switch/auto_select.rs": "a7820f917e477b472ad681c45fb52e365e17e13d86e12e4baf1bd6672426f4e6",
-        "src-tauri/src/runtime/proxy/tests/lifecycle.rs": "11d1b9685ca2d8901705398b67533cd43e2465d67c75e49e2edccac1d6916b24",
+        "src-tauri/src/runtime/proxy/tests/lifecycle.rs": "1a5df95dc4062b9d479825cfd995dcec8bd95932ff161acd21646dd0138b381b",
         "src-tauri/src/runtime/proxy/tests/mesh_route_report.rs": "ac50089fcf54c22fc1cb82aa53a91c96511ddd6ec9edb626785a0539c03d00ab",
         "src-tauri/src/runtime/proxy/runtime_config/tests/mod.rs": "26e85d6c564375144f4393c6e129e7fb6d9618b0bd7d95f6604b830d9068e315",
         "src-tauri/src/runtime/proxy/tests/real_core_cleanup.rs": "f377c78afa55e4cc0f31cb72b4f9b412ecc58884f39561c84257cb59bda36e00"

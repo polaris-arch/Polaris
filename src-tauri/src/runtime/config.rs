@@ -38,6 +38,16 @@ mod identity_repair;
 pub(crate) use identity_repair::{validate_server_identities, IDENTITY_AMBIGUOUS};
 pub use identity_repair::{IdentityConflicts, IdentityRepairRequest};
 
+/// Failure of the nonblocking saved-state fence, never a usable saved snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SavedCommitError {
+    WriterBusy,
+    CacheBusy,
+    WriterPoisoned,
+    CachePoisoned,
+    Cold,
+}
+
 const DEFERRED_DELETIONS_FILE: &str = "pending-config-deletions.json";
 const DEFERRED_DELETIONS_VERSION: u8 = 2;
 const STAGED_PENDING_FILE: &str = "staged-config.pending";
@@ -2003,18 +2013,27 @@ impl ConfigManager {
         &self,
         commit: impl FnOnce(&Value) -> T,
     ) -> Result<T, StoreError> {
+        self.try_with_saved_commit_classified(commit)
+            .map_err(|_| StoreError::validation("saved commit unavailable"))
+    }
+
+    /// Public observation can distinguish a live writer from corrupted/cold state.
+    /// Authority callers above intentionally retain their original refusal contract.
+    pub(crate) fn try_with_saved_commit_classified<T>(
+        &self,
+        commit: impl FnOnce(&Value) -> T,
+    ) -> Result<T, SavedCommitError> {
+        use std::sync::TryLockError;
         deny_inside_projection("try_with_saved_commit");
-        let _writer = self
-            .write_lock
-            .try_lock()
-            .map_err(|_| StoreError::validation("saved commit unavailable"))?;
-        let cache = self
-            .cache
-            .try_read()
-            .map_err(|_| StoreError::validation("saved commit unavailable"))?;
-        let saved = cache
-            .as_ref()
-            .ok_or_else(|| StoreError::validation("saved commit unavailable"))?;
+        let _writer = self.write_lock.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => SavedCommitError::WriterBusy,
+            TryLockError::Poisoned(_) => SavedCommitError::WriterPoisoned,
+        })?;
+        let cache = self.cache.try_read().map_err(|error| match error {
+            TryLockError::WouldBlock => SavedCommitError::CacheBusy,
+            TryLockError::Poisoned(_) => SavedCommitError::CachePoisoned,
+        })?;
+        let saved = cache.as_ref().ok_or(SavedCommitError::Cold)?;
         let _probe = ReentrancyProbe::enter();
         Ok(commit(saved))
     }

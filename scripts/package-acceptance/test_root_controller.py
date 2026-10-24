@@ -1,5 +1,6 @@
 """Pure/mock controller contracts; never execute root/product/account/network tools."""
 import copy
+import ast
 import base64
 import builtins
 import stat
@@ -23,6 +24,15 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 spec_tun = importlib.util.spec_from_file_location('vm_test_tun', HERE / 'tun.py')
 vm_tun = importlib.util.module_from_spec(spec_tun); spec_tun.loader.exec_module(vm_tun)
 H = 'a' * 64
+
+POLKIT_LITERALS = json.loads((HERE/'fixtures/polkit-0.105-textlistener-literals.json').read_text())['literals']
+def dialogue(name, *args):
+    value = ast.literal_eval(POLKIT_LITERALS[name]['cLiteral'])
+    return (value % args if args else value).encode()
+def real_prompt():
+    return dialogue('action', 'org.freedesktop.policykit.exec') + dialogue('identity', 'runner') + b'Password: '
+def real_completion():
+    return dialogue('responseNewline') + dialogue('color') + dialogue('complete') + dialogue('reset')
 
 
 def launch(mode='existing-session'):
@@ -502,24 +512,24 @@ class AdditionalContracts(unittest.TestCase):
             lease.pump()
         return lease, writes
     def test_real_prompt_account_and_complete_separate(self):
-        lease, writes = self.pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nAuthenticating as: runner\nPassword: ',
-                                  b'==== AUTHENTICATION COMPLETE ====\n'])
+        lease, writes = self.pump([real_prompt(),
+                                  real_completion()])
         self.assertTrue(lease.authenticated); self.assertEqual(writes, [b'never-log-this-password\n']); self.assertIsNone(lease.error)
     def test_wrong_prompt_identity_never_gets_secret(self):
-        lease, writes = self.pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nAuthenticating as: root\nPassword: '])
+        lease, writes = self.pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ===\nAuthenticating as: root\nPassword: '])
         self.assertFalse(lease.authenticated); self.assertEqual(writes, []); lease.close.assert_called_once()
     def test_unrelated_action_never_gets_secret(self):
         lease, writes = self.pump([b'==== AUTHENTICATING FOR other.action ====\nAuthenticating as: runner\nPassword: '])
         self.assertEqual(writes, []); self.assertIsNotNone(lease.error)
     def test_completion_without_password_is_not_authentication(self):
-        lease, writes = self.pump([b'==== AUTHENTICATION COMPLETE ====\n'])
+        lease, writes = self.pump([dialogue('complete')])
         self.assertFalse(lease.authenticated); self.assertEqual(writes, [])
     def test_multiple_identity_selects_only_exact_existing_account(self):
-        lease, writes = self.pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nMultiple identities can be used for authentication:\n 1.  root\n 2.  runner\nChoose identity to authenticate as (1-2): ',
-                                  b'Password: ', b'==== AUTHENTICATION COMPLETE ====\n'])
+        lease, writes = self.pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ===\nMultiple identities can be used for authentication:\n 1.  root\n 2.  runner\nChoose identity to authenticate as (1-2): ',
+                                  b'Password: ', real_completion()])
         self.assertTrue(lease.authenticated); self.assertEqual(writes, [b'2\n', b'never-log-this-password\n'])
     def test_multiple_identity_ambiguity_denied(self):
-        lease, writes = self.pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\n 1.  runner\n 2.  runner\nChoose identity to authenticate as (1-2): '])
+        lease, writes = self.pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ===\n 1.  runner\n 2.  runner\nChoose identity to authenticate as (1-2): '])
         self.assertEqual(writes, []); self.assertIsNotNone(lease.error)
     def test_authentication_denial_closes_lease(self):
         lease, writes = self.pump([b'==== AUTHENTICATION FAILED ====\n'])
@@ -627,7 +637,7 @@ class EntryAndConcurrencyTests(unittest.TestCase):
     def test_echo_still_enabled_never_receives_secret(self):
         c=controller(m.AUTH_MODE);c.pty=90;lease=m.CredentialLease(c,'install');lease.window=90
         lease.user=types.SimpleNamespace(pw_name='runner',pw_gecos='');lease.secret=bytearray(b'private');lease.close=Mock()
-        chunk=b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nAuthenticating as: runner\nPassword: '
+        chunk=real_prompt()
         import termios
         with patch.object(m.time,'monotonic',side_effect=[0,1,2,3,4]),patch.object(m.time,'sleep'), \
              patch.object(m.select,'select',return_value=([90],[],[])),patch.object(m.os,'read',return_value=chunk), \
@@ -1208,7 +1218,7 @@ class JointLeaseOrderingTests(unittest.TestCase):
     def test_private_pump_does_not_send_for_changed_selected_identity(self):
         c=group_controller();c.pty=90;lease=m.CredentialLease(c,'install');lease.window=90;lease.group_deadline=time.monotonic()+90
         lease.user=types.SimpleNamespace(pw_name='runner',pw_gecos='runner');lease.secret=bytearray(b'PRIVATE')
-        chunks=[b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nChoose identity to authenticate as\n 1.  runner\n',
+        chunks=[dialogue('action','org.freedesktop.policykit.exec')+dialogue('option',1,'runner')+dialogue('choice',1),
                 b'Authenticating as: root\nPassword:']
         with patch.object(m.select,'select',return_value=([90],[],[])),patch.object(m.os,'read',side_effect=chunks), \
              patch.object(m.os,'write') as write,patch.object(lease,'close'):
@@ -1694,7 +1704,7 @@ class IndependentDialogueObservationTests(unittest.TestCase):
             lease.pump()
         return c,lease,writes
     def test_complete_is_independent_from_main_and_detached(self):
-        c,lease,writes=self.pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nAuthenticating as: runner\nPassword: ',b'==== AUTHENTICATION COMPLETE ====\n'])
+        c,lease,writes=self.pump([real_prompt(),real_completion()])
         c.auth_reached('transaction-observer')
         value=c.auth_snapshot();pump=value['execution']['pump']
         self.assertTrue(lease.authenticated);self.assertEqual(pump['stage'],'completion-observed')
@@ -1704,14 +1714,14 @@ class IndependentDialogueObservationTests(unittest.TestCase):
         pump['observed']['ptyBytes']=False
         self.assertTrue(c.auth_snapshot()['execution']['pump']['observed']['ptyBytes'])
     def test_guard_failure_matrix_is_fixed_and_no_secret(self):
-        prefix=b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\n'
+        prefix=b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ===\n'
         cases=[([b''],'pty-eof'),([b'\xff'],'dialogue-encoding'),
             ([b'x'*16385],'dialogue-limit'),([b'AUTHENTICATION FAILED'],'native-authentication-failed'),
             ([b'AUTHENTICATION CANCELED'],'native-authentication-canceled'),
             ([b'Password:'],'action-mismatch'),
             ([prefix+b'Authenticating as: root\nPassword:'],'identity-mismatch'),
-            ([prefix+b'Choose identity to authenticate as'],'identity-not-unique'),
-            ([b'==== AUTHENTICATION COMPLETE ===='],'completion-unconfirmed')]
+            ([prefix+dialogue('choice',1)],'identity-not-unique'),
+            ([dialogue('complete')],'completion-unconfirmed')]
         for chunks,code in cases:
             with self.subTest(code=code):
                 c,lease,writes=self.pump(chunks);p=c.auth_snapshot()['execution']['pump']
@@ -1721,16 +1731,16 @@ class IndependentDialogueObservationTests(unittest.TestCase):
     def test_io_error_and_short_write_not_completed(self):
         c,lease,_=self.pump([],select_error=OSError('PRIVATE'))
         self.assertEqual(c.auth_snapshot()['execution']['pump']['firstFailure']['code'],'pty-read-failed')
-        c,lease,_=self.pump([b'AUTHENTICATING FOR org.freedesktop.policykit.exec\nAuthenticating as: runner\nPassword:'],write=lambda *a:0)
+        c,lease,_=self.pump([real_prompt()],write=lambda *a:0)
         p=c.auth_snapshot()['execution']['pump'];self.assertEqual(p['firstFailure']['code'],'credential-write-failed')
         self.assertFalse(p['observed']['credentialWriteCompleted']);self.assertFalse(lease.sent)
     def test_echo_timeout_and_identity_write_error(self):
-        chunks=[b'AUTHENTICATING FOR org.freedesktop.policykit.exec\nAuthenticating as: runner\nPassword:']
+        chunks=[real_prompt()]
         with patch.object(m.time,'sleep'),patch.object(m.time,'monotonic',side_effect=[0,0,0,3]):
             c,lease,_=self.pump(chunks,echo=8)
         self.assertEqual(c.auth_snapshot()['execution']['pump']['firstFailure']['code'],'echo-unconfirmed')
         def fail(*args): raise OSError('PRIVATE')
-        c,lease,_=self.pump([b'AUTHENTICATING FOR org.freedesktop.policykit.exec\n 1.  runner\nChoose identity to authenticate as'],write=fail)
+        c,lease,_=self.pump([dialogue('action','org.freedesktop.policykit.exec')+dialogue('option',1,'runner')+dialogue('choice',1)],write=fail)
         self.assertEqual(c.auth_snapshot()['execution']['pump']['firstFailure']['code'],'identity-write-failed')
     def test_cleanup_stop_does_not_invent_initial_rejection(self):
         c,lease,_=self.pump([],stopped=True)
@@ -1971,10 +1981,10 @@ class GroupPumpFenceTests(unittest.TestCase):
             if fence=='error':raise ValueError('private')
             if fence=='cancel':lease.stop.set()
         c.observer.credential_fence.side_effect=gate
-        prompt=b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nAuthenticating as: runner\nPassword: '
+        prompt=real_prompt()
         import termios
         with patch.object(m.select,'select',return_value=([90],[],[])), \
-             patch.object(m.os,'read',side_effect=[prompt,prompt,b'==== AUTHENTICATION COMPLETE ====\n']), \
+             patch.object(m.os,'read',side_effect=[prompt,prompt,dialogue('complete')]), \
              patch.object(m.os,'write',side_effect=lambda fd,b:order.append('write') or writes.append(b) or len(b)), \
              patch('termios.tcgetattr',side_effect=[[0,0,0,0,0,0,[]],[0,0,0,termios.ECHO if echo_after else 0,0,0,[]]]):
             lease.pump()
@@ -1982,7 +1992,7 @@ class GroupPumpFenceTests(unittest.TestCase):
     def test_fence_before_exactly_one_write_repeated_prompt(self):
         lease,writes,order,c=self.pump()
         self.assertEqual(order,['fence','write']);self.assertEqual(writes,[b'test-secret\n'])
-        self.assertTrue(lease.authenticated)
+        self.assertFalse(lease.authenticated);self.assertIsNotNone(lease.error)
         deadline=c.observer.credential_fence.call_args.args[0]
         self.assertEqual(deadline,lease.group_deadline-m.GROUP_RECOVERY_RESERVE)
     def test_error_cancel_or_echo_return_blocks_input_and_closes(self):
@@ -1991,7 +2001,7 @@ class GroupPumpFenceTests(unittest.TestCase):
             self.assertEqual(writes,[]);self.assertFalse(lease.authenticated);lease.close.assert_called_once()
     def test_existing_password_only_pump_does_not_call_fence(self):
         # Existing guarded password-only unit test exercises the original mode.
-        lease,writes=AdditionalContracts().pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nAuthenticating as: runner\nPassword: ',b'==== AUTHENTICATION COMPLETE ====\n'])
+        lease,writes=AdditionalContracts().pump([real_prompt(),real_completion()])
         self.assertFalse(lease.grouped);self.assertEqual(len(writes),1)
 
 class RelatedInventoryTests(unittest.TestCase):
@@ -2043,6 +2053,7 @@ class RealProducerScriptTests(unittest.TestCase):
                 self.assertEqual(proof['bytes'],len(data));self.assertEqual(proof['sha256'],m.sha(data))
                 self.assertEqual(proof['inode'],path.stat().st_ino);self.assertTrue(proof['stableDoubleRead'])
                 self.assertNotIn('eeeeeeee',json.dumps(proof))
+                self.assertTrue(c.close_script_files())
     def test_old_bash_other_shebang_crlf_and_wrong_kind_still_rejected(self):
         data=self.fixture('install')
         with tempfile.TemporaryDirectory() as home:
@@ -2074,13 +2085,37 @@ class PreParentStopLineageTests(unittest.TestCase):
         rows={90:agent,91:child};c.ops.proc.side_effect=lambda pid:copy.deepcopy(rows.get(pid))
         o=m.AuthObserver(c,'install');return c,o,rows
     def test_existing_child_snapshot_is_durable_while_parent_alive(self):
-        c,o,rows=self.observer();events=[]
-        with patch.object(m.Path,'iterdir',return_value=[Path('/proc/90'),Path('/proc/91')]), \
-             patch.object(m,'proc_stat',side_effect=lambda pid:rows.get(pid)), \
-             patch.object(m,'write_recovery_snapshot',side_effect=lambda *a:events.append(copy.deepcopy(a[2]))):
-            o.thread.start();o.prepare_parent_stop();o.thread.join(timeout=1)
-        self.assertTrue(o.stop.is_set());self.assertEqual(len(events),1)
-        self.assertEqual({x['pid'] for x in events[0]['processes']},{90,91});self.assertIsNone(o.error)
+        for old_tick_first in (False,True):
+            with self.subTest(old_tick_first=old_tick_first):
+                c,o,rows=self.observer();events=[];old_tick=threading.Event();release=threading.Event()
+                real_scan=o.scan;real_parent=o.require_live_parent;real_ack=o.parent_stop_ack.set
+                def scan():
+                    if old_tick_first and not old_tick.is_set():
+                        old_tick.set()
+                        if not release.wait(1):raise TimeoutError('test barrier')
+                    real_scan()
+                def parent():
+                    real_parent()
+                    events.append('before' if 'before' not in events else 'after')
+                def durable(*args):
+                    self.assertEqual({x['pid'] for x in args[2]['processes']},{90,91})
+                    self.assertEqual(rows[90]['state'],'S')
+                    events.append('durable')
+                def ack():
+                    events.append('ack');real_ack()
+                o.scan=scan;o.require_live_parent=parent;o.parent_stop_ack.set=ack
+                with patch.object(m.Path,'iterdir',return_value=[Path('/proc/90'),Path('/proc/91')]), \
+                     patch.object(m,'proc_stat',side_effect=lambda pid:rows.get(pid)), \
+                     patch.object(m,'write_recovery_snapshot',side_effect=durable):
+                    if not old_tick_first:o.parent_stop_requested.set()
+                    o.thread.start()
+                    if old_tick_first:
+                        self.assertTrue(old_tick.wait(1))
+                        o.parent_stop_requested.set();release.set()
+                    o.prepare_parent_stop();o.thread.join(timeout=1)
+                expected=(['durable'] if old_tick_first else [])+['before','durable','after','ack']
+                self.assertEqual(events,expected)
+                self.assertTrue(o.stop.is_set());self.assertIsNone(o.error)
     def test_snapshot_error_timeout_or_persistence_never_skips_independent_recovery(self):
         for error in (ValueError('PRIVATE'),TimeoutError('PRIVATE'),OSError('PRIVATE')):
             c,l=GroupLeaseRecoveryTests().lease();events=[];c.auth_observer=Mock();observer=c.auth_observer
@@ -2322,3 +2357,287 @@ class OwnedTerminalReconciliationTests(unittest.TestCase):
         c.ledger.mutate=Mock(side_effect=OSError('disk'))
         with self.assertRaises(OSError):self.scan(o,r)
         self.assertFalse(o.terminals)
+
+class OriginalScriptDescriptorContracts(unittest.TestCase):
+    def make(self, home):
+        path=home/('a'*24+'-polaris-helper-install.sh')
+        path.write_bytes(b'#!/bin/sh\nset -eu\n# inert fixture, never executed\n')
+        path.chmod(0o700)
+        return path,m.HeldScript(path,os.getuid(),home)
+    def test_real_unlink_keeps_original_object_and_closes_fd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);home.chmod(0o700);path,held=self.make(home);fd=held.fd
+            try:
+                proof=held.verify_linked();path.unlink()
+                with self.assertRaises(FileNotFoundError):held.verify_linked()
+                self.assertEqual(held.verify_unlinked(),proof)
+                self.assertEqual(os.fstat(fd).st_nlink,0)
+            finally:held.close()
+            with self.assertRaises(OSError):os.fstat(fd)
+            held.close()
+    def test_replacement_symlink_hardlink_mode_and_truncate_rejected(self):
+        for change in ('replace','symlink','hardlink','chmod','truncate'):
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as directory:
+                home=Path(directory);home.chmod(0o700);path,held=self.make(home)
+                try:
+                    if change=='replace':
+                        data=path.read_bytes();path.unlink();path.write_bytes(data);path.chmod(0o700)
+                    elif change=='symlink':
+                        path.unlink();path.symlink_to(home/'unknown')
+                    elif change=='hardlink':os.link(path,home/'other')
+                    elif change=='chmod':path.chmod(0o600)
+                    else:path.write_bytes(b'#!/bin/sh\nset -eu\n')
+                    with self.assertRaises(ValueError):held.verify_linked()
+                    with self.assertRaises(ValueError):held.verify_unlinked()
+                finally:held.close()
+    def test_unlinked_object_writable_mutation_and_permission_unknown_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);home.chmod(0o700);path,held=self.make(home)
+            writer=os.open(path,os.O_WRONLY)
+            try:
+                path.unlink();os.ftruncate(writer,0)
+                with self.assertRaises(ValueError):held.verify_unlinked()
+            finally:os.close(writer);held.close()
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);home.chmod(0o700);path,held=self.make(home)
+            try:
+                with patch.object(Path,'lstat',side_effect=PermissionError('private')):
+                    with self.assertRaises(PermissionError):held.verify_unlinked()
+            finally:held.close()
+    def test_close_failure_does_not_skip_other_descriptors_or_retry_fd(self):
+        c=controller();c.observer=None
+        a=Mock();a.close.side_effect=OSError('private');b=Mock()
+        c.script_files={Path('a'):a,Path('b'):b}
+        self.assertFalse(c.close_script_files());b.close.assert_called_once()
+        self.assertTrue(c.failed);self.assertIn('script-descriptor-close-unknown',c.recovery_unknown)
+        self.assertTrue(c.close_script_files());a.close.assert_called_once()
+    def test_live_observer_does_not_close_under_inflight_read(self):
+        c=controller();c.observer=Mock();c.observer.thread.is_alive.return_value=True
+        held=Mock();c.script_files={Path('a'):held}
+        self.assertFalse(c.close_script_files());held.close.assert_not_called()
+        c.observer.thread.is_alive.return_value=False
+        self.assertTrue(c.close_script_files());held.close.assert_called_once()
+    def test_first_missing_script_cannot_create_held_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);home.chmod(0o700)
+            with self.assertRaises(FileNotFoundError):m.HeldScript(home/'missing',os.getuid(),home)
+
+class OfficialTextListenerProtocolContracts(unittest.TestCase):
+    pump=IndependentDialogueObservationTests.pump
+    # Pure PTY replay from official C literals; no PAM, agent, credentials or product run.
+    def test_every_completion_split_and_crlf_ansi(self):
+        output=real_completion()
+        for offset in range(1,len(output)):
+            with self.subTest(offset=offset):
+                c,lease,writes=self.pump([real_prompt(),output[:offset],output[offset:]])
+                self.assertTrue(lease.authenticated);self.assertEqual(len(writes),1)
+        c,lease,writes=self.pump([real_prompt().replace(b'\n',b'\r\n'),output.replace(b'\n',b'\r\n')])
+        self.assertTrue(lease.authenticated)
+    def test_every_prompt_split(self):
+        prompt=real_prompt()
+        for offset in range(1,len(prompt)):
+            with self.subTest(offset=offset):
+                c,lease,writes=self.pump([prompt[:offset],prompt[offset:],real_completion()])
+                self.assertTrue(lease.authenticated);self.assertEqual(len(writes),1)
+    def test_official_failure_cancel_eof_and_wrong_old_literal(self):
+        for ending in (dialogue('failed'),dialogue('canceled'),dialogue('cancelled'),b'',b'==== AUTHENTICATION COMPLETE ====\n'):
+            with self.subTest(ending=ending):
+                c,lease,writes=self.pump([real_prompt(),dialogue('responseNewline')+ending,b''])
+                self.assertFalse(lease.authenticated);self.assertEqual(len(writes),1);lease.close.assert_called_once()
+    def test_completion_cannot_precede_input_or_be_embedded(self):
+        for chunks in ([dialogue('complete')+real_prompt()],[real_prompt(),b'prefix '+dialogue('complete'),b'']):
+            c,lease,writes=self.pump(chunks)
+            self.assertFalse(lease.authenticated)
+    def test_multiple_prompt_never_resends_secret(self):
+        c,lease,writes=self.pump([real_prompt(),b'\nPassword: ',real_completion()])
+        self.assertFalse(lease.authenticated);self.assertEqual(len(writes),1)
+        self.assertEqual(c.auth_snapshot()['execution']['pump']['firstFailure']['code'],'multiple-prompts')
+
+class HeldScriptTransactionContracts(unittest.TestCase):
+    setup_observer=TransactionFenceTests.setup_observer
+    scan=TransactionFenceTests.scan
+    def ready(self):
+        c,o,r=self.setup_observer();self.scan(o,r)
+        r[60].update(uid=0,exe=str(Path('/bin/bash').resolve()),exeInode=88)
+        self.scan(o,r)
+        c.verify_unlinked_script=Mock(return_value=next(iter(o.pkexec.values()))['proof'])
+        return c,o,r
+    def test_missing_after_verified_shell_requires_fresh_terminal(self):
+        c,o,r=self.ready();c.verify_script.side_effect=FileNotFoundError()
+        c.tun.terminal_identity.return_value={'pid':60,'startTime':r[60]['startTime'],'state':'absent'}
+        self.scan(o,r);self.assertTrue(o.terminals);c.verify_unlinked_script.assert_called_once()
+        self.assertEqual(len(o.shells),1)
+    def test_first_shell_missing_live_shell_reuse_permission_and_changed_proof_rejected(self):
+        for failure in ('first-shell','live','reuse','permission','changed'):
+            with self.subTest(failure=failure):
+                c,o,r=self.ready()
+                if failure=='first-shell':o.shells.clear()
+                c.verify_script.side_effect=PermissionError() if failure=='permission' else FileNotFoundError()
+                if failure in ('live','reuse'):c.tun.terminal_identity.side_effect=ValueError(failure)
+                if failure=='changed':c.verify_unlinked_script.return_value={'sha256':'b'*64}
+                with self.assertRaises((ValueError,PermissionError)):self.scan(o,r)
+                self.assertFalse(o.terminals)
+    def test_finish_missing_requires_prior_shell_and_terminal_plus_original_fd_proof(self):
+        c,o,r=self.ready();o.thread=Mock();o.thread.is_alive.return_value=False
+        c.verify_script.side_effect=FileNotFoundError()
+        self.assertTrue(o.finish()['closed']);c.verify_unlinked_script.assert_called_once()
+        for error in (FileNotFoundError(),PermissionError(),ValueError()):
+            c,o,r=self.ready();o.thread=Mock();o.thread.is_alive.return_value=False
+            c.verify_script.side_effect=FileNotFoundError();c.verify_unlinked_script.side_effect=error
+            with self.assertRaises(type(error)):o.finish()
+            self.assertEqual(o.error,'script-terminal')
+    def test_finish_terminal_failure_prevents_deleted_script_admission(self):
+        c,o,r=self.ready();o.thread=Mock();o.thread.is_alive.return_value=False
+        c.tun.terminal_identity.side_effect=ValueError('reuse')
+        with self.assertRaises(ValueError):o.finish()
+        self.assertEqual(o.error,'finish-terminal');c.verify_unlinked_script.assert_not_called()
+
+class AdditionalOriginalObjectAndDialogueContracts(unittest.TestCase):
+    def test_abort_close_error_preserves_lease_recovery_and_permanent_failure(self):
+        c=controller();c.ledger=None;c.observer=None;c.lease=Mock();c.lease.thread=None
+        held=Mock();held.close.side_effect=OSError('private descriptor detail')
+        c.script_files={Path('private'):held}
+        result=c.abort()
+        c.lease.close.assert_called_once();held.close.assert_called_once()
+        self.assertEqual(result['state'],'failed')
+        self.assertIn('script-descriptor-close-unknown',result['unknown'])
+        self.assertNotIn('private descriptor',json.dumps(result))
+    def test_multiple_identity_prompt_every_split_is_producer_ordered(self):
+        choice=(dialogue('action','org.freedesktop.policykit.exec')+
+                dialogue('option',1,'root')+dialogue('option',2,'runner')+dialogue('choice',2))
+        harness=AdditionalContracts()
+        for offset in range(1,len(choice)):
+            with self.subTest(offset=offset):
+                lease,writes=harness.pump([choice[:offset],choice[offset:],b'Password: ',real_completion()])
+                self.assertTrue(lease.authenticated)
+                self.assertEqual(writes,[b'2\n',b'never-log-this-password\n'])
+    def test_utf8_split_does_not_turn_valid_identity_into_decode_error(self):
+        harness=AdditionalContracts()
+        name='rúnner'
+        prompt=dialogue('action','org.freedesktop.policykit.exec')+dialogue('identity',name)+b'Password: '
+        at=prompt.index('ú'.encode())+1
+        lease,writes=harness.pump([prompt[:at],prompt[at:],real_completion()],name=name)
+        self.assertTrue(lease.authenticated);self.assertEqual(len(writes),1)
+    def test_premature_completion_does_not_even_write_secret(self):
+        harness=AdditionalContracts()
+        lease,writes=harness.pump([dialogue('complete')+real_prompt()])
+        self.assertFalse(lease.authenticated);self.assertEqual(writes,[])
+
+class RealOrdinaryTerminalScriptContracts(unittest.TestCase):
+    def test_real_ordinary_exit_zombie_and_reaped_with_original_fd(self):
+        # Only /bin/sleep runs. The script fixture is data and is never executed.
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);home.chmod(0o700)
+            path,held=OriginalScriptDescriptorContracts().make(home)
+            child=subprocess.Popen(['/bin/sleep','0.05'])
+            try:
+                row=vm_tun.process_identity(child.pid)
+                self.assertIsNotNone(row)
+                with self.assertRaises(ValueError):vm_tun.terminal_identity(row)
+                path.unlink()
+                os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOWAIT)
+                self.assertEqual(vm_tun.terminal_identity(row)['state'],'zombie')
+                self.assertEqual(held.verify_unlinked(),held.proof)
+                child.wait(timeout=2)
+                self.assertEqual(vm_tun.terminal_identity(row)['state'],'absent')
+                self.assertEqual(held.verify_unlinked(),held.proof)
+            finally:
+                if child.poll() is None:child.terminate();child.wait(timeout=2)
+                held.close()
+    def test_unlinked_terminal_does_not_skip_current_namespace_gate(self):
+        harness=HeldScriptTransactionContracts();c,o,r=harness.ready()
+        r[60]['namespaces']={**r[60]['namespaces'],'mnt':'other'}
+        c.verify_script.side_effect=FileNotFoundError()
+        with self.assertRaises(ValueError):harness.scan(o,r)
+        self.assertEqual(o.error,'namespace');c.verify_unlinked_script.assert_not_called()
+
+class ScriptDescriptorWorkerFenceTests(unittest.TestCase):
+    def test_active_credential_worker_retains_fd_until_recovery(self):
+        c=controller();c.observer=None;c.lease=Mock();c.lease.thread.is_alive.return_value=True
+        held=Mock();c.script_files={Path('x'):held}
+        self.assertFalse(c.close_script_files());held.close.assert_not_called()
+        c.lease.thread.is_alive.return_value=False
+        self.assertTrue(c.close_script_files());held.close.assert_called_once()
+        self.assertTrue(c.failed)
+
+class TransactionFinishDiagnosticContracts(unittest.TestCase):
+    def test_each_finish_boundary_preserves_specific_failure(self):
+        for stage in ('finish-observer','finish-credential','finish-lineage','finish-descriptor','finish-ledger'):
+            with self.subTest(stage=stage):
+                c=controller(m.AUTH_MODE);c.auth_reached('transaction-guard','install')
+                c.observer=Mock();c.observer.finish.return_value={'kind':'install'}
+                c.lease=Mock();c.lease.authenticated=True;c.lease.error=None;c.lease.thread=None
+                c.stop_agent=Mock(return_value={'authDescendantsReaped':True})
+                c.ledger.value['authentication']['lease']={'recovery':{'fixture':True}}
+                c.close_script_files=Mock(return_value=True)
+                error=ValueError('private raw detail')
+                if stage=='finish-observer':c.observer.finish.side_effect=error
+                elif stage=='finish-credential':c.lease.close.side_effect=error
+                elif stage=='finish-lineage':c.stop_agent.side_effect=error
+                elif stage=='finish-descriptor':c.close_script_files.return_value=False
+                else:c.ledger.mutate=Mock(side_effect=error)
+                with self.assertRaises(ValueError):c.transaction_end()
+                first=c.auth_snapshot()['firstFailure']
+                self.assertEqual(first,{'stage':'transaction-finish','code':'transaction-'+stage+'-unconfirmed'})
+                self.assertNotIn('private raw',json.dumps(c.auth_snapshot()))
+                c.close_script_files.assert_called()
+    def test_observer_specific_failure_not_replaced_by_outer_finish(self):
+        c=controller(m.AUTH_MODE);c.auth_reached('transaction-guard','install')
+        c.observer=Mock();c.observer.thread.is_alive.return_value=False
+        def reject():
+            c.auth_failed('transaction-script-terminal-unconfirmed');raise ValueError('private')
+        c.observer.finish.side_effect=reject
+        with self.assertRaises(ValueError):c.transaction_end()
+        self.assertEqual(c.auth_snapshot()['firstFailure']['code'],'transaction-script-terminal-unconfirmed')
+
+class ScriptConstructionFailureContracts(unittest.TestCase):
+    def test_opened_descriptor_closed_when_initial_stability_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);home.chmod(0o700)
+            path=home/'fixture';path.write_bytes(b'#!/bin/sh\nset -eu\n');path.chmod(0o700)
+            opened=[];real_open=os.open
+            def capture(*args,**kwargs):
+                fd=real_open(*args,**kwargs);opened.append(fd);return fd
+            with patch.object(m.os,'open',side_effect=capture),patch.object(m.HeldScript,'verify_linked',side_effect=ValueError('changed')):
+                with self.assertRaises(ValueError):m.HeldScript(path,os.getuid(),home)
+            self.assertTrue(opened)
+            for fd in set(opened):
+                with self.assertRaises(OSError):os.fstat(fd)
+
+class IdentitySelectionActionContract(unittest.TestCase):
+    def test_selection_without_exact_action_sends_nothing(self):
+        lease,writes=AdditionalContracts().pump([dialogue('option',1,'runner')+dialogue('choice',1)])
+        self.assertEqual(writes,[]);self.assertFalse(lease.authenticated)
+
+class IdentitySelectionShortWriteContract(unittest.TestCase):
+    def test_short_selection_write_never_advances_to_secret(self):
+        prompt=dialogue('action','org.freedesktop.policykit.exec')+dialogue('option',1,'runner')+dialogue('choice',1)
+        c,lease,writes=IndependentDialogueObservationTests().pump([prompt],write=lambda *args:0)
+        self.assertFalse(lease.sent);self.assertFalse(lease.authenticated)
+        self.assertEqual(c.auth_snapshot()['execution']['pump']['firstFailure']['code'],'identity-write-failed')
+
+class NonblockingScriptOpenContracts(unittest.TestCase):
+    def test_real_fifo_at_initial_read_is_rejected_without_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);home.chmod(0o700);path=home/'fifo';os.mkfifo(path,0o600)
+            before=time.monotonic()
+            with self.assertRaises(ValueError):m.private_bytes(path,os.getuid(),home)
+            self.assertLess(time.monotonic()-before,1)
+    def test_fifo_replacement_between_initial_read_and_held_open_is_rejected_and_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory);home.chmod(0o700);path=home/'fixture'
+            path.write_bytes(b'#!/bin/sh\nset -eu\n');path.chmod(0o700)
+            real_private=m.private_bytes;real_open=os.open;opened=[]
+            def read_then_replace(*args,**kwargs):
+                result=real_private(*args,**kwargs)
+                path.unlink();os.mkfifo(path,0o600);return result
+            def capture(*args,**kwargs):
+                self.assertTrue(args[1]&os.O_NONBLOCK)
+                fd=real_open(*args,**kwargs);opened.append(fd);return fd
+            before=time.monotonic()
+            with patch.object(m,'private_bytes',side_effect=read_then_replace),patch.object(m.os,'open',side_effect=capture):
+                with self.assertRaises(ValueError):m.HeldScript(path,os.getuid(),home)
+            self.assertLess(time.monotonic()-before,1)
+            self.assertEqual(len(opened),2)
+            for fd in set(opened):
+                with self.assertRaises(OSError):os.fstat(fd)

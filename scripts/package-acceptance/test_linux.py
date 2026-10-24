@@ -907,7 +907,7 @@ class PrimitiveTests(unittest.TestCase):
         run.fixture_control_port = 52345
         run.revalidate_api_endpoint = Mock()
         run.runtime_path, run.rpc_client, run.env = Path('/tmp/singbox-runtime.json'), Path('/private/probe'), {}
-        run.supervisor = SimpleNamespace(lock=threading.RLock(), children={},owned={},roles={})
+        run.supervisor = SimpleNamespace(lock=M.threading.RLock(), children={},owned={},roles={})
         child = Mock(pid=99, returncode=0)
         child.communicate.return_value = (json.dumps({'schema':'polaris-package-rpc-probe-v1', 'ok':True, 'action':'capabilities', 'result':{'active':{}}}).encode(), None)
         with patch.object(M, 'process_identity', side_effect=lambda pid: core if pid==77 else {'pid':99,'startTime':'200'}), patch.object(M.subprocess,'Popen',return_value=child) as popen:
@@ -1191,7 +1191,7 @@ class DriverObservationTests(unittest.TestCase):
         item = {'pid': 123, 'startTime': '42', 'uid': 1001, 'ppid': 1, 'cmdline': 'SECRET'}
         child = Mock(); child.poll.return_value = None
         run = M.CarrierRun.__new__(M.CarrierRun); run.result = {}; run.driver = M.WebDriver(1)
-        run.supervisor = SimpleNamespace(lock=threading.RLock(), owned={123:item},
+        run.supervisor = SimpleNamespace(lock=M.threading.RLock(), owned={123:item},
                                         roles={123:'driver'}, children={123:child})
         with patch.object(M, 'process_identity', return_value=item): run.capture_driver_failure()
         row = run.result['failureProcessObservation']['processes'][0]
@@ -1294,6 +1294,100 @@ class NativeStatusDiagnosticTests(unittest.TestCase):
         forged = {'schema': M.NATIVE_BRIDGE_SCHEMA, 'state': 'envelope-rejected', 'data': None,
                   'diagnostic': 'saved-state-unavailable'}
         self.assertEqual(M.native_bridge_state(forged, 'config_save'), 'invalid-bridge')
+
+
+class PublicStatusBusyTests(unittest.TestCase):
+    def fixture(self):
+        run=M.CarrierRun.__new__(M.CarrierRun);run.result={};run.connect_phase('stopped-check')
+        run.driver=SimpleNamespace(session='private-session')
+        run.readiness_observation_fence=Mock()
+        return run
+
+    def test_real_bridge_typed_codes_and_command_scope(self):
+        import subprocess
+        codes={'PROXY_STATUS_WRITER_BUSY':'status-writer-busy','PROXY_STATUS_CACHE_BUSY':'status-cache-busy',
+               'PROXY_STATUS_WRITER_POISONED':'status-writer-poisoned','PROXY_STATUS_CACHE_POISONED':'status-cache-poisoned',
+               'PROXY_STATUS_CACHE_COLD':'status-cache-cold','PROXY_STATUS_UNAVAILABLE':'proxy-status-unavailable'}
+        for code,diagnostic in codes.items():
+            for command in ('proxy_get_status','config_get','config_save'):
+                raw={'success':False,'error':'PRIVATE','code':code}
+                script='global.window={__TAURI_INTERNALS__:{invoke:()=>Promise.resolve('+json.dumps(raw)+')}};new Function('+json.dumps(M.NATIVE_BRIDGE_JS)+')('+json.dumps(command)+',{},v=>process.stdout.write(JSON.stringify(v)));'
+                value=json.loads(subprocess.check_output(['node','-e',script],text=True))
+                self.assertEqual(value['diagnostic'],diagnostic if command=='proxy_get_status' else 'unknown')
+                self.assertNotIn('PRIVATE',json.dumps(value))
+                self.assertEqual(M.native_bridge_state(value,command),'envelope-rejected')
+        for raw in ({'success':False,'code':'PROXY_STATUS_WRITER_BUSY PRIVATE'},
+                    {'success':False,'code':'PROXY_STATUS_WRITER_BUSY','data':{'running':True}},
+                    {'success':False,'error':'PROXY_STATUS_WRITER_BUSY'}):
+            script='global.window={__TAURI_INTERNALS__:{invoke:()=>Promise.resolve('+json.dumps(raw)+')}};new Function('+json.dumps(M.NATIVE_BRIDGE_JS)+')("proxy_get_status",{},v=>process.stdout.write(JSON.stringify(v)));'
+            self.assertEqual(json.loads(subprocess.check_output(['node','-e',script],text=True))['diagnostic'],'unknown')
+
+    def test_busy_is_only_not_ready_and_keeps_first_failure_without_mutation_replay(self):
+        run=self.fixture();ready={'running':True,'starting':False,'pid':7,'mainGeneration':1}
+        run.status=Mock(side_effect=[M.NativeRejected('PRIVATE','status-writer-busy'),M.NativeRejected('PRIVATE','status-cache-busy'),ready])
+        run.driver.click=Mock()
+        self.assertEqual(run.connect_status(),{});self.assertEqual(run.connect_status(),{})
+        self.assertEqual(run.connect_status(),ready)
+        value=run.result['connectObservation']['savedStateObservation']
+        self.assertEqual(value['busyCount'],2);self.assertEqual(value['firstDiagnostic'],'status-writer-busy')
+        self.assertEqual(value['lastDiagnostic'],'status-cache-busy');self.assertNotIn('PRIVATE',json.dumps(run.result))
+        self.assertEqual(run.status.call_count,3);run.driver.click.assert_not_called()
+
+    def test_poison_cold_old_unknown_and_transport_are_never_pending(self):
+        import http.client
+        errors=[M.NativeRejected('PRIVATE',d) for d in (*M.STATUS_HARD_DIAGNOSTICS,'saved-state-unavailable','proxy-status-unavailable','unknown')]
+        errors += [http.client.RemoteDisconnected(),TimeoutError(),M.GuiFailure('webdriver-http-error'),ValueError('bad-json')]
+        for error in errors:
+            run=self.fixture();run.status=Mock(side_effect=error)
+            with self.subTest(error=type(error).__name__),self.assertRaises(type(error)):run.connect_status()
+            self.assertEqual(run.status.call_count,1);run.readiness_observation_fence.assert_not_called()
+            self.assertNotIn('savedStateObservation',run.result['connectObservation'])
+
+    def test_busy_uses_existing_total_readiness_deadline_and_identity_failure_is_terminal(self):
+        run=self.fixture();run.status=Mock(side_effect=M.NativeRejected('PRIVATE','status-writer-busy'))
+        with self.assertRaises(M.GuiFailure):run.wait_ready_status(0.01)
+        self.assertGreater(run.result['connectObservation']['savedStateObservation']['busyCount'],0)
+        run=self.fixture();run.status=Mock(side_effect=M.NativeRejected('PRIVATE','status-writer-busy'))
+        run.readiness_observation_fence.side_effect=M.GuiFailure('status-readiness-driver-changed')
+        with self.assertRaises(M.GuiFailure):run.connect_status()
+        self.assertEqual(run.status.call_count,1)
+
+    def test_last_read_after_deadline_is_failure_even_when_running(self):
+        run=self.fixture();clock=[0.0]
+        def late():
+            clock[0]=2.0
+            return {'running':True,'starting':False,'pid':7,'mainGeneration':1}
+        run.status=late
+        with patch.object(M.time,'monotonic',side_effect=lambda:clock[0]),self.assertRaises(M.GuiFailure):run.wait_ready_status(1)
+        self.assertIsNone(run._readiness_deadline)
+        self.assertNotIn('lastStatus',run.result['connectObservation'])
+        for timeout in (0,-1,True,float('inf'),float('nan')):
+            with self.assertRaises(M.GuiFailure):run.wait_ready_status(timeout)
+
+    def test_connect_click_is_not_replayed_for_typed_busy(self):
+        run=self.fixture();run.driver.click=Mock();run.status=Mock(side_effect=[{'running':False},
+            M.NativeRejected('busy','status-writer-busy'),{'running':True,'starting':False,'pid':7,'mainGeneration':1}])
+        run.observe_ready_core=lambda:run.wait_ready_status(1)
+        with patch.object(M.time,'sleep'):
+            self.assertTrue(run.connect()['running'])
+        run.driver.click.assert_called_once_with('#connect-btn')
+        self.assertEqual(run.status.call_count,3)
+
+    def test_real_identity_fence_rejects_session_birth_uid_executable_and_missing_driver(self):
+        run=self.fixture();del run.readiness_observation_fence
+        run.app={'exeDev':1,'exeInode':2}
+        expected={'pid':31,'startTime':'100','uid':os.getuid(),'state':'S','ppid':1}
+        run.supervisor=SimpleNamespace(lock=M.threading.RLock(),owned={31:expected},roles={31:'driver'})
+        with patch.object(M,'observe_app_executable',return_value=SimpleNamespace(st_dev=1,st_ino=2)),patch.object(M,'process_identity',return_value=expected):
+            run.readiness_observation_fence('private-session')
+            run.driver.session='replacement'
+            with self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
+            run.driver.session='private-session'
+            with patch.object(M,'process_identity',return_value={**expected,'startTime':'101'}),self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
+            with patch.object(M,'process_identity',return_value={**expected,'uid':expected['uid']+1}),self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
+            with patch.object(M,'observe_app_executable',return_value=SimpleNamespace(st_dev=1,st_ino=3)),self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
+        run._readiness_fence=None;run.supervisor.owned={}
+        with patch.object(M,'observe_app_executable',return_value=SimpleNamespace(st_dev=1,st_ino=2)),self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
 
 
 class SelectionStageTests(unittest.TestCase):

@@ -811,7 +811,7 @@ class TunCarrierRun(base.CarrierRun):
 
     def observe_ready_core(self, timeout=75, register=True):
         self.connect_phase('status-ready')
-        status = base.wait_for(self.connect_status, lambda s: s.get('running') is True and not s.get('starting'), timeout=timeout)
+        status = self.wait_ready_status(timeout)
         self.connect_phase('core-birth', status)
         require(status.get('startedViaHelper') is True, 'real production helper path required')
         if register:

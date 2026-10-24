@@ -3529,3 +3529,66 @@ fn managed_load_rejects_sanitizer_removed_server_before_cache_or_persistence() {
     assert!(mgr.cache.read().unwrap().is_none());
     assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), bytes);
 }
+
+#[test]
+fn saved_commit_classifies_busy_poison_and_cold_without_loading_or_committing() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let directory = temp_dir("saved-commit-classified");
+    let config = ConfigManager::new(directory.clone());
+    let called = std::cell::Cell::new(false);
+    assert_eq!(
+        config.try_with_saved_commit_classified(|_| called.set(true)),
+        Err(SavedCommitError::Cold)
+    );
+    assert!(!called.get());
+    assert!(!directory.join("config.json").exists());
+    config.current().unwrap();
+    let bytes = std::fs::read(directory.join("config.json")).unwrap();
+    {
+        let _writer = config.hold_write_lock_for_test();
+        assert_eq!(
+            config.try_with_saved_commit_classified(|_| called.set(true)),
+            Err(SavedCommitError::WriterBusy)
+        );
+        assert!(config.try_with_saved_commit(|_| called.set(true)).is_err());
+    }
+    {
+        let _cache = config.cache.write().unwrap();
+        assert_eq!(
+            config.try_with_saved_commit_classified(|_| called.set(true)),
+            Err(SavedCommitError::CacheBusy)
+        );
+        assert!(config.try_with_saved_commit(|_| called.set(true)).is_err());
+    }
+    assert!(!called.get());
+    config
+        .try_with_saved_commit_classified(|_| called.set(true))
+        .unwrap();
+    assert!(called.get());
+    assert_eq!(std::fs::read(directory.join("config.json")).unwrap(), bytes);
+    for writer in [true, false] {
+        let directory = temp_dir("saved-commit-poison");
+        let config = ConfigManager::new(directory.clone());
+        config.current().unwrap();
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            if writer {
+                let _guard = config.write_lock.lock().unwrap();
+                panic!("synthetic writer poison");
+            } else {
+                let _guard = config.cache.write().unwrap();
+                panic!("synthetic cache poison");
+            }
+        }));
+        assert!(poisoned.is_err());
+        let expected = if writer {
+            SavedCommitError::WriterPoisoned
+        } else {
+            SavedCommitError::CachePoisoned
+        };
+        assert_eq!(
+            config.try_with_saved_commit_classified(|_| ()),
+            Err(expected)
+        );
+        assert!(config.try_with_saved_commit(|_| ()).is_err());
+    }
+}

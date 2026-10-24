@@ -277,9 +277,19 @@ pub async fn proxy_get_status(
 ) -> Result<ApiResponse<ProxyStatus>, ()> {
     Ok(async {
         state.proxy().native_auto_status().await;
-        ApiResponse::from_result(state.proxy().status_with_owned_stop_context())
+        proxy_status_response(state.proxy())
     }
     .await)
+}
+
+/// Shared desktop/mobile command envelope; a failed capture never carries status data.
+pub(crate) fn proxy_status_response(
+    proxy: &crate::runtime::proxy::ProxyRuntime,
+) -> ApiResponse<ProxyStatus> {
+    match proxy.status_with_owned_stop_context() {
+        Ok(status) => ApiResponse::ok(status),
+        Err(error) => ApiResponse::err_with_code(error.to_string(), error.code()),
+    }
 }
 
 /// `PROXY_GET_PENDING_CHANGES`：待应用节点差集（config 相对运行核起核快照）。

@@ -1154,6 +1154,19 @@ jobs:
           grep -F "test $test_name ... ok" "$RUNNER_TEMP/helper-installer-diagnostic-test.log"
           grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/helper-installer-diagnostic-test.log"
 
+          test_name=runtime::config::tests::saved_commit_classifies_busy_poison_and_cold_without_loading_or_committing
+          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/status-saved-fence-0.log"
+          grep -F "test $test_name ... ok" "$RUNNER_TEMP/status-saved-fence-0.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/status-saved-fence-0.log"
+          test_name=runtime::proxy::tests::lifecycle::public_status_busy_envelope_never_contains_owned_stop_context
+          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/status-saved-fence-1.log"
+          grep -F "test $test_name ... ok" "$RUNNER_TEMP/status-saved-fence-1.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/status-saved-fence-1.log"
+          test_name=runtime::proxy::tests::lifecycle::actual_config_writer_barrier_excludes_mixed_owned_stop_capture_and_claim
+          cargo test --locked -p polaris --lib "$test_name" -- --exact | tee "$RUNNER_TEMP/status-saved-fence-2.log"
+          grep -F "test $test_name ... ok" "$RUNNER_TEMP/status-saved-fence-2.log"
+          grep -F 'test result: ok. 1 passed;' "$RUNNER_TEMP/status-saved-fence-2.log"
+
       - name: Build and stage privileged helper
         shell: bash
         run: |
