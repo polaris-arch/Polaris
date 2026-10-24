@@ -105,8 +105,9 @@ class ToolingTests(unittest.TestCase):
         obj.env = {'PATH': '/usr/bin:/bin'}; obj.result = {}; obj.supervisor = Mock(); obj.workspace = self.root
         config = self.root / 'session.conf'; config.write_text('fixed fixture configuration')
         bus = Mock(); bus.stdout = io.BytesIO(b'unix:path=/tmp/mock-private-bus\n')
-        obj.supervisor.spawn.side_effect = [Mock(), bus, Mock()]
-        web = Mock(); web.request.return_value = {'ready': True}
+        direct=Mock();obj.supervisor.spawn.side_effect = [Mock(), bus, direct]
+        web = Mock(); web.request.side_effect = [{'ready':False},{'ready':True},{'ready':True}]
+        obj.capture_driver_services=Mock(side_effect=[False,True])
         with patch.object(L, 'verified_tools', return_value=facts) as verified, patch.object(L.os, 'read', return_value=b'99\n'), \
              patch.object(L, 'private_session_config', return_value=(config, self.root / 'bus')), \
              patch.object(L, 'private_bus_address', return_value='unix:path=/tmp/mock-private-bus'), \
@@ -114,6 +115,10 @@ class ToolingTests(unittest.TestCase):
              patch('select.select', return_value=([1], [], [])), patch.object(L, 'free_port', side_effect=[14444,14445]), \
              patch.object(L, 'WebDriver', return_value=web):
             obj.start_tools()
+        self.assertEqual(web.request.call_count,3)
+        self.assertEqual(obj.capture_driver_services.call_count,2)
+        self.assertIs(obj.driver_child,direct)
+        self.assertEqual(obj.driver_binaries,{'automation':facts['automation']['binary'],'native':facts['nativeDriver']['binary']})
         verified.assert_called_once_with(obj.supervisor)
         boundary.assert_called_once_with(obj.supervisor, obj.env, 'unix:path=/tmp/mock-private-bus', self.root / 'bus')
         commands = [c.args[0] for c in obj.supervisor.spawn.call_args_list]

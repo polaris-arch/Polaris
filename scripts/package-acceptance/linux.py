@@ -1584,18 +1584,30 @@ class CarrierRun:
         self.driver_port, native_port = free_port(), free_port()
         while native_port == self.driver_port:
             native_port = free_port()
-        self.supervisor.spawn([driver, '--port', str(self.driver_port), '--native-port', str(native_port),
+        self.driver_binaries={'automation':copy.deepcopy(tools['automation']['binary']),
+                              'native':copy.deepcopy(tools['nativeDriver']['binary'])}
+        self.driver_child=self.supervisor.spawn([driver, '--port', str(self.driver_port), '--native-port', str(native_port),
                                '--native-driver', native], self.env, 'driver')
         self.driver = WebDriver(self.driver_port)
+        startup_deadline=time.monotonic()+30
         def available():
             try:
-                return self.driver.request('GET', '/status')
+                row=self.driver.request('GET', '/status')
             except (OSError, ValueError):
                 return None
-        wait_for(available, lambda row: bool(row and row.get('ready') is True), timeout=30)
+            if row and row.get('ready') is True and not self.capture_driver_services():return None
+            gui_require(time.monotonic()<startup_deadline,'driver-startup-timeout')
+            return row
+        wait_for(available, lambda row: bool(row and row.get('ready') is True), timeout=max(0,startup_deadline-time.monotonic()))
+        gui_require(time.monotonic()<startup_deadline,'driver-startup-timeout')
 
     def launch(self):
+        self.check_driver_services()
         self.driver.start(self.entry)
+        self.check_driver_services()
+        gui_require(type(self.driver.session) is str and bool(self.driver.session),'driver-session-unconfirmed')
+        self.driver_service_session=self.driver.session
+        self.result['driverServiceBoundary']['state']='session-bound'
         wait_for(lambda: self.driver.execute("return document.querySelector('#s-home') !== null && '__TAURI_INTERNALS__' in window;"), timeout=60)
         app = self.supervisor.executable(self.payload / self.members['app']['path'])
         env_raw = (Path('/proc') / str(app['pid']) / 'environ').read_bytes().split(b'\0')
@@ -1666,26 +1678,85 @@ class CarrierRun:
         self.result['connectObservation']['phase'] = phase
         self.result['connectObservation']['phases'].append(record)
 
+    def capture_driver_services(self):
+        """Pin the one native Child spawned by fixed tauri-driver before /session."""
+        gui_require(not hasattr(self,'driver_services'),'driver-services-already-bound')
+        observed=self.supervisor.scan()
+        main=self.driver_child
+        with self.supervisor.lock:
+            item=copy.deepcopy(self.supervisor.owned.get(main.pid))
+        gui_require(item is not None and main.poll() is None and
+                    same_process(item,observed.get(main.pid)), 'driver-automation-unconfirmed')
+        automation=self.capture_driver_service(item,self.driver_binaries['automation'],os.getpid())
+        native_path=Path(self.driver_binaries['native']['path']).resolve(strict=True)
+        candidates=[]
+        for pid,current in observed.items():
+            if current['ppid']!=automation['pid'] or current['state']=='Z':continue
+            try:
+                path=(Path('/proc')/str(pid)/'exe').resolve(strict=True)
+            except (FileNotFoundError,ProcessLookupError):continue
+            except OSError:raise GuiFailure('driver-native-unreadable') from None
+            if path==native_path:
+                with self.supervisor.lock:
+                    owned=copy.deepcopy(self.supervisor.owned.get(pid))
+                gui_require(same_process(owned,current),'driver-native-lineage-unconfirmed')
+                candidates.append(self.capture_driver_service(owned,self.driver_binaries['native'],automation['pid']))
+        gui_require(len(candidates)<=1,'driver-native-ambiguous')
+        if not candidates:return False
+        anchors={'automation':automation,'native':candidates[0]}
+        self.check_driver_services(anchors)
+        self.driver_services=anchors
+        self.result['driverServiceBoundary']={'schema':'polaris-driver-service-boundary-v1',
+            'state':'pre-session-bound','services':{role:{'pid':v['pid'],'startTime':v['startTime'],
+                'sha256':v['sha256']} for role,v in anchors.items()},
+            'scope':'explicit-service-anchors-not-descendant-liveness'}
+        return True
+
+    def capture_driver_service(self,item,binary,parent_pid):
+        validate_app_identity(item)
+        gui_require(item['uid']==os.getuid() and item['ppid']==parent_pid and item['state']!='Z',
+                    'driver-service-identity-changed')
+        path=Path(binary['path']).resolve(strict=True)
+        gui_require((Path('/proc')/str(item['pid'])/'exe').resolve(strict=True)==path,
+                    'driver-service-executable-changed')
+        value=app_execution_identity({**item,'exe':str(path),'sha256':binary['sha256']})
+        info=observe_app_executable(value)
+        current=process_identity(item['pid'])
+        gui_require(same_process(item,current) and current['uid']==os.getuid() and
+                    current['ppid']==parent_pid and current['state']!='Z' and info.st_size==binary['bytes'],
+                    'driver-service-identity-changed')
+        for name in ('st_size','st_mtime_ns','st_ctime_ns','st_mode'):value[name]=getattr(info,name)
+        return value
+
+    def check_driver_services(self,anchors=None):
+        anchors=getattr(self,'driver_services',None) if anchors is None else anchors
+        gui_require(type(anchors) is dict and set(anchors)=={'automation','native'},'driver-services-unbound')
+        gui_require(self.driver_child.pid==anchors['automation']['pid'] and self.driver_child.poll() is None,
+                    'status-readiness-driver-changed')
+        for role,anchor in anchors.items():
+            try:
+                with self.supervisor.lock:
+                    owned=copy.deepcopy(self.supervisor.owned.get(anchor['pid']))
+                gui_require(same_process(anchor,owned) and owned['uid']==anchor['uid']==os.getuid(),
+                            'status-readiness-driver-changed')
+                info=observe_app_executable(anchor)
+                current=process_identity(anchor['pid'])
+                parent=os.getpid() if role=='automation' else anchors['automation']['pid']
+                gui_require(same_process(anchor,current) and current['uid']==anchor['uid'] and current['state']!='Z' and
+                            current['ppid']==parent and (info.st_dev,info.st_ino)==(anchor['exeDev'],anchor['exeInode']) and
+                            all(getattr(info,k)==anchor[k] for k in ('st_size','st_mtime_ns','st_ctime_ns','st_mode')),
+                            'status-readiness-driver-changed')
+            except (OSError,ValueError,KeyError,TypeError):
+                self.result.setdefault('driverServiceFailure',{'role':role,'state':'identity-unconfirmed'})
+                raise GuiFailure('status-readiness-driver-changed') from None
+
     def readiness_observation_fence(self, session, owner=None):
-        gui_require(type(session) is str and bool(session) and self.driver.session == session,
-                    'status-readiness-session-changed')
+        gui_require(type(session) is str and bool(session) and self.driver.session == session and
+                    session==getattr(self,'driver_service_session',None), 'status-readiness-session-changed')
         current = observe_app_executable(self.app)
         gui_require((current.st_dev,current.st_ino)==(self.app['exeDev'],self.app['exeInode']),
                     'status-readiness-app-changed')
-        fence = owner.get('fence') if owner is not None else getattr(self, '_readiness_fence', None)
-        if fence is None:
-            with self.supervisor.lock:
-                drivers=[dict(value) for pid,value in self.supervisor.owned.items()
-                         if self.supervisor.roles.get(pid)=='driver']
-            gui_require(bool(drivers),'status-readiness-driver-unknown')
-            fence={'session':session,'drivers':drivers}
-            if owner is None: self._readiness_fence=fence
-            else: owner['fence']=fence
-        gui_require(fence['session']==session,'status-readiness-session-changed')
-        for expected in fence['drivers']:
-            actual=process_identity(expected['pid'])
-            gui_require(same_process(expected,actual) and actual.get('uid')==expected.get('uid')==os.getuid() and
-                        actual.get('state')!='Z', 'status-readiness-driver-changed')
+        self.check_driver_services()
 
     def wait_ready_status(self, timeout):
         gui_require(type(timeout) in (int,float) and 0<timeout<float('inf'), 'status-readiness-timeout-invalid')

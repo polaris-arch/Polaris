@@ -902,4 +902,91 @@ class MonotonicTerminalContracts(unittest.TestCase):
         with patch.object(Path,'lstat',return_value=Mock()),patch.object(Path,'read_text',side_effect=FileNotFoundError(2,'stat')):
             with self.assertRaises(FileNotFoundError):tun.terminal_identity(old)
 
+
+class StructuredProcObservationTests(unittest.TestCase):
+    def contexts(self, probe=None, error_type=FileNotFoundError, reuse=False):
+        count=[0]
+        def failure(current):
+            if current==probe:raise error_type(2 if error_type is FileNotFoundError else 13,'PRIVATE')
+        def text(path,*args,**kwargs):
+            name=str(path)
+            if name.endswith('/stat'):
+                count[0]+=1;current='stat-before' if count[0]%2 else 'stat-after';failure(current)
+                birth='999' if reuse and current=='stat-after' else '88'
+                return '123 (fixture) '+' '.join(['S','20']+['0']*17+[birth])
+            if name.endswith('/status'):
+                failure('status');return 'Uid: 1000 1000 1000 1000\nCapEff: 0\nCapAmb: 0\n'
+            failure('cgroup');return '0::/fixture'
+        def stat(path,*args,**kwargs):
+            name=str(path)
+            if name.endswith('/exe'):failure('exe-stat');return SimpleNamespace(st_dev=1,st_ino=77)
+            current='namespace-'+path.name;failure(current);return SimpleNamespace(st_ino=2)
+        def link(path,*args,**kwargs):failure('exe-link');return '/usr/bin/fixed-test'
+        return (patch.object(Path,'read_text',text),patch.object(Path,'stat',stat),patch.object(tun.os,'readlink',link))
+    def test_every_missing_field_is_named_and_legacy_none_is_preserved(self):
+        for probe in tun.PROCESS_PROBES:
+            with ExitStack() as stack:
+                for context in self.contexts(probe):stack.enter_context(context)
+                value=tun.observe_process_identity(123)
+            self.assertIsNone(value['identity']);self.assertEqual(value['missing'],{'probe':probe,'error':'enoent'})
+            with ExitStack() as stack:
+                for context in self.contexts(probe):stack.enter_context(context)
+                self.assertIsNone(tun.process_identity(123))
+            self.assertNotIn('PRIVATE',json.dumps(value))
+    def test_permission_never_becomes_missing_and_reuse_is_contract_error(self):
+        for probe in tun.PROCESS_PROBES:
+            with ExitStack() as stack:
+                for context in self.contexts(probe,PermissionError):stack.enter_context(context)
+                with self.assertRaises(PermissionError) as caught:tun.observe_process_identity(123)
+            self.assertEqual(caught.exception.process_probe,probe)
+        with ExitStack() as stack:
+            for context in self.contexts(reuse=True):stack.enter_context(context)
+            with self.assertRaises(ValueError) as caught:tun.observe_process_identity(123)
+        self.assertEqual(caught.exception.process_probe,'stat-after')
+    def test_complete_result_and_legacy_identity_have_identical_fields(self):
+        with ExitStack() as stack:
+            for context in self.contexts():stack.enter_context(context)
+            observation=tun.observe_process_identity(123);identity=tun.process_identity(123)
+        self.assertEqual(identity,observation['identity']);self.assertIsNone(observation['missing'])
+        self.assertTrue(tun.same_process(identity,identity))
+
+class LedgerStageDiagnosticTests(unittest.TestCase):
+    def ledger(self,directory):
+        value=tun.Ledger(TOKEN);value.directory=Path(directory);value.path=value.directory/'ledger.json'
+        (value.directory/'ledger.lock').write_bytes(b'');return value
+    def test_private_ordinary_io_load_save_mutate_and_fixed_failures(self):
+        # Root ownership checks are explicitly mocked; only this private user
+        # temp directory is touched. This is not a privileged ledger proof.
+        with tempfile.TemporaryDirectory() as directory,patch.object(tun.os,'geteuid',return_value=0), \
+             patch.object(tun,'root_path',side_effect=lambda path,**kwargs:Path(path)):
+            ledger=self.ledger(directory);value={'schema':tun.SCHEMA,'runId':TOKEN,'count':0}
+            ledger.save(value);self.assertEqual(ledger.load(),value)
+            self.assertEqual(ledger.mutate(lambda row:row.update(count=1))['count'],1)
+            def reject(row):raise ValueError('PRIVATE CHANGE')
+            with self.assertRaises(ValueError) as caught:ledger.mutate(reject)
+            self.assertEqual((caught.exception.ledger_operation,caught.exception.ledger_probe),('mutate','change'))
+            ledger.path.write_text('{invalid')
+            with self.assertRaises(ValueError) as caught:ledger.load()
+            self.assertEqual((caught.exception.ledger_operation,caught.exception.ledger_probe),('load','decode'))
+    def test_save_encode_fsync_replace_and_cleanup_keep_first_original_error(self):
+        for fault in ('encode','file-fsync','replace','directory-fsync','replace-and-cleanup'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory, \
+                 patch.object(tun.os,'geteuid',return_value=0),patch.object(tun,'root_path',side_effect=lambda path,**kwargs:Path(path)):
+                ledger=self.ledger(directory);value={'schema':tun.SCHEMA,'runId':TOKEN};count=[0]
+                real_fsync=os.fsync
+                def fsync(fd):
+                    count[0]+=1
+                    if (fault=='file-fsync' and count[0]==1) or (fault=='directory-fsync' and count[0]==2):raise OSError(5,'PRIVATE FSYNC')
+                    return real_fsync(fd)
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(tun.os,'fsync',side_effect=fsync))
+                    if fault=='encode':stack.enter_context(patch.object(tun,'json_bytes',side_effect=ValueError('PRIVATE ENCODE')))
+                    if fault.startswith('replace'):stack.enter_context(patch.object(tun.os,'replace',side_effect=OSError(5,'PRIVATE REPLACE')))
+                    if fault=='replace-and-cleanup':stack.enter_context(patch.object(Path,'unlink',side_effect=PermissionError(13,'PRIVATE CLEANUP')))
+                    with self.assertRaises((ValueError,OSError)) as caught:ledger.save(value)
+                self.assertEqual(caught.exception.ledger_operation,'save')
+                self.assertEqual(caught.exception.ledger_probe,'replace' if fault.startswith('replace') else fault)
+                if fault=='replace-and-cleanup':self.assertTrue(caught.exception.ledger_cleanup_failed)
+
 if __name__ == '__main__': unittest.main()
+

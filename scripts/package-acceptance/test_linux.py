@@ -1373,21 +1373,158 @@ class PublicStatusBusyTests(unittest.TestCase):
         run.driver.click.assert_called_once_with('#connect-btn')
         self.assertEqual(run.status.call_count,3)
 
-    def test_real_identity_fence_rejects_session_birth_uid_executable_and_missing_driver(self):
+    def test_real_identity_fence_rejects_session_app_executable_and_service_failure(self):
         run=self.fixture();del run.readiness_observation_fence
-        run.app={'exeDev':1,'exeInode':2}
-        expected={'pid':31,'startTime':'100','uid':os.getuid(),'state':'S','ppid':1}
-        run.supervisor=SimpleNamespace(lock=M.threading.RLock(),owned={31:expected},roles={31:'driver'})
-        with patch.object(M,'observe_app_executable',return_value=SimpleNamespace(st_dev=1,st_ino=2)),patch.object(M,'process_identity',return_value=expected):
-            run.readiness_observation_fence('private-session')
+        run.app={'exeDev':1,'exeInode':2};run.driver_service_session='private-session'
+        run.check_driver_services=Mock()
+        with patch.object(M,'observe_app_executable',return_value=SimpleNamespace(st_dev=1,st_ino=2)):
+            run.readiness_observation_fence('private-session');run.check_driver_services.assert_called_once()
             run.driver.session='replacement'
             with self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
             run.driver.session='private-session'
-            with patch.object(M,'process_identity',return_value={**expected,'startTime':'101'}),self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
-            with patch.object(M,'process_identity',return_value={**expected,'uid':expected['uid']+1}),self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
+            run.check_driver_services.side_effect=M.GuiFailure('status-readiness-driver-changed')
+            with self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
+            run.check_driver_services.side_effect=None
             with patch.object(M,'observe_app_executable',return_value=SimpleNamespace(st_dev=1,st_ino=3)),self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
-        run._readiness_fence=None;run.supervisor.owned={}
-        with patch.object(M,'observe_app_executable',return_value=SimpleNamespace(st_dev=1,st_ino=2)),self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
+            del run.driver_service_session
+            with self.assertRaises(M.GuiFailure):run.readiness_observation_fence('private-session')
+
+
+class DriverServiceAnchorTests(unittest.TestCase):
+    def fixture(self):
+        run=M.CarrierRun.__new__(M.CarrierRun);run.result={};run.driver_child=Mock(pid=31);run.driver_child.poll.return_value=None
+        def anchor(pid,ppid):return {'pid':pid,'ppid':ppid,'uid':os.getuid(),'startTime':str(pid),
+            'state':'S','exe':'/fixed/driver','sha256':'a'*64,'exeDev':1,'exeInode':pid,
+            'st_size':10,'st_mtime_ns':1,'st_ctime_ns':1,'st_mode':0o100755}
+        run.driver_services={'automation':anchor(31,os.getpid()),'native':anchor(32,31)}
+        run.supervisor=SimpleNamespace(lock=M.threading.RLock(),owned={a['pid']:dict(a) for a in run.driver_services.values()},roles={31:'driver',32:'driver',33:'driver'})
+        run.supervisor.owned[33]=anchor(33,32)
+        def metadata(item):return SimpleNamespace(st_dev=1,st_ino=item['pid'],**{k:item[k] for k in ('st_size','st_mtime_ns','st_ctime_ns','st_mode')})
+        return run,metadata
+
+    def test_expired_inherited_roles_not_anchors_but_inventory_preserved(self):
+        run,metadata=self.fixture();seen=[]
+        def current(pid):seen.append(pid);return dict(run.supervisor.owned[pid]) if pid in (31,32) else None
+        with patch.object(M,'observe_app_executable',side_effect=metadata),patch.object(M,'process_identity',side_effect=current):run.check_driver_services()
+        self.assertEqual(seen,[31,32]);self.assertIn(33,run.supervisor.owned);self.assertEqual(run.supervisor.roles[33],'driver')
+
+    def test_anchor_gone_zombie_birth_uid_parent_executable_metadata_fail_without_rebinding(self):
+        import copy
+        for role in ('automation','native'):
+            for fault in ('gone','zombie','birth','uid','parent','inode','size','mtime','unreadable','unowned'):
+                run,metadata=self.fixture();original=copy.deepcopy(run.driver_services);pid=original[role]['pid']
+                def current(value):
+                    row=dict(run.supervisor.owned[value])
+                    if value==pid:
+                        if fault=='gone':return None
+                        for key,v in {'zombie':('state','Z'),'birth':('startTime','999'),'uid':('uid',os.getuid()+1),'parent':('ppid',999)}.items():
+                            if fault==key:row[v[0]]=v[1]
+                    return row
+                def info(item):
+                    if item['pid']==pid and fault=='unreadable':raise M.GuiFailure('app-executable-unreadable')
+                    value=metadata(item)
+                    if item['pid']==pid:
+                        if fault=='inode':value.st_ino+=1
+                        if fault=='size':value.st_size+=1
+                        if fault=='mtime':value.st_mtime_ns+=1
+                    return value
+                if fault=='unowned':del run.supervisor.owned[pid]
+                with self.subTest(role=role,fault=fault),patch.object(M,'observe_app_executable',side_effect=info),patch.object(M,'process_identity',side_effect=current),self.assertRaises(M.GuiFailure):run.check_driver_services()
+                self.assertEqual(run.driver_services,original)
+        run,_=self.fixture();run.driver_child.poll.return_value=0
+        with self.assertRaises(M.GuiFailure):run.check_driver_services()
+        run.driver_child.poll.return_value=None;del run.driver_services
+        with self.assertRaises(M.GuiFailure):run.check_driver_services()
+
+    def test_session_creation_is_fenced_before_and_after_not_recaptured(self):
+        run=M.CarrierRun.__new__(M.CarrierRun);run.entry='/private/app';run.driver=Mock();run.driver.session='session'
+        run.result={'driverServiceBoundary':{}};run.check_driver_services=Mock(side_effect=[None,M.GuiFailure('status-readiness-driver-changed')])
+        with self.assertRaises(M.GuiFailure):run.launch()
+        run.driver.start.assert_called_once_with('/private/app');run.driver.execute.assert_not_called()
+        self.assertFalse(hasattr(run,'driver_service_session'))
+        run.check_driver_services=Mock(side_effect=M.GuiFailure('status-readiness-driver-changed'));run.driver.reset_mock()
+        with self.assertRaises(M.GuiFailure):run.launch()
+        run.driver.start.assert_not_called()
+
+    def test_real_service_checks_reject_native_replacement_during_session_creation(self):
+        run,metadata=self.fixture();run.entry='/private/app';run.driver=Mock();run.driver.session='new-session'
+        actual={pid:dict(row) for pid,row in run.supervisor.owned.items()}
+        def replace(_entry):actual[32]['startTime']='replacement'
+        run.driver.start.side_effect=replace
+        with patch.object(M,'observe_app_executable',side_effect=metadata),patch.object(M,'process_identity',side_effect=lambda pid:actual.get(pid)),self.assertRaises(M.GuiFailure):run.launch()
+        run.driver.start.assert_called_once_with('/private/app');run.driver.execute.assert_not_called()
+        self.assertEqual(run.driver_services['native']['startTime'],'32')
+        self.assertFalse(hasattr(run,'driver_service_session'))
+
+    def test_capture_unique_exact_native_and_hash_parent_gates(self):
+        run,metadata=self.fixture();del run.driver_services
+        main=dict(run.supervisor.owned[31]);native=dict(run.supervisor.owned[32])
+        run.driver_binaries={'automation':{'path':'/fixed/main','sha256':'a'*64,'bytes':10},
+                             'native':{'path':'/fixed/native','sha256':'b'*64,'bytes':10}}
+        run.capture_driver_service=Mock(side_effect=lambda item,binary,parent:dict(item))
+        run.check_driver_services=Mock()
+        def resolved(path,strict=False):
+            text=str(path)
+            return Path('/fixed/native') if text in ('/fixed/native','/proc/32/exe','/proc/34/exe') else Path('/fixed/other')
+        run.supervisor.scan=Mock(return_value={31:main,32:native,33:run.supervisor.owned[33]})
+        with patch.object(Path,'resolve',resolved):self.assertTrue(run.capture_driver_services())
+        self.assertEqual(run.driver_services['native']['pid'],32)
+        self.assertEqual(run.capture_driver_service.call_args_list[1].args[2],31)
+        del run.driver_services;run.supervisor.scan.return_value={31:main}
+        with patch.object(Path,'resolve',resolved):self.assertFalse(run.capture_driver_services())
+        self.assertFalse(hasattr(run,'driver_services'))
+        duplicate={**native,'pid':34,'startTime':'34'};run.supervisor.owned[34]=duplicate
+        run.supervisor.scan.return_value={31:main,32:native,34:duplicate}
+        with patch.object(Path,'resolve',resolved),self.assertRaises(M.GuiFailure):run.capture_driver_services()
+        self.assertFalse(hasattr(run,'driver_services'))
+        run.supervisor.scan.return_value={31:main,32:native}
+        run.capture_driver_service.side_effect=[main,M.GuiFailure('app-identity-changed')]
+        with patch.object(Path,'resolve',resolved),self.assertRaises(M.GuiFailure):run.capture_driver_services()
+        self.assertFalse(hasattr(run,'driver_services'))
+
+    @unittest.skipUnless(sys.platform=='linux' and os.getuid()!=0,'ordinary Linux children only')
+    def test_real_ordinary_native_child_and_transient_sibling_exit_keep_exact_anchors(self):
+        import subprocess,select
+        supervisor=M.Supervisor.__new__(M.Supervisor)
+        supervisor.lock=M.threading.RLock();supervisor.owned={};supervisor.children={};supervisor.roles={};supervisor.unknown=[]
+        supervisor.record_diagnostic=Mock()
+        readfd,writefd=os.pipe()
+        code="""import os,sys,json,subprocess
+control=os.fdopen(int(sys.argv[1]),'rb',buffering=0)
+native=subprocess.Popen([sys.executable,'-c','import sys;sys.stdin.buffer.read()'],stdin=subprocess.PIPE)
+transient=subprocess.Popen(['/bin/cat'],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL)
+print(json.dumps([native.pid,transient.pid]),flush=True)
+control.read(1);transient.stdin.close();transient.wait(timeout=5);print('exited',flush=True)
+control.read(1);native.stdin.close();native.wait(timeout=5)
+"""
+        child=None
+        try:
+            child=supervisor.spawn([sys.executable,'-c',code,str(readfd)],{'PATH':'/usr/bin:/bin'},'driver',stdout=subprocess.PIPE,pass_fds=(readfd,))
+            os.close(readfd);readfd=-1
+            self.assertTrue(select.select([child.stdout],[],[],5)[0]);native,transient=json.loads(child.stdout.readline())
+            run=M.CarrierRun.__new__(M.CarrierRun);run.result={};run.supervisor=supervisor;run.driver_child=child
+            path=Path(sys.executable).resolve();binary={'path':str(path),'sha256':M.sha(path),'bytes':path.stat().st_size}
+            run.driver_binaries={'automation':binary,'native':binary}
+            native_identity=M.process_identity(native)
+            for bad in ({**binary,'sha256':'0'*64},{**binary,'bytes':binary['bytes']+1}):
+                with self.assertRaises(M.GuiFailure):run.capture_driver_service(native_identity,bad,child.pid)
+            with self.assertRaises(M.GuiFailure):run.capture_driver_service(native_identity,binary,child.pid+1)
+            self.assertTrue(run.capture_driver_services())
+            self.assertEqual(run.driver_services['native']['pid'],native)
+            self.assertIn(transient,supervisor.owned);self.assertEqual(supervisor.roles[transient],'driver')
+            os.write(writefd,b'x');self.assertTrue(select.select([child.stdout],[],[],5)[0]);self.assertEqual(child.stdout.readline(),b'exited\n')
+            self.assertIsNone(M.process_identity(transient))
+            run.check_driver_services();self.assertIn(transient,supervisor.owned)
+            with self.assertRaises(M.GuiFailure):run.capture_driver_services()
+            os.write(writefd,b'x');child.wait(timeout=5)
+            with self.assertRaises(M.GuiFailure):run.check_driver_services()
+            self.assertEqual(supervisor.unknown,[])
+        finally:
+            if readfd>=0:os.close(readfd)
+            os.close(writefd)
+            if child is not None:
+                child.wait(timeout=7)
+                child.stdout.close()
 
 
 class SelectionStageTests(unittest.TestCase):

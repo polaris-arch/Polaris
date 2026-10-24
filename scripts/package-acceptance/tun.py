@@ -84,26 +84,42 @@ def file_identity(path):
         os.close(fd)
 
 
-def process_identity(pid):
-    """Birth and namespace identity; absence is distinct from unreadable evidence."""
+PROCESS_PROBES = ('stat-before', 'status', 'exe-stat', 'namespace-net', 'namespace-mnt',
+                  'namespace-pid', 'namespace-cgroup', 'exe-link', 'cgroup', 'stat-after')
+
+def observe_process_identity(pid):
+    """Fixed procfs failure location plus internal partial identity; no raw data."""
     require(type(pid) is int and pid > 1, 'bounded non-init PID required')
-    p = Path('/proc') / str(pid)
+    p = Path('/proc') / str(pid); probe = 'stat-before'; partial = {}
     try:
         raw = (p / 'stat').read_text()
         fields = raw[raw.rindex(')') + 2:].split()
+        partial = {'pid':pid, 'startTime':fields[19], 'state':fields[0], 'ppid':int(fields[1])}
+        probe = 'status'
         status = dict(line.split(':', 1) for line in (p / 'status').read_text().splitlines() if ':' in line)
-        image = (p / 'exe').stat()
-        namespaces = {name: (p / 'ns' / name).stat().st_ino for name in ('net', 'mnt', 'pid', 'cgroup')}
-        result = {'pid': pid, 'startTime': fields[19], 'state': fields[0], 'ppid': int(fields[1]),
-                  'uid': int(status['Uid'].split()[0]), 'exeDev': image.st_dev, 'exeInode': image.st_ino,
-                  'exe': os.readlink(p / 'exe'), 'namespaces': namespaces,
-                  'cgroup': (p / 'cgroup').read_text().strip(),
-                  'capEff': int(status['CapEff'].strip(), 16), 'capAmb': int(status['CapAmb'].strip(), 16)}
-        again = (p / 'stat').read_text()
-        require(again[again.rindex(')') + 2:].split()[19] == result['startTime'], 'PID changed during observation')
-        return result
+        partial.update(uid=int(status['Uid'].split()[0]), capEff=int(status['CapEff'].strip(),16),
+                       capAmb=int(status['CapAmb'].strip(),16))
+        probe = 'exe-stat'; image = (p / 'exe').stat()
+        partial.update(exeDev=image.st_dev, exeInode=image.st_ino)
+        partial['namespaces'] = {}
+        for name in ('net','mnt','pid','cgroup'):
+            probe = 'namespace-' + name
+            partial['namespaces'][name] = (p / 'ns' / name).stat().st_ino
+        probe = 'exe-link'; partial['exe'] = os.readlink(p / 'exe')
+        probe = 'cgroup'; partial['cgroup'] = (p / 'cgroup').read_text().strip()
+        probe = 'stat-after'; again = (p / 'stat').read_text()
+        require(again[again.rindex(')') + 2:].split()[19] == partial['startTime'], 'PID changed during observation')
+        return {'identity':partial, 'partial':partial, 'missing':None}
     except FileNotFoundError:
-        return None
+        return {'identity':None, 'partial':partial, 'missing':{'probe':probe,'error':'enoent'}}
+    except Exception as error:
+        error.process_probe = probe
+        raise
+
+
+def process_identity(pid):
+    """Compatibility identity API: only explicit procfs ENOENT yields None."""
+    return observe_process_identity(pid)['identity']
 
 
 def same_process(a, b):
@@ -133,6 +149,9 @@ class Commands:
 
     def proc(self, pid):
         return process_identity(pid)
+
+    def proc_observation(self, pid):
+        return observe_process_identity(pid)
 
     def processes_in(self, inode):
         found = []
@@ -670,6 +689,16 @@ This is not a second transport/formal verifier and cannot mint release receipts.
             'controlConnectionMayBeInterrupted': True}
 
 
+LEDGER_PROBES = ('binding','path','metadata','read','decode','temp-open','encode','write','flush',
+                 'file-fsync','replace','directory-open','directory-fsync','temp-cleanup',
+                 'lock-path','lock-open','lock','change')
+
+def ledger_failure(error, operation, probe):
+    # Original exception and failure behavior are preserved, never its text in IPC.
+    if not hasattr(error, 'ledger_operation'):
+        error.ledger_operation = operation; error.ledger_probe = probe
+
+
 class Ledger:
     def __init__(self, run_id, ops=None):
         self.run_id = token(run_id)
@@ -679,40 +708,64 @@ class Ledger:
         self.children = {}  # native handles owned only by the live root controller
 
     def load(self):
-        require(os.geteuid() == 0, 'root ledger only')
-        path = root_path(self.path)
-        require(path.stat().st_mode & 0o077 == 0 and path.stat().st_size < 4 * 1024 * 1024, 'private bounded ledger required')
-        value = json.loads(path.read_bytes())
-        require(value.get('schema') == SCHEMA and value.get('runId') == self.run_id, 'ledger binding differs')
-        return value
+        probe = 'binding'
+        try:
+            require(os.geteuid() == 0, 'root ledger only')
+            probe = 'path'; path = root_path(self.path)
+            probe = 'metadata'
+            require(path.stat().st_mode & 0o077 == 0 and path.stat().st_size < 4 * 1024 * 1024, 'private bounded ledger required')
+            probe = 'read'; raw = path.read_bytes()
+            probe = 'decode'; value = json.loads(raw)
+            probe = 'binding'
+            require(value.get('schema') == SCHEMA and value.get('runId') == self.run_id, 'ledger binding differs')
+            return value
+        except Exception as error:
+            ledger_failure(error, 'load', probe); raise
 
     def save(self, value):
-        require(os.geteuid() == 0 and value.get('runId') == self.run_id, 'root ledger binding required')
-        root_path(self.directory, directory=True)
-        temp = self.directory / ('ledger-' + os.urandom(8).hex() + '.tmp')
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        probe = 'binding'; temp = None; failed = None
         try:
+            require(os.geteuid() == 0 and value.get('runId') == self.run_id, 'root ledger binding required')
+            probe = 'path'; root_path(self.directory, directory=True)
+            temp = self.directory / ('ledger-' + os.urandom(8).hex() + '.tmp')
+            probe = 'temp-open'; fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, 'wb') as stream:
-                stream.write(json_bytes(value)); stream.flush(); os.fsync(stream.fileno())
-            os.replace(temp, self.path)
-            fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
-            try: os.fsync(fd)
+                probe = 'encode'; data = json_bytes(value)
+                probe = 'write'; stream.write(data)
+                probe = 'flush'; stream.flush()
+                probe = 'file-fsync'; os.fsync(stream.fileno())
+            probe = 'replace'; os.replace(temp, self.path)
+            probe = 'directory-open'; fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                probe = 'directory-fsync'; os.fsync(fd)
             finally: os.close(fd)
+        except Exception as error:
+            failed = error; ledger_failure(error, 'save', probe); raise
         finally:
-            if temp.exists(): temp.unlink()
+            if temp is not None:
+                try:
+                    if temp.exists(): temp.unlink()
+                except Exception as error:
+                    if failed is None:
+                        ledger_failure(error, 'save', 'temp-cleanup'); raise
+                    # Preserve the first failure; cleanup failure cannot turn it
+                    # into success or replace its actual original probe.
+                    failed.ledger_cleanup_failed = True
 
     def mutate(self, change):
-        # The root controller is the sole writer before deadline. Watchdog runs
-        # after deadline; controller MUST stop writes before its reserved margin.
         import fcntl
-        lock_path = self.directory / 'ledger.lock'
-        root_path(lock_path)
-        with lock_path.open('rb') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            value = self.load()
-            change(value)
-            self.save(value)
-            return value
+        probe = 'lock-path'
+        try:
+            lock_path = self.directory / 'ledger.lock'; root_path(lock_path)
+            probe = 'lock-open'
+            with lock_path.open('rb') as lock:
+                probe = 'lock'; fcntl.flock(lock, fcntl.LOCK_EX)
+                value = self.load()
+                probe = 'change'; change(value)
+                self.save(value)
+                return value
+        except Exception as error:
+            ledger_failure(error, 'mutate', probe); raise
 
 
 def prepare_root(run_id, gui_uid, baseline, helper_sha256, core_sha256, seconds=420, ops=None):

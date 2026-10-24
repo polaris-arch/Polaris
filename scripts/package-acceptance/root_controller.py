@@ -441,7 +441,8 @@ AUTH_OPERATION_STAGES = ('idle', 'transaction-guard', 'agent-spawn', 'agent-noti
 TRANSACTION_BOUNDARIES = ('gui', 'inventory', 'candidate', 'pkexec-argv', 'pkexec-uid', 'script',
     'pkexec-executable', 'shell-prior', 'shell-argv', 'shell-executable', 'namespace', 'ordinary-uid',
     'descendant-uid', 'ledger', 'credential-fence', 'script-terminal',
-    'finish-observer', 'finish-terminal', 'finish-credential', 'finish-lineage', 'finish-ledger', 'finish-descriptor')
+    'finish-observer', 'finish-terminal', 'finish-credential', 'finish-lineage', 'finish-ledger', 'finish-descriptor',
+    'auxiliary-census', 'observer-publish')
 AUTH_FAILURE_CODES = ('operation-failed', 'abort-requested', 'input-ended', 'recovery-failed') + tuple(
     'transaction-' + key + '-unconfirmed' for key in TRANSACTION_BOUNDARIES)
 AUTH_RECOVERY_STEPS = ('agent', 'credential', 'group', 'lineage', 'timer')
@@ -495,7 +496,7 @@ def validate_auth_execution(value):
 
 CANDIDATE_PHASES = ('identity-before', 'executable-open', 'executable-initial', 'inputs-before',
     'executable-read', 'inputs-after', 'identity-after', 'snapshot-consistency', 'topology',
-    'gui-parent', 'owned-parent', 'parent-transition', 'auxiliary-terminal')
+    'gui-parent', 'owned-parent', 'parent-transition', 'auxiliary-terminal', 'auxiliary-census', 'ledger', 'observer-publish')
 
 
 CANDIDATE_PROBES = ('unknown', 'initial-identity-read', 'initial-live-state', 'initial-directory-absent', 'exe-open',
@@ -504,7 +505,8 @@ CANDIDATE_PROBES = ('unknown', 'initial-identity-read', 'initial-live-state', 'i
     'final-live-state', 'final-directory-absent', 'consistency-birth', 'consistency-uid', 'consistency-image',
     'consistency-topology', 'consistency-namespace', 'consistency-argv', 'consistency-file',
     'inventory-topology', 'parent-identity', 'consistency-identity', 'prior-identity-conflict', 'terminal-state',
-    'terminal-live', 'terminal-birth', 'terminal-parent', 'terminal-format', 'terminal-transition', 'terminal-reappeared')
+    'terminal-live', 'terminal-birth', 'terminal-parent', 'terminal-format', 'terminal-transition', 'terminal-reappeared',
+    'auxiliary-live-child', 'auxiliary-birth-live', 'ledger-mutate', 'publish-identity', 'publish-role')
 
 def exit_capture_error(error):
     return ((getattr(error,'error',None) == 'contract' and getattr(error,'probe',None) in
@@ -619,14 +621,32 @@ LINEAGE_STAGES = ('initial', 'periodic', 'pre-stop', 'close', 'retain')
 LINEAGE_PROBES = ('inventory', 'candidate-identity', 'candidate-topology', 'parent-identity',
     'identity-boundary', 'terminal', 'snapshot', 'final-parent', 'final-ack', 'thread-join',
     'stop-owned', 'orphan-census', 'reap', 'prior-error', 'retain',
-    'terminal-live', 'terminal-birth', 'terminal-parent', 'terminal-format', 'terminal-transition', 'terminal-reappeared')
+    'terminal-live', 'terminal-birth', 'terminal-parent', 'terminal-format', 'terminal-transition', 'terminal-reappeared',
+    'resample-budget', 'resample-parent', 'resample-conflict')
+PROC_PROBES = ('stat-before','status','exe-stat','namespace-net','namespace-mnt','namespace-pid','namespace-cgroup','exe-link','cgroup','stat-after')
+LEDGER_PROBES = ('binding','path','metadata','read','decode','temp-open','encode','write','flush','file-fsync',
+                 'replace','directory-open','directory-fsync','temp-cleanup','lock-path','lock-open','lock','change')
 LINEAGE_ERRORS = ('contract', 'enoent', 'eacces', 'eperm', 'other-os', 'unexpected')
 
 def validate_lineage_failure(value):
-    exact(value, ('stage', 'probe', 'error', 'priorOwned'))
+    exact(value, ('stage', 'probe', 'error', 'priorOwned', 'process', 'captureProbe', 'attempts'))
     require(value['stage'] in LINEAGE_STAGES and value['probe'] in LINEAGE_PROBES and
             value['error'] in LINEAGE_ERRORS and type(value['priorOwned']) is bool,
             'fixed auth lineage failure required')
+    require(value['captureProbe'] is None or value['captureProbe'] in PROC_PROBES, 'fixed proc probe required')
+    require(type(value['attempts']) is int and 0 <= value['attempts'] <= 3, 'bounded proc attempts required')
+    if value['process'] is not None:
+        exact(value['process'], ('pid','startTime','ppid'))
+        row=value['process']
+        require(type(row['pid']) is int and row['pid'] > 1 and type(row['ppid']) is int and row['ppid'] > 0 and
+                type(row['startTime']) is str and re.fullmatch(r'[1-9][0-9]{0,19}',row['startTime']), 'fixed lineage birth required')
+    return value
+
+
+def validate_ledger_failure(value):
+    exact(value, ('operation','probe','error'))
+    require(value['operation'] in ('load','save','mutate') and value['probe'] in LEDGER_PROBES and
+            value['error'] in LINEAGE_ERRORS, 'fixed ledger failure required')
     return value
 
 
@@ -635,18 +655,19 @@ def auth_runtime_observation(mode):
             'lastReached': 'idle', 'firstFailure': None,
             'recovery': {key: 'not-reached' for key in AUTH_RECOVERY_STEPS},
             'credentialRecovery': None, 'groupRecovery': None, 'persistence': 'not-attempted',
-            'execution': auth_execution_observation(), 'candidateFailure': None, 'lineageFailure': None}
+            'execution': auth_execution_observation(), 'candidateFailure': None, 'lineageFailure': None, 'ledgerFailure': None}
 
 
 def validate_auth_runtime_observation(value):
     exact(value, ('schema', 'mode', 'kind', 'lastReached', 'firstFailure', 'recovery',
-                  'credentialRecovery', 'groupRecovery', 'persistence', 'execution', 'candidateFailure', 'lineageFailure'))
+                  'credentialRecovery', 'groupRecovery', 'persistence', 'execution', 'candidateFailure', 'lineageFailure', 'ledgerFailure'))
     require(value['schema'] == 'polaris-auth-runtime-observation-v2' and
             value['mode'] in ('existing-session', 'pkttyagent-observe', *CREDENTIAL_MODES) and
             value['kind'] in (None, 'install', 'uninstall') and
             value['lastReached'] in AUTH_OPERATION_STAGES and
             value['persistence'] in ('not-attempted', 'recorded', 'unknown'), 'fixed auth observation required')
     validate_auth_execution(value['execution'])
+    if value['ledgerFailure'] is not None: validate_ledger_failure(value['ledgerFailure'])
     if value['lineageFailure'] is not None:
         validate_lineage_failure(value['lineageFailure'])
         require(value['kind'] is not None and value['mode'] in CREDENTIAL_MODES, 'lineage outside owned authentication')
@@ -1274,6 +1295,8 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
         self.durable_rows = {birth(agent): dict(agent)}; self.terminals = {}
         self.probe = 'inventory'; self.prior_owned = False; self.stage = 'initial'
         self.first_failure = None; self.failure_lock = threading.Lock()
+        self.process = None; self.capture_probe = None; self.capture_attempts = 0
+        self.capture_deadline = None
         self.thread = threading.Thread(target=self.loop, name='owned-auth-lineage', daemon=True)
 
     def note_failure(self, error, stage=None, probe=None):
@@ -1285,7 +1308,12 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
                     'other-os' if isinstance(error, OSError) else
                     'contract' if isinstance(error, ValueError) else 'unexpected')
         value = {'stage': stage or self.stage, 'probe': probe or self.probe,
-                 'error': category, 'priorOwned': self.prior_owned}
+                 'error': category, 'priorOwned': self.prior_owned,
+                 'process': self.process, 'captureProbe': self.capture_probe, 'attempts': self.capture_attempts}
+        if getattr(error, 'process_probe', None) in PROC_PROBES:
+            value['captureProbe'] = error.process_probe
+        if value['probe'] in ('final-ack','thread-join','orphan-census','prior-error','snapshot'):
+            value.update(process=None, captureProbe=None, attempts=0, priorOwned=False)
         # No procfs, ledger or authentication lock here: a timed-out final scan
         # must not make its diagnostics another prerequisite for restoration.
         with self.failure_lock:
@@ -1321,8 +1349,80 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
                 self.c.tun.same_process(self.parent_identity, current),
                 'pre-stop registered authentication parent unavailable')
 
+    def capture_child(self, light):
+        """At most three full reads; no unknown/live-without-identity admission."""
+        key=birth(light);held=self.durable_rows.get(key)
+        self.process={k:light[k] for k in ('pid','startTime','ppid')}
+        self.capture_probe=None;self.capture_attempts=0
+        now=time.monotonic();deadline=self.capture_deadline if self.capture_deadline is not None else now+3
+        lease=getattr(self.c,'lease',None);lease_deadline=getattr(lease,'group_deadline',None)
+        if type(lease_deadline) in (int,float):deadline=min(deadline,lease_deadline)
+        retried=False
+        def check_budget():
+            self.probe='resample-budget'
+            require(time.monotonic()<deadline and (not self.stop.is_set() or self.stage=='close'),
+                    'auth observation budget exhausted')
+        def parent_fence():
+            self.probe='resample-parent'
+            require(held is not None and held['ppid']==light['ppid'],'auth held parent differs')
+            parent_pid=held['ppid'];seen=set()
+            while True:
+                keys=[k for k,row in self.durable_rows.items() if row['pid']==parent_pid]
+                require(len(keys)==1 and keys[0] not in seen and len(seen)<32,'auth durable parent missing')
+                parent=self.durable_rows[keys[0]];current=self.c.ops.proc(parent['pid'])
+                require(current and current['state']!='Z' and self.c.tun.same_process(parent,current) and
+                        current['ppid']==parent['ppid'] and current['exe']==parent['exe'], 'auth resample parent changed')
+                if keys[0]==birth(self.parent_identity):break
+                seen.add(keys[0]);parent_pid=parent['ppid']
+        for attempt in range(3):
+            if retried:check_budget();parent_fence()
+            self.probe='candidate-identity';self.capture_attempts=attempt+1
+            observed=self.c.ops.proc_observation(light['pid'])
+            require(type(observed) is dict and set(observed)=={'identity','partial','missing'}, 'fixed proc observation required')
+            p=observed['identity']
+            if p is not None:
+                if retried:
+                    self.probe='resample-conflict'
+                    require(self.c.tun.same_process(held,p) and held['ppid']==p['ppid'] and held['exe']==p['exe'],
+                            'auth resample identity changed')
+                    if p['state']=='Z':
+                        proof=self.c.tun.terminal_identity(held)
+                        parent_fence();check_budget();self.terminals[key]=proof
+                        return None
+                    parent_fence();check_budget()
+                return p
+            missing=observed['missing'];partial=observed['partial']
+            require(type(missing) is dict and missing=={'probe':missing.get('probe'),'error':'enoent'} and
+                    missing['probe'] in PROC_PROBES and type(partial) is dict, 'explicit proc ENOENT required')
+            if self.capture_probe is None:self.capture_probe=missing['probe']
+            self.probe='terminal'
+            require(self.error is None and held is not None and key!=birth(self.parent_identity) and
+                    held['ppid']==light['ppid'], 'auth terminal requires durable child identity')
+            self.probe='resample-conflict'
+            for field,value in partial.items():
+                if field=='state':continue
+                if field=='namespaces':
+                    require(type(value) is dict and all(held['namespaces'].get(k)==v for k,v in value.items()),
+                            'auth partial namespace changed')
+                else:require(field in held and held[field]==value,'auth partial identity changed')
+            self.probe='terminal'
+            try:proof=self.c.tun.terminal_identity(held)
+            except ValueError as error:
+                if (getattr(error,'probe',None)!='terminal-live' or attempt==2 or
+                        missing['probe'] not in ('exe-stat','exe-link')):raise
+                check_budget();parent_fence();check_budget()
+                remaining=deadline-time.monotonic()
+                require(remaining>0,'auth observation budget exhausted')
+                time.sleep(min(.001,remaining));retried=True
+                continue
+            if retried:parent_fence();check_budget()
+            self.terminals[key]=proof
+            return None
+        raise ValueError('auth observation retry exhausted')
+
     def scan(self):
         self.probe = 'inventory'; self.prior_owned = False
+        self.process=None;self.capture_probe=None;self.capture_attempts=0
         values = {}
         for entry in Path('/proc').iterdir():
             if entry.name.isdigit() and int(entry.name) > 1:
@@ -1336,8 +1436,9 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
                     key = birth(light); parent = values.get(light['ppid'])
                     if key not in self.rows and not (parent and birth(parent) in self.rows): continue
                     self.probe = 'candidate-identity'; self.prior_owned = key in self.durable_rows
-                    p = self.c.ops.proc(light['pid'])
-                    if p is None or p.get('state') == 'Z':
+                    p = self.capture_child(light)
+                    if p is None: continue
+                    if p.get('state') == 'Z':
                         self.probe = 'terminal'
                         held = self.durable_rows.get(key)
                         require(self.error is None and held is not None and key != birth(self.parent_identity) and
@@ -1377,6 +1478,7 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
         """
         try:
             require(self.thread.ident is not None and self.error is None, 'authentication observer unavailable')
+            self.capture_deadline = min(time.monotonic()+3, deadline) if deadline is not None else time.monotonic()+3
             self.parent_stop_requested.set()
             remaining = 3 if deadline is None else max(0, min(3, deadline - time.monotonic()))
             require(self.parent_stop_ack.wait(timeout=remaining), 'pre-stop lineage snapshot timed out')
@@ -1395,10 +1497,14 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
             raise
 
     def _close(self, forced=False):
-        self.stage = 'close'; self.probe = 'thread-join'
+        self.capture_deadline=time.monotonic()+3
         self.stop.set()
-        if self.thread.ident is not None: self.thread.join(timeout=3)
-        require(not self.thread.is_alive(), 'authentication lineage observer stuck')
+        try:
+            if self.thread.ident is not None: self.thread.join(timeout=3)
+            require(not self.thread.is_alive(), 'authentication lineage observer stuck')
+        except Exception as error:
+            self.note_failure(error, 'close', 'thread-join'); raise
+        self.stage = 'close'; self.probe = 'thread-join'
         try: self.scan()
         except Exception as error:
             self.note_failure(error, 'close')
@@ -1836,8 +1942,16 @@ class TransactionObserver:
                 # Parent exec-state updates precede child ownership checks even
                 # when procfs enumeration happens to return children first.
                 for light in sorted(values.values(), key=depth):
+                    self.boundary='auxiliary-census';self.candidate_phase='auxiliary-census'
+                    self.candidate_probe='auxiliary-live-child';self.candidate_outcome='unconfirmed'
+                    parent=values.get(light['ppid'])
+                    self.failure_context={'schema':'polaris-transaction-candidate-failure-v2',
+                        'priorOwned':birth(light) in self.rows,'inventory':{k:light[k] for k in ('pid','startTime','ppid')},
+                        'relation':'gui-direct' if parent and birth(parent)==birth(c.gui) else 'owned-child',
+                        'parent':{k:parent[k] for k in ('pid','startTime')} if parent else None}
                     require(light['ppid'] not in {p['inventory']['pid'] for p in self.auxiliary.values()},
                             'unverified auxiliary cannot own a surviving descendant')
+                    self.candidate_probe='auxiliary-birth-live'
                     require(birth(light) not in self.auxiliary,'terminal auxiliary became live')
                     parent = values.get(light['ppid'])
                     direct = parent and birth(parent) == birth(c.gui)
@@ -1845,7 +1959,8 @@ class TransactionObserver:
                     if not direct and not child: continue
                     self.observe_candidate(light, values)
         except Exception as error:
-            if self.boundary == 'candidate' and self.failure_context is not None:
+            c.auth_note('auth_ledger_failure', error)
+            if self.boundary in ('candidate','ledger','observer-publish','auxiliary-census') and self.failure_context is not None:
                 value = dict(self.failure_context)
                 value.update(phase=self.candidate_phase, probe=self.candidate_probe, outcome=self.candidate_outcome,
                              error=self.candidate_error(error))
@@ -1920,8 +2035,9 @@ class TransactionObserver:
             'capture':{'phase':attempts[-1].phase,'probe':attempts[-1].probe,'error':attempts[-1].error},
             'terminal':proof,'priorStrongOwned':False,'identityVerified':False,'signalAuthority':False}
         validate_auxiliary_terminals([row],self.binding,list(self.rows.values()),list(self.pkexec),list(self.shells))
-        self.boundary='ledger'
+        self.boundary='ledger';self.candidate_phase='ledger';self.candidate_probe='ledger-mutate'
         c.ledger.mutate(lambda v:v.setdefault('unverifiedAuxiliaryTerminals',[]).append(row))
+        self.boundary='observer-publish';self.candidate_phase='observer-publish';self.candidate_probe='publish-identity'
         self.auxiliary[key]=row
 
     def observe_candidate(self, light, values, retries=0, budget=None):
@@ -1969,7 +2085,9 @@ class TransactionObserver:
             except ValueError as error:
                 if getattr(error, 'probe', None) in CANDIDATE_PROBES: self.candidate_probe = error.probe
                 raise
+            self.boundary='ledger';self.candidate_phase='ledger';self.candidate_probe='ledger-mutate'
             c.ledger.mutate(lambda v: v.setdefault('transactionTerminals', []).append(proof))
+            self.boundary='observer-publish';self.candidate_phase='observer-publish';self.candidate_probe='publish-identity'
             self.terminals[birth(light)] = proof
             return
         p = observation['identity']; key = birth(p)
@@ -2019,7 +2137,9 @@ class TransactionObserver:
                     terminal = tun.terminal_identity(self.rows[key])
                     require(c.verify_unlinked_script(argv[1], self.pkexec[key]['proof']) == self.pkexec[key]['proof'],
                             'unlinked original script differs')
+                    self.boundary='ledger';self.candidate_phase='ledger';self.candidate_probe='ledger-mutate'
                     c.ledger.mutate(lambda v: v.setdefault('transactionTerminals', []).append(terminal))
+                    self.boundary='observer-publish';self.candidate_phase='observer-publish';self.candidate_probe='publish-identity'
                     self.terminals[key] = terminal
                     return
                 require(proof == self.pkexec[key]['proof'], 'original script changed')
@@ -2031,14 +2151,16 @@ class TransactionObserver:
             self.boundary = 'descendant-uid'; require(uids == (0, 0, 0, 0), 'privileged descendant UID differs')
             self.boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'privileged descendant escaped GUI')
             pending = None
-        self.boundary = 'ledger'
+        self.boundary = 'ledger';self.candidate_phase='ledger';self.candidate_probe='ledger-mutate'
         def record(v):
             records = v.setdefault('transactionProcesses', [])
             old = next((r for r in records if birth(r['identity']) == key), None)
             if old: old.update(identity=p,uids=list(uids))
             else: records.append({'role': 'privilege-transaction', 'identity': p, 'uids':list(uids)})
         c.ledger.mutate(record)
+        self.boundary='observer-publish';self.candidate_phase='observer-publish';self.candidate_probe='publish-identity'
         self.rows[key] = p; self.uid_rows[key] = tuple(uids)
+        self.candidate_probe='publish-role'
         if direct and p['exe'] == str(Path('/usr/bin/pkexec').resolve()): self.pkexec[key] = pending
         elif direct: self.shells[key] = proof
 
@@ -2226,6 +2348,17 @@ class Controller:
                     value['preCleanupObserved'] = True
                     value['preCleanupLive'] = code is None; value['preCleanupExitCode'] = code
         self.auth_checkpoint()
+
+    def auth_ledger_failure(self, error):
+        operation=getattr(error,'ledger_operation',None);probe=getattr(error,'ledger_probe',None)
+        if operation is None:return
+        category=('enoent' if isinstance(error,OSError) and error.errno==2 else
+                  'eacces' if isinstance(error,OSError) and error.errno==13 else
+                  'eperm' if isinstance(error,OSError) and error.errno==1 else
+                  'other-os' if isinstance(error,OSError) else 'contract' if isinstance(error,ValueError) else 'unexpected')
+        value=validate_ledger_failure({'operation':operation,'probe':probe,'error':category})
+        with self.auth_runtime_lock:
+            if self.auth_runtime['ledgerFailure'] is None:self.auth_runtime['ledgerFailure']=value
 
     def auth_lineage_failure(self, value):
         validate_lineage_failure(value)
@@ -2504,7 +2637,8 @@ class Controller:
             self.ledger.mutate(lambda v: (v.setdefault('transactions', []).append(result),
                                          v['authentication'].update(authorized=True)))
             return result
-        except BaseException:
+        except BaseException as error:
+            self.auth_note('auth_ledger_failure', error)
             self.auth_note('auth_failed', 'transaction-' + boundary + '-unconfirmed')
             raise
         finally:
@@ -2658,7 +2792,8 @@ class Controller:
         except Exception as error:
             category = 'other-os' if isinstance(error, OSError) else 'contract' if isinstance(error, ValueError) else 'unexpected'
             self.auth_note('auth_lineage_failure', {'stage':'retain', 'probe':'retain',
-                                                  'error':category, 'priorOwned':True})
+                                                  'error':category, 'priorOwned':True,
+                                                  'process':None, 'captureProbe':None, 'attempts':0})
             raise
 
     def _retain_auth_lineage(self, lineage):
@@ -2903,6 +3038,7 @@ def main():
             try:
                 response = controller.dispatch(json.loads(raw))
             except Exception as error:
+                controller.auth_note('auth_ledger_failure', error)
                 controller.fail()
                 not_ready = isinstance(error, AuthenticationNotReady) and controller.ledger is None
                 response = {'seq': controller.seq, 'ok': False, 'terminal': True,
