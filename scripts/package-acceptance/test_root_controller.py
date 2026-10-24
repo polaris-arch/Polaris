@@ -1941,7 +1941,7 @@ class TransactionFenceTests(unittest.TestCase):
     def test_related_unstable_candidate_bounded_reads_permanent_failure(self):
         c,o,r=self.setup_observer();c.tun.transaction_identity.side_effect=ValueError('not emitted')
         with self.assertRaises(ValueError):self.scan(o,r)
-        self.assertEqual(c.tun.transaction_identity.call_count,3)
+        self.assertEqual(c.tun.transaction_identity.call_count,1) # Explicit non-exit conflict is permanent, not retried.
         self.assertEqual(o.error,'candidate');self.assertFalse(o.pkexec)
         c.auth_note.assert_called_with('auth_failed','transaction-candidate-unconfirmed')
     def test_fence_no_prior_cancel_deadline_error_no_admission(self):
@@ -2278,7 +2278,7 @@ class CandidateReconciliationTests(unittest.TestCase):
     def test_strict_candidate_schema_and_first_diagnostic_is_detached(self):
         c=controller(m.AUTH_MODE);c.auth_runtime=m.auth_runtime_observation(m.AUTH_MODE)
         c.auth_runtime['kind']='install';c.auth_runtime_lock=threading.RLock();c.auth_checkpoint=Mock()
-        d={'schema':'polaris-transaction-candidate-failure-v1','phase':'owned-parent',
+        d={'schema':'polaris-transaction-candidate-failure-v2','phase':'owned-parent','probe':'parent-identity','priorOwned':False,
            'inventory':{'pid':61,'startTime':'1234','ppid':60},'relation':'owned-child',
            'parent':{'pid':60,'startTime':'1234'},'outcome':'identity-mismatch','error':'contract'}
         c.auth_candidate_failure(d);d['inventory']['pid']=999
@@ -2327,7 +2327,7 @@ class OwnedTerminalReconciliationTests(unittest.TestCase):
         for known in (False,True):
             c,o,r=self.setup_observer()
             if known:self.scan(o,r)
-            c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError('unconfirmed'))
+            c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError('unconfirmed'),'initial-live-state')
             c.tun.terminal_identity.return_value={'pid':60,'startTime':r[60]['startTime'],'state':'absent','scope':'sampled-terminal-not-execution-identity'}
             if known:
                 self.scan(o,r)
@@ -2346,13 +2346,13 @@ class OwnedTerminalReconciliationTests(unittest.TestCase):
             with self.assertRaises(ValueError):self.scan(o,r)
             c.tun.terminal_identity.assert_not_called()
         c,o,r=self.setup_observer();self.scan(o,r)
-        c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError('gone'))
+        c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError('gone'),'initial-live-state')
         c.tun.terminal_identity.side_effect=ValueError('reused')
         with self.assertRaises(ValueError):self.scan(o,r)
         self.assertFalse(o.terminals)
     def test_terminal_ledger_failure_remains_failure(self):
         c,o,r=self.setup_observer();self.scan(o,r)
-        c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError('gone'))
+        c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError('gone'),'initial-live-state')
         c.tun.terminal_identity.return_value={'pid':60,'startTime':r[60]['startTime'],'state':'zombie','scope':'sampled-terminal-not-execution-identity'}
         c.ledger.mutate=Mock(side_effect=OSError('disk'))
         with self.assertRaises(OSError):self.scan(o,r)
@@ -2641,3 +2641,175 @@ class NonblockingScriptOpenContracts(unittest.TestCase):
             self.assertEqual(len(opened),2)
             for fd in set(opened):
                 with self.assertRaises(OSError):os.fstat(fd)
+
+class LayeredAuxiliaryTerminalContracts(unittest.TestCase):
+    scan=TransactionFenceTests.scan
+    def setup(self):
+        c,o,rows=TransactionFenceTests().setup_observer()
+        self.scan(o,rows)
+        rows[60].update(uid=0,exe=str(Path('/bin/bash').resolve()),exeInode=88)
+        self.scan(o,rows)
+        c.ledger.mutate(lambda v:v.setdefault('transactionBindings',[]).append(o.binding));o.binding_recorded=True
+        child={**identity(61,0),'ppid':60};rows[61]=child
+        original=c.tun.transaction_identity.side_effect
+        failure=vm_tun.TransactionIdentityError('inputs-before',ValueError('private'),'cmdline-empty',[copy.deepcopy(child)],[(0,0,0,0)])
+        def capture(pid):
+            if pid==61:raise failure
+            return original(pid)
+        c.tun.transaction_identity.side_effect=capture
+        c.tun.unverified_terminal_identity.return_value={'pid':61,'startTime':child['startTime'],'state':'zombie','scope':'sampled-terminal-unverified-execution'}
+        return c,o,rows,failure
+    def test_terminal_is_separate_durable_incomplete_and_has_no_authority(self):
+        c,o,r,e=self.setup();self.scan(o,r)
+        self.assertNotIn(m.birth(r[61]),o.rows);self.assertNotIn(m.birth(r[61]),o.uid_rows)
+        value=o.snapshot();self.assertEqual(value['auxiliaryIdentityCoverage'],'incomplete')
+        row=value['auxiliaryTerminals'][0]
+        self.assertFalse(row['identityVerified']);self.assertFalse(row['signalAuthority'])
+        self.assertEqual(c.ledger.value['unverifiedAuxiliaryTerminals'],[row])
+        self.assertEqual(m.validate_auxiliary_terminals([row],o.binding,list(o.rows.values()),list(o.pkexec),list(o.shells)),[row])
+    def test_binding_schema_and_cross_window_replay_rejected(self):
+        c,o,r,e=self.setup();self.scan(o,r);row=o.snapshot()['auxiliaryTerminals'][0]
+        for field,value in [('runToken','f'*12),('windowNonce','f'*32),('kind','uninstall'),('sourceSha','f'*40),('attempt','2')]:
+            bad=copy.deepcopy(row);bad['binding'][field]=value
+            with self.assertRaises(ValueError):m.validate_auxiliary_terminals([bad],o.binding,list(o.rows.values()),list(o.pkexec),list(o.shells))
+        for field,value in [('signalAuthority',True),('identityVerified',True),('priorStrongOwned',True)]:
+            bad=copy.deepcopy(row);bad[field]=value
+            with self.assertRaises(ValueError):m.validate_auxiliary_terminals([bad],o.binding,list(o.rows.values()),list(o.pkexec),list(o.shells))
+    def test_first_direct_gui_or_missing_shell_or_weak_parent_never_auxiliary(self):
+        for mode in ('direct','no-shell','weak-parent','no-durable-binding'):
+            c,o,r,e=self.setup()
+            if mode=='direct':r[61]['ppid']=c.gui['pid']
+            elif mode=='no-shell':o.shells.clear()
+            elif mode=='weak-parent':o.rows.pop(m.birth(r[60]))
+            else:o.binding_recorded=False
+            if mode=='weak-parent':
+                with self.assertRaises(ValueError):o.observe_auxiliary_terminal(r[61],r[60],(e,))
+            else:
+                with self.assertRaises(ValueError):o.observe_candidate(r[61],r)
+            self.assertFalse(o.auxiliary)
+    def test_all_attempt_conflicts_permissions_and_partial_absence_remain_failed(self):
+        for mode in ('permission','partial-enoent','uid','image','namespace','parent','malformed'):
+            c,o,r,e=self.setup()
+            if mode=='permission':e=vm_tun.TransactionIdentityError('inputs-before',PermissionError(13,'private'),'status-read')
+            elif mode=='partial-enoent':e=vm_tun.TransactionIdentityError('inputs-before',FileNotFoundError(2,'private'),'cmdline-read')
+            elif mode=='malformed':e=vm_tun.TransactionIdentityError('inputs-before',ValueError(),'cmdline-shape')
+            elif mode=='uid':e.uids=((1001,0,0,0),)
+            elif mode=='image':e.identities=(*e.identities,{**e.identities[0],'exeInode':999})
+            elif mode=='namespace':e.identities=({**e.identities[0],'namespaces':{}},)
+            elif mode=='parent':e.identities=({**e.identities[0],'ppid':99},)
+            c.tun.transaction_identity.side_effect=lambda pid,e=e: (_ for _ in ()).throw(e)
+            with self.assertRaises(ValueError):o.observe_candidate(r[61],r)
+            self.assertFalse(o.auxiliary)
+    def test_live_reuse_parent_change_or_persistence_failure_does_not_record(self):
+        for mode in ('live','reuse','parent','persist'):
+            c,o,r,e=self.setup()
+            if mode in ('live','reuse'):c.tun.unverified_terminal_identity.side_effect=ValueError(mode)
+            elif mode=='parent':c.ops.proc.side_effect=lambda pid:{**r[60],'startTime':'999'} if pid==60 else r.get(pid)
+            else:c.ledger.mutate=Mock(side_effect=OSError('private'))
+            with self.assertRaises((ValueError,OSError)):o.observe_candidate(r[61],r)
+            self.assertFalse(o.auxiliary)
+    def test_auxiliary_cannot_parent_surviving_descendant_at_finish(self):
+        c,o,r,e=self.setup();self.scan(o,r)
+        r[61]['state']='Z';r[62]={**identity(62,0),'ppid':61}
+        o.thread=Mock();o.thread.is_alive.return_value=False
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc',str(pid)) for pid in r]), \
+             patch.object(m,'proc_stat',side_effect=lambda pid:copy.deepcopy(r.get(pid))):
+            with self.assertRaises(ValueError):o.finish()
+        self.assertNotIn(m.birth(r[62]),o.rows)
+    def test_retry_conflict_cannot_be_followed_by_success(self):
+        c,o,r,e=self.setup();child=r[61]
+        valid={'identity':child,'uids':(0,0,0,0),'argv':['ignored'],'executable':{'dev':1,'inode':1,'sha256':H}}
+        for probe in ('consistency-uid','consistency-image','consistency-topology','consistency-namespace','consistency-argv'):
+            c.tun.transaction_identity.reset_mock()
+            c.tun.transaction_identity.side_effect=[vm_tun.TransactionIdentityError('snapshot-consistency',ValueError(),probe),valid]
+            with self.assertRaises(ValueError):o.candidate(61,child)
+            self.assertEqual(c.tun.transaction_identity.call_count,1)
+        e=vm_tun.TransactionIdentityError('inputs-before',ValueError(),'cmdline-empty',[{**child,'uid':1001}],[(1001,0,0,0)])
+        c.tun.transaction_identity.side_effect=[e,valid]
+        with self.assertRaises(ValueError):o.candidate(61,child)
+        self.assertNotIn(m.birth(child),o.rows)
+
+class LayeredFinalEvidenceContracts(unittest.TestCase):
+    def setup(self):
+        return LayeredAuxiliaryTerminalContracts().setup()
+    def test_strong_parent_schema_and_namespace_are_not_summaries(self):
+        h=LayeredAuxiliaryTerminalContracts();c,o,r,e=h.setup();h.scan(o,r)
+        row=o.snapshot()['auxiliaryTerminals'][0]
+        for field in ('namespaces','exe','exeInode','ppid','capEff','cgroup'):
+            strong=copy.deepcopy(list(o.rows.values()));strong[0].pop(field)
+            with self.assertRaises((ValueError,KeyError)):
+                m.validate_auxiliary_terminals([row],o.binding,strong,list(o.pkexec),list(o.shells))
+        with self.assertRaises(ValueError):
+            m.validate_auxiliary_terminals([row],o.binding,[],list(o.pkexec),list(o.shells))
+    def test_final_fresh_absence_and_durable_binding_required_without_claiming_reap(self):
+        h=LayeredAuxiliaryTerminalContracts();c,o,r,e=h.setup();h.scan(o,r)
+        r[61]['state']='Z';o.thread=Mock();o.thread.is_alive.return_value=False
+        c.tun.unverified_terminal_identity.return_value={'pid':61,'startTime':r[61]['startTime'],'state':'absent','scope':'sampled-terminal-unverified-execution'}
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc',str(pid)) for pid in r]),              patch.object(m,'proc_stat',side_effect=lambda pid:copy.deepcopy(r.get(pid))):
+            proof=o.finish()
+        self.assertTrue(proof['closed']);self.assertEqual(proof['auxiliaryTerminals'][0]['terminal']['state'],'absent')
+        self.assertEqual(proof['auxiliaryIdentityCoverage'],'incomplete')
+        self.assertNotIn('reaped',proof['auxiliaryTerminals'][0]['terminal'])
+        self.assertEqual(len(c.ledger.value['auxiliaryTerminalClosures']),1)
+        c.ledger.value['transactionBindings']=[]
+        with self.assertRaises(ValueError):o.finish()
+    def test_final_live_reused_or_missing_durable_auxiliary_remains_failure(self):
+        h=LayeredAuxiliaryTerminalContracts()
+        for mode in ('live','reuse','missing-record','late-write-failure'):
+            c,o,r,e=h.setup();h.scan(o,r);r[61]['state']='Z'
+            o.thread=Mock();o.thread.is_alive.return_value=False
+            if mode in ('live','reuse'):c.tun.unverified_terminal_identity.side_effect=ValueError(mode)
+            elif mode=='missing-record':c.ledger.value['unverifiedAuxiliaryTerminals']=[]
+            else:c.ledger.mutate=Mock(side_effect=OSError('private'))
+            with patch.object(m.Path,'iterdir',return_value=[Path('/proc',str(pid)) for pid in r]),                  patch.object(m,'proc_stat',side_effect=lambda pid:copy.deepcopy(r.get(pid))):
+                with self.assertRaises((ValueError,OSError)):o.finish()
+    def test_strong_owned_exit_never_launders_earlier_uid_image_parent_conflict(self):
+        h=TransactionFenceTests()
+        for field,value in (('uid',0),('exeInode',999),('ppid',999),('namespaces',{})):
+            c,o,r=h.setup_observer();h.scan(o,r)
+            before={**r[60],field:value}
+            e=vm_tun.TransactionIdentityError('inputs-before',ValueError(),'cmdline-empty',[before],[(1001,0,0,0)])
+            c.tun.transaction_identity.side_effect=e
+            with self.assertRaises(ValueError):o.observe_candidate(r[60],r)
+            c.tun.terminal_identity.assert_not_called();self.assertFalse(o.terminals)
+
+class TransactionWindowBindingContracts(unittest.TestCase):
+    def test_begin_binding_is_durable_before_observer_runs(self):
+        c=controller();o=m.TransactionObserver(c,'install');o.thread=Mock()
+        o.thread.start.side_effect=lambda:self.assertEqual(c.ledger.load()['transactionBindings'],[o.binding])
+        o.start();self.assertTrue(o.binding_recorded);o.thread.start.assert_called_once()
+        other=m.TransactionObserver(c,'install')
+        self.assertNotEqual(o.binding['windowNonce'],other.binding['windowNonce'])
+        for mutate in (lambda v:v.update(kind='uninstall'),lambda v:v.update(attempt='2'),lambda v:v['subject'].update(startTime='999')):
+            bad=copy.deepcopy(o.binding);mutate(bad)
+            with self.assertRaises(ValueError):m.validate_transaction_binding(bad,launch=c.launch,subject=c.gui,kind='install')
+    def test_failed_binding_persistence_never_starts_observer(self):
+        c=controller();o=m.TransactionObserver(c,'install');o.thread=Mock()
+        c.ledger.mutate=Mock(side_effect=OSError('private'))
+        with self.assertRaises(OSError):o.start()
+        self.assertFalse(o.binding_recorded);o.thread.start.assert_not_called()
+
+class AuxiliaryWholeAbsenceAndMandatoryContracts(unittest.TestCase):
+    def test_whole_directory_absence_can_only_be_aux_under_already_strong_shell(self):
+        h=LayeredAuxiliaryTerminalContracts();c,o,r,e=h.setup()
+        e=vm_tun.TransactionIdentityError('identity-before',ValueError(),'initial-directory-absent')
+        c.tun.transaction_identity.side_effect=e
+        c.tun.unverified_terminal_identity.return_value={'pid':61,'startTime':r[61]['startTime'],'state':'absent','scope':'sampled-terminal-unverified-execution'}
+        o.observe_candidate(r[61],r)
+        self.assertIn(m.birth(r[61]),o.auxiliary);self.assertNotIn(m.birth(r[61]),o.rows)
+    def test_partial_missing_identity_and_known_mandatory_role_not_downgraded(self):
+        for mode in ('partial','helper','core'):
+            h=LayeredAuxiliaryTerminalContracts();c,o,r,e=h.setup()
+            if mode=='partial':
+                c.tun.transaction_identity.side_effect=vm_tun.TransactionIdentityError('identity-before',ValueError(),'initial-live-state')
+            else:c.ledger.value[mode]={'identity':copy.deepcopy(r[61])}
+            with self.assertRaises(ValueError):o.observe_candidate(r[61],r)
+            self.assertFalse(o.auxiliary)
+    def test_final_zombie_is_nonrunning_not_reaped(self):
+        h=LayeredAuxiliaryTerminalContracts();c,o,r,e=h.setup();h.scan(o,r);r[61]['state']='Z'
+        o.thread=Mock();o.thread.is_alive.return_value=False
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc',str(pid)) for pid in r]),              patch.object(m,'proc_stat',side_effect=lambda pid:copy.deepcopy(r.get(pid))):
+            proof=o.finish()
+        self.assertEqual(proof['auxiliaryTerminals'][0]['terminal']['state'],'zombie')
+        self.assertFalse(proof['auxiliaryTerminals'][0]['identityVerified'])
+        self.assertNotIn('reaped',proof['auxiliaryTerminals'][0])

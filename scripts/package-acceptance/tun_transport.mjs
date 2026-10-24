@@ -156,7 +156,80 @@ export function verifyGroupRecovery(recovery, uid, account) {
     && recovery.maxLeaseSeconds === 90, 'Exact bounded added-membership recovery required');
   return recovery;
 }
-export function verifyAuthorization(row, kind, app, uid, mode, subject) {
+const exactAux = (value, keys) => demand(value && typeof value === 'object' && !Array.isArray(value)
+  && Object.keys(value).length === keys.length && keys.every(k => Object.hasOwn(value,k)), 'Exact auxiliary evidence schema required');
+const auxBirth = value => {
+  demand(Number.isSafeInteger(value?.pid) && value.pid > 1 && typeof value.startTime === 'string'
+    && /^[1-9][0-9]{0,19}$/.test(value.startTime), 'Exact auxiliary birth required');
+  return [value.pid,value.startTime];
+};
+const strongAuxIdentity = p => {
+  demand(p && ['pid','startTime','state','ppid','uid','exeDev','exeInode','exe','namespaces','cgroup','capEff','capAmb']
+    .every(k=>Object.hasOwn(p,k)), 'Complete strong auxiliary parent required');
+  auxBirth(p);
+  demand(Number.isSafeInteger(p.ppid) && p.ppid>0 && ['uid','exeDev','exeInode','capEff','capAmb'].every(k=>Number.isSafeInteger(p[k]) && p[k]>=0)
+    && typeof p.exe==='string' && p.exe.startsWith('/') && p.exe.length<=4096
+    && typeof p.cgroup==='string' && p.cgroup.length>0 && p.cgroup.length<=65536
+    && ['R','S','D','Z','T','t','X','x','K','W','P','I'].includes(p.state), 'Strong parent fields required');
+  exactAux(p.namespaces,['net','mnt','pid','cgroup']);
+  demand(Object.values(p.namespaces).every(v=>Number.isSafeInteger(v)&&v>0),'Strong parent namespaces required');
+};
+export function verifyAuxiliaryObservations(a, kind, app, uid, context) {
+  const b=a.transactionBinding;
+  exactAux(b,['schema','runToken','sourceSha','githubRunId','attempt','kind','subject','windowNonce']);
+  demand(b.schema==='polaris-transaction-binding-v1' && /^[0-9a-f]{12}$/.test(b.runToken)
+    && /^[0-9a-f]{40}$/.test(b.sourceSha) && /^[1-9][0-9]*$/.test(b.githubRunId)
+    && /^[1-9][0-9]*$/.test(b.attempt) && b.kind===kind && /^[0-9a-f]{32}$/.test(b.windowNonce)
+    && ['runToken','sourceSha','githubRunId','attempt','windowNonce'].every(k=>typeof b[k]==='string'),
+  'Current transaction execution binding required');
+  exactAux(b.subject,['pid','startTime','uid']);
+  same(auxBirth(b.subject),birth(app),'Auxiliary subject differs');demand(b.subject.uid===uid,'Auxiliary GUI UID differs');
+  if (context) {
+    same(b.sourceSha,context.candidate,'Auxiliary source differs');
+    same(b.githubRunId,context.runId,'Auxiliary run differs');same(b.attempt,context.attempt,'Auxiliary attempt differs');
+  }
+  const rows=a.auxiliaryTerminals;
+  demand(Array.isArray(rows) && rows.length<=256 && a.auxiliaryIdentityCoverage===(rows.length?'incomplete':'complete'),
+    'Explicit incomplete auxiliary identity coverage required');
+  const strong=new Map(a.owned.map(p=>[canonical(auxBirth(p)),p]));
+  demand(strong.size===a.owned.length,'Duplicate strong birth');
+  const shell=new Set(a.rootShellBirths.map(canonical)), mandatory=new Set([...a.pkexecBirths,...a.rootShellBirths].map(canonical));
+  demand([...mandatory].every(k=>strong.has(k)),'Mandatory births missing from strong identities');
+  const seen=new Set();
+  for (const row of rows) {
+    exactAux(row,['schema','binding','inventory','parent','anchor','capture','terminal','priorStrongOwned','identityVerified','signalAuthority']);
+    demand(row.schema==='polaris-unverified-auxiliary-terminal-v1' && row.priorStrongOwned===false
+      && row.identityVerified===false && row.signalAuthority===false,'Terminal observation must not confer identity or signal authority');
+    same(row.binding,b,'Cross-window auxiliary evidence');
+    exactAux(row.inventory,['pid','startTime','ppid']);exactAux(row.parent,['pid','startTime']);exactAux(row.anchor,['pid','startTime']);
+    const key=canonical(auxBirth(row.inventory)), parent=canonical(auxBirth(row.parent)), anchor=canonical(auxBirth(row.anchor));
+    demand(!seen.has(key) && !strong.has(key) && !mandatory.has(key) && row.inventory.ppid===row.parent.pid
+      && row.inventory.ppid!==app.pid && key!==canonical(birth(app)) && strong.has(parent) && shell.has(anchor),
+    'Separate strong-parent auxiliary category required');
+    strongAuxIdentity(strong.get(anchor));
+    let current=parent;const chain=new Set();
+    while(current!==anchor) {
+      demand(strong.has(current) && !chain.has(current) && chain.size<32 && strong.get(current).uid===0,'Strong auxiliary ancestry required');
+      strongAuxIdentity(strong.get(current));
+      same(strong.get(current).namespaces,strong.get(anchor).namespaces,'Strong namespace chain differs');
+      same(strong.get(current).cgroup,strong.get(anchor).cgroup,'Strong cgroup chain differs');
+      chain.add(current);const candidates=[...strong].filter(([,p])=>p.pid===strong.get(current).ppid);
+      demand(candidates.length===1,'Ambiguous auxiliary parent');current=candidates[0][0];
+    }
+    demand(strong.get(anchor)?.uid===0,'Root shell anchor required');
+    exactAux(row.capture,['phase','probe','error']);
+    demand(['identity-before','identity-after','inputs-before','inputs-after'].includes(row.capture.phase)
+      && ['cmdline-empty','initial-directory-absent','final-directory-absent'].includes(row.capture.probe)
+      && ({'cmdline-empty':['inputs-before','inputs-after'],'initial-directory-absent':['identity-before'],'final-directory-absent':['identity-after']}[row.capture.probe]||[]).includes(row.capture.phase)
+      && row.capture.error==='contract','Exit-compatible auxiliary capture required');
+    exactAux(row.terminal,['pid','startTime','state','scope']);same(auxBirth(row.terminal),auxBirth(row.inventory),'Terminal birth differs');
+    demand(['absent','zombie'].includes(row.terminal.state) && row.terminal.scope==='sampled-terminal-unverified-execution',
+      'Sampled terminal evidence, not reaped/identity proof, required');
+    seen.add(key);
+  }
+  return b;
+}
+export function verifyAuthorization(row, kind, app, uid, mode, subject, context) {
   const a = row?.authorization;
   demand(row?.callback?.envelopeSuccess === true && row.callback.success === true
     && row.callback.installed === (kind === 'install') && row.callback.ready === (kind === 'install')
@@ -168,6 +241,7 @@ export function verifyAuthorization(row, kind, app, uid, mode, subject) {
   same(a.pkexecBirths[0], a.rootShellBirths[0], 'Root shell was not the same observed pkexec birth');
   demand(Array.isArray(a.owned) && a.owned.some(p => p.uid === 0 && p.ppid === app.pid
     && canonical(birth(p)) === canonical(a.rootShellBirths[0])), 'Original root shell lineage missing');
+  verifyAuxiliaryObservations(a,kind,app,uid,context);
   if (mode === AUTH_MODE || mode === AUTH_GROUP_MODE) demand(a.credentialAuthenticationComplete === true && a.authDescendantsReaped === true
     && a.credentialRecovery?.guiUid === uid && a.credentialRecovery.finalPasswordStatus === 'L'
     && subject?.guiUid === uid && a.credentialRecovery.account === subject.account
@@ -251,8 +325,12 @@ export function verifyReport(report, admission, admissionSha256, authMode = 'exi
   demand(report.configIdentity.pid === execution.core.pid && report.configIdentity.startTime === execution.core.startTime
     && report.cases.default_graph.evidence.actualGraphSha256 === report.configIdentity.sha256,
   'Original runtime bytes are not the observed TUN core graph');
-  verifyAuthorization(report.helperInstall, 'install', execution.app, execution.uid, authMode, subject);
-  verifyAuthorization(report.helperUninstall, 'uninstall', execution.app, execution.uid, authMode, subject);
+  verifyAuthorization(report.helperInstall, 'install', execution.app, execution.uid, authMode, subject, report.context);
+  verifyAuthorization(report.helperUninstall, 'uninstall', execution.app, execution.uid, authMode, subject, report.context);
+  same(report.helperInstall.authorization.transactionBinding.runToken,report.helperUninstall.authorization.transactionBinding.runToken,'Transaction run token differs');
+  demand(report.helperInstall.authorization.transactionBinding.windowNonce!==report.helperUninstall.authorization.transactionBinding.windowNonce,'Replayed transaction window');
+  demand(report.auxiliaryIdentityCoverage === ([report.helperInstall,report.helperUninstall].some(r=>r.authorization.auxiliaryIdentityCoverage==='incomplete')?'incomplete':'complete'),
+    'Aggregate auxiliary identity coverage required');
   if (authMode === AUTH_GROUP_MODE) {
     demand(report.rootPreparation?.guarded === true
       && report.rootPreparation.authentication === 'pending-real-product-authorization'

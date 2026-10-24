@@ -798,3 +798,76 @@ class OwnedTerminalTests(unittest.TestCase):
                  patch.object(Path,'is_dir',return_value=True),patch.object(Path,'is_symlink',return_value=fault=='symlink'):
                 with self.assertRaises((ValueError,OSError,RuntimeError)):
                     tun.pid1_root_cgroup(Mock(run=Mock(side_effect=query)))
+
+class OrdinaryExitCaptureProbeMatrix(unittest.TestCase):
+    def test_real_exit_at_each_capture_boundary_has_specific_exit_probe(self):
+        import sys
+        for point, expected in (
+            ('identity-before',('identity-before','initial-live-state')),
+            ('executable-open',('executable-open','exe-open')),
+            ('executable-initial',('inputs-before','cmdline-empty')),
+            ('inputs-before',('inputs-before','cmdline-empty')),
+            ('executable-read',('inputs-after','cmdline-empty')),
+            ('inputs-after',('inputs-after','cmdline-empty')),
+            ('identity-after',('identity-after','final-live-state'))):
+            with self.subTest(point=point):
+                child=subprocess.Popen([sys.executable,'-c',"import os;os.write(1,b'R');os.read(0,1)"],
+                    stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+                self.assertEqual(child.stdout.read(1),b'R')
+                prior=tun.transaction_identity(child.pid)
+                state={'exit':False,'fd':None,'fstat':0,'inputs':0}
+                def release():
+                    if state['exit']:return
+                    state['exit']=True;child.stdin.write(b'X');child.stdin.flush()
+                    os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOWAIT)
+                real_identity=tun.process_identity;real_open=os.open;real_fstat=os.fstat;real_read=os.read;real_bytes=Path.read_bytes
+                def identify(pid):
+                    if point=='identity-before':release()
+                    value=real_identity(pid)
+                    if point=='executable-open':release()
+                    return value
+                def opening(path,flags,*args,**kwargs):
+                    fd=real_open(path,flags,*args,**kwargs)
+                    if str(path)==f'/proc/{child.pid}/exe':
+                        state['fd']=fd
+                        if point=='executable-initial':release()
+                    return fd
+                def fstat(fd):
+                    value=real_fstat(fd)
+                    if fd==state['fd']:
+                        state['fstat']+=1
+                        if point=='inputs-before' and state['fstat']==1:release()
+                    return value
+                def read(fd,count):
+                    if fd==state['fd'] and (point=='executable-read' or point=='inputs-after' and count==1):release()
+                    return real_read(fd,count)
+                def read_bytes(path):
+                    value=real_bytes(path)
+                    if str(path)==f'/proc/{child.pid}/cmdline':
+                        state['inputs']+=1
+                        if point=='identity-after' and state['inputs']==2:release()
+                    return value
+                try:
+                    with patch.object(tun,'process_identity',side_effect=identify),patch.object(os,'open',side_effect=opening),                          patch.object(os,'fstat',side_effect=fstat),patch.object(os,'read',side_effect=read),                          patch.object(Path,'read_bytes',autospec=True,side_effect=read_bytes):
+                        with self.assertRaises(tun.TransactionIdentityError) as caught:tun.transaction_identity(child.pid)
+                    self.assertEqual((caught.exception.phase,caught.exception.probe),expected)
+                    self.assertEqual(tun.terminal_identity(prior['identity'])['state'],'zombie')
+                    child.wait(timeout=2)
+                    self.assertEqual(tun.terminal_identity(prior['identity'])['state'],'absent')
+                    unverified=tun.unverified_terminal_identity(prior['identity'])
+                    self.assertEqual(unverified['scope'],'sampled-terminal-unverified-execution')
+                    self.assertNotIn('uid',unverified);self.assertNotIn('exe',unverified)
+                finally:
+                    if child.poll() is None:release();child.wait(timeout=2)
+                    child.stdin.close();child.stdout.close()
+    def test_whole_missing_is_not_partial_file_or_permission_absence(self):
+        with patch.object(tun,'process_identity',return_value=None),patch.object(Path,'lstat',side_effect=FileNotFoundError(2,'private')):
+            with self.assertRaises(tun.TransactionIdentityError) as caught:tun.transaction_identity(99999)
+        self.assertEqual(caught.exception.probe,'initial-directory-absent')
+        with patch.object(tun,'process_identity',return_value=None),patch.object(Path,'lstat',return_value=Mock()):
+            with self.assertRaises(tun.TransactionIdentityError) as caught:tun.transaction_identity(99999)
+        self.assertEqual(caught.exception.probe,'initial-live-state')
+        with patch.object(tun,'process_identity',return_value=None),patch.object(Path,'lstat',side_effect=PermissionError(13,'private')):
+            with self.assertRaises(tun.TransactionIdentityError) as caught:tun.transaction_identity(99999)
+        self.assertEqual(caught.exception.error,'eacces')
+        self.assertNotIn('private',str(caught.exception))

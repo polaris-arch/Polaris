@@ -440,10 +440,20 @@ TRANSACTION_IDENTITY_PHASES = ('identity-before', 'executable-open', 'executable
     'inputs-before', 'executable-read', 'inputs-after', 'identity-after', 'snapshot-consistency')
 
 
+TRANSACTION_PROBES = ('unknown', 'initial-identity-read', 'initial-live-state', 'initial-directory-absent', 'exe-open',
+    'exe-shape', 'exe-match', 'status-read', 'uid-field', 'cmdline-read', 'cmdline-empty',
+    'cmdline-shape', 'cmdline-decode', 'exe-read', 'exe-size', 'final-identity-read',
+    'final-live-state', 'final-directory-absent', 'consistency-birth', 'consistency-uid', 'consistency-image',
+    'consistency-topology', 'consistency-namespace', 'consistency-argv', 'consistency-file',
+    'inventory-topology', 'parent-identity', 'consistency-identity', 'prior-identity-conflict', 'terminal-state')
+
+
 class TransactionIdentityError(ValueError):
-    def __init__(self, phase, error):
+    def __init__(self, phase, error, probe='unknown', identities=(), uids=()):
         super().__init__('transaction candidate observation unconfirmed')
-        self.phase = phase
+        self.phase = phase; self.probe = probe
+        # Internal evidence only; never serialize status, argv, or these objects.
+        self.identities = tuple(identities); self.uids = tuple(uids)
         self.error = ('enoent' if isinstance(error, OSError) and error.errno == 2 else
                       'eacces' if isinstance(error, OSError) and error.errno == 13 else
                       'eperm' if isinstance(error, OSError) and error.errno == 1 else
@@ -453,50 +463,75 @@ class TransactionIdentityError(ValueError):
 
 
 def transaction_identity(pid):
-    """Bounded held-executable observation, with fixed non-secret failure stages."""
-    phase = 'identity-before'
+    """Bounded held-executable observation, with fixed non-secret failure probes."""
+    phase = 'identity-before'; probe = 'initial-identity-read'; identities = []; uid_reads = []
     try:
-        phase = 'identity-before'
         before = process_identity(pid)
+        if before is not None: identities.append(before)
+        probe = 'initial-live-state'
+        if before is None:
+            try: (Path('/proc') / str(pid)).lstat()
+            except FileNotFoundError:
+                probe = 'initial-directory-absent'
         require(before is not None and before['state'] != 'Z', 'live transaction candidate required')
-        phase = 'executable-open'
+        phase = 'executable-open'; probe = 'exe-open'
         root = Path('/proc') / str(pid)
         fd = os.open(root / 'exe', os.O_RDONLY | os.O_CLOEXEC)
         try:
-            phase = 'executable-initial'
+            phase = 'executable-initial'; probe = 'exe-shape'
             info = os.fstat(fd)
-            require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 128 * 1024 * 1024 and
-                    (info.st_dev, info.st_ino) == (before['exeDev'], before['exeInode']), 'transaction executable changed')
+            require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 128 * 1024 * 1024, 'transaction executable shape changed')
+            probe = 'exe-match'
+            require((info.st_dev, info.st_ino) == (before['exeDev'], before['exeInode']), 'transaction executable changed')
             def inputs():
-                status = (root / 'status').read_text()
+                nonlocal probe
+                probe = 'status-read'; status = (root / 'status').read_text()
+                probe = 'uid-field'
                 uids = tuple(int(v) for v in next(x for x in status.splitlines() if x.startswith('Uid:')).split()[1:])
-                raw = (root / 'cmdline').read_bytes()
-                require(len(uids) == 4 and 0 < len(raw) <= 1024 * 1024 and raw.endswith(b'\0'), 'transaction inputs unavailable')
+                require(len(uids) == 4, 'transaction UID field unavailable')
+                uid_reads.append(uids)
+                probe = 'cmdline-read'; raw = (root / 'cmdline').read_bytes()
+                probe = 'cmdline-empty'; require(bool(raw), 'transaction inputs unavailable')
+                probe = 'cmdline-shape'
+                require(len(raw) <= 1024 * 1024 and raw.endswith(b'\0'), 'transaction inputs malformed')
+                probe = 'cmdline-decode'
                 return uids, [x.decode('utf-8', 'strict') for x in raw[:-1].split(b'\0')]
             phase = 'inputs-before'
             uids, argv = inputs(); digest = hashlib.sha256()
-            phase = 'executable-read'
+            phase = 'executable-read'; probe = 'exe-read'
             remaining = info.st_size
             while remaining:
                 block = os.read(fd, min(1024 * 1024, remaining))
-                require(block, 'transaction executable shortened')
-                remaining -= len(block); digest.update(block)
-            require(not os.read(fd, 1), 'transaction executable grew')
-            phase = 'inputs-after'
-            second_inputs = inputs()
-            phase = 'identity-after'
-            after = process_identity(pid); last = os.fstat(fd)
-            phase = 'snapshot-consistency'
-            require(same_process(before, after) and before['ppid'] == after['ppid'] and
-                    before['exe'] == after['exe'] and before['uid'] == uids[0] and second_inputs == (uids, argv) and
-                    (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
-                    (last.st_dev, last.st_ino, last.st_size, last.st_mtime_ns, last.st_ctime_ns), 'transaction observation changed')
+                probe = 'exe-size'; require(block, 'transaction executable shortened')
+                remaining -= len(block); digest.update(block); probe = 'exe-read'
+            probe = 'exe-size'; require(not os.read(fd, 1), 'transaction executable grew')
+            phase = 'inputs-after'; second_inputs = inputs()
+            phase = 'identity-after'; probe = 'final-identity-read'
+            after = process_identity(pid)
+            if after is not None: identities.append(after)
+            probe = 'final-live-state'
+            if after is None:
+                try: root.lstat()
+                except FileNotFoundError:
+                    probe = 'final-directory-absent'
+            require(after is not None and after['state'] != 'Z', 'final candidate unavailable')
+            last = os.fstat(fd); phase = 'snapshot-consistency'
+            probe = 'consistency-birth'; require((before['pid'],before['startTime']) == (after['pid'],after['startTime']), 'candidate birth changed')
+            probe = 'consistency-uid'; require(before['uid'] == after['uid'] == uids[0], 'candidate UID changed')
+            probe = 'consistency-image'; require((before['exeDev'],before['exeInode'],before['exe']) == (after['exeDev'],after['exeInode'],after['exe']), 'candidate image changed')
+            probe = 'consistency-topology'; require(before['ppid'] == after['ppid'], 'candidate parent changed')
+            probe = 'consistency-namespace'; require(before['namespaces'] == after['namespaces'] and before['cgroup'] == after['cgroup'], 'candidate namespace changed')
+            probe = 'consistency-argv'; require(second_inputs == (uids,argv), 'candidate inputs changed')
+            probe = 'consistency-identity'; require(same_process(before, after), 'complete identity required')
+            probe = 'consistency-file'
+            require((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) ==
+                    (last.st_dev, last.st_ino, last.st_size, last.st_mtime_ns, last.st_ctime_ns), 'transaction executable changed')
             return {'identity': before, 'uids': uids, 'argv': argv,
                     'executable': {'dev': info.st_dev, 'inode': info.st_ino, 'sha256': digest.hexdigest()}}
         finally:
             os.close(fd)
     except (OSError, ValueError, StopIteration, KeyError, IndexError) as error:
-        raise TransactionIdentityError(phase, error) from None
+        raise TransactionIdentityError(phase, error, probe, identities, uid_reads) from None
 
 
 def terminal_identity(old):
@@ -522,6 +557,12 @@ def terminal_identity(old):
     require(observed[0] == observed[1], 'terminal observation changed')
     return {'pid': old['pid'], 'startTime': old['startTime'], 'state': observed[0][0],
             'scope': 'sampled-terminal-not-execution-identity'}
+
+
+def unverified_terminal_identity(inventory):
+    """Sample terminal birth only. Does NOT establish executable/UID or signal authority."""
+    proof = terminal_identity(inventory)
+    return {**proof, 'scope': 'sampled-terminal-unverified-execution'}
 
 
 def service_properties(ops):

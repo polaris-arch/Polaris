@@ -1648,6 +1648,7 @@ class CarrierRun:
             self.api_endpoint = None
             self.result.pop('apiEndpoint', None)
             self._readiness_fence = None
+            self._ready_status_context = None
             self._connect_started = time.monotonic()
             self.result['connectObservation'] = {'phases': []}
         record = {'phase': phase, 'elapsedMs': max(0, int((time.monotonic() - self._connect_started) * 1000))}
@@ -1656,20 +1657,21 @@ class CarrierRun:
         self.result['connectObservation']['phase'] = phase
         self.result['connectObservation']['phases'].append(record)
 
-    def readiness_observation_fence(self, session):
+    def readiness_observation_fence(self, session, owner=None):
         gui_require(type(session) is str and bool(session) and self.driver.session == session,
                     'status-readiness-session-changed')
         current = observe_app_executable(self.app)
         gui_require((current.st_dev,current.st_ino)==(self.app['exeDev'],self.app['exeInode']),
                     'status-readiness-app-changed')
-        fence = getattr(self, '_readiness_fence', None)
+        fence = owner.get('fence') if owner is not None else getattr(self, '_readiness_fence', None)
         if fence is None:
             with self.supervisor.lock:
                 drivers=[dict(value) for pid,value in self.supervisor.owned.items()
                          if self.supervisor.roles.get(pid)=='driver']
             gui_require(bool(drivers),'status-readiness-driver-unknown')
             fence={'session':session,'drivers':drivers}
-            self._readiness_fence=fence
+            if owner is None: self._readiness_fence=fence
+            else: owner['fence']=fence
         gui_require(fence['session']==session,'status-readiness-session-changed')
         for expected in fence['drivers']:
             actual=process_identity(expected['pid'])
@@ -1691,45 +1693,118 @@ class CarrierRun:
         if deadline is not None:
             gui_require(time.monotonic()<deadline,'observation-timeout')
 
-    def connect_status(self):
-        # Only this existing readiness poll accepts the explicit producer's
-        # WouldBlock classification. Never replay Connect, fixture writes, or
-        # transport/unknown failures. The caller owns the original deadline.
-        self.readiness_budget()
-        session=getattr(getattr(self,'driver',None),'session',None)
-        try:
-            status = self.status()
-        except NativeRejected as error:
-            if error.diagnostic not in STATUS_BUSY_DIAGNOSTICS:
-                raise
-            self.readiness_budget()
-            self.readiness_observation_fence(session)
-            self.readiness_budget()
-            observation=self.result['connectObservation']
-            transient=observation.setdefault('savedStateObservation',{'state':'waiting','busyCount':0,
-                'firstDiagnostic':error.diagnostic,'lastDiagnostic':error.diagnostic})
-            transient['busyCount']+=1
-            transient['lastDiagnostic']=error.diagnostic
-            transient['state']='waiting'
-            return {}  # no invented running/starting/owned-stop values
-        self.readiness_budget()
-        if getattr(self,'_readiness_fence',None) is not None:
-            self.readiness_observation_fence(session)
-            self.result['connectObservation']['savedStateObservation']['state']='observed'
-        self.readiness_budget()
-        self.result['connectObservation']['lastStatus'] = safe_connect_status(status)
-        return status
+    def new_status_observation(self, context, deadline):
+        # These are existing observation loops, not general status/IPC retry.
+        gui_require(context in ('off','pick','activation','auto','ready-binding'), 'status-observation-context-invalid')
+        gui_require(type(deadline) in (int,float) and time.monotonic()<deadline<float('inf'),
+                    'observation-timeout')
+        record={'context':context,'state':'waiting','samples':0}
+        rows=self.result.setdefault('statusWaitObservations',[])
+        if len(rows)<64: rows.append(record)
+        else: self.result['statusWaitObservationsTruncated']=True
+        return {'deadline':deadline,'record':record,'session':getattr(self.driver,'session',None),
+                'fence':None,'busySeen':False}
 
-    def observed_api_endpoint(self):
+    def status_observation_sample(self, context, read=None):
+        def budget():
+            deadline=context['deadline']
+            if deadline is not None:
+                gui_require(time.monotonic()<deadline,'observation-timeout')
+        record=context['record']
+        try:
+            budget()
+            record['samples']=record.get('samples',0)+1
+            try:
+                status=self.status() if read is None else read()
+            except NativeRejected as error:
+                if error.diagnostic not in STATUS_BUSY_DIAGNOSTICS: raise
+                budget()
+                self.readiness_observation_fence(context['session'],context)
+                budget()
+                transient=record.setdefault('savedStateObservation',{'state':'waiting','busyCount':0,
+                    'firstDiagnostic':error.diagnostic,'lastDiagnostic':error.diagnostic})
+                transient['busyCount']+=1
+                transient.update(lastDiagnostic=error.diagnostic,state='waiting')
+                context['busySeen']=True
+                record['state']='waiting'
+                return None  # no invented running/starting/owned-stop values
+            budget()
+            if context['busySeen']:
+                self.readiness_observation_fence(context['session'],context)
+                record['savedStateObservation']['state']='observed'
+            budget()
+            if read is None: record['lastStatus']=safe_connect_status(status)
+            record['state']='waiting' if status is None else 'observed'
+            return status
+        except Exception:
+            record['state']='failed'
+            raise
+
+    def wait_status_proof(self, observation, read):
+        # Only explicit, read-only stage proofs use this entry. A busy failure
+        # discards the entire partial capture; never wrap a click/commit/register.
+        try:
+            value=wait_for(lambda:self.status_observation_sample(observation,read),
+                           lambda value:value is not None,
+                           timeout=observation['deadline']-time.monotonic())
+            gui_require(time.monotonic()<observation['deadline'],'observation-timeout')
+            return value
+        except Exception:
+            observation['record']['state']='failed'
+            raise
+
+    def wait_status_observation(self, context, condition, deadline, phase=None):
+        observation=self.new_status_observation(context,deadline)
+        def read():
+            status=self.status_observation_sample(observation)
+            if status is not None and phase is not None: self.gui_phase(phase,status)
+            return status
+        try:
+            result=wait_for(read,lambda value:value is not None and condition(value),
+                            timeout=deadline-time.monotonic())
+            gui_require(time.monotonic()<deadline,'observation-timeout')
+            observation['record']['state']='complete'
+            return result
+        except Exception:
+            observation['record']['state']='failed'
+            raise
+
+    def connect_status(self):
+        context=getattr(self,'_ready_status_context',None)
+        if context is None:
+            context={'record':self.result['connectObservation'],'session':getattr(getattr(self,'driver',None),'session',None),
+                     'fence':None,'busySeen':False}
+            self._ready_status_context=context
+        context['deadline']=getattr(self,'_readiness_deadline',None)
+        status=self.status_observation_sample(context)
+        return {} if status is None else status
+
+    def observed_api_endpoint(self, expected_status=None):
         # Parse exactly the stable bytes captured privately, never a subsequent
         # unbound read. Status and the parsed graph are bracketed by captures.
         proof, graph = stable_runtime_capture(self.runtime_path, self.home, self.core,
             self.workspace / 'private-runtime-originals', include_content=True)
         status = self.status()
+        if expected_status is not None:
+            gui_require(type(status.get('mainGeneration')) is int and
+                        status['mainGeneration']==expected_status.get('mainGeneration') and
+                        status.get('pid')==expected_status.get('pid'), 'status-binding-generation-changed')
         after = self.runtime_identity()
         require(proof['sha256'] == after['sha256'] and proof['pid'] == after['pid']
                 and proof['startTime'] == after['startTime'], 'API runtime changed during binding')
         return bind_api_endpoint(graph, status, self.secret, self.core), proof, graph
+
+    def ready_capabilities(self, expected):
+        def current():
+            value=self.status()
+            gui_require(type(value.get('mainGeneration')) is int and
+                        value['mainGeneration']==expected.get('mainGeneration') and
+                        value.get('pid')==expected.get('pid') and value.get('running') is True and
+                        not value.get('starting'),'status-binding-generation-changed')
+        current()
+        value=self.rpc('capabilities')
+        current()
+        return value
 
     def revalidate_api_endpoint(self):
         require(self.api_endpoint is not None, 'API endpoint not bound')
@@ -1748,7 +1823,9 @@ class CarrierRun:
     def observe_ready_core(self, timeout=75, register=True):
         # Observe the original ready core; never click or replay a start here.
         self.connect_phase('status-ready')
+        deadline=time.monotonic()+timeout
         status = self.wait_ready_status(timeout)
+        binding_wait=self.new_status_observation('ready-binding',deadline)
         self.connect_phase('core-birth', status)
         require(status.get('startedViaHelper') is not True, 'privileged helper prohibited')
         core = self.supervisor.executable(self.payload / self.members['core']['path'])
@@ -1767,11 +1844,11 @@ class CarrierRun:
         self.runtime_path = regular(path, self.home)
         require(self.runtime_path.name == 'singbox-runtime.json', 'unexpected runtime config source')
         self.connect_phase('runtime-api')
-        endpoint, runtime, content = self.observed_api_endpoint()
+        endpoint, runtime, content = self.wait_status_proof(binding_wait,lambda:self.observed_api_endpoint(expected_status=status))
         require(all(item.get('type') != 'tun' for item in content.get('inbounds', [])), 'TUN not permitted')
         self.api_endpoint = endpoint
         self.connect_phase('owned-api-probe')
-        self.rpc('capabilities')  # Existing frozen probe verifies the core's LISTEN inode.
+        self.wait_status_proof(binding_wait,lambda:self.ready_capabilities(status))  # Read-only owned LISTEN proof.
         self.connect_phase('cronet-map')
         maps = (Path('/proc') / str(core['pid']) / 'maps').read_text()
         expected = self.payload / self.members['cronet']['path']
@@ -1795,7 +1872,8 @@ class CarrierRun:
         before = self.core
         require(self.status().get('running'), 'disconnect requires running core')
         self.driver.click('#connect-btn')
-        wait_for(lambda: self.gui_read('disconnect-status', self.status), lambda s: s.get('running') is False and not s.get('starting'), timeout=45)
+        self.wait_status_observation('off', lambda s:s.get('running') is False and not s.get('starting'),
+                                     time.monotonic()+45, phase='disconnect-status')
         wait_for(lambda: process_identity(before['pid']),
                  lambda p: not same_process(p, before) or p['state'] == 'Z', timeout=15)
 
@@ -1866,8 +1944,16 @@ class CarrierRun:
         observed = wait_for(lambda: self.gui_read('pick-config-readback', self.config), lambda c: c.get('selectedServerId') == 'node-' + label.lower()
                  and not c.get('selectionIntent'), timeout=30)
         self.gui_phase('pick-status-readback', observed)
-        if self.status().get('running'):
-            status = wait_for(lambda: self.gui_read('pick-status-readback', self.status), lambda s: s.get('actualServerId') == 'node-' + label.lower(), timeout=45)
+        status_deadline=time.monotonic()+45
+        status_context=self.new_status_observation('pick',status_deadline)
+        baseline=self.wait_status_proof(status_context,self.status)
+        gui_require(type(baseline.get('running')) is bool,'status-observation-schema-invalid')
+        if baseline['running']:
+            def selected():
+                value=self.status()
+                self.gui_phase('pick-status-readback',value)
+                return value if value.get('actualServerId') == 'node-' + label.lower() else None
+            status=self.wait_status_proof(status_context,selected)
             self.gui_phase('pick-complete', status)
         else:
             self.gui_phase('pick-complete', observed)
@@ -1948,9 +2034,14 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
             left = deadline-time.monotonic()
             gui_require(left > 0, 'observation-timeout')
             return left
-        disk = saved_read()
-        gui_require(disk['value'] is wanted, 'preference-saved-value-differs')
-        previous = dict(self.core); before_status = self.status()
+        status_wait=self.new_status_observation('activation',deadline)
+        def baseline():
+            disk=saved_read()
+            gui_require(disk['value'] is wanted,'preference-saved-value-differs')
+            previous=dict(self.core);status=self.status()
+            self.same_core(previous,status=status)
+            return disk,previous,status
+        disk,previous,before_status=self.wait_status_proof(status_wait,baseline)
         transition = {'schema':'polaris-activation-observation-v1','context':phase_prefix,
                       'state':'waiting','samples':0,'targetReady':False,'applyVisible':False}
         self.result['activationObservation'] = transition
@@ -1964,8 +2055,8 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
             return control
         def prepared():
             remaining()
-            self.same_core(previous)
             status = self.status()
+            self.same_core(previous, status=status)
             gui_require(status.get('running') is True and status.get('pid') == before_status.get('pid') and
                         status.get('mainGeneration') == before_status.get('mainGeneration'), 'activation-generation-changed')
             gui_require(saved_read() == disk, 'preference-saved-file-changed')
@@ -1987,15 +2078,15 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
             control = observe_control()
             if control['bars']:
                 return None
-            self.same_core(previous)
             current = self.status()
+            self.same_core(previous, status=current)
             gui_require(current.get('running') is True and current.get('pid') == before_status.get('pid') and
                         current.get('mainGeneration') == before_status.get('mainGeneration'), 'activation-generation-changed')
             gui_require(saved_read() == disk, 'preference-saved-file-changed')
             transition['state'] = 'target-already-accepted'
             return control
         try:
-            control = wait_for(prepared, lambda value: value is not None, timeout=remaining())
+            control = self.wait_status_proof(status_wait,prepared)
         except Exception:
             transition['state'] = 'failed'
             raise
@@ -2031,25 +2122,33 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
                 self.gui_phase(phase_prefix+'-restart-ready',status)
             else:
                 gui_require(result.get('ok') is True, 'preference-hot-rejected')
-                self.same_core(previous)
+                self.wait_status_proof(status_wait,lambda:(self.same_core(previous),True)[1])
                 self.connect_phase('apply-ready')
                 self.observe_ready_core(timeout=remaining(),register=False)
-                self.same_core(previous)
+                self.wait_status_proof(status_wait,lambda:(self.same_core(previous),True)[1])
                 transaction=result.get('transactionId')
                 gui_require(type(transaction) is str and bool(transaction),'preference-hot-transaction-missing')
-                lookup=self.native_status(transaction)
-                gui_require(type(lookup.get('lookupState')) is int and lookup['lookupState']==1 and type(lookup.get('operation')) is dict, 'preference-hot-lookup-unconfirmed')
-                operation=lookup['operation']
-                gui_require(operation.get('durable') is True and operation.get('persistenceMode')=='exact_configuration_file'
-                            and operation.get('active')==self.rpc('capabilities')['active'], 'preference-hot-durability-unconfirmed')
-                proof['hotReceipt']={'transactionId':transaction,'durable':True,
-                    'persistenceMode':'exact_configuration_file','active':operation['active']}
+                def accepted_hot():
+                    self.same_core(previous)
+                    lookup=self.native_status(transaction)
+                    gui_require(type(lookup.get('lookupState')) is int and lookup['lookupState']==1 and type(lookup.get('operation')) is dict, 'preference-hot-lookup-unconfirmed')
+                    operation=lookup['operation']
+                    gui_require(operation.get('durable') is True and operation.get('persistenceMode')=='exact_configuration_file'
+                                and operation.get('active')==self.rpc('capabilities')['active'], 'preference-hot-durability-unconfirmed')
+                    return {'transactionId':transaction,'durable':True,
+                            'persistenceMode':'exact_configuration_file','active':operation['active']}
+                proof['hotReceipt']=self.wait_status_proof(status_wait,accepted_hot)
         else:
             gui_require(control['bars']==0, 'preference-pending-without-apply')
-            self.same_core(previous)
-        gui_require(saved_read()==disk, 'preference-saved-file-changed')
+            self.wait_status_proof(status_wait,lambda:(self.same_core(previous),True)[1])
         self.gui_phase(phase_prefix+'-runtime-proof')
-        proof['acceptedRuntime']=runtime_read(wanted)
+        runtime_deadline=min(deadline,time.monotonic()+35) if phase_prefix=='auto' else deadline
+        def accepted_runtime():
+            gui_require(saved_read()==disk,'preference-saved-file-changed')
+            value=runtime_read(wanted,deadline=runtime_deadline) if phase_prefix=='auto' else runtime_read(wanted)
+            gui_require(saved_read()==disk,'preference-saved-file-changed')
+            return value
+        proof['acceptedRuntime']=self.wait_status_proof(status_wait,accepted_runtime)
         wait_for(self.pending_apply_control, lambda value: value=={'bars':0,'buttons':0,'disabled':False}, timeout=remaining())
         remaining()
         transition['state'] = 'accepted-runtime'
@@ -2222,9 +2321,9 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
         return self.rpc('status', {'transactionId': transaction,
                                   'runtimeIncarnation': capability['active']['incarnation']})
 
-    def same_core(self, baseline):
+    def same_core(self, baseline, status=None):
         require(same_process(self.core, process_identity(self.core['pid']))
-                and self.status().get('pid') == baseline['pid']
+                and (self.status() if status is None else status).get('pid') == baseline['pid']
                 and self.core['startTime'] == baseline['startTime'], 'HOT unexpectedly replaced core')
 
     def selection_cases(self):
@@ -2293,16 +2392,16 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
         return {'value':True,'intent':'global','membersSha256':hashlib.sha256(
             json.dumps(servers,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
 
-    def auto_runtime(self, wanted):
+    def auto_runtime(self, wanted, deadline=None):
         observation={'schema':'polaris-auto-runtime-observation-v1','phase':'begin','state':'checking','checks':{}}
         self.result['autoRuntimeObservation']=observation
         try:
-            return self._auto_runtime(wanted,observation)
+            return self._auto_runtime(wanted,observation,deadline=deadline)
         except Exception:
             observation['state']='failed'
             raise
 
-    def _auto_runtime(self, wanted, observation, preparing=False):
+    def _auto_runtime(self, wanted, observation, preparing=False, deadline=None):
         def check(phase, ok, code, facts=None):
             observation.update(phase=phase,state='observed' if ok else 'failed')
             observation['checks'][phase]={'passed':bool(ok),**(facts or {})}
@@ -2384,7 +2483,10 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
                 'generationMatches':type(value.get('generation')) is int and value['generation']==status.get('mainGeneration')}
             return value if confirmed else None
         try:
-            native_status=wait_for(observed,timeout=35)
+            left=35 if deadline is None else deadline-time.monotonic()
+            gui_require(left>0,'observation-timeout')
+            native_status=wait_for(observed,timeout=left)
+            if deadline is not None: gui_require(time.monotonic()<deadline,'observation-timeout')
         except Exception:
             observation['state']='failed'
             raise
@@ -2483,11 +2585,16 @@ return {count:1,checked:e.getAttribute('aria-checked'),disabled:!!e.disabled||e.
         self.network.a.set_admission(False)
         deadline = time.monotonic() + 370
         proofs = []
+        status_wait=self.new_status_observation('auto',deadline)
         switched = False
         while time.monotonic() < deadline:
             proofs.append(self.exchange(old, 'A'))
-            self.same_core(initial)
-            if self.status().get('actualServerId') == 'node-b':
+            require(same_process(self.core,process_identity(self.core['pid'])) and
+                    self.core['startTime']==initial['startTime'], 'HOT unexpectedly replaced core')
+            status=self.status_observation_sample(status_wait)
+            if status is not None: self.same_core(initial,status=status)
+            if status is not None and status.get('actualServerId') == 'node-b':
+                gui_require(time.monotonic()<deadline,'observation-timeout')
                 switched = True
                 break
             time.sleep(3)

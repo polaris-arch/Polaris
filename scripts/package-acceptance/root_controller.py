@@ -498,9 +498,24 @@ CANDIDATE_PHASES = ('identity-before', 'executable-open', 'executable-initial', 
     'gui-parent', 'owned-parent', 'parent-transition')
 
 
+CANDIDATE_PROBES = ('unknown', 'initial-identity-read', 'initial-live-state', 'initial-directory-absent', 'exe-open',
+    'exe-shape', 'exe-match', 'status-read', 'uid-field', 'cmdline-read', 'cmdline-empty',
+    'cmdline-shape', 'cmdline-decode', 'exe-read', 'exe-size', 'final-identity-read',
+    'final-live-state', 'final-directory-absent', 'consistency-birth', 'consistency-uid', 'consistency-image',
+    'consistency-topology', 'consistency-namespace', 'consistency-argv', 'consistency-file',
+    'inventory-topology', 'parent-identity', 'consistency-identity', 'prior-identity-conflict', 'terminal-state')
+
+def exit_capture_error(error):
+    return ((getattr(error,'error',None) == 'contract' and getattr(error,'probe',None) in
+             ('initial-live-state','initial-directory-absent','final-live-state','final-directory-absent','cmdline-empty')) or
+            (getattr(error,'error',None) == 'enoent' and getattr(error,'probe',None) in
+             ('initial-identity-read','exe-open','status-read','cmdline-read','final-identity-read')))
+
+
 def validate_candidate_failure(value):
-    exact(value, ('schema', 'phase', 'inventory', 'relation', 'parent', 'outcome', 'error'))
-    require(value['schema'] == 'polaris-transaction-candidate-failure-v1' and
+    exact(value, ('schema', 'phase', 'inventory', 'relation', 'parent', 'outcome', 'error', 'probe', 'priorOwned'))
+    require(value['schema'] == 'polaris-transaction-candidate-failure-v2' and
+            value['probe'] in CANDIDATE_PROBES and type(value['priorOwned']) is bool and
             value['phase'] in CANDIDATE_PHASES and value['relation'] in ('gui-direct', 'owned-child') and
             value['outcome'] in ('unconfirmed', 'different-birth', 'different-parent', 'identity-mismatch') and
             value['error'] in ('enoent', 'eacces', 'eperm', 'esrch', 'other-os', 'decode', 'contract'),
@@ -513,6 +528,90 @@ def validate_candidate_failure(value):
     identity(value['inventory'])
     if value['parent'] is not None: identity(value['parent'], True)
     return value
+
+
+def validate_transaction_binding(value, *, launch=None, subject=None, kind=None):
+    exact(value, ('schema','runToken','sourceSha','githubRunId','attempt','kind','subject','windowNonce'))
+    require(value['schema'] == 'polaris-transaction-binding-v1' and
+            type(value['runToken']) is str and re.fullmatch(r'[0-9a-f]{12}',value['runToken']) and
+            type(value['sourceSha']) is str and re.fullmatch(r'[0-9a-f]{40}',value['sourceSha']) and
+            all(type(value[k]) is str and re.fullmatch(r'[1-9][0-9]*',value[k]) for k in ('githubRunId','attempt')) and
+            value['kind'] in ('install','uninstall') and type(value['windowNonce']) is str and
+            re.fullmatch(r'[0-9a-f]{32}',value['windowNonce']), 'fixed transaction binding required')
+    exact(value['subject'], ('pid','startTime','uid'))
+    v=value['subject']
+    require(type(v['pid']) is int and v['pid'] > 1 and type(v['startTime']) is str and
+            re.fullmatch(r'[1-9][0-9]{0,19}',v['startTime']) and type(v['uid']) is int and v['uid'] > 0,
+            'transaction GUI subject required')
+    if launch is not None:
+        require((value['runToken'],value['sourceSha'],value['githubRunId'],value['attempt']) ==
+                (launch['runId'],launch['execution']['sourceSha'],launch['execution']['githubRunId'],
+                 launch['execution']['githubRunAttempt']), 'transaction execution binding differs')
+    if subject is not None: require(v == {k:subject[k] for k in ('pid','startTime','uid')}, 'transaction GUI differs')
+    if kind is not None: require(value['kind'] == kind, 'transaction kind differs')
+    return value
+
+
+def validate_strong_transaction_identity(row):
+    require(type(row) is dict and all(k in row for k in
+        ('pid','startTime','state','ppid','uid','exeDev','exeInode','exe','namespaces','cgroup','capEff','capAmb')),
+        'complete strong process identity required')
+    require(type(row['pid']) is int and row['pid']>1 and type(row['startTime']) is str and
+        re.fullmatch(r'[1-9][0-9]{0,19}',row['startTime']) and type(row['ppid']) is int and row['ppid']>0 and
+        all(type(row[k]) is int and row[k]>=0 for k in ('uid','exeDev','exeInode','capEff','capAmb')) and
+        row['state'] in ('R','S','D','Z','T','t','X','x','K','W','P','I') and
+        type(row['exe']) is str and row['exe'].startswith('/') and 0<len(row['exe'])<=4096 and
+        type(row['cgroup']) is str and 0<len(row['cgroup'])<=65536 and
+        type(row['namespaces']) is dict and set(row['namespaces'])=={'net','mnt','pid','cgroup'} and
+        all(type(v) is int and v>0 for v in row['namespaces'].values()), 'strong process fields required')
+    return row
+
+
+def validate_auxiliary_terminals(rows, binding, owned, pkexec, shells):
+    validate_transaction_binding(binding)
+    require(type(rows) is list and len(rows) <= 256 and type(owned) is list, 'bounded auxiliary observations required')
+    strong={birth(p):p for p in owned}
+    require(len(strong) == len(owned), 'duplicate strong births')
+    keys=set(); mandatory={tuple(k) for k in pkexec+shells}
+    shell_keys={tuple(k) for k in shells}
+    require(mandatory <= set(strong), 'mandatory births missing from strong identities')
+    for row in rows:
+        exact(row, ('schema','binding','inventory','parent','anchor','capture','terminal',
+                    'priorStrongOwned','identityVerified','signalAuthority'))
+        require(row['schema'] == 'polaris-unverified-auxiliary-terminal-v1' and row['binding'] == binding and
+                row['priorStrongOwned'] is False and row['identityVerified'] is False and
+                row['signalAuthority'] is False, 'auxiliary observation cannot confer authority')
+        for field in ('inventory','parent','anchor'):
+            v=row[field];exact(v,('pid','startTime','ppid') if field=='inventory' else ('pid','startTime'))
+            require(type(v['pid']) is int and v['pid'] > 1 and type(v['startTime']) is str and
+                    re.fullmatch(r'[1-9][0-9]{0,19}',v['startTime']), 'fixed auxiliary birth required')
+        inv=row['inventory'];key=birth(inv);parent=birth(row['parent']);anchor=birth(row['anchor'])
+        require(type(inv['ppid']) is int and inv['ppid'] == row['parent']['pid'] and
+                key not in keys and key not in strong and key not in mandatory and
+                inv['ppid'] != binding['subject']['pid'] and key != birth(binding['subject']) and
+                parent in strong and anchor in shell_keys, 'auxiliary relation differs')
+        validate_strong_transaction_identity(strong[anchor])
+        chain=parent;seen=set()
+        while chain != anchor:
+            require(chain not in seen and len(seen) < 32 and chain in strong and strong[chain]['uid'] == 0,
+                    'strong auxiliary ancestry required')
+            validate_strong_transaction_identity(strong[chain])
+            require(strong[chain]['namespaces']==strong[anchor]['namespaces'] and
+                    strong[chain]['cgroup']==strong[anchor]['cgroup'], 'auxiliary strong namespace chain differs')
+            seen.add(chain); matches=[k for k,p in strong.items() if p['pid'] == strong[chain]['ppid']]
+            require(len(matches) == 1, 'ambiguous auxiliary ancestor');chain=matches[0]
+        require(strong[anchor]['uid'] == 0, 'strong root shell anchor required')
+        exact(row['capture'],('phase','probe','error'))
+        require(row['capture']['phase'] in CANDIDATE_PHASES and
+                row['capture']['probe'] in ('cmdline-empty','initial-directory-absent','final-directory-absent') and
+                row['capture']['phase'] in {'cmdline-empty':('inputs-before','inputs-after'),
+                    'initial-directory-absent':('identity-before',),'final-directory-absent':('identity-after',)}[row['capture']['probe']] and
+                row['capture']['error'] == 'contract', 'exit-only auxiliary capture required')
+        terminal=row['terminal'];exact(terminal,('pid','startTime','state','scope'))
+        require(birth(terminal) == key and terminal['state'] in ('absent','zombie') and
+                terminal['scope'] == 'sampled-terminal-unverified-execution', 'sampled auxiliary terminal required')
+        keys.add(key)
+    return rows
 
 
 def auth_runtime_observation(mode):
@@ -1581,10 +1680,19 @@ class TransactionObserver:
         self.c = controller; self.kind = kind; self.rows = {}; self.pkexec = {}; self.shells = {}
         self.error = None; self.stop = threading.Event(); self.lock = threading.Lock()
         self.error_lock = threading.Lock()
-        self.terminals = {}
+        self.terminals = {}; self.uid_rows = {}; self.auxiliary = {}
+        launch=controller.launch
+        self.binding={'schema':'polaris-transaction-binding-v1','runToken':launch['runId'],
+            'sourceSha':launch['execution']['sourceSha'],'githubRunId':launch['execution']['githubRunId'],
+            'attempt':launch['execution']['githubRunAttempt'],'kind':kind,
+            'subject':{k:controller.gui[k] for k in ('pid','startTime','uid')},'windowNonce':os.urandom(16).hex()}
+        validate_transaction_binding(self.binding,launch=launch,subject=controller.gui,kind=kind)
+        self.binding_recorded = False
         self.thread = threading.Thread(target=self.loop, name='owned-pkexec-observer', daemon=True)
 
     def start(self):
+        self.c.ledger.mutate(lambda v:v.setdefault('transactionBindings',[]).append(self.binding))
+        self.binding_recorded=True
         self.thread.start()
 
     def fail_boundary(self, boundary):
@@ -1601,6 +1709,7 @@ class TransactionObserver:
 
     def candidate(self, pid, light, budget=None, diagnose=False):
         budget = [3] if budget is None else budget
+        failures = []
         for attempt in range(3):
             try:
                 require(budget[0] > 0, 'candidate read budget exhausted')
@@ -1608,15 +1717,25 @@ class TransactionObserver:
                 value = self.c.tun.transaction_identity(pid)
                 p = value['identity']
                 if diagnose:
-                    self.candidate_phase = 'topology'
+                    self.candidate_phase = 'topology'; self.candidate_probe = 'inventory-topology'
                     self.candidate_outcome = ('different-birth' if birth(p) != birth(light) else
                                               'different-parent' if p['ppid'] != light['ppid'] else 'unconfirmed')
                 require(birth(p) == birth(light) and p['ppid'] == light['ppid'], 'candidate topology changed')
+                for previous in failures:
+                    for observed in getattr(previous,'identities',()):
+                        require(self.c.tun.same_process(observed,p) and observed['ppid']==p['ppid'] and
+                                observed['exe']==p['exe'],'earlier capture identity conflict')
+                    require(all(tuple(u)==tuple(value['uids']) for u in getattr(previous,'uids',())),
+                            'earlier capture UID conflict')
                 return value
             except (OSError, ValueError) as error:
+                failures.append(error)
                 if diagnose and getattr(error, 'phase', None) in CANDIDATE_PHASES:
                     self.candidate_phase = error.phase
-                if attempt == 2 or budget[0] <= 0: raise
+                    self.candidate_probe = getattr(error, 'probe', 'unknown')
+                if attempt == 2 or budget[0] <= 0 or not exit_capture_error(error):
+                    error.capture_attempts = tuple(failures)
+                    raise
                 time.sleep(0.001)
 
     def scan(self):
@@ -1638,6 +1757,9 @@ class TransactionObserver:
                 # Parent exec-state updates precede child ownership checks even
                 # when procfs enumeration happens to return children first.
                 for light in sorted(values.values(), key=depth):
+                    require(light['ppid'] not in {p['inventory']['pid'] for p in self.auxiliary.values()},
+                            'unverified auxiliary cannot own a surviving descendant')
+                    require(birth(light) not in self.auxiliary,'terminal auxiliary became live')
                     parent = values.get(light['ppid'])
                     direct = parent and birth(parent) == birth(c.gui)
                     child = parent and birth(parent) in self.rows
@@ -1646,7 +1768,7 @@ class TransactionObserver:
         except Exception as error:
             if self.boundary == 'candidate' and self.failure_context is not None:
                 value = dict(self.failure_context)
-                value.update(phase=self.candidate_phase, outcome=self.candidate_outcome,
+                value.update(phase=self.candidate_phase, probe=self.candidate_probe, outcome=self.candidate_outcome,
                              error=self.candidate_error(error))
                 c.auth_note('auth_candidate_failure', value)
             self.fail_boundary(self.boundary)
@@ -1662,41 +1784,120 @@ class TransactionObserver:
                 getattr(error, 'error', 'contract') if getattr(error, 'error', 'contract') in
                 ('enoent', 'eacces', 'eperm', 'esrch', 'other-os', 'decode', 'contract') else 'contract')
 
+    def observe_auxiliary_terminal(self, light, parent, attempts):
+        c=self.c; tun=c.tun; key=birth(light)
+        require(self.binding_recorded and parent is not None and light['ppid'] != c.gui['pid'] and
+                key not in self.rows and key not in self.pkexec and key not in self.shells,
+                'auxiliary cannot replace mandatory subject')
+        require(all(getattr(e,'error',None) == 'contract' and getattr(e,'probe',None) in
+                    ('cmdline-empty','initial-directory-absent','final-directory-absent') for e in attempts),
+                'auxiliary requires explicit exit-compatible capture')
+        parent_key=birth(parent);require(parent_key in self.rows,'strong parent required')
+        chain=parent_key;seen=set()
+        while chain not in self.shells:
+            require(chain in self.rows and chain not in seen and len(seen)<32 and self.rows[chain]['uid']==0,
+                    'strong root-shell ancestry required')
+            seen.add(chain)
+            matches=[k for k,p in self.rows.items() if p['pid']==self.rows[chain]['ppid']]
+            require(len(matches)==1,'strong parent chain ambiguous');chain=matches[0]
+        anchor=chain
+        def parent_fence():
+            self.candidate_phase='owned-parent';self.candidate_probe='parent-identity';self.candidate_outcome='identity-mismatch'
+            for k in seen|{parent_key,anchor}:
+                held=self.rows[k];current=c.ops.proc(held['pid'])
+                require(current and current['state']!='Z' and tun.same_process(held,current) and
+                        held['ppid']==current['ppid'] and held['exe']==current['exe'],
+                        'strong auxiliary parent changed')
+        parent_fence()
+        observations=[v for e in attempts for v in getattr(e,'identities',())]
+        uids=[v for e in attempts for v in getattr(e,'uids',())]
+        for e in attempts:
+            if e.probe=='cmdline-empty':
+                require(getattr(e,'identities',()) and getattr(e,'uids',()),'empty input lacks prior identity')
+        first=observations[0] if observations else None
+        self.candidate_probe='prior-identity-conflict'
+        for v in observations:
+            require(birth(v)==key and v['ppid']==light['ppid'] and v['uid']==0 and
+                    v['namespaces']==c.gui['namespaces'] and v['cgroup']==c.gui['cgroup'] and
+                    tun.same_process(first,v) and first['exe']==v['exe'], 'auxiliary capture contradicted')
+        require(all(tuple(v)==(0,0,0,0) for v in uids),'auxiliary UID conflict')
+        # Roles already recorded outside this observer can never be downgraded.
+        ledger=c.ledger.load()
+        require(ledger.get('transactionBindings',[]).count(self.binding)==1,'durable transaction binding missing')
+        for field in ('helper','core'):
+            role=ledger.get(field)
+            if isinstance(role,dict) and isinstance(role.get('identity'),dict):
+                require(birth(role['identity'])!=key,'mandatory product birth cannot be auxiliary')
+        self.candidate_probe='terminal-state';self.candidate_outcome='unconfirmed'
+        proof=tun.unverified_terminal_identity(light)
+        parent_fence()
+        row={'schema':'polaris-unverified-auxiliary-terminal-v1','binding':dict(self.binding),
+            'inventory':{k:light[k] for k in ('pid','startTime','ppid')},
+            'parent':{'pid':parent_key[0],'startTime':parent_key[1]},
+            'anchor':{'pid':anchor[0],'startTime':anchor[1]},
+            'capture':{'phase':attempts[-1].phase,'probe':attempts[-1].probe,'error':attempts[-1].error},
+            'terminal':proof,'priorStrongOwned':False,'identityVerified':False,'signalAuthority':False}
+        validate_auxiliary_terminals([row],self.binding,list(self.rows.values()),list(self.pkexec),list(self.shells))
+        self.boundary='ledger'
+        c.ledger.mutate(lambda v:v.setdefault('unverifiedAuxiliaryTerminals',[]).append(row))
+        self.auxiliary[key]=row
+
     def observe_candidate(self, light, values, retries=0, budget=None):
         budget = [3] if budget is None else budget
         c = self.c; tun = c.tun; parent = values.get(light['ppid'])
         direct = parent and birth(parent) == birth(c.gui)
-        self.failure_context = {'schema': 'polaris-transaction-candidate-failure-v1',
+        self.failure_context = {'schema': 'polaris-transaction-candidate-failure-v2',
+            'priorOwned': birth(light) in self.rows,
             'inventory': {k: light[k] for k in ('pid', 'startTime', 'ppid')},
             'relation': 'gui-direct' if direct else 'owned-child',
             'parent': {k: parent[k] for k in ('pid', 'startTime')} if parent else None}
-        self.candidate_phase = 'identity-before'; self.candidate_outcome = 'unconfirmed'
+        self.candidate_phase = 'identity-before'; self.candidate_probe = 'unknown'; self.candidate_outcome = 'unconfirmed'
         self.boundary = 'candidate'
         try:
             observation = self.candidate(light['pid'], light, budget, diagnose=True)
         except (OSError, ValueError) as error:
-            if not (getattr(error, 'phase', None) == 'identity-before' and
-                    getattr(error, 'error', None) in ('contract', 'enoent')):
-                raise
-            # Rows enter this map only after full strong validation AND durable
-            # ledger mutation. Never reconcile an unobserved child disappearance.
+            # Exit-only observations may close an ALREADY durable strong birth.
+            # No earlier contradictory capture attempt can be erased by a later exit.
             held = self.rows.get(birth(light))
-            if held is None: raise
+            attempts = getattr(error, 'capture_attempts', (error,))
+            exit_contract = ('initial-live-state', 'initial-directory-absent', 'final-live-state', 'final-directory-absent', 'cmdline-empty')
+            exit_missing = ('initial-identity-read', 'exe-open', 'status-read', 'cmdline-read', 'final-identity-read')
+            if held is None:
+                if not all(getattr(e,'error',None)=='contract' and getattr(e,'probe',None) in
+                           ('cmdline-empty','initial-directory-absent','final-directory-absent') for e in attempts):
+                    raise
+                self.observe_auxiliary_terminal(light, parent, attempts)
+                return
+            if not all(
+                    (getattr(e, 'error', None) == 'contract' and getattr(e, 'probe', None) in exit_contract) or
+                    (getattr(e, 'error', None) == 'enoent' and getattr(e, 'probe', None) in exit_missing)
+                    for e in attempts):
+                raise
+            self.candidate_probe = 'prior-identity-conflict'
+            self.candidate_outcome = 'identity-mismatch'
+            for attempt in attempts:
+                for observed in getattr(attempt, 'identities', ()):
+                    require(tun.same_process(held, observed) and held['ppid'] == observed['ppid'] and
+                            held['exe'] == observed['exe'], 'held candidate identity contradicted')
+                for observed_uids in getattr(attempt, 'uids', ()):
+                    require(birth(light) in self.uid_rows and tuple(observed_uids) == self.uid_rows[birth(light)],
+                            'held candidate UID tuple contradicted')
+            self.candidate_probe = 'terminal-state'
             proof = tun.terminal_identity(held)
             c.ledger.mutate(lambda v: v.setdefault('transactionTerminals', []).append(proof))
             self.terminals[birth(light)] = proof
             return
         p = observation['identity']; key = birth(p)
         if direct:
-            self.candidate_phase = 'gui-parent'
+            self.candidate_phase = 'gui-parent'; self.candidate_probe = 'parent-identity'
             self.candidate_outcome = 'identity-mismatch'
             require(tun.same_process(c.gui, c.ops.proc(c.gui['pid'])), 'GUI parent changed')
         else:
-            self.candidate_phase = 'owned-parent'; self.candidate_outcome = 'unconfirmed'
+            self.candidate_phase = 'owned-parent'; self.candidate_probe = 'parent-identity'; self.candidate_outcome = 'unconfirmed'
             current = c.ops.proc(parent['pid'])
             require(current and current['ppid'] == parent['ppid'], 'owned parent topology changed')
             if not tun.same_process(self.rows[birth(parent)], current):
-                self.candidate_phase = 'owned-parent'; self.candidate_outcome = 'identity-mismatch'
+                self.candidate_phase = 'owned-parent'; self.candidate_probe = 'parent-identity'; self.candidate_outcome = 'identity-mismatch'
                 # Only a previously verified direct pkexec birth may take the
                 # existing strict exec-state transition. Re-read the whole child
                 # after durable parent evidence; never infer from a name or UID.
@@ -1749,10 +1950,10 @@ class TransactionObserver:
         def record(v):
             records = v.setdefault('transactionProcesses', [])
             old = next((r for r in records if birth(r['identity']) == key), None)
-            if old: old['identity'] = p
-            else: records.append({'role': 'privilege-transaction', 'identity': p})
+            if old: old.update(identity=p,uids=list(uids))
+            else: records.append({'role': 'privilege-transaction', 'identity': p, 'uids':list(uids)})
         c.ledger.mutate(record)
-        self.rows[key] = p
+        self.rows[key] = p; self.uid_rows[key] = tuple(uids)
         if direct and p['exe'] == str(Path('/usr/bin/pkexec').resolve()): self.pkexec[key] = pending
         elif direct: self.shells[key] = proof
 
@@ -1800,11 +2001,28 @@ class TransactionObserver:
                     'authenticationMode': self.c.launch['authenticationMode'], 'pkexecBirths': [list(k) for k in self.pkexec],
                     'rootShellBirths': [list(k) for k in self.shells],
                     'owned': list(self.rows.values()), 'authorizationObserved': bool(self.shells),
-                    'credentialPromptClaimed': False}
+                    'credentialPromptClaimed': False,
+                    'transactionBinding':json.loads(json.dumps(self.binding)),
+                    'auxiliaryIdentityCoverage':'incomplete' if self.auxiliary else 'complete',
+                    'auxiliaryTerminals':json.loads(json.dumps(list(self.auxiliary.values())))}
 
     def finish(self):
         self.stop.set(); self.thread.join(timeout=3)
         require(not self.thread.is_alive(), 'transaction observer did not stop')
+        if self.auxiliary:
+            durable=self.c.ledger.load()
+            require(durable.get('transactionBindings',[]).count(self.binding)==1,'durable transaction binding missing')
+            for row in self.auxiliary.values():
+                require(durable.get('unverifiedAuxiliaryTerminals',[]).count(row)==1,'durable auxiliary observation missing')
+            self.scan() # Existing strict candidate census; no auxiliary is ever a parent authority.
+            refreshed=[]
+            for row in self.auxiliary.values():
+                proof=self.c.tun.unverified_terminal_identity(row['inventory'])
+                refreshed.append({**row,'terminal':proof})
+            validate_auxiliary_terminals(refreshed,self.binding,list(self.rows.values()),list(self.pkexec),list(self.shells))
+            self.c.ledger.mutate(lambda v:v.setdefault('auxiliaryTerminalClosures',[]).append(
+                {'binding':self.binding,'observations':refreshed}))
+            self.auxiliary={birth(row['inventory']):row for row in refreshed}
         result = self.snapshot()
         require(len(self.pkexec) == len(self.shells) == 1, 'real pkexec authorization unavailable or not fully observed')
         for row in self.rows.values():
@@ -2162,7 +2380,7 @@ class Controller:
             self.lease = CredentialLease(self, kind); self.lease.open()
         self.auth_reached('transaction-observer')
         self.observer = TransactionObserver(self, kind); self.observer.start()
-        return {'observing': kind}
+        return {'observing': kind, 'transactionBinding': json.loads(json.dumps(self.observer.binding))}
 
     def transaction_end(self):
         self.auth_reached('transaction-finish')

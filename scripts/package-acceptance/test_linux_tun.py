@@ -45,17 +45,45 @@ def helper_row(success=True, code='missing', installed=None, ready=None):
             'selectedCoreState':'missing','protocolVersion':None,'expectedProtocolVersion':None,'buildIdentityMatches':None,'executionDiagnosticState':'absent','executionDiagnostic':None}}
 
 
+def transaction_binding(run,kind='install'):
+    run.transaction_launch={'runId':'a'*12,'execution':{'sourceSha':'b'*40,'githubRunId':'1','githubRunAttempt':'1'}}
+    value={'schema':'polaris-transaction-binding-v1','runToken':'a'*12,'sourceSha':'b'*40,'githubRunId':'1','attempt':'1',
+           'kind':kind,'subject':{k:run.app[k] for k in ('pid','startTime','uid')},'windowNonce':'c'*32}
+    run.transaction_binding=value
+    return value
+
+
+def begin_snapshot(run,kind='install'):
+    return {'observing':kind,'transactionBinding':transaction_binding(run,kind)}
+
+
 def scan_snapshot(run,kind='install'):
     import root_controller
     runtime=root_controller.auth_runtime_observation(run.launch_options['authenticationMode']);runtime['kind']=kind
     return {'kind':kind,'subject':{key:run.app[key] for key in ('pid','startTime','uid')},
         'authenticationMode':run.launch_options['authenticationMode'],'pkexecBirths':[], 'rootShellBirths':[],
-        'owned':[],'authorizationObserved':False,'credentialPromptClaimed':False,'authenticationRuntime':runtime}
+        'owned':[],'authorizationObserved':False,'credentialPromptClaimed':False,'authenticationRuntime':runtime,
+        'transactionBinding':transaction_binding(run,kind),'auxiliaryIdentityCoverage':'complete','auxiliaryTerminals':[]}
+
+
+def end_snapshot(run,kind='install'):
+    value=scan_snapshot(run,kind);value.pop('authenticationRuntime')
+    value['closed']=True
+    return value
+
+
+def bind_supervisor_proof(obj,owned):
+    run=SimpleNamespace(app=obj.window['subject'])
+    binding=transaction_binding(run,obj.window['kind']);obj.bind_window(binding,run.transaction_launch)
+    key=[owned[0]['pid'],owned[0]['startTime']]
+    return {'closed':True,'kind':obj.window['kind'],'subject':dict(obj.window['subject']),
+            'transactionBinding':binding,'owned':owned,'pkexecBirths':[key],'rootShellBirths':[key],
+            'authorizationObserved':True,'auxiliaryIdentityCoverage':'complete','auxiliaryTerminals':[]}
 
 
 def supervisor():
     obj = M.TunSupervisor.__new__(M.TunSupervisor)
-    obj.lock = threading.RLock(); obj.window = None; obj.quarantine = {}; obj.confirmed = set()
+    obj.lock = threading.RLock(); obj.window = None; obj.quarantine = {}; obj.confirmed = set(); obj.auxiliary_confirmed={}
     obj.controller_birth = None; obj.controller_descendants = {}; obj.gui_birth = None
     obj.owned = {}; obj.children = {}; obj.roles = {}; obj.unknown = []; obj.forced = []
     obj.diagnostics = []; obj.diagnostics_truncated = False
@@ -341,7 +369,7 @@ class PureContracts(unittest.TestCase):
             obj.scan()
         self.assertNotIn(11, obj.owned)
         self.assertIn((11, '1234'), obj.quarantine)
-        obj.end_window([root])
+        obj.end_window(bind_supervisor_proof(obj,[root]))
         self.assertIn((11, '1234'), obj.confirmed)
 
     def test_same_birth_exec_elevation_is_removed_from_owned(self):
@@ -355,12 +383,12 @@ class PureContracts(unittest.TestCase):
         self.assertNotIn(11, obj.owned)
         self.assertNotIn(11, obj.roles)
         self.assertIn((11, '1234'), obj.quarantine)
-        obj.end_window([elevated])
+        obj.end_window(bind_supervisor_proof(obj,[elevated]))
 
     def test_missed_root_ancestry_fails_closed(self):
         obj = supervisor(); obj.begin_window('install', identity())
         obj.window['births'].add((11, '1234'))
-        with self.assertRaises(ValueError): obj.end_window([identity(12)])
+        with self.assertRaises(ValueError): obj.end_window(bind_supervisor_proof(obj,[identity(12)]))
         self.assertIsNotNone(obj.window)
 
     def test_foreign_outside_transaction_permanent_unknown(self):
@@ -812,7 +840,7 @@ class ControllerLifecycleContracts(unittest.TestCase):
             run.env = {'XDG_CONFIG_HOME': str(run.home / 'config')}; run.supervisor = supervisor()
             run.result = {}; run.run_id = '123456789abc'; run.rpc_client = run.home / 'probe'; run.rpc_client.write_bytes(b'probe')
             run.members = {'app': {'sha256': H}, 'core': {'sha256': H}}
-            run.bound = {'helperBinding': {'helper': {'sha256': H}}}; run.item = {'sha256': H}; run.launch_options = {}
+            run.bound = {'helperBinding': {'helper': {'sha256': H}}}; run.item = {'sha256': H}; run.launch_options = {'execution':{'sourceSha':'b'*40,'githubRunId':'1','githubRunAttempt':'1'}}
             run.controller = None
             client = Mock(); client.lifecycle = {'stage': 'allocated'}
             client.start.side_effect = ValueError('PRIVATE')
@@ -852,12 +880,13 @@ class ControllerLifecycleContracts(unittest.TestCase):
         graph = {'inbounds': [{'type': 'tun', 'interface_name': 'polaris-tun0'}]}
         run.observed_api_endpoint = Mock(return_value=(endpoint, {'sha256': H}, graph))
         run.rpc = Mock()
-        status = {'running': True, 'startedViaHelper': True, 'pid': core['pid'], 'clashApiPort': 45001}
+        status = {'running': True, 'startedViaHelper': True, 'pid': core['pid'], 'mainGeneration':1, 'clashApiPort': 45001}
+        run.status=Mock(side_effect=lambda: {'running':False} if run.result.get('connectObservation',{}).get('phase')=='stopped-check' else status)
         return run, status, endpoint, graph
 
     def test_tun_actual_endpoint_connect_reuses_root_owned_probe_and_rebinds(self):
         run, status, endpoint, graph = self.tun_connect_fixture()
-        with patch.object(M.base, 'wait_for', return_value=status), patch.object(M.base, 'regular', side_effect=lambda p,*args: p):
+        with patch.object(run,'wait_ready_status',return_value=status), patch.object(M.base, 'regular', side_effect=lambda p,*args: p):
             run.connect()
             self.assertEqual(run.api_endpoint, endpoint)
             self.assertTrue(run.result['apiEndpoint']['ownedListenerProbe'])
@@ -878,9 +907,9 @@ class ControllerLifecycleContracts(unittest.TestCase):
         run.controller.call.side_effect=call
         run.retire_applied_core(previous)
         run.connect_phase('apply-ready')
-        with patch.object(M.base,'wait_for',return_value=status),patch.object(M.base,'regular',side_effect=lambda p,*a:p):
+        with patch.object(run,'wait_ready_status',return_value=status),patch.object(M.base,'regular',side_effect=lambda p,*a:p):
             run.observe_ready_core(timeout=10)
-        self.assertEqual(calls,['core_stopped','register_core','core_attest','tun_register'])
+        self.assertEqual(calls,['core_stopped','register_core','core_attest','core_attest','tun_register'])
         self.assertEqual(run.api_endpoint,endpoint);run.driver.click.assert_not_called()
         self.assertFalse(run.stopped)
         run.controller.call.side_effect=None;run.controller.call.return_value={'stopped':True,'identity':identity(99)}
@@ -889,9 +918,9 @@ class ControllerLifecycleContracts(unittest.TestCase):
     def test_hot_apply_reobserves_existing_core_without_duplicate_registration(self):
         run,status,endpoint,graph=self.tun_connect_fixture()
         run.connect_phase('apply-ready')
-        with patch.object(M.base,'wait_for',return_value=status),patch.object(M.base,'regular',side_effect=lambda p,*a:p):
+        with patch.object(run,'wait_ready_status',return_value=status),patch.object(M.base,'regular',side_effect=lambda p,*a:p):
             run.observe_ready_core(timeout=10,register=False)
-        self.assertEqual([c.args[0] for c in run.controller.call.call_args_list],['core_attest'])
+        self.assertEqual([c.args[0] for c in run.controller.call.call_args_list],['core_attest','core_attest'])
         run.rpc.assert_called_once_with('capabilities');run.driver.click.assert_not_called()
 
     def test_manual_policy_activation_precedes_new_stream_and_keeps_same_core_switch_assertion(self):
@@ -927,7 +956,7 @@ class ControllerLifecycleContracts(unittest.TestCase):
             if failure == 'root-runtime': run.observed_api_endpoint.return_value = (endpoint, {'sha256':'b'*64}, graph)
             if failure == 'tun-graph': run.observed_api_endpoint.return_value = (endpoint, {'sha256':H}, {'inbounds':[]})
             if failure == 'owned-listener': run.rpc.side_effect = ValueError('root owned socket mismatch')
-            with patch.object(M.base, 'wait_for', return_value=status), patch.object(M.base, 'regular', side_effect=lambda p,*args: p):
+            with patch.object(run,'wait_ready_status',return_value=status), patch.object(M.base, 'regular', side_effect=lambda p,*args: p):
                 with self.assertRaises(ValueError): run.connect()
             self.assertNotIn('execution', run.result)
             self.assertNotIn('apiEndpoint', run.result)
@@ -939,7 +968,7 @@ class ControllerLifecycleContracts(unittest.TestCase):
         run=M.TunCarrierRun.__new__(M.TunCarrierRun)
         run.result={};run.core={'pid':10,'startTime':'1'};run.api_endpoint={'port':1234}
         run.controller=Mock();run.status=Mock(return_value={'running':True,'pid':10,'mainGeneration':3})
-        run.same_core=Mock();run.gui_phase=Mock();run.apply=Mock()
+        run.same_core=Mock();run.gui_phase=Mock();run.apply=Mock();run.driver=SimpleNamespace(session='private-session')
         run.pending_apply_control=Mock(return_value={'bars':0,'buttons':0,'disabled':False})
         old={'outbounds':[{'tag':'proxy-selector','type':'selector'}]}
         new={'outbounds':[{'tag':'proxy-selector','type':'selector','interrupt_exist_connections':True}]}
@@ -1040,14 +1069,15 @@ class ControllerLifecycleContracts(unittest.TestCase):
             run.launch_options={'authenticationMode':M.AUTH_GROUP_MODE,'authorization':{'guiUid':1001,'account':'runner'}}
             result=copy.deepcopy(proof)
             if not valid: result['jointLease']['groupRecovery']['writerStopped']=False
-            run.controller.call.side_effect=lambda command,**args:result if command=='transaction_end' else scan_snapshot(run) if command=='transaction_scan' else {}
+            run.controller.call.side_effect=lambda command,**args:{**end_snapshot(run),**result} if command=='transaction_end' else scan_snapshot(run) if command=='transaction_scan' else begin_snapshot(run) if command=='transaction_begin' else {}
             run.text=lambda key:key
             replies=iter([[],[helper_row()]])
             run.tun_observations=lambda:next(replies)
             if valid:
-                self.assertEqual(run.helper_action('install')['authorization'],result)
+                self.assertEqual(run.helper_action('install')['authorization'],{**end_snapshot(run),**result})
                 self.assertEqual(run.membership_gid,27)
-                run.supervisor.end_window.assert_called_once_with([])
+                run.supervisor.end_window.assert_called_once()
+                self.assertEqual(run.supervisor.end_window.call_args.args[0]['transactionBinding'],run.transaction_binding)
             else:
                 with self.assertRaises(ValueError):run.helper_action('install')
                 run.supervisor.end_window.assert_not_called()
@@ -1173,13 +1203,15 @@ class AuthenticationRuntimeConsumerTests(unittest.TestCase):
         producer.auth_runtime=root_controller.auth_runtime_observation(root_controller.AUTH_GROUP_MODE)
         producer.auth_runtime['kind']='install';producer.auth_runtime['lastReached']='transaction-observer'
         producer.auth_runtime['firstFailure']={'stage':'transaction-observer','code':'transaction-candidate-unconfirmed'}
-        failure={'schema':'polaris-transaction-candidate-failure-v1','phase':'owned-parent',
+        failure={'schema':'polaris-transaction-candidate-failure-v2','phase':'owned-parent',
                  'inventory':{'pid':61,'startTime':'1234','ppid':60},'relation':'owned-child',
-                 'parent':{'pid':60,'startTime':'1234'},'outcome':'identity-mismatch','error':'contract'}
+                 'parent':{'pid':60,'startTime':'1234'},'outcome':'identity-mismatch','error':'contract',
+                 'probe':'parent-identity','priorOwned':False}
         producer.auth_candidate_failure(failure)
-        for fault in (None,'phase','extra'):
+        for fault in (None,'phase','probe','extra'):
             observation=copy.deepcopy(producer.auth_runtime)
             if fault=='phase':observation['candidateFailure']['phase']='PRIVATE'
+            if fault=='probe':observation['candidateFailure']['probe']='PRIVATE'
             if fault=='extra':observation['candidateFailure']['raw']='PRIVATE'
             client=M.Controller();client.closed=False
             payload={'seq':1,'ok':False,'error':{'stage':'dispatch','code':'CONTROLLER_FAILED','authenticationRuntime':observation}}
@@ -1219,7 +1251,7 @@ class AuthenticationRuntimeConsumerTests(unittest.TestCase):
         run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.env={};run.result={};run.app={'pid':100,'startTime':'123','uid':1001}
         run.launch_options={'authenticationMode':'existing-session'}
         run.driver=Mock();run.supervisor=Mock();run.controller=Mock();run.text=lambda key:key
-        run.controller.call.side_effect=lambda command,**kw:scan_snapshot(run) if command=='transaction_scan' else {}
+        run.controller.call.side_effect=lambda command,**kw:scan_snapshot(run) if command=='transaction_scan' else begin_snapshot(run) if command=='transaction_begin' else {}
         replies=iter([[],[helper_row(False,'installerFailed')]])
         run.tun_observations=lambda:next(replies)
         with self.assertRaises(ValueError):run.helper_action('install')
@@ -1234,7 +1266,7 @@ class HelperObservationConsumerTests(unittest.TestCase):
         run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.env={};run.result={};run.app={'pid':100,'startTime':'123','uid':1001}
         run.launch_options={'authenticationMode':'existing-session'};run.driver=Mock();run.supervisor=Mock();run.controller=Mock();run.env={}
         run.text=lambda key:key
-        run.controller.call.side_effect=lambda command,**kw:scan_snapshot(run) if command=='transaction_scan' else {'owned':[]} if command=='transaction_end' else {}
+        run.controller.call.side_effect=lambda command,**kw:scan_snapshot(run) if command=='transaction_scan' else end_snapshot(run) if command=='transaction_end' else begin_snapshot(run) if command=='transaction_begin' else {}
         rows=iter([[],[helper_row() if row is None else row]])
         run.tun_observations=lambda:next(rows)
         return run
@@ -1245,7 +1277,8 @@ class HelperObservationConsumerTests(unittest.TestCase):
         self.assertEqual(out['callback']['callbackObservedElapsedMs'],735)
         self.assertFalse(run.result['helperObservation']['commandIdentityClaimed'])
         self.assertNotIn('firstBusinessFailure',run.result)
-        run.supervisor.end_window.assert_called_once_with([])
+        run.supervisor.end_window.assert_called_once()
+        self.assertEqual(run.supervisor.end_window.call_args.args[0]['transactionBinding'],run.transaction_binding)
 
     def test_failure_cancel_partial_and_each_typed_code_stays_failure(self):
         for code in M.helper_observation.ERROR_CODES:
@@ -1452,6 +1485,186 @@ class LogindReadOnlyObservationTests(unittest.TestCase):
         self.assertLess(source.index('observe_logind_session'),source.index("self.controller.call('transaction_begin'"))
         probe=__import__('inspect').getsource(M.observe_logind_session)
         self.assertNotIn('CreateSession',probe);self.assertNotIn('ActivateSession',probe)
+
+
+class ExplicitStatusWaitConsumerTests(unittest.TestCase):
+    def fixture(self):
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.core=identity(10)
+        run.driver=SimpleNamespace(session='private-session',click=Mock())
+        run.readiness_observation_fence=Mock();run.gui_phase=Mock();run.controller=Mock();run.stopped=False
+        return run
+
+    def test_off_busy_uses_shared_wait_once_then_exact_root_ledger_exit(self):
+        self.assertIs(M.TunCarrierRun.wait_status_observation,M.base.CarrierRun.wait_status_observation)
+        run=self.fixture();run.status=Mock(side_effect=[{'running':True},
+            M.base.NativeRejected('PRIVATE','status-writer-busy'),{'running':False,'starting':False}])
+        run.controller.call.return_value={'stopped':True,'identity':run.core}
+        with patch.object(M.base.time,'sleep'):proof=run.disconnect()
+        self.assertTrue(proof['stopped']);self.assertTrue(run.stopped)
+        run.driver.click.assert_called_once_with('#connect-btn');run.controller.call.assert_called_once_with('core_stopped')
+        self.assertEqual(run.result['statusWaitObservations'][0]['savedStateObservation']['busyCount'],1)
+        # Still require exact original root-ledger birth after the read completes.
+        run=self.fixture();run.status=Mock(side_effect=[{'running':True},{'running':False}])
+        run.controller.call.return_value={'stopped':True,'identity':identity(99)}
+        with self.assertRaises(ValueError):run.disconnect()
+        self.assertFalse(run.stopped)
+
+    def test_off_hard_status_error_does_not_replay_click_or_claim_root_exit(self):
+        for diagnostic in ('status-cache-cold','status-writer-poisoned','unknown'):
+            run=self.fixture();run.status=Mock(side_effect=[{'running':True},M.base.NativeRejected('PRIVATE',diagnostic)])
+            with self.subTest(diagnostic=diagnostic),self.assertRaises(M.base.NativeRejected):run.disconnect()
+            run.driver.click.assert_called_once_with('#connect-btn');run.controller.call.assert_not_called()
+            self.assertFalse(run.stopped)
+
+    def test_auto_loop_uses_one_original_timer_and_positive_sample_not_redundant_read(self):
+        run=self.fixture();run.boundary=Mock();run.prepare_auto=Mock();run.network=Mock();run.same_core=Mock()
+        run.preference=Mock();run.activate_saved_preference=Mock()
+        run.socket=Mock(side_effect=[('old',{'backend':'A'}),('new',{'backend':'B'})]);run.exchange=Mock(return_value={'backend':'A'})
+        run.config=Mock(return_value={'selectionIntent':{'mode':'auto'}});run.fixture_control=Mock(return_value={'errors':[],'closed':False})
+        run.record=Mock();run.snapshot=Mock(return_value={})
+        run.status=Mock(side_effect=[M.base.NativeRejected('PRIVATE','status-cache-busy'),{'actualServerId':'node-b'}])
+        with patch.object(M.time,'sleep') as sleep:run.auto_case()
+        self.assertEqual(run.status.call_count,2);self.assertEqual(run.exchange.call_count,3)
+        self.assertEqual(run.socket.call_count,2);sleep.assert_called_once_with(3)
+        run.same_core.assert_called_once_with(run.core,status={'actualServerId':'node-b'})
+        self.assertEqual(run.result['statusWaitObservations'][0]['context'],'auto')
+        run.driver.click.assert_not_called()
+
+    def test_ready_binding_busy_reacquires_root_proof_but_registers_only_once(self):
+        run,status,endpoint,graph=ControllerLifecycleContracts().tun_connect_fixture()
+        run.readiness_observation_fence=Mock();run.driver.session='same-session'
+        run.observed_api_endpoint.side_effect=[M.base.NativeRejected('PRIVATE','status-writer-busy'),(endpoint,{'sha256':H},graph)]
+        with patch.object(run,'wait_ready_status',return_value=status),patch.object(M.base,'regular',side_effect=lambda p,*a:p),patch.object(M.time,'sleep'):
+            run.connect()
+        actions=[c.args[0] for c in run.controller.call.call_args_list]
+        self.assertEqual(actions,['register_core','core_attest','core_attest','core_attest','tun_register'])
+        run.driver.click.assert_called_once_with('#connect-btn')
+        self.assertEqual(run.result['statusWaitObservations'][0]['savedStateObservation']['busyCount'],1)
+
+    def test_explicit_status_sample_does_not_replace_tun_root_attestation(self):
+        run=self.fixture();run.controller.call.return_value={'identity':identity(99)}
+        run.status=Mock()
+        with self.assertRaises(ValueError):run.same_core(run.core,status={'pid':10})
+        run.controller.call.assert_called_once_with('core_attest');run.status.assert_not_called()
+
+
+
+class AuxiliaryTerminalConsumerTests(unittest.TestCase):
+    def fixture(self):
+        obj=supervisor();gui=identity(10,1001,9);obj.begin_window('install',gui)
+        strong=[{**identity(20,0,10),'capEff':0,'capAmb':0},{**identity(21,0,20),'capEff':0,'capAmb':0}]
+        proof=bind_supervisor_proof(obj,strong)
+        inv={'pid':22,'startTime':'1234','ppid':21}
+        row={'schema':'polaris-unverified-auxiliary-terminal-v1','binding':copy.deepcopy(proof['transactionBinding']),
+             'inventory':inv,'parent':{'pid':21,'startTime':'1234'},'anchor':{'pid':20,'startTime':'1234'},
+             'capture':{'phase':'inputs-before','probe':'cmdline-empty','error':'contract'},
+             'terminal':{'pid':22,'startTime':'1234','state':'absent','scope':'sampled-terminal-unverified-execution'},
+             'priorStrongOwned':False,'identityVerified':False,'signalAuthority':False}
+        proof.update(auxiliaryIdentityCoverage='incomplete',auxiliaryTerminals=[row])
+        obj.quarantine[(22,'1234')]={**inv,'uid':0,'state':'S'};obj.window['births'].add((22,'1234'))
+        return obj,proof,row
+
+    def test_terminal_class_never_enters_owned_strong_confirmation_or_signal_authority(self):
+        obj,proof,row=self.fixture();obj.unknown.append('previous-security-failure')
+        with patch.object(M.tun,'unverified_terminal_identity',return_value=row['terminal']):obj.end_window(proof)
+        self.assertIsNone(obj.window);self.assertNotIn((22,'1234'),obj.confirmed)
+        self.assertIn((22,'1234'),obj.auxiliary_confirmed);self.assertIn((22,'1234'),obj.quarantine)
+        self.assertNotIn(22,obj.owned);self.assertEqual(obj.unknown,['previous-security-failure'])
+        with patch.object(M.os,'getuid',return_value=1001),patch.object(M.base.Supervisor,'signal') as signal:
+            with self.assertRaises(ValueError):obj.signal(obj.quarantine[(22,'1234')],15)
+            signal.assert_not_called()
+
+    def test_nonce_kind_subject_and_execution_mismatch_reject_window_without_confirmation(self):
+        for field in ('windowNonce','kind','subject','sourceSha','runToken'):
+            obj,proof,row=self.fixture();bad=copy.deepcopy(proof)
+            bad['transactionBinding'][field]={'pid':99,'startTime':'1234','uid':1001} if field=='subject' else 'uninstall' if field=='kind' else 'd'*len(str(bad['transactionBinding'][field]))
+            with self.subTest(field=field),self.assertRaises(ValueError):obj.end_window(bad)
+            self.assertIsNotNone(obj.window);self.assertEqual(obj.confirmed,set());self.assertEqual(obj.auxiliary_confirmed,{})
+
+    def test_unknown_live_changed_parent_mandatory_overlap_and_extra_fields_fail(self):
+        for fault in ('live','permission','parent','outside','overlap','raw','mandatory','coverage','reappeared'):
+            obj,proof,row=self.fixture()
+            if fault=='parent':obj.quarantine[(22,'1234')]['ppid']=99
+            if fault=='outside':obj.window['births'].clear()
+            if fault=='overlap':proof['owned'].append({**row['inventory'],'uid':0})
+            if fault=='raw':row['raw']='PRIVATE'
+            if fault=='mandatory':proof['rootShellBirths']=[]
+            if fault=='coverage':proof['auxiliaryIdentityCoverage']='complete'
+            response={**row['terminal'],'state':'zombie' if fault=='reappeared' else 'absent'}
+            error=ValueError('live or reused') if fault=='live' else PermissionError() if fault=='permission' else None
+            with self.subTest(fault=fault),patch.object(M.tun,'unverified_terminal_identity',side_effect=error,return_value=response),self.assertRaises((ValueError,PermissionError)):
+                obj.end_window(proof)
+            self.assertIsNotNone(obj.window);self.assertEqual(obj.auxiliary_confirmed,{})
+
+    def test_commit_rechecks_new_quarantine_birth_parent_under_lock(self):
+        obj,proof,row=self.fixture();obj.quarantine.clear();obj.window['births'].clear()
+        def race(_):
+            obj.quarantine[(22,'1234')]={**row['inventory'],'ppid':99,'uid':0}
+            obj.window['births'].add((22,'1234'))
+            return row['terminal']
+        with patch.object(M.tun,'unverified_terminal_identity',side_effect=race),self.assertRaises(ValueError):obj.end_window(proof)
+        self.assertIsNotNone(obj.window);self.assertFalse(obj.auxiliary_confirmed)
+
+    def test_cleanup_requires_whole_pid_absence_not_zombie_or_unreadable(self):
+        for terminal in ('absent','zombie','permission'):
+            obj,proof,row=self.fixture()
+            with patch.object(M.tun,'unverified_terminal_identity',return_value=row['terminal']):obj.end_window(proof)
+            with patch.object(M.base,'process_identity',return_value=None),patch.object(M.base.Supervisor,'close',return_value={'state':'normal','unknown':[]}),\
+                 patch.object(M.tun,'unverified_terminal_identity',side_effect=PermissionError() if terminal=='permission' else None,
+                              return_value={**row['terminal'],'state':terminal}):result=obj.close(True)
+            self.assertEqual(result['auxiliaryIdentityCoverage'],'incomplete')
+            self.assertEqual(result['state'],'normal' if terminal=='absent' else 'failed')
+            self.assertEqual(result['unknown'],[] if terminal=='absent' else ['auxiliary-terminal-not-reaped'])
+
+    def test_observation_projection_preserves_incomplete_without_promoting_ownership(self):
+        run=HelperObservationConsumerTests().run_fixture();run._gui_started=M.time.monotonic()
+        obj,proof,row=self.fixture()
+        # Bind this producer-shaped observation to this exact consumer subject/run.
+        run.app=dict(proof['subject']);run.transaction_launch={'runId':'a'*12,'execution':{'sourceSha':'b'*40,'githubRunId':'1','githubRunAttempt':'1'}}
+        run.transaction_binding=copy.deepcopy(proof['transactionBinding'])
+        value=scan_snapshot(run);value.update({k:copy.deepcopy(proof[k]) for k in ('transactionBinding','owned','pkexecBirths','rootShellBirths','authorizationObserved','auxiliaryIdentityCoverage','auxiliaryTerminals')})
+        run.record_transaction_observation(value,'install')
+        self.assertEqual(run.result['auxiliaryIdentityCoverage'],'incomplete')
+        observed=run.result['rootTransactionObservation']
+        self.assertNotIn([22,'1234'],observed['ownedBirths']);self.assertEqual(observed['auxiliaryTerminals'],[row])
+        value['auxiliaryTerminals']=[];value['auxiliaryIdentityCoverage']='complete'
+        run.record_transaction_observation(value,'install')
+        self.assertEqual(run.result['auxiliaryIdentityCoverage'],'incomplete')
+
+    def test_real_ordinary_orphan_grandchild_is_not_cleared_by_terminal_class(self):
+        # Isolated ordinary Python subreaper only; no product/root/network/actions.
+        script=r'''
+import ctypes,importlib.util,json,os,sys,threading,time
+sys.path.insert(0,os.path.dirname(sys.argv[1]))
+spec=importlib.util.spec_from_file_location('plain_tun',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+assert ctypes.CDLL(None).prctl(36,1,0,0,0)==0
+info_r,info_w=os.pipe();release_r,release_w=os.pipe()
+child=os.fork()
+if child==0:
+ os.close(info_r);os.close(release_w)
+ grandchild=os.fork()
+ if grandchild==0:
+  os.close(info_w);os.read(release_r,1);os._exit(0)
+ os.write(info_w,str(grandchild).encode());os._exit(0)
+os.close(info_w);os.close(release_r);pid=int(os.read(info_r,64));os.close(info_r);os.waitpid(child,0)
+try:
+ current=m.base.process_identity(pid);assert current and current['ppid']==os.getpid()
+ obj=m.TunSupervisor.__new__(m.TunSupervisor)
+ obj.lock=threading.RLock();obj.window=None;obj.quarantine={};obj.confirmed=set();obj.auxiliary_confirmed={}
+ obj.controller_birth=None;obj.controller_descendants={};obj.gui_birth=None
+ obj.owned={};obj.children={};obj.roles={};obj.unknown=[];obj.forced=[]
+ obj.diagnostics=[];obj.diagnostics_truncated=False;obj.diagnostic_executable_budget=[m.base.DIAGNOSTIC_EXE_LIMIT]
+ obj.scan()
+ assert 'unobserved-adopted-descendant' in obj.unknown
+ assert obj.roles.get(pid)=='unknown'
+ print(json.dumps({'adopted':True,'unknownRetained':True,'signalUsed':False}))
+finally:
+ os.write(release_w,b'x');os.close(release_w);os.waitpid(pid,0)
+'''
+        result=subprocess.run([sys.executable,'-B','-c',script,str(Path(M.__file__))],text=True,capture_output=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout),{'adopted':True,'unknownRetained':True,'signalUsed':False})
+
 
 if __name__ == '__main__':
     unittest.main()

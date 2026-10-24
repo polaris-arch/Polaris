@@ -77,10 +77,15 @@ Object.assign(report.helperIdentity.identity, { pid: 99, startTime: '122', ppid:
 Object.assign(report.helperIdentity.executable, { dev: 42, inode: 550 });
 
 
+const transactionBinding = kind => ({schema:'polaris-transaction-binding-v1',runToken:'abcdef123456',
+  sourceSha:sha,githubRunId:context.runId,attempt:context.attempt,kind,
+  subject:{pid:100,startTime:'123',uid:1001},windowNonce:(kind==='install'?'1':'2').repeat(32)});
 const authorization = kind => ({ callback: { envelopeSuccess: true, success: true, installed: kind === 'install', ready: kind === 'install' },
   authorization: { kind, subject: { pid: 100, startTime: '123', uid: 1001 }, authenticationMode: 'existing-session',
     authorizationObserved: true, closed: true, credentialPromptClaimed: false,
+    transactionBinding:transactionBinding(kind),auxiliaryIdentityCoverage:'complete',auxiliaryTerminals:[],
     pkexecBirths: [[102, '125']], rootShellBirths: [[102, '125']], owned: [{ uid: 0, ppid: 100, pid: 102, startTime: '125' }] } });
+report.auxiliaryIdentityCoverage='complete';
 report.helperInstall = authorization('install'); report.helperUninstall = authorization('uninstall');
 
 test('TUN is separately selected direct dispatch and never a publication receipt', () => {
@@ -257,7 +262,7 @@ import helper_observation as helper
 app={'pid':100,'startTime':'123','uid':1001}
 results=[]
 for kind in ('install','uninstall'):
-    controller=types.SimpleNamespace(gui=app,launch={'authenticationMode':'existing-session'},ops=types.SimpleNamespace(proc=lambda pid:None),tun=actual_tun)
+    controller=types.SimpleNamespace(gui=app,launch={'authenticationMode':'existing-session','runId':'abcdef123456','execution':{'sourceSha':'a'*40,'githubRunId':'120','githubRunAttempt':'1'}},ops=types.SimpleNamespace(proc=lambda pid:None),tun=actual_tun)
     private=tempfile.TemporaryDirectory()
     home=actual_tun.Path(private.name);home.chmod(0o700)
     script=home/('a'*24+'-polaris-helper-'+kind+'.sh')
@@ -300,10 +305,10 @@ for kind in ('install','uninstall'):
     held.close();private.cleanup()
     run=object.__new__(gui.TunCarrierRun)
     run.result={}; run.env={}
-    run.app=app; run.driver=Mock(); run.supervisor=Mock(); run.controller=Mock(); run.launch_options={'authenticationMode':'existing-session'}
+    run.app=app; run.driver=Mock(); run.supervisor=Mock(); run.controller=Mock(); run.launch_options={'authenticationMode':'existing-session'};run.transaction_launch=controller.launch
     runtime=root.auth_runtime_observation('existing-session');runtime['kind']=kind
     scanned={**observer.snapshot(),'authenticationRuntime':runtime}
-    run.controller.call.side_effect=lambda command,**args: closed if command=='transaction_end' else scanned if command=='transaction_scan' else {}
+    run.controller.call.side_effect=lambda command,**args: closed if command=='transaction_end' else scanned if command=='transaction_scan' else {'observing':kind,'transactionBinding':observer.binding} if command=='transaction_begin' else {}
     run.text=lambda key:key
     raw={'success':True,'data':{'success':True,'status':{'supported':True,'installed':kind=='install','ready':kind=='install'}}}
     projector='process.stdout.write(JSON.stringify(('+helper.PROJECTOR_JS+')(JSON.parse(process.argv[1]))))'
@@ -313,7 +318,7 @@ for kind in ('install','uninstall'):
     run.tun_observations=lambda:next(replies)
     result=run.helper_action(kind)
     assert run.controller.call.call_args_list[-1].args==('transaction_end',)
-    run.supervisor.end_window.assert_called_once_with(closed['owned'])
+    run.supervisor.end_window.assert_called_once_with(closed)
     results.append(result)
 print(json.dumps(results))`;
   const rows = JSON.parse(execFileSync('python3', ['-B', '-c', program, join(ROOT, 'scripts/package-acceptance')],
@@ -412,5 +417,41 @@ test('joint report requires pending preparation and final same-GID recovery for 
     r=>r.rootPreparation.authenticationReadiness.groupMembership='ready',
     r=>r.rootPreparation.guarded=false]) {
     const bad=clone(actual);mutate(bad);assert.throws(()=>verifyReport(bad,admitted,hash,AUTH_GROUP_MODE));
+  }
+});
+
+test('auxiliary terminals remain separate incomplete evidence with exact binding and strong ancestry', () => {
+  const row=authorization('install'), a=row.authorization;
+  Object.assign(a.owned[0],{state:'S',exe:'/bin/bash',exeDev:1,exeInode:2,capEff:0,capAmb:0,
+    namespaces:{net:1,mnt:2,pid:3,cgroup:4},cgroup:'0::/'});
+  a.auxiliaryIdentityCoverage='incomplete';
+  a.auxiliaryTerminals=[{schema:'polaris-unverified-auxiliary-terminal-v1',binding:clone(a.transactionBinding),
+    inventory:{pid:103,startTime:'126',ppid:102},parent:{pid:102,startTime:'125'},anchor:{pid:102,startTime:'125'},
+    capture:{phase:'inputs-before',probe:'cmdline-empty',error:'contract'},
+    terminal:{pid:103,startTime:'126',state:'absent',scope:'sampled-terminal-unverified-execution'},
+    priorStrongOwned:false,identityVerified:false,signalAuthority:false}];
+  verifyAuthorization(row,'install',report.execution.app,1001,'existing-session',subject,context);
+  for (const mutate of [
+    r=>r.authorization.auxiliaryTerminals[0].binding.attempt='2',
+    r=>r.authorization.auxiliaryTerminals[0].binding.windowNonce='f'.repeat(32),
+    r=>r.authorization.auxiliaryTerminals[0].signalAuthority=true,
+    r=>r.authorization.auxiliaryTerminals[0].identityVerified=true,
+    r=>r.authorization.auxiliaryTerminals[0].terminal.state='reaped',
+    r=>r.authorization.auxiliaryTerminals[0].capture.probe='raw-secret',
+    r=>r.authorization.auxiliaryTerminals[0].capture.phase='owned-parent',
+    r=>r.authorization.auxiliaryTerminals[0].capture.error='eacces',
+    r=>r.authorization.auxiliaryTerminals[0].parent.startTime='999',
+    r=>r.authorization.auxiliaryTerminals[0].anchor.pid=999,
+    r=>r.authorization.auxiliaryIdentityCoverage='complete',
+    r=>r.authorization.owned.push({...r.authorization.auxiliaryTerminals[0].inventory,uid:0}),
+    r=>r.authorization.auxiliaryTerminals.push(clone(r.authorization.auxiliaryTerminals[0])),
+    r=>delete r.authorization.owned[0].namespaces,
+    r=>delete r.authorization.owned[0].exe,
+    r=>delete r.authorization.owned[0].exeInode,
+    r=>delete r.authorization.owned[0].ppid,
+    r=>r.callback.success=false
+  ]) {
+    const bad=clone(row);mutate(bad);
+    assert.throws(()=>verifyAuthorization(bad,'install',report.execution.app,1001,'existing-session',subject,context));
   }
 });

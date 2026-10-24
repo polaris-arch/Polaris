@@ -258,12 +258,14 @@ class TunSupervisor(base.Supervisor):
 
 No privileged birth is admitted to ``owned``, and no name/path inference grants
 signal authority. A bounded GUI window is accepted only after an independent
-root ledger confirms every observed birth. Missing observations fail forever.
+root ledger strongly confirms mandatory births. Separately typed terminal-only
+auxiliary evidence never verifies execution or grants signal authority.
 """
     def __init__(self):
         self.window = None
         self.quarantine = {}
         self.confirmed = set()
+        self.auxiliary_confirmed = {}
         self.controller_birth = None
         self.controller_descendants = {}
         self.gui_birth = None
@@ -272,17 +274,55 @@ root ledger confirms every observed birth. Missing observations fail forever.
     def begin_window(self, kind, gui):
         require(kind in ('install', 'uninstall') and self.window is None, 'bounded GUI auth window required')
         self.gui_birth = birth(gui)
-        self.window = {'kind': kind, 'started': time.monotonic(), 'births': set()}
+        self.window = {'kind': kind, 'started': time.monotonic(), 'births': set(),
+                       'subject':{k:gui[k] for k in ('pid','startTime','uid')},'binding':None}
 
-    def end_window(self, root_observed):
-        require(self.window is not None, 'no GUI authentication window')
-        observed = {(birth(p)['pid'], birth(p)['startTime']) for p in root_observed}
-        required = self.window['births']
-        # Root has the authoritative fast observer and may see births ordinary
-        # polling missed; ordinary polling must never invent missing root proof.
-        require(required <= observed and observed, 'root GUI lineage observation incomplete')
-        self.confirmed.update(observed)
-        self.window = None
+    def bind_window(self, binding, launch):
+        import root_controller
+        require(self.window is not None and self.window['binding'] is None,'one root binding per GUI window')
+        root_controller.validate_transaction_binding(binding,launch=launch,subject=self.window['subject'],kind=self.window['kind'])
+        self.window['binding']=copy.deepcopy(binding)
+
+    def end_window(self, proof):
+        import root_controller
+        require(self.window is not None and self.window['binding'] is not None,'bound GUI authentication window required')
+        window=self.window
+        require(time.monotonic()-window['started']<90,'GUI transaction window expired')
+        require(type(proof) is dict and proof.get('closed') is True and proof.get('transactionBinding')==window['binding'] and
+                proof.get('kind')==window['kind'] and proof.get('subject')==window['subject'], 'root GUI window proof differs')
+        binding=root_controller.validate_transaction_binding(proof['transactionBinding'],subject=window['subject'],kind=window['kind'])
+        owned=proof['owned'];aux=proof['auxiliaryTerminals']
+        root_controller.validate_auxiliary_terminals(aux,binding,owned,proof['pkexecBirths'],proof['rootShellBirths'])
+        require(len(proof['pkexecBirths'])==len(proof['rootShellBirths'])==1 and proof.get('authorizationObserved') is True,
+                'strong mandatory authorization proof required')
+        require(proof['auxiliaryIdentityCoverage']==('incomplete' if aux else 'complete'),'auxiliary coverage differs')
+        observed={(birth(p)['pid'],birth(p)['startTime']) for p in owned}
+        require(len(observed)==len(owned) and observed,'strong root births required')
+        auxiliary={}
+        for row in aux:
+            item=row['inventory'];key=(item['pid'],item['startTime'])
+            if key in self.quarantine:
+                require(key in window['births'] and self.quarantine[key]['ppid']==item['ppid'],
+                        'auxiliary observation outside window or different parent')
+            fresh=tun.unverified_terminal_identity(item)
+            require(fresh['state'] in ('absent','zombie') and
+                    (row['terminal']['state']!='absent' or fresh['state']=='absent'), 'auxiliary terminal contradicted')
+            auxiliary[key]=copy.deepcopy(row)
+        require(window['births'] <= observed | set(auxiliary),'root GUI lineage observation incomplete')
+        # Keep the two classes disjoint. In particular no auxiliary ever enters
+        # owned, confirmed(strong), or a signal path; prior unknowns are untouched.
+        require(not (observed & set(auxiliary)),'auxiliary cannot replace strong ownership')
+        with self.lock:
+            require(self.window is window and window['births'] <= observed | set(auxiliary),
+                    'GUI transaction window changed or new birth unconfirmed')
+            for key,row in auxiliary.items():
+                if key in self.quarantine:
+                    require(key in window['births'] and same_birth(self.quarantine[key],row['inventory']) and
+                            self.quarantine[key]['ppid']==row['inventory']['ppid'],
+                            'auxiliary raced ordinary inventory boundary')
+            self.confirmed.update(observed)
+            self.auxiliary_confirmed.update(auxiliary)
+            self.window=None
 
     def scan(self):
         observed = {int(p.name): base.process_identity(int(p.name)) for p in Path('/proc').iterdir() if p.name.isdigit()}
@@ -347,7 +387,7 @@ root ledger confirms every observed birth. Missing observations fail forever.
 
     def close(self, normal):
         try:
-            if self.window or any(key not in self.confirmed for key in self.quarantine):
+            if self.window or any(key not in self.confirmed and key not in self.auxiliary_confirmed for key in self.quarantine):
                 self.unknown.append('unconfirmed-privileged-GUI-lineage')
             for item in self.quarantine.values():
                 current = base.process_identity(item['pid'])
@@ -362,7 +402,19 @@ root ledger confirms every observed birth. Missing observations fail forever.
                     self.unknown.append('root-controller-descendant-not-reaped')
         except Exception:
             self.unknown.append('privileged-cleanup-observation-unconfirmed')
-        return super().close(normal)
+        cleanup=super().close(normal)
+        # Root's sampled zombie is not reaping. After ordinary descendants/tools
+        # close, every terminal-only auxiliary must be whole-PID absent twice.
+        for row in self.auxiliary_confirmed.values():
+            try:
+                fresh=tun.unverified_terminal_identity(row['inventory'])
+                require(fresh['state']=='absent','auxiliary not reaped')
+            except Exception:
+                self.unknown.append('auxiliary-terminal-not-reaped')
+        cleanup['auxiliaryIdentityCoverage']='incomplete' if self.auxiliary_confirmed else 'complete'
+        cleanup['unknown']=sorted(set(self.unknown))
+        if cleanup['unknown']: cleanup['state']='failed'
+        return cleanup
 
 
 TUN_OBSERVER = r'''
@@ -686,7 +738,8 @@ class TunCarrierRun(base.CarrierRun):
         # This is the already-returned read-only snapshot, never a replacement
         # for transaction_end or evidence admitting ordinary root signals.
         keys = {'kind', 'subject', 'authenticationMode', 'pkexecBirths', 'rootShellBirths',
-                'owned', 'authorizationObserved', 'credentialPromptClaimed', 'authenticationRuntime'}
+                'owned', 'authorizationObserved', 'credentialPromptClaimed', 'authenticationRuntime',
+                'transactionBinding','auxiliaryIdentityCoverage','auxiliaryTerminals'}
         require(type(value) is dict and set(value) == keys and value['kind'] == kind and
                 value['authenticationMode'] == self.launch_options['authenticationMode'],
                 'fixed transaction observation required')
@@ -720,12 +773,21 @@ class TunCarrierRun(base.CarrierRun):
         require(all(row in owned for row in pkexec + shells) and all(row in pkexec for row in shells) and
                 type(value['authorizationObserved']) is bool and value['authorizationObserved'] == bool(shells) and
                 value['credentialPromptClaimed'] is False, 'transaction observation claims differ')
+        binding=root_controller.validate_transaction_binding(value['transactionBinding'],launch=self.transaction_launch,subject=self.app,kind=kind)
+        require(binding==self.transaction_binding,'transaction scan differs from begin')
+        aux=root_controller.validate_auxiliary_terminals(value['auxiliaryTerminals'],binding,value['owned'],
+                                                         value['pkexecBirths'],value['rootShellBirths'])
+        coverage='incomplete' if aux else 'complete'
+        require(value['auxiliaryIdentityCoverage']==coverage,'transaction auxiliary coverage differs')
+        if coverage=='incomplete' or self.result.get('auxiliaryIdentityCoverage')!='incomplete':
+            self.result['auxiliaryIdentityCoverage']=coverage
         self.result['rootTransactionObservation'] = {'schema': 'polaris-root-transaction-observation-v1',
             'kind': kind, 'subject': dict(subject), 'pkexecBirths': pkexec, 'rootShellBirths': shells,
             'ownedBirths': owned, 'authorizationObserved': value['authorizationObserved'],
             'credentialPromptClaimed': False, 'scope': 'root-observed-births-not-transaction-completion-or-cleanup',
             'receivedElapsedMs': max(0, int((time.monotonic() - self._gui_started) * 1000)),
-            'authenticationRuntime': copy.deepcopy(runtime)}
+            'authenticationRuntime': copy.deepcopy(runtime), 'transactionBinding':copy.deepcopy(binding),
+            'auxiliaryIdentityCoverage':coverage,'auxiliaryTerminals':copy.deepcopy(aux)}
 
     def helper_action(self, kind):
         self.gui_phase('helper-begin')
@@ -739,7 +801,13 @@ class TunCarrierRun(base.CarrierRun):
         self.gui_phase('helper-window')
         self.supervisor.begin_window(kind, self.app)
         self.gui_phase('helper-transaction-begin')
-        self.controller.call('transaction_begin', kind=kind)
+        begin=self.controller.call('transaction_begin', kind=kind)
+        import root_controller
+        require(type(begin) is dict and set(begin)=={'observing','transactionBinding'} and begin['observing']==kind,
+                'fixed transaction begin required')
+        self.transaction_binding=copy.deepcopy(root_controller.validate_transaction_binding(begin['transactionBinding'],
+            launch=self.transaction_launch,subject=self.app,kind=kind))
+        self.supervisor.bind_window(self.transaction_binding,self.transaction_launch)
         self.driver.execute("window.__tunObservation.context=arguments[0];return true;", kind)
         self.gui_phase('helper-click')
         if kind == 'install':
@@ -790,7 +858,14 @@ class TunCarrierRun(base.CarrierRun):
             subject = self.launch_options['authorization']
             recovered = verify_joint_recovery(proof, subject, getattr(self, 'membership_gid', None))
             self.membership_gid = recovered['groupGid']
-        self.supervisor.end_window(proof['owned'])
+        require(proof.get('transactionBinding')==self.transaction_binding,'transaction end differs from begin')
+        root_controller.validate_auxiliary_terminals(proof['auxiliaryTerminals'],self.transaction_binding,
+            proof['owned'],proof['pkexecBirths'],proof['rootShellBirths'])
+        coverage='incomplete' if proof['auxiliaryTerminals'] else 'complete'
+        require(proof['auxiliaryIdentityCoverage']==coverage,'transaction end coverage differs')
+        self.supervisor.end_window(proof)
+        if coverage=='incomplete' or self.result.get('auxiliaryIdentityCoverage')!='incomplete':
+            self.result['auxiliaryIdentityCoverage']=coverage
         self.driver.execute("window.__tunObservation.context=null;return true;")
         self.driver.click('.side .nav-item', self.text('settings.nav.back'))
         return {'callback': self.result['helperCallback'], 'authorization': proof}
@@ -811,7 +886,9 @@ class TunCarrierRun(base.CarrierRun):
 
     def observe_ready_core(self, timeout=75, register=True):
         self.connect_phase('status-ready')
+        deadline=time.monotonic()+timeout
         status = self.wait_ready_status(timeout)
+        binding_wait=self.new_status_observation('ready-binding',deadline)
         self.connect_phase('core-birth', status)
         require(status.get('startedViaHelper') is True, 'real production helper path required')
         if register:
@@ -824,13 +901,19 @@ class TunCarrierRun(base.CarrierRun):
         self.runtime_path = base.regular(self.runtime_path, self.home)
         require(self.runtime_path.name == 'singbox-runtime.json', 'actual private runtime path required')
         self.connect_phase('runtime-api')
-        endpoint, runtime, graph = self.observed_api_endpoint()
-        require(runtime['sha256'] == attested['runtime']['sha256'], 'root/core actual runtime differs')
+        def binding():
+            fresh=self.controller.call('core_attest')  # Existing read-only ledger/proc/runtime attestation.
+            require(same_birth(self.core,fresh['identity']) and fresh['executable']['sha256']==self.core['sha256'],
+                    'ready core changed during observation')
+            endpoint,runtime,graph=self.observed_api_endpoint(expected_status=status)
+            require(runtime['sha256']==fresh['runtime']['sha256'],'root/core actual runtime differs')
+            return endpoint,runtime,graph,fresh
+        endpoint,runtime,graph,attested=self.wait_status_proof(binding_wait,binding)
         inbounds = [i for i in graph.get('inbounds', []) if i.get('type') == 'tun']
         require(len(inbounds) == 1 and inbounds[0].get('interface_name') == 'polaris-tun0', 'original TUN interface graph required')
         self.api_endpoint = endpoint
         self.connect_phase('owned-api-probe')
-        self.rpc('capabilities')  # Root's existing frozen probe owns LISTEN-inode verification.
+        self.wait_status_proof(binding_wait,lambda:self.ready_capabilities(status))  # Read-only root owned LISTEN proof.
         if register:
             self.controller.call('tun_register')
         self.stopped = False
@@ -843,9 +926,9 @@ class TunCarrierRun(base.CarrierRun):
         self.result['configIdentity'] = runtime
         return status
 
-    def same_core(self, baseline):
+    def same_core(self, baseline, status=None):
         actual = self.controller.call('core_attest')
-        require(same_birth(baseline, actual['identity']) and self.status().get('pid') == baseline['pid'],
+        require(same_birth(baseline, actual['identity']) and (self.status() if status is None else status).get('pid') == baseline['pid'],
                 'TUN hot operation replaced owned core')
         return actual
 
@@ -933,13 +1016,20 @@ class TunCarrierRun(base.CarrierRun):
         # A remains alive and continues the old stream; only health latency changes.
         self.network.set_latency('A', 1.5); self.network.set_latency('B', 0)
         deadline = time.monotonic() + 340
+        status_wait=self.new_status_observation('auto',deadline)
+        switched=False
         while time.monotonic() < deadline:
             self.exchange(old, 'A')
-            if self.status().get('actualServerId') == 'node-b': break
+            status=self.status_observation_sample(status_wait)
+            if status is not None and status.get('actualServerId') == 'node-b':
+                switched=True
+                break
             time.sleep(3)
-        require(self.status().get('actualServerId') == 'node-b' and self.config().get('selectionIntent'),
+        require(switched and self.config().get('selectionIntent'),
                 'real native Auto failed to choose B on unchanged timer')
-        self.same_core(initial); _, fresh = self.socket('B')
+        self.same_core(initial,status=status)
+        base.gui_require(time.monotonic()<deadline,'observation-timeout')
+        _, fresh = self.socket('B')
         live = self.fixture_control('A', {'action': 'snapshot'})
         require(not live.get('errors') and live.get('closed') is not True, 'old backend must remain alive')
         self.record('auto_preserves', beforeCore=initial, afterCore=dict(self.core),
@@ -1000,7 +1090,8 @@ class TunCarrierRun(base.CarrierRun):
         self.api_endpoint = None
         require(self.status().get('running'), 'TUN OFF requires running core')
         self.driver.click('#connect-btn')
-        base.wait_for(self.status, lambda s: s.get('running') is False and not s.get('starting'), timeout=45)
+        self.wait_status_observation('off', lambda s:s.get('running') is False and not s.get('starting'),
+                                     time.monotonic()+45, phase='disconnect-status')
         proof = self.controller.call('core_stopped')
         require(proof.get('stopped') is True and same_birth(proof['identity'], self.core), 'OFF did not reap exact root-ledger core')
         self.stopped = True
@@ -1049,6 +1140,7 @@ class TunCarrierRun(base.CarrierRun):
             **self.launch_options}
         self.result['rootPreparationProgress']['stage'] = 'launch-contract'
         root_controller.validate_launch(launch)
+        self.transaction_launch={'runId':launch['runId'],'execution':copy.deepcopy(launch['execution'])}
         self.controller = Controller()
         self.result['controllerLifecycle'] = self.controller.lifecycle
         self.result['rootPreparationProgress']['stage'] = 'controller-start'

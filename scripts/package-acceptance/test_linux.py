@@ -785,7 +785,7 @@ class PrimitiveTests(unittest.TestCase):
         core = {'pid': 77, 'startTime': '125', 'uid': os.getuid(), 'sha256': 'a' * 64, 'exe': '/private/sing-box'}
         secret = 'private-test-secret-never-public'
         graph = {'services': [{'type': 'api', 'listen': '127.0.0.1', 'listen_port': port, 'secret': secret}]}
-        status = {'running': True, 'pid': 77, 'clashApiPort': port}
+        status = {'running': True, 'pid': 77, 'mainGeneration':1, 'clashApiPort': port}
         return core, secret, graph, status
 
     def test_dynamic_api_binder_matches_actual_status_not_legacy_control(self):
@@ -879,12 +879,12 @@ class PrimitiveTests(unittest.TestCase):
         run.secret, run.home, run.workspace, run.payload = secret, Path('/tmp'), Path('/tmp'), Path('/payload')
         run.members = {'core': {'path': 'sing-box'}, 'cronet': {'path': 'libcronet.so', 'sha256':'b'*64}}
         run.app = {'pid': 70, 'startTime': '100', 'sha256': 'c'*64}
-        run.status = Mock(return_value={'running':False}); run.driver = Mock(); run.supervisor = Mock()
+        run.status = Mock(side_effect=lambda: {'running':False} if run.result.get('connectObservation',{}).get('phase')=='stopped-check' else status); run.driver = Mock(); run.supervisor = Mock()
         run.supervisor.executable.return_value = core
         endpoint = M.bind_api_endpoint(graph,status,secret,core)
         run.observed_api_endpoint = Mock(return_value=(endpoint, {'sha256':'d'*64}, graph))
         run.runtime_identity = Mock(return_value={'sha256':'d'*64}); run.rpc = Mock()
-        with patch.object(M, 'wait_for', return_value=status), patch.object(M, 'regular', side_effect=lambda p,*a: p), patch.object(Path, 'read_bytes', return_value=b'core\0run\0-c\0/tmp/singbox-runtime.json\0'), patch.object(Path, 'read_text', return_value=''), patch.object(M, 'cronet_mapping', return_value={}):
+        with patch.object(run,'wait_ready_status',return_value=status), patch.object(M, 'regular', side_effect=lambda p,*a: p), patch.object(Path, 'read_bytes', return_value=b'core\0run\0-c\0/tmp/singbox-runtime.json\0'), patch.object(Path, 'read_text', return_value=''), patch.object(M, 'cronet_mapping', return_value={}):
             run.connect()
             self.assertTrue(run.result['apiEndpoint']['ownedListenerProbe'])
             self.assertEqual(run.api_endpoint['port'], 41321)
@@ -928,7 +928,7 @@ class PrimitiveTests(unittest.TestCase):
             run.secret, run.home, run.workspace, run.payload = secret, Path('/tmp'), Path('/tmp'), Path('/payload')
             run.members = {'core':{'path':'sing-box'},'cronet':{'path':'libcronet.so','sha256':'b'*64}}
             run.app = {'pid':70,'startTime':'100','sha256':'c'*64}
-            run.status = Mock(return_value={'running':False}); run.driver = Mock(); run.supervisor = Mock()
+            run.status = Mock(side_effect=lambda: {'running':False} if run.result.get('connectObservation',{}).get('phase')=='stopped-check' else status); run.driver = Mock(); run.supervisor = Mock()
             run.supervisor.executable.return_value = core
             endpoint = M.bind_api_endpoint(graph,status,secret,core)
             run.observed_api_endpoint = Mock(return_value=(endpoint,{},graph))
@@ -938,7 +938,7 @@ class PrimitiveTests(unittest.TestCase):
                 original(name,status)
                 if name == failed_phase: raise ValueError('fixture private error')
             run.connect_phase = phase
-            with patch.object(M,'wait_for',return_value=status), patch.object(M,'regular',side_effect=lambda p,*a:p), patch.object(Path,'read_bytes',return_value=b'core\0run\0-c\0/tmp/singbox-runtime.json\0'), patch.object(Path,'read_text',return_value=''), patch.object(M,'cronet_mapping',return_value={}):
+            with patch.object(run,'wait_ready_status',return_value=status), patch.object(M,'regular',side_effect=lambda p,*a:p), patch.object(Path,'read_bytes',return_value=b'core\0run\0-c\0/tmp/singbox-runtime.json\0'), patch.object(Path,'read_text',return_value=''), patch.object(M,'cronet_mapping',return_value={}):
                 with self.assertRaises(ValueError): run.connect()
             self.assertEqual(run.result['connectObservation']['phase'],failed_phase)
             self.assertNotIn(secret,json.dumps(run.result))
@@ -2142,7 +2142,10 @@ class AutoPreparationTests(unittest.TestCase):
             runtime=Mock(return_value={'globalConfirmed':True})
             with patch.object(M,'wait_for',side_effect=PreferenceApplyTests.once):
                 result=run.activate_saved_graph(True,saved,runtime,'autoActivations',phase_prefix='auto')
-            runtime.assert_called_once_with(True)
+            runtime.assert_called_once()
+            self.assertEqual(runtime.call_args.args,(True,))
+            self.assertGreater(runtime.call_args.kwargs['deadline'],M.time.monotonic())
+            self.assertLessEqual(runtime.call_args.kwargs['deadline']-M.time.monotonic(),35)
             self.assertEqual(run.result['autoActivations'],[result])
             self.assertEqual(result['restartConfirmed'],outcome=='restartRequired')
             self.assertIn(('auto-runtime-proof',),[c.args for c in run.gui_phase.call_args_list])
@@ -2186,6 +2189,194 @@ class AutoPreparationTests(unittest.TestCase):
         source=(SOURCE/'src-tauri/src/runtime/proxy/native_auto.rs').read_text()
         self.assertIn('New reference adds native outbounds',source)
         self.assertIn('self.defer_selected_projection(projected, core_generation, generation)',source)
+
+
+
+class ExplicitStatusObservationTests(unittest.TestCase):
+    def fixture(self):
+        run=PublicStatusBusyTests().fixture()
+        run.core={'pid':7,'startTime':'100'}
+        run.gui_phase=Mock();run.driver.click=Mock()
+        return run
+
+    def test_every_wait_context_preserves_typed_first_failure_and_never_replays_actions(self):
+        for context in ('off','pick','activation','auto'):
+            run=self.fixture();ready={'running':False,'starting':False,'pid':7,'actualServerId':'node-b'}
+            run.status=Mock(side_effect=[M.NativeRejected('SECRET','status-writer-busy'),
+                                        M.NativeRejected('SECRET','status-cache-busy'),ready])
+            with self.subTest(context=context),patch.object(M.time,'sleep'):
+                result=run.wait_status_observation(context,lambda s:s.get('actualServerId')=='node-b',M.time.monotonic()+10)
+            self.assertEqual(result,ready);run.driver.click.assert_not_called()
+            row=run.result['statusWaitObservations'][0]
+            self.assertEqual(row['context'],context);self.assertEqual(row['state'],'complete')
+            self.assertEqual(row['savedStateObservation']['busyCount'],2)
+            self.assertEqual(row['savedStateObservation']['firstDiagnostic'],'status-writer-busy')
+            self.assertNotIn('SECRET',json.dumps(run.result))
+            self.assertEqual(run.readiness_observation_fence.call_count,3)
+
+    def test_all_wait_contexts_reject_hard_errors_without_second_read(self):
+        import http.client
+        for context in ('off','pick','activation','auto'):
+            for error in [M.NativeRejected('SECRET',d) for d in (*M.STATUS_HARD_DIAGNOSTICS,'unknown','saved-state-unavailable')]+[
+                    http.client.RemoteDisconnected(),TimeoutError(),M.GuiFailure('webdriver-http-error'),ValueError('bad-json')]:
+                run=self.fixture();run.status=Mock(side_effect=error)
+                with self.subTest(context=context,error=type(error).__name__),self.assertRaises(type(error)):
+                    run.wait_status_observation(context,bool,M.time.monotonic()+10)
+                self.assertEqual(run.status.call_count,1);run.driver.click.assert_not_called()
+                self.assertEqual(run.result['statusWaitObservations'][0]['state'],'failed')
+
+    def test_busy_cannot_extend_absolute_deadline_or_admit_late_success(self):
+        for context in ('off','pick','activation','auto'):
+            for late in (False,True):
+                run=self.fixture();clock=[0.0]
+                def read():
+                    clock[0]+=2
+                    if late:return {'running':False,'actualServerId':'node-b'}
+                    raise M.NativeRejected('SECRET','status-writer-busy')
+                run.status=Mock(side_effect=read)
+                with self.subTest(context=context,late=late),patch.object(M.time,'monotonic',side_effect=lambda:clock[0]),self.assertRaises(M.GuiFailure):
+                    run.wait_status_observation(context,bool,1.0)
+                self.assertEqual(run.status.call_count,1)
+                self.assertNotIn('lastStatus',run.result['statusWaitObservations'][0])
+
+    def test_busy_fences_are_context_local_and_identity_failure_is_terminal(self):
+        run=self.fixture();run.status=Mock(side_effect=M.NativeRejected('SECRET','status-cache-busy'))
+        first=run.new_status_observation('off',M.time.monotonic()+10)
+        second=run.new_status_observation('pick',M.time.monotonic()+10)
+        self.assertIsNone(run.status_observation_sample(first))
+        self.assertFalse(second['busySeen']);self.assertIsNone(second['fence'])
+        run.readiness_observation_fence.side_effect=M.GuiFailure('status-readiness-app-changed')
+        with self.assertRaises(M.GuiFailure):run.status_observation_sample(second)
+        self.assertEqual(second['record']['state'],'failed')
+        with self.assertRaises(M.GuiFailure):run.new_status_observation('config-save',M.time.monotonic()+10)
+
+    def test_real_off_flow_clicks_once_then_waits_and_proves_old_core_exit(self):
+        run=self.fixture();run.status=Mock(side_effect=[{'running':True},
+            M.NativeRejected('SECRET','status-writer-busy'),{'running':False,'starting':False}])
+        with patch.object(M.time,'sleep'),patch.object(M,'process_identity',return_value=None) as identity:
+            run.disconnect()
+        run.driver.click.assert_called_once_with('#connect-btn');identity.assert_called_once_with(7)
+        self.assertEqual(run.result['statusWaitObservations'][0]['state'],'complete')
+        # A stopped status alone must not bypass the separate original-birth exit proof.
+        run=self.fixture();run.status=Mock(side_effect=[{'running':True},{'running':False}])
+        with patch.object(M,'process_identity',side_effect=PermissionError()),self.assertRaises(PermissionError):run.disconnect()
+        run.driver.click.assert_called_once_with('#connect-btn')
+
+    def test_off_precondition_remains_strict_and_does_not_click(self):
+        run=self.fixture();run.status=Mock(side_effect=M.NativeRejected('SECRET','status-writer-busy'))
+        with self.assertRaises(M.NativeRejected):run.disconnect()
+        run.driver.click.assert_not_called();self.assertNotIn('statusWaitObservations',run.result)
+
+    def test_pick_readback_busy_does_not_reclick_node(self):
+        run=GuiNavigationContracts().run_fixture('true');run.driver.session='same-session'
+        run.readiness_observation_fence=Mock()
+        run.status.side_effect=[{'running':True},M.NativeRejected('SECRET','status-cache-busy'),{'actualServerId':'node-a'},{'actualServerId':'node-b'}]
+        with patch.object(M.time,'sleep'):run.pick('B')
+        self.assertEqual([c.args[0]['element'][M.ELEMENT] for c in run.driver.click_control.call_args_list],['fixture-node'])
+        self.assertEqual(run.result['statusWaitObservations'][0]['context'],'pick')
+
+    def test_activation_busy_samples_preserve_original_generation_and_single_apply(self):
+        run=PreferenceApplyTests().fixture('hotApplied');run.driver.session='same-session';run.readiness_observation_fence=Mock()
+        good={'running':True,'mainGeneration':1,'pid':10}
+        run.status.side_effect=[good,M.NativeRejected('SECRET','status-writer-busy'),good]
+        with patch.object(M,'wait_for',side_effect=PreferenceApplyTests.sequence):proof=run.activate_saved_preference(True)
+        self.assertEqual(proof['apply'],'hotApplied');run.apply.assert_called_once()
+        self.assertEqual(run.result['statusWaitObservations'][0]['savedStateObservation']['busyCount'],1)
+        run.same_core.assert_any_call({'pid':10,'startTime':'100'},status=good)
+        run=PreferenceApplyTests().fixture('hotApplied');run.driver.session='same-session';run.readiness_observation_fence=Mock()
+        run.status.side_effect=[good,M.NativeRejected('SECRET','status-cache-busy'),{**good,'mainGeneration':2}]
+        with patch.object(M,'wait_for',side_effect=PreferenceApplyTests.sequence),self.assertRaises(M.GuiFailure):run.activate_saved_preference(True)
+        run.apply.assert_not_called()
+
+    def test_activation_final_sample_busy_cannot_claim_no_pending_or_skip_changed_disk(self):
+        run=PreferenceApplyTests().fixture('hotApplied');run.driver.session='same-session';run.readiness_observation_fence=Mock()
+        good={'running':True,'mainGeneration':1,'pid':10};empty={'bars':0,'buttons':0,'disabled':False}
+        run.status.side_effect=[good,good,M.NativeRejected('SECRET','status-writer-busy'),good,good]
+        run.pending_apply_control.side_effect=None;run.pending_apply_control.return_value=empty
+        with patch.object(M,'wait_for',side_effect=PreferenceApplyTests.sequence):proof=run.activate_saved_preference(True)
+        self.assertEqual(proof['apply'],'not-needed');run.apply.assert_not_called()
+        self.assertEqual(run.preference_disk.call_count,6)
+        run.preference_runtime.assert_called_once_with(True)
+
+    def test_auto_busy_preserves_live_stream_and_fixed_timer_without_manual_switch(self):
+        run=self.fixture();run.prepare_auto=Mock();run.network=Mock();run.same_core=Mock();run.pick=Mock()
+        run.socket=Mock(side_effect=[('old',{'backend':'A'}),('new',{'backend':'B'})])
+        run.exchange=Mock(return_value={'backend':'A'});run.config=Mock(return_value={'selectionIntent':{'mode':'auto'}})
+        run.record=Mock();run.snapshot=Mock(return_value={})
+        run.status=Mock(side_effect=[M.NativeRejected('SECRET','status-writer-busy'),{'pid':7,'actualServerId':'node-a'},
+                                    {'pid':7,'actualServerId':'node-b'}])
+        with patch.object(M.time,'sleep') as sleep,patch.object(M,'process_identity',return_value=run.core):run.auto_case()
+        self.assertEqual(run.exchange.call_count,4);self.assertEqual(run.socket.call_count,2)
+        self.assertEqual([c.args for c in sleep.call_args_list],[(3,),(3,)])
+        self.assertEqual(run.network.a.set_admission.call_args_list[0].args,(False,))
+        self.assertEqual(run.network.a.set_admission.call_count,2)
+        self.assertEqual(run.record.call_args.kwargs['keepaliveExchanges'],3)
+        run.pick.assert_called_once_with('A') # original cleanup selection only, no simulated Auto switch
+
+    def test_authority_reads_and_other_commands_have_no_busy_fallback(self):
+        source=Path(M.__file__).read_text()
+        self.assertIn("return self.driver.invoke('proxy_get_status')",source)
+        for method,end in [('observed_api_endpoint','revalidate_api_endpoint'),('same_core','selection_cases')]:
+            body=source.split('    def '+method+'(',1)[1].split('    def '+end+'(',1)[0]
+            self.assertNotIn('except NativeRejected',body)
+        run=self.fixture();run.driver.invoke=Mock(side_effect=M.NativeRejected('SECRET','status-cache-busy'))
+        with self.assertRaises(M.NativeRejected):M.CarrierRun.status(run)
+        run.driver.invoke.assert_called_once_with('proxy_get_status')
+
+
+
+class StatusBoundProofTests(unittest.TestCase):
+    def test_runtime_capture_is_discarded_on_busy_and_generation_change_fails(self):
+        core,secret,graph,status=PrimitiveTests().api_fixture()
+        for changed in (False,True):
+            run=ExplicitStatusObservationTests().fixture();run.core=core;run.secret=secret
+            run.runtime_path=Path('/private/runtime');run.home=Path('/private');run.workspace=Path('/private')
+            old={'pid':core['pid'],'startTime':core['startTime'],'sha256':'a'*64}
+            new={**old,'sha256':'b'*64}
+            run.status=Mock(side_effect=[M.NativeRejected('SECRET','status-writer-busy'),{**status,'mainGeneration':2 if changed else 1}])
+            run.runtime_identity=Mock(return_value=new)
+            context=run.new_status_observation('ready-binding',M.time.monotonic()+10)
+            with patch.object(M,'stable_runtime_capture',side_effect=[(old,graph),(new,graph)]) as capture,patch.object(M.time,'sleep'):
+                if changed:
+                    with self.assertRaises(M.GuiFailure):run.wait_status_proof(context,lambda:run.observed_api_endpoint(expected_status=status))
+                    run.runtime_identity.assert_not_called()
+                else:
+                    _,proof,_=run.wait_status_proof(context,lambda:run.observed_api_endpoint(expected_status=status))
+                    self.assertEqual(proof,new);run.runtime_identity.assert_called_once()
+                self.assertEqual(capture.call_count,2)
+
+    def test_pick_initial_post_action_sample_can_wait_without_replaying_selection(self):
+        run=GuiNavigationContracts().run_fixture('true');run.driver.session='same-session';run.readiness_observation_fence=Mock()
+        run.status.side_effect=[M.NativeRejected('SECRET','status-writer-busy'),{'running':True},{'actualServerId':'node-b'}]
+        with patch.object(M.time,'sleep'):run.pick('B')
+        self.assertEqual([c.args[0]['element'][M.ELEMENT] for c in run.driver.click_control.call_args_list],['fixture-node'])
+        self.assertEqual(len(run.result['statusWaitObservations']),1)
+        self.assertEqual(run.result['statusWaitObservations'][0]['savedStateObservation']['busyCount'],1)
+
+    def test_activation_baseline_and_final_proof_reacquire_whole_binding_without_reapply(self):
+        run=PreferenceApplyTests().fixture('hotApplied');run.driver.session='same-session';run.readiness_observation_fence=Mock()
+        good={'running':True,'mainGeneration':1,'pid':10}
+        run.status.side_effect=[M.NativeRejected('SECRET','status-cache-busy'),good,good]
+        accepted=run.preference_runtime.return_value
+        run.preference_runtime.side_effect=[M.NativeRejected('SECRET','status-writer-busy'),accepted]
+        with patch.object(M,'wait_for',side_effect=PreferenceApplyTests.sequence):proof=run.activate_saved_preference(True)
+        self.assertEqual(proof['acceptedRuntime'],accepted);run.apply.assert_called_once()
+        self.assertEqual(run.preference_runtime.call_count,2)
+        self.assertGreaterEqual(run.preference_disk.call_count,6)
+        self.assertEqual(run.result['statusWaitObservations'][0]['savedStateObservation']['busyCount'],2)
+
+    def test_bound_read_final_generation_and_deadline_are_not_stale_success(self):
+        run=ExplicitStatusObservationTests().fixture();expected={'running':True,'pid':7,'mainGeneration':1}
+        run.status=Mock(side_effect=[expected,{**expected,'mainGeneration':2}]);run.rpc=Mock(return_value={'active':{}})
+        context=run.new_status_observation('ready-binding',M.time.monotonic()+10)
+        with self.assertRaises(M.GuiFailure):run.wait_status_proof(context,lambda:run.ready_capabilities(expected))
+        run.rpc.assert_called_once_with('capabilities')
+        clock=[0.0];run=ExplicitStatusObservationTests().fixture()
+        def late():clock[0]=2;return {'proof':'not-admissible'}
+        with patch.object(M.time,'monotonic',side_effect=lambda:clock[0]):
+            context=run.new_status_observation('activation',1.0)
+            with self.assertRaises(M.GuiFailure):run.wait_status_proof(context,late)
+        self.assertEqual(context['record']['state'],'failed')
 
 
 if __name__ == '__main__':
