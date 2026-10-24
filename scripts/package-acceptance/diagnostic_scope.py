@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 
 SCHEMA = 'polaris-package-workflow-diagnostic-v1'
 STEPS = ('checkout', 'admission', 'native_tools', 'test_tools', 'protoc',
@@ -118,6 +119,108 @@ def preflight_context(env, event):
             'attempt': field(env, 'GITHUB_RUN_ATTEMPT', r'[1-9][0-9]{0,9}')}
 
 
+HOST_LIMIT = 262144
+HOST_QUERIES = (
+    ('/usr/bin/systemctl', '--system', 'show', '--all', '--property=ControlGroup'),
+    ('/usr/bin/systemctl', '--system', 'show', '--all',
+     '--property=ControlGroup,LoadState,ActiveState', 'init.scope'),
+)
+
+
+def host_read(path):
+    with open(path, 'rb') as stream:
+        value = stream.read(HOST_LIMIT + 1)
+    require(len(value) <= HOST_LIMIT, 'Host observation limit')
+    return value.decode('utf-8', errors='strict')
+
+
+def host_query(argv):
+    require(tuple(argv) in HOST_QUERIES, 'Fixed host query required')
+    result = subprocess.run(list(argv), stdin=subprocess.DEVNULL, capture_output=True,
+        check=True, timeout=3, env={'PATH':'/usr/bin:/bin', 'LANG':'C', 'LC_ALL':'C'})
+    require(len(result.stdout) <= HOST_LIMIT, 'Host observation limit')
+    return result.stdout.decode('utf-8', errors='strict')
+
+
+def host_properties(raw, keys):
+    rows = raw.splitlines()
+    require(len(rows) == len(keys), 'Unique explicit properties required')
+    result = {}
+    for row in rows:
+        key, sep, value = row.partition('=')
+        require(sep and key in keys and key not in result, 'Unique explicit properties required')
+        result[key] = value
+    require(set(result) == set(keys), 'Complete properties required')
+    return result
+
+
+def host_hierarchy(raw):
+    rows = raw.splitlines()
+    if len(rows) != 1: return 'multiple-or-missing'
+    return {'0::/':'root', '0::/init.scope':'init-scope'}.get(rows[0], 'other')
+
+
+def host_group(value):
+    return {'':'explicit-empty', '/':'root-slash', '/init.scope':'init-scope'}.get(value, 'other')
+
+
+def observe_host_facts(*, read=host_read, query=host_query, stat_path=os.stat, readlink=os.readlink):
+    """Ordinary-user diagnostics only. No value here grants VM/credential authority."""
+    rows = {}
+    def observe(name, action):
+        try:
+            value = action()
+            rows[name] = {'state':'observed', 'value':value, 'error':'none'}
+            return value
+        except Exception as error:
+            code = ('timeout' if isinstance(error, subprocess.TimeoutExpired) else
+                    'command-failed' if isinstance(error, subprocess.CalledProcessError) else
+                    'permission' if isinstance(error, PermissionError) else
+                    'missing' if isinstance(error, FileNotFoundError) else
+                    'decode' if isinstance(error, UnicodeError) else
+                    'invalid' if isinstance(error, ValueError) else 'unknown')
+            rows[name] = {'state':'unknown', 'value':None, 'error':code}
+            return None
+    observe('pid1Comm', lambda: 'systemd' if read('/proc/1/comm').strip() == 'systemd' else 'other')
+    observe('pid1Owner', lambda: 'root' if stat_path('/proc/1').st_uid == 0 else 'nonroot')
+    before = observe('pid1HierarchyBefore', lambda: host_hierarchy(read('/proc/1/cgroup')))
+    observe('managerControlGroup', lambda: host_group(host_properties(query(HOST_QUERIES[0]), ('ControlGroup',))['ControlGroup']))
+    def unit():
+        props = host_properties(query(HOST_QUERIES[1]), ('ControlGroup','LoadState','ActiveState'))
+        return {'controlGroup':host_group(props['ControlGroup']),
+                'load':props['LoadState'] if props['LoadState'] in ('loaded','not-found') else 'other',
+                'active':props['ActiveState'] if props['ActiveState'] in ('active','inactive','failed') else 'other'}
+    observe('initScope', unit)
+    for name in ('pid','mnt','cgroup'):
+        def namespace(name=name):
+            a = readlink('/proc/1/ns/' + name); b = readlink('/proc/self/ns/' + name)
+            require(re.fullmatch(name + r':\[[0-9]+\]', a) is not None and
+                    re.fullmatch(name + r':\[[0-9]+\]', b) is not None, 'Namespace format')
+            return 'same' if a == b else 'different'
+        observe(name + 'Namespace', namespace)
+    def mount():
+        values = [row.split() for row in read('/proc/self/mountinfo').splitlines()]
+        require(all(len(row) >= 10 and '-' in row for row in values), 'Mount record format')
+        roots = [row for row in values if row[4] == '/sys/fs/cgroup']
+        return ('root-cgroup2' if len(roots) == 1 and roots[0][3] == '/' and
+            roots[0][roots[0].index('-') + 1] == 'cgroup2' and
+            not any(row[4].startswith('/sys/fs/cgroup/') for row in values) else 'other')
+    observe('cgroupMount', mount)
+    def member():
+        require(before in ('root','init-scope'), 'Known membership path required')
+        path = '/sys/fs/cgroup/' + ('init.scope/' if before == 'init-scope' else '') + 'cgroup.procs'
+        values = read(path).splitlines()
+        require(all(re.fullmatch(r'[1-9][0-9]*', value) for value in values), 'Membership record format')
+        return 'present' if '1' in values else 'absent'
+    observe('pid1Membership', member)
+    after = observe('pid1HierarchyAfter', lambda: host_hierarchy(read('/proc/1/cgroup')))
+    stability = ('stable' if before == after else 'changed') if before in ('root','init-scope') and after in ('root','init-scope') else 'unknown'
+    return {'schema':'polaris-readonly-host-cgroup-observation-v1',
+            'scope':'sampled-host-diagnostic-not-vm-or-credential-authority',
+            'observations':rows, 'membershipStability':stability,
+            'queryTimeoutSeconds':3, 'queryCountLimit':2}
+
+
 def build_auth_preflight(env, event):
     context = preflight_context(env, event)
     uid = os.getuid()
@@ -134,7 +237,7 @@ def build_auth_preflight(env, event):
             'scope': 'read-only-account-group-diagnostic-not-credential-authority',
             'acceptance': False, 'publicationEligible': False, 'context': context,
             'runtime': 'not-started', 'cleanup': 'not-assessed', 'currentUid': uid,
-            'groupObservation': groups}
+            'groupObservation': groups, 'hostFacts': observe_host_facts()}
 
 
 def run_auth_preflight(env, root):

@@ -119,6 +119,10 @@ def preflight_fixture():
 
 
 class AuthPreflightTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(m, "observe_host_facts", return_value={"scope":"mock-host-diagnostic"})
+        patcher.start(); self.addCleanup(patcher.stop)
+
     def user(self): return types.SimpleNamespace(pw_uid=1001,pw_gid=42,pw_name='runner',pw_gecos='PRIVATE',pw_passwd='PRIVATE')
 
     def build(self, rows):
@@ -196,6 +200,92 @@ class AuthPreflightTests(unittest.TestCase):
                 data=(Path(temp)/m.AUTH_OUTPUT).read_text(); value=json.loads(data)
                 self.assertNotIn('PRIVATE',data);self.assertFalse(value['acceptance'])
                 self.assertEqual(value['groupObservation']['lookupState'],'failed' if error else 'observed')
+                self.assertEqual(value['hostFacts'], {'scope':'mock-host-diagnostic'})
+
+
+class HostFactsTests(unittest.TestCase):
+    def fixture(self, changes=None, replies=None):
+        files = {'/proc/1/comm':'systemd\n', '/proc/1/cgroup':'0::/init.scope\n',
+            '/proc/self/mountinfo':'30 20 0:2 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n',
+            '/sys/fs/cgroup/init.scope/cgroup.procs':'1\n2\n', '/sys/fs/cgroup/cgroup.procs':'1\n'}
+        files.update(changes or {})
+        calls = []
+        def read(path):
+            value = files[path]
+            if isinstance(value, Exception): raise value
+            if isinstance(value, list): return value.pop(0)
+            return value
+        def query(argv):
+            calls.append(tuple(argv))
+            value = (replies or {}).get(tuple(argv), 'ControlGroup=\n' if tuple(argv) == m.HOST_QUERIES[0]
+                else 'ControlGroup=\nLoadState=loaded\nActiveState=active\n')
+            if isinstance(value, Exception): raise value
+            return value
+        return dict(read=read, query=query, stat_path=lambda p: types.SimpleNamespace(st_uid=0),
+            readlink=lambda p: p.rsplit('/',1)[1] + ':[42]'), calls
+
+    def test_unit_empty_is_not_manager_root_and_all_reads_are_fixed(self):
+        args,calls = self.fixture(); value = m.observe_host_facts(**args)
+        rows = value['observations']
+        self.assertEqual(rows['managerControlGroup']['value'],'explicit-empty')
+        self.assertEqual(rows['initScope']['value']['controlGroup'],'explicit-empty')
+        self.assertEqual(rows['pid1Membership']['value'],'present')
+        self.assertEqual(value['membershipStability'],'stable')
+        self.assertEqual(calls,list(m.HOST_QUERIES));self.assertNotIn('acceptance',value)
+        self.assertNotIn('/init.scope',json.dumps(value))
+
+    def test_properties_missing_duplicate_wrong_and_unknown_are_not_empty(self):
+        for raw in ('', 'Other=PRIVATE', 'ControlGroup=\nControlGroup=/', 'ControlGroup=\nX=PRIVATE'):
+            args,_ = self.fixture(replies={m.HOST_QUERIES[0]:raw})
+            value=m.observe_host_facts(**args)
+            self.assertEqual(value['observations']['managerControlGroup']['error'],'invalid')
+            self.assertNotIn('PRIVATE',json.dumps(value))
+        args,_=self.fixture(replies={m.HOST_QUERIES[1]:'ControlGroup=/PRIVATE\nLoadState=loaded\nActiveState=active'})
+        value=m.observe_host_facts(**args)
+        self.assertEqual(value['observations']['initScope']['value']['controlGroup'],'other')
+        self.assertNotIn('PRIVATE',json.dumps(value))
+
+    def test_command_failure_does_not_skip_independent_query_or_leak(self):
+        for error,code in ((m.subprocess.TimeoutExpired('PRIVATE',3),'timeout'),
+                          (m.subprocess.CalledProcessError(1,'PRIVATE',stderr='PRIVATE'),'command-failed'),
+                          (PermissionError('PRIVATE'),'permission')):
+            args,calls=self.fixture(replies={m.HOST_QUERIES[0]:error})
+            value=m.observe_host_facts(**args)
+            self.assertEqual(value['observations']['managerControlGroup']['error'],code)
+            self.assertEqual(value['observations']['initScope']['state'],'observed')
+            self.assertEqual(len(calls),2);self.assertNotIn('PRIVATE',json.dumps(value))
+
+    def test_membership_and_stability_never_infer_missing_unknown(self):
+        for change,key,wanted in (({'/proc/1/cgroup':['0::/init.scope','0::/']},None,'changed'),
+            ({'/proc/1/cgroup':'0::/PRIVATE'},None,'unknown'),
+            ({'/sys/fs/cgroup/init.scope/cgroup.procs':'2\n'},'pid1Membership','absent'),
+            ({'/sys/fs/cgroup/init.scope/cgroup.procs':PermissionError('PRIVATE')},'pid1Membership',None),
+            ({'/proc/self/mountinfo':'30 20 0:2 /nested /sys/fs/cgroup rw - cgroup2 cgroup rw'},'cgroupMount','other')):
+            args,_=self.fixture(change);value=m.observe_host_facts(**args)
+            self.assertEqual(value['observations'][key]['value'] if key else value['membershipStability'],wanted)
+            self.assertNotIn('PRIVATE',json.dumps(value))
+
+    def test_invalid_hierarchy_permission_namespace_and_owner_stay_classified(self):
+        for raw in ('', '0::/\n0::/init.scope\n', 'PRIVATE', PermissionError('PRIVATE')):
+            args,_=self.fixture({'/proc/1/cgroup':raw}); value=m.observe_host_facts(**args)
+            self.assertEqual(value['membershipStability'],'unknown')
+            self.assertEqual(value['observations']['pid1Membership']['state'],'unknown')
+            self.assertNotIn('PRIVATE',json.dumps(value))
+        args,_=self.fixture()
+        args['stat_path']=lambda p: types.SimpleNamespace(st_uid=1001)
+        args['readlink']=lambda p: p.rsplit('/',1)[1]+(':[42]' if '/1/' in p else ':[43]')
+        value=m.observe_host_facts(**args)
+        self.assertEqual(value['observations']['pid1Owner']['value'],'nonroot')
+        for key in ('pidNamespace','mntNamespace','cgroupNamespace'):
+            self.assertEqual(value['observations'][key]['value'],'different')
+
+    def test_host_query_fixed_readonly_timeout_and_environment(self):
+        with patch.object(m.subprocess,'run',return_value=types.SimpleNamespace(stdout=b'ControlGroup=\n')) as run:
+            self.assertEqual(m.host_query(m.HOST_QUERIES[0]),'ControlGroup=\n')
+            self.assertEqual(run.call_args.kwargs['timeout'],3)
+            self.assertEqual(run.call_args.kwargs['env'],{'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'})
+            with self.assertRaises(ValueError):m.host_query(['/usr/bin/systemctl','start','PRIVATE'])
+            self.assertEqual(run.call_count,1)
 
 
 if __name__ == '__main__':

@@ -1705,6 +1705,7 @@ class PreferenceApplyTests(unittest.TestCase):
     def fixture(self, outcome='restartRequired'):
         run=M.CarrierRun.__new__(M.CarrierRun)
         run.result={};run.core={'pid':10,'startTime':'100'}
+        run.activation_runtime_ready=Mock(return_value=True)
         run.preference_disk=Mock(return_value={'value':True,'sha256':'a'*64})
         run.status=Mock(return_value={'running':True,'mainGeneration':1,'pid':10})
         run.gui_phase=Mock();run.connect_phase=Mock();run.same_core=Mock();run.retire_applied_core=Mock()
@@ -1726,6 +1727,49 @@ class PreferenceApplyTests(unittest.TestCase):
     @staticmethod
     def once(read, condition=bool, **kwargs):
         value=read();M.gui_require(condition(value),'observation-timeout');return value
+
+    @staticmethod
+    def sequence(read, condition=bool, **kwargs):
+        for _ in range(8):
+            value=read()
+            if condition(value):return value
+        raise M.GuiFailure('observation-timeout')
+
+    def test_delayed_pending_is_not_noop_then_apply_exactly_once(self):
+        run=self.fixture('hotApplied')
+        empty={'bars':0,'buttons':0,'disabled':False}
+        button={'bars':1,'buttons':1,'disabled':False}
+        run.pending_apply_control.side_effect=[empty,empty,{**button,'disabled':True},button,empty]
+        run.activation_runtime_ready.return_value=False
+        with patch.object(M,'wait_for',side_effect=self.sequence):proof=run.activate_saved_preference(True)
+        self.assertEqual(proof['apply'],'hotApplied');run.apply.assert_called_once()
+        self.assertEqual(run.result['activationObservation']['samples'],4)
+        self.assertEqual(run.activation_runtime_ready.call_count,2)
+        run.preference_runtime.assert_called_once_with(True)
+
+    def test_pending_appearing_during_owned_capture_wins(self):
+        run=self.fixture('hotApplied');empty={'bars':0,'buttons':0,'disabled':False};button={'bars':1,'buttons':1,'disabled':False}
+        run.pending_apply_control.side_effect=[empty,button,button,empty]
+        with patch.object(M,'wait_for',side_effect=self.sequence):proof=run.activate_saved_preference(True)
+        self.assertEqual(proof['apply'],'hotApplied');run.apply.assert_called_once()
+
+    def test_not_ready_or_changed_or_invalid_never_applies_or_claims_acceptance(self):
+        for fault in ('never-ready','schema','generation','saved','runtime-schema'):
+            run=self.fixture();empty={'bars':0,'buttons':0,'disabled':False}
+            run.pending_apply_control.side_effect=None;run.pending_apply_control.return_value=empty
+            run.activation_runtime_ready.return_value=False
+            if fault=='schema':run.pending_apply_control.return_value={**empty,'buttons':True}
+            if fault=='generation':run.status.side_effect=[run.status.return_value,{**run.status.return_value,'mainGeneration':2}]
+            if fault=='saved':run.preference_disk.side_effect=[{'value':True},{'value':False}]
+            if fault=='runtime-schema':run.activation_runtime_ready.side_effect=M.GuiFailure('auto-runtime-outbound-schema-invalid')
+            with self.subTest(fault=fault),patch.object(M,'wait_for',side_effect=self.sequence),self.assertRaises(M.GuiFailure):run.activate_saved_preference(True)
+            run.apply.assert_not_called();self.assertNotIn('preferenceActivations',run.result)
+            self.assertEqual(run.result['activationObservation']['state'],'failed')
+
+    def test_apply_disappearing_is_not_replayed(self):
+        run=self.fixture('hotApplied');run.apply.side_effect=M.GuiFailure('control-missing')
+        with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.activate_saved_preference(True)
+        run.apply.assert_called_once();run.preference_runtime.assert_not_called()
 
     def test_restart_scheduled_is_not_ready_and_binds_exact_terminal_new_core(self):
         run=self.fixture()
@@ -1856,7 +1900,8 @@ class AutoPreparationTests(unittest.TestCase):
         row={'count':1,'checked':'true' if enabled else 'false','disabled':False,'busy':'false'}
         run.driver.execute.side_effect=[row]+([] if enabled else [{'count':1,'checked':'true','disabled':False,'busy':'false'}])+['false']
         run.config=Mock(side_effect=[{'autoSelectEnabled':enabled}]+([] if enabled else [{'autoSelectEnabled':True}])+[{'autoSelectEnabled':True,'selectionIntent':{'mode':'auto','scope':'global'}}])
-        run.driver.observations.side_effect=[[],[{'sequence':1,'source':'original-auto-mode-callback','success':True,'intentApplied':True,'featureEnabled':True,'generation':3,'applyOutcome':'applied'}]]
+        receipt={'sequence':1,'source':'original-auto-mode-callback','success':True,'intentApplied':True,'featureEnabled':True,'generation':3,'applyOutcome':'applied'}
+        run.driver.observations.side_effect=([] if enabled else [[],[receipt]]) + [[receipt],[receipt,{**receipt,'sequence':2,'applyOutcome':'deferred'}]]
         run.driver.invoke.return_value={'featureEnabled':True,'generation':3}
         run.activate_saved_graph=Mock(return_value={'acceptedRuntime':True})
         return run
@@ -1886,6 +1931,21 @@ class AutoPreparationTests(unittest.TestCase):
             run.driver.observations.side_effect=[[],[row]]
             with patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.prepare_auto()
             self.assertEqual(run.driver.click.call_count,3);run.activate_saved_graph.assert_not_called()
+
+    def test_global_intent_receipt_rejection_ambiguity_and_generation_fail_without_apply(self):
+        for fault in ('rejected','generation','ambiguous','unknown-outcome'):
+            run=self.prepared(True)
+            row={'sequence':2,'source':'original-auto-mode-callback','success':True,'intentApplied':True,
+                 'featureEnabled':True,'generation':3,'applyOutcome':'deferred'}
+            if fault=='rejected':row['success']=False
+            elif fault=='generation':row['generation']=4
+            elif fault=='unknown-outcome':row['applyOutcome']='PRIVATE'
+            rows=[row,{**row,'sequence':3}] if fault=='ambiguous' else [row]
+            run.driver.observations.side_effect=[[],rows]
+            with self.subTest(fault=fault),patch.object(M,'wait_for',side_effect=self.once),self.assertRaises(M.GuiFailure):run.prepare_auto()
+            run.activate_saved_graph.assert_not_called()
+            self.assertEqual([c.args[0] for c in run.driver.click.call_args_list].count('#node-menu [data-auto-select-scope="global"] .auto-choice-pick'),1)
+            self.assertNotIn('PRIVATE',json.dumps(run.result))
 
     def runtime(self):
         run=M.CarrierRun.__new__(M.CarrierRun);run.result={};run.core={'pid':10,'startTime':'1'};run.api_endpoint={'port':1}
@@ -1961,6 +2021,25 @@ class AutoPreparationTests(unittest.TestCase):
         graph['outbounds'][2]['outbounds']=['stable-opaque-b','proxy-opaque-a']
         with patch.object(M,'wait_for',side_effect=self.once):run.auto_runtime(True)
         self.assertTrue(run.result['autoRuntimeObservation']['checks']['member-set']['passed'])
+
+    def test_preparation_waits_for_real_graph_not_empty_pending_frame(self):
+        run,graph=self.runtime()
+        graph['outbounds']=[o for o in graph['outbounds'] if o.get('tag')!='polaris-auto-global']
+        self.assertFalse(run.activation_runtime_ready(True,'auto'))
+        self.assertEqual(run.result['autoRuntimePreparation']['state'],'waiting')
+        run.driver.invoke.assert_not_called()
+        run,graph=self.runtime()
+        self.assertTrue(run.activation_runtime_ready(True,'auto'))
+        run.driver.invoke.assert_not_called()
+        # Graph readiness must not authorize malformed/canonical-invalid graphs.
+        for fault in ('duplicate','type','interval','null-interrupt'):
+            run,graph=self.runtime()
+            if fault=='duplicate':graph['outbounds'].append(dict(graph['outbounds'][1]))
+            elif fault=='type':graph['outbounds'][1]['type']='direct'
+            elif fault=='interval':graph['outbounds'][2]['interval']='PRIVATE'
+            else:graph['outbounds'][1]['interrupt_exist_connections']=None
+            with self.subTest(fault=fault),self.assertRaises(M.GuiFailure):run.activation_runtime_ready(True,'auto')
+            self.assertNotIn('PRIVATE',json.dumps(run.result))
 
     def test_auto_uses_same_hot_and_restart_lifecycle_gate_before_runtime_proof(self):
         for outcome in ('hotApplied','restartRequired'):

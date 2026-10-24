@@ -96,7 +96,11 @@ if (mode === 'recovery') {
   test.fail = () => { recovery = { ...recovery, revision: 2, phase: 'failed', terminal: true }; useSubscriptionCreateOperationStore.getState().accept(recovery); };
 }
 if (mode === 'apply' || mode === 'mobile-apply') {
-  useAppStore.setState({ pendingChanges: { added: [], removed: [], modified: [], restartDeferred: true } });
+  const deferred = new URLSearchParams(location.search).has('deferredPending');
+  test.publishPending = value => useAppStore.getState().setPendingChanges({ added: [], removed: [], modified: [], restartDeferred: value });
+  test.publishPending(!deferred);
+  // Saved intent and the later native pending PUSH are independent publications.
+  if (deferred) useAppStore.setState({ config: { ...config, selectionIntent: { mode: 'auto', scope: 'global' } } });
   const schedule = window.setTimeout.bind(window);
   window.setTimeout = (callback, delay, ...args) => delay === 12000 ? (test.fallback = callback, 0) : schedule(callback, delay, ...args);
 }
@@ -399,6 +403,27 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
     { mode: 'apply', button: '.pending-bar .btn.flow', errorBar: '.pending-bar.err' },
     { mode: 'mobile-apply', button: '.m-pending .m-pending-primary', errorBar: '.m-pending.m-pending-err' },
   ])('attributed Apply consumer: $mode', ({ mode, button, errorBar }) => {
+    it('does not treat saved intent plus an empty first frame as accepted runtime', async () => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/__transactions?mode=' + mode + '&deferredPending=1');
+      await page.waitForFunction('typeof window.__transactions.publishPending === "function"');
+      expect(await page.locator(button).count()).toBe(0);
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(0);
+      await page.evaluate('window.__transactions.publishPending(true)');
+      await page.locator(button).waitFor({state:'visible'});
+      // A newer empty publication must remove the action, not authorize a stale click.
+      await page.evaluate('window.__transactions.publishPending(false)');
+      await page.locator(button).waitFor({state:'hidden'});
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(0);
+      await page.evaluate('window.__transactions.publishPending(true)');
+      await page.locator(button).click();
+      await page.waitForFunction('typeof window.__transactions.receipt === "function"');
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      await page.evaluate('window.__transactions.publishPending(false); window.__transactions.receipt({ok:true,status:"hotApplied",transactionId:"original",runtimeGeneration:10,selectionIntentGeneration:0})');
+      await page.locator(button).waitFor({state:'hidden'});
+      expect(await page.evaluate('window.__transactions.applyCalls')).toBe(1);
+      await page.close();
+    });
     it('reconciles persistence through the original status token without replay', async () => {
       const page = await browser.newPage();
       await page.goto(origin + '/__transactions?mode=' + mode);

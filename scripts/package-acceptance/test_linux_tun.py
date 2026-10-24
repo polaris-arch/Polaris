@@ -933,6 +933,29 @@ class ControllerLifecycleContracts(unittest.TestCase):
             self.assertNotIn('apiEndpoint', run.result)
             self.assertEqual(run.result['connectObservation']['phase'], 'owned-api-probe' if failure == 'owned-listener' else 'runtime-api')
 
+    def test_shared_activation_waits_for_tun_target_without_registration_or_mutation(self):
+        self.assertIs(M.TunCarrierRun.activate_saved_graph, M.base.CarrierRun.activate_saved_graph)
+        self.assertIs(M.TunCarrierRun.activation_runtime_ready, M.base.CarrierRun.activation_runtime_ready)
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun)
+        run.result={};run.core={'pid':10,'startTime':'1'};run.api_endpoint={'port':1234}
+        run.controller=Mock();run.status=Mock(return_value={'running':True,'pid':10,'mainGeneration':3})
+        run.same_core=Mock();run.gui_phase=Mock();run.apply=Mock()
+        run.pending_apply_control=Mock(return_value={'bars':0,'buttons':0,'disabled':False})
+        old={'outbounds':[{'tag':'proxy-selector','type':'selector'}]}
+        new={'outbounds':[{'tag':'proxy-selector','type':'selector','interrupt_exist_connections':True}]}
+        proof={'pid':10,'startTime':'1','sha256':H}
+        run.observed_api_endpoint=Mock(side_effect=[(run.api_endpoint,proof,old),(run.api_endpoint,proof,new),(run.api_endpoint,proof,new)])
+        def wait(read,condition=bool,**kwargs):
+            for _ in range(4):
+                value=read()
+                if condition(value):return value
+            raise M.base.GuiFailure('observation-timeout')
+        with patch.object(M.base,'wait_for',side_effect=wait):
+            result=run.activate_saved_graph(True,lambda:{'value':True},run.preference_runtime,'preferenceActivations')
+        self.assertEqual(result['apply'],'not-needed');self.assertEqual(run.result['activationObservation']['samples'],2)
+        self.assertTrue(result['acceptedRuntime']['selectorInterrupt'])
+        run.apply.assert_not_called();run.controller.call.assert_not_called()
+
     def test_tun_rpc_brackets_root_call_without_supplying_endpoint_authority(self):
         run = M.TunCarrierRun.__new__(M.TunCarrierRun)
         run.controller = Mock(); run.revalidate_api_endpoint = Mock()

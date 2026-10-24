@@ -1846,6 +1846,33 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
     def activate_saved_preference(self, wanted):
         return self.activate_saved_graph(wanted, self.preference_disk, self.preference_runtime, 'preferenceActivations')
 
+    def activation_runtime_ready(self, wanted, phase):
+        # Read-only preparation predicate, not the final business proof. An absent
+        # first Auto graph or the previous boolean policy is a legitimate old R.
+        # Malformed schemas, ownership failures and transport errors still fail.
+        if phase == 'preference':
+            endpoint, _, graph = self.observed_api_endpoint()
+            gui_require(endpoint == self.api_endpoint, 'preference-runtime-endpoint-changed')
+            outbounds = graph.get('outbounds')
+            gui_require(type(outbounds) is list and all(type(o) is dict for o in outbounds),
+                        'preference-runtime-selector-invalid')
+            rows = [o for o in outbounds if o.get('tag') == 'proxy-selector']
+            gui_require(len(rows) == 1 and rows[0].get('type') == 'selector', 'preference-runtime-selector-invalid')
+            value = rows[0].get('interrupt_exist_connections', False)
+            gui_require(type(value) is bool, 'preference-runtime-value-invalid')
+            return value is wanted
+        observation = {'schema':'polaris-auto-runtime-observation-v1','phase':'begin','state':'checking','checks':{}}
+        self.result['autoRuntimePreparation'] = observation
+        try:
+            self._auto_runtime(wanted, observation, preparing=True)
+            return True
+        except GuiFailure as error:
+            if error.code != 'auto-runtime-target-not-ready':
+                observation['state'] = 'failed'
+                raise
+            observation['state'] = 'waiting'
+            return False
+
     def activate_saved_graph(self, wanted, saved_read, runtime_read, receipt_key, phase_prefix='preference'):
         gui_require(phase_prefix in ('preference','auto'), 'activation-context-invalid')
         # Saved D, accepted R, and the subsequent selection are separate proofs.
@@ -1858,15 +1885,59 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
         disk = saved_read()
         gui_require(disk['value'] is wanted, 'preference-saved-value-differs')
         previous = dict(self.core); before_status = self.status()
-        control = self.pending_apply_control()
-        gui_require(type(control) is dict and set(control) == {'bars','buttons','disabled'} and
-                    type(control['bars']) is int and type(control['buttons']) is int and
-                    type(control['disabled']) is bool and control['bars'] in (0,1) and control['buttons'] in (0,1),
-                    'preference-apply-control-invalid')
+        transition = {'schema':'polaris-activation-observation-v1','context':phase_prefix,
+                      'state':'waiting','samples':0,'targetReady':False,'applyVisible':False}
+        self.result['activationObservation'] = transition
+        self.gui_phase(phase_prefix+'-activation-wait')
+        def observe_control():
+            control = self.pending_apply_control()
+            gui_require(type(control) is dict and set(control) == {'bars','buttons','disabled'} and
+                        type(control['bars']) is int and type(control['buttons']) is int and
+                        type(control['disabled']) is bool and control['bars'] in (0,1) and control['buttons'] in (0,1) and
+                        control['buttons'] <= control['bars'], 'preference-apply-control-invalid')
+            return control
+        def prepared():
+            remaining()
+            self.same_core(previous)
+            status = self.status()
+            gui_require(status.get('running') is True and status.get('pid') == before_status.get('pid') and
+                        status.get('mainGeneration') == before_status.get('mainGeneration'), 'activation-generation-changed')
+            gui_require(saved_read() == disk, 'preference-saved-file-changed')
+            control = observe_control()
+            transition['samples'] += 1
+            transition['applyVisible'] = bool(control['buttons'])
+            if control['buttons'] and not control['disabled']:
+                transition['state'] = 'apply-ready'
+                return control
+            # A temporarily empty/disabled bar is not proof of no pending work.
+            if control['bars']:
+                return None
+            ready = self.activation_runtime_ready(wanted, phase_prefix)
+            transition['targetReady'] = ready
+            if not ready:
+                return None
+            # Re-read the actual control after the owned R capture; a newly
+            # rendered pending action wins over the no-action path.
+            control = observe_control()
+            if control['bars']:
+                return None
+            self.same_core(previous)
+            current = self.status()
+            gui_require(current.get('running') is True and current.get('pid') == before_status.get('pid') and
+                        current.get('mainGeneration') == before_status.get('mainGeneration'), 'activation-generation-changed')
+            gui_require(saved_read() == disk, 'preference-saved-file-changed')
+            transition['state'] = 'target-already-accepted'
+            return control
+        try:
+            control = wait_for(prepared, lambda value: value is not None, timeout=remaining())
+        except Exception:
+            transition['state'] = 'failed'
+            raise
         proof = {'wanted':wanted,'saved':disk,'apply':'not-needed','restartConfirmed':False}
         if control['buttons']:
             gui_require(not control['disabled'], 'preference-apply-disabled')
             self.gui_phase(phase_prefix+'-apply-click')
+            transition['state'] = 'apply-requested'
             result = self.apply(('hotApplied','restartRequired'), timeout=min(65,remaining()))
             proof['apply'] = result['status']
             if result['status'] == 'restartRequired':
@@ -1915,6 +1986,7 @@ return {bars:bars.length,buttons:buttons.length,disabled:buttons.some(e=>e.disab
         proof['acceptedRuntime']=runtime_read(wanted)
         wait_for(self.pending_apply_control, lambda value: value=={'bars':0,'buttons':0,'disabled':False}, timeout=remaining())
         remaining()
+        transition['state'] = 'accepted-runtime'
         self.result.setdefault(receipt_key,[]).append(proof)
         return proof
 
@@ -2164,7 +2236,7 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
             observation['state']='failed'
             raise
 
-    def _auto_runtime(self, wanted, observation):
+    def _auto_runtime(self, wanted, observation, preparing=False):
         def check(phase, ok, code, facts=None):
             observation.update(phase=phase,state='observed' if ok else 'failed')
             observation['checks'][phase]={'passed':bool(ok),**(facts or {})}
@@ -2177,6 +2249,8 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
         check('outbound-schema',type(outbounds) is list and all(type(o) is dict for o in outbounds), 'auto-runtime-outbound-schema-invalid')
         def one(tag,kind,role):
             rows=[o for o in outbounds if o.get('tag')==tag]
+            if preparing and not rows and role in ('auto-wrapper','native-urltest'):
+                check(role,False,'auto-runtime-target-not-ready',{'count':0})
             check(role,len(rows)==1 and rows[0].get('type')==kind,'auto-runtime-'+role+'-invalid',{'count':len(rows)})
             return rows[0]
         selector=one('proxy-selector','selector','main-selector')
@@ -2189,7 +2263,8 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
         check('references',selector.get('default')=='polaris-auto-global' and
               'polaris-auto-global' in selector['outbounds'] and
               'polaris-auto-global-test' in wrapper['outbounds'] and
-              wrapper.get('default')=='polaris-auto-global-test','auto-runtime-reference-invalid')
+              wrapper.get('default')=='polaris-auto-global-test',
+              'auto-runtime-target-not-ready' if preparing else 'auto-runtime-reference-invalid')
         for role,group in (('main-selector',selector),('auto-wrapper',wrapper),('native-urltest',native)):
             value=group.get('interrupt_exist_connections',False)
             check(role+'-interrupt',type(value) is bool and value is False,'auto-runtime-interrupt-invalid',
@@ -2223,6 +2298,9 @@ return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>
         url=native.get('url')
         check('health-url',type(url) is str and url==self.network.health_url,'auto-runtime-health-url-differs',
               {'matchesFixture':type(url) is str and url==self.network.health_url})
+        if preparing:
+            observation.update(phase='graph-ready',state='observed')
+            return {'runtime':proof}
         observation.update(phase='status-read',state='checking')
         status=self.status()
         observation.update(phase='native-confirmation',state='checking')
@@ -2307,8 +2385,21 @@ return {count:1,checked:e.getAttribute('aria-checked'),disabled:!!e.disabled||e.
         expanded=self.driver.execute("return document.querySelector('#node-trigger')?.getAttribute('aria-expanded');")
         gui_require(expanded in ('true','false'),'auto-menu-state-invalid')
         if expanded=='false':self.driver.click('#node-trigger')
+        cursor=max((r['sequence'] for r in self.driver.observations()),default=0)
         self.gui_phase('auto-enable-click')
         self.driver.click('#node-menu [data-auto-select-scope="global"] .auto-choice-pick')
+        self.gui_phase('auto-intent-callback')
+        def intent_receipt():
+            rows=[r for r in self.driver.observations() if r.get('sequence',0)>cursor and r.get('source')=='original-auto-mode-callback']
+            gui_require(len(rows)<=1,'auto-intent-callback-ambiguous')
+            return rows[0] if rows else None
+        receipt=wait_for(intent_receipt)
+        gui_require(receipt.get('success') is True and receipt.get('intentApplied') is True and
+                    receipt.get('featureEnabled') is True and receipt.get('applyOutcome') in ('applied','pending','deferred') and
+                    type(receipt.get('generation')) is int and receipt['generation']==before.get('mainGeneration'),
+                    'auto-intent-unconfirmed')
+        preparation['intentAssociation']='shape-only-click-window'
+        preparation['intentReceipt']={k:receipt[k] for k in ('success','intentApplied','featureEnabled','generation','applyOutcome')}
         self.gui_phase('auto-intent-readback')
         wait_for(self.config,lambda c:c.get('autoSelectEnabled') is True and
                  c.get('selectionIntent')=={'mode':'auto','scope':'global'})
