@@ -370,21 +370,71 @@ AUTH_FAILURE_CODES = ('operation-failed', 'abort-requested', 'input-ended', 'rec
 AUTH_RECOVERY_STEPS = ('agent', 'credential', 'group', 'lineage', 'timer')
 
 
+AUTH_PUMP_STAGES = ('not-started', 'waiting', 'bytes-observed', 'action-checked', 'identity-checked',
+    'echo-wait', 'credential-write', 'completion-observed', 'stopped')
+AUTH_PUMP_CODES = ('pty-read-failed', 'pty-eof', 'dialogue-limit', 'dialogue-encoding',
+    'action-mismatch', 'identity-not-unique', 'identity-mismatch', 'identity-write-failed',
+    'echo-unconfirmed', 'credential-write-failed', 'native-authentication-failed',
+    'native-authentication-canceled', 'completion-unconfirmed', 'activity-deadline', 'unexpected-error')
+AUTH_PUMP_FLAGS = ('ptyBytes', 'expectedAction', 'expectedIdentity', 'echoDisabled',
+                   'credentialWriteCompleted', 'authenticationComplete')
+
+def auth_execution_observation():
+    return {'pump': {'stage': 'not-started', 'firstFailure': None,
+                    'observed': {key: False for key in AUTH_PUMP_FLAGS}, 'stoppedBy': 'none'},
+            'agent': {'notifyClosed': False, 'subjectBound': False, 'registrationLive': False,
+                      'latestLive': None, 'exitCode': None, 'preCleanupObserved': False,
+                      'preCleanupLive': None, 'preCleanupExitCode': None}}
+
+def validate_auth_execution(value):
+    exact(value, ('pump', 'agent'))
+    pump = value['pump']; exact(pump, ('stage', 'firstFailure', 'observed', 'stoppedBy'))
+    require(pump['stage'] in AUTH_PUMP_STAGES and pump['stoppedBy'] in
+            ('none', 'controller-cleanup', 'worker-failure', 'deadline'), 'fixed pump observation required')
+    exact(pump['observed'], AUTH_PUMP_FLAGS)
+    require(all(type(v) is bool for v in pump['observed'].values()), 'fixed pump flags required')
+    flags = pump['observed']
+    require(not flags['authenticationComplete'] or flags['credentialWriteCompleted'], 'completion without input')
+    require(not flags['credentialWriteCompleted'] or (flags['echoDisabled'] and flags['expectedIdentity'] and flags['expectedAction']), 'input without guarded dialogue')
+    require(not any(flags[k] for k in AUTH_PUMP_FLAGS[1:]) or flags['ptyBytes'], 'dialogue without PTY observation')
+    if pump['firstFailure'] is not None:
+        exact(pump['firstFailure'], ('stage', 'code'))
+        require(pump['firstFailure']['stage'] in AUTH_PUMP_STAGES and
+                pump['firstFailure']['code'] in AUTH_PUMP_CODES, 'fixed pump failure required')
+    agent = value['agent']; exact(agent, ('notifyClosed', 'subjectBound', 'registrationLive', 'latestLive', 'exitCode',
+                                       'preCleanupObserved', 'preCleanupLive', 'preCleanupExitCode'))
+    require(all(type(agent[k]) is bool for k in ('notifyClosed', 'subjectBound', 'registrationLive')) and
+            (agent['latestLive'] is None or type(agent['latestLive']) is bool) and
+            (agent['exitCode'] is None or type(agent['exitCode']) is int and -128 <= agent['exitCode'] <= 255), 'fixed agent observation required')
+    require(type(agent['preCleanupObserved']) is bool and
+            (agent['preCleanupLive'] is None or type(agent['preCleanupLive']) is bool) and
+            (agent['preCleanupExitCode'] is None or type(agent['preCleanupExitCode']) is int and -128 <= agent['preCleanupExitCode'] <= 255), 'fixed pre-cleanup agent observation required')
+    require(agent['preCleanupObserved'] or (agent['preCleanupLive'] is None and agent['preCleanupExitCode'] is None), 'unobserved pre-cleanup state')
+    require(agent['preCleanupExitCode'] is None or agent['preCleanupLive'] is False, 'pre-cleanup exit/live mismatch')
+    require(not agent['registrationLive'] or (agent['notifyClosed'] and agent['subjectBound']), 'agent registration incomplete')
+    require(agent['exitCode'] is None or agent['latestLive'] is False, 'agent exit/live mismatch')
+    return value
+
+
 def auth_runtime_observation(mode):
-    return {'schema': 'polaris-auth-runtime-observation-v1', 'mode': mode, 'kind': None,
+    return {'schema': 'polaris-auth-runtime-observation-v2', 'mode': mode, 'kind': None,
             'lastReached': 'idle', 'firstFailure': None,
             'recovery': {key: 'not-reached' for key in AUTH_RECOVERY_STEPS},
-            'credentialRecovery': None, 'groupRecovery': None, 'persistence': 'not-attempted'}
+            'credentialRecovery': None, 'groupRecovery': None, 'persistence': 'not-attempted',
+            'execution': auth_execution_observation()}
 
 
 def validate_auth_runtime_observation(value):
     exact(value, ('schema', 'mode', 'kind', 'lastReached', 'firstFailure', 'recovery',
-                  'credentialRecovery', 'groupRecovery', 'persistence'))
-    require(value['schema'] == 'polaris-auth-runtime-observation-v1' and
+                  'credentialRecovery', 'groupRecovery', 'persistence', 'execution'))
+    require(value['schema'] == 'polaris-auth-runtime-observation-v2' and
             value['mode'] in ('existing-session', 'pkttyagent-observe', *CREDENTIAL_MODES) and
             value['kind'] in (None, 'install', 'uninstall') and
             value['lastReached'] in AUTH_OPERATION_STAGES and
             value['persistence'] in ('not-attempted', 'recorded', 'unknown'), 'fixed auth observation required')
+    validate_auth_execution(value['execution'])
+    if value['mode'] not in CREDENTIAL_MODES or value['kind'] is None:
+        require(value['execution']['pump'] == auth_execution_observation()['pump'], 'credential dialogue outside authority')
     failure = value['firstFailure']
     if failure is not None:
         exact(failure, ('stage', 'code'))
@@ -1175,40 +1225,63 @@ observably active before a password-setting attempt. Each transaction re-locks.
         data = bytearray(); deadline = self.group_deadline - GROUP_RECOVERY_RESERVE if self.grouped else time.monotonic() + self.window - 5; selected = False
         user = self.user
         display = user.pw_name if not user.pw_gecos or user.pw_gecos == user.pw_name else user.pw_gecos + ' (' + user.pw_name + ')'
+        failure_code = 'unexpected-error'; cleanup_stop = False
+        def observe(stage=None, flag=None, code=None, stopped=None):
+            self.c.auth_note('auth_pump', stage, flag, code, stopped)
+        def check(condition, code):
+            nonlocal failure_code
+            failure_code = code; require(condition, code)
         try:
-            self.c.auth_reached('dialogue')
+            observe('waiting')
             while not self.stop.is_set() and time.monotonic() < deadline:
+                failure_code = 'pty-read-failed'
                 if not select.select([self.c.pty], [], [], 0.05)[0]: continue
-                part = os.read(self.c.pty, 1024); require(part, 'owned authentication PTY closed')
-                data += part; require(len(data) <= 16384, 'authentication dialogue bound')
+                part = os.read(self.c.pty, 1024); check(part, 'pty-eof')
+                observe('bytes-observed', 'ptyBytes')
+                data += part; check(len(data) <= 16384, 'dialogue-limit')
+                failure_code = 'dialogue-encoding'
                 text = re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]', b'', bytes(data)).decode('utf-8', 'strict').replace('\r', '')
-                require('AUTHENTICATION FAILED' not in text and 'AUTHENTICATION CANCELED' not in text, 'actual authentication rejected')
-                require('AUTHENTICATING FOR org.freedesktop.policykit.exec' in text or not ('Password:' in text), 'unexpected polkit action')
-                self.c.auth_reached('dialogue-identity')
+                check('AUTHENTICATION FAILED' not in text, 'native-authentication-failed')
+                check('AUTHENTICATION CANCELED' not in text, 'native-authentication-canceled')
+                check('AUTHENTICATING FOR org.freedesktop.policykit.exec' in text or not ('Password:' in text), 'action-mismatch')
+                if 'AUTHENTICATING FOR org.freedesktop.policykit.exec' in text: observe('action-checked', 'expectedAction')
+                observe('identity-checked')
                 if 'Choose identity to authenticate as' in text and not selected:
                     matches = re.findall(r'^ ([0-9]+)\.  ' + re.escape(display) + r'$', text, re.M)
-                    require(len(matches) == 1, 'approved existing identity not uniquely offered')
+                    check(len(matches) == 1, 'identity-not-unique')
+                    failure_code = 'identity-write-failed'
                     os.write(self.c.pty, matches[0].encode() + b'\n'); selected = True
                 if self.grouped:
                     offered = re.findall(r'^Authenticating as: (.+)$', text, re.M)
-                    require(all(name == display for name in offered), 'authentication changed to another identity')
+                    check(all(name == display for name in offered), 'identity-mismatch')
                 identity_ok = selected or ('Authenticating as: ' + display + '\n') in text
+                if identity_ok: observe(flag='expectedIdentity')
                 if 'Password:' in text and not self.sent:
-                    self.c.auth_reached('dialogue-password')
-                    require(identity_ok, 'password requested for another identity')
+                    check(identity_ok, 'identity-mismatch')
+                    observe('echo-wait')
+                    failure_code = 'echo-unconfirmed'
                     # pkttyagent prints the prompt just before disabling echo; wait
                     # for the actual terminal state, never sleep-and-assume it.
                     echo_deadline = time.monotonic() + 2
                     while termios.tcgetattr(self.c.pty)[3] & termios.ECHO:
-                        require(time.monotonic() < echo_deadline, 'authentication terminal echo remains enabled')
+                        check(time.monotonic() < echo_deadline, 'echo-unconfirmed')
                         time.sleep(0.005)
-                    os.write(self.c.pty, bytes(self.secret) + b'\n'); self.sent = True
+                    observe('credential-write', 'echoDisabled')
+                    failure_code = 'credential-write-failed'
+                    written = os.write(self.c.pty, bytes(self.secret) + b'\n')
+                    check(written == len(self.secret) + 1, 'credential-write-failed')
+                    self.sent = True; observe(flag='credentialWriteCompleted')
                 if '==== AUTHENTICATION COMPLETE ====' in text:
-                    require(self.sent and identity_ok, 'authentication completion lacks owned credential exchange')
-                    self.c.auth_reached('dialogue-complete')
+                    check(self.sent and identity_ok, 'completion-unconfirmed')
+                    observe('completion-observed', 'authenticationComplete')
                     self.authenticated = True; return
+            if self.stop.is_set():
+                cleanup_stop = True; observe('stopped', stopped='controller-cleanup')
+            else: observe(stopped='deadline')
+            failure_code = 'activity-deadline'
             raise ValueError('authentication request did not complete within lease')
         except BaseException as error:
+            if not cleanup_stop: observe(code=failure_code, stopped='worker-failure' if failure_code != 'activity-deadline' else 'deadline')
             self.c.auth_note('auth_failed')
             self.error = type(error).__name__
             try: self.close()
@@ -1217,6 +1290,7 @@ observably active before a password-setting attempt. Each transaction re-locks.
             for i in range(len(data)): data[i] = 0
 
     def close(self):
+        self.c.auth_note('auth_agent', 'before-cleanup')
         if self.grouped: return self.close_group()
         self.stop.set()
         worker_stopped = True
@@ -1257,6 +1331,7 @@ observably active before a password-setting attempt. Each transaction re-locks.
             self.close_lock.release()
 
     def close_group(self):
+        self.c.auth_note('auth_agent', 'before-cleanup')
         self.stop.set()
         errors = []; proof = self.credential_recovery
         if self.thread and self.thread is not threading.current_thread():
@@ -1480,6 +1555,35 @@ class Controller:
             self.auth_runtime = updated
         self.auth_checkpoint()
 
+    def auth_pump(self, stage=None, flag=None, code=None, stopped=None):
+        with self.auth_runtime_lock:
+            value = self.auth_runtime['execution']['pump']
+            if stage is not None:
+                require(stage in AUTH_PUMP_STAGES, 'fixed pump stage required'); value['stage'] = stage
+            if flag is not None:
+                require(flag in AUTH_PUMP_FLAGS, 'fixed pump flag required'); value['observed'][flag] = True
+            if code is not None and value['firstFailure'] is None:
+                require(code in AUTH_PUMP_CODES, 'fixed pump code required')
+                value['firstFailure'] = {'stage': value['stage'], 'code': code}
+            if stopped is not None: value['stoppedBy'] = stopped
+        self.auth_checkpoint()
+
+    def auth_agent(self, event):
+        with self.auth_runtime_lock:
+            value = self.auth_runtime['execution']['agent']
+            require(event in ('notify', 'bound', 'poll', 'before-cleanup'), 'fixed agent event required')
+            if event == 'notify': value['notifyClosed'] = True
+            if event == 'bound':
+                value['subjectBound'] = True; value['registrationLive'] = True
+            if self.agent is not None:
+                code = self.agent.poll()
+                require(code is None or type(code) is int and -128 <= code <= 255, 'fixed agent exit required')
+                value['latestLive'] = code is None; value['exitCode'] = code
+                if event == 'before-cleanup' and not value['preCleanupObserved']:
+                    value['preCleanupObserved'] = True
+                    value['preCleanupLive'] = code is None; value['preCleanupExitCode'] = code
+        self.auth_checkpoint()
+
     def auth_note(self, method, *args):
         # Diagnostic persistence is never a prerequisite for emergency recovery.
         try: return getattr(self, method)(*args)
@@ -1634,11 +1738,13 @@ class Controller:
             os.close(slave); slave = -1; os.close(notify_fd); notify_fd = -1
             self.auth_reached('agent-notify')
             require(select.select([read_fd], [], [], 10)[0] and os.read(read_fd, 1) == b'', 'agent registration not notified')
+            self.auth_note('auth_agent', 'notify')
             self.auth_reached('agent-identity')
             row = self.ops.proc(child.pid)
             require(child.poll() is None and row and row['ppid'] == os.getpid() and row['uid'] == user.pw_uid and
                     row['namespaces'] == self.gui['namespaces'] and
                     self.tun.executable_identity(child.pid) == self.tools['pkttyagent'], 'owned real pkttyagent not running')
+            self.auth_note('auth_agent', 'bound')
             self.ledger.mutate(lambda v: v['authentication'].update(agent={'identity': row}, agentSpawnPending=False,
                 registered=True, subject={'pid': self.gui['pid'], 'startTime': self.gui['startTime']}))
             return {'registered': True, 'authenticated': False, 'credentialInputImplemented': False,
@@ -1849,6 +1955,7 @@ class Controller:
         return lineage
 
     def stop_agent(self, close_window=True, forced=False):
+        self.auth_note('auth_agent', 'before-cleanup')
         lineage = self.auth_observer.close(forced=forced) if self.auth_observer else getattr(self, 'group_lineage_closed', None)
         if lineage:
             self.group_lineage_closed = lineage
@@ -1858,6 +1965,7 @@ class Controller:
         if self.agent:
             require(self.agent.wait(timeout=5) == -signal.SIGTERM, 'owned agent shutdown differs')
         if self.pty is not None: os.close(self.pty); self.pty = None
+        self.auth_note('auth_agent', 'poll')
         self.agent = None
         if lineage:
             result['authLineage'] = lineage
@@ -1918,6 +2026,8 @@ class Controller:
         elif action == 'transaction_begin': result = self.transaction_begin(message['kind'])
         elif action == 'transaction_scan':
             require(self.observer, 'no transaction'); result = self.observer.snapshot()
+            self.auth_note('auth_agent', 'poll')
+            result['authenticationRuntime'] = self.auth_snapshot()
         elif action == 'transaction_end': result = self.transaction_end()
         elif action == 'register_helper':
             value = self.guard()
@@ -1973,6 +2083,7 @@ class Controller:
             try:
                 if self.pty is not None: os.close(self.pty); self.pty = None
             except Exception: errors.append('authentication-cleanup-unknown')
+        self.auth_note('auth_agent', 'poll')
         try: close_transactions(self.ledger, self.tun)
         except Exception: errors.append('privilege-transaction-cleanup-unknown')
         try: result = self.tun.cleanup(self.ledger, forced=True)

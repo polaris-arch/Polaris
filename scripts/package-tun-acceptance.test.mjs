@@ -247,11 +247,12 @@ test('actual controller transaction schema survives actual GUI adapter and Node 
   // Pure schema integration: no subprocess, privilege, account or product action.
   // Use real observer.finish and helper_action bodies; only OS/driver operations
   // are fakes. This guards producer/consumer field drift, not runtime coverage.
-  const program = `import json,sys,threading,types
+  const program = `import json,sys,threading,types,subprocess
 from unittest.mock import Mock
 sys.path.insert(0,sys.argv[1])
 import root_controller as root
 import linux_tun as gui
+import helper_observation as helper
 app={'pid':100,'startTime':'123','uid':1001}
 results=[]
 for kind in ('install','uninstall'):
@@ -262,11 +263,17 @@ for kind in ('install','uninstall'):
     observer.rows={(102,'125'):row}; observer.pkexec={(102,'125'):row}; observer.shells={(102,'125'):row}
     closed=observer.finish()
     run=object.__new__(gui.TunCarrierRun)
-    run.result={}
+    run.result={}; run.env={}
     run.app=app; run.driver=Mock(); run.supervisor=Mock(); run.controller=Mock(); run.launch_options={'authenticationMode':'existing-session'}
-    run.controller.call.side_effect=lambda command,**args: closed if command=='transaction_end' else {}
+    runtime=root.auth_runtime_observation('existing-session');runtime['kind']=kind
+    scanned={**observer.snapshot(),'authenticationRuntime':runtime}
+    run.controller.call.side_effect=lambda command,**args: closed if command=='transaction_end' else scanned if command=='transaction_scan' else {}
     run.text=lambda key:key
-    replies=iter([[],[{'sequence':1,'kind':'helper','envelopeSuccess':True,'success':True,'installed':kind=='install','ready':kind=='install'}]])
+    raw={'success':True,'data':{'success':True,'status':{'supported':True,'installed':kind=='install','ready':kind=='install'}}}
+    projector='process.stdout.write(JSON.stringify(('+helper.PROJECTOR_JS+')(JSON.parse(process.argv[1]))))'
+    projected=json.loads(subprocess.check_output(['node','-e',projector,json.dumps(raw)],text=True))
+    helper.validate_projection(projected)
+    replies=iter([[],[{'sequence':1,'kind':'helperObservation','observedElapsedMs':10,'projection':projected}]])
     run.tun_observations=lambda:next(replies)
     result=run.helper_action(kind)
     assert run.controller.call.call_args_list[-1].args==('transaction_end',)

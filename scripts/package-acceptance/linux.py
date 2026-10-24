@@ -21,6 +21,7 @@ import shutil
 import signal
 import socket
 import stat
+import sys
 import struct
 import subprocess
 import tempfile
@@ -65,6 +66,60 @@ def regular(path, within=None):
         require(path.is_relative_to(Path(within).resolve()), 'path outside owned directory')
     return path
 
+
+
+def read_saved_preference(home, xdg_config):
+    """Read only the real private App config, never invoke config_get/migration."""
+    home = Path(home).absolute()
+    require(Path(xdg_config).absolute() == home / 'config', 'private config root differs')
+    require(all(not parent.is_symlink() for parent in (home, *home.parents)), 'linked config root')
+    opened = []
+    def hold(fd, location):
+        opened.append((fd, location, None))
+        info = os.fstat(fd)
+        opened[-1] = (fd, location, info)
+        return info
+    try:
+        current = home
+        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        hold(fd, current)
+        for name in ('config', 'com.polaris.app', 'polaris'):
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            current = current / name
+            hold(fd, current)
+        require(all(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() for _, _, info in opened),
+                'private config directory owner differs')
+        fd = os.open('config.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        path = current / 'config.json'; before = hold(fd, path)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and
+                0 < before.st_size <= 4 * 1024 * 1024, 'bounded private config required')
+        chunks = []; remaining = before.st_size + 1
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk: break
+            chunks.append(chunk); remaining -= len(chunk)
+        raw = b''.join(chunks); after = os.fstat(fd)
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_uid', 'st_mode')
+        require(len(raw) == before.st_size and all(getattr(before,k) == getattr(after,k) for k in fields),
+                'config changed during read')
+        require(all(not parent.is_symlink() for parent in (home, *home.parents)), 'linked config root changed')
+        for _, location, original in opened:
+            now = location.lstat()
+            require(not stat.S_ISLNK(now.st_mode) and (now.st_dev,now.st_ino,now.st_uid) ==
+                    (original.st_dev,original.st_ino,original.st_uid), 'config path changed during read')
+        value = json.loads(raw)
+        require(type(value) is dict and type(value.get('interruptConnectionsOnSwitch')) is bool,
+                'saved preference boolean unavailable')
+        return {'source': 'private-app-config-file', 'value': value['interruptConnectionsOnSwitch'],
+                'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+    finally:
+        reading_failed = sys.exc_info()[0] is not None
+        close_failed = False
+        for fd, _, _ in reversed(opened):
+            try: os.close(fd)
+            except OSError: close_failed = True
+        if close_failed and not reading_failed:
+            raise ValueError('private config descriptor close unconfirmed')
 
 def byte_identity(path, root=None):
     path = regular(path, root)
@@ -832,6 +887,15 @@ const observe = function(id) {
   return function(...args) {
     try {
       const raw = args[0], data = raw?.data;
+      // SaveOutcome remains shape-only. The UI click window and independent
+      // private-file read prove this preference without replaying a write/read IPC.
+      if (data?.status === 'saved' || data?.status === 'conflict') {
+        observation.rows.push({sequence: ++observation.cursor,
+          source:'original-config-save-callback', success:raw?.success === true,
+          status:data.status, versionValid:typeof data.version==='string' && /^[0-9a-f]{8}$/.test(data.version),
+          preference:typeof data.config?.interruptConnectionsOnSwitch==='boolean'?data.config.interruptConnectionsOnSwitch:null});
+        if (observation.rows.length > 512) observation.rows.shift();
+      }
       // Callback replies do not identify commands. Capture only the original
       // RuntimeApplyResult shape, then correlate a click cursor with real status.
       if (states.has(data?.status) && typeof data.ok === 'boolean' &&
@@ -1561,25 +1625,85 @@ class CarrierRun:
         else:
             self.gui_phase('pick-complete', observed)
 
+    def preference_disk(self):
+        # Existing observed App birth only; no process scan/adoption or signal.
+        app = dict(self.app)
+        def same_app():
+            current = process_identity(app['pid'])
+            return (same_process(app, current) and current['state'] != 'Z' and
+                    current['uid'] == os.getuid() and all(type(app.get(k)) is int and current.get(k) == app[k]
+                    for k in ('exeDev', 'exeInode')))
+        gui_require(same_app(), 'preference-app-identity-changed')
+        value = read_saved_preference(self.home, self.env['XDG_CONFIG_HOME'])
+        gui_require(same_app(), 'preference-app-identity-changed')
+        return value
+
+    def preference_pending_save(self):
+        count = self.driver.execute(r'''
+const visible=e=>e.getClientRects().length && getComputedStyle(e).visibility!=='hidden';
+return [...document.querySelectorAll('.pending-bar .pb-acts button')].filter(e=>visible(e)&&e.textContent.trim()===arguments[0]).length;
+''', self.text('home.pendingSaveBtn'))
+        gui_require(type(count) is int and count in (0, 1), 'preference-save-not-unique')
+        return count == 1
+
     def preference(self, wanted):
         gui_require(type(wanted) is bool, 'preference-value-invalid')
-        self.gui_phase('preference-readback')
-        if self.config().get('interruptConnectionsOnSwitch') == wanted:
-            return
         self.gui_phase('preference-navigation')
         self.driver.click('.side .nav-item', self.text('sidebar.settings'))
         self.driver.click('.set-nav', self.text('settings.nav.network'))
         self.gui_phase('preference-control')
         control = self.driver.wait_control('preference-switch', self.text('settings.network.interruptOnSwitch'))
-        gui_require(control.get('checked') in ('true', 'false') and
-                    (control['checked'] == 'true') != wanted, 'preference-state-differs')
-        self.gui_phase('preference-click')
-        self.driver.click_control(control)
-        self.gui_phase('preference-save')
-        if self.driver.element('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn')):
+        gui_require(control.get('checked') in ('true', 'false'), 'preference-state-differs')
+        gui_require(not self.preference_pending_save(), 'preference-preexisting-dirty')
+        before = self.preference_disk()
+        checked = control['checked'] == 'true'
+        gui_require(before['value'] == checked, 'preference-ui-disk-differs')
+        proof = {'wanted': wanted, 'before': before, 'clicked': False, 'commandIdentityClaimed': False}
+        proofs = self.result.setdefault('preferenceObservations', [])
+        gui_require(len(proofs) < 128, 'preference-observation-bound')
+        proofs.append(proof)
+        # Preserve the original 30s confirmation budget across all observations;
+        # do not grant a fresh budget for each callback/disk/UI check.
+        deadline = time.monotonic() + 30
+        def confirm(read, condition=bool):
+            remaining = deadline - time.monotonic()
+            gui_require(remaining > 0, 'observation-timeout')
+            value = wait_for(read, condition, timeout=remaining)
+            gui_require(time.monotonic() <= deadline, 'observation-timeout')
+            return value
+        if checked != wanted:
+            self.gui_phase('preference-click')
+            self.driver.click_control(control)
+            proof['clicked'] = True
+            self.gui_phase('preference-save-ready')
+            confirm(self.preference_pending_save, lambda visible: visible is True)
+            cursor = max((row['sequence'] for row in self.driver.observations()), default=0)
+            self.gui_phase('preference-save')
             self.driver.click('.pending-bar .pb-acts button', self.text('home.pendingSaveBtn'))
-        self.gui_phase('preference-config-readback')
-        wait_for(self.config, lambda c: c.get('interruptConnectionsOnSwitch') == wanted)
+            def saved():
+                rows = [r for r in self.driver.observations() if r.get('sequence', 0) > cursor
+                        and r.get('source') == 'original-config-save-callback']
+                gui_require(len(rows) <= 1, 'preference-save-ambiguous')
+                if not rows: return None
+                row = rows[0]
+                gui_require(set(row) == {'sequence','source','success','status','versionValid','preference'} and
+                            type(row['sequence']) is int and row['success'] is True and row['status'] == 'saved' and
+                            row['versionValid'] is True and type(row['preference']) is bool and row['preference'] == wanted,
+                            'preference-save-unconfirmed')
+                return {'association': 'shape-only-click-window', 'status': 'saved',
+                        'versionValid': True, 'preference': row['preference']}
+            self.gui_phase('preference-save-callback')
+            proof['saveCallback'] = confirm(saved)
+        self.gui_phase('preference-durable-readback')
+        after = self.preference_disk()
+        gui_require(after['value'] == wanted, 'preference-disk-value-differs')
+        proof['after'] = after
+        self.gui_phase('preference-clean-readback')
+        confirm(self.preference_pending_save, lambda visible: visible is False)
+        observed = self.driver.wait_control('preference-switch', self.text('settings.network.interruptOnSwitch'))
+        gui_require(observed.get('checked') == ('true' if wanted else 'false'), 'preference-state-differs')
+        gui_require(time.monotonic() <= deadline, 'observation-timeout')
+        proof['clean'] = True
         self.gui_phase('preference-return')
         self.driver.click('.side .nav-item', self.text('settings.nav.back'))
 

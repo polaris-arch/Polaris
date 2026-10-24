@@ -291,11 +291,18 @@ test('immutable native bridge observer preserves async resolve/reject, once dele
 test('callback observation is shape-limited, monotonic and bounded; immutable incompatibility fails', async () => {
   const b = bridge(); b.install();
   await b.invoke('read-config', { success: true, data: { status: 'saved', secret: 'private' } });
-  assert.equal(b.window.__packageObservation.rows.length, 0);
+  // A SaveOutcome-shaped callback is observed, not attributed to its command.
+  // Missing version/config must remain unusable as a successful save proof.
+  assert.deepEqual(JSON.parse(JSON.stringify(b.window.__packageObservation.rows)), [{
+    sequence: 1, source: 'original-config-save-callback', success: true,
+    status: 'saved', versionValid: false, preference: null,
+  }]);
+  assert.ok(!JSON.stringify(b.window.__packageObservation).includes('private'));
+  assert.ok(!JSON.stringify(b.window.__packageObservation).includes('read-config'));
   for (let i = 0; i < 520; i++) await b.invoke('actual', reply);
   const observed = b.window.__packageObservation;
-  assert.equal(observed.cursor, 520); assert.equal(observed.rows.length, 512);
-  assert.equal(observed.rows[0].sequence, 9); assert.equal(observed.rows.at(-1).sequence, 520);
+  assert.equal(observed.cursor, 521); assert.equal(observed.rows.length, 512);
+  assert.equal(observed.rows[0].sequence, 10); assert.equal(observed.rows.at(-1).sequence, 521);
   assert.equal(observed.failed, false);
   const bad = bridge(); Object.preventExtensions(bad.callbacks); assert.throws(bad.install);
   const wrong = { __TAURI_INTERNALS__: { invoke: () => {}, callbacks: new Map() } };

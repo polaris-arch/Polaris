@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import select
 import signal
@@ -32,6 +33,37 @@ HERE = Path(__file__).resolve().parent
 
 
 AUTH_GROUP_MODE = 'temporary-existing-runner-password-and-sudo-group'
+
+
+def observe_logind_session(supervisor, env, app):
+    """Existing ordinary read-only tool; unique destination cannot auto-activate login1.
+
+    All errors are unknown, never inferred session absence or authentication.
+    Supervisor-owned forced/unknown cleanup records are deliberately not cleared.
+    """
+    result = {'schema': 'polaris-logind-session-observation-v1', 'state': 'unknown',
+              'subject': {key: app[key] for key in ('pid', 'startTime', 'uid')},
+              'birthStable': False, 'scope': 'direct-logind-session-only-not-polkit-display-fallback-or-authorization'}
+    try:
+        before = base.process_identity(app['pid'])
+        require(base.same_process(app, before), 'session subject birth changed')
+        prefix = ['/usr/bin/gdbus', 'call', '--system']
+        owner = supervisor.query(prefix + ['--dest', 'org.freedesktop.DBus', '--object-path',
+            '/org/freedesktop/DBus', '--method', 'org.freedesktop.DBus.GetNameOwner',
+            'org.freedesktop.login1'], env, 'logind-observation', timeout=2, limit=1024).strip()
+        match = re.fullmatch(r"\('(:[0-9]+\.[0-9]+)',\)", owner)
+        require(match is not None, 'fixed unique service owner required')
+        reply = supervisor.query(prefix + ['--dest', match[1], '--object-path', '/org/freedesktop/login1',
+            '--method', 'org.freedesktop.login1.Manager.GetSessionByPID', str(app['pid'])],
+            env, 'logind-observation', timeout=2, limit=1024).strip()
+        require(re.fullmatch(r"\(objectpath '/org/freedesktop/login1/session/[A-Za-z0-9_]+',\)", reply) is not None,
+                'fixed session response required')
+        after = base.process_identity(app['pid'])
+        require(base.same_process(app, after) and base.same_process(before, after), 'session subject birth changed')
+        result['birthStable'] = True; result['state'] = 'present'
+    except Exception:
+        pass
+    return result
 
 
 def verify_group_recovery(value, uid, account, expected_gid=None):
@@ -668,10 +700,14 @@ class TunCarrierRun(base.CarrierRun):
         # This is the already-returned read-only snapshot, never a replacement
         # for transaction_end or evidence admitting ordinary root signals.
         keys = {'kind', 'subject', 'authenticationMode', 'pkexecBirths', 'rootShellBirths',
-                'owned', 'authorizationObserved', 'credentialPromptClaimed'}
+                'owned', 'authorizationObserved', 'credentialPromptClaimed', 'authenticationRuntime'}
         require(type(value) is dict and set(value) == keys and value['kind'] == kind and
                 value['authenticationMode'] == self.launch_options['authenticationMode'],
                 'fixed transaction observation required')
+        import root_controller
+        runtime = root_controller.validate_auth_runtime_observation(value['authenticationRuntime'])
+        require(runtime['mode'] == value['authenticationMode'] and runtime['kind'] == kind,
+                'authentication observation transaction differs')
         subject = value['subject']
         require(type(subject) is dict and set(subject) == {'pid', 'startTime', 'uid'} and
                 type(subject['pid']) is int and subject['pid'] == self.app['pid'] and
@@ -702,7 +738,8 @@ class TunCarrierRun(base.CarrierRun):
             'kind': kind, 'subject': dict(subject), 'pkexecBirths': pkexec, 'rootShellBirths': shells,
             'ownedBirths': owned, 'authorizationObserved': value['authorizationObserved'],
             'credentialPromptClaimed': False, 'scope': 'root-observed-births-not-transaction-completion-or-cleanup',
-            'receivedElapsedMs': max(0, int((time.monotonic() - self._gui_started) * 1000))}
+            'receivedElapsedMs': max(0, int((time.monotonic() - self._gui_started) * 1000)),
+            'authenticationRuntime': copy.deepcopy(runtime)}
 
     def helper_action(self, kind):
         self.gui_phase('helper-begin')
@@ -711,6 +748,8 @@ class TunCarrierRun(base.CarrierRun):
         self.driver.click('.side .nav-item', self.text('sidebar.settings'))
         self.driver.click('.set-nav', self.text('settings.nav.helper'))
         cursor = max((r['sequence'] for r in self.tun_observations()), default=0)
+        self.gui_phase('helper-session-observation')
+        self.result['logindSessionObservation'] = observe_logind_session(self.supervisor, getattr(self, 'env', {}), self.app)
         self.gui_phase('helper-window')
         self.supervisor.begin_window(kind, self.app)
         self.gui_phase('helper-transaction-begin')
@@ -754,7 +793,8 @@ class TunCarrierRun(base.CarrierRun):
         self.result['helperCallback'] = {**callback, 'errorCode': projection['errorCode'],
             'association': projection['association'], 'requestedActionContext': kind,
             'callbackObservedElapsedMs': reply['callbackObservedElapsedMs'], 'projection': copy.deepcopy(projection)}
-        require(projection['statusShape'] == 'valid' and projection['errorCode'] in ('none', 'missing') and
+        require(projection['statusShape'] == 'valid' and projection['executionDiagnosticState'] == 'absent' and
+                projection['errorCode'] in ('none', 'missing') and
                 projection['status']['supported'] is True and callback['envelopeSuccess'] is True and callback['success'] is True and
                 callback['installed'] == (kind == 'install') and callback['ready'] == (kind == 'install'),
                 'actual helper GUI action failed')

@@ -1437,3 +1437,81 @@ fn windows_installer_stage_codes_are_presentation_only_and_platform_scoped() {
         "helper installer exited unsuccessfully"
     );
 }
+
+#[test]
+fn execution_diagnostic_is_fixed_non_authoritative_and_bounded() {
+    for (text, marker) in [
+        (
+            "pkexec must be setuid root",
+            HelperExecutionMarker::NotSetuidRoot,
+        ),
+        (
+            "Error executing command as another user: No authentication agent found.",
+            HelperExecutionMarker::NoAuthenticationAgent,
+        ),
+        (
+            "Error executing command as another user: Not authorized",
+            HelperExecutionMarker::NotAuthorized,
+        ),
+        (
+            "Error creating textual authentication agent: PRIVATE",
+            HelperExecutionMarker::TextAgentCreationFailed,
+        ),
+        (
+            "Error registering local authentication agent: PRIVATE",
+            HelperExecutionMarker::TextAgentRegistrationFailed,
+        ),
+        (
+            "Error checking for authorization PRIVATE",
+            HelperExecutionMarker::AuthorizationCheckFailed,
+        ),
+    ] {
+        let value = helper_execution_diagnostic(Platform::Linux, 127, text).unwrap();
+        assert_eq!(value.marker, marker);
+        assert_eq!(value.exit_code, 127);
+        assert_eq!(value.scope, "child-stderr-marker-not-verified-emitter");
+        assert!(!serde_json::to_string(&value).unwrap().contains("PRIVATE"));
+        assert_eq!(
+            helper_execution_diagnostic(Platform::Linux, 126, text)
+                .unwrap()
+                .marker,
+            HelperExecutionMarker::Unknown
+        );
+    }
+    for text in [
+        "PRIVATE password",
+        "pkexec must be setuid root suffix",
+        "translated message",
+        "pkexec must be setuid root\nError executing command as another user: Not authorized",
+    ] {
+        assert_eq!(
+            helper_execution_diagnostic(Platform::Linux, 127, text)
+                .unwrap()
+                .marker,
+            HelperExecutionMarker::Unknown
+        );
+    }
+    assert_eq!(
+        helper_execution_diagnostic(Platform::Linux, 127, &"x".repeat(16385))
+            .unwrap()
+            .marker,
+        HelperExecutionMarker::Unknown
+    );
+    assert!(helper_execution_diagnostic(Platform::Mac, 127, "PRIVATE").is_none());
+    assert!(helper_execution_diagnostic(Platform::Win, 127, "PRIVATE").is_none());
+}
+
+#[test]
+fn helper_execution_optional_field_does_not_change_legacy_action_json() {
+    let result = HelperActionResult {
+        success: false,
+        execution_diagnostic: None,
+        error_code: Some(HelperActionErrorCode::Cancelled),
+        diagnostic: None,
+        status: HelperStatusSnapshot::default(),
+    };
+    let value = serde_json::to_value(result).unwrap();
+    assert!(value.get("executionDiagnostic").is_none());
+    assert_eq!(value["errorCode"], "cancelled");
+    assert_eq!(value["success"], false);
+}

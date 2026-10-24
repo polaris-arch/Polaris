@@ -11,6 +11,7 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -402,7 +403,7 @@ class CredentialTests(unittest.TestCase):
             run.assert_not_called()
     def test_setting_unknown_always_attempts_relock(self):
         c = controller(m.AUTH_MODE); lease = m.CredentialLease(c, 'install')
-        c.agent = Mock(); c.ledger.value['authentication']['registered'] = True
+        c.agent = Mock(); c.agent.poll.return_value = None; c.ledger.value['authentication']['registered'] = True
         c.ops.run.return_value = 'inactive'
         writer = Mock(pid=89); writer.communicate.side_effect = subprocess.TimeoutExpired('chpasswd', 10); writer.poll.return_value = None
         c.ops.proc.return_value = {**identity(89, 0), 'ppid': os.getpid()}
@@ -491,7 +492,7 @@ class AdditionalContracts(unittest.TestCase):
             home = Path(d); home.chmod(0o700); target = home/'runtime'; target.write_text('fixture'); target.chmod(0o644)
             with self.assertRaises(ValueError): m.private_bytes(target, os.getuid(), home)
     def pump(self, chunks, *, echo=0, name='runner'):
-        c = controller(m.AUTH_MODE); c.pty = 90
+        c = controller(m.AUTH_MODE); c.pty = 90; c.auth_reached('transaction-guard', 'install')
         lease = m.CredentialLease(c, 'install'); lease.window = 90
         lease.user = types.SimpleNamespace(pw_name=name, pw_gecos=''); lease.secret = bytearray(b'never-log-this-password')
         lease.close = Mock(); writes = []
@@ -1670,5 +1671,134 @@ class AuthenticationRecoveryObservationTests(unittest.TestCase):
             with self.assertRaises(ValueError):c.transaction_begin('install')
         lease.assert_not_called();self.assertIsNotNone(c.auth_observer)
         self.assertEqual(c.auth_snapshot()['lastReached'],'lineage-start')
+
+
+class IndependentDialogueObservationTests(unittest.TestCase):
+    def pump(self, chunks, *, echo=0, write=None, select_error=None, stopped=False):
+        c=controller(m.AUTH_MODE); c.pty=90; c.auth_reached('transaction-guard','install')
+        lease=m.CredentialLease(c,'install');lease.window=90
+        lease.user=types.SimpleNamespace(pw_name='runner',pw_gecos='')
+        lease.secret=bytearray(b'PRIVATE_PASSWORD');lease.close=Mock()
+        if stopped: lease.stop.set()
+        writes=[]
+        def output(fd,data):
+            writes.append(data)
+            if write: return write(fd,data)
+            return len(data)
+        with patch.object(m.select,'select',side_effect=select_error,return_value=([90],[],[])), \
+             patch.object(m.os,'read',side_effect=chunks),patch.object(m.os,'write',side_effect=output), \
+             patch('termios.tcgetattr',return_value=[0,0,0,echo,0,0,[]]):
+            lease.pump()
+        return c,lease,writes
+    def test_complete_is_independent_from_main_and_detached(self):
+        c,lease,writes=self.pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nAuthenticating as: runner\nPassword: ',b'==== AUTHENTICATION COMPLETE ====\n'])
+        c.auth_reached('transaction-observer')
+        value=c.auth_snapshot();pump=value['execution']['pump']
+        self.assertTrue(lease.authenticated);self.assertEqual(pump['stage'],'completion-observed')
+        self.assertTrue(all(pump['observed'].values()));self.assertIsNone(pump['firstFailure'])
+        self.assertEqual(value['lastReached'],'transaction-observer')
+        self.assertNotIn('PRIVATE',json.dumps(value))
+        pump['observed']['ptyBytes']=False
+        self.assertTrue(c.auth_snapshot()['execution']['pump']['observed']['ptyBytes'])
+    def test_guard_failure_matrix_is_fixed_and_no_secret(self):
+        prefix=b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\n'
+        cases=[([b''],'pty-eof'),([b'\xff'],'dialogue-encoding'),
+            ([b'x'*16385],'dialogue-limit'),([b'AUTHENTICATION FAILED'],'native-authentication-failed'),
+            ([b'AUTHENTICATION CANCELED'],'native-authentication-canceled'),
+            ([b'Password:'],'action-mismatch'),
+            ([prefix+b'Authenticating as: root\nPassword:'],'identity-mismatch'),
+            ([prefix+b'Choose identity to authenticate as'],'identity-not-unique'),
+            ([b'==== AUTHENTICATION COMPLETE ===='],'completion-unconfirmed')]
+        for chunks,code in cases:
+            with self.subTest(code=code):
+                c,lease,writes=self.pump(chunks);p=c.auth_snapshot()['execution']['pump']
+                self.assertEqual(p['firstFailure']['code'],code);self.assertFalse(lease.authenticated)
+                self.assertEqual(writes,[]);lease.close.assert_called_once()
+                self.assertNotIn('PRIVATE',json.dumps(c.auth_snapshot()))
+    def test_io_error_and_short_write_not_completed(self):
+        c,lease,_=self.pump([],select_error=OSError('PRIVATE'))
+        self.assertEqual(c.auth_snapshot()['execution']['pump']['firstFailure']['code'],'pty-read-failed')
+        c,lease,_=self.pump([b'AUTHENTICATING FOR org.freedesktop.policykit.exec\nAuthenticating as: runner\nPassword:'],write=lambda *a:0)
+        p=c.auth_snapshot()['execution']['pump'];self.assertEqual(p['firstFailure']['code'],'credential-write-failed')
+        self.assertFalse(p['observed']['credentialWriteCompleted']);self.assertFalse(lease.sent)
+    def test_echo_timeout_and_identity_write_error(self):
+        chunks=[b'AUTHENTICATING FOR org.freedesktop.policykit.exec\nAuthenticating as: runner\nPassword:']
+        with patch.object(m.time,'sleep'),patch.object(m.time,'monotonic',side_effect=[0,0,0,3]):
+            c,lease,_=self.pump(chunks,echo=8)
+        self.assertEqual(c.auth_snapshot()['execution']['pump']['firstFailure']['code'],'echo-unconfirmed')
+        def fail(*args): raise OSError('PRIVATE')
+        c,lease,_=self.pump([b'AUTHENTICATING FOR org.freedesktop.policykit.exec\n 1.  runner\nChoose identity to authenticate as'],write=fail)
+        self.assertEqual(c.auth_snapshot()['execution']['pump']['firstFailure']['code'],'identity-write-failed')
+    def test_cleanup_stop_does_not_invent_initial_rejection(self):
+        c,lease,_=self.pump([],stopped=True)
+        p=c.auth_snapshot()['execution']['pump']
+        self.assertEqual(p['stoppedBy'],'controller-cleanup');self.assertIsNone(p['firstFailure'])
+        self.assertFalse(p['observed']['credentialWriteCompleted'])
+    def test_fixed_failure_is_first_and_diagnostic_failure_does_not_block_close(self):
+        c=controller(m.AUTH_MODE);c.auth_reached('transaction-guard','install')
+        c.auth_pump('waiting',code='pty-eof');c.auth_pump('stopped',code='unexpected-error')
+        self.assertEqual(c.auth_snapshot()['execution']['pump']['firstFailure']['code'],'pty-eof')
+        c.lease=Mock();c.ledger.mutate=Mock(side_effect=OSError('PRIVATE'))
+        c.fail();c.lease.close.assert_called_once();self.assertTrue(c.recovery_unknown)
+    def test_agent_snapshots_are_held_handle_not_continuous_claim(self):
+        c=controller(m.AUTH_MODE);c.agent=Mock();c.agent.poll.return_value=None
+        c.auth_agent('notify');c.auth_agent('bound')
+        a=c.auth_snapshot()['execution']['agent'];self.assertTrue(a['registrationLive']);self.assertTrue(a['latestLive'])
+        c.agent.poll.return_value=-15;c.auth_agent('poll')
+        a=c.auth_snapshot()['execution']['agent'];self.assertFalse(a['latestLive']);self.assertEqual(a['exitCode'],-15)
+        self.assertTrue(a['registrationLive'])
+    def test_precleanup_exit_not_overwritten_by_our_term_or_repeated_cleanup(self):
+        for before in (None,0,127):
+            c=controller(m.AUTH_MODE);c.agent=Mock();c.agent.poll.return_value=before
+            c.auth_agent('before-cleanup')
+            c.agent.poll.return_value=-15;c.auth_agent('poll');c.auth_agent('before-cleanup')
+            a=c.auth_snapshot()['execution']['agent']
+            self.assertTrue(a['preCleanupObserved']);self.assertEqual(a['preCleanupLive'],before is None)
+            self.assertEqual(a['preCleanupExitCode'],before);self.assertEqual(a['exitCode'],-15)
+    def test_all_existing_close_entries_capture_before_cleanup(self):
+        import inspect
+        for method in (m.CredentialLease.close,m.CredentialLease.close_group,m.Controller.stop_agent):
+            source=inspect.getsource(method)
+            self.assertIn("auth_note('auth_agent', 'before-cleanup')",source)
+
+    def test_execution_validator_rejects_pollution_and_impossible_flags(self):
+        for mutate in (lambda v:v['pump'].update(raw='PRIVATE'),
+                       lambda v:v['pump']['observed'].update(authenticationComplete=True),
+                       lambda v:v['agent'].update(exitCode=0,latestLive=True),
+                       lambda v:v['pump'].update(firstFailure={'stage':'waiting','code':'PRIVATE'}),
+                       lambda v:v['agent'].update(registrationLive=True)):
+            value=m.auth_execution_observation();mutate(value)
+            with self.assertRaises(ValueError):m.validate_auth_execution(value)
+
+
+class AuthenticationSnapshotConcurrencyTests(unittest.TestCase):
+    def test_main_and_pump_snapshots_remain_consistent(self):
+        c=controller(m.AUTH_MODE);c.auth_reached('transaction-guard','install');errors=[]
+        def pump():
+            try:
+                c.auth_pump('bytes-observed','ptyBytes')
+                c.auth_pump('action-checked','expectedAction')
+                c.auth_pump('identity-checked','expectedIdentity')
+                c.auth_pump('credential-write','echoDisabled')
+                c.auth_pump(flag='credentialWriteCompleted')
+                c.auth_pump('completion-observed','authenticationComplete')
+            except Exception as e:errors.append(type(e).__name__)
+        worker=threading.Thread(target=pump);worker.start()
+        for _ in range(100):
+            c.auth_reached('transaction-observer');m.validate_auth_runtime_observation(c.auth_snapshot())
+        worker.join();self.assertEqual(errors,[]);self.assertFalse(c.recovery_unknown)
+        self.assertTrue(c.auth_snapshot()['execution']['pump']['observed']['authenticationComplete'])
+    def test_kindless_or_noncredential_dialogue_rejected(self):
+        for mode,kind in ((m.AUTH_MODE,None),('existing-session','install')):
+            value=m.auth_runtime_observation(mode);value['kind']=kind
+            value['execution']['pump']['stage']='waiting'
+            with self.assertRaises(ValueError):m.validate_auth_runtime_observation(value)
+    def test_activity_deadline_fixed_failure_not_fake_success(self):
+        c=controller(m.AUTH_MODE);c.auth_reached('transaction-guard','install');c.pty=90
+        lease=m.CredentialLease(c,'install');lease.window=5;lease.user=types.SimpleNamespace(pw_name='runner',pw_gecos='')
+        lease.close=Mock()
+        lease.pump()
+        p=c.auth_snapshot()['execution']['pump'];self.assertEqual(p['firstFailure']['code'],'activity-deadline')
+        self.assertEqual(p['stoppedBy'],'deadline');self.assertFalse(lease.authenticated);lease.close.assert_called_once()
 
 if __name__ == '__main__': unittest.main(verbosity=2)

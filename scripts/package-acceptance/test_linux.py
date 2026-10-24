@@ -1023,10 +1023,16 @@ class GuiNavigationContracts(unittest.TestCase):
         self.assertRegex(primitives,r'<span\s+id=\{id\}\s+role="switch"')
 
     def test_preference_shared_real_span_control_and_readback(self):
-        run=self.run_fixture(); run.config.side_effect=[{'interruptConnectionsOnSwitch':False},{'interruptConnectionsOnSwitch':True}]
+        run=self.run_fixture()
+        run.preference_pending_save=Mock(side_effect=[False,True,False])
+        run.preference_disk=Mock(side_effect=[{'value':False},{'value':True}])
+        run.driver.wait_control.side_effect=[{'checked':'false','element':{M.ELEMENT:'preference-switch'}},{'checked':'true','element':{M.ELEMENT:'preference-switch'}}]
+        run.driver.observations.side_effect=[[],[{'sequence':1,'source':'original-config-save-callback',
+            'success':True,'status':'saved','versionValid':True,'preference':True}]]
         run.preference(True)
-        run.driver.wait_control.assert_called_once_with('preference-switch','settings.network.interruptOnSwitch')
+        self.assertEqual(run.driver.wait_control.call_count,2)
         self.assertEqual(run.driver.click_control.call_count,1)
+        run.config.assert_not_called()
         self.assertEqual(run.result['guiObservation']['phase'],'preference-return')
 
     def test_observations_bounded_and_secret_free(self):
@@ -1322,6 +1328,155 @@ class SelectionStageTests(unittest.TestCase):
         self.assertIn(('exchange', 'selection-preserved-traffic'), seen)
         self.assertIn(('disconnect', 'selection-off'), seen)
         self.assertIn(('config', 'selection-on-readback'), seen)
+
+
+class SavedPreferenceTests(unittest.TestCase):
+    def files(self, root, value=False):
+        home=Path(root)/'home'; directory=home/'config/com.polaris.app/polaris'
+        directory.mkdir(parents=True)
+        path=directory/'config.json'
+        path.write_text(json.dumps({'interruptConnectionsOnSwitch':value,'clashApiSecret':'SECRET'}))
+        return home,path
+
+    def test_real_file_proof_is_bounded_and_contains_no_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home,path=self.files(tmp)
+            result=M.read_saved_preference(home,home/'config')
+            self.assertFalse(result['value']); self.assertEqual(result['sha256'],M.sha(path))
+            self.assertNotIn('SECRET',json.dumps(result)); self.assertEqual(set(result),{'source','value','bytes','sha256'})
+
+    def test_fifo_directory_and_symlink_rejected_without_content_read(self):
+        for kind in ('fifo','directory','symlink'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                home,path=self.files(tmp);path.unlink()
+                if kind=='fifo': os.mkfifo(path)
+                elif kind=='directory':path.mkdir()
+                else:path.symlink_to(home/'missing')
+                with patch.object(M.os,'read',side_effect=AssertionError('must not read')):
+                    with self.assertRaises((ValueError,OSError)):M.read_saved_preference(home,home/'config')
+        with tempfile.TemporaryDirectory() as tmp:
+            home,path=self.files(tmp);original=path.parent; moved=original.with_name('moved');original.rename(moved);original.symlink_to(moved,target_is_directory=True)
+            with self.assertRaises((ValueError,OSError)):M.read_saved_preference(home,home/'config')
+
+    def test_owner_root_size_and_value_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home,path=self.files(tmp)
+            with patch.object(M.os,'getuid',return_value=os.getuid()+1):
+                with self.assertRaises(ValueError):M.read_saved_preference(home,home/'config')
+            with self.assertRaises(ValueError):M.read_saved_preference(home,home/'elsewhere')
+            path.write_bytes(b'x'*(4*1024*1024+1))
+            with patch.object(M.os,'read',side_effect=AssertionError('must not read')):
+                with self.assertRaises(ValueError):M.read_saved_preference(home,home/'config')
+            path.write_text('{"interruptConnectionsOnSwitch":"true"}')
+            with self.assertRaises(ValueError):M.read_saved_preference(home,home/'config')
+
+    def test_replacement_during_read_is_not_proof_of_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home,path=self.files(tmp);original_read=os.read;replaced=False
+            def read(fd,n):
+                nonlocal replaced
+                value=original_read(fd,n)
+                if not replaced:
+                    replacement=path.with_name('new');replacement.write_bytes(path.read_bytes());os.replace(replacement,path);replaced=True
+                return value
+            with patch.object(M.os,'read',side_effect=read):
+                with self.assertRaises(ValueError):M.read_saved_preference(home,home/'config')
+
+    def test_fstat_and_close_errors_do_not_leak_fds_or_mask_first_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home,path=self.files(tmp);close=os.close
+            with patch.object(M.os,'fstat',side_effect=OSError('fixed')),patch.object(M.os,'close',wraps=close) as closed:
+                with self.assertRaises(OSError):M.read_saved_preference(home,home/'config')
+                self.assertEqual(closed.call_count,1)
+            def bad_close(fd):close(fd);raise OSError('fixed')
+            with patch.object(M.os,'close',side_effect=bad_close) as closed:
+                with self.assertRaisesRegex(ValueError,'descriptor close'):M.read_saved_preference(home,home/'config')
+                self.assertEqual(closed.call_count,5)
+            path.write_bytes(b'bad json')
+            with patch.object(M.os,'close',side_effect=bad_close) as closed:
+                with self.assertRaises(json.JSONDecodeError):M.read_saved_preference(home,home/'config')
+                self.assertEqual(closed.call_count,5)
+
+    def fixture(self, current=False):
+        run=M.CarrierRun.__new__(M.CarrierRun);run.result={};run.driver=Mock();run.text=lambda x:x
+        run.config=Mock(side_effect=AssertionError('no config IPC'))
+        run.preference_pending_save=Mock(side_effect=[False,True,False] if not current else [False,False])
+        run.preference_disk=Mock(side_effect=[{'value':current},{'value':True}])
+        run.driver.wait_control.side_effect=[{'checked':'true' if current else 'false'},{'checked':'true'}]
+        self.row={'sequence':1,'source':'original-config-save-callback','success':True,'status':'saved','versionValid':True,'preference':True}
+        run.driver.observations.side_effect=[[],[self.row]]
+        return run
+
+    def test_already_wanted_still_requires_disk_clean_and_no_click(self):
+        run=self.fixture(True);run.preference(True)
+        run.driver.click_control.assert_not_called();run.driver.observations.assert_not_called()
+        self.assertEqual(run.preference_disk.call_count,2);run.config.assert_not_called()
+        self.assertTrue(run.result['preferenceObservations'][0]['clean'])
+
+    def test_dirty_or_ui_disk_disagreement_never_toggles(self):
+        for dirty in (True,False):
+            run=self.fixture();run.preference_pending_save=Mock(return_value=dirty)
+            if not dirty:run.preference_disk=Mock(return_value={'value':True})
+            with self.assertRaises(M.GuiFailure):run.preference(True)
+            run.driver.click_control.assert_not_called();run.config.assert_not_called()
+
+    def test_bad_save_callback_never_replays_mutation(self):
+        for change in ({'success':False},{'status':'conflict'},{'versionValid':False},{'preference':False},{'extra':'SECRET'}):
+            run=self.fixture();run.driver.observations.side_effect=[[],[{**self.row,**change}]]
+            with self.subTest(change=change),self.assertRaises(M.GuiFailure):run.preference(True)
+            self.assertEqual(run.driver.click_control.call_count,1)
+            saves=[c for c in run.driver.click.call_args_list if c.args[0]=='.pending-bar .pb-acts button']
+            self.assertEqual(len(saves),1);run.config.assert_not_called()
+            self.assertNotIn('SECRET',json.dumps(run.result))
+        run=self.fixture();run.driver.observations.side_effect=[[],[self.row,{**self.row,'sequence':2}]]
+        with self.assertRaises(M.GuiFailure):run.preference(True)
+
+    def test_saved_callback_does_not_replace_disk_or_app_identity(self):
+        run=self.fixture();run.preference_disk.side_effect=[{'value':False},{'value':False}]
+        with self.assertRaises(M.GuiFailure):run.preference(True)
+        self.assertEqual(run.driver.click_control.call_count,1)
+        run=M.CarrierRun.__new__(M.CarrierRun);run.app={'pid':1,'startTime':'1','exeDev':1,'exeInode':2}
+        run.home=Path('/private');run.env={'XDG_CONFIG_HOME':'/private/config'}
+        with patch.object(M,'process_identity',return_value={'pid':1,'startTime':'2'}),patch.object(M,'read_saved_preference') as read:
+            with self.assertRaises(M.GuiFailure):run.preference_disk()
+            read.assert_not_called()
+
+    def test_confirmation_budget_is_not_reset_or_success_after_expiry(self):
+        run=self.fixture(); now=[0.0]; calls=[0]
+        def observations():
+            calls[0]+=1
+            if calls[0]==1:return []
+            now[0]=31.0
+            return [self.row]
+        run.driver.observations.side_effect=observations
+        with patch.object(M.time,'monotonic',side_effect=lambda:now[0]):
+            with self.assertRaises(M.GuiFailure) as caught:run.preference(True)
+        self.assertEqual(caught.exception.code,'observation-timeout')
+        self.assertEqual(run.driver.click_control.call_count,1)
+        self.assertNotIn('clean',run.result['preferenceObservations'][0])
+
+    def test_app_generation_change_after_disk_read_is_rejected(self):
+        run=M.CarrierRun.__new__(M.CarrierRun)
+        run.app={'pid':1,'startTime':'1','exeDev':1,'exeInode':2}
+        run.home=Path('/private');run.env={'XDG_CONFIG_HOME':'/private/config'}
+        live={**run.app,'state':'S','uid':os.getuid()}
+        with patch.object(M,'process_identity',side_effect=[live,{**live,'startTime':'2'}]),patch.object(M,'read_saved_preference',return_value={'value':True}):
+            with self.assertRaises(M.GuiFailure):run.preference_disk()
+
+    def test_real_observer_projects_save_without_secret_or_command_claim(self):
+        import subprocess
+        raw={'success':True,'data':{'status':'saved','version':'1234abcd','config':{'interruptConnectionsOnSwitch':True,'secret':'SECRET'}}}
+        script=('const callbacks=new Map([[1,x=>{}]]);global.window={};const internals={};'
+            'Object.defineProperty(internals,"invoke",{value:()=>{},writable:false,configurable:false});'
+            'Object.defineProperty(internals,"callbacks",{value:callbacks,writable:false,configurable:false});'
+            'window.__TAURI_INTERNALS__=internals;new Function('+json.dumps(M.OBSERVER)+')();'
+            'callbacks.get(1)('+json.dumps(raw)+');process.stdout.write(JSON.stringify(window.__packageObservation.rows));')
+        rows=json.loads(subprocess.check_output(['node','-e',script],text=True))
+        self.assertTrue(rows[0]['versionValid']);self.assertTrue(rows[0]['preference'])
+        self.assertNotIn('SECRET',json.dumps(rows));self.assertNotIn('command',rows[0])
+        source=Path(M.__file__).read_text();body=source.split('    def preference(self, wanted):',1)[1].split('    def socket(',1)[0]
+        self.assertNotIn('self.config(',body);self.assertNotIn('invoke(',body)
+        self.assertIn('wait_for(closed, timeout=12)',source)
 
 
 if __name__ == '__main__':

@@ -119,3 +119,42 @@ class HelperProjectionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class ExecutionDiagnosticProjectionTests(unittest.TestCase):
+    def raw(self):
+        raw=action(code='authorizationIncomplete')
+        raw['data']['executionDiagnostic']={'schema':h.EXECUTION_SCHEMA,'exitCode':127,
+            'marker':'noAuthenticationAgent','scope':h.EXECUTION_SCOPE}
+        return raw
+    def test_every_marker_survives_without_claiming_emitter(self):
+        for marker in h.EXECUTION_MARKERS:
+            raw=self.raw();raw['data']['executionDiagnostic']['marker']=marker
+            value=h.validate_projection(project(raw))
+            self.assertEqual(value['executionDiagnosticState'],'valid')
+            self.assertEqual(value['executionDiagnostic']['marker'],marker)
+            self.assertEqual(value['executionDiagnostic']['scope'],'child-stderr-marker-not-verified-emitter')
+            detached=h.validate_projection(value);detached['executionDiagnostic']['marker']='unknown'
+            self.assertEqual(value['executionDiagnostic']['marker'],marker)
+    def test_malformed_and_secret_input_never_survive(self):
+        for mutate in (lambda e:e.update(raw='PRIVATE'),lambda e:e.update(marker='PRIVATE'),
+                       lambda e:e.update(exitCode=True),lambda e:e.update(exitCode=126),
+                       lambda e:e.update(scope='verified-authority'),lambda e:e.update(schema='wrong')):
+            raw=self.raw();mutate(raw['data']['executionDiagnostic'])
+            value=h.validate_projection(project(raw))
+            self.assertEqual(value['executionDiagnosticState'],'malformed');self.assertIsNone(value['executionDiagnostic'])
+            self.assertNotIn('PRIVATE',json.dumps(value))
+        raw=self.raw();raw['data']['success']=True
+        self.assertEqual(project(raw)['executionDiagnosticState'],'malformed')
+    def test_legacy_absence_and_strict_injected_observation(self):
+        value=project(action());self.assertEqual(value['executionDiagnosticState'],'absent')
+        value['executionDiagnostic']={'raw':'PRIVATE'}
+        with self.assertRaises(ValueError):h.validate_projection(value)
+    def test_markers_match_rust_enum_and_existing_failure_boundaries(self):
+        root=Path(os.environ.get('POLARIS_ACCEPTANCE_TEST_SOURCE_ROOT',Path(__file__).resolve().parents[2]))
+        source=(root/'src-tauri/src/runtime/helper.rs').read_text()
+        body=source.split('pub enum HelperExecutionMarker {',1)[1].split('}',1)[0]
+        names=re.findall(r'^\s*([A-Z][A-Za-z]+),\s*$',body,re.M)
+        self.assertEqual(tuple(n[0].lower()+n[1:] for n in names),h.EXECUTION_MARKERS)
+        self.assertEqual(source.count('result.execution_diagnostic ='),2)
+        command=(root/'src-tauri/src/commands/helper.rs').read_text()
+        self.assertEqual(command.count('execution_diagnostic: None'),2)

@@ -42,13 +42,15 @@ def helper_row(success=True, code='missing', installed=None, ready=None):
     return {'sequence':1,'kind':'helperObservation','observedElapsedMs':735,
         'projection':{'schema':M.helper_observation.SCHEMA,'kind':'helperAction','association':'shape-only',
             'envelopeSuccess':True,'actionSuccess':success,'errorCode':code,'statusShape':'valid','status':status,
-            'selectedCoreState':'missing','protocolVersion':None,'expectedProtocolVersion':None,'buildIdentityMatches':None}}
+            'selectedCoreState':'missing','protocolVersion':None,'expectedProtocolVersion':None,'buildIdentityMatches':None,'executionDiagnosticState':'absent','executionDiagnostic':None}}
 
 
 def scan_snapshot(run,kind='install'):
+    import root_controller
+    runtime=root_controller.auth_runtime_observation(run.launch_options['authenticationMode']);runtime['kind']=kind
     return {'kind':kind,'subject':{key:run.app[key] for key in ('pid','startTime','uid')},
         'authenticationMode':run.launch_options['authenticationMode'],'pkexecBirths':[], 'rootShellBirths':[],
-        'owned':[],'authorizationObserved':False,'credentialPromptClaimed':False}
+        'owned':[],'authorizationObserved':False,'credentialPromptClaimed':False,'authenticationRuntime':runtime}
 
 
 def supervisor():
@@ -942,7 +944,7 @@ class ControllerLifecycleContracts(unittest.TestCase):
         proof={'owned':[],'credentialRecovery':credential,'credentialAuthenticationComplete':True,'authDescendantsReaped':True,
                'jointLease':{'credentialRecovery':dict(credential),'groupRecovery':self.membership_recovery()}}
         for valid in (True,False):
-            run=M.TunCarrierRun.__new__(M.TunCarrierRun); run.result={}
+            run=M.TunCarrierRun.__new__(M.TunCarrierRun); run.env={}; run.result={}
             run.app={'pid':100,'startTime':'123','uid':1001};run.driver=Mock();run.supervisor=Mock();run.controller=Mock()
             run.launch_options={'authenticationMode':M.AUTH_GROUP_MODE,'authorization':{'guiUid':1001,'account':'runner'}}
             result=copy.deepcopy(proof)
@@ -973,7 +975,7 @@ class SharedGuiAndVmContracts(unittest.TestCase):
         self.assertIn('dialog[open][aria-labelledby="restart-apply-title"] button',source)
 
     def test_tun_exchange_retains_framed_fixture_and_pending_proof(self):
-        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.pending_streams={}
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.env={};run.result={};run.pending_streams={}
         proof={'exit':'A','bytes':36,'nonceSha256':'a'*64}
         with patch.object(M.fixture,'exchange',return_value=proof) as exchange:
             self.assertEqual(run.exchange(Mock(),'A'),proof)
@@ -1071,7 +1073,7 @@ class AuthenticationRuntimeConsumerTests(unittest.TestCase):
         self.assertEqual(client.lifecycle['abortReceipt']['authenticationRuntime'],observation)
 
     def test_helper_callback_failure_preserves_only_fixed_booleans(self):
-        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.app={'pid':100,'startTime':'123','uid':1001}
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.env={};run.result={};run.app={'pid':100,'startTime':'123','uid':1001}
         run.launch_options={'authenticationMode':'existing-session'}
         run.driver=Mock();run.supervisor=Mock();run.controller=Mock();run.text=lambda key:key
         run.controller.call.side_effect=lambda command,**kw:scan_snapshot(run) if command=='transaction_scan' else {}
@@ -1086,8 +1088,8 @@ class AuthenticationRuntimeConsumerTests(unittest.TestCase):
 
 class HelperObservationConsumerTests(unittest.TestCase):
     def run_fixture(self,row=None):
-        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.result={};run.app={'pid':100,'startTime':'123','uid':1001}
-        run.launch_options={'authenticationMode':'existing-session'};run.driver=Mock();run.supervisor=Mock();run.controller=Mock()
+        run=M.TunCarrierRun.__new__(M.TunCarrierRun);run.env={};run.result={};run.app={'pid':100,'startTime':'123','uid':1001}
+        run.launch_options={'authenticationMode':'existing-session'};run.driver=Mock();run.supervisor=Mock();run.controller=Mock();run.env={}
         run.text=lambda key:key
         run.controller.call.side_effect=lambda command,**kw:scan_snapshot(run) if command=='transaction_scan' else {'owned':[]} if command=='transaction_end' else {}
         rows=iter([[],[helper_row() if row is None else row]])
@@ -1113,7 +1115,7 @@ class HelperObservationConsumerTests(unittest.TestCase):
             self.assertNotIn('transaction_end',[c.args[0] for c in run.controller.call.call_args_list])
 
     def test_outer_failure_is_uncorrelated_not_business_failure(self):
-        row=helper_row();p=row['projection'];p.update(kind='outerFailure',association='uncorrelated',envelopeSuccess=False,
+        row=helper_row();p=row['projection'];p.update(kind='outerFailure',association='uncorrelated',envelopeSuccess=False,executionDiagnosticState='not-applicable',
             actionSuccess=None,errorCode='not-applicable',statusShape='not-applicable')
         p['status']={k:None for k in p['status']}
         run=self.run_fixture()
@@ -1219,6 +1221,64 @@ console.log(JSON.stringify({invokeUnchanged:window.__TAURI_INTERNALS__.invoke===
         later=helper_row(False,'partialCleanup');later['sequence']=2
         run.helper_observations('uninstall',1,[later])
         self.assertEqual(run.result['firstBusinessFailure'],first)
+
+
+class AuthenticationAndExecutionConsumerTests(unittest.TestCase):
+    def test_root_execution_is_preserved_but_not_authority(self):
+        run=HelperObservationConsumerTests().run_fixture();run.gui_phase('helper-begin');value=scan_snapshot(run)
+        run.record_transaction_observation(value,'install')
+        saved=run.result['rootTransactionObservation']['authenticationRuntime']
+        self.assertEqual(saved['schema'],'polaris-auth-runtime-observation-v2')
+        self.assertFalse(run.result['rootTransactionObservation']['authorizationObserved'])
+        value['authenticationRuntime']['execution']['agent']['exitCode']=127
+        self.assertIsNone(saved['execution']['agent']['exitCode'])
+        with self.assertRaises(ValueError):run.record_transaction_observation(value,'install')
+    def test_native_marker_preserved_without_business_success(self):
+        row=helper_row(False,'authorizationIncomplete')
+        p=row['projection'];p['executionDiagnosticState']='valid'
+        p['executionDiagnostic']={'schema':M.helper_observation.EXECUTION_SCHEMA,'exitCode':127,
+            'marker':'noAuthenticationAgent','scope':M.helper_observation.EXECUTION_SCOPE}
+        run=HelperObservationConsumerTests().run_fixture(row)
+        with self.assertRaises(ValueError):run.helper_action('install')
+        self.assertEqual(run.result['firstBusinessFailure']['projection']['executionDiagnostic']['exitCode'],127)
+        self.assertFalse(run.result['helperCallback']['success'])
+        self.assertNotIn('transaction_end',[c.args[0] for c in run.controller.call.call_args_list])
+    def test_contradictory_success_with_execution_diagnostic_is_not_success(self):
+        row=helper_row();row['projection']['executionDiagnosticState']='malformed'
+        run=HelperObservationConsumerTests().run_fixture(row)
+        with self.assertRaises(ValueError):run.helper_action('install')
+        run.supervisor.end_window.assert_not_called()
+
+
+class LogindReadOnlyObservationTests(unittest.TestCase):
+    def test_unique_owner_exact_subject_and_bounded_calls(self):
+        app=identity();supervisor=Mock();supervisor.query.side_effect=["(':1.27',)","(objectpath '/org/freedesktop/login1/session/c1',)"]
+        with patch.object(M.base,'process_identity',return_value=app): result=M.observe_logind_session(supervisor,{},app)
+        self.assertEqual(result['state'],'present');self.assertTrue(result['birthStable'])
+        calls=supervisor.query.call_args_list;self.assertEqual(len(calls),2)
+        self.assertIn(':1.27',calls[1].args[0]);self.assertNotIn('org.freedesktop.login1',calls[1].args[0])
+        self.assertEqual(calls[1].args[0][-1],str(app['pid']))
+        self.assertEqual(calls[0].kwargs['timeout'],2);self.assertNotIn('c1',json.dumps(result))
+    def test_missing_owner_error_bad_reply_and_birth_change_stay_unknown(self):
+        app=identity()
+        for replies in ([ValueError('PRIVATE')],["('org.freedesktop.login1',)"],
+                        ["(':1.2',)",ValueError('NoSessionForPID PRIVATE')],
+                        ["(':1.2',)","PRIVATE"]):
+            supervisor=Mock();supervisor.query.side_effect=replies
+            with patch.object(M.base,'process_identity',return_value=app): result=M.observe_logind_session(supervisor,{},app)
+            self.assertEqual(result['state'],'unknown');self.assertNotIn('PRIVATE',json.dumps(result))
+        supervisor=Mock();supervisor.query.side_effect=["(':1.2',)","(objectpath '/org/freedesktop/login1/session/c1',)"]
+        with patch.object(M.base,'process_identity',side_effect=[app,{**app,'startTime':'999'}]):result=M.observe_logind_session(supervisor,{},app)
+        self.assertEqual(result['state'],'unknown');self.assertFalse(result['birthStable'])
+    def test_unknown_does_not_erase_supervisor_cleanup_evidence(self):
+        app=identity();supervisor=Mock();supervisor.unknown=['tool-query-timeout'];supervisor.query.side_effect=ValueError('PRIVATE')
+        with patch.object(M.base,'process_identity',return_value=app):M.observe_logind_session(supervisor,{},app)
+        self.assertEqual(supervisor.unknown,['tool-query-timeout'])
+    def test_session_probe_precedes_lease_and_never_calls_mutation(self):
+        source=__import__('inspect').getsource(M.TunCarrierRun.helper_action)
+        self.assertLess(source.index('observe_logind_session'),source.index("self.controller.call('transaction_begin'"))
+        probe=__import__('inspect').getsource(M.observe_logind_session)
+        self.assertNotIn('CreateSession',probe);self.assertNotIn('ActivateSession',probe)
 
 if __name__ == '__main__':
     unittest.main()
