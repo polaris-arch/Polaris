@@ -366,15 +366,19 @@ AUTH_OPERATION_STAGES = ('idle', 'transaction-guard', 'agent-spawn', 'agent-noti
     'lease-timer-verify', 'group-add', 'setting-intent', 'password-writer', 'password-readback',
     'dialogue', 'dialogue-identity', 'dialogue-password', 'dialogue-complete', 'transaction-observer',
     'transaction-finish', 'controller-input')
-AUTH_FAILURE_CODES = ('operation-failed', 'abort-requested', 'input-ended', 'recovery-failed')
+TRANSACTION_BOUNDARIES = ('gui', 'inventory', 'candidate', 'pkexec-argv', 'pkexec-uid', 'script',
+    'pkexec-executable', 'shell-prior', 'shell-argv', 'shell-executable', 'namespace', 'ordinary-uid',
+    'descendant-uid', 'ledger', 'credential-fence')
+AUTH_FAILURE_CODES = ('operation-failed', 'abort-requested', 'input-ended', 'recovery-failed') + tuple(
+    'transaction-' + key + '-unconfirmed' for key in TRANSACTION_BOUNDARIES)
 AUTH_RECOVERY_STEPS = ('agent', 'credential', 'group', 'lineage', 'timer')
 
 
 AUTH_PUMP_STAGES = ('not-started', 'waiting', 'bytes-observed', 'action-checked', 'identity-checked',
-    'echo-wait', 'credential-write', 'completion-observed', 'stopped')
+    'echo-wait', 'pkexec-fence', 'credential-write', 'completion-observed', 'stopped')
 AUTH_PUMP_CODES = ('pty-read-failed', 'pty-eof', 'dialogue-limit', 'dialogue-encoding',
     'action-mismatch', 'identity-not-unique', 'identity-mismatch', 'identity-write-failed',
-    'echo-unconfirmed', 'credential-write-failed', 'native-authentication-failed',
+    'echo-unconfirmed', 'pkexec-fence-unconfirmed', 'credential-write-failed', 'native-authentication-failed',
     'native-authentication-canceled', 'completion-unconfirmed', 'activity-deadline', 'unexpected-error')
 AUTH_PUMP_FLAGS = ('ptyBytes', 'expectedAction', 'expectedIdentity', 'echoDisabled',
                    'credentialWriteCompleted', 'authenticationComplete')
@@ -1064,16 +1068,19 @@ exit as proof all authentication helpers are gone. No unknown PID is killed.
         values = {}
         for entry in Path('/proc').iterdir():
             if entry.name.isdigit() and int(entry.name) > 1:
-                p = self.c.ops.proc(int(entry.name))
+                p = proc_stat(int(entry.name))
                 if p and p['state'] != 'Z': values[p['pid']] = p
         with self.lock:
             for _ in range(8):
                 changed = False
-                for p in values.values():
-                    key = birth(p); parent = values.get(p['ppid'])
-                    if key not in self.rows and not (parent and birth(parent) in self.rows and
-                            self.c.tun.same_process(self.rows[birth(parent)], parent)):
-                        continue
+                ordered = sorted(values.values(), key=lambda row: 0 if birth(row) in self.rows else 1)
+                for light in ordered:
+                    key = birth(light); parent = values.get(light['ppid'])
+                    if key not in self.rows and not (parent and birth(parent) in self.rows): continue
+                    p = self.c.ops.proc(light['pid'])
+                    require(p and birth(p) == key and p['ppid'] == light['ppid'], 'auth candidate topology changed')
+                    if key not in self.rows:
+                        require(self.c.tun.same_process(self.rows[birth(parent)], self.c.ops.proc(parent['pid'])), 'auth parent changed')
                     require(p['uid'] in (0, self.c.launch['guiUid']) and p['namespaces'] == self.c.gui['namespaces'] and
                             p['cgroup'] == self.rows[next(iter(self.rows))]['cgroup'], 'auth helper escaped native lineage')
                     if self.rows.get(key) != p:
@@ -1266,8 +1273,17 @@ observably active before a password-setting attempt. Each transaction re-locks.
                     while termios.tcgetattr(self.c.pty)[3] & termios.ECHO:
                         check(time.monotonic() < echo_deadline, 'echo-unconfirmed')
                         time.sleep(0.005)
+                    if self.grouped:
+                        observe('pkexec-fence')
+                        failure_code = 'pkexec-fence-unconfirmed'
+                        check(self.c.observer is not None, failure_code)
+                        self.c.observer.credential_fence(deadline, self.stop)
+                        check(not self.stop.is_set() and time.monotonic() < deadline, failure_code)
+                        check(not termios.tcgetattr(self.c.pty)[3] & termios.ECHO, 'echo-unconfirmed')
                     observe('credential-write', 'echoDisabled')
                     failure_code = 'credential-write-failed'
+                    if self.grouped:
+                        check(not self.stop.is_set() and time.monotonic() < deadline, 'pkexec-fence-unconfirmed')
                     written = os.write(self.c.pty, bytes(self.secret) + b'\n')
                     check(written == len(self.secret) + 1, 'credential-write-failed')
                     self.sent = True; observe(flag='credentialWriteCompleted')
@@ -1410,68 +1426,143 @@ class TransactionObserver:
     def __init__(self, controller, kind):
         self.c = controller; self.kind = kind; self.rows = {}; self.pkexec = {}; self.shells = {}
         self.error = None; self.stop = threading.Event(); self.lock = threading.Lock()
+        self.error_lock = threading.Lock()
         self.thread = threading.Thread(target=self.loop, name='owned-pkexec-observer', daemon=True)
 
     def start(self):
         self.thread.start()
 
+    def fail_boundary(self, boundary):
+        # Fixed non-secret cause survives snapshot's secondary exception and recovery.
+        with self.error_lock:
+            first = self.error is None
+            if first: self.error = boundary
+        if first: self.c.auth_note('auth_failed', 'transaction-' + boundary + '-unconfirmed')
+
     def loop(self):
         while not self.stop.wait(0.01):
+            try: self.scan()
+            except Exception: return  # scan retains the first fixed boundary
+
+    def candidate(self, pid, light):
+        for attempt in range(3):
             try:
-                self.scan()
-            except Exception as error:
-                self.error = type(error).__name__; return
+                value = self.c.tun.transaction_identity(pid)
+                p = value['identity']
+                require(birth(p) == birth(light) and p['ppid'] == light['ppid'], 'candidate topology changed')
+                return value
+            except (OSError, ValueError):
+                if attempt == 2: raise
+                time.sleep(0.001)
 
     def scan(self):
-        c = self.c; tun = c.tun
-        require(tun.same_process(c.gui, c.ops.proc(c.gui['pid'])), 'GUI birth changed during privilege transaction')
-        values = {}
-        for item in Path('/proc').iterdir():
-            if item.name.isdigit() and int(item.name) > 1:
-                try:
-                    p = c.ops.proc(int(item.name))
-                except FileNotFoundError:
-                    continue
-                if p and p['state'] != 'Z': values[p['pid']] = p
-        with self.lock:
-            for p in values.values():
-                key = birth(p); parent = values.get(p['ppid'])
-                direct = parent and tun.same_process(parent, c.gui)
-                child = parent and birth(parent) in self.rows and tun.same_process(self.rows[birth(parent)], parent)
-                if not direct and not child:
-                    continue
-                if direct:
-                    argv = command_line(p['pid']); uids = uid_tuple(p['pid'])
-                    if p['exe'] == str(Path('/usr/bin/pkexec').resolve()):
-                        require(argv[:2] == ['/usr/bin/pkexec', '/bin/bash'] and len(argv) == 3,
-                                'unexpected GUI pkexec argv')
-                        require(uids[0] == c.launch['guiUid'] and uids[1] == 0, 'pkexec UID transition differs')
-                        c.verify_script(argv[2], self.kind)
-                        require(tun.executable_identity(p['pid']) == c.tools['pkexec'], 'pkexec object changed')
-                        self.pkexec[key] = {'identity': p, 'script': argv[2]}
-                    elif p['exe'] == str(Path('/bin/bash').resolve()) and uids == (0, 0, 0, 0):
-                        require(key in self.pkexec, 'root bash without observed original pkexec birth')
-                        require(argv == ['/bin/bash', self.pkexec[key]['script']], 'root bash argv differs')
-                        require(tun.executable_identity(p['pid']) == c.tools['bash'], 'root bash object changed')
-                        proof = c.verify_script(argv[1], self.kind)
-                        require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'],
-                                'privilege transaction escaped GUI namespace/cgroup')
-                        self.shells[key] = proof
+        c = self.c; tun = c.tun; boundary = 'gui'
+        try:
+            require(tun.same_process(c.gui, c.ops.proc(c.gui['pid'])), 'GUI birth changed during privilege transaction')
+            boundary = 'inventory'; values = {}
+            # No full exe/namespace/cmdline reads for unrelated system processes.
+            for item in Path('/proc').iterdir():
+                if item.name.isdigit() and int(item.name) > 1:
+                    p = proc_stat(int(item.name))
+                    if p and p['state'] != 'Z': values[p['pid']] = p
+            def depth(row):
+                seen = set(); count = 0
+                while row['ppid'] in values and row['ppid'] not in seen and count < 32:
+                    seen.add(row['ppid']); row = values[row['ppid']]; count += 1
+                return count
+            with self.lock:
+                # Parent exec-state updates precede child ownership checks even
+                # when procfs enumeration happens to return children first.
+                for light in sorted(values.values(), key=depth):
+                    parent = values.get(light['ppid'])
+                    direct = parent and birth(parent) == birth(c.gui)
+                    child = parent and birth(parent) in self.rows
+                    if not direct and not child: continue
+                    boundary = 'candidate'; observation = self.candidate(light['pid'], light)
+                    p = observation['identity']; key = birth(p)
+                    if direct:
+                        require(tun.same_process(c.gui, c.ops.proc(c.gui['pid'])), 'GUI parent changed')
                     else:
-                        # Normal ordinary WebKit children remain the GUI supervisor's domain.
-                        require(uids[0] == c.launch['guiUid'] and uids[1] == c.launch['guiUid'],
-                                'unobserved privileged GUI child')
-                        continue
-                else:
-                    require(uid_tuple(p['pid']) == (0, 0, 0, 0) and p['namespaces'] == c.gui['namespaces'] and
-                            p['cgroup'] == c.gui['cgroup'], 'privileged descendant ownership differs')
-                self.rows[key] = p
-                def record(v):
-                    records = v.setdefault('transactionProcesses', [])
-                    old = next((r for r in records if birth(r['identity']) == key), None)
-                    if old: old['identity'] = p
-                    else: records.append({'role': 'privilege-transaction', 'identity': p})
-                c.ledger.mutate(record)
+                        require(tun.same_process(self.rows[birth(parent)], c.ops.proc(parent['pid'])), 'owned parent changed')
+                    argv = observation['argv']; uids = observation['uids']; executable = observation['executable']
+                    if direct:
+                        if p['exe'] == str(Path('/usr/bin/pkexec').resolve()):
+                            boundary = 'pkexec-argv'
+                            require(argv[:2] == ['/usr/bin/pkexec', '/bin/bash'] and len(argv) == 3, 'unexpected GUI pkexec argv')
+                            boundary = 'pkexec-uid'
+                            initial = uids == (c.launch['guiUid'], 0, 0, 0)
+                            require(initial or (uids == (0, 0, 0, 0) and key in self.pkexec), 'pkexec UID transition differs')
+                            boundary = 'script'; proof = c.verify_script(argv[2], self.kind)
+                            if key in self.pkexec:
+                                require(argv[2] == self.pkexec[key]['script'] and proof == self.pkexec[key]['proof'], 'original script changed')
+                            boundary = 'pkexec-executable'; require(executable == c.tools['pkexec'], 'pkexec object changed')
+                            boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'pkexec namespace/cgroup differs')
+                            pending = {'identity': p, 'script': argv[2], 'proof': proof}
+                        elif p['exe'] == str(Path('/bin/bash').resolve()) and uids == (0, 0, 0, 0):
+                            boundary = 'shell-prior'; require(key in self.pkexec, 'root bash without original pkexec birth')
+                            boundary = 'shell-argv'; require(argv == ['/bin/bash', self.pkexec[key]['script']], 'root bash argv differs')
+                            boundary = 'shell-executable'; require(executable == c.tools['bash'], 'root bash object changed')
+                            boundary = 'script'; proof = c.verify_script(argv[1], self.kind)
+                            require(proof == self.pkexec[key]['proof'], 'original script changed')
+                            boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'root shell escaped GUI')
+                            pending = None
+                        else:
+                            boundary = 'ordinary-uid'; require(uids[0] == c.launch['guiUid'] and uids[1] == c.launch['guiUid'], 'unobserved privileged GUI child')
+                            continue
+                    else:
+                        boundary = 'descendant-uid'; require(uids == (0, 0, 0, 0), 'privileged descendant UID differs')
+                        boundary = 'namespace'; require(p['namespaces'] == c.gui['namespaces'] and p['cgroup'] == c.gui['cgroup'], 'privileged descendant escaped GUI')
+                        pending = None
+                    boundary = 'ledger'
+                    def record(v):
+                        records = v.setdefault('transactionProcesses', [])
+                        old = next((r for r in records if birth(r['identity']) == key), None)
+                        if old: old['identity'] = p
+                        else: records.append({'role': 'privilege-transaction', 'identity': p})
+                    c.ledger.mutate(record)
+                    self.rows[key] = p
+                    if direct and p['exe'] == str(Path('/usr/bin/pkexec').resolve()): self.pkexec[key] = pending
+                    elif direct: self.shells[key] = proof
+        except Exception:
+            self.fail_boundary(boundary)
+            raise
+
+    def credential_fence(self, deadline, stopped):
+        # No lock is held while waiting, reading procfs or persisting observations.
+        def acquire():
+            while not stopped.is_set():
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, 'credential observer lock deadline')
+                if self.lock.acquire(timeout=min(remaining, 0.005)): return
+            raise ValueError('credential observer canceled')
+        try:
+            while not stopped.is_set() and time.monotonic() < deadline:
+                acquire()
+                try:
+                    require(self.error is None, 'transaction observer failed')
+                    require(len(self.pkexec) <= 1 and not self.shells, 'ambiguous credential transaction')
+                    prior = json.loads(json.dumps(next(iter(self.pkexec.values())))) if self.pkexec else None
+                finally: self.lock.release()
+                if prior is None:
+                    stopped.wait(0.005); continue
+                p = prior['identity']; observed = self.candidate(p['pid'], p)
+                now = observed['identity']
+                require(self.c.tun.same_process(p, now) and now['ppid'] == self.c.gui['pid'] and
+                        self.c.tun.same_process(self.c.gui, self.c.ops.proc(self.c.gui['pid'])) and
+                        observed['uids'] == (self.c.launch['guiUid'], 0, 0, 0) and
+                        observed['executable'] == self.c.tools['pkexec'] and
+                        observed['argv'] == ['/usr/bin/pkexec', '/bin/bash', prior['script']] and
+                        self.c.verify_script(prior['script'], self.kind) == prior['proof'], 'credential pkexec proof changed')
+                acquire()
+                try:
+                    require(self.error is None and len(self.pkexec) == 1 and not self.shells, 'credential observer changed')
+                finally: self.lock.release()
+                require(not stopped.is_set() and time.monotonic() < deadline, 'credential deadline reached')
+                return
+            raise ValueError('credential fence unavailable')
+        except Exception:
+            self.fail_boundary('credential-fence')
+            raise
 
     def snapshot(self):
         require(self.error is None, 'privilege transaction observation failed')
@@ -1637,8 +1728,21 @@ class Controller:
         matches = []
         for entry in Path('/proc').iterdir():
             if not entry.name.isdigit() or int(entry.name) <= 1: continue
-            candidate = self.ops.proc(int(entry.name))
-            if not candidate or candidate['state'] == 'Z' or candidate['uid'] != gui['uid']: continue
+            light = proc_stat(int(entry.name))
+            if not light or light['state'] == 'Z': continue
+            try: uids = uid_tuple(light['pid'])
+            except FileNotFoundError:
+                require(proc_absent(light['pid']), 'binding candidate unavailable'); continue
+            again = proc_stat(light['pid'])
+            if not again:
+                require(proc_absent(light['pid']), 'binding candidate unavailable'); continue
+            require(birth(again) == birth(light), 'binding candidate changed')
+            if uids[0] != gui['uid']: continue
+            candidate = self.ops.proc(light['pid'])
+            if not candidate:
+                require(proc_absent(light['pid']), 'binding candidate unavailable'); continue
+            require(birth(candidate) == birth(light), 'binding candidate changed')
+            if candidate['state'] == 'Z' or candidate['uid'] != gui['uid']: continue
             if (candidate['exeDev'], candidate['exeInode']) == (gui['exeDev'], gui['exeInode']): matches.append(birth(candidate))
         require(matches == [birth(gui)], 'actual packaged App is not unique in the dedicated VM')
         require(self.tun.same_process(gui, self.ops.proc(pid)), 'GUI changed while binding')
@@ -1838,8 +1942,11 @@ class Controller:
         rows = []
         for item in Path('/proc').iterdir():
             if item.name.isdigit() and int(item.name) > 1:
-                row = self.ops.proc(int(item.name))
-                if row and row['ppid'] == value['helper']['identity']['pid'] and row['state'] != 'Z': rows.append(row)
+                light = proc_stat(int(item.name))
+                if not light or light['state'] == 'Z' or light['ppid'] != value['helper']['identity']['pid']: continue
+                row = self.ops.proc(light['pid'])
+                require(row and birth(row) == birth(light) and row['ppid'] == light['ppid'], 'core candidate changed')
+                rows.append(row)
         require(len(rows) == 1, 'single actual helper core child required')
         return {'identity': self.tun.register_core(self.ledger, rows[0]['pid'])}
 

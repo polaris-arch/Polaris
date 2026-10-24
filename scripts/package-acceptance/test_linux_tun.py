@@ -504,8 +504,9 @@ class PureContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'app'; raw = b'\x7fELFactual-test-byte-stream'; path.write_bytes(raw)
             info = path.stat(); fd = os.open(path, os.O_RDONLY)
-            app = {**identity(10, os.getuid()), 'sha256': hashlib.sha256(raw).hexdigest()}
-            with patch.object(M.base, 'process_identity', return_value=app), \
+            observed = {'pid':10,'startTime':'123','ppid':2,'state':'S','uid':os.getuid()}
+            app = {**observed, 'exe':str(path), 'sha256': hashlib.sha256(raw).hexdigest()}
+            with patch.object(M.base, 'process_identity', return_value=observed), \
                  patch.object(M.os, 'open', return_value=fd), patch.object(M.Path, 'stat', return_value=info):
                 result = M.app_execution_identity(app)
             self.assertEqual(result['exeDev'], info.st_dev)
@@ -1055,6 +1056,25 @@ class AuthenticationRuntimeConsumerTests(unittest.TestCase):
             if invalid:self.assertNotIn('authenticationRuntime',saved)
             else:self.assertEqual(saved['authenticationRuntime'],value)
             self.assertNotIn('PRIVATE',json.dumps(client.lifecycle))
+
+    def test_transaction_candidate_error_frame_keeps_only_validated_first_cause(self):
+        import root_controller
+        for code in ('transaction-candidate-unconfirmed','transaction-raw-secret'):
+            observation=root_controller.auth_runtime_observation(root_controller.AUTH_GROUP_MODE)
+            observation['kind']='install';observation['lastReached']='transaction-observer'
+            observation['firstFailure']={'stage':'transaction-observer','code':code}
+            client=M.Controller();client.closed=False
+            payload={'seq':1,'ok':False,'error':{'stage':'dispatch','code':'CONTROLLER_FAILED',
+                'authenticationRuntime':observation}}
+            with patch.object(client,'_write'),patch.object(client,'_read',return_value=payload):
+                with self.assertRaises(ValueError):client.call('transaction_scan',kind='install')
+            saved=client.lifecycle['rootOperationFailure']
+            if code=='transaction-candidate-unconfirmed':
+                self.assertEqual(saved['authenticationRuntime'],observation)
+                self.assertEqual(saved['authenticationRuntime']['firstFailure']['code'],code)
+            else:
+                self.assertNotIn('authenticationRuntime',saved)
+                self.assertNotIn('transaction-raw-secret',json.dumps(client.lifecycle))
 
     def test_abort_keeps_safe_partial_proof_without_promoting_failure(self):
         import root_controller

@@ -303,6 +303,82 @@ def process_identity(pid):
         return None
 
 
+def validate_app_identity(value, *, captured=False):
+    """Validate only this ordinary App evidence contract, not scan/signal authority."""
+    valid = (type(value) is dict and type(value.get('pid')) is int and value['pid'] > 1
+        and type(value.get('startTime')) is str and value['startTime'].isdigit() and int(value['startTime']) > 0
+        and type(value.get('ppid')) is int and value['ppid'] >= 0
+        and type(value.get('uid')) is int and value['uid'] >= 0
+        and type(value.get('state')) is str and len(value['state']) == 1)
+    gui_require(valid, 'app-identity-schema-invalid')
+    if captured:
+        gui_require(all(type(value.get(k)) is int and value[k] >= 0 for k in ('exeDev', 'exeInode'))
+                    and value['exeInode'] > 0, 'app-identity-schema-invalid')
+    return value
+
+
+def observe_app_executable(app):
+    """Fresh executable metadata, fenced by the original ordinary App birth."""
+    validate_app_identity(app)
+    try:
+        before = process_identity(app['pid'])
+        gui_require(before is not None, 'app-identity-changed')
+        validate_app_identity(before)
+        gui_require(same_process(app, before) and before['uid'] == app['uid'] == os.getuid()
+                    and before['state'] != 'Z', 'app-identity-changed')
+        path = Path('/proc') / str(app['pid']) / 'exe'
+        info = path.stat()
+        after = process_identity(app['pid'])
+        gui_require(after is not None, 'app-identity-changed')
+        validate_app_identity(after)
+        gui_require(same_process(before, after) and after['uid'] == app['uid']
+                    and after['state'] != 'Z', 'app-identity-changed')
+        current = path.stat()
+        final = process_identity(app['pid'])
+        gui_require(final is not None, 'app-identity-changed')
+        validate_app_identity(final)
+        fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_mode')
+        gui_require(stat.S_ISREG(info.st_mode) and same_process(before, after) and same_process(after, final)
+                    and after['uid'] == final['uid'] == app['uid'] and after['state'] != 'Z' and final['state'] != 'Z'
+                    and all(getattr(info,k) == getattr(current,k) for k in fields), 'app-identity-changed')
+        return current
+    except OSError:
+        raise GuiFailure('app-executable-unreadable') from None
+
+
+def app_execution_identity(app):
+    """Bind already-owned App birth to its admitted bytes and opened executable."""
+    validate_app_identity(app)
+    gui_require(type(app.get('sha256')) is str and re.fullmatch(r'[0-9a-f]{64}', app['sha256']) is not None
+                and type(app.get('exe')) is str and Path(app['exe']).is_absolute(), 'app-identity-schema-invalid')
+    try:
+        before = observe_app_executable(app)
+        path = Path('/proc') / str(app['pid']) / 'exe'
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            gui_require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 128 * 1024 * 1024
+                        and (info.st_dev,info.st_ino) == (before.st_dev,before.st_ino), 'app-identity-changed')
+            digest = hashlib.sha256(); remaining = info.st_size
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                gui_require(bool(chunk), 'app-identity-changed')
+                digest.update(chunk); remaining -= len(chunk)
+            gui_require(not stream.read(1), 'app-identity-changed')
+            final = os.fstat(stream.fileno())
+        after = observe_app_executable(app)
+        fields = ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns')
+        gui_require(all(getattr(info,k) == getattr(final,k) == getattr(after,k) for k in fields)
+                    and digest.hexdigest() == app['sha256'], 'app-identity-changed')
+        result = {**app, 'exeDev': info.st_dev, 'exeInode': info.st_ino}
+        if 'exeDev' in app or 'exeInode' in app:
+            validate_app_identity(app, captured=True)
+            gui_require(all(result[k] == app[k] for k in ('exeDev','exeInode')), 'app-identity-changed')
+        return result
+    except OSError:
+        raise GuiFailure('app-executable-unreadable') from None
+
+
 DIAGNOSTIC_EXE_LIMIT = 64 * 1024 * 1024
 DIAGNOSTIC_ANCESTORS = 8
 
@@ -1449,7 +1525,7 @@ class CarrierRun:
         require(not names.intersection(FORBIDDEN)
                 and not any('TOKEN' in name or name.startswith(('GITHUB_', 'ACTIONS_', 'RUNNER_', 'AWS_')) for name in names),
                 'product inherited automation escape or runner credentials')
-        self.app = app
+        self.app = app_execution_identity(app)
         return self.driver.invoke('config_get')
 
     def capture_driver_failure(self):
@@ -1665,15 +1741,15 @@ class CarrierRun:
 
     def preference_disk(self):
         # Existing observed App birth only; no process scan/adoption or signal.
+        validate_app_identity(self.app, captured=True)
         app = dict(self.app)
         def same_app():
-            current = process_identity(app['pid'])
-            return (same_process(app, current) and current['state'] != 'Z' and
-                    current['uid'] == os.getuid() and all(type(app.get(k)) is int and current.get(k) == app[k]
-                    for k in ('exeDev', 'exeInode')))
-        gui_require(same_app(), 'preference-app-identity-changed')
+            current = observe_app_executable(app)
+            gui_require((current.st_dev, current.st_ino) == (app['exeDev'], app['exeInode']),
+                        'preference-app-identity-changed')
+        same_app()
         value = read_saved_preference(self.home, self.env['XDG_CONFIG_HOME'])
-        gui_require(same_app(), 'preference-app-identity-changed')
+        same_app()
         return value
 
     def preference_pending_save(self):

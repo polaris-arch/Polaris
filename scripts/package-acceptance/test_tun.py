@@ -582,3 +582,35 @@ class VMObservationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class TransactionIdentityTests(unittest.TestCase):
+    def observe(self, *, change=None, second_argv=None, second_uid=None, grow=False):
+        with tempfile.TemporaryFile() as f:
+            f.write(b'pure-test-executable');f.flush();f.seek(0);st=os.fstat(f.fileno())
+            row={'pid':321,'startTime':'123','state':'S','ppid':123,'uid':1001,'exeDev':st.st_dev,
+                 'exeInode':st.st_ino,'exe':'/usr/bin/pkexec','namespaces':dict(net=1,mnt=2,pid=3,cgroup=4),'cgroup':'0::/test'}
+            after={**row,**(change or {})}
+            status='Uid:\t1001\t0\t0\t0\n';argv=b'/usr/bin/pkexec\0/bin/bash\0/private.sh\0'
+            original_read=os.read
+            def read(fd,n):
+                value=original_read(fd,n)
+                if grow and not value:return b'x'
+                return value
+            with patch.object(tun,'process_identity',side_effect=[row,after]), \
+                 patch.object(tun.os,'open',return_value=os.dup(f.fileno())), \
+                 patch.object(tun.os,'read',side_effect=read), \
+                 patch.object(Path,'read_text',side_effect=[status,second_uid or status]), \
+                 patch.object(Path,'read_bytes',side_effect=[argv,second_argv or argv]):
+                return tun.transaction_identity(321)
+    def test_held_fd_and_actual_five_identity_fields(self):
+        value=self.observe();self.assertEqual(value['uids'],(1001,0,0,0))
+        self.assertEqual(value['executable']['sha256'],hashlib.sha256(b'pure-test-executable').hexdigest())
+        self.assertEqual(value['identity']['exeInode'],value['executable']['inode'])
+    def test_birth_exe_uid_parent_and_namespace_changes_rejected(self):
+        for changed in ({'startTime':'124'},{'exeInode':999},{'uid':0},{'ppid':999},{'namespaces':dict(net=9,mnt=2,pid=3,cgroup=4)}):
+            with self.subTest(changed=changed),self.assertRaises(ValueError):self.observe(change=changed)
+    def test_second_inputs_must_match_before_final_identity(self):
+        with self.assertRaises(ValueError):self.observe(second_argv=b'/other\0')
+        with self.assertRaises(ValueError):self.observe(second_uid='Uid:\t0\t0\t0\t0\n')
+    def test_growing_file_is_bounded_and_rejected(self):
+        with self.assertRaises(ValueError):self.observe(grow=True)

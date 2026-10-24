@@ -195,23 +195,9 @@ def same_birth(a, b):
 
 
 def app_execution_identity(app):
-    before = base.process_identity(app['pid'])
-    require(base.same_process(before, app) and before['uid'] == os.getuid(), 'actual ordinary App birth required')
-    path = Path('/proc') / str(app['pid']) / 'exe'
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
-    with os.fdopen(fd, 'rb') as stream:
-        info = os.fstat(stream.fileno())
-        require(0 < info.st_size <= 128 * 1024 * 1024, 'bounded actual App ELF required')
-        digest = hashlib.sha256()
-        while chunk := stream.read(1024 * 1024): digest.update(chunk)
-        final = os.fstat(stream.fileno())
-    current = path.stat(); after = base.process_identity(app['pid'])
-    require((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) ==
-            (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) and
-            (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino) and
-            digest.hexdigest() == app['sha256'] and base.same_process(before, after) and after['uid'] == os.getuid(),
-            'actual App ELF/birth changed while observing inode')
-    return {**app, 'exeDev': info.st_dev, 'exeInode': info.st_ino}
+    # Same ordinary producer contract as plain; not tun.process_identity's
+    # namespace/capability-rich root authorization identity.
+    return base.app_execution_identity(app)
 
 
 def verify_gui_binding(app, proof):

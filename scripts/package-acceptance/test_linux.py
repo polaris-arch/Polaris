@@ -1436,7 +1436,7 @@ class SavedPreferenceTests(unittest.TestCase):
         run=self.fixture();run.preference_disk.side_effect=[{'value':False},{'value':False}]
         with self.assertRaises(M.GuiFailure):run.preference(True)
         self.assertEqual(run.driver.click_control.call_count,1)
-        run=M.CarrierRun.__new__(M.CarrierRun);run.app={'pid':1,'startTime':'1','exeDev':1,'exeInode':2}
+        run=M.CarrierRun.__new__(M.CarrierRun);run.app={'pid':10,'startTime':'1','ppid':2,'state':'S','uid':os.getuid(),'exeDev':1,'exeInode':2}
         run.home=Path('/private');run.env={'XDG_CONFIG_HOME':'/private/config'}
         with patch.object(M,'process_identity',return_value={'pid':1,'startTime':'2'}),patch.object(M,'read_saved_preference') as read:
             with self.assertRaises(M.GuiFailure):run.preference_disk()
@@ -1458,11 +1458,13 @@ class SavedPreferenceTests(unittest.TestCase):
 
     def test_app_generation_change_after_disk_read_is_rejected(self):
         run=M.CarrierRun.__new__(M.CarrierRun)
-        run.app={'pid':1,'startTime':'1','exeDev':1,'exeInode':2}
+        run.app={'pid':10,'startTime':'1','ppid':2,'state':'S','uid':os.getuid(),'exeDev':1,'exeInode':2}
         run.home=Path('/private');run.env={'XDG_CONFIG_HOME':'/private/config'}
-        live={**run.app,'state':'S','uid':os.getuid()}
-        with patch.object(M,'process_identity',side_effect=[live,{**live,'startTime':'2'}]),patch.object(M,'read_saved_preference',return_value={'value':True}):
+        live={k:run.app[k] for k in ('pid','startTime','ppid','state','uid')}
+        image=SimpleNamespace(st_mode=0o100755,st_dev=1,st_ino=2,st_size=10,st_mtime_ns=1,st_ctime_ns=1)
+        with patch.object(M,'process_identity',side_effect=[live,live,live,{**live,'startTime':'2'}]), patch.object(M.Path,'stat',return_value=image), patch.object(M,'read_saved_preference',return_value={'value':True}) as read:
             with self.assertRaises(M.GuiFailure):run.preference_disk()
+            read.assert_called_once()
 
     def test_real_observer_projects_save_without_secret_or_command_claim(self):
         import subprocess
@@ -1590,6 +1592,109 @@ class DriverWireTests(unittest.TestCase):
             with patch.object(M.http.client,'HTTPConnection',return_value=conn) as create:
                 with self.assertRaises(M.http.client.RemoteDisconnected):driver.invoke(command)
             create.assert_called_once();conn.request.assert_called_once();conn.close.assert_called_once()
+
+
+class AppIdentityProducerTests(unittest.TestCase):
+    def child(self):
+        import contextlib
+        import subprocess
+        @contextlib.contextmanager
+        def running():
+            child=subprocess.Popen([sys.executable,'-c','import sys; sys.stdin.read()'],stdin=subprocess.PIPE)
+            try:
+                raw=M.process_identity(child.pid)
+                supervisor=M.Supervisor.__new__(M.Supervisor)
+                supervisor.living=lambda:[raw]
+                supervisor.mark_product=Mock()
+                app=supervisor.executable(Path(sys.executable).resolve())
+                yield raw,app
+            finally:
+                child.communicate(timeout=5)
+        return running()
+
+    def test_real_producer_capture_and_preference_read_without_fabricated_exe_fields(self):
+        with self.child() as (raw,app), tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(set(raw),{'pid','startTime','ppid','state','uid'})
+            self.assertEqual(set(app),set(raw)|{'sha256','exe'})
+            captured=M.app_execution_identity(app)
+            self.assertEqual(set(captured),set(app)|{'exeDev','exeInode'})
+            home=Path(tmp);path=home/'config/com.polaris.app/polaris/config.json'
+            path.parent.mkdir(parents=True);path.write_text(json.dumps({'interruptConnectionsOnSwitch':True}))
+            run=M.CarrierRun.__new__(M.CarrierRun);run.app=captured;run.home=home
+            run.env={'XDG_CONFIG_HOME':str(home/'config')}
+            self.assertTrue(run.preference_disk()['value'])
+            self.assertNotIn('exeDev',M.process_identity(app['pid']))
+
+    def test_invalid_identity_container_is_classified_before_copy_or_proc_read(self):
+        for value in (None, [], 'private', 10):
+            run=M.CarrierRun.__new__(M.CarrierRun);run.app=value
+            with patch.object(M,'process_identity') as proc,self.assertRaises(M.GuiFailure) as error:
+                run.preference_disk()
+            self.assertEqual(error.exception.code,'app-identity-schema-invalid');proc.assert_not_called()
+
+    def test_each_producer_field_missing_or_wrong_type_is_schema_failure(self):
+        with self.child() as (raw,app):
+            for field in ('pid','startTime','ppid','uid','state','sha256','exe'):
+                for missing in (True,False):
+                    bad=dict(app)
+                    if missing:bad.pop(field)
+                    else:bad[field]=False if field in ('pid','ppid','uid') else 123
+                    with self.subTest(field=field,missing=missing),self.assertRaises(M.GuiFailure) as e:
+                        M.app_execution_identity(bad)
+                    self.assertEqual(e.exception.code,'app-identity-schema-invalid')
+            captured=M.app_execution_identity(app)
+            for field in ('exeDev','exeInode'):
+                for invalid in (None,False,'1'):
+                    bad={**captured,field:invalid}
+                    with self.subTest(field=field,value=invalid),self.assertRaises(M.GuiFailure) as e:
+                        M.validate_app_identity(bad,captured=True)
+                    self.assertEqual(e.exception.code,'app-identity-schema-invalid')
+            for field in raw:
+                incomplete=dict(raw);incomplete.pop(field)
+                with patch.object(M,'process_identity',return_value=incomplete),self.assertRaises(M.GuiFailure) as e:
+                    M.observe_app_executable(app)
+                self.assertEqual(e.exception.code,'app-identity-schema-invalid')
+
+    def test_real_producer_changed_birth_uid_hash_and_executable_fail(self):
+        with self.child() as (raw,app):
+            for change in ({'startTime':str(int(raw['startTime'])+1)}, {'uid':raw['uid']+1}, {'state':'Z'}):
+                with patch.object(M,'process_identity',return_value={**raw,**change}),self.assertRaises(M.GuiFailure) as e:
+                    M.observe_app_executable(app)
+                self.assertEqual(e.exception.code,'app-identity-changed')
+            with self.assertRaises(M.GuiFailure) as e:M.app_execution_identity({**app,'sha256':'0'*64})
+            self.assertEqual(e.exception.code,'app-identity-changed')
+            with patch.object(M.Path,'stat',side_effect=PermissionError(13,'PRIVATE')),self.assertRaises(M.GuiFailure) as e:
+                M.observe_app_executable(app)
+            self.assertEqual(e.exception.code,'app-executable-unreadable');self.assertNotIn('PRIVATE',str(e.exception))
+            captured=M.app_execution_identity(app)
+            run=M.CarrierRun.__new__(M.CarrierRun);run.app={**captured,'exeInode':captured['exeInode']+1}
+            with patch.object(M,'read_saved_preference') as read,self.assertRaises(M.GuiFailure) as e:run.preference_disk()
+            self.assertEqual(e.exception.code,'preference-app-identity-changed');read.assert_not_called()
+
+    def test_fresh_stat_fences_birth_on_both_sides_and_capture_rechecks_inode(self):
+        with self.child() as (raw,app):
+            with patch.object(M,'process_identity',side_effect=[raw,{**raw,'startTime':str(int(raw['startTime'])+1)},raw]),self.assertRaises(M.GuiFailure) as e:
+                M.observe_app_executable(app)
+            self.assertEqual(e.exception.code,'app-identity-changed')
+            captured=M.app_execution_identity(app)
+            with self.assertRaises(M.GuiFailure) as e:M.app_execution_identity({**captured,'exeInode':captured['exeInode']+1})
+            self.assertEqual(e.exception.code,'app-identity-changed')
+
+    def test_same_birth_exec_between_metadata_samples_is_rejected(self):
+        with self.child() as (raw,app):
+            info=(Path('/proc')/str(app['pid'])/'exe').stat()
+            fields=('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns','st_mode')
+            changed=SimpleNamespace(**{k:getattr(info,k)+(1 if k=='st_ino' else 0) for k in fields})
+            with patch.object(M,'process_identity',return_value=raw),patch.object(M.Path,'stat',side_effect=[info,changed]),self.assertRaises(M.GuiFailure) as error:
+                M.observe_app_executable(app)
+            self.assertEqual(error.exception.code,'app-identity-changed')
+
+    def test_shared_capture_keeps_plain_and_tun_identity_sources_distinct(self):
+        shared=Path(M.__file__).read_text();tun=Path(M.__file__).with_name('linux_tun.py').read_text()
+        self.assertIn('self.app = app_execution_identity(app)',shared)
+        body=tun.split('def app_execution_identity(app):',1)[1].split('def verify_gui_binding',1)[0]
+        self.assertIn('return base.app_execution_identity(app)',body)
+        self.assertNotIn('tun.process_identity',body.split('return',1)[1])
 
 
 if __name__ == '__main__':

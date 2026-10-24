@@ -469,7 +469,7 @@ class AdditionalContracts(unittest.TestCase):
         c = controller(); c.ledger.value['helper'] = {'identity': identity(70, 0)}
         child = identity(80); child['ppid'] = 70
         c.ops.proc.side_effect = lambda pid: child if pid == 80 else (_ for _ in ()).throw(AssertionError('PID1 must not be read'))
-        with patch.object(m.Path, 'iterdir', return_value=[Path('/proc/1'), Path('/proc/self'), Path('/proc/80')]):
+        with patch.object(m.Path, 'iterdir', return_value=[Path('/proc/1'), Path('/proc/self'), Path('/proc/80')]), patch.object(m,'proc_stat',return_value=child):
             c.register_core()
         c.tun.register_core.assert_called_once_with(c.ledger, 80)
     def test_transaction_scan_skips_pid_one(self):
@@ -537,15 +537,18 @@ class RecoveryAndObserverTests(unittest.TestCase):
         process = {**identity(60), 'ppid': c.gui['pid'], 'exe': str(Path('/usr/bin/pkexec').resolve())}
         script = c.launch['helperScriptDir'] + '/' + 'd'*24 + '-polaris-helper-install.sh'
         rows = {c.gui['pid']: c.gui, 60: process}; c.ops.proc.side_effect = lambda pid: rows.get(pid)
+        c.tun.transaction_identity.side_effect = lambda pid: {'identity': rows[pid], 'uids': (1001,0,0,0) if rows[pid]['uid']==1001 else (0,0,0,0),
+            'argv': ['/usr/bin/pkexec','/bin/bash',script] if rows[pid]['uid']==1001 else ['/bin/bash',script], 'executable': {'sha256': H}}
         with patch.object(m.Path, 'iterdir', side_effect=lambda: [Path('/proc/1'), *[Path('/proc', str(k)) for k in rows]]), \
              patch.object(m, 'command_line', return_value=['/usr/bin/pkexec','/bin/bash',script]), \
              patch.object(m, 'uid_tuple', return_value=(1001,0,0,0)):
-            if include_pkexec: obs.scan()
-        rows[60] = {**process, 'uid': 0, 'exe': str(Path('/bin/bash').resolve())}
+            with patch.object(m, 'proc_stat', side_effect=lambda pid: rows.get(pid)):
+                if include_pkexec: obs.scan()
+        rows[60] = {**process, 'uid': 0, 'exeInode': 88, 'exe': str(Path('/bin/bash').resolve())}
         with patch.object(m.Path, 'iterdir', side_effect=lambda: [Path('/proc/1'), *[Path('/proc', str(k)) for k in rows]]), \
              patch.object(m, 'command_line', return_value=['/bin/bash',script]), \
              patch.object(m, 'uid_tuple', return_value=(0,0,0,0)):
-            obs.scan()
+            with patch.object(m, 'proc_stat', side_effect=lambda pid: rows.get(pid)): obs.scan()
         return c, obs, rows
     def test_actual_observer_pkexec_same_birth_root_exec(self):
         c, obs, rows = self.observer_case()
@@ -565,7 +568,7 @@ class RecoveryAndObserverTests(unittest.TestCase):
         c.ops.proc.side_effect=lambda pid: rows.get(pid)
         observer=m.AuthObserver(c,'install')
         with patch.object(m.Path,'iterdir',return_value=[Path('/proc/1'),Path('/proc/90'),Path('/proc/91')]), \
-             patch.object(m,'write_recovery_snapshot') as write:
+             patch.object(m,'write_recovery_snapshot') as write, patch.object(m,'proc_stat',side_effect=lambda pid:rows.get(pid)):
             observer.scan()
             saved=write.call_args.args[2]; self.assertEqual(len(saved['processes']),2)
             self.assertEqual(saved['processes'][1]['uid'],0)
@@ -709,7 +712,7 @@ class GuiBindingProofTests(unittest.TestCase):
         c.ops.proc.side_effect=lambda pid:copy.deepcopy(gui if pid==50 else driver)
         c.tun.executable_identity.return_value={'sha256':H,'dev':1,'inode':78 if mismatch else 77}
         if changed:c.tun.same_process.side_effect=[True,False]
-        with patch.object(m.Path,'iterdir',return_value=[Path('/proc/1'),Path('/proc/50')]):return c.bind_gui(50)
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc/1'),Path('/proc/50')]), patch.object(m,'proc_stat',return_value=gui), patch.object(m,'uid_tuple',return_value=(1001,)*4):return c.bind_gui(50)
     def test_binding_returns_observed_executable_same_inode(self):
         result=self.binding();self.assertEqual(result['executable'],{'sha256':H,'dev':1,'inode':77})
         self.assertEqual(result['identity']['exeInode'],result['executable']['inode'])
@@ -1879,3 +1882,148 @@ class OwnedProcessAgentPreferenceTests(unittest.TestCase):
             self.assertEqual(m.validate_permission(c.launch)['maxLeaseSeconds'],90)
 
 if __name__ == '__main__': unittest.main(verbosity=2)
+
+
+class TransactionFenceTests(unittest.TestCase):
+    def setup_observer(self):
+        c = controller(); c.launch['authenticationMode']=m.AUTH_GROUP_MODE; c.auth_note = Mock()
+        c.tools = {'pkexec': {'dev':1,'inode':77,'sha256':H}, 'bash': {'dev':1,'inode':88,'sha256':H}}
+        c.verify_script = Mock(return_value={'dev':1,'inode':99,'sha256':H,'bytes':123,'stableDoubleRead':True})
+        script = '/tmp/qa/home/config/polaris/'+'d'*24+'-polaris-helper-install.sh'
+        p = {**identity(60), 'ppid':c.gui['pid'], 'exe':str(Path('/usr/bin/pkexec').resolve())}
+        rows = {c.gui['pid']:c.gui,60:p}
+        obs = m.TransactionObserver(c,'install'); c.observer=obs
+        c.ops.proc.side_effect=lambda pid: rows.get(pid)
+        c.tun.transaction_identity.side_effect=lambda pid: {'identity':copy.deepcopy(rows[pid]),
+            'uids':(1001,0,0,0) if rows[pid]['uid']==1001 else (0,0,0,0),
+            'argv':['/bin/bash',script] if rows[pid]['exe']==str(Path('/bin/bash').resolve()) else ['/usr/bin/pkexec','/bin/bash',script],
+            'executable':c.tools['bash' if rows[pid]['exe']==str(Path('/bin/bash').resolve()) else 'pkexec']}
+        return c,obs,rows
+    def scan(self,obs,rows):
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc',str(pid)) for pid in rows]), \
+             patch.object(m,'proc_stat',side_effect=lambda pid:copy.deepcopy(rows.get(pid))): obs.scan()
+    def test_initial_pending_root_then_bash_exact_inode_and_script(self):
+        c,o,r=self.setup_observer();self.scan(o,r)
+        o.credential_fence(time.monotonic()+1,threading.Event())
+        r[60]['uid']=0;self.scan(o,r)
+        self.assertFalse(o.snapshot()['authorizationObserved'])
+        r[60].update(exe=str(Path('/bin/bash').resolve()),exeInode=88);self.scan(o,r)
+        self.assertTrue(o.snapshot()['authorizationObserved'])
+        self.assertEqual(c.ledger.value['transactionProcesses'][0]['identity']['exeInode'],88)
+    def test_root_pkexec_without_prior_rejected(self):
+        c,o,r=self.setup_observer();r[60]['uid']=0
+        with self.assertRaises(ValueError):self.scan(o,r)
+        self.assertEqual(o.error,'pkexec-uid');self.assertFalse(o.pkexec)
+    def test_script_replacement_rejected_at_fence_and_shell(self):
+        for shell in (False,True):
+            c,o,r=self.setup_observer();self.scan(o,r)
+            c.verify_script.return_value={**c.verify_script.return_value,'inode':100}
+            with self.assertRaises(ValueError):
+                if shell:
+                    r[60].update(uid=0,exe=str(Path('/bin/bash').resolve()),exeInode=88);self.scan(o,r)
+                else:o.credential_fence(time.monotonic()+1,threading.Event())
+            self.assertFalse(o.shells)
+    def test_unrelated_executable_is_never_read(self):
+        c,o,r=self.setup_observer();r[999]={**identity(999),'ppid':1}
+        self.scan(o,r)
+        self.assertNotIn(999,[v.args[0] for v in c.tun.transaction_identity.call_args_list])
+        self.assertNotIn(999,[v.args[0] for v in c.ops.proc.call_args_list])
+    def test_related_unstable_candidate_bounded_reads_permanent_failure(self):
+        c,o,r=self.setup_observer();c.tun.transaction_identity.side_effect=ValueError('not emitted')
+        with self.assertRaises(ValueError):self.scan(o,r)
+        self.assertEqual(c.tun.transaction_identity.call_count,3)
+        self.assertEqual(o.error,'candidate');self.assertFalse(o.pkexec)
+        c.auth_note.assert_called_with('auth_failed','transaction-candidate-unconfirmed')
+    def test_fence_no_prior_cancel_deadline_error_no_admission(self):
+        for case in ('cancel','deadline','error'):
+            c,o,r=self.setup_observer();stop=threading.Event()
+            if case=='cancel':stop.set()
+            if case=='error':o.error='inventory'
+            with self.assertRaises(ValueError):o.credential_fence(time.monotonic()-(1 if case=='deadline' else -1),stop)
+            self.assertFalse(o.pkexec)
+    def test_fence_rejects_reuse_uid_exec_and_parent_change(self):
+        for field,value in [('startTime','9999'),('uid',0),('exeInode',99),('ppid',123)]:
+            c,o,r=self.setup_observer();self.scan(o,r);r[60][field]=value
+            with self.assertRaises(ValueError):o.credential_fence(time.monotonic()+1,threading.Event())
+    def test_fence_wait_holds_no_observer_lock(self):
+        c,o,r=self.setup_observer();stop=Mock();stop.is_set.return_value=False
+        def wait(seconds):
+            self.assertTrue(o.lock.acquire(False));o.lock.release();self.scan(o,r)
+        stop.wait.side_effect=wait
+        o.credential_fence(time.monotonic()+1,stop)
+        stop.wait.assert_called_once()
+    def test_ledger_failure_never_publishes_ready_pkexec(self):
+        c,o,r=self.setup_observer();c.ledger.mutate=Mock(side_effect=OSError('private'))
+        with self.assertRaises(OSError):self.scan(o,r)
+        self.assertFalse(o.pkexec);self.assertEqual(o.error,'ledger')
+    def test_first_boundary_not_overwritten_by_fence(self):
+        c,o,r=self.setup_observer();o.fail_boundary('script');o.fail_boundary('credential-fence')
+        self.assertEqual(o.error,'script');c.auth_note.assert_called_once()
+
+class GroupPumpFenceTests(unittest.TestCase):
+    def pump(self, fence=None, echo_after=False):
+        c=controller();c.launch['authenticationMode']=m.AUTH_GROUP_MODE;c.pty=90;c.auth_note=Mock()
+        lease=m.CredentialLease(c,'install');lease.group_deadline=time.monotonic()+90
+        lease.user=types.SimpleNamespace(pw_name='runner',pw_gecos='');lease.secret=bytearray(b'test-secret')
+        lease.close=Mock();c.observer=Mock();writes=[];order=[]
+        def gate(*args):
+            order.append('fence')
+            if fence=='error':raise ValueError('private')
+            if fence=='cancel':lease.stop.set()
+        c.observer.credential_fence.side_effect=gate
+        prompt=b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nAuthenticating as: runner\nPassword: '
+        import termios
+        with patch.object(m.select,'select',return_value=([90],[],[])), \
+             patch.object(m.os,'read',side_effect=[prompt,prompt,b'==== AUTHENTICATION COMPLETE ====\n']), \
+             patch.object(m.os,'write',side_effect=lambda fd,b:order.append('write') or writes.append(b) or len(b)), \
+             patch('termios.tcgetattr',side_effect=[[0,0,0,0,0,0,[]],[0,0,0,termios.ECHO if echo_after else 0,0,0,[]]]):
+            lease.pump()
+        return lease,writes,order,c
+    def test_fence_before_exactly_one_write_repeated_prompt(self):
+        lease,writes,order,c=self.pump()
+        self.assertEqual(order,['fence','write']);self.assertEqual(writes,[b'test-secret\n'])
+        self.assertTrue(lease.authenticated)
+        deadline=c.observer.credential_fence.call_args.args[0]
+        self.assertEqual(deadline,lease.group_deadline-m.GROUP_RECOVERY_RESERVE)
+    def test_error_cancel_or_echo_return_blocks_input_and_closes(self):
+        for kwargs in ({'fence':'error'},{'fence':'cancel'},{'echo_after':True}):
+            lease,writes,order,c=self.pump(**kwargs)
+            self.assertEqual(writes,[]);self.assertFalse(lease.authenticated);lease.close.assert_called_once()
+    def test_existing_password_only_pump_does_not_call_fence(self):
+        # Existing guarded password-only unit test exercises the original mode.
+        lease,writes=AdditionalContracts().pump([b'==== AUTHENTICATING FOR org.freedesktop.policykit.exec ====\nAuthenticating as: runner\nPassword: ',b'==== AUTHENTICATION COMPLETE ====\n'])
+        self.assertFalse(lease.grouped);self.assertEqual(len(writes),1)
+
+class RelatedInventoryTests(unittest.TestCase):
+    def test_auth_scan_does_not_read_unrelated_executable(self):
+        c=controller();agent=identity(90);child={**identity(91,0),'ppid':90};other={**identity(999),'ppid':1}
+        rows={90:agent,91:child,999:other};c.ledger.value['authentication']['agent']={'identity':agent}
+        c.ops.proc.side_effect=lambda pid: (_ for _ in ()).throw(PermissionError()) if pid==999 else rows.get(pid)
+        o=m.AuthObserver(c,'install')
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc',str(x)) for x in rows]), \
+             patch.object(m,'proc_stat',side_effect=lambda pid:rows.get(pid)),patch.object(m,'write_recovery_snapshot'):
+            o.scan()
+        self.assertEqual(len(o.rows),2)
+    def test_auth_unknown_related_identity_still_rejected(self):
+        c=controller();agent=identity(90);child={**identity(91,0),'ppid':90}
+        rows={90:agent,91:child};c.ledger.value['authentication']['agent']={'identity':agent}
+        c.ops.proc.side_effect=lambda pid: (_ for _ in ()).throw(PermissionError()) if pid==91 else rows.get(pid)
+        o=m.AuthObserver(c,'install')
+        with patch.object(m.Path,'iterdir',return_value=[Path('/proc',str(x)) for x in rows]), \
+             patch.object(m,'proc_stat',side_effect=lambda pid:rows.get(pid)),patch.object(m,'write_recovery_snapshot'):
+            with self.assertRaises(PermissionError):o.scan()
+    def test_child_before_parent_inventory_updates_exec_first(self):
+        t=TransactionFenceTests();c,o,r=t.setup_observer();t.scan(o,r)
+        r[60].update(uid=0,exe=str(Path('/bin/bash').resolve()),exeInode=88)
+        child={**identity(61,0),'ppid':60,'exe':'/root/verified-child','exeInode':101}
+        r[61]=child;r={61:r[61],60:r[60],c.gui['pid']:c.gui}
+        original=c.tun.transaction_identity.side_effect
+        c.tun.transaction_identity.side_effect=lambda pid: {'identity':child,'uids':(0,)*4,'argv':['child'],'executable':{'dev':1,'inode':101,'sha256':H}} if pid==61 else original(pid)
+        t.scan(o,r);self.assertIn(m.birth(child),o.rows);self.assertTrue(o.shells)
+    def test_fence_contended_lock_deadline_is_bounded(self):
+        c,o,r=TransactionFenceTests().setup_observer();o.lock.acquire()
+        try:
+            before=time.monotonic()
+            with self.assertRaises(ValueError):o.credential_fence(before+0.02,threading.Event())
+            self.assertLess(time.monotonic()-before,0.5)
+        finally:o.lock.release()
