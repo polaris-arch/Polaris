@@ -1562,6 +1562,23 @@ internal object VpnBridge {
     @Synchronized
     fun currentConfig(): String? = request?.configContent
 
+    /** Called only after durable bytes and digest commit under the original Service owner. */
+    @Synchronized
+    fun publishRuntimeConfig(attempt: MainKernelAttempt<*>, config: String, digest: String) {
+        check(running && !starting && !stopping && !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt)) {
+            "runtime bridge owner expired"
+        }
+        val current = request
+        if (current == null) {
+            check(systemStarted) { "runtime bridge request missing" }
+            return // System-start reload reads the durable SystemStart source.
+        }
+        check(current.runId == attempt.runId && current.nativeTicket == attempt.nativeTicket) {
+            "runtime bridge request changed"
+        }
+        request = current.copy(configContent = config, configDigest = digest)
+    }
+
     @Synchronized
     fun currentStartRequest(): MainStartRequest? = request
 

@@ -23,12 +23,16 @@ const startMock = vi.fn(async () => undefined);
 const stopMock = vi.fn(async () => undefined);
 const switchMock = vi.fn(async (_serverId: string) => undefined);
 const cleanExitMock = vi.fn(async () => false);
+const configSignals = new Set<() => void>();
 
 vi.mock('@/ipc', () => ({
   api: {
     config: {
       get: () => getMock(),
-      onChangedReady: async () => () => {},
+      onChangedReady: async (listener: () => void) => {
+        configSignals.add(listener);
+        return () => { configSignals.delete(listener); };
+      },
       save: (config: UserConfig, deferRestart: boolean, baseVersion: string) =>
         saveMock(config, deferRestart, baseVersion),
       patch: (patch: Partial<UserConfig>) => patchMock(patch),
@@ -48,7 +52,7 @@ vi.mock('@/ipc', () => ({
 
 import { withConfigWriteLock } from '@/lib/config-write-lock';
 import { configBaseVersion, type StagedEntry } from '@/lib/staged-config';
-import { useAppStore } from './app-store';
+import { acquireConfigSync, refreshConfig, useAppStore } from './app-store';
 import { useStagedConfigStore } from './staged-config-store';
 
 const ENTRY: StagedEntry = {
@@ -230,4 +234,96 @@ describe('配置保存与下一次启动的事务边界', () => {
       'scheduler-won-the-race'
     );
   });
+});
+
+
+describe('订阅元数据空信号重读最新磁盘且不引入待应用变更', () => {
+  for (const draft of [false, true]) {
+    it(`304/200等价刷新保留节点、选择和既有草稿（draft=${draft}）`, async () => {
+      seed(draft ? [ENTRY] : []);
+      const beforePending = useAppStore.getState().pendingChanges;
+      const release = acquireConfigSync({ scope: 'main' });
+      try {
+        await refreshConfig();
+        const baseline = useStagedConfigStore.getState().baseline;
+        const latest = { ...CONFIG, subscriptions: [{ id: 'sub-1', etag: 'fresh-validator',
+          lastUpdated: '2026-10-25T09:00:00Z', userInfo: { upload: 10, download: 20 } }] } as unknown as UserConfig;
+        getMock.mockResolvedValue(latest);
+        expect(configSignals.size).toBe(1);
+        for (const signal of configSignals) signal();
+        await refreshConfig();
+        expect(useAppStore.getState().config).toBe(latest);
+        expect(useAppStore.getState().servers).toEqual(CONFIG.servers);
+        expect(useAppStore.getState().selectedServerId).toBe(CONFIG.selectedServerId);
+        expect(useAppStore.getState().pendingChanges).toEqual(beforePending);
+        expect(useStagedConfigStore.getState().entries).toEqual(draft ? [ENTRY] : []);
+        if (draft) expect(useStagedConfigStore.getState().baseline).toEqual(baseline);
+        else expect(useStagedConfigStore.getState().baseline).toBe(latest);
+        expect(saveMock).not.toHaveBeenCalled();
+        expect(patchMock).not.toHaveBeenCalled();
+        expect(startMock).not.toHaveBeenCalled();
+        expect(switchMock).not.toHaveBeenCalled();
+      } finally { release(); }
+    });
+  }
+
+  it('旧GET跨元数据signal回包不发布，尾读最新并保留草稿', async () => {
+    seed([ENTRY]);
+    const release = acquireConfigSync({ scope: 'main' });
+    try {
+      await refreshConfig();
+      let resolveOld!: (value: UserConfig) => void;
+      const latest = { ...CONFIG, subscriptions: [{ id: 'sub-1', etag: 'latest' }] } as unknown as UserConfig;
+      getMock.mockImplementationOnce(() => new Promise<UserConfig>((resolve) => { resolveOld = resolve; }));
+      const pending = refreshConfig({ fresh: true });
+      await vi.waitFor(() => expect(resolveOld).toBeDefined());
+      const stale = { ...CONFIG, subscriptions: [{ id: 'sub-1', etag: 'stale' }] } as unknown as UserConfig;
+      getMock.mockResolvedValue(latest);
+      const published: UserConfig[] = [];
+      const unsubscribe = useAppStore.subscribe((state) => { if (state.config) published.push(state.config); });
+      try {
+        for (const signal of configSignals) signal();
+        resolveOld(stale);
+        await pending;
+        await vi.waitFor(() => expect(useAppStore.getState().config).toBe(latest));
+        expect(published).not.toContain(stale);
+        expect(useStagedConfigStore.getState().entries).toEqual([ENTRY]);
+        expect(useStagedConfigStore.getState().baseline).toEqual(CONFIG);
+      } finally { unsubscribe(); }
+    } finally { release(); }
+  });
+});
+
+
+it('代际检查后新编辑已保存，迟到空信号只读取最新URL和手选且保留草稿', async () => {
+  seed([ENTRY]);
+  const release = acquireConfigSync({ scope: 'main' });
+  try {
+    getMock.mockResolvedValue(CONFIG);
+    await refreshConfig();
+    const baseline = useStagedConfigStore.getState().baseline;
+    const pending = useAppStore.getState().pendingChanges;
+    // This barrier models a completed newer backend edit between the producer's
+    // short generation check and delivery of its payload-free invalidation.
+    const newerEdit = {
+      ...CONFIG,
+      selectedServerId: 'user-selected-new',
+      servers: [{ id: 'user-selected-new', name: 'User selection' }],
+      subscriptions: [{ id: 'sub-1', url: 'https://example.invalid/new', etag: 'new-edit' }],
+    } as unknown as UserConfig;
+    getMock.mockResolvedValue(newerEdit);
+    for (const signal of configSignals) signal();
+    await refreshConfig();
+    expect(useAppStore.getState().config).toBe(newerEdit);
+    expect(useAppStore.getState().config?.subscriptions?.[0]?.url).toBe('https://example.invalid/new');
+    expect(useAppStore.getState().selectedServerId).toBe('user-selected-new');
+    expect(useAppStore.getState().servers).toEqual(newerEdit.servers);
+    expect(useAppStore.getState().pendingChanges).toEqual(pending);
+    expect(useStagedConfigStore.getState().entries).toEqual([ENTRY]);
+    expect(useStagedConfigStore.getState().baseline).toEqual(baseline);
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(patchMock).not.toHaveBeenCalled();
+    expect(startMock).not.toHaveBeenCalled();
+    expect(switchMock).not.toHaveBeenCalled();
+  } finally { release(); }
 });

@@ -3484,7 +3484,7 @@ async fn public_stop_marks_recovery_aborted_and_next_start_resets_it() {
     );
 
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
-    let _ = rt.start(bad_config()).await;
+    let _ = rt.start(post_admission_failure_config()).await;
     assert!(
         !rt.crash_lock().auto_restart_aborted(),
         "下一次显式 start 必须复位旧 stop 的 abort 标记"
@@ -3613,60 +3613,15 @@ fn attestation_only_trusts_the_helper_image_for_its_own_pid() {
     );
 }
 
-/// **接线门**：自证腿必须真的去问 helper，**并且真的把答案用掉**。
-///
-/// # 为什么不能只断言「函数名出现过」
-///
-/// 只断言 `helper_reported_core_image(...)` 出现在方法体里，挡不住这一类变异：
-///
-/// ```ignore
-/// let running = running_exe_path(pid);
-/// let _ = helper_reported_core_image(helper.as_deref(), pid);   // 调用还在，结果丢了
-/// ```
-///
-/// 调用点一个字没少、门照绿，而 Windows 自证退回恒 `Unobservable` —— D2 整条失效。故断言必须
-/// 咬住**数据流**：helper 的答案要经 `.or_else` 接进 `running`，`running` 再喂给
-/// `attest_core_binary`。判据按**去空白**形态比对（`split_whitespace().collect()`），
-/// 这样 rustfmt 怎么折行都不影响，改的是接线才会红。
-///
-/// 变异锁：删掉 `.or_else(...)` → 第三条红；把 `.or_else` 的结果丢弃（上面那段）→ 第三条红；
-/// 把 `attest_core_binary` 的实参换成 `None` → 第四条红。
+/// A PID-reported image is not permission to execute that path as a diagnostic.
 #[test]
-fn attestation_consults_the_helper_reported_image() {
-    const HEAD: &str = "    async fn attest_running_core_binary(";
-    let src = module_code("runtime/proxy");
-    let at = src
-        .find(HEAD)
-        .unwrap_or_else(|| panic!("锚点 `{HEAD}` 消失，源码型守卫已失去判据"));
-    let cut = src[at..]
-        .find("\n#[cfg(test)]\n")
-        .map_or(src.len(), |i| at + i);
-    let prod = &src[..cut];
-    // 切点自检：判据区域若含本测试自身，断言会被自己的字面量喂饱（生产调用点删光也绿）。
+fn attestation_does_not_execute_or_certify_pid_reported_paths() {
+    let source = crate::test_support::crate_code("runtime/proxy/process_supervision.rs");
+    let body = method_body(&source, "    async fn attest_running_core_binary(");
+    assert!(body.contains("attest_core_binary(expected, None, \"\", \"\")"));
+    assert!(!body.contains("first_line("));
     assert!(
-        !prod.contains("fn attestation_consults_the_helper_reported_image"),
-        "判据区域包含本测试自身 —— 切点选错"
-    );
-    let body = method_body(prod, HEAD);
-    assert!(
-        body.contains("helper_reported_core_image(helper.as_deref(), pid)"),
-        "自证没有第二观测腿 —— Windows 上 running_exe_path 恒 None，自证恒「未能进行」"
-    );
-    assert!(
-        body.contains("running_exe_path(pid)"),
-        "自证不能只靠 helper：本地读得到时必须优先用本地事实（少一次 IPC，且不受 helper 影响）"
-    );
-    // 消费侧：两条观测腿必须汇进同一个 `running`，`running` 必须真的喂给判定函数。
-    let compact: String = body.split_whitespace().collect();
-    assert!(
-        compact.contains(
-            "letrunning=running_exe_path(pid).or_else(||helper_reported_core_image(helper.as_deref(),pid));"
-        ),
-        "helper 那条腿的结果没有接进 `running` —— 调用还在但答案被丢掉，Windows 自证仍恒「未能进行」"
-    );
-    assert!(
-        compact.contains("attest_core_binary(&expected,running.as_deref(),"),
-        "`running` 没喂给 attest_core_binary —— 观测到了却不参与判定，等于没观测"
+        body.contains("attestation_commit_allowed(self.gate.generation(), my_gen, &status, pid)")
     );
 }
 

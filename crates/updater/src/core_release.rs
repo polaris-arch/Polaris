@@ -124,11 +124,14 @@ fn desktop_release_identity_from_contract<'a>(
     Some((version, selection["sourceTree"].as_str()?))
 }
 
-// Match the upstream release validator's numeric triplet and Polaris channel.
+// Match scripts/lib/polaris-version.json; shared fixture tests enforce parity.
+// One optional Polaris revision retains the full upstream prerelease baseline.
 // Version syntax alone is never enough to admit an identity.
 fn upstream_release_version(version: &str) -> bool {
     fn digits(value: &str) -> bool {
-        !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+        !value.is_empty()
+            && value.bytes().all(|b| b.is_ascii_digit())
+            && (value == "0" || !value.starts_with('0'))
     }
     let Some((triplet, suffix)) = version.split_once("-polaris-") else {
         return false;
@@ -137,11 +140,12 @@ fn upstream_release_version(version: &str) -> bool {
     let Some((channel, number)) = suffix.split_once('.') else {
         return false;
     };
+    let revisions: Vec<_> = number.split('.').collect();
     numbers.len() == 3
         && numbers.iter().all(|number| digits(number))
         && matches!(channel, "alpha" | "beta" | "rc")
-        && digits(number)
-        && (number == "0" || !number.starts_with('0'))
+        && (1..=2).contains(&revisions.len())
+        && revisions.iter().all(|revision| digits(revision))
 }
 
 #[cfg(test)]

@@ -482,25 +482,21 @@ fn linux_check_scope_does_not_borrow_a_function_outside_its_cfg() {
     assert!(std::panic::catch_unwind(|| braced_block("mod linux {", "mod linux {")).is_err());
 }
 
-/// Version execution was moved into the bounded shared runner, not dropped.
+/// Diagnostics may not execute cached or PID-derived paths, even via a guarded runner.
 #[test]
-fn version_probes_reach_the_guarded_shared_runner() {
+fn version_probes_do_not_create_foreign_processes() {
     let updater = strip_comments(&read("src-tauri/src/runtime/updater.rs"));
     assert!(braced_block(&updater, "pub fn read_core_version_line(")
         .contains("self.core_version_probe.first_line(&bin)"));
     let supervision = strip_comments(&read("src-tauri/src/runtime/proxy/process_supervision.rs"));
-    assert!(supervision.contains("version_probe.first_line(&expected)"));
-    assert!(supervision.contains("version_probe.first_line(r)"));
+    let attestation = braced_block(&supervision, "async fn attest_running_core_binary(");
+    assert!(attestation.contains("attest_core_binary(expected, None, \"\", \"\")"));
+    assert!(!attestation.contains("first_line("));
     let probe = strip_comments(&read("src-tauri/src/runtime/core_version_probe.rs"));
-    let owner = braced_block(&probe, "impl CoreVersionProbe {");
-    let body = braced_block(owner, "pub(crate) fn first_line(&self, bin: &Path)");
-    assert!(body.contains("StdCommandRunner.run_observed("));
-    assert!(body.contains("&Command::new(program, [\"version\"])"));
-    for bypass in ["process::Command", ".spawn()", ".output()"] {
-        assert!(
-            !body.contains(bypass),
-            "version probe bypasses the guarded runner: {bypass}"
-        );
+    let body = braced_block(&probe, "pub(crate) fn first_line(");
+    assert!(body.contains("String::new()"));
+    for bypass in ["Command::", ".spawn()", ".output()", "run_observed("] {
+        assert!(!body.contains(bypass), "diagnostic execution: {bypass}");
     }
 }
 

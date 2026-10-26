@@ -979,3 +979,21 @@ body {
   transform: translateX(-50%);
   border-radius: 0 0 var(--nav-indicator-h) var(--nav-indicator-h);
 }
+
+/* Dismissible diagnostics keep the complete reason keyboard-scrollable; the
+   mobile host and tokens remain independent of desktop CSS. */
+.m-toast-dismissible .m-toast-desc { max-height: 35vh; overflow-y: auto; pointer-events: auto; }
+.m-toast-dismissible .m-toast-desc:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: -2px; }
+.m-toast-dismissible .m-toast-actions { max-width: 40%; min-width: 0; flex-wrap: wrap; }
+.m-toast-dismissible .m-toast-action { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.m-toast-dismissible .m-toast-close { flex-shrink: 0; }
+
+/* On narrow mobile viewports keep diagnostics and actions on separate rows.
+   Long translated action labels must not reduce the reason to a thin column. */
+@media (max-width: 480px) {
+  .m-toast-dismissible { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+  .m-toast-dismissible .m-toast-body { grid-column: 1 / -1; }
+  .m-toast-dismissible .m-toast-actions { grid-row: 2; grid-column: 1; max-width: 100%; }
+  .m-toast-dismissible .m-toast-action { flex: 1 1 0; min-width: var(--tap-min); }
+  .m-toast-dismissible .m-toast-close { grid-row: 2; grid-column: 2; align-self: start; }
+}

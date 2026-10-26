@@ -207,7 +207,7 @@ pub fn config_generation_norm(
             .utls_policy
             .as_deref()
             .and_then(crate::user_config::normalize::normalize_token)
-            .unwrap_or_else(|| "default".into())),
+            .unwrap_or_else(|| "follow".into())),
     );
 
     // 一等流量规则投影（缺省兼容 policyRules/customRules）。targetServerId 由 selector 热切，不进 norm。

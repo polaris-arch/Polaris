@@ -1,3 +1,4 @@
+import { visionTransportReason } from '@/domain/node-compatibility';
 import { useInputRequest } from '@/hooks/use-input-request';
 import { realityUtlsError } from '@/domain/utls';
 /**
@@ -327,7 +328,7 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       const codecBase =
         base && base.protocol === proto ? { ...base, ...meta } : meta;
       const full = protoCodec[proto].toConfig(draft, codecBase);
-      const utlsError = realityUtlsError(full);
+      const utlsError = realityUtlsError(full) ?? (visionTransportReason(full) ? 'nodes.invalidVisionTransport' : undefined);
       if (utlsError) {
         setFormTab('connection');
         toast.error(t('common.saveFailed'), t(utlsError));

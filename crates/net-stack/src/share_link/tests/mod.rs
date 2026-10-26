@@ -1750,3 +1750,102 @@ fn invalid_shared_pin_is_rejected_even_when_insecure_is_requested() {
 }
 
 mod import_parity;
+
+#[test]
+fn naive_quic_community_uri_preserves_h3_and_existing_tls_query() {
+    let original = parse_ok("naive+quic://u%3Aser:p%40ss%3Aword@[2001:db8::1]:8443?sni=tls.example#H3%20%E6%B5%8B%E8%AF%95");
+    assert_eq!(
+        original.naive_settings.as_ref().and_then(|s| s.use_http3),
+        Some(true)
+    );
+    assert_eq!(original.username.as_deref(), Some("u:ser"));
+    assert_eq!(original.password.as_deref(), Some("p@ss:word"));
+    assert_eq!(
+        original
+            .tls_settings
+            .as_ref()
+            .unwrap()
+            .server_name
+            .as_deref(),
+        Some("tls.example")
+    );
+    let uri = encode_share_url(&original).unwrap();
+    assert!(
+        uri.starts_with("naive+quic://"),
+        "wire scheme independently asserted"
+    );
+    assert!(uri.contains("@[2001:db8::1]:8443"));
+    let restored = parse_ok(&uri);
+    assert_eq!(restored.naive_settings, original.naive_settings);
+    assert_eq!(restored.username, original.username);
+    assert_eq!(restored.password, original.password);
+    assert_eq!(restored.address, original.address);
+    assert_eq!(restored.port, original.port);
+    assert_eq!(restored.name, original.name);
+    assert_eq!(restored.tls_settings, original.tls_settings);
+    assert_eq!(parse_ok("naive+quic://u:p@h.example#default").port, 443);
+    assert!(!is_supported_share_url("naive+quic-extra://u:p@h.example"));
+    assert!(parse_err("naive+quic://u:p@h.example?type=quic").contains("传输"));
+    let h2 = parse_ok("naive+https://u:p@h.example#legacy");
+    assert!(encode_share_url(&h2).unwrap().starts_with("http2://"));
+    assert_ne!(
+        h2.naive_settings.as_ref().and_then(|s| s.use_http3),
+        Some(true)
+    );
+}
+
+#[test]
+fn naive_quic_multiline_subscription_keeps_h2_and_h3() {
+    let source = "naive+quic://u:p@naive.example:443#H3\nhttp2://u:p@naive.example:443#H2";
+    let result = crate::subscription::parse_subscription(
+        source,
+        "sub",
+        "now",
+        &mut ids(),
+        crate::singbox_import::ImportOrigin::RemoteSubscription,
+    );
+    assert_eq!(
+        (result.servers.len(), result.failed, result.skipped),
+        (2, 0, 0)
+    );
+    let nodes = crate::subscription::dedupe_by_fingerprint(result.servers);
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node
+                .naive_settings
+                .as_ref()
+                .and_then(|settings| settings.use_http3)
+                == Some(true))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn vision_transport_import_retains_original_nodes_and_safe_warnings() {
+    let text = format!("vless://{U}@private.example:443?security=tls&flow=xtls-rprx-vision&type=ws&path=%2Fsecret#RepairMe\nvless://{U}@good.example:443?security=tls#Good");
+    let parsed = parse_url_list(&text, "sub", "now", &mut ids());
+    assert_eq!(parsed.servers.len(), 2);
+    assert_eq!(parsed.failed, 0);
+    assert_eq!(parsed.servers[0].flow.as_deref(), Some("xtls-rprx-vision"));
+    assert_eq!(parsed.servers[0].network.as_deref(), Some("ws"));
+    assert!(parsed
+        .warnings
+        .iter()
+        .any(|w| w.contains("RepairMe") && w.contains("vision-transport-unsupported")));
+    assert!(parsed
+        .warnings
+        .iter()
+        .all(|w| !w.contains("private.example") && !w.contains(U) && !w.contains("/secret")));
+    let stored = serde_json::to_value(&parsed.servers).unwrap();
+    let restored: Vec<ServerConfig> = serde_json::from_value(stored.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&restored).unwrap(), stored);
+    assert!(
+        polaris_config_engine::builder::outbound::validate_vision_transport(&restored[0]).is_err()
+    );
+    assert!(
+        polaris_config_engine::builder::outbound::validate_vision_transport(&restored[1]).is_ok()
+    );
+}

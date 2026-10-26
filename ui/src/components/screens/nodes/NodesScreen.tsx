@@ -371,7 +371,7 @@ export function NodesScreen() {
    * 用户选中它、连不上、无从得知原因（上游 `server-card.tsx:58` 是消费的）。
    */
   const invalidNodes = useAppStore((s) => s.invalidNodes);
-  const invalidIndex = useMemo(() => invalidNodeIndex(invalidNodes), [invalidNodes]);
+  const invalidIndex = useMemo(() => invalidNodeIndex(invalidNodes, servers), [invalidNodes, servers]);
 
   /* 节点卡只投影 S2 的同代报告：已确认重叠、未知、未见重叠分开，
    * 不再把已保存配置的旧估算当作当前运行归属。 */

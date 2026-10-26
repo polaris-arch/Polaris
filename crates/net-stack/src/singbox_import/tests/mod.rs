@@ -1520,7 +1520,8 @@ fn remote_openvpn_static_key_mode_omits_tls_and_checks_with_core() {
     let dir = std::env::temp_dir().join(format!("polaris-ov-static-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("static.json");
-    let mut surface = json!({"log":{"disabled":true},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":endpoints});
+    let mut surface =
+        json!({"log":{"disabled":true},"outbounds":cfg["outbounds"],"endpoints":endpoints});
     surface["dns"] = outbound_dns_surface(&cfg);
     surface["route"] = json!({"default_domain_resolver":"dns-bootstrap"});
     std::fs::write(&path, serde_json::to_vec_pretty(&surface).unwrap()).unwrap();
@@ -1608,6 +1609,15 @@ fn generate_import(
     servers: &[ServerConfig],
     subscription_id: Option<&str>,
 ) -> polaris_config_engine::builder::GenerateOutcome {
+    generate_import_on_platform(servers, subscription_id, "linux", "x86_64")
+}
+
+fn generate_import_on_platform(
+    servers: &[ServerConfig],
+    subscription_id: Option<&str>,
+    platform: &str,
+    arch: &str,
+) -> polaris_config_engine::builder::GenerateOutcome {
     use polaris_config_engine::builder::{
         generate_sing_box_config_with_report, GenerateConfigDeps,
     };
@@ -1630,8 +1640,8 @@ fn generate_import(
     }))
     .expect("导入产物反序列化成 UserConfig 失败");
     let deps = GenerateConfigDeps {
-        platform: "linux".into(),
-        arch: "x86_64".into(),
+        platform: platform.into(),
+        arch: arch.into(),
         node_dns_decoy_override: None,
         probe_direct_port: None,
         probe_proxy_port: None,
@@ -2248,3 +2258,107 @@ fn malformed_pins_fail_import_instead_of_becoming_insecure_unpinned_nodes() {
 }
 
 mod import_parity;
+
+#[test]
+fn naive_json_h2_h3_survive_dedup_serde_and_full_generation() {
+    let parsed = parse(json!({"outbounds":[
+        {"type":"naive","tag":"H2","server":"naive.example","server_port":443,"username":"user","password":"fixture","quic":false},
+        {"type":"naive","tag":"H3","server":"naive.example","server_port":443,"username":"user","password":"fixture","quic":true}
+    ]}));
+    assert_eq!((parsed.failed, parsed.skipped), (0, 0));
+    let nodes = crate::subscription::dedupe_by_fingerprint(parsed.servers);
+    assert_eq!(nodes.len(), 2, "same endpoint does not mean same transport");
+    let nodes: Vec<ServerConfig> =
+        serde_json::from_slice(&serde_json::to_vec(&nodes).unwrap()).unwrap();
+    assert_ne!(
+        crate::subscription::server_generation_identity(&nodes[0]),
+        crate::subscription::server_generation_identity(&nodes[1])
+    );
+    for (platform, arch) in [
+        ("darwin", "aarch64"),
+        ("linux", "x86_64"),
+        ("win32", "x86_64"),
+        ("android", "aarch64"),
+        ("ios", "aarch64"),
+    ] {
+        let outcome = generate_import_on_platform(&nodes, Some("sub1"), platform, arch);
+        assert!(outcome.invalid_nodes.is_empty());
+        let config = serde_json::to_value(outcome.config).unwrap();
+        let naive: Vec<_> = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["type"] == "naive")
+            .collect();
+        assert_eq!(naive.len(), 2);
+        assert_eq!(naive.iter().filter(|v| v["quic"] == true).count(), 1);
+        assert_eq!(
+            naive
+                .iter()
+                .filter(|v| v.get("quic").and_then(Value::as_bool) != Some(true))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn naive_json_quic_flag_is_not_an_unsupported_transport_object() {
+    let parsed = parse(json!({"outbounds":[
+        {"type":"naive","tag":"H3","server":"naive.example","server_port":443,"username":"user","password":"fixture","quic":true},
+        {"type":"naive","tag":"bad-transport","server":"naive.example","server_port":443,"username":"user","password":"fixture","transport":{"type":"quic"}},
+        {"type":"naive","tag":"bad-port","server":"naive.example","server_port":0,"username":"user","password":"fixture","quic":true}
+    ]}));
+    assert_eq!(
+        (parsed.servers.len(), parsed.skipped, parsed.failed),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        parsed.servers[0]
+            .naive_settings
+            .as_ref()
+            .and_then(|s| s.use_http3),
+        Some(true)
+    );
+}
+
+#[test]
+fn vision_extra_transports_are_retained_with_repairable_warning() {
+    for transport in ["ws", "grpc", "http", "httpupgrade"] {
+        let parsed = parse(json!({"outbounds":[
+            {"type":"vless","tag":"RepairMe","server":"private.example","server_port":443,"uuid":"private-uuid","flow":"xtls-rprx-vision","tls":{"enabled":true},"transport":{"type":transport}},
+            {"type":"vless","tag":"Good","server":"good.example","server_port":443,"uuid":"good-uuid","tls":{"enabled":true}}
+        ]}));
+        assert_eq!(
+            parsed.servers.len(),
+            2,
+            "{transport}: {:?}",
+            parsed.warnings
+        );
+        assert_eq!(parsed.failed, 0);
+        let stored = serde_json::to_value(&parsed.servers).unwrap();
+        let mut restored: Vec<ServerConfig> = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), stored);
+        restored.swap(0, 1); // The good explicit selection must remain usable.
+        let generated = generate_remote_import(&restored, "sub1");
+        assert_eq!(generated.invalid_nodes.len(), 1);
+        assert_eq!(
+            generated.invalid_nodes[0].reason,
+            "vision-transport-unsupported"
+        );
+
+        assert_eq!(parsed.servers[0].flow.as_deref(), Some("xtls-rprx-vision"));
+        assert!(
+            polaris_config_engine::builder::outbound::validate_vision_transport(&parsed.servers[0])
+                .is_err()
+        );
+        assert!(parsed
+            .warnings
+            .iter()
+            .any(|w| w.contains("RepairMe") && w.contains("vision-transport-unsupported")));
+        assert!(parsed
+            .warnings
+            .iter()
+            .all(|w| !w.contains("private.example") && !w.contains("private-uuid")));
+    }
+}

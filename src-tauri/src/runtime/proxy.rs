@@ -44,9 +44,11 @@ mod tls_capabilities;
 pub(crate) mod core_log;
 mod dns_takeover;
 mod hot_switch;
+mod lan_gateway;
 mod lifecycle;
 mod login_fallback;
 mod management_api;
+mod runtime_config;
 // S4 journal, artifact, and guarded CAS contract. The managed coordinator is
 // deliberately not wired until core ownership and platform receipts exist.
 pub(crate) mod coex_observer;
@@ -364,6 +366,7 @@ pub mod code {
     /// Android's in-process VPN core cannot own a second endpoint system interface.
     pub const SYSTEM_INTERFACE_UNSUPPORTED: &str = "SYSTEM_INTERFACE_UNSUPPORTED";
     /// 起核腿失败（就绪门判定核已死 / 就绪超时）——「启动失败」轴。
+    pub const VISION_TRANSPORT_UNSUPPORTED: &str = "VISION_TRANSPORT_UNSUPPORTED";
     pub const STARTUP_FAILED: &str = "STARTUP_FAILED";
     pub const SPEED_TEST_URL_INVALID: &str = "SPEED_TEST_URL_INVALID";
     pub const NODE_RESOLVER_UNSUPPORTED: &str = "NODE_RESOLVER_UNSUPPORTED";
@@ -417,15 +420,8 @@ pub mod code {
     /// 实际默认出口，与用户落盘的 `selectedServerId` 对账（见 [`attest_effective_exit`](super::startup::attest_effective_exit)）。
     /// 非终态（核在跑），同走 `set_nonfatal_error`。这是「用户以为走代理、实则明文直连」的唯一告警通道。
     pub const EXIT_MISMATCH: &str = "EXIT_MISMATCH";
-    /// **内核自证**：核已就绪，但**实际跑起来的那个二进制**不是本次期望的核——「提权助手里的内核与本应用不配套」轴。
-    ///
-    /// 与 [`EXIT_MISMATCH`] 的判据形态**刻意相反**：那一条是纯静态对账（两个输入都源自「意图」），
-    /// 本条只吃**事实**——`running` 取自内核对该 pid 的记账（linux `/proc/<pid>/exe`、mac `ps -o comm=`），
-    /// 版本取自**对那个文件真跑一次 `sing-box version`**。理由是血证：TUN 提权路径上
-    /// 「app 请求 bin=A、helper 实跑 bin=B」持续一天多而全链零告警（p101，A=1.14.0-beta.3、
-    /// B=1.14.0-alpha.45），静态对账在此天然瞎——两侧根本不共享同一个「意图」。
-    ///
-    /// 非终态（核确在跑，只是版本不对），同走 `set_nonfatal_error`。
+    /// Nonfatal diagnostic mismatch, separate from byte/source startup admission.
+    /// Cached or PID-derived pathnames are never executed to produce this verdict.
     pub const CORE_BINARY_MISMATCH: &str = "CORE_BINARY_MISMATCH";
     /// The pinned Start/status receipt differs from the selected immutable CoreID.
     /// Runtime version strings are diagnostic and never establish this verdict.
@@ -433,6 +429,8 @@ pub mod code {
     /// Another content id/user or pending native custody occupies the helper.
     pub const HELPER_CORE_OCCUPIED: &str = "HELPER_CORE_OCCUPIED";
     /// The package payload does not match its compiled content identity.
+    pub const LAN_GATEWAY_FORWARDING_REQUIRED: &str = "LAN_GATEWAY_FORWARDING_REQUIRED";
+    pub const LAN_GATEWAY_FORWARDING_UNCONFIRMED: &str = "LAN_GATEWAY_FORWARDING_UNCONFIRMED";
     pub const CORE_BUNDLE_MISMATCH: &str = "CORE_BUNDLE_MISMATCH";
     /// The selected content id has not been installed by an administrator.
     pub const HELPER_CORE_ABSENT: &str = "HELPER_CORE_ABSENT";
@@ -1338,6 +1336,8 @@ pub struct SpeedProbeTargets {
 /// 持有 config / helper / mesh 引用（跨运行时协作：启动需读 config + 可能经 helper 提权 + mesh exit route）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForceRestartSource {
+    /// Exact snapshot approved by the restart dialog; never refreshed by later edits.
+    Confirmed { intent_generation: u64 },
     /// An explicit Apply or full-config operation owns the snapshot; later selector intents only
     /// update its selected id and must not revoke the authorized full restart.
     Full,
@@ -1461,8 +1461,6 @@ pub struct ProxyRuntime {
     /// helper stop（child 恒 None）+ 崩溃监测/就绪门改用 pid 探活（helper 核无本地 [`tokio::process::Child`] 句柄）。
     /// 起核提交时置、停核/直起时清。
     core_via_helper: Arc<AtomicBool>,
-    /// Bounded diagnostic probe owns its original pending child/readers across generations.
-    core_version_probe: Arc<crate::runtime::core_version_probe::CoreVersionProbe>,
     /// H-1 强制重启专用配置快照（`(id, config, source)`）。
     ///
     /// **不可用 currentConfig 替代**：in-flight start 腿会覆盖 currentConfig，drain 必须读本字段
@@ -1492,6 +1490,8 @@ pub struct ProxyRuntime {
     /// 表现为最后一次点击被盖回、继而由错误快照触发多余重启。Tokio Mutex 按等待顺序放行，且锁只护
     /// 配置入核流水线，不与同步 [`LifecycleGate`] / 配置写锁混用。
     switch_serial: AsyncMutex<()>,
+    runtime_config_baseline: RwLock<Option<runtime_config::RuntimeConfigBaseline>>,
+    runtime_config_apply: Mutex<runtime_config::RuntimeConfigApplyState>,
     native_observation: Mutex<native_auto::NativeObservation>,
     /// selector 意图代次、强制重申脏位与后台单飞交接的唯一 owner。
     /// 它与 `switch_serial` 正交：前者给出跨 await 的所有权事实，后者仍串行真实入核 I/O。
@@ -1841,9 +1841,6 @@ impl ProxyRuntime {
             android_main_token: Mutex::new(None),
             pid: Arc::new(Mutex::new(None)),
             core_via_helper: Arc::new(AtomicBool::new(false)),
-            core_version_probe: Arc::new(
-                crate::runtime::core_version_probe::CoreVersionProbe::default(),
-            ),
             pending_force_restart: RwLock::new(None),
             force_restart_seq: AtomicU64::new(1),
             current_config: RwLock::new(None),
@@ -1851,6 +1848,8 @@ impl ProxyRuntime {
             pending_switch: RwLock::new(None),
             switch_seq: AtomicU64::new(1),
             switch_serial: AsyncMutex::new(()),
+            runtime_config_baseline: RwLock::new(None),
+            runtime_config_apply: Mutex::new(runtime_config::RuntimeConfigApplyState::default()),
             native_observation: Mutex::new(native_auto::NativeObservation::default()),
             selector_reconcile: Arc::new(SelectorReconcileOwner::default()),
             auto_select: std::sync::Mutex::default(),

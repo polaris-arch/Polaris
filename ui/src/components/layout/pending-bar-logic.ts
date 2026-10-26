@@ -1,4 +1,4 @@
-import type { PendingNodeChanges, ProxyLifecycleEvent } from '@/contracts/types';
+import type { PendingApplyResult, PendingNodeChanges, ProxyLifecycleEvent } from '@/contracts/types';
 import {
   proxyErrorReason,
   type ProxyErrorTranslate,
@@ -36,11 +36,11 @@ export function hasPendingWork(pending: PendingNodeChanges): boolean {
   return pendingChangesCount(pending) > 0 || pending?.restartDeferred === true;
 }
 
-/** `applyPendingChanges()` 的后端三态（真运行态判定：运行=applied / 在飞=deferred / 未运行=skipped）。 */
-export type ApplyStatus = 'applied' | 'deferred' | 'skipped';
+/** HOT receipt outcomes plus the backward-compatible explicit restart scheduling states. */
+export type ApplyStatus = PendingApplyResult['status'];
 
 /** 条的 B 维度里由「这一次 apply」驱动的那部分（§2.4 维度 B 的 applying / applyFailed 两态）。 */
-export type ApplyPhase = 'idle' | 'applying' | 'failed';
+export type ApplyPhase = 'idle' | 'applying' | 'failed' | 'durabilityPending';
 
 export interface ApplyOutcome {
   phase: ApplyPhase;
@@ -73,11 +73,44 @@ export interface ApplyOutcome {
  */
 export const APPLY_CONFIRM_TIMEOUT_MS = 12_000;
 
-export function applyOutcome(status: ApplyStatus | null | undefined): ApplyOutcome {
+/** Only the trusted code/path pair selects this restart-source explanation. */
+export function runtimeApplyConflictKey(reasons?: PendingApplyResult['reasons']): string {
+  return reasons?.some(reason => reason.code === 'OWNER_STATE_SUPERSEDED' && reason.path === 'desired')
+    ? 'home.pendingHotOwnerSuperseded' : 'home.pendingHotConflict';
+}
+
+/** Only a verified obsolete desired owner ends original-transaction recovery. */
+export function runtimePersistenceRecoveryEnded(status: ApplyStatus | null | undefined, reasons?: PendingApplyResult['reasons']): boolean {
+  return status === 'conflict' && reasons?.some(reason => reason.code === 'OWNER_STATE_SUPERSEDED' && reason.path === 'desired') === true;
+}
+
+export function runtimeApplyRejectedKey(reasons?: PendingApplyResult['reasons']): string {
+  if (reasons?.some(reason => reason.code === 'VISION_TRANSPORT_UNSUPPORTED' && reason.path === 'outbounds.vision.transport')) return 'nodes.invalidVisionTransport';
+  const gateway = reasons?.find(reason => reason.path === 'inbounds.tun.gateway.forwarding' &&
+    (reason.code === 'LAN_GATEWAY_FORWARDING_REQUIRED' || reason.code === 'LAN_GATEWAY_FORWARDING_UNCONFIRMED'));
+  return gateway?.code === 'LAN_GATEWAY_FORWARDING_REQUIRED' ? 'errors.lanGatewayForwardingRequired'
+    : gateway ? 'errors.lanGatewayForwardingUnconfirmed' : 'home.pendingHotRejected';
+}
+
+export function applyOutcome(status: ApplyStatus | null | undefined, reasons?: PendingApplyResult['reasons']): ApplyOutcome {
   switch (status) {
     case 'applied':
     case 'deferred':
       return { phase: 'applying', toast: null };
+    case 'hotApplied':
+      return { phase: 'idle', toast: { kind: 'info', key: 'home.pendingHotApplied' } };
+    case 'hotDurabilityPending':
+      return { phase: 'durabilityPending', toast: null };
+    case 'restartRequired':
+      return { phase: 'idle', toast: null };
+    case 'conflict':
+      return { phase: 'failed', toast: { kind: 'error', key: runtimeApplyConflictKey(reasons) } };
+    case 'rejected':
+      return { phase: 'failed', toast: { kind: 'error', key: runtimeApplyRejectedKey(reasons) } };
+    case 'unconfirmed':
+      return { phase: 'failed', toast: { kind: 'error', key:
+        reasons?.some(reason => reason.code === 'CORE_BUNDLE_MISMATCH' && reason.path === 'runtime.protocol')
+          ? 'errors.coreBundleMismatch' : 'home.pendingHotUnconfirmed' } };
     case 'skipped':
       return { phase: 'idle', toast: { kind: 'info', key: 'home.pendingSkippedNotRunning' } };
     default:
@@ -119,6 +152,13 @@ export function isRestartFailureCode(code: string | undefined): boolean {
 export interface ApplyState {
   phase: ApplyPhase;
   applyId?: number;
+  /** Only a status read may resolve an ambiguous or durability-pending transaction. */
+  reconciling?: boolean;
+  transactionId?: string;
+  /** Preserve persistence-only recovery across ambiguous/failed replies. */
+  persistenceOnly?: boolean;
+  /** Confirmed regeneration supersession ends this original recovery, not durability. */
+  persistenceRecoveryEnded?: boolean;
   mainGeneration?: number;
   /** 只在 `failed` 时有意义。 */
   reason: string | null;
@@ -160,9 +200,9 @@ export function applyStateOnLifecycle(
 export type StagedPhase = 'clean' | 'staged' | 'saving' | 'saveFailed';
 
 /** 维度 B：pending（磁盘 vs 运行核）。 */
-export type PendingPhase = 'none' | 'pending' | 'applying' | 'applyFailed';
+export type PendingPhase = 'none' | 'pending' | 'applying' | 'applyFailed' | 'durabilityPending';
 
-export type BarActionId = 'reset' | 'save' | 'apply' | 'retryApply' | 'dismissApply' | 'retrySave';
+export type BarActionId = 'reset' | 'save' | 'apply' | 'retryApply' | 'dismissApply' | 'retrySave' | 'retryPersistence';
 
 /** `disabled` 与「不出现」是两回事：表里的「禁用」要求按钮仍在位（否则条会在重启期间抖一下）。 */
 export interface BarAction {
@@ -199,6 +239,11 @@ export interface BarInput {
    * 「保存」不受影响 —— 落盘在两种运行态下语义完全相同。
    */
   coreRunning: boolean;
+  /** Exact original receipt is available for an explicit persistence-only retry. */
+  persistenceRetryAvailable?: boolean;
+  persistenceOnly?: boolean;
+  /** Confirmed regeneration supersession ends this original recovery, not durability. */
+  persistenceRecoveryEnded?: boolean;
 }
 
 const HIDDEN: BarView = {
@@ -228,7 +273,7 @@ export function composeBarView(input: BarInput): BarView {
 
   /** 核没在跑 ⇒ 抹掉全部「重启核」类动作（见 `BarInput.coreRunning`）。收在一处，别逐格判。 */
   const gateApply = (actions: BarAction[]): BarAction[] =>
-    coreRunning ? actions : actions.filter((a) => a.id !== 'apply' && a.id !== 'retryApply');
+    coreRunning ? actions : actions.filter((a) => a.id !== 'apply' && a.id !== 'retryApply' && a.id !== 'retryPersistence');
 
   // ── A 的动作生命周期态覆盖整行 B ──
   if (stagedPhase === 'saving') {
@@ -255,10 +300,22 @@ export function composeBarView(input: BarInput): BarView {
     };
   }
 
+  // Persistence recovery is a distinct original-transaction action, never Apply.
+  if (pendingPhase === 'durabilityPending') {
+    return { visible: true, err: false, titleKey: 'home.pendingHotDurabilityPending',
+      titleVars: {}, detailKey: '', actions: input.persistenceRetryAvailable ? gateApply([act('retryPersistence')]) : [] };
+  }
+
   const applyFailedTitle: Pick<BarView, 'titleKey' | 'titleVars'> = {
     titleKey: applyError === null ? 'home.pendingApplyFailed' : 'home.pendingApplyFailedReason',
     titleVars: applyError === null ? {} : { reason: applyError },
   };
+
+  if (pendingPhase === 'applyFailed' && input.persistenceOnly) {
+    return { visible: true, err: true, ...applyFailedTitle, detailKey: '',
+      actions: input.persistenceRecoveryEnded ? [act('dismissApply')]
+        : input.persistenceRetryAvailable ? gateApply([act('retryPersistence')]) : [] };
+  }
 
   if (stagedPhase === 'clean') {
     switch (pendingPhase) {
@@ -353,6 +410,7 @@ export function stagedPhaseOf(
 
 /** B 维度取值：本次 apply 的生命周期优先于「磁盘 vs 运行核」的静态差集。 */
 export function pendingPhaseOf(applyPhase: ApplyPhase, pending: PendingNodeChanges): PendingPhase {
+  if (applyPhase === 'durabilityPending') return 'durabilityPending';
   if (applyPhase === 'failed') return 'applyFailed';
   if (applyPhase === 'applying') return 'applying';
   return hasPendingWork(pending) ? 'pending' : 'none';

@@ -503,3 +503,21 @@ test('Android lifecycle observations are explicitly registered for APK validatio
   assert.match(ANDROID_IMPACT_SCOPES[path].why, /APK Rust cdylib/);
   assert.equal(classifyImpact([path]).android, true);
 });
+
+// Imported siblings affect the same real packaged Linux acceptance as the CLI entries.
+test('Linux package acceptance directory cannot silently lose its package signal', () => {
+  for (const leaf of [
+    'transport.mjs', 'tun-transport.mjs', 'linux.py', 'linux_tun.py',
+    'root_controller.py', 'tun.py', 'future/owned-module.py',
+  ]) {
+    const impact = classifyImpact([`scripts/package-acceptance/${leaf}`]);
+    assert.deepEqual(impact.platforms, ['linux']);
+    assert.equal(impact.hasPackage, true);
+    assert.equal(impact.preflight, true);
+    assert.equal(impact.kernel, false);
+    assert.equal(impact.android, false);
+  }
+  for (const path of ['scripts/package-acceptance-other/linux.py', 'docs/package-acceptance.md']) {
+    assert.equal(classifyImpact([path]).hasPackage, false);
+  }
+});

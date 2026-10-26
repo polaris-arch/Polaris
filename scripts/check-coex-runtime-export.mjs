@@ -23,6 +23,20 @@ export const SOURCE_PATHS = [
   'src-tauri/src/runtime/proxy/recovery.rs',
   'src-tauri/src/runtime/proxy/startup.rs',
 ];
+// Additional changed/new proxy files in this HOT integration, not historical
+// producer inputs and not a complete App/native/transitive dependency graph.
+export const HOT_PROXY_SOURCE_PATHS = [
+  'src-tauri/src/runtime/proxy/mesh_route_report.rs',
+  'src-tauri/src/runtime/proxy/native_auto.rs',
+  'src-tauri/src/runtime/proxy/pending_changes.rs',
+  'src-tauri/src/runtime/proxy/runtime_config.rs',
+  'src-tauri/src/runtime/proxy/runtime_config/tests/mod.rs',
+  'src-tauri/src/runtime/proxy/tests/hot_switch.rs',
+  'src-tauri/src/runtime/proxy/tests/hot_switch/auto_select.rs',
+  'src-tauri/src/runtime/proxy/tests/lifecycle.rs',
+  'src-tauri/src/runtime/proxy/tests/mesh_route_report.rs',
+  'src-tauri/src/runtime/proxy/tests/real_core_cleanup.rs',
+];
 export const DECODER_PATHS = [
   'ui/src/contracts/coex-runtime.ts',
   'ui/src/contracts/coex-snapshot.ts',
@@ -138,7 +152,7 @@ export function validateStates(value, label) {
   exactKeys(value, STATE_KEYS, label);
   for (const key of STATE_KEYS) requireThat(record(value[key]), `${label}.${key}: expected state object`);
 }
-export function validateSnapshot(snapshot, expectedSha, compatibility) {
+export function validateSnapshot(snapshot, expectedSha, compatibility, hotProxyCompatibility) {
   requireThat(/^[a-f0-9]{40}$/.test(expectedSha), 'GITHUB_SHA is missing or invalid');
   requireThat(snapshot.commit === expectedSha, 'checkout does not match GITHUB_SHA');
   requireThat(/^[a-f0-9]{40}$/.test(snapshot.tree), 'invalid git tree identity');
@@ -147,6 +161,9 @@ export function validateSnapshot(snapshot, expectedSha, compatibility) {
   exactKeys(snapshot.decoderSourceSha256, DECODER_PATHS, 'decoder source snapshot');
   exactKeys(compatibility, SOURCE_PATHS, 'fixture sourceCompatibility');
   requireThat(canonical(snapshot.sourceSha256) === canonical(compatibility), 'current nine-source hashes differ from fixture sourceCompatibility');
+  exactKeys(snapshot.hotProxySourceSha256, HOT_PROXY_SOURCE_PATHS, 'HOT proxy source snapshot');
+  exactKeys(hotProxyCompatibility, HOT_PROXY_SOURCE_PATHS, 'fixture HOT proxy supplement');
+  requireThat(canonical(snapshot.hotProxySourceSha256) === canonical(hotProxyCompatibility), 'current HOT proxy hashes differ from fixture supplement');
 }
 export function validateExecution(execution, log, startedAtMs, exportMtimeMs) {
   requireThat(execution.command === TEST_COMMAND, 'workspace test command changed');
@@ -170,6 +187,7 @@ function sourceSnapshot(root) {
     trackedStatus: git('status', '--porcelain=v1', '--untracked-files=no'),
     fixtureSha256: sha256(readFileSync(join(root, FIXTURE))),
     sourceSha256: Object.fromEntries(SOURCE_PATHS.map(path => [path, sha256(readFileSync(join(root, path)))])),
+    hotProxySourceSha256: Object.fromEntries(HOT_PROXY_SOURCE_PATHS.map(path => [path, sha256(readFileSync(join(root, path)))])),
     decoderSourceSha256: Object.fromEntries(DECODER_PATHS.map(path => [path, sha256(readFileSync(join(root, path)))])),
   };
 }
@@ -194,7 +212,8 @@ export function prepare(root, env) {
     const fixture = jsonFile(join(root, FIXTURE));
     validateStates(fixture.states, 'historical states');
     const snapshot = sourceSnapshot(root);
-    validateSnapshot(snapshot, env.GITHUB_SHA, fixture.sourceCompatibility?.sourceSha256);
+    validateSnapshot(snapshot, env.GITHUB_SHA, fixture.sourceCompatibility?.sourceSha256,
+      fixture.sourceCompatibility?.hotProxyIntegration?.sourceSha256);
     requireThat(sha256(canonical(fixture.states)) === fixture.sourceCompatibility.originalStatesCanonicalSha256,
       'historical states digest changed');
     writeJson(join(directory, 'historical-fixture.json'), fixture);
@@ -272,7 +291,8 @@ export async function capture(root, scriptPath, env) {
   requireThat(!existsSync(before.exportPath), 'export already exists before workspace test');
   const snapshot = sourceSnapshot(root);
   requireThat(canonical(snapshot) === canonical({ commit: before.commit, tree: before.tree, trackedStatus: before.trackedStatus,
-    fixtureSha256: before.fixtureSha256, sourceSha256: before.sourceSha256, decoderSourceSha256: before.decoderSourceSha256 }), 'checkout changed before workspace test');
+    fixtureSha256: before.fixtureSha256, sourceSha256: before.sourceSha256,
+    hotProxySourceSha256: before.hotProxySourceSha256, decoderSourceSha256: before.decoderSourceSha256 }), 'checkout changed before workspace test');
   writeFileSync(join(directory, 'workflow-test-command.sh'), script, { flag: 'wx' });
   for (const name of ['cargo-test.log', 'cargo-test.stdout.log', 'cargo-test.stderr.log']) writeFileSync(join(directory, name), '', { flag: 'wx' });
   const startedAtMs = Date.now();
@@ -305,8 +325,9 @@ export async function verify(root, env) {
     requireThat(before.root === realpathSync(root), 'verify root differs from prepared checkout');
     requireThat(before.github.sha === env.GITHUB_SHA && before.github.runId === env.GITHUB_RUN_ID
       && before.github.runAttempt === env.GITHUB_RUN_ATTEMPT && before.github.job === env.GITHUB_JOB, 'CI invocation identity changed');
-    validateSnapshot(after, env.GITHUB_SHA, historical.sourceCompatibility?.sourceSha256);
-    for (const key of ['commit', 'tree', 'trackedStatus', 'fixtureSha256', 'sourceSha256', 'decoderSourceSha256']) {
+    validateSnapshot(after, env.GITHUB_SHA, historical.sourceCompatibility?.sourceSha256,
+      historical.sourceCompatibility?.hotProxyIntegration?.sourceSha256);
+    for (const key of ['commit', 'tree', 'trackedStatus', 'fixtureSha256', 'sourceSha256', 'hotProxySourceSha256', 'decoderSourceSha256']) {
       requireThat(canonical(before[key]) === canonical(after[key]), `before/after ${key} changed`);
     }
     requireThat(after.fixtureSha256 === sha256(readFileSync(join(root, FIXTURE))), 'fixture source changed');

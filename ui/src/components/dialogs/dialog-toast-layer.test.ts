@@ -153,7 +153,6 @@ describe('.dlg-err 白名单：提交级错误条不得回到 children 末尾', 
    */
   const ALLOWED: Record<string, string> = {
     'TsLoginDialog.tsx': '上下文级：紧贴 Auth Key / 登录方式那块控件，距 </Modal> 48 行，不在滚动尾部',
-    'SubDialog.tsx': '上下文级：订阅预检结果，与 .mesh-success 二选一，贴着「预检」按钮',
     'SubscriptionCreateTaskDialog.tsx': '上下文级：恢复任务的 terminal failed 状态，保留到用户关闭任务；toast 只作一次通知，正文提供可见状态与本地化原因',
   };
 
@@ -186,3 +185,4 @@ describe('.dlg-err 白名单：提交级错误条不得回到 children 末尾', 
     });
   }
 });
+

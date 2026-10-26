@@ -234,6 +234,7 @@ def app_identity(*, status_log=None):
                 ['scripts/mobile-core/consume.py', 'scripts/mobile-core/artifacts.py',
                  'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py', 'scripts/mobile-core/carriers.py',
                  'scripts/mobile-core/source-contract.json', 'scripts/mobile-core/transaction.py',
+                 'scripts/lib/polaris-version.json',
                  'scripts/mobile-core/native_inputs.py', 'src-tauri/gen/apple/project.yml',
                  'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj',
                  'scripts/verify-apk.mjs', 'scripts/assert-r8-evidence.mjs',

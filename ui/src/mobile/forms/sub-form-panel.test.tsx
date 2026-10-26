@@ -15,7 +15,7 @@ const probe = vi.hoisted(() => ({
   loading: false,
   failed: false,
   submit: null as (() => void) | null,
-  update: vi.fn<(sub: SubscriptionConfig) => Promise<void>>(),
+  update: vi.fn<(sub: SubscriptionConfig, editRequestId?: string) => Promise<import('@/ipc/api/subscriptions').SubscriptionEditResult>>(),
   load: vi.fn<() => Promise<void>>(),
 }));
 
@@ -32,7 +32,7 @@ vi.mock('./FormSheet', async (original) => {
 });
 vi.mock('@/ipc', async (original) => {
   const real = await original<typeof import('@/ipc')>();
-  return { ...real, api: { ...real.api, subscription: { ...real.api.subscription, update: probe.update } } };
+  return { ...real, api: { ...real.api, subscription: { ...real.api.subscription, update: probe.update, onUpdateProgressReady: async () => () => {} } } };
 });
 const { SubFormPanel } = await import('./SubFormPanel');
 
@@ -56,7 +56,7 @@ beforeEach(() => {
   probe.loading = false;
   probe.failed = false;
   probe.submit = null;
-  probe.update.mockReset().mockResolvedValue(undefined);
+  probe.update.mockReset().mockImplementation(async (_sub, editRequestId) => ({ saved: true, editRequestId, publication: 'scheduled', refresh: null }));
   probe.load.mockReset().mockResolvedValue(undefined);
   useStagedConfigStore.setState({ entries: [] });
   Object.assign(useStagedConfigStore.getInitialState(), useStagedConfigStore.getState());
@@ -93,7 +93,7 @@ describe('subscription interface field', () => {
     expect(html).toContain('value="https://example.com/sub"');
     expect(probe.submit).not.toBeNull();
     probe.submit?.();
-    await vi.waitFor(() => expect(probe.update).toHaveBeenCalledExactlyOnceWith(base));
+    await vi.waitFor(() => expect(probe.update).toHaveBeenCalledExactlyOnceWith(base, expect.any(String)));
     expect(probe.load).toHaveBeenCalledOnce();
   });
 
@@ -103,7 +103,7 @@ describe('subscription interface field', () => {
     expect(html).toContain('<option value="old-wifi" disabled="" selected="">');
     expect(html).toContain(tx('settings.network.interfaceUnavailable', { name: 'old-wifi' }));
     probe.submit?.();
-    await vi.waitFor(() => expect(probe.update).toHaveBeenCalledWith({ ...base, updateViaProxy: false }));
+    await vi.waitFor(() => expect(probe.update).toHaveBeenCalledWith({ ...base, updateViaProxy: false }, expect.any(String)));
   });
 
   it('inherited selection writes no per-subscription override', async () => {
@@ -153,5 +153,33 @@ describe('subscription interface field', () => {
     expect(item?.label).toBe(i18n.t('common.edit'));
     item?.onSelect?.();
     expect(onEditUrl).toHaveBeenCalledOnce();
+  });
+});
+
+describe('subscription notice presentation keeps the real FormSheet contract', () => {
+  it('legacy notices remain readable without a new detailed container', async () => {
+    const { FormSheet } = await vi.importActual<typeof import('./FormSheet')>('./FormSheet');
+    const html = renderToStaticMarkup(<FormSheet title="Edit" closeLabel="Close" cancelLabel="Cancel"
+      onRequestClose={() => {}} notice={{ tone: 'err', text: 'Original failure' }}><input aria-label="URL" /></FormSheet>);
+    expect(html).toContain('class="m-form-notice err" role="status"');
+    expect(html).toContain('Original failure');
+    expect(html).not.toContain('m-form-notice-detailed');
+  });
+  it('saved state and failed follow-up are distinct, readable facts', async () => {
+    const { FormSheet } = await vi.importActual<typeof import('./FormSheet')>('./FormSheet');
+    const html = renderToStaticMarkup(<FormSheet title="Edit" closeLabel="Close" cancelLabel="Cancel"
+      onRequestClose={() => {}} notice={{ tone: 'err', title: i18n.t('feedback.subscriptionSaved'), text: i18n.t('feedback.followupIncomplete') }}>
+      <input aria-label="URL" />
+    </FormSheet>);
+    expect(html).toContain('m-form-notice-detailed');
+    expect(html).toContain(`<strong>${tx('feedback.subscriptionSaved')}</strong>`);
+    expect(html).toContain(`<p>${tx('feedback.followupIncomplete')}</p>`);
+    expect(html).toContain('m-form-foot');
+  });
+  it('an identical title and reason are not repeated', async () => {
+    const { FormSheet } = await vi.importActual<typeof import('./FormSheet')>('./FormSheet');
+    const html = renderToStaticMarkup(<FormSheet title="Edit" closeLabel="Close" cancelLabel="Cancel"
+      onRequestClose={() => {}} notice={{ tone: 'err', title: 'Save failed', text: 'Save failed' }}><input aria-label="URL" /></FormSheet>);
+    expect(html.match(/>Save failed</g)).toHaveLength(1);
   });
 });

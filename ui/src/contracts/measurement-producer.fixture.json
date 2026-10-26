@@ -51,7 +51,7 @@
             },
             "configDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "nodeFingerprintDigest": "83c8618a2ca1d99aaa3d21496a85062d6783e3cf52f46f257438bee59deddc37",
-            "connectionDigest": "fe69999ff8051319d26d6cbc3f6977dd7600da2f50ceeb6eab61e26ac671c239",
+            "connectionDigest": "0f0ad378b5df3e74fa45837c55d8fe9ec0e3981cecf71deec5079640329641d0",
             "networkEpoch": 3,
             "measuredAt": 1000,
             "coreBinarySha256": null

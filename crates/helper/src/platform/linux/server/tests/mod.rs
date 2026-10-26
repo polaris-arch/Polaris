@@ -308,10 +308,15 @@ fn reap_group_wait_returns_immediately_when_empty() {
 }
 
 #[test]
-fn forward_fn_satisfies_injection_contract_without_host_writes() {
-    // Check the HandlerDeps callback contract without invoking the host writer.
-    let forward: fn(bool) = forward_fn();
-    let _: &(dyn Fn(bool) + Send + Sync) = &forward;
+fn linux_lifecycle_has_no_host_forwarding_writer() {
+    for source in [
+        polaris_source_probe::crate_source!("platform/linux/server.rs"),
+        polaris_source_probe::crate_source!("platform/linux/handler.rs"),
+        polaris_source_probe::crate_source!("platform/linux/daemon.rs"),
+    ] {
+        assert!(!source.contains("set_forward_prod"));
+        assert!(!source.contains("deps.set_forward"));
+    }
 }
 
 /// 静态断言：ServerError 实现了 std::error::Error + Display。

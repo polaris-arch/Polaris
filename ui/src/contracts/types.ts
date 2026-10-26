@@ -574,7 +574,9 @@ export type StagedDecision = 'hotSwitch' | 'noOp' | 'defer' | 'restart';
 
 export interface StagedClassification {
   decision: StagedDecision;
-  /** 恒等式：`restartRequired === decision ∈ {defer, restart}`。是 `decision` 的投影，不是第二个判据。 */
+  /** Saved desired state still differs from the accepted running state. */
+  pendingApply: boolean;
+  /** A restart is actually required; independent of pendingApply. */
   restartRequired: boolean;
 }
 
@@ -764,7 +766,7 @@ export interface UserConfig {
   // 原 systemProxyBypass 已并入此字段（单一清单，杜绝两处重复）。
   bypassLANList?: string[];
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
-  utlsPolicy?: string; // default (Chrome; initial policy), follow, or a supported core profile
+  utlsPolicy?: string; // follow (initial policy), default (Chrome), or a supported core profile
   tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
   // WebRTC 防泄露（仅 TUN 模式生效）：off=关；proxy=对 STUN 经协议嗅探强制走代理（srflx=代理 IP，WebRTC 正常）；
   // block=reject STUN（断 P2P、零公网 IP 泄露）。默认 undefined=off（零行为变化）。系统代理模式拦不住（浏览器 WebRTC
@@ -831,4 +833,20 @@ export interface UserConfig {
   helperDisabledPromptDismissed?: boolean;
 
   uiTheme?: 'light' | 'dark' | 'system';
+}
+
+/** Receipt-based HOT outcomes and legacy explicitly confirmed restart scheduling. */
+export interface PendingApplyResult {
+  persistenceMode?: string;
+  transactionId?: string;
+  runtimeGeneration?: number;
+  selectionIntentGeneration?: number;
+  ok: boolean;
+  status: 'applied' | 'deferred' | 'skipped' | 'hotApplied' | 'hotDurabilityPending'
+    | 'restartRequired' | 'conflict' | 'rejected' | 'unconfirmed';
+  applyId?: number | null;
+  restartConfirmation?: string;
+  reasons?: { code: string; path: string }[];
+  pendingApply?: boolean;
+  restartRequired?: boolean;
 }

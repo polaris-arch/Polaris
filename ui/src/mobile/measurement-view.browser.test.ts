@@ -13,6 +13,7 @@ import { MobileNodesScreen } from '/src/mobile/nodes/MobileNodesScreen';
 import { MobileHomeScreen } from '/src/mobile/home/MobileHomeScreen';
 import { MeasurementStartNotice } from '/src/mobile/MeasurementStartNotice';
 import { MeasurementLabel } from '/src/mobile/MeasurementLabel';
+import { Csel } from '/src/components/dialogs/Csel';
 import { measurementT, refreshTrayLang } from '/src/tray/labels';
 import { useAppStore } from '/src/store/app-store';
 import { useStagedConfigStore } from '/src/store/staged-config-store';
@@ -26,7 +27,7 @@ await i18nReady; i18n.addResourceBundle('zh-CN','translation',zhCN,true,true); a
 const mode=new URLSearchParams(location.search).get('mode')||'desktop';
 localStorage.setItem('polaris.language','zh-CN');refreshTrayLang();
 document.documentElement.dataset.mobileOs=mode==='ios'?'ios':'android';
-if(mode==='desktop')await import('/src/styles/index.css');
+if(mode==='desktop'||mode==='csel')await import('/src/styles/index.css');
 else {await import('/src/styles/tokens.resolved.css');await import('/src/mobile/mobile.css');await import('/src/mobile/redesign.css');}
 const servers=['a','b','c'].map((id,index)=>({id,name:index<2?'同名节点':'自建节点',protocol:'socks',address:'fixture.invalid',port:1,...(index<2?{subscriptionId:index===0?'one':'two'}:{})}));
 const config={selectedServerId:'a',proxyMode:'smart',servers,subscriptions:[{id:'one',name:'Alpha',url:'https://fixture.invalid'},{id:'two',name:'Beta',url:'https://fixture.invalid'},{id:'empty',name:'Empty',url:'https://fixture.invalid'}]};
@@ -66,8 +67,9 @@ useAppStore.setState({config,servers,selectedServerId:'a',proxyStatus:status,inv
 const dispose=subscribeLatencyEvents();
 function TrayLanguageFixture(){const [lang,setLang]=useState('zh-CN');f.language=()=>{localStorage.setItem('polaris.language','en-US');setLang(refreshTrayLang());};return <div data-tray-language={lang}><MeasurementLabel serverId="a" displayedServer={servers[0]} translate={measurementT}/></div>;}
 function FixtureMount({children}){useLayoutEffect(()=>{f.mounted=true;document.getElementById('root').dataset.fixtureMode=mode;return()=>{f.mounted=false;};},[]);return children;}
+function ShallowSelectFixture(){const [value,setValue]=useState('remote');return <section className="card" style={{position:'absolute',left:16,right:16,bottom:24,padding:16,height:120}}><Csel value={value} onChange={setValue} ariaLabel="DNS fallback" options={Array.from({length:12},(_,i)=>({value:i===0?'remote':String(i),label:'Resolver '+i,description:'Long resolver description with DNS routing and fallback details '+i}))}/></section>;}
 let app=createRoot(document.getElementById('root'));
-app.render(<FixtureMount>{mode==='tray-language'?<TrayLanguageFixture/>:mode==='home'?<MobileHomeScreen/>:mode==='ios'?<><MobileHomeScreen/><MeasurementStartNotice/></>:mode==='mobile'?<MobileNodesScreen/>:<div className="main-scroll"><NodesScreen/></div>}</FixtureMount>);
+app.render(<FixtureMount>{mode==='csel'?<ShallowSelectFixture/>:mode==='tray-language'?<TrayLanguageFixture/>:mode==='home'?<MobileHomeScreen/>:mode==='ios'?<><MobileHomeScreen/><MeasurementStartNotice/></>:mode==='mobile'?<MobileNodesScreen/>:<div className="main-scroll"><NodesScreen/></div>}</FixtureMount>);
 `;
 
 let server: ViteDevServer;
@@ -157,7 +159,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
     await server.listen(); const address = server.httpServer!.address();
     if (!address || typeof address !== 'object') throw Error('fixture did not bind');
     origin = 'http://127.0.0.1:' + address.port;
-    browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
+    browser = await chromium.launch({ chromiumSandbox: true, headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH });
     // Vite module/CSS/i18n preparation belongs to this bounded setup phase, not
     // the first behavior case's 5000ms allowance. Readiness comes from actual
     // production React commit; each later page must independently reach it.
@@ -271,4 +273,25 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('UI01 remaining capabi
     } catch (error) { await captureFailure(page, error); throw error; }
     finally { await page.close(); }
   });
+  for (const width of [390, 1100]) for (const rtl of [false, true]) {
+    it(`shared select: shallow card at ${width}px / rtl=${rtl} exposes long options and keyboard navigation`, async () => {
+      const page = await browser.newPage({ viewport: { width, height: 844 } });
+      try {
+        await openFixture(page, 'csel', `csel-${width}-${rtl}`);
+        if (rtl) await page.evaluate(() => { document.documentElement.dir = 'rtl'; });
+        await page.getByRole('button', { name: 'DNS fallback' }).click();
+        const menu = page.getByRole('listbox'); await menu.waitFor({ state: 'visible' });
+        const box = await menu.boundingBox();
+        expect(box!.height).toBeGreaterThan(150); expect(box!.x).toBeGreaterThanOrEqual(0);
+        expect(box!.x + box!.width).toBeLessThanOrEqual(width); expect(box!.y).toBeGreaterThanOrEqual(0);
+        expect(box!.y + box!.height).toBeLessThanOrEqual(844);
+        const trigger = page.getByRole('button', { name: 'DNS fallback' });
+        for (let i=0;i<11;i++) await trigger.press('ArrowDown');
+        await trigger.press('Enter');
+        expect(await trigger.innerText()).toContain('Resolver 11');
+        expect(await menu.count()).toBe(0);
+      } finally { await page.close(); }
+    });
+  }
+
 });

@@ -6,6 +6,8 @@ export type MeshRouteScope = 'preview' | 'applied' | 'persistedUnknown';
 export type MeshRouteConfigSource = 'draft' | 'running' | 'persisted';
 export type MeshRouteLoadEvidence =
   | 'startupReady'
+  // A committed runtime receipt proves loading, not durable persistence.
+  | 'runtimeCommitted'
   | 'fileWrittenUnacknowledged'
   | 'loadFailed'
   | 'unknown';

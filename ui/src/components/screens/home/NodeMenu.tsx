@@ -29,7 +29,7 @@ import { MeasurementLabel } from '@/mobile/MeasurementLabel';
  * 识别不到 → 不画（不回退地球：原型的 globe 兜底会让「没识别出来」看起来像「在某个未知国家」）。
  */
 
-import { Fragment, useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { Fragment, useMemo, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { ServerConfig, SubscriptionConfig } from '@/contracts/types';
 import { groupServersBySubscription, defaultOpenGroupIds } from '@/domain/server-grouping';
@@ -71,8 +71,17 @@ export interface NodeMenuProps {
   onManage: () => void;
 }
 
-export function NodeMenu({
-  open,
+// Each opening owns its search/expansion state. Closing unmounts that state;
+// no post-paint reset may overwrite an interaction with an already visible menu.
+export function NodeMenu(props: NodeMenuProps) {
+  const { t } = useTranslation();
+  if (!props.open) {
+    return <div className="node-menu" id="node-menu" role="listbox" aria-label={t('home.nodesMenu')} hidden />;
+  }
+  return <OpenNodeMenu {...props} />;
+}
+
+function OpenNodeMenu({
   autoSelectControls,
   servers,
   subscriptions,
@@ -92,15 +101,9 @@ export function NodeMenu({
   // 此前这里自造 useState → 与 Nodes 工具栏各记各的、不持久、不同步托盘（契约 L23）。
   const latencySort = useNodeSortStore((s) => s.sortByLatency);
   const toggleLatencySort = useNodeSortStore((s) => s.toggleSortByLatency);
-  const [openGroups, setOpenGroups] = useState<Set<string>>(new Set());
 
   const directOn = isDirectSelection(selectedServerId);
   const blockOn = isBlockSelection(selectedServerId);
-
-  // 对齐原型 toggleNodeMenu：每次打开复位搜索框（renderNodeMenu('')）。
-  useEffect(() => {
-    if (open) setSearch('');
-  }, [open]);
 
   const groups = useMemo(
     () => groupServersBySubscription(servers, subscriptions, false),
@@ -144,9 +147,22 @@ export function NodeMenu({
     [groups, selectedServerId],
   );
 
-  useEffect(() => {
-    if (open) setOpenGroups(new Set(defaultOpen));
-  }, [open, defaultOpen]);
+  // Snapshot defaults before the first committed interactive render. Later
+  // config publications may replace arrays or the selected exit; neither may
+  // override the user's expansion choice. Only previously unseen group IDs
+  // receive a default when asynchronous configuration introduces them.
+  const [openGroups, setOpenGroups] = useState<Map<string, boolean>>(
+    () => new Map(groups.map((group) => [group.id, defaultOpen.has(group.id)])),
+  );
+  if (groups.some((group) => !openGroups.has(group.id))) {
+    const next = new Map(openGroups);
+    for (const group of groups) {
+      if (!next.has(group.id)) next.set(group.id, defaultOpen.has(group.id));
+    }
+    // Guarded render-time adjustment: React retries this component before
+    // committing children, so no collapsed-first paint or delayed reset exists.
+    setOpenGroups(next);
+  }
 
   const groupLabel = (g: { isManual: boolean; isMesh?: boolean; name: string }) =>
     g.isManual ? t('nodes.tab.manual') : g.isMesh ? t('nodes.tab.mesh') : g.name;
@@ -154,9 +170,8 @@ export function NodeMenu({
   const scheduleReveal = useRevealAfterCommit();
   const toggleGroup = (id: string) => {
     setOpenGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      const next = new Map(prev);
+      next.set(id, !prev.get(id));
       return next;
     });
   };
@@ -169,10 +184,6 @@ export function NodeMenu({
   };
 
 
-
-  if (!open) {
-    return <div className="node-menu" id="node-menu" role="listbox" aria-label={t('home.nodesMenu')} hidden />;
-  }
 
   return (
     <div className="node-menu" id="node-menu" role="listbox" aria-label={t('home.nodesMenu')}>
@@ -234,7 +245,7 @@ export function NodeMenu({
       {autoSelectControls ?? <SavedAutoSelectControls t={t} />}
 
       {filteredGroups.map((g) => {
-        const isOpen = searching || openGroups.has(g.id);
+        const isOpen = searching || openGroups.get(g.id) === true;
         let items = g.servers;
         // 委托 domain 的单一比较器（与 Nodes 工具栏同口径：无测速结果恒沉底，不随方向翻转）。
         if (latencySort) items = sortServersByLatency(items, (id) => latencies[id]);

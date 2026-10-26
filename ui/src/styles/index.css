@@ -1836,3 +1836,19 @@ body:has(.pending-bar.show) #toast-stack{
 .auto-choice-details{margin-top:8px;font-size:12px;}
 .auto-choice-details>summary{cursor:pointer;}
 .auto-choice-divider{border:0;border-top:1px solid hsl(var(--line));margin-block:8px;}
+
+/* Persistent action feedback: compact hierarchy, no global typography changes. */
+.feedback-notice{ min-width:0; padding:12px; border:1px solid hsl(var(--err)/0.3); border-radius:var(--r-sm);
+  background:hsl(var(--err-weak)); overflow-wrap:anywhere; }
+.feedback-notice-title{ display:block; font-size:13px; font-weight:660; line-height:1.4; color:hsl(var(--err)); }
+.feedback-notice-detail{ margin:6px 0 0; font-size:12px; line-height:1.55; color:hsl(var(--fg)); }
+.feedback-notice-hint{ margin:6px 0 0; font-size:11.5px; line-height:1.55; color:hsl(var(--fg-dim)); }
+.feedback-notice-actions{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.feedback-notice-actions .btn{ max-width:100%; height:auto; min-height:28px; white-space:normal; text-align:start; }
+
+/* A dismissible diagnostic keeps its full detail scrollable without pushing the
+   close button outside the viewport. Ordinary short notifications are unchanged. */
+.toast.dismissible{ max-width:min(320px, calc(100vw - 48px)); box-sizing:border-box; }
+.toast.dismissible .toast-desc{ max-height:35vh; overflow-y:auto; overflow-wrap:anywhere; }
+.toast.dismissible .toast-desc:focus-visible{ outline:2px solid currentColor; outline-offset:1px; }
+.toast.dismissible .toast-action{ max-width:100%; white-space:normal; overflow-wrap:anywhere; }

@@ -43,7 +43,7 @@ function render() { h.stateIndex = h.refIndex = 0; return Screen(); }
 function nodes(node: unknown): ReactElement<Record<string, unknown>>[] {
   if (Array.isArray(node)) return node.flatMap(nodes);
   if (!isValidElement<Record<string, unknown>>(node)) return [];
-  return [node, ...nodes(node.props.children)];
+  return [node, ...nodes(node.props.children), ...nodes(node.props.actions)];
 }
 function text(node: unknown): string {
   if (Array.isArray(node)) return node.map(text).join('');
@@ -93,4 +93,41 @@ it('reopened helper page retains a cleanup action when service status says absen
   vi.mocked(helperApi.uninstall).mockResolvedValue({ success: true, status: absent } as never);
   click('helper.uninstall'); await vi.waitFor(() => expect(helperApi.uninstall).toHaveBeenCalledTimes(1));
   expect(helperApi.install).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['none', absent],
+  ['needs-repair', { ...absent, needsRepair: true }],
+  ['needs-upgrade', { ...absent, upgradeable: true }],
+  ['installed', installed],
+  ['needs-btm', { ...installed, backgroundDisabled: true }],
+] as const)('failed install in %s exposes exactly one status-only recovery action', async (expectedState, resultStatus) => {
+  await mounted(absent);
+  vi.mocked(helperApi.install).mockResolvedValueOnce({ success: false, errorCode: 'installerFailed', status: resultStatus } as never);
+  click('helper.installAction');
+  await vi.waitFor(() => expect(h.state[3]).toBe('installerFailed'));
+  expect(h.state[1]).toBe(expectedState);
+  const rechecks = nodes(render()).filter(n => typeof n.props.onClick === 'function' && text(n.props.children) === 'helper.recheck');
+  expect(rechecks).toHaveLength(1);
+  vi.mocked(helperApi.getStatus).mockResolvedValue(resultStatus as never);
+  click('helper.recheck');
+  await vi.waitFor(() => expect(h.state[2]).toBe(false));
+  expect(helperApi.getStatus).toHaveBeenLastCalledWith(true);
+  expect(helperApi.install).toHaveBeenCalledTimes(1);
+  expect(helperApi.uninstall).not.toHaveBeenCalled();
+  expect(h.state[3]).toBe('installerFailed');
+});
+it('failed status recovery retains the install cause and never retries installation', async () => {
+  await mounted(absent);
+  vi.mocked(helperApi.install).mockResolvedValueOnce({ success: false, errorCode: 'installerFailed', status: absent } as never);
+  click('helper.installAction');
+  await vi.waitFor(() => expect(h.state[3]).toBe('installerFailed'));
+  vi.mocked(helperApi.getStatus).mockRejectedValueOnce(new Error('synthetic status failure'));
+  click('helper.recheck');
+  await vi.waitFor(() => expect(h.state[2]).toBe(false));
+  expect(h.state[3]).toBe('installerFailed');
+  expect(h.state[1]).toBe('none');
+  expect(toast.error).toHaveBeenLastCalledWith('helper.statusCheckFail', 'helper.actionError.failed');
+  expect(helperApi.install).toHaveBeenCalledTimes(1);
+  expect(helperApi.uninstall).not.toHaveBeenCalled();
 });

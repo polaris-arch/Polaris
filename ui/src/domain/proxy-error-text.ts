@@ -19,6 +19,7 @@ export interface ProxyErrorTextInput {
 
 /** Rust `runtime/proxy.rs::code` 的全量用户可见映射。 */
 export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
+  VISION_TRANSPORT_UNSUPPORTED: 'nodes.invalidVisionTransport',
   STARTUP_FAILED: 'errors.startupFailed',
   NODE_RESOLVER_UNSUPPORTED: 'errors.nodeResolverUnsupported',
   SPEED_TEST_URL_INVALID: 'errors.speedTestUrlInvalid',
@@ -35,6 +36,8 @@ export const PROXY_ERROR_TEXT_KEY: Readonly<Record<string, string>> = {
   EXIT_MISMATCH: 'home.proxyMisdirected',
   CORE_BINARY_MISMATCH: 'errors.coreBinaryMismatch',
   CORE_NOT_EXECUTABLE: 'errors.coreNotExecutable',
+  LAN_GATEWAY_FORWARDING_REQUIRED: 'errors.lanGatewayForwardingRequired',
+  LAN_GATEWAY_FORWARDING_UNCONFIRMED: 'errors.lanGatewayForwardingUnconfirmed',
   CORE_BUNDLE_MISMATCH: 'errors.coreBundleMismatch',
   HELPER_CORE_OCCUPIED: 'errors.helperCoreOccupied',
   HELPER_CORE_ABSENT: 'errors.helperCoreAbsent',

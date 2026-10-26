@@ -89,15 +89,19 @@ fn update_defers_removed_node_assets_until_the_restart_boundary() {
         .find("state.config().update_deferred_cleanup(|cfg|")
         .expect("订阅对账必须在延迟删除事务中原子完成");
     let broadcast = body
-        .find("broadcast_config_changed_with_completion(app, &cfg, false,")
+        .find("broadcast_config_changed_with_registered_intent(")
         .expect("内容变化后的热切换广播仍须存在");
     assert!(
         journal < broadcast,
         "删除意图须先持久化，随后广播才能触发旧核退出与安全消费"
     );
     assert!(body.contains("reconcile_subscription_servers("));
-    assert!(body.contains("record_auto_exit_after_removal(proxy, &record_config, record_from.as_deref(), outcome)"),
-        "refresh bookkeeping must consume the completed broadcast receipt");
+    assert!(
+        body.split_whitespace().collect::<String>().contains(
+            "record_auto_exit_after_removal(proxy,&record_config,record_from.as_deref(),outcome,)"
+        ),
+        "refresh bookkeeping must consume the completed broadcast receipt"
+    );
 }
 
 #[test]
@@ -164,8 +168,10 @@ fn preview_treats_renderer_via_proxy_as_preference_not_effective_fact() {
 /// 这正是本门存在的理由。
 #[test]
 fn changing_ua_drops_the_conditional_get_validators() {
-    let wrapper = fn_body("pub fn subscription_update(");
-    assert!(wrapper.contains("subscription_update_core(state.config(), subscription)"));
+    let wrapper = fn_body("pub async fn subscription_update(");
+    assert!(wrapper.contains(
+        "subscription_update_core(state.config(), subscription, &state.subscription_refresh)"
+    ));
     let body = fn_body("fn subscription_update_core(");
     let at = body
         .find("ua_changed(&arr[idx], &subscription)")
@@ -184,7 +190,16 @@ fn changing_ua_drops_the_conditional_get_validators() {
 /// **终态必达**由外壳结构保证，不是靠逐条早退各补一句 emit。
 #[test]
 fn the_update_shell_cannot_return_without_a_terminal_frame() {
-    let shell = fn_body("pub(crate) async fn perform_subscription_update(");
+    let admission_shell = fn_body("pub(crate) async fn perform_subscription_update(");
+    let shell = fn_body("async fn perform_owned_subscription_update(");
+    assert!(
+        admission_shell
+            .find("subscription_refresh.try_admit(subscription_id)")
+            .unwrap()
+            < admission_shell
+                .find("perform_owned_subscription_update(")
+                .unwrap()
+    );
     assert!(
         shell.contains("terminal_progress_frame(&result)"),
         "变异锁：删掉终态帧 → 订阅信息栏永远挂在「更新中」，且失败无处可见"
@@ -193,10 +208,7 @@ fn the_update_shell_cannot_return_without_a_terminal_frame() {
     let progress = shell
         .find("let sink:")
         .expect("admitted operation owns progress");
-    let admission = shell
-        .find("subscription_refresh.try_admit(subscription_id)")
-        .unwrap();
-    assert!(admission < progress);
+
     // Once progress has started, every outcome must reach the owner's terminal frame.
     assert!(
         !shell[progress..].contains("return"),
@@ -213,7 +225,7 @@ fn the_update_shell_cannot_return_without_a_terminal_frame() {
 /// 起手帧必须排在真正开跑之前（否则「点了没反应」这个原始症状原样保留）。
 #[test]
 fn fetching_frame_precedes_the_real_work() {
-    let shell = fn_body("pub(crate) async fn perform_subscription_update(");
+    let shell = fn_body("async fn perform_owned_subscription_update(");
     let emit = shell
         .find("\"phase\": \"fetching\"")
         .expect("变异锁：删掉起手帧 → 前 30s 屏幕上什么都不会变");
@@ -376,4 +388,94 @@ fn every_frame_is_stamped_with_the_subscription_id() {
         body.contains("\"subscriptionId\""),
         "变异锁：不补 subscriptionId → 帧无归属，前端要么全栏一起亮要么全不亮"
     );
+}
+
+#[test]
+fn metadata_only_success_paths_emit_signal_without_runtime_publication() {
+    let inner = fn_body("async fn perform_subscription_update_inner(");
+    let unchanged304 = inner
+        .split("if outcome.not_modified {")
+        .nth(1)
+        .unwrap()
+        .split("if outcome.servers.is_empty()")
+        .next()
+        .unwrap();
+    assert_eq!(
+        unchanged304
+            .matches("refresh_not_modified_metadata(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        unchanged304
+            .matches("emit_config_changed_signal(app)")
+            .count(),
+        1
+    );
+    assert!(unchanged304.contains("return update_failure(error)"));
+    let unchanged200 = inner
+        .split("if !content_changed && !partial {")
+        .nth(1)
+        .unwrap()
+        .split("let token = owner.token();")
+        .next()
+        .unwrap();
+    assert_eq!(
+        unchanged200
+            .matches("publish_subscription_metadata(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        unchanged200
+            .matches("emit_config_changed_signal(app)")
+            .count(),
+        1
+    );
+    for branch in [unchanged304, unchanged200] {
+        for forbidden in [
+            "broadcast_config_changed",
+            "switch_mode",
+            "prepare_subscription_publication",
+            "invalidate(",
+        ] {
+            assert!(
+                !branch.contains(forbidden),
+                "metadata path must not run {forbidden}"
+            );
+        }
+    }
+    assert_eq!(
+        inner
+            .matches("broadcast_config_changed_with_registered_intent(")
+            .count(),
+        1
+    );
+    let saved = inner.find("match transaction {").unwrap();
+    assert!(saved < inner.find("if !content_changed && !partial {").unwrap());
+    assert!(
+        inner[saved..inner.find("if !content_changed && !partial {").unwrap()]
+            .contains("Err(e) => return update_failure")
+    );
+    let persist = fn_body("fn refresh_not_modified_metadata(");
+    assert!(
+        persist.find("config.update(|cfg|").unwrap() < persist.find("token.is_current()").unwrap()
+    );
+    assert!(
+        persist.find("match result {").unwrap()
+            < persist
+                .find("publish_subscription_metadata(token, signal)")
+                .unwrap()
+    );
+    let signal = fn_body("fn publish_subscription_metadata(");
+    assert!(signal.contains("if token.is_current()"));
+    assert!(signal.contains("signal()"));
+    assert!(!signal.contains("with_current"));
+    assert!(!signal.contains("config"));
+    let event = top_level_fn_body(
+        &crate_code("commands/config.rs"),
+        "pub(crate) fn emit_config_changed_signal(",
+    );
+    assert!(event.contains("app.emit(EVENT_CONFIG_CHANGED, json!({}))"));
+    assert!(!event.contains("switch_mode"));
 }

@@ -553,3 +553,31 @@ async fn malformed_url_diagnostics_never_echo_unparsed_credentials() {
         assert!(client.seen.lock().unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn generated_default_and_custom_ua_reach_real_fetch_init() {
+    let default = default_subscription_user_agent("1.0.0", "1.15.0-polaris-alpha.12.2");
+    for ua in [&default, "global/2", "per-sub/3", "Polaris/1.0"] {
+        let client = MockFetch::new();
+        client.set(
+            "https://sub.example.com/list",
+            ok_body("{\"outbounds\":[]}"),
+        );
+        let body = fetch_subscription_full(
+            &client,
+            &MockLookup::public(),
+            "https://sub.example.com/list",
+            ua,
+            None,
+            false,
+            MAIN_FETCH_TIMEOUT_MS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, "{\"outbounds\":[]}");
+        let seen = client.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1.user_agent, ua);
+    }
+    assert_eq!(default, "Polaris/1.0.0 sing-box/1.15.0-polaris-alpha.12.2");
+}

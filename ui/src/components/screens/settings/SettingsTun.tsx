@@ -559,6 +559,7 @@ export default function SettingsTun({ config, update }: SettingsTunProps) {
             </>
           }
         >
+          <p className="set-row-tip">{t('settings.advanced.lanGatewayPrerequisite')}</p>
           {/* neighborDomains → dns-local 的 neighbor_domain（builder/dns.rs:355-378） */}
           <SetRowGroup>
             <Fold

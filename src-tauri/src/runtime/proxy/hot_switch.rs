@@ -43,8 +43,8 @@ use polaris_helper_proto::Platform;
 use polaris_stats_engine::RuleIdentity;
 use polaris_switch_engine::ConnectionSnapshot;
 use polaris_switch_engine::{
-    decide, DecisionInput, HotSwitchOutcome, ManagementApi, ManagementError, SwitchDecision,
-    SwitchExecutor,
+    decide, select_connections_to_close, switched_pairs_from_puts, DecisionInput, HotSwitchOutcome,
+    ManagementApi, ManagementError, PrecisionDisconnectOutcome, SwitchDecision, SwitchExecutor,
 };
 
 use crate::commands::speedtest::current_server_fingerprints;
@@ -69,10 +69,10 @@ use super::UnlockInvalidationProbe;
 #[serde(rename_all = "camelCase")]
 pub struct StagedClassification {
     pub decision: &'static str,
-    /// 恒等式：`restart_required == decision != noOp`。
-    /// “保存”策略不允许修改运行核，因此本性可热切的改动也要等“立即应用”（当前实现 force-restart）
-    /// 才进入运行态；字段名为兼容既有 IPC 保留，语义是“保存后是否仍待应用”。
+    /// True only for an identified structural restart boundary. Pending Apply
+    /// is separate: a daily HOT change can be pending without needing a restart.
     pub restart_required: bool,
+    pub pending_apply: bool,
 }
 
 /// [`ProxyRuntime::classify_switch`] 的产物：判定结果，不含任何执行动作。
@@ -213,7 +213,7 @@ pub(super) enum PendingSwitch {
     },
 }
 
-fn copy_selection_projection(destination: &mut Value, source: &Value) {
+pub(super) fn copy_selection_projection(destination: &mut Value, source: &Value) {
     let Some(object) = destination.as_object_mut() else {
         return;
     };
@@ -294,6 +294,11 @@ pub(crate) struct TestPutSink {
     pub(super) groups: Mutex<Option<Vec<GroupSelection>>>,
     /// Native snapshot including member/history metadata, using the same PUT harness.
     pub(super) native_groups: Mutex<Option<Vec<polaris_singbox_grpc::daemon::Group>>>,
+    pub(super) connections: Mutex<Vec<ConnectionSnapshot>>,
+    pub(super) closed_ids: Mutex<Vec<String>>,
+    pub(super) on_close: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub(super) connection_snapshot_calls: AtomicU32,
+    pub(super) connection_snapshot_error: Mutex<Option<ManagementError>>,
     pub(super) fail_at: Mutex<BTreeSet<usize>>,
     /// 在 PUT 边界制造新用户意图或 stop 世代跃迁，验证旧回执不会提交/起核。
     pub(super) on_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -347,6 +352,73 @@ impl ManagementApi for GenerationManagementApi<'_> {
             return Err(ManagementError::NotReady);
         }
         self.api.first_connection_snapshot().await
+    }
+}
+
+/// Freeze the existing scope helper's old IDs before PUT, but do not close them
+/// until the caller has attested and published the logical exit change.
+pub(super) struct PendingLogicalExitDisconnect {
+    outcome: Option<PrecisionDisconnectOutcome>,
+}
+
+impl PendingLogicalExitDisconnect {
+    async fn capture(
+        api: &dyn ManagementApi,
+        plan: &polaris_config_engine::builder::hotswitch::HotSwitchPlan,
+        interrupt: bool,
+    ) -> Self {
+        let outcome = if interrupt {
+            let pairs = switched_pairs_from_puts(&plan.puts);
+            Some(if pairs.is_empty() {
+                PrecisionDisconnectOutcome::default()
+            } else {
+                match api.first_connection_snapshot().await {
+                    Ok(snapshot) => select_connections_to_close(&snapshot, &pairs),
+                    Err(error) => PrecisionDisconnectOutcome {
+                        snapshot_error: Some(error.to_string()),
+                        ..PrecisionDisconnectOutcome::default()
+                    },
+                }
+            })
+        } else {
+            None
+        };
+        Self { outcome }
+    }
+
+    async fn close(self, api: &dyn ManagementApi) -> Option<PrecisionDisconnectOutcome> {
+        use futures::StreamExt;
+        let mut outcome = self.outcome?;
+        // Same bounded, cancellation-safe per-ID close strategy as SwitchExecutor.
+        // Snapshot errors carry no IDs; they never trigger a late replacement read.
+        let mut acknowledged = vec![false; outcome.selected_ids.len()];
+        let mut closes = futures::stream::iter(outcome.selected_ids.iter().cloned().enumerate())
+            .map(|(index, id)| async move {
+                let success = api.close_connection(&id).await.is_ok();
+                (index, success)
+            })
+            .buffer_unordered(16);
+        while let Some((index, success)) = closes.next().await {
+            acknowledged[index] = success;
+        }
+        drop(closes);
+        for (id, success) in outcome.selected_ids.iter().zip(acknowledged) {
+            if success {
+                outcome.closed_ids.push(id.clone());
+            } else {
+                outcome.failed_ids.push(id.clone());
+            }
+        }
+        if let Some(error) = &outcome.snapshot_error {
+            log::warn!("logical exit disconnect skipped: {error}");
+        }
+        if !outcome.failed_ids.is_empty() {
+            log::warn!(
+                "logical exit disconnect failed for {} captured IDs",
+                outcome.failed_ids.len()
+            );
+        }
+        Some(outcome)
     }
 }
 
@@ -439,12 +511,21 @@ impl ManagementApi for TestPutSink {
             .map_err(ManagementError::Call)
     }
 
-    async fn close_connection(&self, _id: &str) -> Result<(), ManagementError> {
+    async fn close_connection(&self, id: &str) -> Result<(), ManagementError> {
+        if let Some(callback) = self.on_close.lock().unwrap().take() {
+            callback();
+        }
+        self.closed_ids.lock().unwrap().push(id.to_owned());
         Ok(())
     }
 
     async fn first_connection_snapshot(&self) -> Result<Vec<ConnectionSnapshot>, ManagementError> {
-        Ok(Vec::new())
+        self.connection_snapshot_calls
+            .fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.connection_snapshot_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        Ok(self.connections.lock().unwrap().clone())
     }
 }
 
@@ -1309,7 +1390,7 @@ impl ProxyRuntime {
             Value::String(server_id.to_string()),
         );
         object.remove(polaris_store::SELECTION_INTENT_KEY);
-        // Pinning the already observed TCP leaf changes intent, not the transport.
+        // Auto and a concrete node are distinct user exits, even at the same leaf.
         // Retain dormant native groups until the next authorized structural reload.
         if let Some(outcome) = self
             .native_manual_exit(&projected, server_id, intent_generation)
@@ -1409,9 +1490,25 @@ impl ProxyRuntime {
             return SwitchOutcome::Pending;
         }
 
+        // Graph changes use the additive transaction; ordinary selector/no-op
+        // controls retain their proven path. Save-only never mutates the runtime.
+        if !defer_restart && self.core_running() {
+            let graph_change = !matches!(
+                self.classify_switch(&new_config, false),
+                ClassifiedSwitch::Decided {
+                    decision: SwitchDecision::HotSwitch(_) | SwitchDecision::NoOp,
+                    ..
+                } | ClassifiedSwitch::Unchanged
+            );
+            if graph_change {
+                let result = self.apply_runtime_candidate(new_config.clone()).await;
+                return Self::runtime_result_outcome(&result);
+            }
+        }
+
         // 网卡绑定是 fail-closed 变更：目标接口不存在 / down 时，运行核继续保留旧配置，磁盘改动进入
         // 待应用态并提醒用户；绝不为了让热切换“成功”而把 bind_interface 去掉、静默走系统默认出口。
-        // 解析失败仍交给既有 classify_switch 的保守重启腿，避免本门扩大自己的判定范围。
+        // 解析失败仍由 classify_switch 保守判定为待应用；本门不授权重启。
         if let Ok(candidate) = serde_json::from_value::<UserConfig>(new_config.clone()) {
             if let Err(message) = self.validate_required_bind_interfaces(&candidate).await {
                 self.set_nonfatal_error(&message, code::OUTBOUND_INTERFACE_UNAVAILABLE);
@@ -1449,7 +1546,7 @@ impl ProxyRuntime {
                 ) {
                     return SwitchOutcome::Pending;
                 }
-                return self.restart_selected_projection(
+                return self.defer_selected_projection(
                     &new_config,
                     switch_generation,
                     intent_generation,
@@ -1464,8 +1561,8 @@ impl ProxyRuntime {
                 self.push_pending_changes();
                 return SwitchOutcome::Deferred;
             }
-            self.apply_restart();
-            return SwitchOutcome::Restarting;
+            self.defer_runtime_apply();
+            return SwitchOutcome::Deferred;
         }
         if self.gate.generation() != switch_generation
             || self.selector_reconcile.intent_generation() != intent_generation
@@ -1512,14 +1609,14 @@ impl ProxyRuntime {
                     ) {
                         return SwitchOutcome::Pending;
                     }
-                    return self.restart_selected_projection(
+                    return self.defer_selected_projection(
                         &new_config,
                         switch_generation,
                         intent_generation,
                     );
                 }
-                self.apply_restart();
-                return SwitchOutcome::Restarting;
+                self.defer_runtime_apply();
+                return SwitchOutcome::Deferred;
             }
         }
 
@@ -1548,7 +1645,7 @@ impl ProxyRuntime {
                         ) {
                             return SwitchOutcome::Pending;
                         }
-                        return self.restart_selected_projection(
+                        return self.defer_selected_projection(
                             &new_config,
                             switch_generation,
                             intent_generation,
@@ -1579,9 +1676,9 @@ impl ProxyRuntime {
                     self.defer_selected_switch(why);
                     return SwitchOutcome::Deferred;
                 }
-                log::warn!("switchMode：{why} → 保守走重启");
-                self.apply_restart();
-                return SwitchOutcome::Restarting;
+                log::warn!("switchMode：{why} → 保持待应用，不隐式重启");
+                self.defer_runtime_apply();
+                return SwitchOutcome::Deferred;
             }
             ClassifiedSwitch::Decided { decision, new_cfg } => (decision, *new_cfg),
         };
@@ -1625,14 +1722,14 @@ impl ProxyRuntime {
                     ) {
                         return SwitchOutcome::Pending;
                     }
-                    return self.restart_selected_projection(
+                    return self.defer_selected_projection(
                         &new_config,
                         switch_generation,
                         intent_generation,
                     );
                 }
-                self.apply_restart();
-                return SwitchOutcome::Restarting;
+                self.defer_runtime_apply();
+                return SwitchOutcome::Deferred;
             }
         }
 
@@ -1663,7 +1760,7 @@ impl ProxyRuntime {
                     ) {
                         return SwitchOutcome::Pending;
                     }
-                    return self.restart_selected_projection(
+                    return self.defer_selected_projection(
                         &new_config,
                         switch_generation,
                         intent_generation,
@@ -1700,16 +1797,16 @@ impl ProxyRuntime {
                         {
                             return SwitchOutcome::Pending;
                         }
-                        log::warn!("TS mode 热切前运行态无法自证 → 安全重启");
+                        log::warn!("TS mode 热切前运行态无法自证 → 保持待应用，不隐式重启");
                         if scope == SwitchApplyScope::SelectedOnly {
-                            return self.restart_selected_projection(
+                            return self.defer_selected_projection(
                                 &new_config,
                                 switch_generation,
                                 intent_generation,
                             );
                         }
-                        self.apply_restart();
-                        return SwitchOutcome::Restarting;
+                        self.defer_runtime_apply();
+                        return SwitchOutcome::Deferred;
                     }
                     // Entering a TS without an exit node: route/DNS must fall back to direct
                     // before proxy-selector points at a split-only endpoint.
@@ -1736,16 +1833,16 @@ impl ProxyRuntime {
                         if self.gate.generation() != switch_generation {
                             return SwitchOutcome::Pending;
                         }
-                        log::warn!("TS mode 预切失败或读回不符 → 安全重启");
+                        log::warn!("TS mode 预切失败或读回不符 → 保持待应用，不隐式重启");
                         if scope == SwitchApplyScope::SelectedOnly {
-                            return self.restart_selected_projection(
+                            return self.defer_selected_projection(
                                 &new_config,
                                 switch_generation,
                                 intent_generation,
                             );
                         }
-                        self.apply_restart();
-                        return SwitchOutcome::Restarting;
+                        self.defer_runtime_apply();
+                        return SwitchOutcome::Deferred;
                     }
                     if new_mode == MESH_DIRECT
                         && !self.selector_operation_is_current(switch_generation, intent_generation)
@@ -1802,16 +1899,18 @@ impl ProxyRuntime {
                                 return SwitchOutcome::Pending;
                             }
                             self.rollback_selector_puts(&plan, switch_generation).await;
-                            log::warn!("TS mode 切回普通出口失败或读回不符 → 安全重启");
+                            log::warn!(
+                                "TS mode 切回普通出口失败或读回不符 → 保持待应用，不隐式重启"
+                            );
                             if scope == SwitchApplyScope::SelectedOnly {
-                                return self.restart_selected_projection(
+                                return self.defer_selected_projection(
                                     &new_config,
                                     switch_generation,
                                     intent_generation,
                                 );
                             }
-                            self.apply_restart();
-                            return SwitchOutcome::Restarting;
+                            self.defer_runtime_apply();
+                            return SwitchOutcome::Deferred;
                         }
                         if mesh_mode_ready {
                             let groups = self.read_selector_groups().await;
@@ -1833,16 +1932,16 @@ impl ProxyRuntime {
                                 } else {
                                     self.rollback_selector_puts(&plan, switch_generation).await;
                                 }
-                                log::warn!("TS 热切 mode/proxy/dashboard 读回不符 → 安全重启");
+                                log::warn!("TS 热切 mode/proxy/dashboard 读回不符 → 保持待应用，不隐式重启");
                                 if scope == SwitchApplyScope::SelectedOnly {
-                                    return self.restart_selected_projection(
+                                    return self.defer_selected_projection(
                                         &new_config,
                                         switch_generation,
                                         intent_generation,
                                     );
                                 }
-                                self.apply_restart();
-                                return SwitchOutcome::Restarting;
+                                self.defer_runtime_apply();
+                                return SwitchOutcome::Deferred;
                             }
                         }
                         let current = if scope == SwitchApplyScope::SelectedOnly {
@@ -1896,9 +1995,9 @@ impl ProxyRuntime {
                             }
                             if !selectors_match_puts(&plan.puts, groups.as_deref()) {
                                 log::warn!(
-                                    "显式节点热切：PUT 未获严格运行态读回 → 仅重启运行态投影"
+                                    "显式节点热切：PUT 未获严格运行态读回 → 保持选择投影待应用，不隐式重启"
                                 );
-                                return self.restart_selected_projection(
+                                return self.defer_selected_projection(
                                     &new_config,
                                     switch_generation,
                                     intent_generation,
@@ -1952,10 +2051,9 @@ impl ProxyRuntime {
                         self.schedule_exit_ip_refresh(true);
                         SwitchOutcome::HotSwitched
                     }
-                    // 失败/未就绪 → 退回去抖重启兜底（executor 契约：「任一失败 → 整体退回去抖重启，
-                    // 保证一定能应用」）。**刻意偏离 上游**：上游 热切失败后 fall-through 到 no-op 腿，
-                    // kind=rules 的失败会因 norm 等价 + 节点未变而被 no-op **静默吞掉**（变更永不生效）。
-                    // 见交付说明「边界声明」。
+                    // Failure or missing readiness remains visibly pending. Do not
+                    // fall through to no-op success or authorize an implicit restart.
+                    // Explicit Apply performs capability-aware negotiation later.
                     other => {
                         if let Some(old_mode) = mode_change {
                             if self.gate.generation() == switch_generation {
@@ -1980,17 +2078,19 @@ impl ProxyRuntime {
                             self.selector_reconcile.mark_required();
                             return SwitchOutcome::Pending;
                         }
-                        log::warn!("switchMode：热切换失败（{other:?}）→ 退回重启式切换");
+                        log::warn!(
+                            "switchMode：热切换失败（{other:?}）→ 保持待应用，等待显式 Apply"
+                        );
                         if scope == SwitchApplyScope::SelectedOnly {
-                            return self.restart_selected_projection(
+                            return self.defer_selected_projection(
                                 &new_config,
                                 switch_generation,
                                 intent_generation,
                             );
                         } else {
-                            self.apply_restart();
+                            self.defer_runtime_apply();
                         }
-                        SwitchOutcome::Restarting
+                        SwitchOutcome::Deferred
                     }
                 }
             }
@@ -2006,7 +2106,7 @@ impl ProxyRuntime {
                         ) {
                             return SwitchOutcome::Pending;
                         }
-                        return self.restart_selected_projection(
+                        return self.defer_selected_projection(
                             &new_config,
                             switch_generation,
                             intent_generation,
@@ -2054,22 +2154,22 @@ impl ProxyRuntime {
                     ) {
                         return SwitchOutcome::Pending;
                     }
-                    return self.restart_selected_projection(
+                    return self.defer_selected_projection(
                         &new_config,
                         switch_generation,
                         intent_generation,
                     );
                 }
-                log::info!("switchMode：结构性变更 → 调度去抖重启");
-                self.apply_restart();
-                SwitchOutcome::Restarting
+                log::info!("switchMode：结构性变更 → 等待显式 Apply/重启确认");
+                self.defer_runtime_apply();
+                SwitchOutcome::Deferred
             }
         };
         // A4 触发点②：非重启腿提交后对账登录期出口让位。覆盖两类驱动——
         //  · 切出口（HotSwitched）：切走原让位出口 → stale 复位（清 flag，不 PUT，selector 已被 planHotSwitch 移走）；
         //  · 切「meshLoginFallbackDirect 开关」（NoOp：该字段排除出 norm → 走 no-op 腿）：关开关须即刻 disengage 切回出口。
         // 重启腿不在此对账——重启后 start_inner 的预置 + 首帧 reconcile 覆盖。
-        if !matches!(outcome, SwitchOutcome::Restarting)
+        if !matches!(outcome, SwitchOutcome::Deferred)
             && !(defer_restart && matches!(outcome, SwitchOutcome::Deferred))
         {
             if let Some(reconcile_config) = self
@@ -2171,6 +2271,9 @@ impl ProxyRuntime {
         let Ok(_) = serde_json::from_value::<UserConfig>(reconciled_runtime.clone()) else {
             return SelectorReconcileOutcome::NotEligible;
         };
+        if !self.runtime_physical_targets_ready(&reconciled_runtime) {
+            return SelectorReconcileOutcome::NotEligible;
+        }
 
         if api
             .select_outbound(PROXY_SELECTOR_TAG, &target_tag)
@@ -2311,7 +2414,7 @@ impl ProxyRuntime {
 
         // 腿 2：解析 + 规划。
         // 任一侧解析失败 → 保守重启（fail-closed）：热切换靠精确 diff，解析不出就无从判断，
-        // 宁可多断一次流，也不能把「没看懂的变更」当成「无需动作」静默吞掉。
+        // 保持待应用并等待显式处理，不能把无法判定的变更当成无操作成功。
         let (Ok(old_cfg), Ok(new_cfg)) = (
             serde_json::from_value::<UserConfig>(old_value),
             serde_json::from_value::<UserConfig>(new_config.clone()),
@@ -2335,8 +2438,10 @@ impl ProxyRuntime {
                 .lock()
                 .map(|state| state.plan.clone())
                 .unwrap_or_default();
-            if !runtime_binding_roots_covered(&new_cfg, &binding_plan) {
-                return ClassifiedSwitch::Fallback("目标包含本核未规划的自动物理出口");
+            if !runtime_binding_roots_covered(&new_cfg, &binding_plan)
+                || !self.runtime_route_targets_reusable(&old_cfg, &new_cfg, &binding_plan)
+            {
+                return ClassifiedSwitch::Fallback("目标包含本核未规划或已改变的自动物理出口");
             }
         }
 
@@ -2398,31 +2503,45 @@ impl ProxyRuntime {
     pub fn classify_staged(&self, candidate: &Value) -> StagedClassification {
         let decision = match self.classify_switch(candidate, false) {
             ClassifiedSwitch::NotRunning | ClassifiedSwitch::Unchanged => "noOp",
-            ClassifiedSwitch::Fallback(_) => "restart",
+            ClassifiedSwitch::Fallback(_) => "defer",
             ClassifiedSwitch::Decided { decision, .. } => match decision {
                 SwitchDecision::HotSwitch(_) => "hotSwitch",
                 SwitchDecision::NoOp => "noOp",
                 SwitchDecision::Defer => "defer",
-                SwitchDecision::Restart => "restart",
+                SwitchDecision::Restart => {
+                    let current = self.current_config_snapshot();
+                    if current.as_ref().is_some_and(|old| {
+                        super::runtime_config::structural_runtime_change(old, candidate)
+                    }) {
+                        "restart"
+                    } else {
+                        "defer"
+                    }
+                }
             },
         };
         StagedClassification {
             decision,
             // 保存不改变运行核：hotSwitch/defer/restart 三腿落盘后都仍待 Apply；只有 NoOp 没有运行差集。
-            restart_required: decision != "noOp",
+            restart_required: decision == "restart",
+            pending_apply: decision != "noOp",
         }
     }
 
-    /// 非重启腿（热切/no-op/defer）的收尾：对账 `current_config` + 刷新待决 force-restart 快照。
-    ///
-    /// H-1（上游 :1792-1801/1846-1847/1875-1876）：这三条腿都不重启，但若有 `apply_pending` 已排程的
-    /// 待决 force-restart，其快照仍是**旧** cfg → timer 到点会把核重启回旧节点，把刚热切的结果吃掉。
-    /// 故必须把快照**值**刷新到 newConfig，同时**保留 force-restart 意图与 id**（不清空、不换号）。
+    /// Reconcile accepted R after a non-restart operation. Legacy queued
+    /// snapshots may follow the selected projection; explicit confirmed payloads
+    /// are immutable and must pass their saved-state/intent fence at dispatch.
     pub(super) fn commit_applied(&self, new_config: &Value) {
         self.commit_coex_current_config(new_config.clone());
         if let Ok(mut g) = self.pending_force_restart.write() {
-            if let Some((id, _, _)) = g.take() {
-                *g = Some((id, new_config.clone(), super::ForceRestartSource::Full));
+            if let Some((id, snapshot, source)) = g.take() {
+                *g = Some(
+                    if matches!(source, super::ForceRestartSource::Confirmed { .. }) {
+                        (id, snapshot, source)
+                    } else {
+                        (id, new_config.clone(), super::ForceRestartSource::Full)
+                    },
+                );
             }
         }
     }
@@ -2437,6 +2556,9 @@ impl ProxyRuntime {
         self.commit_coex_current_config(projected.clone());
         if let Ok(mut pending) = self.pending_force_restart.write() {
             if let Some((id, config, source)) = pending.as_mut() {
+                if matches!(source, super::ForceRestartSource::Confirmed { .. }) {
+                    return;
+                }
                 let pending_mode = config.get("autoSelectEnabled")
                     != projected.get("autoSelectEnabled")
                     || config.get("autoSelectPins") != projected.get("autoSelectPins");
@@ -2457,60 +2579,22 @@ impl ProxyRuntime {
         }
     }
 
-    /// 热切 PUT/读回失败或选择引起结构性变化时，只重启运行态 R 的选择投影。
-    /// pending_force_restart 若已经是用户明确 Apply 的完整 D，则保留它，只更新选择字段。
-    pub(super) fn restart_selected_projection(
+    /// Failed selector readback or graph changes remain pending. This helper
+    /// never schedules restart or widens an existing confirmed restart snapshot.
+    pub(super) fn defer_selected_projection(
         self: &Arc<Self>,
-        projected: &Value,
+        _projected: &Value,
         expected_generation: u64,
         intent_generation: u64,
     ) -> SwitchOutcome {
-        let selected = projected
-            .get("selectedServerId")
-            .cloned()
-            .unwrap_or(Value::Null);
-        if let Ok(mut pending) = self.pending_force_restart.write() {
-            let id = pending.as_ref().map_or_else(
-                || self.force_restart_seq.fetch_add(1, Ordering::SeqCst),
-                |(id, _, _)| *id,
-            );
-            if !self
-                .debounced
-                .replace_force_if_current(expected_generation, id)
-            {
-                drop(pending);
-                if polaris_store::auto_select::target(projected).is_none()
-                    && self.gate.is_busy()
-                    && self.selector_reconcile.intent_generation() == intent_generation
-                {
-                    if let Some(server_id) = selected.as_str() {
-                        self.queue_selected_switch(server_id, intent_generation);
-                    }
-                }
-                return SwitchOutcome::Pending;
-            }
-            if let Some((_, config, source)) = pending.as_mut() {
-                copy_selection_projection(config, projected);
-                if matches!(source, super::ForceRestartSource::Selected { .. }) {
-                    *source = super::ForceRestartSource::Selected { intent_generation };
-                }
-            } else {
-                *pending = Some((
-                    id,
-                    projected.clone(),
-                    super::ForceRestartSource::Selected { intent_generation },
-                ));
-            }
-        } else {
-            self.defer_selected_switch("重启快照锁不可用");
-            return SwitchOutcome::Deferred;
+        // A failed HOT/selection cannot grant restart permission. Keep R and make
+        // the pending change visible; explicit Apply negotiates the capability
+        // and returns an exact-candidate restart choice when necessary.
+        if !self.selector_operation_is_current(expected_generation, intent_generation) {
+            return SwitchOutcome::Pending;
         }
-        self.schedule_restart_for_generation(expected_generation);
-        // This selection is already being applied by the automatic restart. Emitting
-        // D/R debt here briefly presents an actionable "Apply pending" bar even though
-        // tapping it would queue a redundant full-config restart. Stop/ready publish
-        // the authoritative pending snapshot; deferred selections still push above.
-        SwitchOutcome::Restarting
+        self.defer_runtime_apply();
+        SwitchOutcome::Deferred
     }
 
     async fn strict_confirm_selected(&self, projected: &Value) -> bool {
@@ -2593,24 +2677,77 @@ impl ProxyRuntime {
         SwitchExecutor.execute(&guarded, plan, interrupt).await
     }
 
-    /// 重启腿收尾：保留当前运行态 R，**丢弃**旧 force-restart 快照 + 调度去抖重启。
-    ///
-    /// 上游 :1886-1889：结构性重启用的是最新完整 config → 超代任何待决 force-restart 快照。
-    /// 快照和 gate id 必须同一临界区一起清除；严格 id 认领不允许旧 id 回落到磁盘 D。
-    fn apply_restart(self: &Arc<Self>) {
+    /// Auto/manual logical exit changes capture their old connections before PUT.
+    /// Later connections through the same physical winner are outside this scope.
+    pub(super) async fn execute_hot_switch_plan_with_pre_switch_snapshot(
+        &self,
+        plan: &polaris_config_engine::builder::hotswitch::HotSwitchPlan,
+        interrupt: bool,
+        generation: u64,
+        intent_generation: u64,
+    ) -> (HotSwitchOutcome, PendingLogicalExitDisconnect) {
+        #[cfg(test)]
+        if let Some(sink) = self
+            .management_api_stub
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(Arc::clone))
         {
-            let mut pending = self
-                .pending_force_restart
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let old_id = pending.as_ref().map(|(id, _, _)| *id);
-            self.debounced.invalidate_pending();
-            *pending = None;
-            if old_id.is_some() && self.gate.pending().force_restart_id == old_id {
-                self.gate.clear_force_restart();
-            }
+            let guarded = GenerationManagementApi {
+                runtime: self,
+                api: sink.as_ref(),
+                generation,
+                intent_generation,
+            };
+            let captured = PendingLogicalExitDisconnect::capture(&guarded, plan, interrupt).await;
+            return (
+                SwitchExecutor.execute(&guarded, plan, false).await,
+                captured,
+            );
         }
-        self.schedule_restart();
+        let api = self.management_api().await;
+        let guarded = GenerationManagementApi {
+            runtime: self,
+            api: &api,
+            generation,
+            intent_generation,
+        };
+        let captured = PendingLogicalExitDisconnect::capture(&guarded, plan, interrupt).await;
+        (
+            SwitchExecutor.execute(&guarded, plan, false).await,
+            captured,
+        )
+    }
+
+    pub(super) async fn finish_logical_exit_disconnect(
+        &self,
+        captured: PendingLogicalExitDisconnect,
+        generation: u64,
+        intent_generation: u64,
+    ) -> Option<PrecisionDisconnectOutcome> {
+        #[cfg(test)]
+        if let Some(sink) = self
+            .management_api_stub
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(Arc::clone))
+        {
+            let guarded = GenerationManagementApi {
+                runtime: self,
+                api: sink.as_ref(),
+                generation,
+                intent_generation,
+            };
+            return captured.close(&guarded).await;
+        }
+        let api = self.management_api().await;
+        let guarded = GenerationManagementApi {
+            runtime: self,
+            api: &api,
+            generation,
+            intent_generation,
+        };
+        captured.close(&guarded).await
     }
 
     /// A4：热切 selector（`select_outbound` PUT，零重启）。核未起/未就绪 → `management_api` 返 not_ready →
@@ -2800,7 +2937,7 @@ impl ProxyRuntime {
     ///   tag，而运行核的 tag 集合定格在它启动的那份 config 上（`current_config` 可能已被并发推进）。
     /// - **解析不出 tag 不静默 break**（上游 bug#5）：选中节点不在运行核的 tag 映射里（config 被并发
     ///   推进）时，静默放弃会让 selector 无声地停在 cache_file 的旧选择上 —— 那正是本 bug 的症状放大器。
-    ///   留 warn 日志，收敛交给后续的对账重启。
+    ///   留 warn 日志，保留未确认状态并等待后续对账或显式 Apply。
     /// - **停核 / 被接管中直接放弃**：别在杀核窗口里重连一个将死的管理 API（上游 `this.stopping` 守卫，
     ///   Polaris 侧等价物是「`running` 已假」或「世代已变」两条腿的析取）。
     ///

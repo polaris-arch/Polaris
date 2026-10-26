@@ -1992,3 +1992,34 @@ fn discarded_modeled_pins_are_not_parsed_by_direct_outbound_generation() {
         }
     }
 }
+
+#[test]
+fn vision_transport_admission_preserves_supported_native_streams() {
+    for transport in ["ws", "grpc", "http", "h2", "httpupgrade", " WS ", "H2"] {
+        let mut node = server(Protocol::Vless, "private.example");
+        node.flow = Some(" XTls-RPRX-Vision ".into());
+        node.network = Some(transport.into());
+        let original = serde_json::to_value(&node).unwrap();
+        for platform in ["linux", "darwin", "windows"] {
+            assert_eq!(
+                build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", platform)
+                    .unwrap_err(),
+                "vision-transport-unsupported"
+            );
+        }
+        assert_eq!(serde_json::to_value(&node).unwrap(), original);
+        node.flow = None;
+        assert!(build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", "linux").is_ok());
+        node.flow = Some("xtls-rprx-vision".into());
+        node.protocol = Protocol::Vmess;
+        assert!(validate_vision_transport(&node).is_ok());
+    }
+    for network in [None, Some("tcp"), Some("")] {
+        let mut node = server(Protocol::Vless, "private.example");
+        node.flow = Some("xtls-rprx-vision".into());
+        node.network = network.map(str::to_string);
+        let ob = build_proxy_outbound(&node, "n", &test_dial_resolver(), "x64", "linux").unwrap();
+        assert_eq!(ob.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert!(ob.transport.is_none());
+    }
+}

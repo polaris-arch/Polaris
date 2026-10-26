@@ -1197,6 +1197,9 @@ const SHARED_PACKAGE_PATHS = new Set([
 ]);
 
 const LINUX_PACKAGE_PATHS = new Set(['scripts/postprocess-appimage.mjs']);
+// The Linux package acceptance orchestrators import sibling Python/Node modules.
+// Classify the whole owned directory, not just today's two workflow entry points.
+const LINUX_PACKAGE_PREFIXES = ['scripts/package-acceptance/'];
 
 function normalized(path) {
   return String(path).replaceAll('\\', '/').replace(/^\.\//, '').trim();
@@ -1321,7 +1324,7 @@ export function classifyImpact(rawPaths, { forceFull = false } = {}) {
       addAll();
       continue;
     }
-    if (LINUX_PACKAGE_PATHS.has(path) || isUiBuildConfig(path)) {
+    if (LINUX_PACKAGE_PATHS.has(path) || startsWithAny(path, LINUX_PACKAGE_PREFIXES) || isUiBuildConfig(path)) {
       platforms.add('linux');
       continue;
     }

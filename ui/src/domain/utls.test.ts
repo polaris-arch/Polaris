@@ -131,11 +131,11 @@ it('uses actual native-engine capabilities without rejecting dormant engines or 
   expect(nativeUtlsUnsupported('apple')).toBe(false);
 });
 
-it('keeps global Follow distinct from the initial Default selection in both settings screens', () => {
+it('starts with Follow without replacing an explicit Default selection in both settings screens', () => {
   for (const file of ['../components/screens/settings/SettingsNetwork.tsx', '../mobile/settings/NetworkPage.tsx']) {
     const source = readFileSync(new URL(file, import.meta.url), 'utf8');
-    expect(source).toContain("config.utlsPolicy ?? 'default'");
-    expect(source).not.toContain("config.utlsPolicy ?? 'follow'");
+    expect(source).toContain("config.utlsPolicy ?? 'follow'");
+    expect(source).not.toContain("config.utlsPolicy ?? 'default'");
   }
   expect(globalUtlsOptions(undefined).map(([id]) => id)).toEqual(['follow', 'default']);
 });

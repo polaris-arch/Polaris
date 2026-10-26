@@ -32,8 +32,8 @@ use polaris_config_engine::user_config::collections::dedupe_trim;
 use polaris_config_engine::user_config::normalize::{normalize_token, normalize_transport};
 use polaris_config_engine::user_config::protocol_settings::{
     AnyTlsSettings, GrpcSettings, HttpSettings, Hysteria2ObfsSettings, Hysteria2Settings,
-    RealitySettings, ShadowTlsSettings, ShadowsocksSettings, SnellSettings, TlsSettings,
-    TuicSettings, WebSocketSettings,
+    NaiveSettings, RealitySettings, ShadowTlsSettings, ShadowsocksSettings, SnellSettings,
+    TlsSettings, TuicSettings, WebSocketSettings,
 };
 use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
 use polaris_config_engine::user_config::tls_pin::{keep_valid_cert_pins, preserve_cert_pins};
@@ -59,6 +59,7 @@ pub const SUPPORTED_URL_SCHEMES: &[&str] = &[
     "naive",
     "http2",
     "naive+https",
+    "naive+quic",
     "socks5",
     "socks",
     "s5",
@@ -920,6 +921,12 @@ fn parse_naive(u: &Url, id_gen: &mut impl FnMut() -> String) -> Result<ServerCon
     let mut c = new_config(id_gen, b.name, Protocol::Naive, b.address, b.port);
     c.username = Some(username);
     c.password = Some(password);
+    // Community share URI convention (naiveproxy issue #86), not transport.type=quic.
+    if u.scheme() == "naive+quic" {
+        c.naive_settings = Some(NaiveSettings {
+            use_http3: Some(true),
+        });
+    }
     if let Some(net) = b.params.get_ne("type") {
         apply_transport_settings(&mut c, &b.params, &net)?;
     }
@@ -1208,7 +1215,7 @@ fn parse_share_url_inner(
         "tuic" => parse_tuic(&u, id_gen),
         // naive 别名族：naive:// / http2:// / naive+https://，以及部分客户端的 https://..#naive。
         // （`http2` 是本仓编码器 [`encode_naive`] 自己产出的 naive scheme，改判即自断往返。）
-        "naive" | "http2" | "naive+https" => parse_naive(&u, id_gen),
+        "naive" | "http2" | "naive+https" | "naive+quic" => parse_naive(&u, id_gen),
         // `#naive` 是**类型标记**——即 fragment 的全部，不是节点名里的一个词。naive 与 HTTPS 代理
         // 共用同一条 URL 文法（`https://user:pass@host:port`），这个标记是唯一的判别位，故分支保留；
         // 但判据由「fragment **含** naive 子串」收窄为「整体恰为该标记」：此前任何名字带 naive 字样
@@ -1815,7 +1822,15 @@ fn encode_naive(c: &ServerConfig) -> Result<String, String> {
         percent_encode_component(password)
     );
     Ok(assemble(
-        "http2",
+        if c.naive_settings
+            .as_ref()
+            .and_then(|settings| settings.use_http3)
+            == Some(true)
+        {
+            "naive+quic"
+        } else {
+            "http2"
+        },
         Some(userinfo),
         &c.address,
         c.port,

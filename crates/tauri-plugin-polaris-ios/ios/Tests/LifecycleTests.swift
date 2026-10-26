@@ -11,17 +11,21 @@ struct LifecycleTests {
         try directoryRetirementCases()
         try reloadCustodyCases()
         managedBootstrapCases()
+        try runtimeProtocolAdmissionCases()
         try ordinaryStopDispatchCases()
         let identity = TunnelIdentity(sessionID: "session-a", requestID: "start-a", configDigest: "digest-a")
         let lifecycle = TunnelLifecycle()
         let start = try lifecycle.start(identity)
+        try admitRuntimeFixture(lifecycle, generation: start)
         assert(lifecycle.complete(start, phase: "running", stopped: false))
         let reload1 = try lifecycle.reload()
+        try admitRuntimeFixture(lifecycle, generation: reload1)
         assert(lifecycle.complete(reload1, phase: "running", stopped: false))
         let reload2 = try lifecycle.reload()
         assert(reload1 != reload2)
         assert(!lifecycle.timeout(reload1, "old reload watchdog"))
         assert(lifecycle.report().lifecycle == "reloadAccepted")
+        try admitRuntimeFixture(lifecycle, generation: reload2)
         assert(lifecycle.complete(reload2, phase: "running", stopped: false))
         // This watchdog started at the same generation as the reload. Success
         // won before it acquired the lifecycle lock, so phase must also be checked.
@@ -213,6 +217,7 @@ struct LifecycleTests {
 
         let live = TunnelLifecycle()
         let liveGeneration = try live.start(identity)
+        try admitRuntimeFixture(live, generation: liveGeneration)
         assert(live.complete(liveGeneration, phase: "running", stopped: false))
         let observed = live.observeSession(identity: identity, nonce: "fresh-nonce", expectedGeneration: liveGeneration)!
         let observation = try JSONSerialization.jsonObject(with: JSONEncoder().encode(observed)) as! [String: Any]
@@ -231,6 +236,7 @@ struct LifecycleTests {
         assert(live.observeSession(identity: identity, nonce: "") == nil)
         let changedGeneration = try live.reload()
         assert(live.observeSession(identity: identity, nonce: "fresh-nonce", expectedGeneration: liveGeneration) == nil)
+        try admitRuntimeFixture(live, generation: changedGeneration)
         assert(live.complete(changedGeneration, phase: "running", stopped: false))
         live.settingsUncertain(changedGeneration, "late system settings")
         let uncertainObservation = try JSONSerialization.jsonObject(with: JSONEncoder().encode(
@@ -320,6 +326,7 @@ struct LifecycleTests {
         }
         let lifecycle = TunnelLifecycle()
         let start = try lifecycle.start(identity)
+        try admitRuntimeFixture(lifecycle, generation: start)
         assert(lifecycle.complete(start, phase: "running", stopped: false))
         var received: TunnelObservation?
         assert(!lifecycle.prepareStop(identity: identity, requestID: "scope-stop", nonce: "scope-nonce",
@@ -412,6 +419,7 @@ struct LifecycleTests {
         let lifecycle = TunnelLifecycle()
         let generation = try lifecycle.start(identity)
         lifecycle.retainTailscaleDirectoryScope(original, identity: identity)
+        try admitRuntimeFixture(lifecycle, generation: generation)
         assert(lifecycle.complete(generation, phase: "running", stopped: false))
         var response: TunnelObservation?
         assert(lifecycle.prepareStop(identity: identity, requestID: "stop-a", nonce: "nonce-a",
@@ -468,6 +476,7 @@ struct LifecycleTests {
         let unknown = TunnelLifecycle()
         let first = try unknown.start(identity)
         unknown.retainTailscaleDirectoryScope(original, identity: identity)
+        try admitRuntimeFixture(unknown, generation: first)
         assert(unknown.complete(first, phase: "running", stopped: false))
         assert(unknown.prepareStop(identity: identity, requestID: "stop-b", nonce: "nonce-b", observation: { _ in }))
         let final = unknown.stop()!
@@ -650,6 +659,7 @@ struct LifecycleTests {
         assert(generation == 1)
         lifecycle.retainTailscaleStoreScope(try text(store), identity: boundIdentity)
         lifecycle.retainTailscaleDirectoryScope(try directory(false), identity: boundIdentity)
+        try admitRuntimeFixture(lifecycle, generation: generation)
         assert(lifecycle.complete(generation, phase: "running", stopped: false))
         let worker = StopDispatchFixture(original); worker.lifecycle = lifecycle; worker.begin()
         assert(worker.callback != nil && worker.observation == nil && worker.workerStopToken == nil)
@@ -773,6 +783,144 @@ struct LifecycleTests {
         reloadFailure.reloadCallbacks[0](.success(reloadFailure.original))
         assert(reloadFailure.original.stops == 0 && reloadFailure.failures == 1)
         reloadFailure.assertNoScopedProof()
+    }
+
+    // Inert protojson shared by the existing decoder matrix and lifecycle fixtures.
+    // It is not libbox execution, source/carrier provenance or a runtime receipt.
+    static func runtimeReadyFixture(digest: String) -> [String: Any] {
+        let methods = ["GetRuntimeCapabilities", "PlanRuntimeConfig", "ApplyRuntimeConfig",
+            "GetRuntimeConfigStatus", "RetryRuntimePersistence", "AcknowledgeRuntimePersistence"]
+        let protocolField: [String: Any] = ["effective_path": "runtime.protocol",
+            "variant": "polaris-daily-runtime-v1", "adapter_version": "1",
+            "platform_build": "ios/arm64", "conditions": methods]
+        let identity: [String: Any] = ["incarnation": "original-instance",
+            "applied_revision": "1", "effective_digest": digest]
+        return ["contract_version": 1, "connected_hot_enabled": true,
+            "implementation_manifest_digest": digest, "active": identity, "fields": [protocolField]]
+    }
+
+    static func admitRuntimeFixture(_ lifecycle: TunnelLifecycle, generation: UInt64) throws {
+        let data = try JSONSerialization.data(withJSONObject:
+            runtimeReadyFixture(digest: String(repeating: "a", count: 64)), options: [.sortedKeys])
+        let admission = try TunnelRuntimeAdmission.decode(String(decoding: data, as: UTF8.self), platform: "ios/arm64")
+        assert(lifecycle.admitRuntimeProtocol(generation, admission: admission))
+    }
+
+    // Actual production decoder and generation-bound lifecycle admission with
+    // inert protojson. No libbox, NE, provider startup or carrier success is proved.
+    static func runtimeProtocolAdmissionCases() throws {
+        let digest = String(repeating: "a", count: 64)
+        let ready = runtimeReadyFixture(digest: digest)
+        let protocolField = (ready["fields"] as! [[String: Any]])[0]
+        let methods = protocolField["conditions"] as! [String]
+        let identity = ready["active"] as! [String: Any]
+        func decode(_ value: [String: Any]) throws -> TunnelRuntimeAdmission {
+            let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw NSError(domain: "LifecycleTestFixture", code: 1)
+            }
+            return try TunnelRuntimeAdmission.decode(text, platform: "ios/arm64")
+        }
+        func rejected(_ value: [String: Any]) {
+            do { _ = try decode(value); assertionFailure("Invalid runtime admission accepted") } catch {}
+        }
+        func reason(_ code: String, _ path: String = "runtime") -> [String: Any] {
+            ["effective_path": "runtime.instance", "variant": code, "conditions": [path]]
+        }
+        let admitted = try decode(ready)
+        assert(admitted.identity?.incarnation == "original-instance")
+        assert(admitted.manifestDigest == digest && admitted.controlRevision == "0")
+        assert(admitted.unsupportedPaths.isEmpty)
+
+        // A decoded admission is necessary but cannot cross a lifecycle generation,
+        // Stop or quarantine. Each reload must admit again before ready publication.
+        let lifecycle = TunnelLifecycle()
+        let owner = TunnelIdentity(sessionID: "admission-session", requestID: "admission-start", configDigest: digest)
+        let initial = try lifecycle.start(owner)
+        assert(!lifecycle.complete(initial, phase: "running", stopped: false))
+        assert(!lifecycle.admitRuntimeProtocol(initial + 1, admission: admitted))
+        assert(!lifecycle.complete(initial, phase: "running", stopped: false))
+        assert(lifecycle.admitRuntimeProtocol(initial, admission: admitted))
+        assert(lifecycle.complete(initial, phase: "running", stopped: false))
+        let reloaded = try lifecycle.reload()
+        assert(!lifecycle.complete(reloaded, phase: "running", stopped: false))
+        assert(!lifecycle.admitRuntimeProtocol(initial, admission: admitted))
+        assert(!lifecycle.complete(reloaded, phase: "running", stopped: false))
+        assert(lifecycle.admitRuntimeProtocol(reloaded, admission: admitted))
+        assert(lifecycle.complete(reloaded, phase: "running", stopped: false))
+        let stopping = lifecycle.stop()!
+        assert(!lifecycle.admitRuntimeProtocol(reloaded, admission: admitted))
+        assert(!lifecycle.admitRuntimeProtocol(stopping, admission: admitted))
+        assert(!lifecycle.complete(stopping, phase: "running", stopped: false))
+        assert(lifecycle.complete(stopping, phase: "stopped", stopped: true))
+        assert(!lifecycle.admitRuntimeProtocol(stopping, admission: admitted))
+        let restarted = try lifecycle.start(owner)
+        assert(!lifecycle.complete(restarted, phase: "running", stopped: false))
+        assert(lifecycle.admitRuntimeProtocol(restarted, admission: admitted))
+        assert(lifecycle.timeout(restarted, "inert admission quarantine fixture"))
+        assert(!lifecycle.admitRuntimeProtocol(restarted, admission: admitted))
+        assert(!lifecycle.complete(restarted, phase: "running", stopped: false))
+        var bad = ready; bad["fields"] = []; rejected(bad)
+        bad = ready; bad["contract_version"] = 2; rejected(bad)
+        bad = ready; bad["fields"] = [protocolField, protocolField]; rejected(bad)
+        for (key, value) in [("variant", "upstream"), ("adapter_version", "2"),
+                             ("platform_build", "linux/arm64"), ("update_class", "IN_PLACE")] {
+            var field = protocolField; field[key] = value
+            bad = ready; bad["fields"] = [field]; rejected(bad)
+        }
+        for conditions in [Array(methods.reversed()), Array(methods.dropLast())] {
+            var field = protocolField; field["conditions"] = conditions
+            bad = ready; bad["fields"] = [field]; rejected(bad)
+        }
+        for value in ["", String(repeating: "a", count: 63), String(repeating: "g", count: 64),
+                      String(repeating: "A", count: 64)] {
+            bad = ready; bad["implementation_manifest_digest"] = value; rejected(bad)
+        }
+        for value in ["9007199254740993", "18446744073709551615"] {
+            var active = identity; active["applied_revision"] = value
+            var document = ready; document["active"] = active; document["control_revision"] = value
+            let result = try decode(document)
+            assert(result.controlRevision == value && result.identity?.appliedRevision == value)
+        }
+        let invalidIntegers: [Any] = ["18446744073709551616", "01", "-1", "1.0", "1e3", 1, 1.0]
+        for value in invalidIntegers {
+            bad = ready; bad["control_revision"] = value; rejected(bad)
+            var active = identity; active["applied_revision"] = value
+            bad = ready; bad["active"] = active; rejected(bad)
+        }
+        bad = ready; bad.removeValue(forKey: "active"); rejected(bad)
+        for (key, value) in [("incarnation", ""), ("applied_revision", "0"), ("effective_digest", "")] {
+            var active = identity; active[key] = value
+            bad = ready; bad["active"] = active; rejected(bad)
+        }
+        bad = ready; bad["connected_hot_enabled"] = "true"; rejected(bad)
+        bad = ready; bad["connected_hot_enabled"] = false; rejected(bad)
+        bad = ready; bad.removeValue(forKey: "connected_hot_enabled"); rejected(bad)
+        var unsupported = ready
+        unsupported.removeValue(forKey: "active"); unsupported.removeValue(forKey: "connected_hot_enabled")
+        let pending = reason("PENDING_ADAPTER", "services")
+        let started = reason("RUNTIME_STARTED_UNSUPPORTED")
+        unsupported["fields"] = [protocolField, pending]; rejected(unsupported)
+        unsupported["fields"] = [protocolField, started]; rejected(unsupported)
+        unsupported["fields"] = [protocolField, started, pending]
+        let legacy = try decode(unsupported)
+        assert(legacy.identity == nil && legacy.unsupportedPaths == ["services"])
+        bad = unsupported; bad["active"] = identity; rejected(bad)
+        bad = unsupported; bad["connected_hot_enabled"] = true; rejected(bad)
+        bad = unsupported; bad["fields"] = [protocolField, started, pending, started]; rejected(bad)
+        for code in ["RUNTIME_STARTING", "RUNTIME_STOPPED", "RUNTIME_GRAPH_UNAVAILABLE",
+                     "INITIAL_CONFIG_ENCODING_FAILED", "INVALID_ACTIVE_SNAPSHOT", "UNKNOWN_REASON"] {
+            bad = ready; bad["fields"] = [protocolField, reason(code)]; rejected(bad)
+            bad = unsupported; bad["fields"] = [protocolField, started, pending, reason(code)]; rejected(bad)
+        }
+        bad = ready; bad["fields"] = [protocolField, pending]; rejected(bad)
+        var warning = ready
+        warning["fields"] = [protocolField, reason("OWNER_PERSISTENCE_UNBOUND", "runtime.persistence"),
+            ["effective_path": "runtime.build", "variant": "with_naive_outbound", "conditions": ["state=unknown"]]]
+        let warningResult = try decode(warning)
+        assert(warningResult.identity?.incarnation == "original-instance")
+        bad = ready; bad["fields"] = [protocolField, reason("OWNER_PERSISTENCE_UNBOUND", "wrong.path")]; rejected(bad)
+        print("iOS runtime protocol decoder cases passed: six RPCs, exact uint64, ready identity, unsupported lifecycle, warnings")
     }
 
     // Validator/options coverage only; does not execute provider startup or IPC.

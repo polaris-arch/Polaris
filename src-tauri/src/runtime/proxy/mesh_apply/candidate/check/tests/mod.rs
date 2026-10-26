@@ -191,15 +191,16 @@ mod linux_tests {
             Ok(LinuxCheckProfile::A4D085)
         );
         let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
-        assert_eq!(
-            polaris_updater::verify::sha256_hex(binding.as_bytes()),
-            contract
+        let current_digest = polaris_updater::verify::sha256_hex(binding.as_bytes());
+        assert_ne!(
+            current_digest, contract,
+            "historical contract is not current"
         );
         let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
-        assert_eq!(binding["sourceCommit"], replacement.source_commit);
+        assert_ne!(binding["sourceCommit"], replacement.source_commit);
         assert_eq!(
-            binding["platforms"]["linux"]["core"]["sha256"],
-            replacement.binary_sha256
+            reviewed_compiled_profile(replacement.source_commit, &current_digest),
+            Err(CandidateCheckError::Unsupported)
         );
         assert_eq!(
             LinuxCheckProfile::A4D085.binary_sha256(),
@@ -251,6 +252,241 @@ mod linux_tests {
     }
 
     #[test]
+    fn published_patch_requires_its_exact_source_contract_and_actual_elf() {
+        use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
+        use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
+        let replacement = &REVIEWED_CHECK_IDENTITIES[4];
+        assert_eq!(
+            replacement.source_commit,
+            "814da362838e96e54f904836a92c2b0d8c3ae29b"
+        );
+        let contract = replacement.contract_sha256.unwrap();
+        assert_eq!(
+            contract,
+            "c6c1a11c1f9c7eebe8e424dbcb6e9737dfa9828e3613012622a5e0069a9ee681"
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, contract),
+            Ok(LinuxCheckProfile::E814DA)
+        );
+        let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
+        let current_digest = polaris_updater::verify::sha256_hex(binding.as_bytes());
+        assert_ne!(
+            current_digest, contract,
+            "historical contract is not current"
+        );
+        let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
+        assert_ne!(binding["sourceCommit"], replacement.source_commit);
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, &current_digest),
+            Err(CandidateCheckError::Unsupported)
+        );
+        assert_eq!(
+            LinuxCheckProfile::E814DA.binary_sha256(),
+            "363261029cea32333adcdd67288b23e4ae4084efa96b7f2b157af6e9d39946ee"
+        );
+        assert_eq!(
+            LinuxCheckProfile::E814DA.input_profile(),
+            LinuxInputProfile::E814DA
+        );
+        assert!(matches!(
+            LinuxCheckProfile::E814DA.input_profile(),
+            LinuxInputProfile::PlainTcpCheckV1(_)
+        ));
+        assert!(LinuxCheckProfile::E814DA
+            .execution_profile()
+            .contains("814da:runtime-evidence-pending"));
+        for digest in [
+            "",
+            "unknown",
+            replacement.binary_sha256,
+            REVIEWED_CHECK_IDENTITIES[1].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[2].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[3].contract_sha256.unwrap(),
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(replacement.source_commit, digest),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        for source in [
+            "",
+            "unknown",
+            REVIEWED_CHECK_IDENTITIES[0].source_commit,
+            REVIEWED_CHECK_IDENTITIES[1].source_commit,
+            REVIEWED_CHECK_IDENTITIES[2].source_commit,
+            REVIEWED_CHECK_IDENTITIES[3].source_commit,
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(source, contract),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        assert_eq!(
+            reviewed_compiled_profile(&replacement.source_commit.to_ascii_uppercase(), contract),
+            Err(CandidateCheckError::Unsupported)
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, &contract.to_ascii_uppercase()),
+            Err(CandidateCheckError::Unsupported)
+        );
+    }
+    #[test]
+    fn historical_c6_retains_its_exact_compiled_source_and_contract() {
+        use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
+        use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
+        let replacement = &REVIEWED_CHECK_IDENTITIES[5];
+        assert_eq!(
+            replacement.source_commit,
+            "c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a"
+        );
+        let contract = replacement.contract_sha256.unwrap();
+        assert_eq!(
+            contract,
+            "976a9535eea2149ec7630956a3fb8ae9183c0167b732182b2bb42de65f4045d6"
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, contract),
+            Ok(LinuxCheckProfile::C6C0D8)
+        );
+        assert_eq!(
+            LinuxCheckProfile::C6C0D8.binary_sha256(),
+            "80e21e78875f2f1cbfb1356dd977d6043a7776179df61f57897a4d811eaa1eaf"
+        );
+        assert_eq!(
+            LinuxCheckProfile::C6C0D8.input_profile(),
+            LinuxInputProfile::C6C0D8
+        );
+        assert!(matches!(
+            LinuxCheckProfile::C6C0D8.input_profile(),
+            LinuxInputProfile::PlainTcpCheckV1(_)
+        ));
+        assert!(LinuxCheckProfile::C6C0D8
+            .execution_profile()
+            .contains("c6c0d8:runtime-evidence-pending"));
+        for digest in [
+            "",
+            "unknown",
+            replacement.binary_sha256,
+            REVIEWED_CHECK_IDENTITIES[1].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[2].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[3].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[4].contract_sha256.unwrap(),
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(replacement.source_commit, digest),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        for source in [
+            "",
+            "unknown",
+            REVIEWED_CHECK_IDENTITIES[0].source_commit,
+            REVIEWED_CHECK_IDENTITIES[1].source_commit,
+            REVIEWED_CHECK_IDENTITIES[2].source_commit,
+            REVIEWED_CHECK_IDENTITIES[3].source_commit,
+            REVIEWED_CHECK_IDENTITIES[4].source_commit,
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(source, contract),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        assert_eq!(
+            reviewed_compiled_profile(&replacement.source_commit.to_ascii_uppercase(), contract),
+            Err(CandidateCheckError::Unsupported)
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, &contract.to_ascii_uppercase()),
+            Err(CandidateCheckError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn alpha124_requires_its_exact_source_contract_and_actual_elf() {
+        use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
+        use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
+        let replacement = &REVIEWED_CHECK_IDENTITIES[6];
+        assert_eq!(
+            replacement.source_commit,
+            "0cfa24573ff34c26608151068334329268cfdf14"
+        );
+        let contract = replacement.contract_sha256.unwrap();
+        assert_eq!(
+            contract,
+            "96e8cc61d7abf345145b2af230724708f9a1baea77715467e38e96277ae0ffdf"
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, contract),
+            Ok(LinuxCheckProfile::E0CFA24)
+        );
+        let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
+        assert_eq!(
+            polaris_updater::verify::sha256_hex(binding.as_bytes()),
+            contract
+        );
+        let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
+        assert_eq!(binding["sourceCommit"], replacement.source_commit);
+        assert_eq!(
+            binding["platforms"]["linux"]["core"]["sha256"],
+            replacement.binary_sha256
+        );
+        assert_eq!(
+            LinuxCheckProfile::E0CFA24.binary_sha256(),
+            "7fde19e331e654280e134a89c26af5be706e4364e3003a74b7619c220d5a03aa"
+        );
+        assert_eq!(
+            LinuxCheckProfile::E0CFA24.input_profile(),
+            LinuxInputProfile::E0CFA24
+        );
+        assert!(matches!(
+            LinuxCheckProfile::E0CFA24.input_profile(),
+            LinuxInputProfile::PlainTcpCheckV1(_)
+        ));
+        assert!(LinuxCheckProfile::E0CFA24
+            .execution_profile()
+            .contains("0cfa24:runtime-evidence-pending"));
+        for digest in [
+            "",
+            "unknown",
+            replacement.binary_sha256,
+            REVIEWED_CHECK_IDENTITIES[1].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[2].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[3].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[4].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[5].contract_sha256.unwrap(),
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(replacement.source_commit, digest),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        for source in [
+            "",
+            "unknown",
+            REVIEWED_CHECK_IDENTITIES[0].source_commit,
+            REVIEWED_CHECK_IDENTITIES[1].source_commit,
+            REVIEWED_CHECK_IDENTITIES[2].source_commit,
+            REVIEWED_CHECK_IDENTITIES[3].source_commit,
+            REVIEWED_CHECK_IDENTITIES[4].source_commit,
+            REVIEWED_CHECK_IDENTITIES[5].source_commit,
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(source, contract),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        assert_eq!(
+            reviewed_compiled_profile(&replacement.source_commit.to_ascii_uppercase(), contract),
+            Err(CandidateCheckError::Unsupported)
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, &contract.to_ascii_uppercase()),
+            Err(CandidateCheckError::Unsupported)
+        );
+    }
+
+    #[test]
     fn candidate_test_selection_requires_exact_opt_in_or_reviewed_compiled_identity() {
         use super::super::select_test_core;
         use std::ffi::OsStr;
@@ -265,6 +501,9 @@ mod linux_tests {
             LinuxCheckProfile::FE182,
             LinuxCheckProfile::C002,
             LinuxCheckProfile::A4D085,
+            LinuxCheckProfile::E814DA,
+            LinuxCheckProfile::C6C0D8,
+            LinuxCheckProfile::E0CFA24,
         ] {
             for required in [false, true] {
                 assert_eq!(
@@ -286,6 +525,10 @@ mod linux_tests {
                 "f99daa91345df468b18e9c61451cc6465ffdce137fb1adc33829053ab2b194f3",
                 "c002",
                 "a4d085",
+                "0cfa24",
+                "0cfa24573ff34c26608151068334329268cfdf14",
+                "96e8cc61d7abf345145b2af230724708f9a1baea77715467e38e96277ae0ffdf",
+                "7fde19e331e654280e134a89c26af5be706e4364e3003a74b7619c220d5a03aa",
                 "a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae",
                 "2a7495faeb18d2666dfcc77f678057c35cc7a7bb36b03a8a16ff9ac6249b4db8",
                 " 1",
@@ -348,6 +591,9 @@ mod linux_tests {
             LinuxCheckProfile::FE182,
             LinuxCheckProfile::C002,
             LinuxCheckProfile::A4D085,
+            LinuxCheckProfile::E814DA,
+            LinuxCheckProfile::C6C0D8,
+            LinuxCheckProfile::E0CFA24,
         ] {
             for path in [dir.join("missing"), wrong.clone(), link.clone()] {
                 assert!(matches!(
@@ -377,6 +623,8 @@ mod linux_tests {
             (LinuxCheckProfile::FE182, LinuxCheckProfile::A4D085),
             (LinuxCheckProfile::A4D085, LinuxCheckProfile::C002),
             (LinuxCheckProfile::C002, LinuxCheckProfile::A4D085),
+            (LinuxCheckProfile::E0CFA24, LinuxCheckProfile::C6C0D8),
+            (LinuxCheckProfile::C6C0D8, LinuxCheckProfile::E0CFA24),
         ] {
             let (dir, runtime, snapshot, input, plan) = fixture();
             let candidate =
@@ -677,6 +925,9 @@ mod linux_tests {
             LinuxCheckProfile::FE182,
             LinuxCheckProfile::C002,
             LinuxCheckProfile::A4D085,
+            LinuxCheckProfile::E814DA,
+            LinuxCheckProfile::C6C0D8,
+            LinuxCheckProfile::E0CFA24,
         ] {
             if substituted != profile {
                 assert!(matches!(

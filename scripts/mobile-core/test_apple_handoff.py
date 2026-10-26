@@ -552,7 +552,7 @@ class AppleHandoffControls(unittest.TestCase):
                            'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
                            'wakeNow', 'recordScreenState']
                 (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' +
-                    FormalOutputs.validation_result_objc_header(None))
+                    FormalOutputs.validation_result_objc_header(None) + FormalOutputs.hot_objc_header(None))
                 for directory in (lib, lib.parent, lib / 'Resources', lib / 'Resources/empty', lib / 'Headers'):
                     directory.chmod(0o755)
             (framework / 'Info.plist').write_bytes(plistlib.dumps({'AvailableLibraries': entries}))

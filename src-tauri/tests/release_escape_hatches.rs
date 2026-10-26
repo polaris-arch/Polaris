@@ -205,6 +205,18 @@ const PENDING_TRUST_GATE: &[Entry] = &[];
 /// **同形但非读取**的串。每条同样要求恰好命中一次 —— 那个串一旦消失，条目必须跟着走。
 const TEXT_ONLY: &[Entry] = &[
     Entry {
+        name: "POLARIS_DIAGNOSTICS",
+        reason: "Generated maintenance shell diagnostic selector, set to 1 by the fixed Linux DIAGNOSTICS prelude before transactions. Shell reads only gate failure-marker emission, never admission, cleanup success or exit status; Mac has no Linux diagnostic function, and an inherited value can at most attempt that ignored diagnostic call. Not a Rust environment-driven release escape hatch.",
+    },
+    Entry {
+        name: "POLARIS_HELPER_FAILURE_V1",
+        reason: "Fixed stderr marker emitted by the Linux diagnostic function and parsed under stage/recovery/length bounds. Explicitly not verified emitter, authorization or recovery proof; no environment read.",
+    },
+    Entry {
+        name: "POLARIS_PID1_MEMBERS",
+        reason: "Shell heredoc delimiter for previously sampled cgroup.procs membership; the body is checked for PID 1. Not an environment key or admission override.",
+    },
+    Entry {
         name: "POLARIS_BUILD_ID",
         reason: "`crates/helper-proto/src/lib.rs` 的 `option_env!(\"POLARIS_BUILD_ID\")` —— \
                  **编译期**读取：发布流水线把同一份 `github.sha` 注入 helper 与 app 的构建环境，\

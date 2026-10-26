@@ -169,6 +169,7 @@ class AppleReadReuse(unittest.TestCase):
     def framework_fixture(self, root):
         fixtures = module('read_reuse_framework_fixture', 'scripts/apple-carrier.test.py')
         from test_apple_entry import single_fat_archive
+        from test_outputs import FormalOutputs
         framework = root / 'Libbox.xcframework'; framework.mkdir()
         expected_id = 'polaris-mobile-' + 'a' * 64
         def archive(target):
@@ -187,6 +188,7 @@ class AppleReadReuse(unittest.TestCase):
                    'TailscaleStoreMembership', 'TailscaleStoreRetirement', 'Validation', 'ValidationError']
         header = '\n'.join(symbols) + '\n@interface LibboxConfigValidationResult : NSObject <goSeqRefInterface> {}\n'
         header += '\n'.join('- (NSString* _Nonnull)get' + name + ';' for name in getters) + '\n@end\n'
+        header += FormalOutputs.hot_objc_header(None)
         for identifier, variant, arches, raw in [
                 ('ios-arm64', None, ['arm64'], device),
                 ('ios-arm64-simulator', 'simulator', ['arm64'], sim)]:

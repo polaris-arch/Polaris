@@ -68,6 +68,23 @@ on:
     types: [checks_requested]
   workflow_dispatch:
     inputs:
+      runtime_config_loopback_input:
+        description: 'HOT input: diagnostic source build or committed formal Release; four Linux noTUN scenarios only'
+        type: choice
+        default: diagnostic-source
+        options: [diagnostic-source, formal-release]
+      runtime_config_loopback_candidate:
+        description: 'Exact App SHA: real kernel Linux loopback HOT control/data-plane; no TUN or publication authority'
+        type: string
+        default: ''
+      app_native_compile_candidate:
+        description: 'Exact App SHA: Ubuntu native build and test-binary compilation only; no runtime or HOT acceptance'
+        type: string
+        default: ''
+      runtime_config_source_only:
+        description: 'RuntimeConfig source/mock tests only on Ubuntu; not full CI, native or HOT acceptance'
+        type: boolean
+        default: false
       native_dns_candidate:
         description: 'Optional exact App SHA on the fixed native-DNS branch; validation only'
         type: string
@@ -110,6 +127,10 @@ on:
   # 供 package.yml 复用作发布前置门（与打包并行跑，门不绿则 release job 不起），零重复定义。
   workflow_call:
     inputs:
+      runtime_config_loopback_input:
+        description: 'Preserve ordinary reusable CI; non-default input does not authorize HOT'
+        type: string
+        default: diagnostic-source
       windows_system_candidate:
         description: 'Explicit exact final App SHA forwarded by the complete manual Package campaign'
         type: string
@@ -135,14 +156,17 @@ concurrency:
 
 jobs:
   cheap_format:
-    # Only an explicit manual diagnostic selection skips the ordinary gate DAG.
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '' }}
+    # Explicit source-only dispatch runs its own admission in runtime_config_source_tests.
+    # All native descendants retain this required predecessor and implicit success().
+    if: ${{ ((contains(toJSON(inputs), '"runtime_config_loopback_input"') && inputs.runtime_config_loopback_input != 'diagnostic-source') || (github.event_name == 'workflow_dispatch' && ((inputs.runtime_config_loopback_candidate || '') != '' || (inputs.app_native_compile_candidate || '') != ''))) || (github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && (github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '') }}
     name: Cheap Rust formatting gate
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
       contents: read
     outputs:
+      runtime_config_loopback_only: ${{ steps.runtime_config_loopback_admission.outputs.loopback_only }}
+      app_native_compile_only: ${{ steps.app_native_compile_admission.outputs.compile_only }}
       native_required: ${{ steps.native_impact.outputs.native_required }}
       native_dns_candidate: ${{ steps.native_dns_admission.outputs.candidate }}
       native_dns_default: ${{ steps.native_dns_admission.outputs.temporary_default }}
@@ -161,10 +185,77 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: '26'
+      - name: Validate exact loopback input mode
+        # GitHub string comparisons fold case; Node is the exact authority.
+        shell: bash
+        env:
+          RUNTIME_CONFIG_LOOPBACK_INPUTS: ${{ toJSON(inputs) }}
+        run: node --input-type=module -e 'import { loopbackInput } from "./scripts/runtime-config-loopback-formal.mjs"; loopbackInput(JSON.parse(process.env.RUNTIME_CONFIG_LOOPBACK_INPUTS));'
+      - name: Admit exact real HOT loopback request
+        id: runtime_config_loopback_admission
+        if: ${{ (contains(toJSON(inputs), '"runtime_config_loopback_input"') && inputs.runtime_config_loopback_input != 'diagnostic-source') || (github.event_name == 'workflow_dispatch' && (inputs.runtime_config_loopback_candidate || '') != '') }}
+        env:
+          RUNTIME_CONFIG_LOOPBACK_INPUTS: ${{ toJSON(inputs) }}
+        run: node scripts/runtime-config-loopback.mjs admit
+      - name: Admit exact App native compile-only request
+        id: app_native_compile_admission
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.app_native_compile_candidate || '') != '' }}
+        shell: bash
+        env:
+          APP_NATIVE_COMPILE_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync } from 'node:fs';
+          const e = process.env, selected = JSON.parse(e.APP_NATIVE_COMPILE_INPUTS);
+          const ref = 'refs/heads/hot/app-runtime-consumer-20261020';
+          const candidate = selected.app_native_compile_candidate;
+          if (e.GITHUB_ACTIONS !== 'true' || e.GITHUB_EVENT_NAME !== 'workflow_dispatch'
+              || e.GITHUB_REPOSITORY !== 'polaris-arch/Polaris' || e.GITHUB_REPOSITORY_ID !== '1347028220'
+              || e.GITHUB_REF !== ref || e.GITHUB_WORKFLOW_REF !== `polaris-arch/Polaris/.github/workflows/ci.yml@${ref}`
+              || typeof candidate !== 'string' || !/^[0-9a-f]{40}$/.test(candidate) || candidate !== e.GITHUB_SHA)
+            throw Error('Exact direct HOT App compile-only context required');
+          if ((selected.runtime_config_loopback_input !== undefined && selected.runtime_config_loopback_input !== 'diagnostic-source')
+              || (selected.runtime_config_loopback_candidate || '') !== ''
+              || selected.os !== 'ubuntu-22.04' || selected.runtime_config_source_only === true
+              || selected.windows_launcher_diagnostics === true || (selected.native_dns_candidate || '') !== ''
+              || (selected.windows_system_candidate || '') !== '' || (selected.windows_directory_candidate_source || '') !== ''
+              || (selected.windows_directory_mode || 'formal') !== 'formal')
+            throw Error('App compile-only requires Ubuntu and cannot combine source-only, diagnostic, candidate or SYSTEM requests');
+          for (const key of ['CORE_CANDIDATE', 'CORE_PLATFORM', 'POLARIS_NATIVE_DNS_CANDIDATE', 'POLARIS_NATIVE_DNS_FORMAL',
+            'POLARIS_NATIVE_PAYLOAD_VALIDATION', 'POLARIS_NATIVE_DNS_PLATFORM', 'POLARIS_SINGBOX_PATH', 'POLARIS_TEST_CORE',
+            'POLARIS_CORE_IDENTITY_FILE', 'POLARIS_CORE_CARRIER_DIR', 'POLARIS_REQUIRE_KERNEL_GATE', 'POLARIS_KERNEL_GATE_TARGET',
+            'POLARIS_NO_KERNEL_RUN', 'POLARIS_BUILD_ID', 'POLARIS_RUNTIME_CONFIG_PROTO_SOURCE', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'])
+            if (Object.hasOwn(e, key)) throw Error(`App compile-only must not inherit runtime selectors: ${key}`);
+          if (execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== candidate
+              || execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8' }).trim() !== '')
+            throw Error('App compile-only checkout differs or tracked source is dirty');
+          appendFileSync(e.GITHUB_OUTPUT, 'compile_only=true\n');
+          NODE
+      - name: Execute native compile routing contracts before native setup
+        if: steps.app_native_compile_admission.outputs.compile_only == 'true'
+        run: node --test scripts/native-dns-ci-routing.test.mjs scripts/windows-token-owner.test.mjs scripts/gate-rust-ci-parity.test.mjs
+      - name: Execute launcher routing contracts before native setup
+        if: steps.app_native_compile_admission.outputs.compile_only == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LAUNCHER_CONTRACT_TAP="$RUNNER_TEMP/app-native-launcher-contracts.tap"
+          node --test --test-reporter=tap --test-name-pattern='^manual (fixed-source )?launcher diagnosis' scripts/ci-workflow-efficiency.test.mjs | tee "$LAUNCHER_CONTRACT_TAP"
+          node --input-type=module - <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const text = readFileSync(process.env.LAUNCHER_CONTRACT_TAP, 'utf8');
+          for (const [key, expected] of [['pass', 8], ['fail', 0], ['cancelled', 0]]) {
+            const matches = [...text.matchAll(new RegExp(`^# ${key} (\\d+)\\r?$`, 'gm'))];
+            if (matches.length !== 1 || Number(matches[0][1]) !== expected)
+              throw Error(`Launcher routing tests require exactly one ${key}=${expected} summary`);
+          }
+          NODE
       - name: Classify native CI impact
         id: native_impact
         run: node scripts/classify-ci-impact.mjs --native-ci
       - name: Admit exact final candidate SYSTEM request
+        if: steps.runtime_config_loopback_admission.outputs.loopback_only != 'true' && steps.app_native_compile_admission.outputs.compile_only != 'true'
         shell: bash
         env:
           SYSTEM_CANDIDATE: ${{ inputs.windows_system_candidate || '' }}
@@ -186,6 +277,7 @@ jobs:
           }
           NODE
       - name: Admit explicit native DNS ordinary CI selection
+        if: steps.runtime_config_loopback_admission.outputs.loopback_only != 'true' && steps.app_native_compile_admission.outputs.compile_only != 'true'
         id: native_dns_admission
         shell: bash
         env:
@@ -253,8 +345,78 @@ jobs:
           rustc -Vv
           cargo fmt --version
       - name: Check workspace formatting before native compilation
+        id: workspace_format
         if: steps.native_impact.outputs.native_required != 'false'
         run: cargo fmt --all -- --check
+      - name: Collect exact HOT formatting repair after failed gate
+        id: hot_format_patch
+        if: ${{ failure() && steps.workspace_format.outcome == 'failure' && steps.runtime_config_loopback_admission.outputs.loopback_only == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import hashlib, json, os, stat, subprocess
+          from pathlib import Path
+          paths = [
+              'src-tauri/src/runtime/core_version_probe.rs',
+              'src-tauri/src/runtime/core_version_probe/tests/mod.rs',
+              'src-tauri/src/runtime/proxy.rs',
+              'src-tauri/src/runtime/proxy/core_binary.rs',
+              'src-tauri/src/runtime/proxy/process_supervision.rs',
+              'src-tauri/src/runtime/proxy/runtime_config.rs',
+              'src-tauri/src/runtime/proxy/startup.rs',
+              'src-tauri/src/runtime/proxy/tests/mod.rs',
+              'src-tauri/src/runtime/proxy/tests/process_supervision.rs',
+              'src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs',
+              'src-tauri/src/runtime/proxy/tests/startup.rs',
+              'src-tauri/tests/ignored_tests_registry.rs',
+              'src-tauri/tests/windows_console_suppression.rs',
+          ]
+          def capture(*args):
+              return subprocess.check_output(args, timeout=120)
+          def digest(path):
+              p = Path(path)
+              if p.is_symlink() or not stat.S_ISREG(p.stat().st_mode) or p.stat().st_size > 4 * 1024 * 1024:
+                  raise RuntimeError('format input is not bounded regular Rust source')
+              raw = p.read_bytes()
+              raw.decode('utf-8')
+              return {'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw)}
+          commit = capture('git', 'rev-parse', 'HEAD').decode().strip()
+          if commit != os.environ['GITHUB_SHA'] or capture('git', 'status', '--porcelain', '--untracked-files=no').strip():
+              raise RuntimeError('format checkout changed since exact admission')
+          before = {path: digest(path) for path in paths}
+          versions = {tool: capture(*command).decode().strip() for tool, command in {
+              'rustc': ['rustc', '-Vv'], 'cargoFmt': ['cargo', 'fmt', '--version'],
+              'rustfmt': ['rustfmt', '--version']}.items()}
+          subprocess.run(['cargo', 'fmt', '--all'], check=True, timeout=120)
+          changed = capture('git', 'diff', '--name-only', '--no-ext-diff').decode().splitlines()
+          if not changed or not set(changed) <= set(paths):
+              raise RuntimeError('format repair escaped the reviewed Rust source scope')
+          subprocess.run(['cargo', 'fmt', '--all', '--', '--check'], check=True, timeout=120)
+          patch = capture('git', 'diff', '--no-ext-diff', '--no-color', '--binary', '--', *paths)
+          if not patch or len(patch) > 32 * 1024 * 1024:
+              raise RuntimeError('format patch is empty or exceeds complete-artifact bound')
+          root = Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
+          out = root / ('polaris-hot-format-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'])
+          out.mkdir(mode=0o700)
+          (out / 'format.patch').write_bytes(patch)
+          receipt = {'schema': 'polaris-hot-format-repair-v1', 'appCommit': commit,
+              'appTree': capture('git', 'rev-parse', 'HEAD^{tree}').decode().strip(),
+              'formatGatePassed': False, 'formatOnlyFixedPoint': True, 'versions': versions,
+              'files': {path: {'before': before[path], 'after': digest(path)} for path in changed},
+              'patchSha256': hashlib.sha256(patch).hexdigest(), 'patchBytes': len(patch)}
+          (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              output.write('directory=' + str(out) + '\n')
+          PY
+      - name: Retain complete HOT format repair for independent replay
+        if: ${{ always() && steps.hot_format_patch.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: polaris-hot-format-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ steps.hot_format_patch.outputs.directory }}
+          retention-days: 3
+          if-no-files-found: error
 
   native_dns_candidate_gates:
     needs: cheap_format
@@ -262,7 +424,7 @@ jobs:
     # Manual diagnostics retain their fixed context. Committed formal defaults use
     # the same caller/App SHA and four-host gate plan without a second dispatch.
     if: >-
-      ${{ needs.cheap_format.outputs.native_required != 'false'
+      ${{ needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && needs.cheap_format.outputs.app_native_compile_only != 'true' && needs.cheap_format.outputs.native_required != 'false'
           && (github.event_name == 'workflow_dispatch'
           && github.workflow_ref == 'polaris-arch/Polaris/.github/workflows/ci.yml@refs/heads/collab/native-node-dns-20261018'
           && inputs.native_dns_candidate != ''
@@ -279,7 +441,7 @@ jobs:
   lint:
     needs: cheap_format
     if: >-
-      needs.cheap_format.outputs.native_required != 'false'
+      needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && needs.cheap_format.outputs.app_native_compile_only != 'true' && needs.cheap_format.outputs.native_required != 'false'
     name: fmt + clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -525,7 +687,7 @@ jobs:
     needs: cheap_format
     name: cross-target clippy + android face
     if: >-
-      needs.cheap_format.outputs.native_required != 'false'
+      needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && needs.cheap_format.outputs.app_native_compile_only != 'true' && needs.cheap_format.outputs.native_required != 'false'
       && !(github.event_name == 'workflow_dispatch'
         && github.event.inputs.os != ''
         && github.event.inputs.os != 'all'
@@ -825,8 +987,8 @@ jobs:
   test:
     needs: cheap_format
     if: >-
-      needs.cheap_format.outputs.native_required != 'false'
-    name: build + test (${{ matrix.os }})
+      needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && needs.cheap_format.outputs.native_required != 'false'
+    name: ${{ needs.cheap_format.outputs.app_native_compile_only == 'true' && 'Native consumer compile only' || 'build + test' }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     permissions:
@@ -849,6 +1011,7 @@ jobs:
 
     steps:
       - name: Set absolute release-consumer job deadline
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true'
         shell: bash
         run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 119 * 60000) + "\n")'
 
@@ -860,9 +1023,34 @@ jobs:
         with:
           node-version: '26'
 
+      - name: Verify admitted App compile checkout
+        if: needs.cheap_format.outputs.app_native_compile_only == 'true'
+        shell: bash
+        env:
+          APP_NATIVE_COMPILE_CANDIDATE: ${{ inputs.app_native_compile_candidate }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { existsSync } from 'node:fs';
+          const e = process.env;
+          if (e.RUNNER_OS !== 'Linux' || e.RUNNER_ARCH !== 'X64'
+              || e.GITHUB_SHA !== e.APP_NATIVE_COMPILE_CANDIDATE
+              || execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== e.APP_NATIVE_COMPILE_CANDIDATE
+              || execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8' }).trim() !== '')
+            throw Error('Admitted Ubuntu App checkout differs');
+          for (const key of ['CORE_CANDIDATE', 'CORE_PLATFORM', 'POLARIS_NATIVE_DNS_CANDIDATE', 'POLARIS_NATIVE_DNS_FORMAL',
+            'POLARIS_NATIVE_PAYLOAD_VALIDATION', 'POLARIS_NATIVE_DNS_PLATFORM', 'POLARIS_SINGBOX_PATH', 'POLARIS_TEST_CORE',
+            'POLARIS_CORE_IDENTITY_FILE', 'POLARIS_CORE_CARRIER_DIR', 'POLARIS_REQUIRE_KERNEL_GATE', 'POLARIS_KERNEL_GATE_TARGET',
+            'POLARIS_NO_KERNEL_RUN', 'POLARIS_BUILD_ID', 'POLARIS_RUNTIME_CONFIG_PROTO_SOURCE', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'])
+            if (Object.hasOwn(e, key)) throw Error(`App compile-only must not inherit runtime selectors: ${key}`);
+          for (const platform of ['linux', 'win', 'mac-x64', 'mac-arm64'])
+            for (const name of ['sing-box', 'sing-box.exe', 'core-manifest.json', 'candidate-carrier.json'])
+              if (existsSync(`resources/${platform}/${name}`)) throw Error('Compile-only checkout must have no runtime carrier');
+          NODE
+
       # 判据与逐条理由见 lint job 同名步上方那段。本 job 不装 rustfmt / clippy 组件（不跑那两条门）。
       - name: Windows installer cleanup fixtures (native PowerShell)
-        if: runner.os == 'Windows'
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true' && (runner.os == 'Windows')
         run: node --test scripts/nsis-core-sweep.test.mjs scripts/nsis-helper-cleanup.test.mjs
 
       - name: Install Rust toolchain (preinstalled rustup)
@@ -876,6 +1064,7 @@ jobs:
           rustc -Vv
 
       - name: Activate admitted native DNS test inputs for the actual host
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true'
         id: native_dns_host
         shell: bash
         env:
@@ -942,20 +1131,20 @@ jobs:
           NODE
 
       - name: Setup candidate archive verifier Python
-        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
         uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
       - name: Setup verified candidate Go metadata reader
-        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
         uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.native_dns_host.outputs.go_version }}
           cache: false
 
       - name: Verify exact candidate Go toolchain
-        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
         shell: bash
         env:
           EXPECTED_GO: ${{ steps.native_dns_host.outputs.go_version }}
@@ -966,7 +1155,7 @@ jobs:
 
       - name: Acquire all four explicit candidate payloads before placeholders
         id: native_dns_acquire
-        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
         shell: bash
         env:
           POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
@@ -980,6 +1169,7 @@ jobs:
 
       # 键独立的理由见 lint job 同名步。这一份是三者里最大的（dev 构型全量 codegen）。
       - name: Setup Rust cache
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           key: test
@@ -1050,9 +1240,24 @@ jobs:
             done
           fi
 
+      - name: Verify compile-only resource placeholders
+        if: needs.cheap_format.outputs.app_native_compile_only == 'true'
+        run: |
+          node --input-type=module - <<'NODE'
+          import { lstatSync, readdirSync } from 'node:fs';
+          for (const platform of ['dashboard', 'linux', 'win', 'mac-x64', 'mac-arm64']) {
+            const directory = `resources/${platform}`;
+            const stat = lstatSync(directory);
+            if (!stat.isDirectory() || stat.isSymbolicLink()
+                || JSON.stringify(readdirSync(directory)) !== '[".keep"]'
+                || !lstatSync(`${directory}/.keep`).isFile() || lstatSync(`${directory}/.keep`).size !== 0)
+              throw Error('Compile-only resources must contain only empty placeholders');
+          }
+          NODE
+
       - name: Build actual candidate helper bytes and freeze the separate App identity
         id: native_dns_identity
-        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1085,7 +1290,7 @@ jobs:
 
       - name: Verify all candidate payloads and compiled identity before workspace build
         id: native_dns_before
-        if: ${{ (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1102,17 +1307,31 @@ jobs:
         id: workspace_build
         run: cargo build --workspace --verbose
 
+      - name: Compile native consumer test binaries without execution
+        id: native_consumer_test_compile
+        if: needs.cheap_format.outputs.app_native_compile_only == 'true'
+        run: cargo test --locked --workspace --no-run
+
+      - name: Record native consumer compilation scope
+        if: needs.cheap_format.outputs.app_native_compile_only == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code HEAD --
+          printf '%s\n' 'Ubuntu App/workspace build and test-binary compilation passed. No Rust test/App/kernel execution, HOT acceptance, cross-target, mobile, packaged or publication acceptance. The unavailable formal identity is not a usable installation.' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Coex export checker fixtures
-        if: runner.os == 'Linux'
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true' && (runner.os == 'Linux')
         run: node --test scripts/check-coex-runtime-export.test.mjs
 
       - name: Prepare current Coex source evidence
-        if: runner.os == 'Linux'
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true' && (runner.os == 'Linux')
         id: coex_prepare
         run: node scripts/check-coex-runtime-export.mjs prepare
 
       - name: Test
         id: workspace_tests
+        if: needs.cheap_format.outputs.app_native_compile_only != 'true'
         # Keep the actual gate command byte-identical to gate-rust.sh. Linux capture
         # supplies the fresh export env to this one existing full-workspace execution.
         # The static shell routes macOS/Windows to bash/pwsh with native failure propagation.
@@ -1126,9 +1345,19 @@ jobs:
         # 加上它之后，一次 run 给出**全部**失败清单，代价只是失败时多跑几个 crate 的测试（秒级）。
         run: cargo test --workspace --no-fail-fast
 
+      - name: Verify native helper bootstrap descriptor primitives
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (runner.os == 'macOS' || runner.os == 'Linux') && !cancelled() && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
+        shell: bash
+        run: node scripts/run-native-dns-controlled-tests.mjs --bootstrap-contracts
+
+      - name: Verify native subscription JSON URI and UA preservation
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && (runner.os == 'macOS' || runner.os == 'Linux') && !cancelled() && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
+        shell: bash
+        run: node scripts/run-native-dns-controlled-tests.mjs --source-contracts
+
       - name: Run exact controlled App lifecycle hot-switch and stats tests
         id: native_dns_app_runtime
-        if: ${{ !cancelled() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') && steps.workspace_build.outcome == 'success' && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && !cancelled() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') && steps.workspace_build.outcome == 'success' && (steps.workspace_tests.outcome == 'success' || steps.workspace_tests.outcome == 'failure') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1138,14 +1367,14 @@ jobs:
             runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop
             runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid
             runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt
-            runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_falls_back_to_restart
+            runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation
             runtime::stats::tests::real_core_tests::real_core_aggregate_relay_emits_real_frames
           )
           node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"
 
       - name: Verify all candidate payloads after workspace and controlled App tests
         id: native_dns_after
-        if: ${{ always() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') && steps.native_dns_acquire.outcome == 'success' }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && always() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') && steps.native_dns_acquire.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1166,7 +1395,7 @@ jobs:
       # fails this job; PR/SYSTEM gates retain their existing success requirement.
       - name: Select explicit formal or candidate Windows directory source
         if: >-
-          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && runner.os == 'Windows' && (success() || (!cancelled()
           && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
           && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure')) }}
         id: windows_directory_source
@@ -1201,7 +1430,7 @@ jobs:
       - name: Checkout exact Windows directory producer source
         id: windows_directory_checkout
         if: >-
-          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && runner.os == 'Windows' && (success() || (!cancelled()
           && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
           && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
           && steps.windows_directory_source.outcome == 'success' }}
@@ -1215,7 +1444,7 @@ jobs:
           fetch-depth: 1
       - name: Resolve exact checked-out kernel toolchain
         if: >-
-          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && runner.os == 'Windows' && (success() || (!cancelled()
           && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
           && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
           && steps.windows_directory_checkout.outcome == 'success' }}
@@ -1227,7 +1456,7 @@ jobs:
       - name: Setup exact kernel Go toolchain
         id: windows_directory_go_setup
         if: >-
-          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && runner.os == 'Windows' && (success() || (!cancelled()
           && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
           && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
           && steps.windows_directory_go.outcome == 'success' }}
@@ -1238,7 +1467,7 @@ jobs:
       - name: Build and run native Windows directory producer and consumer acceptance
         id: windows_directory_acceptance
         if: >-
-          ${{ runner.os == 'Windows' && (success() || (!cancelled()
+          ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && runner.os == 'Windows' && (success() || (!cancelled()
           && github.event_name == 'workflow_dispatch' && (inputs.windows_directory_mode == 'candidate' || needs.cheap_format.outputs.native_dns_candidate != '')
           && steps.workspace_build.outcome == 'success' && steps.workspace_tests.outcome == 'failure'))
           && steps.windows_directory_go_setup.outcome == 'success' }}
@@ -1273,7 +1502,7 @@ jobs:
       - name: Approved batch SYSTEM producer — fresh
         id: windows_system_fresh
         if: >-
-          ${{ runner.os == 'Windows'
+          ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && runner.os == 'Windows'
               && github.repository == 'polaris-arch/Polaris'
               && steps.windows_directory_acceptance.outcome == 'success'
               && ((github.event_name == 'pull_request'
@@ -1341,7 +1570,7 @@ jobs:
       - name: Approved batch SYSTEM producer — prebuilt-user
         id: windows_system_prebuilt
         if: >-
-          ${{ runner.os == 'Windows'
+          ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && runner.os == 'Windows'
               && github.repository == 'polaris-arch/Polaris'
               && steps.windows_directory_acceptance.outcome == 'success'
               && ((github.event_name == 'pull_request'
@@ -1406,7 +1635,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'App tracked source changed during SYSTEM acceptance' }
           @{result='passed';attemptId=$systemVerified.AttemptId;receiptSHA256=$systemVerified.ReceiptSHA256;systemNonce=$systemVerified.SystemNonce;systemReceiptSHA256=$systemVerified.SystemReceiptSHA256} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $args.EvidenceDirectory 'ci-attempt-binding.json')
       - name: Require both explicitly requested SYSTEM checks
-        if: ${{ always() && runner.os == 'Windows' && inputs.windows_system_candidate != '' }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && always() && runner.os == 'Windows' && inputs.windows_system_candidate != '' }}
         shell: pwsh
         env:
           SYSTEM_FRESH_OUTCOME: ${{ steps.windows_system_fresh.outcome }}
@@ -1417,7 +1646,7 @@ jobs:
           }
       - name: Preserve Windows directory artifact identities and build evidence
         if: >-
-          ${{ always() && runner.os == 'Windows'
+          ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && always() && runner.os == 'Windows'
               && (steps.windows_directory_acceptance.outcome == 'success'
                   || steps.windows_directory_acceptance.outcome == 'failure'
                   || steps.windows_directory_acceptance.outcome == 'cancelled') }}
@@ -1429,7 +1658,7 @@ jobs:
           retention-days: 14
 
       - name: Record ordinary candidate outcomes without claiming skipped acceptance
-        if: ${{ always() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && always() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
         shell: bash
         env:
           ADMITTED_CANDIDATE: ${{ needs.cheap_format.outputs.native_dns_candidate }}
@@ -1457,7 +1686,7 @@ jobs:
             'runtime::proxy::tests::lifecycle::real_core_lifecycle_race_start_then_immediate_stop',
             'runtime::proxy::tests::hot_switch::real_core_hot_switch_keeps_pid',
             'runtime::proxy::tests::hot_switch::real_core_auto_failover_attests_without_applying_saved_debt',
-            'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_falls_back_to_restart',
+            'runtime::proxy::tests::hot_switch::real_core_hot_switch_failure_waits_for_explicit_restart_confirmation',
           ];
           const statusPath = `${directory}/runtime-status.txt`;
           const statuses = existsSync(statusPath) ? readFileSync(statusPath, 'utf8').split('\n') : [];
@@ -1495,7 +1724,7 @@ jobs:
           NODE
 
       - name: Always preserve exact ordinary candidate evidence
-        if: ${{ always() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && always() && (needs.cheap_format.outputs.native_dns_candidate != '' || needs.cheap_format.outputs.native_dns_default == 'true' || needs.cheap_format.outputs.native_dns_formal == 'true') }}
         uses: actions/upload-artifact@v7
         with:
           name: native-dns-ordinary-ci-${{ matrix.os }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1504,13 +1733,13 @@ jobs:
           retention-days: 14
 
       - name: Verify current Coex serializer evidence
-        if: ${{ always() && runner.os == 'Linux' && steps.coex_prepare.outputs.directory != '' }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && always() && runner.os == 'Linux' && steps.coex_prepare.outputs.directory != '' }}
         env:
           COEX_EVIDENCE_DIR: ${{ steps.coex_prepare.outputs.directory }}
         run: node scripts/check-coex-runtime-export.mjs verify
 
       - name: Preserve current Coex export and original test logs
-        if: ${{ always() && runner.os == 'Linux' && steps.coex_prepare.outputs.directory != '' }}
+        if: ${{ needs.cheap_format.outputs.app_native_compile_only != 'true' && always() && runner.os == 'Linux' && steps.coex_prepare.outputs.directory != '' }}
         uses: actions/upload-artifact@v7
         with:
           name: coex-runtime-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1519,10 +1748,154 @@ jobs:
           retention-days: 14
 
 
+  # Independent additive API check: generated Rust bindings plus loopback mocks.
+  # No kernel payload, App build, mobile callback or live-TUN acceptance is implied.
+  # The existing full-workspace, wire, native payload and release gates remain intact.
+  # The opt-in dispatch route must reach this job even with conflicting inputs:
+  # admission fails here, rather than reporting an all-skipped successful run.
+  runtime_config_loopback:
+    needs: cheap_format
+    if: needs.cheap_format.outputs.runtime_config_loopback_only == 'true'
+    name: Real HOT Linux loopback (explicit input, no TUN)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Admit execution runner for real HOT loopback
+        id: loopback_admission
+        env:
+          RUNTIME_CONFIG_LOOPBACK_INPUTS: ${{ toJSON(inputs) }}
+        run: node scripts/runtime-config-loopback.mjs admit
+      - name: Test real HOT loopback admission and routing contracts
+        run: node --test scripts/runtime-config-loopback.test.mjs scripts/runtime-config-loopback-formal.test.mjs scripts/native-dns-ci-routing.test.mjs scripts/gate-rust-ci-parity.test.mjs
+      - name: Verify reused source identity checker fixtures
+        run: python3 scripts/mobile-core/test-ci-hot-candidate.py
+      - name: Install Rust toolchain (preinstalled rustup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc -Vv
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+      - name: Assert pinned protoc resolves on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "protoc → $(command -v protoc)"
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
+      - name: Setup exact loopback Go compiler
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.2'
+          check-latest: false
+          cache: false
+      - name: Install Linux system dependencies (Tauri webkit/gtk)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+      - name: Run exact real App to paired kernel HOT loopback tests
+        env:
+          RUNTIME_CONFIG_LOOPBACK_INPUTS: ${{ toJSON(inputs) }}
+        run: node scripts/runtime-config-loopback.mjs run
+      - name: Retain real HOT loopback evidence only
+        if: ${{ always() && steps.loopback_admission.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-config-loopback-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ steps.loopback_admission.outputs.evidence }}
+          if-no-files-found: error
+          retention-days: 3
+
+  runtime_config_source_tests:
+    if: ${{ !((contains(toJSON(inputs), '"runtime_config_loopback_input"') && inputs.runtime_config_loopback_input != 'diagnostic-source') || (github.event_name == 'workflow_dispatch' && ((inputs.runtime_config_loopback_candidate || '') != '' || (inputs.app_native_compile_candidate || '') != ''))) && ((github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true) || github.event_name != 'workflow_dispatch' || inputs.windows_launcher_diagnostics != true || (inputs.windows_system_candidate || '') != '') }}
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true && 'RuntimeConfig source only (not full CI/native/HOT acceptance)' || 'RuntimeConfig mock and source tests' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Validate exact loopback input mode
+        # GitHub string comparisons fold case; Node is the exact authority.
+        shell: bash
+        env:
+          RUNTIME_CONFIG_LOOPBACK_INPUTS: ${{ toJSON(inputs) }}
+        run: node --input-type=module -e 'import { loopbackInput } from "./scripts/runtime-config-loopback-formal.mjs"; loopbackInput(JSON.parse(process.env.RUNTIME_CONFIG_LOOPBACK_INPUTS));'
+      - name: Admit isolated RuntimeConfig source-only selection
+        if: github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true
+        shell: bash
+        env:
+          RUNTIME_CONFIG_SOURCE_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          node --input-type=module - <<'NODE'
+          const selected = JSON.parse(process.env.RUNTIME_CONFIG_SOURCE_INPUTS);
+          if (process.env.GITHUB_EVENT_NAME !== 'workflow_dispatch' || selected.runtime_config_source_only !== true)
+            throw Error('RuntimeConfig source-only mode requires an explicit manual boolean selection');
+          if ((selected.runtime_config_loopback_input !== undefined && selected.runtime_config_loopback_input !== 'diagnostic-source')
+              || (selected.runtime_config_loopback_candidate || '') !== ''
+              || (selected.app_native_compile_candidate || '') !== ''
+              || selected.windows_launcher_diagnostics === true
+              || (selected.native_dns_candidate || '') !== ''
+              || (selected.windows_system_candidate || '') !== ''
+              || (selected.windows_directory_candidate_source || '') !== ''
+              || (selected.windows_directory_mode || 'formal') !== 'formal'
+              || !['all', 'ubuntu-22.04'].includes(selected.os || 'all'))
+            throw Error('RuntimeConfig source-only mode cannot combine diagnostic, candidate or non-Ubuntu selections');
+          NODE
+      - name: Install Rust toolchain (preinstalled rustup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          [ -n "${CARGO_INCREMENTAL+set}" ] || echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+          [ -n "${CARGO_TERM_COLOR+set}" ] || echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+          rustc -Vv
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: runtime-config-source
+      - name: Install protoc (pinned URL + sha256)
+        run: node scripts/fetch-protoc.mjs
+      - name: Assert pinned protoc resolves on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "protoc → $(command -v protoc)"
+          got="$(protoc --version)"
+          [ "$got" = "$PROTOC_EXPECT" ] || {
+            echo "::error::protoc on PATH is '$got', expected '$PROTOC_EXPECT'"; exit 1; }
+      - name: Test additive RuntimeConfig client against loopback mocks
+        run: cargo test --locked -p polaris-singbox-grpc --test runtime_config
+      - name: State validation scope
+        shell: bash
+        run: |
+          printf '%s\n' 'RuntimeConfig: generated Rust bindings and loopback mock/source tests only. This job is not full CI, native or HOT acceptance. No built-kernel wire/service, App transaction, mobile callback, live-TUN or publication acceptance.' >> "$GITHUB_STEP_SUMMARY"
+
   windows_launcher_diagnostics:
     name: Windows launcher diagnosis (not PR acceptance)
     if: >-
-      ${{ github.event_name == 'workflow_dispatch' && inputs.windows_launcher_diagnostics == true && (inputs.windows_system_candidate || '') == ''
+      ${{ !((contains(toJSON(inputs), '"runtime_config_loopback_input"') && inputs.runtime_config_loopback_input != 'diagnostic-source') || (github.event_name == 'workflow_dispatch' && ((inputs.runtime_config_loopback_candidate || '') != '' || (inputs.app_native_compile_candidate || '') != ''))) && github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only != true && inputs.windows_launcher_diagnostics == true && (inputs.windows_system_candidate || '') == ''
           && github.repository == 'polaris-arch/Polaris'
           && github.ref == 'refs/heads/collab/dots-audit-remediation-20261017' }}
     runs-on: windows-2022
@@ -1535,6 +1908,16 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Setup exact input admission Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Validate exact loopback input mode
+        # GitHub string comparisons fold case; Node is the exact authority.
+        shell: bash
+        env:
+          RUNTIME_CONFIG_LOOPBACK_INPUTS: ${{ toJSON(inputs) }}
+        run: node --input-type=module -e 'import { loopbackInput } from "./scripts/runtime-config-loopback-formal.mjs"; loopbackInput(JSON.parse(process.env.RUNTIME_CONFIG_LOOPBACK_INPUTS));'
       - name: Validate the fixed reviewed candidate
         id: candidate
         shell: pwsh

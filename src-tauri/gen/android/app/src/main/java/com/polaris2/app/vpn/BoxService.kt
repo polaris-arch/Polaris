@@ -34,6 +34,7 @@ import io.nekohasekai.libbox.CommandServerHandler
 import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.Notification
 import io.nekohasekai.libbox.OverrideOptions
+import io.nekohasekai.libbox.RuntimePersistenceHandler
 import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.SystemProxyStatus
 import io.nekohasekai.libbox.TunOptions
@@ -87,6 +88,9 @@ class BoxService(
     @Volatile private var commandServer: CommandServer? = null
     @Volatile private var mainAttempt: MainKernelAttempt<CommandServer>? = null
     private var receiverRegistered = false
+    private var runtimePersistenceEpoch = 0L
+    // Replaced only after this exact server/epoch passes the post-Start protocol gate.
+    private var runtimeAdmission: RuntimeProtocolAdmission? = null
 
     private val stopReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -264,8 +268,10 @@ class BoxService(
                         check(isStarting(attempt)) { "起核已被停核接管" }
                         SystemStart.requireLegacyAllowed(service)
                         observeNativeInput(attempt, server, config, { isStarting(attempt) }) {
-                            server.startOrReloadService(config, OverrideOptions())
+                            server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(),
+                                runtimePersistenceHandler(attempt, server))
                         }
+                        admitRuntimeProtocol(attempt, server) { isStarting(attempt) }
                         SystemStart.requireLegacyAllowed(service)
                     }
                 }
@@ -273,6 +279,7 @@ class BoxService(
             val acknowledged = synchronized(this) {
                 // stopService 持同一把锁：停核已接管时不可重新放开命令流。
                 check(mainAttempt === attempt && !attempt.revoked && state == ServiceState.Starting) { "起核已被停核接管" }
+                check(runtimeAdmission != null) { "runtime protocol was not admitted" }
                 attempt.acknowledgeStart()
                 if (bridgeConfig != null) NativeReconnectNotice.clear(service)
                 state = ServiceState.Started
@@ -302,9 +309,12 @@ class BoxService(
             // 经桥起核成功 ⇒ 记下这一份，此后系统发起的起核才有配置可用。排在结账之后：它要读一次
             // 盘并算摘要，不该拖慢 Rust 侧的就绪门。失败只影响「系统起核可用性」，不影响本次连接。
             if (bridgeConfig != null) {
-                runCatching { SystemStart.remember(service, bridgeConfig, attempt.systemStartGeneration) {
-                    mainAttempt === attempt && MainKernelAttemptRegistry.isCurrent(attempt) &&
-                        !attempt.revoked && state == ServiceState.Started
+                runCatching { synchronized(this) {
+                    // A HOT callback may have committed after ready; never replace its digest with startup bytes.
+                    SystemStart.remember(service, VpnBridge.currentConfig() ?: bridgeConfig, attempt.systemStartGeneration) {
+                        mainAttempt === attempt && MainKernelAttemptRegistry.isCurrent(attempt) &&
+                            !attempt.revoked && state == ServiceState.Started
+                    }
                 } }
                     .onFailure { Log.e(TAG, "记录起核配置失败，系统发起的起核将不可用", it) }
             }
@@ -392,8 +402,19 @@ class BoxService(
             },
             nativeReload = { server, config ->
                 // construct enters admission before OverrideOptions' first JNI allocation.
+                // CAS the preflight/host snapshot and revoke the previous callback epoch
+                // together. A HOT receipt committed since loadConfig must never be lost.
+                val persistence = runtimePersistenceHandler(attempt, server, expectedReloadConfig = config)
                 observeNativeInput(attempt, server, config, { isReloadCurrent(attempt, server) }) {
-                    server.startOrReloadService(config, OverrideOptions())
+                    server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(), persistence)
+                }
+                try {
+                    admitRuntimeProtocol(attempt, server) { isReloadCurrent(attempt, server) }
+                } catch (failure: Throwable) {
+                    // The replacement returned but cannot be published as a paired live core.
+                    // Exact-attempt Stop queues Close behind this same operationLock.
+                    stopService(attempt)
+                    throw failure
                 }
                 SystemStart.requireLegacyAllowed(service)
             },
@@ -404,6 +425,75 @@ class BoxService(
             },
             logFailure = { Log.e(TAG, "重载失败 type=${it.javaClass.simpleName}") },
         )
+    }
+
+    /** Native starts (including OS always-on) cannot bypass protocol admission in Rust. */
+    private fun admitRuntimeProtocol(
+        attempt: MainKernelAttempt<CommandServer>, server: CommandServer, current: () -> Boolean,
+    ) {
+        check(Thread.holdsLock(attempt.operationLock)) { "runtime admission requires the native operation owner" }
+        val epoch = synchronized(this) {
+            check(current() && mainAttempt === attempt && commandServer === server &&
+                !attempt.revoked && MainKernelAttemptRegistry.isCurrent(attempt)) { "runtime admission owner expired" }
+            runtimePersistenceEpoch
+        }
+        val is64Bit = android.os.Process.is64Bit()
+        val processAbis = if (is64Bit) Build.SUPPORTED_64_BIT_ABIS else Build.SUPPORTED_32_BIT_ABIS
+        val platform = RuntimeProtocolAdmission.androidPlatform(BuildConfig.FLAVOR, is64Bit, processAbis.toList())
+        // Real generated Java bridge; a missing method/query error is a startup failure.
+        // JNI stays outside BoxService's short monitor so persistence/Stop cannot deadlock.
+        val admission = RuntimeProtocolAdmission.decode(server.runtimeCapabilities(), platform)
+        synchronized(this) {
+            check(current() && mainAttempt === attempt && commandServer === server &&
+                runtimePersistenceEpoch == epoch && !attempt.revoked &&
+                MainKernelAttemptRegistry.isCurrent(attempt)) { "runtime admission receipt was superseded" }
+            runtimeAdmission = admission
+        }
+    }
+
+    /** New native incarnation gets a fresh epoch; never hold this lock across Go. */
+    private fun runtimePersistenceHandler(
+        attempt: MainKernelAttempt<CommandServer>, server: CommandServer, expectedReloadConfig: String? = null,
+    ): RuntimePersistenceHandler {
+        val epoch = synchronized(this) {
+            check(mainAttempt === attempt && commandServer === server && !attempt.revoked &&
+                MainKernelAttemptRegistry.isCurrent(attempt)) { "runtime persistence owner expired" }
+            if (expectedReloadConfig != null) {
+                check(state == ServiceState.Started) { "runtime reload owner expired" }
+                val currentConfig = VpnBridge.currentConfig() ?: SystemStart.load(service)
+                check(currentConfig == expectedReloadConfig) { "runtime reload source superseded by committed configuration" }
+            }
+            runtimeAdmission = null
+            ++runtimePersistenceEpoch
+        }
+        return object : RuntimePersistenceHandler {
+            override fun runtimePersistenceMode(): String = "exact_configuration_file"
+            private var incarnation: String? = null
+            private var lastRevision = -1L
+            private var lastDigest: String? = null
+            override fun persistRuntimeConfiguration(runtimeIncarnation: String, revision: Long,
+                                                     effectiveDigest: String, configContent: String) {
+                // Do not acquire operationLock or call Go: Close can be joining this callback.
+                synchronized(this@BoxService) {
+                    fun current() = mainAttempt === attempt && commandServer === server &&
+                        runtimePersistenceEpoch == epoch && !attempt.revoked && state == ServiceState.Started &&
+                        MainKernelAttemptRegistry.isCurrent(attempt)
+                    check(current()) { "runtime persistence owner expired" }
+                    check(runtimeIncarnation.isNotEmpty() && revision >= 0 &&
+                        runtimeAdmission?.identity?.incarnation == runtimeIncarnation &&
+                        (incarnation == null || incarnation == runtimeIncarnation) &&
+                        revision >= lastRevision && (revision != lastRevision || lastDigest == effectiveDigest)) {
+                        "runtime persistence receipt is stale"
+                    }
+                    // Advance the receipt fence even if storage fails; an older retry cannot overwrite it.
+                    incarnation = runtimeIncarnation
+                    lastRevision = revision
+                    lastDigest = effectiveDigest
+                    SystemStart.persistRuntime(service, configContent, effectiveDigest, attempt.systemStartGeneration,
+                        ::current) { VpnBridge.publishRuntimeConfig(attempt, configContent, effectiveDigest) }
+                }
+            }
+        }
     }
 
     /** Same operationLock as JNI. Digest/current lookups are outside the short observer gate. */
@@ -667,6 +757,7 @@ class BoxService(
             check(MainKernelAttemptRegistry.completeAfterClose(attempt) {
                 deliverStop = VpnBridge.takeFinishStop(attempt = attempt)
                 commandServer = null
+                runtimeAdmission = null
                 mainAttempt = null
                 state = ServiceState.Stopped
                 closeFailed = false

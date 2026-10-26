@@ -75,3 +75,32 @@ it('resolves the nearest semantic content boundary, includes padding, and inters
   expect(closest).toHaveBeenCalledWith('[data-overlay-boundary], .card, .dlg-body, dialog');
   expect(getControlBoundary({ closest: () => null } as unknown as HTMLElement, { left: 0, top: 0, ...vp })).toEqual({ left: 0, top: 0, ...vp });
 });
+
+it('portalled select escapes a shallow ordinary card vertically, not horizontally', () => {
+  vi.stubGlobal('getComputedStyle', () => ({}));
+  const card = { getBoundingClientRect: () => ({ left: 100, right: 900, top: 500, bottom: 620 }),
+    matches: (selector: string) => selector === '.card' };
+  const closest = (selector: string) => selector.includes('[data-overlay-boundary]') ? card : null;
+  const boundary = getControlBoundary({ closest } as unknown as HTMLElement, { left: 0, top: 0, ...vp }, false);
+  expect(boundary).toEqual({ left: 100, top: 0, width: 800, height: 800 });
+  for (const rtl of [false, true]) {
+    const p = computeCselPosition({ left: 650, top: 570, bottom: 610, width: 230 }, 300, vp, 320, boundary, rtl);
+    expect(p.maxHeight).toBe(300); expect(p.flipped).toBe(true); contained(p, boundary);
+  }
+});
+it('select keeps explicit boundary and dialog containment despite card escape', () => {
+  vi.stubGlobal('getComputedStyle', () => ({}));
+  const card = { getBoundingClientRect: () => ({ left: 100, right: 900, top: 500, bottom: 620 }), matches: () => true };
+  const closest = (selector: string) => selector.includes('[data-overlay-boundary]') ? card : null;
+  expect(getControlBoundary({ closest } as unknown as HTMLElement, { left: 0, top: 0, ...vp }, false))
+    .toEqual({ left: 100, top: 500, width: 800, height: 120 });
+});
+
+it('ordinary card escape still intersects a distinct outer explicit overlay boundary', () => {
+  vi.stubGlobal('getComputedStyle', () => ({}));
+  const card = { getBoundingClientRect: () => ({ left: 100, right: 900, top: 500, bottom: 620 }), matches: (s: string) => s === '.card' };
+  const explicit = { getBoundingClientRect: () => ({ left: 50, right: 950, top: 250, bottom: 700 }), matches: () => false };
+  const closest = (s: string) => s === '[data-overlay-boundary]' ? explicit : s.includes('.card') ? card : null;
+  expect(getControlBoundary({ closest } as unknown as HTMLElement, { left: 0, top: 0, ...vp }, false))
+    .toEqual({ left: 100, top: 250, width: 800, height: 450 });
+});

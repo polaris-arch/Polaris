@@ -55,7 +55,8 @@ it('empty groups have no Auto card but Settings can always turn off saved Auto',
   state.report = null;
   const empty = { ...config, servers: [], selectedServerId: null };
   const html = renderToStaticMarkup(<AutoSelectControls config={empty} accept={() => {}} t={key => key} variant="switch" />);
-  expect(html).toMatch(/role="switch"[^>]*aria-checked="true"[^>]*data-exit-write="auto-select-mode"/);
+  expect(html).toMatch(/role="switch"[^>]*aria-checked="true"/);
+  expect(html).toContain('data-exit-write="auto-select-mode"');
   expect(html).not.toMatch(/role="switch"[^>]*disabled/);
 });
 

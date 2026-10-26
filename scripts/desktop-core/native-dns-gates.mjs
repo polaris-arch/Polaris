@@ -210,7 +210,7 @@ export function executeCommand(gate, { root, env, directory, timeout, captureStd
       process.removeListener('SIGTERM', interrupt); process.removeListener('SIGINT', interrupt);
       closeSync(fd);
       const output = readFileSync(logPath);
-      done({ status, error, timedOut, cleanupUncertain, interrupted, output: output.toString('utf8'),
+      done({ processId: child.pid ?? null, status, error, timedOut, cleanupUncertain, interrupted, output: output.toString('utf8'),
         ...(captureStdout ? { stdout: Buffer.concat(stdout).toString('utf8') } : {}),
         logSha256: sha256(output), logBytes: output.length });
     }

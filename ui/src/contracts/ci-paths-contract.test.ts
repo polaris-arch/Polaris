@@ -23,7 +23,11 @@
  * - 端到端触发验证：过滤器是声明式，真触发要等下一次纯 UI push（CI-5 登记为待验）。
  */
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import playwrightConfig from '../../playwright.config';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
@@ -161,5 +165,85 @@ describe('CI 触发面对称契约（判据面横跨两侧 ⇒ 过滤器不得 i
           `ignore ui/** 则让 UI 门与本门在纯 UI push 上全部转黑`,
       ).toBe(false);
     }
+  });
+});
+
+
+describe('UI evidence ownership across the real installed Playwright runner', () => {
+  const require = createRequire(import.meta.url);
+  const cli = require.resolve('@playwright/test/cli');
+  const runner = require.resolve('@playwright/test');
+
+  it.each([
+    ['legacy-shared-root', './test-results', false, false],
+    ['isolated-success', playwrightConfig.outputDir, false, true],
+    ['isolated-failure', playwrightConfig.outputDir, true, true],
+  ] as const)('%s cleans only its own output and preserves sibling producer evidence', (_name, outputDir, fail, survives) => {
+    expect(playwrightConfig.outputDir).toBe('./test-results/playwright');
+    expect(typeof outputDir).toBe('string');
+    const dir = mkdtempSync(join(tmpdir(), 'polaris-ui-evidence-'));
+    try {
+      const feedback = join(dir, 'test-results', 'feedback', 'synthetic.txt');
+      const measurement = join(dir, 'test-results', 'ui01-measurement', 'synthetic.txt');
+      for (const file of [feedback, measurement]) {
+        mkdirSync(join(file, '..'), { recursive: true });
+        writeFileSync(file, 'synthetic prior producer evidence');
+      }
+      const destination = join(dir, outputDir!);
+      mkdirSync(destination, { recursive: true });
+      const oldRunner = join(destination, 'stale-runner.txt');
+      writeFileSync(oldRunner, 'must be removed by the actual runner');
+      writeFileSync(join(dir, 'playwright.config.cjs'), 'module.exports = ' + JSON.stringify({
+        testDir: dir, testMatch: 'receipt.spec.cjs', outputDir: destination,
+        workers: 1, reporter: 'line', preserveOutput: 'always',
+      }));
+      // No browser fixture, web server, app, core, network or user data. This
+      // executes the installed runner's real pre-run deletion and artifact write.
+      writeFileSync(join(dir, 'receipt.spec.cjs'), `
+const { test, expect } = require(${JSON.stringify(runner)});
+const fs = require('node:fs');
+test('synthetic output receipt', async ({}, info) => {
+  fs.writeFileSync(info.outputPath('runner-receipt.txt'), 'synthetic current output');
+  expect(${JSON.stringify(fail)}).toBe(false);
+});
+`);
+      const result = spawnSync(process.execPath, [cli, 'test', '--config', join(dir, 'playwright.config.cjs')], {
+        cwd: dir, encoding: 'utf8', timeout: 8000, maxBuffer: 1024 * 1024,
+      });
+      expect(result.error, result.stdout + result.stderr).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.status, result.stdout + result.stderr).toBe(fail ? 1 : 0);
+      expect(result.stdout).toContain(fail ? '1 failed' : '1 passed');
+      expect(existsSync(oldRunner)).toBe(false);
+      for (const file of [feedback, measurement]) {
+        expect(existsSync(file)).toBe(survives);
+        if (survives) expect(readFileSync(file, 'utf8')).toBe('synthetic prior producer evidence');
+      }
+      expect(readdirSync(destination, { recursive: true }).some(p => p.toString().endsWith('runner-receipt.txt'))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10000);
+
+  it('uploads both producer trees on failure and requires screenshots after successful browser gates', () => {
+    const workflow = read('ui.yml');
+    const failure = workflow.slice(workflow.indexOf('      - name: Browser form failure evidence'), workflow.indexOf('      - name: Feedback fixture screenshots'));
+    const feedback = workflow.slice(workflow.indexOf('      - name: Feedback fixture screenshots'));
+    expect(failure).toContain('path: ui/test-results/');
+    expect(failure).toContain('if: failure()');
+    expect(feedback).toContain('if: always()');
+    expect(feedback).toContain('path: ui/test-results/feedback/');
+    expect(feedback).toContain("if-no-files-found: ${{ steps.browser_forms.outcome == 'success' && 'error' || 'ignore' }}");
+    expect(workflow).toContain('      - name: Browser form round trip (mock IPC, no app or core)\n        id: browser_forms');
+    // Status functions are permitted in a step's if, not action inputs. This
+    // outcome data comes from the exact browser step, including skipped/failure.
+    const expression = /if-no-files-found: \$\{\{ (.+) \}\}/.exec(feedback)![1];
+    for (const outcome of ['success', 'failure', 'cancelled', 'skipped', undefined]) {
+      const actual = runInNewContext(expression, { steps: { browser_forms: { outcome } } });
+      expect(actual).toBe(outcome === 'success' ? 'error' : 'ignore');
+    }
+    expect(expression).not.toMatch(/\b(success|failure|cancelled|always)\s*\(/);
+
+    for (const block of [failure, feedback]) expect(block).toContain('retention-days: 3');
   });
 });

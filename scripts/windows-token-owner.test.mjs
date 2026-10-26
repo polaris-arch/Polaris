@@ -240,7 +240,9 @@ function checkDiagnosticScheduling(workflow) {
   assert.match(workflow, /- name: Test\n\s+id: workspace_tests/);
   assert.match(workflow, /run: cargo test --workspace --no-fail-fast/);
   const testBlock = workflow.split('      - name: Test\n')[1].split('\n      - ')[0];
-  assert.doesNotMatch(testBlock, /continue-on-error|\bif:/);
+  assert.doesNotMatch(testBlock, /continue-on-error/);
+  assert.deepEqual([...testBlock.matchAll(/^        if: (.+)$/gm)].map((m) => m[1]),
+    ["needs.cheap_format.outputs.app_native_compile_only != 'true'"]);
   for (const [name, dependency] of diagnosticStages) {
     const block = workflow.split(`      - name: ${name}\n`)[1]?.split('      - name:')[0];
     assert.ok(block, name);
@@ -254,6 +256,7 @@ function checkDiagnosticScheduling(workflow) {
       for (const event of ['workflow_dispatch', 'pull_request', 'push'])
         for (const mode of ['candidate', 'formal'])
           for (const admittedCandidate of ['', 'a'.repeat(40)])
+            for (const compileOnly of ['', 'true', 'false', 'unknown'])
             for (const succeeded of [false, true])
               for (const wasCancelled of [false, true])
                 for (const build of ['success', 'failure', 'skipped'])
@@ -262,11 +265,11 @@ function checkDiagnosticScheduling(workflow) {
                       if (succeeded && wasCancelled) continue;
                       const steps = { workspace_build: { outcome: build }, workspace_tests: { outcome: tests } };
                       if (dependency) steps[dependency] = { outcome: preceding };
-                      const expected = os === 'Windows' && (!dependency || preceding === 'success')
+                      const expected = compileOnly !== 'true' && os === 'Windows' && (!dependency || preceding === 'success')
                         && (succeeded || (!wasCancelled && event === 'workflow_dispatch' && (mode === 'candidate' || admittedCandidate !== '')
                           && build === 'success' && tests === 'failure'));
                       assert.equal(evaluate({ os }, { event_name: event }, { windows_directory_mode: mode }, steps,
-                        { cheap_format: { outputs: { native_dns_candidate: admittedCandidate } } },
+                        { cheap_format: { outputs: { native_dns_candidate: admittedCandidate, app_native_compile_only: compileOnly } } },
                         () => succeeded, () => wasCancelled), expected, `${name}: ${[os,event,mode,admittedCandidate,succeeded,wasCancelled,build,tests,preceding]}`);
                     }
   }

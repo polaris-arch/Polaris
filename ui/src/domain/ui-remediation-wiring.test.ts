@@ -77,6 +77,9 @@ it('form union extraction includes readonly discriminants and does not invent ab
 it('claimed startup errors retain localized resolver and speed URL recovery hints', () => {
   const home = read('components/screens/home/HomeScreen.tsx');
   expect(home).toContain('code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID');
-  expect(home).toContain('toast.error(proxyErrorText({ errorCode: code }, key => t(key)))');
+  expect(home).toContain('reportConnectionFailure(proxyErrorText({ errorCode: code }, key => t(key)))');
+  expect(home).toContain("const reportConnectionFailure = (detail: string) => toast.error(");
+  expect(home).toContain("t(action === 'stop' ? 'feedback.stopFailed' : 'feedback.connectionFailed'), detail");
   expect(proxyErrorReason({ errorCode: 'SPEED_TEST_URL_INVALID', message: 'private endpoint' }, key => key)).toBe('errors.speedTestUrlInvalid');
 });
+

@@ -321,7 +321,7 @@ pub fn default_config() -> Value {
         // 均合法（global/smart/direct），此处只动出厂默认。
         "proxyMode": "smart",
         "proxyModeType": "systemProxy",
-        "utlsPolicy": "default",
+        "utlsPolicy": "follow",
         // mtu **刻意缺席** = 自动（生成期不下发 `mtu` 键，由 sing-box 内核取默认，见 config-engine `TunModeConfig::mtu`）。
         // 新装写一个具体数会把「当时的默认」冻在磁盘上，此后默认值再变也追不上——那正是存量
         // 1350/1400 需要 `migrate_tun_mtu` 清一遍的成因。

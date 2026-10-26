@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  TEST_COMMAND, EXPORT_TEST, SOURCE_PATHS, DECODER_PATHS, STATE_KEYS, canonical, sha256, stateDifferences,
+  TEST_COMMAND, EXPORT_TEST, SOURCE_PATHS, HOT_PROXY_SOURCE_PATHS, DECODER_PATHS, STATE_KEYS, canonical, sha256, stateDifferences,
   TEMPORAL_POLICY_VERSION, TEMPORAL_STATES, TEMPORAL_PATHS, compareExportStates,
   validateStates, validateSnapshot, validateExecution, workspaceInvocation, prepare, capture, verify,
 } from './check-coex-runtime-export.mjs';
@@ -16,7 +16,8 @@ const historicalStates = JSON.parse(readFileSync(join(REPO_ROOT, 'ui/src/contrac
 const states = () => structuredClone(historicalStates);
 const decoderHashes = () => Object.fromEntries(DECODER_PATHS.map(path => [path, sha256(readFileSync(join(REPO_ROOT, path)))]));
 const hashes = () => Object.fromEntries(SOURCE_PATHS.map(path => [path, sha256(path)]));
-const snapshot = () => ({ commit: 'a'.repeat(40), tree: 'b'.repeat(40), trackedStatus: '', sourceSha256: hashes(), decoderSourceSha256: decoderHashes() });
+const hotHashes = () => Object.fromEntries(HOT_PROXY_SOURCE_PATHS.map(path => [path, sha256(path)]));
+const snapshot = () => ({ commit: 'a'.repeat(40), tree: 'b'.repeat(40), trackedStatus: '', sourceSha256: hashes(), hotProxySourceSha256: hotHashes(), decoderSourceSha256: decoderHashes() });
 const execution = () => ({ command: TEST_COMMAND, exitCode: 0, signal: null, logError: null, startedAtMs: 100, finishedAtMs: 200 });
 const passedLine = `test ${EXPORT_TEST} ... ok\n`;
 
@@ -29,21 +30,28 @@ test('canonical comparison preserves every value and array position; only object
   assert.deepEqual(stateDifferences({ rows: [{ value: '3' }] }, { rows: [{ value: '4' }] }),
     [{ path: '$["rows"][0]["value"]', kind: 'changed', expected: '3', actual: '4' }]);
 });
-test('all six states and all nine current sources are mandatory with no extra keys', () => {
+test('all six states, original nine-file footprint and HOT proxy supplement are mandatory with no extra keys', () => {
   validateStates(states(), 'fixture');
   for (const key of STATE_KEYS) { const value = states(); delete value[key]; assert.throws(() => validateStates(value, 'fixture')); }
   assert.throws(() => validateStates({ ...states(), extra: {} }, 'fixture'));
   assert.throws(() => validateStates({ ...states(), latest: null }, 'fixture'));
-  validateSnapshot(snapshot(), 'a'.repeat(40), hashes());
-  for (const key of SOURCE_PATHS) { const value = snapshot(); delete value.sourceSha256[key]; assert.throws(() => validateSnapshot(value, value.commit, hashes())); }
-  for (const key of DECODER_PATHS) { const value = snapshot(); delete value.decoderSourceSha256[key]; assert.throws(() => validateSnapshot(value, value.commit, hashes())); }
+  validateSnapshot(snapshot(), 'a'.repeat(40), hashes(), hotHashes());
+  for (const key of SOURCE_PATHS) { const value = snapshot(); delete value.sourceSha256[key]; assert.throws(() => validateSnapshot(value, value.commit, hashes(), hotHashes())); }
+  for (const key of HOT_PROXY_SOURCE_PATHS) { const value = snapshot(); delete value.hotProxySourceSha256[key]; assert.throws(() => validateSnapshot(value, value.commit, hashes(), hotHashes())); }
+  for (const key of HOT_PROXY_SOURCE_PATHS) { const value = hotHashes(); delete value[key]; assert.throws(() => validateSnapshot(snapshot(), 'a'.repeat(40), hashes(), value)); }
+  for (const key of DECODER_PATHS) { const value = snapshot(); delete value.decoderSourceSha256[key]; assert.throws(() => validateSnapshot(value, value.commit, hashes(), hotHashes())); }
   for (const value of [
     { ...snapshot(), commit: 'c'.repeat(40) }, { ...snapshot(), tree: '' },
     { ...snapshot(), trackedStatus: ' M source.rs' },
     { ...snapshot(), sourceSha256: { ...hashes(), extra: '1' } },
+    { ...snapshot(), hotProxySourceSha256: { ...hotHashes(), extra: '1' } },
+    ...HOT_PROXY_SOURCE_PATHS.map(path => ({ ...snapshot(), hotProxySourceSha256: { ...hotHashes(), [path]: '0'.repeat(64) } })),
     { ...snapshot(), sourceSha256: { ...hashes(), [SOURCE_PATHS[0]]: '0'.repeat(64) } },
-  ]) assert.throws(() => validateSnapshot(value, 'a'.repeat(40), hashes()));
-  assert.throws(() => validateSnapshot(snapshot(), '', hashes()));
+  ]) assert.throws(() => validateSnapshot(value, 'a'.repeat(40), hashes(), hotHashes()));
+  assert.throws(() => validateSnapshot(snapshot(), '', hashes(), hotHashes()));
+  assert.throws(() => validateSnapshot(snapshot(), 'a'.repeat(40), hashes(), undefined));
+  assert.throws(() => validateSnapshot(snapshot(), 'a'.repeat(40), hashes(), { ...hotHashes(), extra: '1' }));
+  for (const path of HOT_PROXY_SOURCE_PATHS) assert.throws(() => validateSnapshot(snapshot(), 'a'.repeat(40), hashes(), { ...hotHashes(), [path]: '0'.repeat(64) }));
 });
 test('zero/ignored/failed/duplicate export tests, nonzero cargo, failed capture and stale exports fail closed', () => {
   validateExecution(execution(), `\x1b[32m${passedLine.trim()}\x1b[0m\n`, 90, 150.9);
@@ -224,11 +232,11 @@ function fixture(t, options = {}, originalStates = states()) {
   const temporary = mkdtempSync(join(tmpdir(), 'coex-checker-unit-'));
   t.after(() => rmSync(temporary, { recursive: true, force: true }));
   const root = join(temporary, 'repo'); mkdirSync(root);
-  for (const path of SOURCE_PATHS) { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), path); }
+  for (const path of [...SOURCE_PATHS, ...HOT_PROXY_SOURCE_PATHS]) { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), path); }
   // Copy the real current consumer and its two real imports. No fake/second decoder.
   for (const path of DECODER_PATHS) { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), readFileSync(join(REPO_ROOT, path))); }
   writeFileSync(join(root, 'ui/package.json'), JSON.stringify({ type: 'module' }));
-  const historical = { states: originalStates, producer: { historical: true }, sourceCompatibility: { sourceSha256: hashes(), originalStatesCanonicalSha256: sha256(canonical(originalStates)) } };
+  const historical = { states: originalStates, producer: { historical: true }, sourceCompatibility: { sourceSha256: hashes(), hotProxyIntegration: { sourceSha256: hotHashes() }, originalStatesCanonicalSha256: sha256(canonical(originalStates)) } };
   const fixturePath = join(root, 'ui/src/contracts/coex-runtime.rust.fixture.json');
   mkdirSync(dirname(fixturePath), { recursive: true }); writeFileSync(fixturePath, JSON.stringify(historical));
   const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
@@ -263,6 +271,8 @@ test('actual checker path retains evidence, passes controlled matching output, a
   assert.deepEqual(result.decoder.results.map(row => row.name), STATE_KEYS);
   assert.ok(result.decoder.results.every(row => row.status === 'passed' && row.inputSha256 === row.decodedSha256));
   assert.deepEqual(result.decoder.sourceSha256, decoderHashes());
+  assert.deepEqual(result.after.hotProxySourceSha256, hotHashes());
+  assert.deepEqual(JSON.parse(readFileSync(join(f.directory, 'before.json'))).hotProxySourceSha256, hotHashes());
   const invocations = readFileSync(f.env.FAKE_INVOCATIONS, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(invocations, [{ args: ['test', '--workspace', '--no-fail-fast'], exportPath: join(f.directory, 'coex-runtime-current.json') }]);
   assert.deepEqual(readFileSync(f.fixturePath), f.historicalBytes);
@@ -290,6 +300,43 @@ for (const options of [{ NO_EXPORT: '1' }, { ZERO_TESTS: '1' }, { FAKE_EXIT: '7'
     assert.ok(existsSync(join(f.directory, 'state-diff.json')));
   });
 }
+for (const change of ['missing', 'extra', 'bytes']) {
+  const tamperPreparedSupplement = f => {
+    const path = join(f.directory, 'before.json');
+    const before = JSON.parse(readFileSync(path));
+    if (change === 'missing') delete before.hotProxySourceSha256[HOT_PROXY_SOURCE_PATHS[0]];
+    else if (change === 'extra') before.hotProxySourceSha256.extra = '0'.repeat(64);
+    else before.hotProxySourceSha256[HOT_PROXY_SOURCE_PATHS[0]] = '0'.repeat(64);
+    writeFileSync(path, JSON.stringify(before));
+  };
+  test(`capture rejects ${change} in the prepared HOT proxy supplement before invoking cargo`, async t => {
+    const f = fixture(t);
+    tamperPreparedSupplement(f);
+    await assert.rejects(capture(f.root, f.script, f.env), /checkout changed before workspace test/);
+    assert.equal(existsSync(f.env.FAKE_INVOCATIONS), false);
+  });
+  test(`verification rejects ${change} in the before/after HOT proxy supplement`, async t => {
+    const f = fixture(t);
+    assert.equal(await capture(f.root, f.script, f.env), 0);
+    tamperPreparedSupplement(f);
+    await assert.rejects(verify(f.root, f.env), /before\/after hotProxySourceSha256 changed/);
+    assert.deepEqual(readFileSync(f.fixturePath), f.historicalBytes);
+  });
+}
+for (const phase of ['before capture', 'after test']) test(`HOT runtime module byte drift ${phase} fails closed`, async t => {
+  const f = fixture(t);
+  if (phase === 'after test') assert.equal(await capture(f.root, f.script, f.env), 0);
+  writeFileSync(join(f.root, 'src-tauri/src/runtime/proxy/runtime_config.rs'), 'changed HOT publication caller');
+  if (phase === 'before capture') {
+    await assert.rejects(capture(f.root, f.script, f.env), /checkout changed before workspace test/);
+    assert.equal(existsSync(f.env.FAKE_INVOCATIONS), false);
+  } else {
+    await assert.rejects(verify(f.root, f.env), /checkout differs/);
+    const result = JSON.parse(readFileSync(join(f.directory, 'verification.json')));
+    assert.equal(result.after.hotProxySourceSha256['src-tauri/src/runtime/proxy/runtime_config.rs'], sha256('changed HOT publication caller'));
+  }
+  assert.deepEqual(readFileSync(f.fixturePath), f.historicalBytes);
+});
 test('actual checker preserves full field mismatch, and rejects a changed source/checkout', async t => {
   const current = states(); current.latest.binding.sessionId.value = '4';
   const f = fixture(t, { EXPORT_BYTES: JSON.stringify({ provenance: 'controlled fixture', states: current }) });

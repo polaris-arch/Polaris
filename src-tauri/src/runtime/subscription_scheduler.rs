@@ -319,6 +319,14 @@ fn build_autoupdate_payload(id: &str, name: &str, result: &Value) -> Value {
     }
 }
 
+/// A superseded refresh belongs to the replacement edit, not scheduler failure/backoff.
+fn refresh_completion_status(result: &Value) -> Option<bool> {
+    if result.get("superseded").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    Some(result.get("success").and_then(Value::as_bool) == Some(true))
+}
+
 /// 订阅自动更新调度器（含退避 + 防重入 + 挂起补更）。
 pub struct SubscriptionScheduler {
     inner: Arc<Mutex<Inner>>,
@@ -498,7 +506,9 @@ impl SubscriptionScheduler {
             // 逐个更新（不持调度器锁跨 await）。
             for id in selection.due_ids {
                 let result = perform_subscription_update(app, state.inner(), &id).await;
-                let ok = result.get("success").and_then(Value::as_bool) == Some(true);
+                let Some(ok) = refresh_completion_status(&result) else {
+                    continue; // no stale toast, no failure backoff for the replacement URL
+                };
                 // 失败落日志（对齐 上游 SubScheduler logManager.addLog('warn', ...)：后台失败的用户可见面 =
                 // 日志）+ 发事件让渲染端弹 toast（补 上游 无、Polaris 原本静默的缺口——退避已限频，不刷屏）。
                 let name = sub_name(&config, &id).to_string();

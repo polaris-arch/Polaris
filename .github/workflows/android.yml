@@ -31,10 +31,10 @@ name: Android
 # 只有 `workflow_call`（release-risk 按影响面调用）与 `workflow_dispatch`（手动复跑）。
 # 没有 push/pull_request 直接触发：本腿要现建 libbox + 全量交叉编译，冷跑昂贵，不该挂在每个 PR 上。
 #
-# ── 两种调用只走 release profile ──
+# ── 默认调用走 release profile；显式候选另有隔离的 arm64 debug consumer ──
 # `publish_release=false`：release-risk 的普通风险验证构建一份未签名 release-profile APK，只在 runner
 # 上做 R8 / resources / native libraries / 16 KiB alignment 等产物级检查，并留存 mapping；APK 本身
-# 不上传为 Actions artifact，也不进入 GitHub Release。Debug 仅用于开发者本地真机功能 QA，CI 不构建。
+# 不上传为 Actions artifact，也不进入 GitHub Release。显式候选的 debug APK 同样不上传、不安装。
 #
 # `publish_release=true`：package.yml 的 tag 发布 DAG 在桌面草稿资产验过后调用 `release-apk`，构建
 # 正式签名 Release APK，校验签名证书与 base applicationId，并把三份 ARM release APK 上传到同 tag 草稿。
@@ -92,13 +92,19 @@ on:
       POLARIS_KEY_ALIAS:
         description: 私钥别名
         required: false
-  # 手动入口只跑非发布 release-profile 验证。发布参数只声明在 workflow_call，故只有 Package DAG
+  # 手动默认入口跑非发布 release-profile；显式 exact-SHA 候选只做 arm64 debug consumer。
+  # 发布参数只声明在 workflow_call，故只有 Package DAG
   # 能传 publish_release=true；避免直接 Android dispatch 与 Package 对同一 tag 草稿并发 --clobber。
   workflow_dispatch:
     inputs:
       preserve_run:
         type: boolean
         default: false
+      hot_consumer_candidate:
+        description: Exact App SHA for the frozen final-kernel Android arm64 diagnostic consumer
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -206,13 +212,26 @@ jobs:
   # tag 上的 `release-apk`（同一组产物判据在签名包上原样再跑一遍），与手动 dispatch 本 workflow
   # （无输入 ⇒ 发行构型）。故发 tag 前若动过 Rust 依赖 / 链接参数，先手动 dispatch 一次本 workflow。
   release_check:
-    name: 未分发 release-profile 产物验证
+    name: ${{ (inputs.hot_consumer_candidate || '') != '' && 'Android arm64 diagnostic consumer build' || '未分发 release-profile 产物验证' }}
     # 发布调用由 signed job 覆盖同一组产物判据，不并行构建 unsigned APK。
-    if: inputs.publish_release != true
+    if: inputs.publish_release != true || (inputs.hot_consumer_candidate || '') != ''
     runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v7
+
+      # A nonempty selector must reach this rejection gate before any setup/cache.
+      # In the signed job this always rejects; no workflow_call candidate input exists.
+      - name: Admit exact Android consumer candidate
+        id: hot_candidate
+        if: (inputs.hot_consumer_candidate || '') != ''
+        env:
+          HOT_CONSUMER_INPUTS: ${{ toJSON(inputs) }}
+        run: python3 scripts/mobile-core/ci-hot-candidate.py admit
+
+      - name: Verify candidate admission and routing contracts
+        if: (inputs.hot_consumer_candidate || '') != ''
+        run: python3 scripts/mobile-core/test-ci-hot-candidate.py
 
       # pnpm 11 要求 Node 22.13+，且版本必须与 ui.yml / package.yml 一致（同一套前端产物）。
       - uses: actions/setup-node@v7
@@ -234,6 +253,7 @@ jobs:
           echo "store_path=$("$RUNNER_TEMP/pnpm/bin/pnpm" store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
+        if: (inputs.hot_consumer_candidate || '') == ''
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm.outputs.store_path }}
@@ -271,6 +291,7 @@ jobs:
       # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
       # 位置必须在 `Setup Rust cache` 之前：两种构型的缓存键靠下面那步的 `-light` 后缀分开。
       - name: Select APK build weight (release profile vs risk-gate light)
+        if: (inputs.hot_consumer_candidate || '') == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -308,6 +329,7 @@ jobs:
       # 与桌面不同的一点：rust-cache 的键默认还含 job id（`add-job-id-key` 缺省 true），签名发布腿
       # 与验证腿本来就各存各的 ⇒ tag 发布构建的缓存冷热不因本改动而变（桌面那边会变，见 package.yml）。
       - name: Setup Rust cache
+        if: (inputs.hot_consumer_candidate || '') == ''
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
@@ -321,8 +343,14 @@ jobs:
       - name: Read pinned libbox Go version
         id: libbox_go
         shell: bash
+        env:
+          HOT_CONSUMER_CANDIDATE: ${{ inputs.hot_consumer_candidate || '' }}
         run: |
           set -euo pipefail
+          if [ -n "$HOT_CONSUMER_CANDIDATE" ]; then
+            echo 'version=1.27.2' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; load()"
           version="$(node -p 'require("./scripts/mobile-core/source-contract.json").goVersion')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -346,7 +374,12 @@ jobs:
           distribution: temurin
           java-version: '17.0.20+101'
 
+      - name: Verify preinstalled candidate SDK and licenses
+        if: (inputs.hot_consumer_candidate || '') != ''
+        run: python3 scripts/mobile-core/ci-hot-candidate.py sdk
+
       - name: Resolve JDK / Android SDK / NDK
+        if: (inputs.hot_consumer_candidate || '') == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -372,18 +405,18 @@ jobs:
             src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
           [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
           echo "compileSdk=$compile_sdk"
-          yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          python3 scripts/libbox-patches/prepare-ndk-linux.py --profile scripts/mobile-core/ndk-r30-linux.json --sdk "$ANDROID_HOME" --check-license-only
           libbox_platform="$(node -p 'require("./scripts/libbox-patches/android-source-policy.json").sdkBootclasspath.platform')"
-          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform"
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform" </dev/null
 
           # ── NDK：两个用途、两条不同约束 ──
           #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
-          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前 r30 beta3）；
+          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前稳定 r30 / 30.0.16248370）；
           #     Cronet 预编译归档不兼容 Rust 所用的 r27，不能混用或摘掉功能标签。
           rust_ndk_version="$(cat scripts/android-rust-ndk.version)"
           rust_ndk="$ANDROID_HOME/ndk/$rust_ndk_version"
           if [ ! -f "$rust_ndk/source.properties" ]; then
-            "$sdkmanager" "ndk;$rust_ndk_version"
+            "$sdkmanager" "ndk;$rust_ndk_version" </dev/null
           fi
           [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
@@ -391,6 +424,7 @@ jobs:
           echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
 
       - name: Resolve bundled core version
+        if: (inputs.hot_consumer_candidate || '') == ''
         id: core
         shell: bash
         run: |
@@ -409,11 +443,13 @@ jobs:
       # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
       # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
       - name: Prepare formal mobile source and isolated tools
+        if: (inputs.hot_consumer_candidate || '') == ''
         id: libbox_input
         shell: bash
         run: python3 scripts/mobile-core/ci_android.py prepare
 
       - name: Restore formal component and fixed Go cache
+        if: (inputs.hot_consumer_candidate || '') == ''
         id: libbox
         uses: actions/cache/restore@v6
         with:
@@ -423,10 +459,12 @@ jobs:
           key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
 
       - name: Build or revalidate formal four-ABI component and App input
+        if: (inputs.hot_consumer_candidate || '') == ''
         shell: bash
         run: python3 scripts/mobile-core/ci_android.py build
 
       - name: libbox.aar 必须在位
+        if: (inputs.hot_consumer_candidate || '') == ''
         id: libbox_verified
         shell: bash
         run: |
@@ -445,8 +483,27 @@ jobs:
           key: ${{ steps.libbox.outputs.cache-primary-key }}
 
 
+      - name: Build frozen Android arm64 diagnostic consumer
+        if: (inputs.hot_consumer_candidate || '') != ''
+        run: python3 scripts/mobile-core/ci-hot-candidate.py build
+
+      - name: Retain Android candidate evidence only
+        if: always() && (inputs.hot_consumer_candidate || '') != '' && steps.hot_candidate.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-hot-consumer-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.hot_candidate.outputs.evidence }}/*.json
+            ${{ steps.hot_candidate.outputs.evidence }}/*.xml
+            ${{ steps.hot_candidate.outputs.evidence }}/*.log
+            ${{ steps.hot_candidate.outputs.evidence }}/*.log.stdout.raw
+            ${{ steps.hot_candidate.outputs.evidence }}/*.log.stderr.raw
+          if-no-files-found: error
+          retention-days: 90
+
       # Release profile 构建直接让 Tauri 驱动 Gradle；本腿显式只产出未分发的未签名验证包。
       - name: Build unsigned release-profile validation APK
+        if: (inputs.hot_consumer_candidate || '') == ''
         shell: bash
         env:
           ANDROID_NDK_HOME: ${{ env.NDK_RUST }}
@@ -502,6 +559,7 @@ jobs:
       # Run the S5 source-owned tests against this checkout's real generated Gradle/AAR inputs.
       # The clean task removes prior variant reports; nonzero complete method coverage is checked below.
       - name: Verify S5 Android network observation and admission unit tests
+        if: (inputs.hot_consumer_candidate || '') == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -514,13 +572,16 @@ jobs:
             --tests com.polaris2.app.vpn.AndroidNativeAdmissionTest \
             --tests com.polaris2.app.vpn.AndroidNativeMainControlsTest \
             --tests com.polaris2.app.vpn.MainNativeAdmissionWiringTest \
+            --tests com.polaris2.app.vpn.DualModeEndpointWiringTest \
+            --tests com.polaris2.app.vpn.RuntimePersistenceSourceTest \
+            --tests com.polaris2.app.vpn.RuntimeProtocolAdmissionTest \
             -PpolarisAllowUnsigned=true -x :app:rustBuildArm64Release --max-workers=2 --no-daemon
           python3 -I - "$RUNNER_TEMP/s5-android-unit-results.json" <<'PYRESULT'
           import hashlib, json, re, subprocess, sys
           from pathlib import Path
           from xml.etree import ElementTree as ET
           base = Path('src-tauri/gen/android/app')
-          classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest']
+          classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest', 'RuntimePersistenceSourceTest', 'RuntimeProtocolAdmissionTest']
           rows = []
           for name in classes:
               source = base / 'src/test/java/com/polaris2/app/vpn' / (name + '.kt')
@@ -549,21 +610,24 @@ jobs:
           PYRESULT
 
       - name: wry keep 规则与生成物对拍
+        if: (inputs.hot_consumer_candidate || '') == ''
         run: node scripts/verify-wry-keep-rules.mjs
 
       - name: release 构建行为裁判（gradle 配置期实证）
+        if: (inputs.hot_consumer_candidate || '') == ''
         env:
           POLARIS_GATE_CI_DAEMON: "1"
         run: bash scripts/gate-android-release-behavior.sh
 
       # APK 不会上传；验证结论与 mapping 才是这条非发布腿的输出。
       - name: 开箱验（resources / native libraries / 16 KiB）
+        if: (inputs.hot_consumer_candidate || '') == ''
         run: node scripts/verify-apk.mjs src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a
 
       # 先留存再判定：configuration.txt 的断言万一红了，mapping 也已经拿到手，
       # 不用为了取证再构一版（而重构一版的 R8 输入已经变了，映射对不上）。
       - name: 留存 mapping.txt / usage.txt（唯一能把 logcat 反混淆回来的东西）
-        if: always()
+        if: always() && (inputs.hot_consumer_candidate || '') == ''
         uses: actions/upload-artifact@v7
         with:
           name: android-release-mapping
@@ -579,6 +643,9 @@ jobs:
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidNativeAdmissionTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidNativeMainControlsTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.MainNativeAdmissionWiringTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.DualModeEndpointWiringTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimePersistenceSourceTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.RuntimeProtocolAdmissionTest.xml
             ${{ runner.temp }}/s5-android-unit-results.json
             ${{ runner.temp }}/release-stage1.log
           # Preserve original Rust/Tauri/frontend/first-Gradle stage1 output even on failure.
@@ -599,6 +666,7 @@ jobs:
       #      东西**。keep 指向一个不存在的类时，那行文本照样在，而类已被 R8 整包剪掉。
       #      「保住了什么」的判据是 seeds.txt —— 那份文件早就在上传清单里，却一条断言都没有。
       - name: R8 吃进了什么 / 保住了什么（产物级证据）
+        if: (inputs.hot_consumer_candidate || '') == ''
         run: |
           node scripts/assert-r8-evidence.mjs src-tauri/gen/android/app/build/outputs/mapping/arm64Release
           python3 scripts/mobile-core/ci_android.py verify --apk src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk --abi arm64-v8a --r8 src-tauri/gen/android/app/build/outputs/mapping/arm64Release
@@ -606,7 +674,7 @@ jobs:
       # prepare can reject after observation but before it emits work/cache outputs.
       # Keep these two fixed-root inputs independently of successful SDK admission.
       - name: Retain actual NDK input observations even on prepare failure
-        if: always()
+        if: always() && (inputs.hot_consumer_candidate || '') == ''
         uses: actions/upload-artifact@v7
         with:
           name: formal-mobile-ndk-input-${{ github.job }}
@@ -617,7 +685,7 @@ jobs:
           retention-days: 90
 
       - name: Retain actual formal mobile component and original receipts
-        if: always() && steps.libbox_input.outcome == 'success'
+        if: always() && steps.libbox_input.outcome == 'success' && (inputs.hot_consumer_candidate || '') == ''
         uses: actions/upload-artifact@v7
         with:
           name: formal-mobile-input-${{ github.job }}
@@ -636,6 +704,7 @@ jobs:
           retention-days: 90
 
       - name: 记录未分发 APK 体积
+        if: (inputs.hot_consumer_candidate || '') == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -692,6 +761,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      # A nonempty selector must reach this rejection gate before any setup/cache.
+      # In the signed job this always rejects; no workflow_call candidate input exists.
+      - name: Admit exact Android consumer candidate
+        id: hot_candidate
+        if: (inputs.hot_consumer_candidate || '') != ''
+        env:
+          HOT_CONSUMER_INPUTS: ${{ toJSON(inputs) }}
+        run: python3 scripts/mobile-core/ci-hot-candidate.py admit
+
+      - name: Verify candidate admission and routing contracts
+        if: (inputs.hot_consumer_candidate || '') != ''
+        run: python3 scripts/mobile-core/test-ci-hot-candidate.py
 
       # 先验发布身份，后续所有资产写入只认这一组 tag / commit / draft。
       # publish_release 输入只存在于 workflow_call；package.yml 创建草稿后才可调用本 job。
@@ -754,6 +836,7 @@ jobs:
           echo "store_path=$("$RUNNER_TEMP/pnpm/bin/pnpm" store path --silent)" >> "$GITHUB_OUTPUT"
 
       - name: Cache pnpm store
+        if: (inputs.hot_consumer_candidate || '') == ''
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm.outputs.store_path }}
@@ -791,6 +874,7 @@ jobs:
       # 签名发布腿上本步恒走发行分支：零写入，只查「环境里没有任何 cargo profile 覆盖」。
       # 位置必须在 `Setup Rust cache` 之前：两种构型的缓存键靠下面那步的 `-light` 后缀分开。
       - name: Select APK build weight (release profile vs risk-gate light)
+        if: (inputs.hot_consumer_candidate || '') == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -828,6 +912,7 @@ jobs:
       # 与桌面不同的一点：rust-cache 的键默认还含 job id（`add-job-id-key` 缺省 true），签名发布腿
       # 与验证腿本来就各存各的 ⇒ tag 发布构建的缓存冷热不因本改动而变（桌面那边会变，见 package.yml）。
       - name: Setup Rust cache
+        if: (inputs.hot_consumer_candidate || '') == ''
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
@@ -841,8 +926,14 @@ jobs:
       - name: Read pinned libbox Go version
         id: libbox_go
         shell: bash
+        env:
+          HOT_CONSUMER_CANDIDATE: ${{ inputs.hot_consumer_candidate || '' }}
         run: |
           set -euo pipefail
+          if [ -n "$HOT_CONSUMER_CANDIDATE" ]; then
+            echo 'version=1.27.2' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           python3 -c "import sys; sys.path.insert(0, 'scripts/mobile-core'); from fork_input import load; load()"
           version="$(node -p 'require("./scripts/mobile-core/source-contract.json").goVersion')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -866,7 +957,12 @@ jobs:
           distribution: temurin
           java-version: '17.0.20+101'
 
+      - name: Verify preinstalled candidate SDK and licenses
+        if: (inputs.hot_consumer_candidate || '') != ''
+        run: python3 scripts/mobile-core/ci-hot-candidate.py sdk
+
       - name: Resolve JDK / Android SDK / NDK
+        if: (inputs.hot_consumer_candidate || '') == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -892,18 +988,18 @@ jobs:
             src-tauri/gen/android/app/build.gradle.kts | grep -oE '[0-9]+$' | head -1)"
           [ -n "$compile_sdk" ] || { echo "::error::从 build.gradle.kts 读不到 compileSdk"; exit 1; }
           echo "compileSdk=$compile_sdk"
-          yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+          python3 scripts/libbox-patches/prepare-ndk-linux.py --profile scripts/mobile-core/ndk-r30-linux.json --sdk "$ANDROID_HOME" --check-license-only
           libbox_platform="$(node -p 'require("./scripts/libbox-patches/android-source-policy.json").sdkBootclasspath.platform')"
-          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform"
+          "$sdkmanager" "platforms;android-${compile_sdk}" "build-tools;${compile_sdk}.0.0" "platforms;$libbox_platform" </dev/null
 
           # ── NDK：两个用途、两条不同约束 ──
           #   · Rust 交叉编译：使用 scripts/android-rust-ndk.version 的已验稳定版。
-          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前 r30 beta3）；
+          #   · libbox：使用 mobile-core/source-contract.json 固定的独立 NDK（当前稳定 r30 / 30.0.16248370）；
           #     Cronet 预编译归档不兼容 Rust 所用的 r27，不能混用或摘掉功能标签。
           rust_ndk_version="$(cat scripts/android-rust-ndk.version)"
           rust_ndk="$ANDROID_HOME/ndk/$rust_ndk_version"
           if [ ! -f "$rust_ndk/source.properties" ]; then
-            "$sdkmanager" "ndk;$rust_ndk_version"
+            "$sdkmanager" "ndk;$rust_ndk_version" </dev/null
           fi
           [ -f "$rust_ndk/source.properties" ] || { echo "::error::Rust NDK 未安装：$rust_ndk"; exit 1; }
           echo "NDK_RUST=$rust_ndk" >> "$GITHUB_ENV"
@@ -911,6 +1007,7 @@ jobs:
           echo "NDK(rust)=$rust_ndk; libbox tools are verified before source cache lookup"
 
       - name: Resolve bundled core version
+        if: (inputs.hot_consumer_candidate || '') == ''
         id: core
         shell: bash
         run: |
@@ -929,11 +1026,13 @@ jobs:
       # null/partial 配置先拒绝；命中与 fresh 都消费同一个源码/产物谓词。
       # Pure admission already ran before Go/SDK preparation. Actual tool bytes precede AAR cache lookup.
       - name: Prepare formal mobile source and isolated tools
+        if: (inputs.hot_consumer_candidate || '') == ''
         id: libbox_input
         shell: bash
         run: python3 scripts/mobile-core/ci_android.py prepare
 
       - name: Restore formal component and fixed Go cache
+        if: (inputs.hot_consumer_candidate || '') == ''
         id: libbox
         uses: actions/cache/restore@v6
         with:
@@ -943,10 +1042,12 @@ jobs:
           key: libbox-formal-v1-${{ runner.os }}-${{ steps.libbox_input.outputs.fingerprint }}
 
       - name: Build or revalidate formal four-ABI component and App input
+        if: (inputs.hot_consumer_candidate || '') == ''
         shell: bash
         run: python3 scripts/mobile-core/ci_android.py build
 
       - name: libbox.aar 必须在位
+        if: (inputs.hot_consumer_candidate || '') == ''
         id: libbox_verified
         shell: bash
         run: |

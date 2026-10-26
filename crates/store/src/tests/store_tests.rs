@@ -617,8 +617,26 @@ fn legacy_invalid_tun_stack_loads_and_saves_without_validation_error() {
 }
 
 #[test]
-fn new_installation_uses_global_chrome_default_policy() {
-    assert_eq!(default_config()["utlsPolicy"], "default");
+fn new_installation_uses_follow_and_preserves_explicit_saved_policies() {
+    let fs = MockFs::default();
+    let fresh = ConfigStore::load(&fs, Path::new(CFG));
+    assert!(fresh.was_missing);
+    assert!(fresh.error.is_none());
+    assert_eq!(fresh.config["utlsPolicy"], "follow");
+    ConfigStore::save(&fs, Path::new(CFG), &fresh.config, "abcdef012345").unwrap();
+    assert_eq!(
+        ConfigStore::load(&fs, Path::new(CFG)).config["utlsPolicy"],
+        "follow"
+    );
+    for policy in ["follow", "default", "random", "firefox", "future-custom"] {
+        let mut config = default_config();
+        config["utlsPolicy"] = serde_json::json!(policy);
+        ConfigStore::save(&fs, Path::new(CFG), &config, "abcdef012345").unwrap();
+        let loaded = ConfigStore::load(&fs, Path::new(CFG));
+        assert!(loaded.loaded_from_disk);
+        assert!(loaded.error.is_none());
+        assert_eq!(loaded.config["utlsPolicy"], policy);
+    }
 }
 
 #[test]
@@ -799,4 +817,27 @@ fn raw_save_pin_validation_uses_the_shared_emission_policy() {
             );
         }
     }
+}
+
+#[test]
+fn unsupported_vision_transport_remains_repairable_across_real_store() {
+    let fs = MockFs::default();
+    let mut original = default_config();
+    original["servers"] = serde_json::json!([
+        {"id":"bad","name":"RepairMe","protocol":"vless","address":"private.example","port":443,"uuid":"private-uuid","flow":"xtls-rprx-vision","network":"httpupgrade","security":"tls","wsSettings":{"path":"/retained","headers":{"Host":"retained.example"}}},
+        {"id":"good","name":"Good","protocol":"vless","address":"good.example","port":443,"uuid":"good-uuid"}
+    ]);
+    original["selectedServerId"] = serde_json::json!("good");
+    ConfigStore::save(&fs, Path::new(CFG), &original, "abcdef012345").unwrap();
+    let loaded = ConfigStore::load(&fs, Path::new(CFG));
+    assert!(loaded.loaded_from_disk);
+    assert!(loaded.error.is_none());
+    assert_eq!(loaded.config["servers"], original["servers"]);
+    let nodes: Vec<polaris_config_engine::user_config::server_config::ServerConfig> =
+        serde_json::from_value(loaded.config["servers"].clone()).unwrap();
+    assert_eq!(
+        polaris_config_engine::builder::outbound::validate_vision_transport(&nodes[0]),
+        Err("vision-transport-unsupported")
+    );
+    assert!(polaris_config_engine::builder::outbound::validate_vision_transport(&nodes[1]).is_ok());
 }

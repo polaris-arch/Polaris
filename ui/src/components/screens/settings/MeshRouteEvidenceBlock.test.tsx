@@ -40,6 +40,24 @@ describe('P1 route evidence is a bounded report, not a live ownership claim', ()
     expect(settingsTunSource).not.toContain('api.config.endpointForceRouteReport()');
   });
 
+  it('provides runtime commit labels in both surfaces for all supported locales', () => {
+    for (const language of ['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa']) {
+      const text = JSON.parse(readFileSync(fileURLToPath(new URL(`../../../i18n/locales/${language}.json`, import.meta.url)), 'utf8'));
+      expect(text.settings.tun.meshEvidence.load.runtimeCommitted).toEqual(expect.any(String));
+      expect(text.mobileMeshRouteEvidence.load.runtimeCommitted).toEqual(expect.any(String));
+      expect(Object.keys(text.settings.tun.meshEvidence.load).sort())
+        .toEqual(Object.keys(text.mobileMeshRouteEvidence.load).sort());
+    }
+  });
+
+  it('renders committed runtime loading as separate evidence from startup loading', () => {
+    const report = clone();
+    report.snapshot.scope = 'applied';
+    report.snapshot.loadEvidence = 'runtimeCommitted';
+    expect(render(report)).toContain('运行时加载已提交');
+    expect(render(report)).not.toContain('启动加载已确认');
+  });
+
   it('keeps producer order and distinguishes full, none, and unknown without CIDR calculation', () => {
     const rows = meshRouteEvidenceRows(fixture);
     expect(rows.map((row) => row.candidate.serverId)).toEqual(['a', 'b', 'c']);

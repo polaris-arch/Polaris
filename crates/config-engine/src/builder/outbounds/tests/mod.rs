@@ -2112,3 +2112,110 @@ fn helper_and_probe_tags_cannot_be_captured_by_node_display_names() {
         assert_eq!(tags.contains("probe-selector-0"), enabled);
     }
 }
+
+#[test]
+fn vision_invalid_nodes_preserve_explicit_targets_and_good_auto_candidates() {
+    use crate::user_config::auto_select::{AutoSelectPin, AutoSelectTarget, SelectionIntent};
+    let bad = ServerConfig {
+        id: "bad".into(),
+        name: "Bad".into(),
+        protocol: Protocol::Vless,
+        flow: Some("xtls-rprx-vision".into()),
+        network: Some("ws".into()),
+        ..Default::default()
+    };
+    let good = ServerConfig {
+        id: "good".into(),
+        name: "Good".into(),
+        protocol: Protocol::Vless,
+        ..Default::default()
+    };
+    let mut config = UserConfig {
+        servers: vec![good, bad],
+        selected_server_id: Some("good".into()),
+        ..Default::default()
+    };
+    let original = serde_json::to_value(&config).unwrap();
+    let mut deps = deps_default();
+    let result = build_outbounds(&config, &mut deps).unwrap();
+    assert_eq!(
+        deps.gate_invalid_nodes.get("bad").copied(),
+        Some(INVALID_REASON_VISION_TRANSPORT)
+    );
+    assert!(!result.outbounds.iter().any(|o| o.tag == "Bad"));
+    assert_eq!(serde_json::to_value(&config).unwrap(), original);
+    config.selected_server_id = Some("bad".into());
+    assert!(build_outbounds(&config, &mut deps_default())
+        .unwrap_err()
+        .contains("INVALID_ROUTE_TARGET"));
+    config.selected_server_id = Some("good".into());
+    config.servers[0].detour = Some("bad".into());
+    assert!(build_outbounds(&config, &mut deps_default())
+        .unwrap_err()
+        .contains("INVALID_ROUTE_TARGET"));
+    config.servers[0].detour = None;
+    config.app_rules = vec![crate::user_config::AppRule {
+        app_id: "browser".into(),
+        action: RuleAction::Proxy,
+        enabled: true,
+        target_server_id: Some("bad".into()),
+        target_auto_select: None,
+    }];
+    assert!(build_outbounds(&config, &mut deps_default())
+        .unwrap_err()
+        .contains("INVALID_ROUTE_TARGET"));
+    config.app_rules.clear();
+    config.traffic_rules = Some(vec![Rule {
+        id: "target".into(),
+        type_field: RuleType::Domain,
+        values: vec!["example.test".into()],
+        action: RuleAction::Proxy,
+        enabled: true,
+        effects: Some(RuleEffects {
+            route: Some(RuleRouteEffect {
+                enabled: true,
+                action: RuleAction::Proxy,
+                target_server_id: Some("bad".into()),
+                target_auto_select: None,
+                destination_resolution: None,
+                resolution_only: false,
+            }),
+            dns: None,
+        }),
+        ..Default::default()
+    }]);
+    assert!(build_outbounds(&config, &mut deps_default())
+        .unwrap_err()
+        .contains("INVALID_ROUTE_TARGET"));
+    config.traffic_rules = None;
+    config.dns_servers.push(
+        serde_json::from_value(serde_json::json!({
+            "id":"dns-explicit", "name":"DNS", "enabled":true, "type":"udp",
+            "endpoint":{"host":"192.0.2.53"}, "outbound":{"type":"node", "nodeId":"bad"}
+        }))
+        .unwrap(),
+    );
+    assert!(build_outbounds(&config, &mut deps_default())
+        .unwrap_err()
+        .contains("INVALID_ROUTE_TARGET"));
+    config.dns_servers.pop();
+
+    config.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
+    config.auto_select_enabled = true;
+    assert!(build_outbounds(&config, &mut deps_default()).is_ok());
+    config.auto_select_pins = vec![AutoSelectPin {
+        target: AutoSelectTarget::Global,
+        server_id: "bad".into(),
+    }];
+    assert!(build_outbounds(&config, &mut deps_default())
+        .unwrap_err()
+        .contains("INVALID_ROUTE_TARGET"));
+    config.auto_select_pins.clear();
+    config.servers.remove(0);
+    assert!(build_outbounds(&config, &mut deps_default())
+        .unwrap_err()
+        .contains("AUTO_SELECT_SCOPE_EMPTY"));
+}

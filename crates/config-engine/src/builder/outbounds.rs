@@ -54,6 +54,8 @@ pub const INVALID_REASON_DETOUR_CASCADE: &str = "detour-cascade";
 /// 需要动 `ui/src/i18n/locales/*.json`，不在本批射程内。
 pub const INVALID_REASON_REALITY_UTLS_DISABLED: &str = "reality-utls-disabled";
 
+pub const INVALID_REASON_VISION_TRANSPORT: &str = "vision-transport-unsupported";
+
 pub const INVALID_REASON_CUSTOM_MALFORMED: &str = "custom-outbound-malformed";
 
 /// Tailscale `control_url` 非法（IP 字面量 / 缺 scheme / host 畸形）的 reason token 前缀族。
@@ -296,6 +298,47 @@ pub fn build_outbounds(
     build_outbounds_with_runtime_bindings(config, deps, &BTreeMap::new())
 }
 
+/// Explicit invalid destinations must not silently follow a different selector.
+pub fn vision_route_targets_valid(config: &UserConfig) -> bool {
+    // Only explicit desired targets reject the whole graph. Auto scope enumeration
+    // may omit an invalid candidate, with the existing invalid-node report retained.
+    let incompatible: BTreeSet<&str> = config
+        .servers
+        .iter()
+        .filter(|server| crate::builder::outbound::validate_vision_transport(server).is_err())
+        .map(|server| server.id.as_str())
+        .collect();
+    !vision_targets_intersect(config, &incompatible)
+}
+
+fn vision_targets_intersect(config: &UserConfig, incompatible: &BTreeSet<&str>) -> bool {
+    let targets = crate::builder::endpoint_routes::engaged_rule_targeted_server_ids(config);
+    config
+        .effective_selected_server_id()
+        .is_some_and(|id| incompatible.contains(id))
+        || targets.iter().any(|id| incompatible.contains(id.as_str()))
+        || config.dns_servers.iter().filter(|resource| resource.enabled
+            && !matches!(resource.kind, crate::user_config::dns_policy::DnsServerKind::Local | crate::user_config::dns_policy::DnsServerKind::Hosts)).any(|resource| {
+            matches!(&resource.outbound, crate::user_config::dns_policy::DnsServerOutbound::Node { node_id } if incompatible.contains(node_id.as_str()))
+        })
+        || config
+            .servers
+            .iter()
+            .filter(|server| !incompatible.contains(server.id.as_str()))
+            .any(|server| {
+                server
+                    .detour
+                    .as_deref()
+                    .is_some_and(|id| incompatible.contains(id))
+            })
+        || crate::user_config::auto_select::referenced_targets(config)
+            .iter()
+            .any(|target| {
+                crate::user_config::auto_select::pin(config, target)
+                    .is_some_and(|id| incompatible.contains(id))
+            })
+}
+
 /// [`build_outbounds`] + 本次运行期按目的路由推导出的低优先级网卡绑定。
 ///
 /// 显式节点/订阅/全局策略始终优先；运行时映射只填补未配置项，且不写回用户配置。
@@ -305,6 +348,20 @@ pub fn build_outbounds_with_runtime_bindings(
     runtime_bind_interfaces: &BTreeMap<String, String>,
 ) -> Result<OutboundsResult, String> {
     validate_detour_graph(config)?;
+    if !vision_route_targets_valid(config) {
+        return Err("INVALID_ROUTE_TARGET: vision-transport-unsupported".into());
+    }
+    let incompatible: Vec<&str> = config
+        .servers
+        .iter()
+        .filter(|server| crate::builder::outbound::validate_vision_transport(server).is_err())
+        .map(|server| server.id.as_str())
+        .collect();
+    for id in incompatible {
+        deps.gate_invalid_nodes
+            .insert(id.to_string(), INVALID_REASON_VISION_TRANSPORT);
+    }
+
     let mut pending_endpoints: Vec<Endpoint> = Vec::new();
     let mut pending_rule_selectors: Vec<PendingRuleSelector> = Vec::new();
     let mut outbounds: Vec<Outbound> = Vec::new();

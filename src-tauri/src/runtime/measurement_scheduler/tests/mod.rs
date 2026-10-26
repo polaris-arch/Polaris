@@ -2592,3 +2592,69 @@ fn freshness_index_preserves_first_plan_membership() {
     assert_eq!(indexed["same"], 5 * MINUTE);
     assert_eq!(indexed["second"], 30 * MINUTE);
 }
+
+#[test]
+fn metadata_invalidation_keeps_effective_plan_due_inflight_and_expired_results() {
+    let config = json!({
+        "subscriptions": [{"id":"sub", "periodicSpeedTest":true,
+            "etag":"old", "lastUpdated":"old", "lastModified":"old"}],
+        "servers": [{"id":"a", "name":"A", "protocol":"http", "subscriptionId":"sub"}]
+    });
+    let mut updated = config.clone();
+    updated["subscriptions"][0]["etag"] = json!("new");
+    updated["subscriptions"][0]["lastUpdated"] = json!("2026-10-25T09:00:00Z");
+    updated["subscriptions"][0]["lastModified"] = json!("new-date");
+    updated["subscriptions"][0]["userInfo"] = json!({"upload":10,"download":20});
+    for platform in [
+        Platform::Linux,
+        Platform::Mac,
+        Platform::Win,
+        Platform::Android,
+        Platform::Ios,
+    ] {
+        assert_eq!(
+            effective_plan(&config, platform),
+            effective_plan(&updated, platform)
+        );
+    }
+    let original = effective_plan(&config, Platform::Linux);
+    let refreshed = effective_plan(&updated, Platform::Linux);
+    assert_eq!(original, plan(&[("sub", 30, &["a"])]));
+    let mut planner = Planner::new(Platform::Linux, at(0));
+    assert!(planner
+        .tick(&input(at(0), Some(1), &original))
+        .start
+        .is_none());
+    let due_before = planner.subs["sub"].next_due;
+    let wake = planner.tick(&input(at(FIRST_ROUND_DELAY_MS - 1), Some(1), &refreshed));
+    assert!(wake.start.is_none());
+    assert!(!wake.abort);
+    assert_eq!(planner.subs["sub"].next_due, due_before);
+    let first = planner.tick(&input(at(FIRST_ROUND_DELAY_MS), Some(1), &refreshed));
+    assert!(first.start.is_some());
+    let inflight = planner.status(at(FIRST_ROUND_DELAY_MS), true, &refreshed);
+    let wake = planner.tick(&input(at(FIRST_ROUND_DELAY_MS + 1), Some(1), &refreshed));
+    assert!(wake.start.is_none());
+    assert!(!wake.abort);
+    let after_wake = planner.status(at(FIRST_ROUND_DELAY_MS), true, &refreshed);
+    for field in ["state", "subscriptions", "roundTraceSerial", "roundStarts"] {
+        assert_eq!(after_wake[field], inflight[field], "{field}");
+    }
+    planner.on_round_end(at(FIRST_ROUND_DELAY_MS + 1000), &completed(&[("a", true)]));
+    let due = planner.subs["sub"].next_due;
+    let wake = planner.tick(&input(at(due - 1), Some(1), &refreshed));
+    assert!(wake.start.is_none());
+    assert!(!wake.abort);
+    assert_eq!(planner.subs["sub"].next_due, due);
+    let ledger = MeasurementLedger::new();
+    ledger.record("a", Ok(80), measured(1, WALL));
+    let expired_at = WALL + 60 * MINUTE + 1;
+    assert!(!selectable_at(&ledger, &original, None, expired_at));
+    let wake = planner.tick(&TickInput {
+        ledger: &ledger,
+        ..input(at(due - 1), Some(1), &refreshed)
+    });
+    assert!(wake.start.is_none());
+    assert!(!wake.abort);
+    assert!(!selectable_at(&ledger, &refreshed, None, expired_at));
+}

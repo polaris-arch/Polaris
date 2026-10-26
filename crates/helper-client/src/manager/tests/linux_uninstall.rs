@@ -3,7 +3,7 @@ use super::*;
 
 #[test]
 #[cfg(target_os = "linux")]
-fn linux_uninstall_requires_effective_unit_and_hierarchical_closure() {
+pub(super) fn linux_uninstall_requires_effective_unit_and_hierarchical_closure() {
     // Exercise the actual shared proof with inert stop/removal commands. Sealed
     // utility bootstrap and the maintenance lease are covered by uninstall_unix.
     let script = format!(
@@ -66,6 +66,28 @@ echo polaris-helper-uninstall-ok
         ("NAMESPACE", "mnt", false),
         ("NAMESPACE", "pid", false),
         ("NAMESPACE_READ_RC", "1", false),
+        ("MANAGER_GROUP", "", true),
+        ("MANAGER_FORM", "missing", false),
+        ("MANAGER_FORM", "duplicate", false),
+        ("MANAGER_FORM", "foreign", false),
+        ("INIT_QUERY_RC", "1", false),
+        ("PID1_READ_RC", "1", false),
+        ("PID1_GROUP", "0::/", true),
+        ("PID1_GROUP", "0::/subtree/init.scope", false),
+        ("PID1_GROUP", "0::/init.scope\n0::/init.scope", false),
+        ("PID1_GROUP", "", false),
+        ("INIT_GROUP", "/foreign", false),
+        ("INIT_GROUP", "", true),
+        ("INIT_GROUP", "/", false),
+        ("INIT_LOAD", "not-found", false),
+        ("INIT_STATE", "inactive", false),
+        ("INIT_FORM", "missing", false),
+        ("INIT_FORM", "duplicate", false),
+        ("PID1_MEMBERS", "2", false),
+        ("PID1_MEMBERS", "PRIVATE", false),
+        ("PID1_MEMBERS_RC", "1", false),
+        ("PID1_SECOND_MISSING", "1", false),
+        ("PID1_CHANGED", "1", false),
         ("MANAGER_GROUP", "/subtree", false),
         ("MANAGER_QUERY_RC", "1", false),
         ("MOUNT_ROOT", "/subtree", false),
@@ -85,6 +107,9 @@ echo polaris-helper-uninstall-ok
     ] {
         run_linux_proof_fixture(&script, key, value, succeeds, &[]);
     }
+    // Reproduce the N16 observed empty-manager/empty-unit pair. Namespace and
+    // mount evidence here is an additional strong fixture, not ordinary authority.
+    run_linux_proof_fixture(&script, "INIT_GROUP", "", true, &[("MANAGER_GROUP", "")]);
 }
 
 #[cfg(target_os = "linux")]
@@ -114,12 +139,21 @@ fn run_linux_proof_fixture(
     if matches!(key, "ABSENT_CGROUP" | "ABSENT_FIND_FAIL") {
         std::fs::remove_dir_all(&cgroup).unwrap();
     }
+    std::fs::create_dir_all(fixture.path().join("cgroup/init.scope")).unwrap();
     let commands = [
         ("systemctl", r#"[ "$1" != --system ] || shift
 case "$1" in
   show)
 PROPERTY=${3#--property=}
-if [ "$#" -eq 3 ]; then echo "$PROPERTY=$MOCK_MANAGER_GROUP"; exit "$MOCK_MANAGER_QUERY_RC"; fi
+if [ "$#" -eq 3 ]; then
+  case "$MOCK_MANAGER_FORM" in missing) exit 0;; duplicate) echo "$PROPERTY=/";; foreign) echo Other=; exit 0;; esac
+  echo "$PROPERTY=$MOCK_MANAGER_GROUP"; exit "$MOCK_MANAGER_QUERY_RC"
+fi
+if [ "$4" = init.scope ]; then
+  case "$MOCK_INIT_FORM" in missing) exit 0;; duplicate) echo "$PROPERTY=";; esac
+  case "$PROPERTY" in ControlGroup) VALUE=$MOCK_INIT_GROUP;; LoadState) VALUE=$MOCK_INIT_LOAD;; ActiveState) VALUE=$MOCK_INIT_STATE;; *) exit 90;; esac
+  echo "$PROPERTY=$VALUE"; exit "$MOCK_INIT_QUERY_RC"
+fi
 [ "$PROPERTY" != "$MOCK_MISSING_PROPERTY" ] || exit 0
 if [ "$PROPERTY" = "$MOCK_DUPLICATE_PROPERTY" ]; then echo "$PROPERTY=one"; echo "$PROPERTY=two"; exit 0; fi
 if [ "$PROPERTY" = "$MOCK_FOREIGN_PROPERTY" ]; then echo Foreign=value; exit 0; fi
@@ -153,6 +187,14 @@ esac
         ("stat", "case \"$1:$2\" in -c:%u) echo \"$MOCK_OWNER\";; -c:%a) echo \"$MOCK_MODE\";; -f:-c) echo \"$MOCK_CGTYPE\";; *) exit 90;; esac\n"),
         ("cat", r#"case "$1" in
   /proc/1/comm) echo "$MOCK_MANAGER"; exit 0;;
+  /proc/1/cgroup) [ "$MOCK_PID1_READ_RC" = 0 ] || exit 1
+    if [ "$MOCK_PID1_CHANGED" = 1 ] && [ -f "$MOCK_MEMBERS_SEEN" ]; then echo '0::/'; exit 0; fi
+    printf '%s\n' "$MOCK_PID1_GROUP"; exit 0;;
+  "$MOCK_CGROOT/cgroup.procs"|"$MOCK_CGROOT/init.scope/cgroup.procs")
+    [ "$MOCK_PID1_MEMBERS_RC" = 0 ] || exit 1
+    if [ "$MOCK_PID1_SECOND_MISSING" = 1 ] && [ -f "$MOCK_MEMBERS_SEEN" ]; then echo 2; exit 0; fi
+    : > "$MOCK_MEMBERS_SEEN"
+    printf '%s\n' "$MOCK_PID1_MEMBERS"; exit 0;;
   /proc/self/mountinfo)
 [ "$MOCK_MOUNT_READ_RC" = 0 ] || exit 1
 [ "$MOCK_MOUNT_MISSING" = 0 ] || exit 0
@@ -196,7 +238,10 @@ exec /usr/bin/find "$@"
             ),
         );
     let mut command = std::process::Command::new("/bin/sh");
-    command.args(["-c", &script]).env("PATH", fixture.path());
+    command
+        .args(["-c", &script])
+        .env("PATH", fixture.path())
+        .env("MOCK_MEMBERS_SEEN", fixture.path().join("members-seen"));
     for (name, value) in [
         ("LOAD", "loaded"),
         ("STATE", "inactive"),
@@ -208,7 +253,19 @@ exec /usr/bin/find "$@"
         ("NAMESPACE", ""),
         ("NAMESPACE_READ_RC", "0"),
         ("MANAGER_GROUP", "/"),
+        ("PID1_GROUP", "0::/init.scope"),
+        ("INIT_GROUP", "/init.scope"),
+        ("INIT_LOAD", "loaded"),
+        ("INIT_STATE", "active"),
+        ("INIT_FORM", "normal"),
+        ("PID1_MEMBERS", "1\n2"),
+        ("PID1_MEMBERS_RC", "0"),
+        ("PID1_SECOND_MISSING", "0"),
+        ("PID1_CHANGED", "0"),
         ("MANAGER_QUERY_RC", "0"),
+        ("MANAGER_FORM", "normal"),
+        ("INIT_QUERY_RC", "0"),
+        ("PID1_READ_RC", "0"),
         ("MOUNT_ROOT", "/"),
         ("MOUNT_READ_RC", "0"),
         ("MOUNT_MISSING", "0"),
@@ -281,7 +338,7 @@ exec /usr/bin/find "$@"
 
 #[test]
 #[cfg(target_os = "linux")]
-fn linux_install_inactive_snapshot_still_requires_production_closure() {
+pub(super) fn linux_install_inactive_snapshot_still_requires_production_closure() {
     let params = install_params(PathBuf::from("/inert"), PathBuf::from("/inert/helper"));
     let generated = build_linux_install_script(&InstallPaths::linux(), &params, &"a".repeat(64));
     let stop_body = generated
@@ -361,5 +418,126 @@ echo polaris-helper-uninstall-ok
         ("STATE", "deactivating", false, vec![]),
     ] {
         run_linux_proof_fixture(&script, key, value, succeeds, &overrides);
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+pub(super) fn linux_cleanup_failure_markers_do_not_change_success_or_recovery() {
+    let params = install_params(PathBuf::from("/inert"), PathBuf::from("/inert/helper"));
+    let generated = build_linux_install_script(&InstallPaths::linux(), &params, &"a".repeat(64));
+    let functions = generated
+        .split_once("\ncleanup_failure() {\n")
+        .unwrap()
+        .1
+        .split_once("\ntrap cleanup EXIT")
+        .unwrap()
+        .0;
+    assert!(!functions.contains("\ntrap "));
+    assert!(!functions.contains("/bin/"));
+    for (original, removal, expected) in [(0, 0, 0), (7, 0, 7), (0, 2, 2), (7, 2, 2)] {
+        let script = format!(
+            r#"set -eu
+{diagnostics}
+cleanup_failure() {{
+{functions}
+rm() {{ return {removal}; }}
+touch() {{ :; }}
+admin() {{ :; }}
+close_bootstrap() {{ :; }}
+ADMITTED=0
+TXDIR=/inert-polaris-diagnostic-only
+BOOT=''
+INSTALL_STAGE=manager-property
+trap cleanup EXIT
+exit {original}
+"#,
+            diagnostics = linux_service_stop::DIAGNOSTICS
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .env_clear()
+            .env("PATH", "/nonexistent-polaris-inert-test")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if expected == 0 {
+            assert!(!stderr.contains("POLARIS_HELPER_FAILURE_V1:"));
+        } else {
+            let stage = if original == 0 {
+                "cleanup"
+            } else {
+                "manager-property"
+            };
+            assert!(stderr.contains(&format!("POLARIS_HELPER_FAILURE_V1:{stage}:")));
+            if removal != 0 {
+                assert!(stderr.contains("recovery-unconfirmed"));
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+pub(super) fn linux_maintenance_traps_keep_success_silent_and_cleanup_unknown() {
+    let utility = MaintenanceUtility {
+        src_binary: PathBuf::from("/inert/helper"),
+        helper_sha256: "a".repeat(64),
+    };
+    let generated = uninstall_unix::build_linux_uninstall_script(&InstallPaths::linux(), &utility);
+    for name in ["bootstrap_cleanup", "cleanup"] {
+        let definition = generated
+            .split_once(&format!("\n{name}() {{\n"))
+            .unwrap()
+            .1
+            .split_once(&format!("\ntrap {name} EXIT"))
+            .unwrap()
+            .0;
+        assert!(!definition.contains("\ntrap "));
+        assert!(!definition.contains("/bin/chmod"));
+        assert!(!definition.contains("/usr/bin/mktemp"));
+        assert!(!definition.contains("/bin/"));
+        for (original, close_failed, expected) in [(0, 0, 0), (7, 0, 7), (0, 1, 1), (7, 1, 1)] {
+            let expected = if name == "bootstrap_cleanup" && original == 7 {
+                7
+            } else {
+                expected
+            };
+            let script = format!(
+                r#"set -eu
+{diagnostics}
+{name}() {{
+{definition}
+close_bootstrap() {{ return {close_failed}; }}
+rm() {{ return 91; }}
+touch() {{ return 91; }}
+admin() {{ return 91; }}
+FINISHED=1
+TXDIR=''
+FINAL_STATE=stopped-removed-lease-preserved
+INSTALL_STAGE=manager-property
+trap {name} EXIT
+exit {original}
+"#,
+                diagnostics = linux_service_stop::DIAGNOSTICS
+            );
+            let output = std::process::Command::new("/bin/sh")
+                .env_clear()
+                .env("PATH", "/nonexistent-polaris-inert-test")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected));
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            if expected == 0 {
+                assert!(!stderr.contains("POLARIS_HELPER_FAILURE_V1:"));
+            } else {
+                assert!(stderr.contains("POLARIS_HELPER_FAILURE_V1:"));
+            }
+            if close_failed != 0 {
+                assert!(stderr.contains("recovery-unconfirmed"));
+            }
+        }
     }
 }

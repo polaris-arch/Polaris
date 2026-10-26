@@ -4,6 +4,8 @@ import {
   pendingChangesCount,
   hasPendingWork,
   applyOutcome,
+  runtimePersistenceRecoveryEnded,
+  runtimeApplyRejectedKey,
   applyStateOnLifecycle,
   isRestartFailureCode,
   composeBarView,
@@ -79,7 +81,27 @@ describe('pendingChangesCount', () => {
   });
 });
 
+describe('runtimePersistenceRecoveryEnded', () => {
+  const superseded = [{ code: 'OWNER_STATE_SUPERSEDED', path: 'desired' }];
+  it('ends only a confirmed superseded desired-owner recovery', () => {
+    expect(runtimePersistenceRecoveryEnded('conflict', superseded)).toBe(true);
+    expect(runtimePersistenceRecoveryEnded('unconfirmed', superseded)).toBe(false);
+    expect(runtimePersistenceRecoveryEnded('conflict', [{ code: 'OWNER_STATE_SUPERSEDED', path: 'active' }])).toBe(false);
+    expect(runtimePersistenceRecoveryEnded('conflict', [{ code: 'CONFLICT', path: 'desired' }])).toBe(false);
+    expect(runtimePersistenceRecoveryEnded('conflict')).toBe(false);
+  });
+});
+
 describe('applyOutcome（spec §2.5 Q8：applied 不再报成功）', () => {
+  it('paired-core protocol mismatch stays failed and uses the existing localized core error', () => {
+    expect(applyOutcome('unconfirmed', [{ code: 'CORE_BUNDLE_MISMATCH', path: 'runtime.protocol' }]))
+      .toEqual({ phase: 'failed', toast: { kind: 'error', key: 'errors.coreBundleMismatch' } });
+    for (const reasons of [undefined, [], [{ code: 'CORE_BUNDLE_MISMATCH', path: 'other' }],
+      [{ code: 'UNAVAILABLE', path: 'runtime.protocol' }]]) {
+      expect(applyOutcome('unconfirmed', reasons))
+        .toEqual({ phase: 'failed', toast: { kind: 'error', key: 'home.pendingHotUnconfirmed' } });
+    }
+  });
   // C-8：`applied` 只意味着 schedule_restart() 已排程，重启成没成走 proxyStarted/proxyError。
   // 变异对照：把 applied 腿改回 `{phase:'idle', toast:{kind:'success',…}}` → 本条转红。
   // 这正是 Q8 表第三行点名的洞：「排程了但核没起来」时旧实现会报「已应用」。
@@ -535,4 +557,73 @@ describe('A/B 不混同 —— 停核（只动 B）不得产出「未保存」�
         .visible
     ).toBe(false);
   });
+});
+
+
+describe('HOT receipt outcomes', () => {
+  it('completes a committed receipt without waiting for a process lifecycle event', () => {
+    expect(applyOutcome('hotApplied').phase).toBe('idle');
+    expect(applyOutcome('applied').phase).toBe('applying');
+  });
+  it('keeps persistence pending visible without offering a second Apply', () => {
+    const outcome = applyOutcome('hotDurabilityPending');
+    expect(outcome).toEqual({ phase: 'durabilityPending', toast: null });
+    const view = composeBarView(barInput({ pendingPhase: pendingPhaseOf(outcome.phase, PENDING_NONE) }));
+    expect(view.visible).toBe(true);
+    expect(view.titleKey).toBe('home.pendingHotDurabilityPending');
+    expect(view.actions).toEqual([]);
+  });
+  it('offers only persistence recovery when an original receipt is available', () => {
+    const input = barInput({ pendingPhase: 'durabilityPending', persistenceRetryAvailable: true });
+    expect(composeBarView(input).actions).toEqual([{ id: 'retryPersistence', disabled: false }]);
+    expect(composeBarView({ ...input, coreRunning: false }).actions).toEqual([]);
+  });
+  it.each(['clean', 'staged'] as const)('preserves persistence-only retry after failure with %s drafts', (stagedPhase) => {
+    const view = composeBarView(barInput({ stagedPhase, pendingPhase: 'applyFailed', persistenceOnly: true,
+      persistenceRetryAvailable: true }));
+    expect(view.actions).toEqual([{ id: 'retryPersistence', disabled: false }]);
+    expect(view.err).toBe(true);
+  });
+  it('requires a separate exit action after confirmed owner supersession', () => {
+    const view = composeBarView(barInput({ stagedPhase: 'staged', pendingPhase: 'applyFailed', persistenceOnly: true,
+      persistenceRetryAvailable: true, persistenceRecoveryEnded: true }));
+    expect(view.actions).toEqual([{ id: 'dismissApply', disabled: false }]);
+    expect(view.err).toBe(true);
+  });
+  it.each(['conflict', 'rejected', 'unconfirmed'] as const)('%s is never success', (status) => {
+    expect(applyOutcome(status).phase).toBe('failed');
+    expect(applyOutcome(status).toast?.kind).toBe('error');
+  });
+  it('restartRequired does not start or claim a restart', () => {
+    expect(applyOutcome('restartRequired')).toEqual({ phase: 'idle', toast: null });
+  });
+});
+
+describe('durable desired owner conflicts', () => {
+  it('explains newer saved settings only for the trusted reason and path', () => {
+    expect(applyOutcome('conflict', [{ code: 'OWNER_STATE_SUPERSEDED', path: 'desired' }]))
+      .toEqual({ phase: 'failed', toast: { kind: 'error', key: 'home.pendingHotOwnerSuperseded' } });
+    for (const reasons of [undefined, [{ code: 'OWNER_STATE_SUPERSEDED', path: 'other' }], [{ code: 'arbitrary kernel message', path: 'desired' }]]) {
+      expect(applyOutcome('conflict', reasons).toast?.key).toBe('home.pendingHotConflict');
+    }
+  });
+});
+
+
+describe('routed LAN prerequisites remain localized and fail closed', () => {
+  it.each([
+    ['LAN_GATEWAY_FORWARDING_REQUIRED', 'errors.lanGatewayForwardingRequired'],
+    ['LAN_GATEWAY_FORWARDING_UNCONFIRMED', 'errors.lanGatewayForwardingUnconfirmed'],
+  ])('%s maps only the exact gateway reason', (code, key) => {
+    expect(applyOutcome('rejected', [{ code, path: 'inbounds.tun.gateway.forwarding' }]))
+      .toEqual({ phase: 'failed', toast: { kind: 'error', key } });
+    expect(applyOutcome('rejected', [{ code, path: 'unrelated' }]))
+      .toEqual({ phase: 'failed', toast: { kind: 'error', key: 'home.pendingHotRejected' } });
+  });
+});
+
+
+it('Vision rejection explains the exact trusted compatibility reason', () => {
+  expect(runtimeApplyRejectedKey([{code: 'VISION_TRANSPORT_UNSUPPORTED', path: 'outbounds.vision.transport'}])).toBe('nodes.invalidVisionTransport');
+  expect(runtimeApplyRejectedKey([{code: 'VISION_TRANSPORT_UNSUPPORTED', path: 'private.raw'}])).toBe('home.pendingHotRejected');
 });

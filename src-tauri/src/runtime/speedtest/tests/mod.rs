@@ -5229,3 +5229,23 @@ fn temporary_probe_rejects_invalid_pin_even_when_insecure() {
         Some("TLS_PIN_INVALID")
     );
 }
+
+#[test]
+fn vision_transport_temp_plan_reports_fixed_failure_without_losing_good_nodes() {
+    let servers: Vec<ServerConfig> = serde_json::from_value(json!([
+        {"id":"bad","name":"RepairMe","protocol":"vless","address":"private.example","port":443,"flow":"xtls-rprx-vision","network":"httpupgrade"},
+        {"id":"good","name":"Good","protocol":"vless","address":"good.example","port":443}
+    ])).unwrap();
+    let before = serde_json::to_value(&servers).unwrap();
+    let plan = plan_temp_core_with_utls_policy(&servers, &env(), &BTreeMap::new(), Some("follow"));
+    assert_eq!(plan.testable.len(), 1);
+    assert_eq!(plan.testable[0].id, "good");
+    assert_eq!(
+        plan.unusable,
+        vec![(
+            "bad".into(),
+            UnusableReason::BuildFailed("vision-transport-unsupported")
+        )]
+    );
+    assert_eq!(serde_json::to_value(&servers).unwrap(), before);
+}

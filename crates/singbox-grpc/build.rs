@@ -8,6 +8,7 @@
 include!("proto_wire_check.rs");
 include!("android_wire_check.rs");
 include!("apple_wire_check.rs");
+include!("runtime_config_wire_check.rs");
 
 // 符号表与 vendored proto 原文均取自 `proto_wire_check`（此前 build.rs / tests 各存一份，
 // 两处注释都写着「一处漏加，另一处就白守」；运行期换核检查要用第三次，故下沉共用）。
@@ -15,10 +16,16 @@ use proto_wire_check::WireVerdict;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_proto_matches_bundled_core();
+    runtime_config_wire_check::check_optional_source()?;
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(&["proto/started_service.proto"], &["proto"])?;
+        .compile_protos(
+            &["proto/started_service.proto", "proto/runtime_config.proto"],
+            &["proto"],
+        )?;
+    println!("cargo:rerun-if-changed=proto/runtime_config.proto");
+    println!("cargo:rerun-if-changed=runtime_config_wire_check.rs");
     println!("cargo:rerun-if-changed=proto/started_service.proto");
     println!("cargo:rerun-if-changed=proto_wire_check.rs");
     println!("cargo:rerun-if-changed=android_wire_check.rs");

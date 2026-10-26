@@ -1,3 +1,5 @@
+mod bootstrap_identity;
+
 use super::*;
 use crate::transport::MockStream;
 use std::collections::HashSet;
@@ -1498,8 +1500,19 @@ fn unix_install_publishes_initialized_journal_only_after_admission_and_cleans_be
         );
         assert!(failed_stop.contains("exit 1"));
         assert!(!failed_stop.contains("rm -rf"));
-        let cleanup = rollback.rfind("if [ \"$OK\" -eq 1 ]; then rm -rf \"$TXDIR\"; else touch \"$TXDIR/recovery-required\";").unwrap();
-        assert!(cleanup < rollback.rfind("exec 9>&-").unwrap());
+        // Both Unix renderers share this guarded rollback tail. Match the whole
+        // branch so failed cleanup cannot become unconditional journal removal.
+        let cleanup_line = r#"  if [ "$OK" -eq 1 ]; then rm -rf "$TXDIR" || cleanup_failure; else touch "$TXDIR/recovery-required"; echo "helper rollback incomplete; recovery transaction retained: $TXDIR" >&2; fi"#;
+        let cleanup = rollback
+            .rfind(cleanup_line)
+            .expect("exact guarded rollback journal branch");
+        let unlock = rollback
+            .rfind("  exec 9>&- || cleanup_failure")
+            .expect("guarded final lease release");
+        assert!(cleanup < unlock);
+        assert!(rollback[cleanup + cleanup_line.len()..unlock]
+            .trim()
+            .is_empty());
         assert!(!rollback.contains("lease-release"));
         assert!(script.contains("case \"$(cat \"$OLD/transaction-phase\")\" in"));
         assert!(script.contains("staging) rm -rf \"$OLD\";;"));
@@ -2112,4 +2125,79 @@ fn retained_windows_helper_requires_framing_before_service_or_registration_chang
     assert!(probe < registration && probe < admission);
     assert!(source.contains("retained newer helper capability unavailable while stopped"));
     assert!(source.contains(".Hash.ToLowerInvariant() -cne '{helper_hash}'"));
+}
+
+/// Both fixtures are complete outputs from the real split Unix producers, with
+/// synthetic values only. Never execute these administrator script bytes.
+#[test]
+fn linux_script_producer_matches_package_acceptance_fixtures() {
+    // Existing Package exact-test entry also executes the shared service proof
+    // with inert command fixtures, never the generated administrator payload.
+    #[cfg(target_os = "linux")]
+    {
+        linux_uninstall::linux_uninstall_requires_effective_unit_and_hierarchical_closure();
+        linux_uninstall::linux_install_inactive_snapshot_still_requires_production_closure();
+        linux_uninstall::linux_cleanup_failure_markers_do_not_change_success_or_recovery();
+        linux_uninstall::linux_maintenance_traps_keep_success_silent_and_cleanup_unknown();
+    }
+    let paths = InstallPaths::linux();
+    // Target is Linux even when this pure producer test runs on Windows.
+    let staged_helper = PathBuf::from("/tmp/producer fixture/用户's stage/polaris-helper");
+    let mut params = install_params(
+        PathBuf::from("/tmp/producer fixture/用户's config"),
+        staged_helper.clone(),
+    );
+    params.conf_dir = params.script_dir.clone();
+    params.uid = 1001;
+    params.user_identity = polaris_helper_proto::core_protocol::CallerIdentity::Unix(1001);
+    let install = build_linux_install_script(&paths, &params, &"e".repeat(64));
+    let utility = MaintenanceUtility {
+        src_binary: staged_helper,
+        helper_sha256: "a".repeat(64),
+    };
+    let uninstall = uninstall_unix::build_linux_uninstall_script(&paths, &utility);
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/package-acceptance/fixtures");
+    for (kind, bytes) in [
+        ("install", install.as_bytes()),
+        ("uninstall", uninstall.as_bytes()),
+    ] {
+        let expected = std::fs::read(fixtures.join(format!("linux-helper-{kind}.sh"))).unwrap();
+        assert_eq!(
+            bytes,
+            expected.as_slice(),
+            "complete {kind} producer bytes differ"
+        );
+        assert!(bytes.starts_with(b"#!/bin/sh\nset -eu\n"));
+        assert!(!bytes.starts_with(b"#!/bin/bash"));
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert!(text.contains(&shell_quote(&utility.src_binary.to_string_lossy())));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let name = format!("polaris-helper-{kind}.sh");
+            let path = write_secure_script(dir.path(), &name, text).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                path.file_name().unwrap().to_str().unwrap().len(),
+                25 + name.len()
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            // Model run_privileged_script's finally unlink without executing it.
+            let mut held = std::fs::File::open(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let mut still_held = Vec::new();
+            std::io::Read::read_to_end(&mut held, &mut still_held).unwrap();
+            assert_eq!(still_held, bytes);
+            assert!(!path.exists());
+        }
+    }
 }

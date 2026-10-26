@@ -38,6 +38,16 @@ mod identity_repair;
 pub(crate) use identity_repair::{validate_server_identities, IDENTITY_AMBIGUOUS};
 pub use identity_repair::{IdentityConflicts, IdentityRepairRequest};
 
+/// Failure of the nonblocking saved-state fence, never a usable saved snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SavedCommitError {
+    WriterBusy,
+    CacheBusy,
+    WriterPoisoned,
+    CachePoisoned,
+    Cold,
+}
+
 const DEFERRED_DELETIONS_FILE: &str = "pending-config-deletions.json";
 const DEFERRED_DELETIONS_VERSION: u8 = 2;
 const STAGED_PENDING_FILE: &str = "staged-config.pending";
@@ -624,6 +634,21 @@ pub(crate) enum DeferredConfigDeletion {
         device_id: String,
         token: String,
     },
+}
+
+// Test assertion diagnostics must not expose any deletion payload fields.
+#[cfg(test)]
+impl std::fmt::Debug for DeferredConfigDeletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RuleResource { .. } => "RuleResource",
+            Self::BuiltinRuleResource { .. } => "BuiltinRuleResource",
+            Self::AppIcon { .. } => "AppIcon",
+            Self::TailscaleState { .. } => "TailscaleState",
+            Self::TailscaleDirectory { .. } => "TailscaleDirectory",
+            Self::WarpDevice { .. } => "WarpDevice",
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1947,6 +1972,40 @@ impl ConfigManager {
         Ok(f(&cfg))
     }
 
+    /// Attest the exact saved desired document without allowing a writer between
+    /// disk verification and the bounded owner acknowledgement. Call only from a
+    /// blocking worker; the closure must not reenter configuration or emit events.
+    pub(crate) fn with_durable_runtime_owner<T>(
+        &self,
+        expected: &Value,
+        acknowledge: impl FnOnce(String, String) -> T,
+    ) -> Result<T, StoreError> {
+        deny_inside_projection("with_durable_runtime_owner");
+        let _writer = self
+            .write_lock
+            .lock()
+            .map_err(|_| StoreError::validation("runtime owner writer unavailable"))?;
+        let cache = self
+            .cache
+            .read()
+            .map_err(|_| StoreError::validation("runtime owner cache unavailable"))?;
+        if cache.as_ref() != Some(expected) {
+            return Err(StoreError::validation("runtime desired owner superseded"));
+        }
+        let bytes = std::fs::read(&self.path).map_err(|error| StoreError::Io(error.to_string()))?;
+        let persisted: Value = serde_json::from_slice(&bytes).map_err(StoreError::from_parse)?;
+        if &persisted != expected {
+            return Err(StoreError::validation(
+                "runtime durable desired owner superseded",
+            ));
+        }
+        let _probe = ReentrancyProbe::enter();
+        Ok(acknowledge(
+            polaris_updater::sha256_hex(&bytes),
+            config_version(expected),
+        ))
+    }
+
     /// Warm saved-state commit fence. This shares the real writer mutex, never loads or
     /// migrates from disk, and fails immediately while a writer is active. The callback
     /// must only commit memory and must not reenter configuration or emit events.
@@ -1954,18 +2013,27 @@ impl ConfigManager {
         &self,
         commit: impl FnOnce(&Value) -> T,
     ) -> Result<T, StoreError> {
+        self.try_with_saved_commit_classified(commit)
+            .map_err(|_| StoreError::validation("saved commit unavailable"))
+    }
+
+    /// Public observation can distinguish a live writer from corrupted/cold state.
+    /// Authority callers above intentionally retain their original refusal contract.
+    pub(crate) fn try_with_saved_commit_classified<T>(
+        &self,
+        commit: impl FnOnce(&Value) -> T,
+    ) -> Result<T, SavedCommitError> {
+        use std::sync::TryLockError;
         deny_inside_projection("try_with_saved_commit");
-        let _writer = self
-            .write_lock
-            .try_lock()
-            .map_err(|_| StoreError::validation("saved commit unavailable"))?;
-        let cache = self
-            .cache
-            .try_read()
-            .map_err(|_| StoreError::validation("saved commit unavailable"))?;
-        let saved = cache
-            .as_ref()
-            .ok_or_else(|| StoreError::validation("saved commit unavailable"))?;
+        let _writer = self.write_lock.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => SavedCommitError::WriterBusy,
+            TryLockError::Poisoned(_) => SavedCommitError::WriterPoisoned,
+        })?;
+        let cache = self.cache.try_read().map_err(|error| match error {
+            TryLockError::WouldBlock => SavedCommitError::CacheBusy,
+            TryLockError::Poisoned(_) => SavedCommitError::CachePoisoned,
+        })?;
+        let saved = cache.as_ref().ok_or(SavedCommitError::Cold)?;
         let _probe = ReentrancyProbe::enter();
         Ok(commit(saved))
     }
@@ -2347,12 +2415,61 @@ impl ConfigManager {
         self.save_deferred_deletions_locked(&journal)
     }
 
+    /// Capture only journal identities removed by this exact candidate, while
+    /// saved D still matches its owner. Never widen this set after Plan.
+    pub(crate) fn runtime_deletion_scope(
+        &self,
+        desired: &Value,
+        before: &Value,
+        candidate: &Value,
+    ) -> Result<Vec<DeferredConfigDeletion>, StoreError> {
+        deny_inside_projection("runtime_deletion_scope");
+        let _writer = self
+            .write_lock
+            .lock()
+            .map_err(|_| StoreError::validation("deletion scope unavailable"))?;
+        let _deletions = self
+            .deferred_delete_lock
+            .lock()
+            .map_err(|_| StoreError::validation("deletion scope unavailable"))?;
+        if self
+            .cache
+            .read()
+            .ok()
+            .and_then(|value| value.clone())
+            .as_ref()
+            != Some(desired)
+        {
+            return Err(StoreError::validation(
+                "deletion scope desired owner changed",
+            ));
+        }
+        Ok(self
+            .load_deferred_deletions_locked()?
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                deferred_deletion_is_cancelled(entry, before)
+                    && !deferred_deletion_is_cancelled(entry, candidate)
+            })
+            .collect())
+    }
+
     /// Apply / 冷启动消费延迟删除。每条先按最新配置复核；执行失败保留在日志中，下一次 Apply/启动重试。
+    #[cfg(test)]
     pub(crate) fn process_deferred_deletions(
         &self,
+        apply: impl FnMut(&DeferredConfigDeletion, &Value) -> Result<(), String>,
+    ) -> Result<DeferredDeletionSummary, StoreError> {
+        self.process_deferred_deletions_scoped(None, apply)
+    }
+
+    pub(crate) fn process_deferred_deletions_scoped(
+        &self,
+        scope: Option<&[DeferredConfigDeletion]>,
         mut apply: impl FnMut(&DeferredConfigDeletion, &Value) -> Result<(), String>,
     ) -> Result<DeferredDeletionSummary, StoreError> {
-        deny_inside_projection("process_deferred_deletions");
+        deny_inside_projection("process_deferred_deletions_scoped");
         // 锁序与保存腿保持一致：write → deferred-delete。消费期间配置不能被重新加入/删除；否则
         // “复核未取消 → 执行删除”之间仍有竞态。此前反向先拿 deletion 再 cold-current 拿 write，
         // 还会与 save 的 write→deletion 构成冷启动死锁。
@@ -2370,6 +2487,10 @@ impl ConfigManager {
         let mut summary = DeferredDeletionSummary::default();
         let mut remaining = Vec::new();
         for entry in journal.entries {
+            if scope.is_some_and(|scope| !scope.contains(&entry)) {
+                remaining.push(entry);
+                continue;
+            }
             if mesh_guard::has_managed_fields(&current)
                 && matches!(
                     &entry,
@@ -2508,6 +2629,57 @@ impl ConfigManager {
         f: impl FnOnce(&mut Value) -> Decision<R>,
     ) -> Result<(R, Option<Value>), StoreError> {
         self.update_with_cleanup(false, f)
+    }
+
+    /// Subscription metadata edit: save first, then synchronously supersede refresh ownership
+    /// before releasing the same writer lock used by refresh commits. This is deliberately a
+    /// concrete publication, not an arbitrary post-save callback. Storage failure leaves the
+    /// previous refresh owner untouched. No network, broadcast or configuration re-entry occurs.
+    pub(crate) fn update_subscription_edit<R>(
+        &self,
+        admission: &crate::runtime::subscription_refresh::SubscriptionRefreshAdmission,
+        f: impl FnOnce(&mut Value) -> Decision<(R, Option<String>)>,
+    ) -> Result<
+        (
+            R,
+            Option<Value>,
+            Option<crate::runtime::subscription_refresh::SubscriptionRefreshOwner>,
+        ),
+        StoreError,
+    > {
+        deny_inside_projection("update_subscription_edit");
+        let started = std::time::Instant::now();
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let writer_wait_ms = started.elapsed().as_millis();
+        let load_started = std::time::Instant::now();
+        let mut cfg = match self.load_full_under_write_lock() {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                log::info!("subscription edit storage timing: outcome=load_failed writer_wait_ms={writer_wait_ms} load_ms={} total_ms={}", load_started.elapsed().as_millis(), started.elapsed().as_millis());
+                return Err(error);
+            }
+        };
+        let load_ms = load_started.elapsed().as_millis();
+        match f(&mut cfg) {
+            Decision::Skip((result, _)) => Ok((result, None, None)),
+            Decision::Write((result, refresh_id)) => {
+                let persist_started = std::time::Instant::now();
+                let saved = match self.save_full_under_write_lock(&cfg) {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        log::info!("subscription edit storage timing: outcome=save_failed writer_wait_ms={writer_wait_ms} load_ms={load_ms} persist_ms={} total_ms={}", persist_started.elapsed().as_millis(), started.elapsed().as_millis());
+                        return Err(error);
+                    }
+                };
+                let persist_ms = persist_started.elapsed().as_millis();
+                let owner = refresh_id.map(|id| admission.supersede(&id));
+                log::info!("subscription edit storage timing: outcome=saved writer_wait_ms={writer_wait_ms} load_ms={load_ms} persist_ms={persist_ms} total_ms={}", started.elapsed().as_millis());
+                Ok((result, Some(saved), owner))
+            }
+        }
     }
 
     /// [`Self::update`] 的延迟不可逆清理形态：同一临界区内保留旧配置、生成删除 journal、落新配置。

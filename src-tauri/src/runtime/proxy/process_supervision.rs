@@ -1019,32 +1019,10 @@ impl ProxyRuntime {
         Ok(token)
     }
 
-    /// **内核自证**：核就绪后校验「**实际跑起来的那个二进制**的版本 == 本次期望的核版本」。
-    ///
-    /// # 这一条为什么必须观测事实（血证）
-    ///
-    /// 同仓既有的[出口自证](Self::attest_selected_exit)是**纯静态对账**（自述「纯函数、零 I/O」
-    /// 「不用探针 / 不查 selector」）：它拿本次生成的 config 与落盘的用户意图互校 —— 两个输入同源于
-    /// 「意图」，故意图自洽而事实偏离时它一律判通过。今天这个缺陷正是在它眼皮底下溜过去的：
-    /// app 请求 bin=`core_update/sing-box`(1.14.0-beta.3)，helper 实跑
-    /// `/Library/Application Support/Polaris/core/sing-box`(1.14.0-alpha.45)，持续一天多、零告警。
-    ///
-    /// 故本方法**不**对账「我请求了什么 / 我配置了什么」，而是问系统两个事实问题：
-    ///  1. **内核记账里，这个 pid 正在执行哪个文件？**（`running_exe_path`：linux `/proc/<pid>/exe`
-    ///     符号链接、mac `ps -p <pid> -o comm=`）—— 与我们的请求完全独立的来源；
-    ///  2. **那个文件自报什么版本？**（对它真跑一次 `sing-box version`）。
-    ///
-    /// # 判据与代价
-    ///
-    /// 路径相同 ⇒ 同一文件，直接通过，**零 spawn**（app 直起腿的稳态走这里）。
-    /// 路径不同才各跑一次 `version`（TUN 提权腿的稳态：实跑受保护核副本，版本应相同）。
-    /// 「读不出版本」判**告警**而非通过 —— 见 [`CoreBinaryAttestation::VersionUnreadable`]。
-    /// 「读不到实跑 exe」判 [`Unobservable`](crate::runtime::core_attest::CoreBinaryAttestation::Unobservable)：只落 warn，
-    /// **绝不写成「自证通过」**（没观测到 ≠ 观测到没问题）。
-    ///
-    /// 版本首行只作运行期诊断，经助手起核也不因版本字符串停核；清单身份与内容校验另守起核准入。
-    ///
-    /// [`CoreBinaryAttestation::VersionUnreadable`]: crate::runtime::core_attest::CoreBinaryAttestation::VersionUnreadable
+    /// Runtime version diagnostics must never execute a PID-derived image path.
+    /// Content/source admission remains at the existing resolver/helper boundary.
+    /// Without an owned loaded-image proof, report unknown after the same exact
+    /// generation/PID commit check; matching pathnames are not byte evidence.
     pub(super) fn spawn_running_core_binary_attestation(
         self: &Arc<Self>,
         pid: u32,
@@ -1064,46 +1042,10 @@ impl ProxyRuntime {
     }
 
     async fn attest_running_core_binary(self: &Arc<Self>, pid: u32, expected: &Path, my_gen: u64) {
-        use crate::runtime::core_attest::attest_core_binary;
-
-        let expected = expected.to_path_buf();
-        let via_helper = self.core_via_helper.load(Ordering::SeqCst);
-        // D2：Windows 上 `running_exe_path` 恒 None（Medium IL app 读不了 SYSTEM child），自证因此
-        // 恒判「未能进行」。helper 在权限边界另一侧、且持着受管核的句柄，它 status 回传的 `image=`
-        // 就是同一个事实。只在**经 helper 起核**时取这条腿：直起腿本地就读得到，不必多一次 IPC。
-        let helper = via_helper.then(|| Arc::clone(&self.helper));
-        let selected_version = via_helper.then(|| {
-            crate::runtime::core_identity::current_platform()
-                .and_then(crate::runtime::core_identity::selected_manifest)
-                .map(|manifest| format!("sing-box version {}", manifest.version))
-                .unwrap_or_default()
-        });
-        let version_probe = Arc::clone(&self.core_version_probe);
-        // 观测腿全是阻塞 syscall / 子进程 / 同步 IPC → spawn_blocking。
-        let attestation = tokio::task::spawn_blocking(move || {
-            let running = running_exe_path(pid)
-                .or_else(|| helper_reported_core_image(helper.as_deref(), pid));
-            // 路径相同就不必花两次 spawn 去问版本（同一文件，版本必同）。
-            let (ev, rv) = match running.as_deref() {
-                Some(r) if r != expected.as_path() => (
-                    selected_version
-                        .clone()
-                        .unwrap_or_else(|| version_probe.first_line(&expected)),
-                    version_probe.first_line(r),
-                ),
-                _ => (String::new(), String::new()),
-            };
-            attest_core_binary(&expected, running.as_deref(), &ev, &rv)
-        })
-        .await;
-
-        let attestation = match attestation {
-            Ok(a) => a,
-            Err(e) => {
-                log::warn!("内核自证任务 join 失败（未判定通过）：{e}");
-                return;
-            }
-        };
+        // Do not reopen expected or a PID-derived path as a new executable.
+        // A future read-only loaded-image diagnostic may refine this unknown,
+        // but a version subprocess cannot attest the already-running object.
+        let attestation = crate::runtime::core_attest::attest_core_binary(expected, None, "", "");
         let status = self.status();
         if !attestation_commit_allowed(self.gate.generation(), my_gen, &status, pid) {
             log::info!(

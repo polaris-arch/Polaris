@@ -277,9 +277,19 @@ pub async fn proxy_get_status(
 ) -> Result<ApiResponse<ProxyStatus>, ()> {
     Ok(async {
         state.proxy().native_auto_status().await;
-        ApiResponse::from_result(state.proxy().status_with_owned_stop_context())
+        proxy_status_response(state.proxy())
     }
     .await)
+}
+
+/// Shared desktop/mobile command envelope; a failed capture never carries status data.
+pub(crate) fn proxy_status_response(
+    proxy: &crate::runtime::proxy::ProxyRuntime,
+) -> ApiResponse<ProxyStatus> {
+    match proxy.status_with_owned_stop_context() {
+        Ok(status) => ApiResponse::ok(status),
+        Err(error) => ApiResponse::err_with_code(error.to_string(), error.code()),
+    }
 }
 
 /// `PROXY_GET_PENDING_CHANGES`：待应用节点差集（config 相对运行核起核快照）。
@@ -297,18 +307,43 @@ pub fn proxy_get_pending_changes(
     ApiResponse::ok(state.proxy().pending_changes())
 }
 
-/// 上游 `PROXY_APPLY_PENDING_CHANGES`：立即应用待应用变更（force-restart）。
+/// Apply saved changes through HOT negotiation; restart requires its bound confirmation token.
 ///
 /// 返回 `{ ok, status }`，status ∈ `applied | deferred | skipped`（对齐 上游 proxy-handlers.ts:122-127）。
 /// status 由**真实运行态 + lifecycle 在飞判定**得出（此前硬编码 `"applied"` → UI 误报成功）。
 #[tauri::command]
 pub async fn proxy_apply_pending_changes(
     state: State<'_, AppRuntime>,
+    restart_confirmation: Option<String>,
+    retry_persistence_transaction_id: Option<String>,
 ) -> Result<ApiResponse<Value>, ()> {
-    let proxy = state.proxy.clone();
-    let (status, apply_id) = proxy.apply_pending_owned().await;
+    // The explicit retry selector is mutually exclusive with restart permission.
+    if restart_confirmation.is_some() && retry_persistence_transaction_id.is_some() {
+        return Err(());
+    }
+    let result = if let Some(transaction_id) = retry_persistence_transaction_id {
+        state.proxy.retry_runtime_persistence(transaction_id).await
+    } else {
+        state
+            .proxy
+            .clone()
+            .apply_pending_transaction(restart_confirmation)
+            .await
+    };
     Ok(ApiResponse::ok(
-        json!({ "ok": status != "skipped", "status": status, "applyId": apply_id }),
+        serde_json::to_value(result).map_err(|_| ())?,
+    ))
+}
+
+/// Observe an existing HOT transaction without resubmission or restart.
+#[tauri::command]
+pub async fn proxy_runtime_apply_status(
+    state: State<'_, AppRuntime>,
+    transaction_id: String,
+) -> Result<ApiResponse<Value>, ()> {
+    let result = state.proxy.runtime_apply_status(transaction_id).await;
+    Ok(ApiResponse::ok(
+        serde_json::to_value(result).map_err(|_| ())?,
     ))
 }
 

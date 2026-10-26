@@ -63,7 +63,7 @@ pub mod server;
 pub mod state;
 
 // daemon 入口（binary main 经 cfg 调）：serve 入口即 [`daemon::daemon_main`]（内部建 tokio runtime +
-// prepare_socket + accept 循环骨架 + SIGTERM 收割器 + 退出兜底 setForward(false)）。
+// prepare_socket + accept 循环骨架 + SIGTERM 收割器；不修改 host forwarding）。
 pub use daemon::daemon_main;
 
 // 便利重导出：让 `platform::linux::HandlerDeps` 等无需钻模块路径。
@@ -76,13 +76,13 @@ pub use handler::{handle, Conn, HandlerDeps, LineConn, READ_TIMEOUT_SECS};
 // DNS flush 不在 Linux helper 职责内（无上游 Go 命令 / app 进程非提权侧已有单一真值
 // `system-integration::dns_flush`）；判据见 ops.rs「系统 DNS 刷新」段。
 pub use ops::{
-    set_forward_prod, RouteAction, RouteOps, RouteVerb, SystemdAction, SystemdOps, SystemdResult,
-    TokioRoute, TokioSystemd, TokioTun, TunAction, TunOps,
+    RouteAction, RouteOps, RouteVerb, SystemdAction, SystemdOps, SystemdResult, TokioRoute,
+    TokioSystemd, TokioTun, TunAction, TunOps,
 };
 pub use resolved_dns::{ResolvectlDnsOps, ResolvedDnsOps};
 pub use server::{
-    ambient_caps, forward_fn, prepare_socket, ss_lookup, AmbientCapsSpawner, ConnServer,
-    ServerConfig, ServerError, WatchStep, DEFAULT_AUTH_FILE, DEFAULT_CORE_DIR, DEFAULT_SOCK_PATH,
+    ambient_caps, prepare_socket, ss_lookup, AmbientCapsSpawner, ConnServer, ServerConfig,
+    ServerError, WatchStep, DEFAULT_AUTH_FILE, DEFAULT_CORE_DIR, DEFAULT_SOCK_PATH,
 };
 pub use state::{CoreHandle, CoreSpawner, HandlerState, SpawnCoreRequest, SpawnError};
 

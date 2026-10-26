@@ -42,6 +42,11 @@ export type SubscriptionUpdatePhase =
 /** `event:subscriptionUpdateProgress` 载荷。可选字段按 phase 出现（见各字段注释）。 */
 export interface SubscriptionUpdateProgress {
   subscriptionId: string;
+  /** Monotonic backend refresh owner within this process; rejects late superseded frames. */
+  generation?: number;
+  /** Present only for refresh caused by an already-durable metadata edit. */
+  editRequestId?: string;
+  saved?: true;
   phase: SubscriptionUpdatePhase;
   /** `providers`：**已完成**的 provider 数（第一条子拉取发起时报 0，之后每条 settle 递增）。 */
   done?: number;

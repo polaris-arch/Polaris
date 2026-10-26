@@ -63,18 +63,13 @@ async fn entering_and_leaving_block_restart_only_the_running_projection() {
             rt.switch_selected_server_if_current(new, intent)
                 .await
                 .unwrap(),
-            Some(SwitchOutcome::Restarting),
+            Some(SwitchOutcome::Pending),
             "{old} -> {new} must regenerate reject routes"
         );
         assert!(sink.calls().is_empty(), "block has no selector member");
-        let (_, projected, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
-        assert_eq!(
-            source,
-            ForceRestartSource::Selected {
-                intent_generation: intent
-            }
-        );
-        assert_eq!(projected["selectedServerId"], new);
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        let projected = rt.current_config_snapshot().unwrap();
+        assert_eq!(projected["selectedServerId"], old);
         assert_eq!(
             projected["logLevel"], running["logLevel"],
             "D debt leaked into R'"
@@ -120,8 +115,9 @@ async fn already_blocked_requires_ready_startup_proof_before_applied_receipt() {
             );
             assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
         } else {
-            assert_eq!(outcome, Some(SwitchOutcome::Restarting));
-            let projected = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
+            assert_eq!(outcome, Some(SwitchOutcome::Deferred));
+            assert!(rt.pending_force_restart.read().unwrap().is_none());
+            let projected = rt.current_config_snapshot().unwrap();
             assert_eq!(projected["selectedServerId"], BLOCK_SERVER_ID);
             assert_eq!(projected["logLevel"], running["logLevel"]);
             rt.gate.bump_generation(); // Fake core must not execute the scheduled restart.
@@ -198,11 +194,15 @@ async fn clean_mesh_selection_that_changes_routes_restarts_only_the_running_proj
             rt.switch_selected_server_if_current(&target, intent)
                 .await
                 .unwrap(),
-            Some(SwitchOutcome::Restarting),
+            Some(SwitchOutcome::Pending),
             "{label}: clean runtime member needs a selected-only restart"
         );
-        let pending = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
-        assert_eq!(pending["selectedServerId"], target, "{label}");
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        let pending = rt.current_config_snapshot().unwrap();
+        assert_eq!(
+            pending["selectedServerId"], running["selectedServerId"],
+            "{label}"
+        );
         assert_eq!(
             pending["logLevel"], running["logLevel"],
             "{label}: D log debt leaked into R"
@@ -256,15 +256,16 @@ async fn leaving_an_openvpn_mesh_exit_restarts_the_running_projection() {
         rt.switch_selected_server_if_current("node-a", intent)
             .await
             .unwrap(),
-        Some(SwitchOutcome::Restarting),
+        Some(SwitchOutcome::Pending),
         "leaving a mesh-only exit removes the direct fallback route"
     );
     assert!(
         sink.calls().is_empty(),
         "a route-changing selection must not PUT"
     );
-    let projected = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
-    assert_eq!(projected["selectedServerId"], "node-a");
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    let projected = rt.current_config_snapshot().unwrap();
+    assert_eq!(projected["selectedServerId"], "ovpn-mesh");
     assert_eq!(
         rt.current_config_snapshot().unwrap()["selectedServerId"],
         "ovpn-mesh"
@@ -300,9 +301,9 @@ async fn successful_new_selection_cancels_an_older_selected_restart_timer() {
         rt.switch_selected_server_if_current("ts-mesh", first)
             .await
             .unwrap(),
-        Some(SwitchOutcome::Restarting)
+        Some(SwitchOutcome::Pending)
     );
-    assert!(rt.pending_force_restart.read().unwrap().is_some());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
 
     disk["selectedServerId"] = serde_json::json!("node-c");
     rt.config.save_full(&disk).unwrap();
@@ -429,17 +430,17 @@ async fn ts_and_warp_selection_matrix_preserves_route_rebuild_boundary() {
             if requires_restart {
                 assert_eq!(
                     outcome,
-                    Some(SwitchOutcome::Restarting),
+                    Some(SwitchOutcome::Pending),
                     "{label}: {old}->{new}"
                 );
                 assert!(
                     sink.calls().is_empty(),
                     "{label}: route changes cannot be selector PUT"
                 );
-                assert!(rt.pending_force_restart.read().unwrap().is_some());
+                assert!(rt.pending_force_restart.read().unwrap().is_none());
                 assert!(
-                    pending_events.lock().unwrap().is_empty(),
-                    "{label}: scheduled automatic restart must not flash an Apply-pending bar"
+                    !pending_events.lock().unwrap().is_empty(),
+                    "{label}: uncommitted route changes must remain visibly pending"
                 );
                 rt.gate.bump_generation(); // Fake core must not execute the scheduled restart.
             } else {
@@ -725,12 +726,12 @@ async fn residual_mode_or_selector_drift_cannot_claim_an_ordinary_hot_switch() {
             rt.switch_selected_server_if_current("node-b", intent)
                 .await
                 .unwrap(),
-            Some(SwitchOutcome::Restarting),
+            Some(SwitchOutcome::Deferred),
             "mode={mode} dashboard={dashboard} proxy={proxy}"
         );
         assert!(sink.calls().is_empty());
         assert!(rt.selector_reconcile.is_required());
-        assert!(rt.pending_force_restart.read().unwrap().is_some());
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
         rt.gate.bump_generation();
     }
 }
@@ -793,9 +794,9 @@ async fn saved_full_config_with_mesh_control_drift_waits_for_explicit_apply() {
         assert_ne!(saved["tunConfig"], running["tunConfig"]);
         assert_ne!(saved["trafficRules"], running["trafficRules"]);
 
-        assert_eq!(rt.apply_pending().await, "applied");
+        assert_eq!(rt.apply_confirmed_for_test().await.0, "applied");
         let (id, pending, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
-        assert_eq!(source, ForceRestartSource::Full);
+        assert!(matches!(source, ForceRestartSource::Confirmed { .. }));
         assert_eq!(
             pending, saved,
             "Apply must carry the exact saved DNS/TUN/rules"
@@ -1062,7 +1063,7 @@ async fn silent_clash_mode_noop_rolls_back_or_restarts_without_false_hot_switch_
             rt.switch_selected_server_if_current(new, intent)
                 .await
                 .unwrap(),
-            Some(SwitchOutcome::Restarting),
+            Some(SwitchOutcome::Deferred),
             "{old}->{new}"
         );
         assert_eq!(
@@ -1070,7 +1071,7 @@ async fn silent_clash_mode_noop_rolls_back_or_restarts_without_false_hot_switch_
             generation,
             "restart is scheduled, not falsely completed"
         );
-        assert!(rt.pending_force_restart.read().unwrap().is_some());
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
         assert_eq!(sink.mode.lock().unwrap().as_deref(), Some(old_mode));
         let groups = sink.groups.lock().unwrap();
         assert!(
@@ -1356,15 +1357,16 @@ async fn explicit_selection_wrong_or_missing_group_falls_back_to_r_only_restart(
             rt.switch_selected_server_if_current("node-b", intent)
                 .await
                 .unwrap(),
-            Some(SwitchOutcome::Restarting),
+            Some(SwitchOutcome::Deferred),
             "错值、缺 selector、读回不可用都不能报已应用"
         );
         assert_eq!(
             rt.current_config.read().unwrap().as_ref().unwrap()["selectedServerId"],
             "node-a"
         );
-        let force = rt.pending_force_restart.read().unwrap().clone().unwrap().1;
-        assert_eq!(force["selectedServerId"], "node-b");
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        let force = rt.current_config_snapshot().unwrap();
+        assert_eq!(force["selectedServerId"], "node-a");
         assert_eq!(
             force["logLevel"], running["logLevel"],
             "fallback 不可夹带 D"
@@ -1551,54 +1553,27 @@ fn explicit_selection_receipt_rejects_old_pending_and_old_success() {
 }
 
 #[tokio::test]
-async fn claimed_selected_restart_receipt_remains_typed_until_explicit_stop_takes_over() {
+async fn failed_selection_stays_deferred_until_explicit_stop_takes_over() {
     let (rt, _dir, sink, running) = explicit_selection_fixture();
     let mut disk = running.clone();
     disk["selectedServerId"] = serde_json::json!("node-b");
     rt.config.save_full(&disk).unwrap();
-    // The PUT succeeds, but the running selector readback disagrees, so this selected-only
-    // request schedules an exact R-projection restart instead of claiming it has applied.
     *sink.groups.lock().unwrap() = Some(vec![group(PROXY_SELECTOR_TAG, "Node A")]);
     let intent = rt.register_selector_intent();
-    let starting_generation = rt.gate.generation();
+    let generation = rt.gate.generation();
     let outcome = rt
         .switch_selected_server_if_current("node-b", intent)
         .await
         .unwrap();
-    assert_eq!(outcome, Some(SwitchOutcome::Restarting));
-    let force_id = rt.gate.pending().force_restart_id.unwrap();
-
-    // Use the actual debounced decision and runtime claim, stopping before the real core
-    // stop/start side effect. The receipt can now race this claimed restart in production.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    rt.debounced
-        .schedule_with_ticket(true, move |decision, ticket| {
-            let _ = tx.send((decision, ticket));
-        });
-    let (decision, ticket) = rx.await.unwrap();
-    assert!(matches!(
-        decision,
-        polaris_switch_engine::DebouncedOutcome::Proceed(Some(id)) if id == force_id
-    ));
-    let (_, claimed_generation, _legacy_lease) = rt
-        .claim_debounced_restart(Some(force_id), starting_generation, ticket)
-        .expect("selected projection must be claimed by its exact force id");
-    assert_eq!(
-        rt.settle_selected_switch_receipt(outcome, starting_generation, intent),
-        Some(SwitchOutcome::Restarting),
-        "a claimed restart must retain its typed receipt, not become generic pending"
-    );
-
+    assert_eq!(outcome, Some(SwitchOutcome::Deferred));
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(rt.current_config_snapshot().unwrap(), running);
+    assert_eq!(rt.gate.generation(), generation);
     rt.gate.claim_generation(None, LifecycleKind::Stop);
     assert_eq!(
-        rt.settle_selected_switch_receipt(outcome, starting_generation, intent),
-        Some(SwitchOutcome::NotRunning),
-        "a newer explicit Stop must retain priority over the claimed restart"
+        rt.settle_selected_switch_receipt(outcome, generation, intent),
+        Some(SwitchOutcome::NotRunning)
     );
-    assert!(matches!(
-        rt.gate.end_restart_after(Some(claimed_generation)),
-        LifecycleEndResult::Stopped(_)
-    ));
 }
 
 #[tokio::test]
@@ -1757,17 +1732,12 @@ async fn selected_rule_confirmation_failure_restarts_only_the_running_projection
         rt.switch_selected_server_if_current("node-b", intent)
             .await
             .unwrap(),
-        Some(SwitchOutcome::Restarting),
+        Some(SwitchOutcome::Deferred),
         "unconfirmed rule publication debt must request a projection-scoped restart"
     );
-    let (_, projected, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
-    assert_eq!(
-        source,
-        ForceRestartSource::Selected {
-            intent_generation: intent
-        }
-    );
-    assert_eq!(projected["selectedServerId"], "node-b");
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    let projected = rt.current_config_snapshot().unwrap();
+    assert_eq!(projected["selectedServerId"], "node-a");
     assert_eq!(projected["logLevel"], running["logLevel"]);
     assert_eq!(rt.config.current().unwrap()["logLevel"], "debug");
     rt.gate.bump_generation(); // Fake runtime must not execute the scheduled restart.
@@ -1838,7 +1808,7 @@ fn install_startup_snapshot(rt: &ProxyRuntime, cfg: &Value) {
 /// **变异对照**：给 `PendingChangesSummary` 加回 `updated` 字段 → 键集断言转红；
 /// 去掉 `#[serde(rename_all = "camelCase")]` → 键名变 `restart_deferred` → 同样转红。
 #[test]
-fn pending_changes_contract_has_exactly_three_keys() {
+fn pending_changes_contract_has_exactly_six_typed_fields() {
     let (rt, _dir) = test_runtime();
     let v = serde_json::to_value(rt.pending_changes()).expect("契约体应可序列化");
     let mut keys: Vec<&str> = v
@@ -1850,7 +1820,18 @@ fn pending_changes_contract_has_exactly_three_keys() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["added", "modified", "removed", "restartDeferred"]
+        vec![
+            "added",
+            "modified",
+            "pendingApply",
+            "removed",
+            "restartDeferred",
+            "restartRequired"
+        ]
+    );
+    assert_eq!(
+        v,
+        serde_json::json!({"added":[],"modified":[],"removed":[],"restartDeferred":false,"pendingApply":false,"restartRequired":false})
     );
 }
 
@@ -1867,6 +1848,8 @@ fn pending_changes_baseline_states_are_all_empty() {
         modified: vec![],
         removed: vec![],
         restart_deferred: false,
+        pending_apply: false,
+        restart_required: false,
     };
 
     // ① 核未运行 / 无起核快照。
@@ -3296,12 +3279,10 @@ async fn persisted_switch_discards_an_out_of_order_stale_broadcast() {
     );
 }
 
-/// 腿 3-热切：切节点 → 走热切腿。此处**无真核** → gRPC 连不上 → executor 返 ClientNotReady
-/// → 按契约退回去抖重启（而非静默吞掉变更）。
-///
-/// 这条同时锁死两件事：① 切节点确实被判为热切腿（否则不会去连 gRPC）；② 热切不可用时**必**回退重启。
+/// Selector HOT failure preserves desired state and the old runtime selection.
+/// An unavailable management API never grants permission to restart.
 #[tokio::test]
-async fn switch_mode_node_switch_falls_back_to_restart_when_grpc_unavailable() {
+async fn switch_mode_node_switch_stays_deferred_when_grpc_unavailable() {
     let (rt, _dir) = test_runtime();
     let cfg = two_node_config(7891, "node-a");
     mark_running_with_snapshot(&rt, &cfg);
@@ -3312,8 +3293,8 @@ async fn switch_mode_node_switch_falls_back_to_restart_when_grpc_unavailable() {
     let out = rt.switch_mode(next).await;
     assert_eq!(
         out,
-        SwitchOutcome::Restarting,
-        "热切换不可用（gRPC 连不上）必须退回重启兜底，绝不能静默吞掉切节点"
+        SwitchOutcome::Deferred,
+        "热切换不可用（gRPC 连不上）必须保留待应用，不能隐式重启"
     );
     assert!(
         rt.current_config
@@ -3325,11 +3306,12 @@ async fn switch_mode_node_switch_falls_back_to_restart_when_grpc_unavailable() {
         "重启等待期间 R 必须仍是旧核的选择，不能先把 D 冒充已运行出口"
     );
     assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-b");
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
 }
 
-/// 腿 3-重启：改 norm 内字段（mixedPort）→ 结构性变更 → 去抖重启，**不**热切。
+/// A structural edit without a runtime transaction baseline stays unconfirmed.
 #[tokio::test]
-async fn switch_mode_norm_field_change_takes_restart_leg() {
+async fn switch_mode_norm_field_change_without_baseline_stays_pending() {
     let (rt, _dir) = test_runtime();
     let cfg = two_node_config(7891, "node-a");
     mark_running_with_snapshot(&rt, &cfg);
@@ -3338,9 +3320,14 @@ async fn switch_mode_norm_field_change_takes_restart_leg() {
 
     // 只改端口（norm 内字段）→ plan_hot_switch 的 norm 前提失败 → kind=None → Restart。
     let out = rt.switch_mode(next).await;
-    assert_eq!(out, SwitchOutcome::Restarting, "norm 内字段变更必须走重启");
+    assert_eq!(
+        out,
+        SwitchOutcome::Pending,
+        "graph change without a runtime baseline remains unconfirmed/pending"
+    );
     assert_eq!(rt.current_config_snapshot().unwrap()["mixedPort"], 7891);
     assert_eq!(rt.config.current().unwrap()["mixedPort"], 7899);
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
 }
 
 // ── P4「保存不重启」（spec §2.5 Q4）：defer_restart 的射程与记账 ──────────────────────
@@ -3351,7 +3338,7 @@ async fn switch_mode_norm_field_change_takes_restart_leg() {
 /// 结构性变更 + `defer_restart=true` → 落 Defer 腿：**不排重启**，但记下欠账。
 ///
 /// 变异对照：把 `switch_mode_with` 里传给 `DecisionInput` 的 `defer_restart` 硬编码成 `false`
-/// → 本条第一个断言转红（回到 Restarting）。
+/// → 本条第一个断言转红（缺少运行事务基准时返回 Pending）。
 #[tokio::test]
 async fn defer_restart_flag_defers_structural_change_and_records_debt() {
     let (rt, _dir) = test_runtime();
@@ -3360,7 +3347,7 @@ async fn defer_restart_flag_defers_structural_change_and_records_debt() {
     // 起核快照 = 待应用差集的分母，生产里由 start_inner 与 switch_snapshot 同刻装上。
     *rt.startup_snapshot.write().unwrap() = Some(cfg.clone());
 
-    // 同一份输入在 defer_restart=false 时是 Restarting（见 switch_mode_norm_field_change_takes_restart_leg）。
+    // 同一份输入在 defer_restart=false 且缺少运行事务基准时返回 Pending。
     let out = rt
         .switch_mode_with(two_node_config(7899, "node-a"), true)
         .await;
@@ -3553,8 +3540,8 @@ async fn classify_staged_agrees_with_the_leg_switch_mode_actually_takes() {
     let hot = rt.classify_staged(&two_node_config(7891, "node-b"));
     assert_eq!(hot.decision, "hotSwitch");
     assert!(
-        hot.restart_required,
-        "restartRequired 是兼容字段，语义是‘保存后仍待应用’，不是‘本性必须重启’"
+        hot.pending_apply && !hot.restart_required,
+        "daily HOT debt is distinct from a structural restart boundary"
     );
 
     // ③ norm 内字段（端口）变 → restart、需重启。随后真跑一次 switch_mode 验证结论一致。
@@ -3564,8 +3551,8 @@ async fn classify_staged_agrees_with_the_leg_switch_mode_actually_takes() {
     assert!(predicted.restart_required);
     assert_eq!(
         rt.switch_mode(structural).await,
-        SwitchOutcome::Restarting,
-        "预告说 restart，实际必须真走重启腿"
+        SwitchOutcome::Pending,
+        "预告说明结构边界，但没有用户确认仍不得重启"
     );
 
     // ④ 核未运行 → 落盘不触发任何核动作 ⇒ 不存在「需重启才生效」。
@@ -3616,9 +3603,9 @@ async fn switch_mode_norm_excluded_field_change_is_noop() {
     assert!(!rt.gate.pending().restart_pending, "NoOp 腿绝不能排程重启");
 }
 
-/// 腿 3-Defer：仅新增未被引用的节点（订阅刷新常见）→ 免整核重启。
+/// A new unreferenced node requires graph attestation; missing baseline stays pending.
 #[tokio::test]
-async fn switch_mode_added_unreferenced_node_defers() {
+async fn switch_mode_added_unreferenced_node_without_baseline_stays_pending() {
     let (rt, _dir) = test_runtime();
     let cfg = two_node_config(7891, "node-a");
     mark_running_with_snapshot(&rt, &cfg);
@@ -3632,16 +3619,19 @@ async fn switch_mode_added_unreferenced_node_defers() {
 
     assert_eq!(
         rt.switch_mode(next).await,
-        SwitchOutcome::Deferred,
-        "仅新增未引用节点 → Defer（免重启），否则订阅刷新每次都断流"
+        SwitchOutcome::Pending,
+        "graph mutation without a runtime baseline cannot be attested"
     );
-    assert!(!rt.gate.pending().restart_pending, "Defer 腿绝不能排程重启");
+    assert!(
+        !rt.gate.pending().restart_pending,
+        "unconfirmed graph change cannot schedule restart"
+    );
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(rt.current_config_snapshot().unwrap(), cfg);
 }
 
-/// **R2 PUSH**：`switch_mode` 末尾 `push_pending_changes` 把 `pending_changes()` **原样**推一次
-/// （无适配层，pull/push 同一个 `PendingChangesSummary`）。added=相对起核快照的新增未引用节点。
-/// 变异有牙：删 switch_mode 末尾 emit 点 → len==0 转红；把 `added` 换成 `old ∩ new`（旧 `updated` 的
-/// 语义）→ added 含 node-a/node-b 转红；漏起核快照基准（startup_snapshot）→ pending_changes 退化转红。
+/// An unconfirmed graph transaction emits the same pending summary used by pull.
+/// Added nodes remain relative to startup; existing unchanged nodes are not modified.
 #[tokio::test]
 async fn switch_mode_push_pending_changes_added_only() {
     let (rt, _dir) = test_runtime();
@@ -3667,12 +3657,19 @@ async fn switch_mode_push_pending_changes_added_only() {
 
     assert_eq!(
         rt.switch_mode(next).await,
-        SwitchOutcome::Deferred,
-        "仅新增未引用节点 → Defer（前置：push 挂在 switch_mode 末尾，此腿也走）"
+        SwitchOutcome::Pending,
+        "missing runtime baseline must emit pending changes without claiming application"
     );
 
+    assert!(!rt.gate.pending().restart_pending);
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(rt.current_config_snapshot().unwrap(), cfg);
     let evs = pending.lock().unwrap();
-    assert_eq!(evs.len(), 1, "switch_mode 末尾恰 push 一次");
+    assert_eq!(
+        evs.len(),
+        1,
+        "unconfirmed transaction emits pending changes once"
+    );
     assert_eq!(
         evs[0].added,
         vec!["node-c".to_string()],
@@ -3686,12 +3683,9 @@ async fn switch_mode_push_pending_changes_added_only() {
     drop(evs);
 }
 
-/// Defer 开关：`restartOnNodeChange=true` → 节点变更即刻重启（auto-apply 语义），不落 Defer。
-///
-/// 该字段**不在 UserConfig 结构体里**，只能从原始 JSON 读 → 这条锁死那条读取路径没写错，
-/// 否则开关恒失效（用户开了「立即应用」却仍走 defer）。
+/// The legacy auto-apply preference cannot authorize an implicit restart.
 #[tokio::test]
-async fn switch_mode_restart_on_node_change_defeats_defer() {
+async fn switch_mode_restart_on_node_change_does_not_authorize_restart() {
     let (rt, _dir) = test_runtime();
     let mut cfg = two_node_config(7891, "node-a");
     cfg.as_object_mut()
@@ -3707,14 +3701,15 @@ async fn switch_mode_restart_on_node_change_defeats_defer() {
 
     assert_eq!(
         rt.switch_mode(next).await,
-        SwitchOutcome::Restarting,
-        "restartOnNodeChange=true → 节点变更即刻重启，不得落 Defer"
+        SwitchOutcome::Pending,
+        "legacy auto-apply preference cannot authorize implicit restart"
     );
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
 }
 
 /// 无热切换基准快照（核在跑但快照缺失）→ 保守走重启，绝不静默吞。
 #[tokio::test]
-async fn switch_mode_without_snapshot_falls_back_to_restart() {
+async fn switch_mode_without_snapshot_stays_unconfirmed_pending() {
     let (rt, _dir) = test_runtime();
     let cfg = two_node_config(7891, "node-a");
     mark_running(&rt);
@@ -3722,46 +3717,50 @@ async fn switch_mode_without_snapshot_falls_back_to_restart() {
     // 不装 switch_snapshot。
     assert_eq!(
         rt.switch_mode(two_node_config(7891, "node-b")).await,
-        SwitchOutcome::Restarting,
-        "无基准 → 无从判热切 → 必须重启（fail-closed）"
+        SwitchOutcome::Pending,
+        "missing baseline is unconfirmed/pending, never restart permission"
     );
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
 }
 
-/// H-1：非重启腿（NoOp/Defer/热切）必须把待决 force-restart 快照的**值**刷新到 newConfig，
-/// 且**保留 id**。不刷新 → 去抖 timer 到点把核重启回旧配置，刚应用的变更被吃掉。
+/// Legacy Full queues refresh on NoOp; explicitly confirmed queues retain their exact snapshot.
+/// Both retain the original queue identity.
 #[tokio::test]
-async fn non_restart_leg_refreshes_pending_force_restart_snapshot_keeping_id() {
-    let (rt, _dir) = test_runtime();
-    let mut cfg = two_node_config(7891, "node-a");
-    cfg.as_object_mut()
-        .unwrap()
-        .insert("language".into(), serde_json::json!("zh-CN"));
-    mark_running_with_snapshot(&rt, &cfg);
-    // 模拟已有待决 force-restart（apply_pending 排程过），载荷是旧 cfg。
-    *rt.pending_force_restart.write().unwrap() = Some((42, cfg.clone(), ForceRestartSource::Full));
-
-    let mut next = cfg.clone();
-    next.as_object_mut()
-        .unwrap()
-        .insert("language".into(), serde_json::json!("en-US"));
-    assert_eq!(rt.switch_mode(next.clone()).await, SwitchOutcome::NoOp);
-
-    let pending = rt.pending_force_restart.read().unwrap().clone().unwrap();
-    assert_eq!(
-        pending.0, 42,
-        "必须保留 force-restart id（换号 = 排空时认领不到）"
-    );
-    assert_eq!(
-        pending.1, next,
-        "必须把载荷刷新到 newConfig，否则重启回退旧配置"
-    );
+async fn non_restart_leg_refreshes_legacy_queue_but_preserves_confirmed_snapshot_and_id() {
+    for confirmed in [false, true] {
+        let (rt, _dir) = test_runtime();
+        let mut cfg = two_node_config(7891, "node-a");
+        cfg["language"] = serde_json::json!("zh-CN");
+        mark_running_with_snapshot(&rt, &cfg);
+        let source = if confirmed {
+            ForceRestartSource::Confirmed {
+                intent_generation: rt.selector_reconcile.intent_generation(),
+            }
+        } else {
+            ForceRestartSource::Full
+        };
+        *rt.pending_force_restart.write().unwrap() = Some((42, cfg.clone(), source));
+        let mut next = cfg.clone();
+        next["language"] = serde_json::json!("en-US");
+        assert_eq!(rt.switch_mode(next.clone()).await, SwitchOutcome::NoOp);
+        let pending = rt.pending_force_restart.read().unwrap().clone().unwrap();
+        assert_eq!(pending.0, 42);
+        assert_eq!(pending.2, source);
+        assert_eq!(
+            pending.1,
+            if confirmed { cfg } else { next },
+            "a user-confirmed snapshot must never absorb a later edit"
+        );
+    }
 }
 
-/// 重启腿相反：**丢弃**待决 force-restart 快照（上游 :1888 `pendingForceRestartConfig = null`）。
-/// 结构性重启用最新完整 config → 旧 force 快照必须让位，否则它反 shadow 本次变更。
+/// An unconfirmed graph transaction cannot replace or discard an existing restart snapshot.
 #[tokio::test]
-async fn restart_leg_discards_pending_force_restart_snapshot() {
+async fn unconfirmed_graph_change_preserves_existing_force_snapshot() {
     for old_source in [
+        ForceRestartSource::Confirmed {
+            intent_generation: 0,
+        },
         ForceRestartSource::Full,
         ForceRestartSource::Selected {
             intent_generation: 7,
@@ -3775,16 +3774,16 @@ async fn restart_leg_discards_pending_force_restart_snapshot() {
         let next = two_node_config(7899, "node-a");
         rt.config.save_full(&next).unwrap();
 
-        assert_eq!(rt.switch_mode(next).await, SwitchOutcome::Restarting);
-        assert!(rt.pending_force_restart.read().unwrap().is_none());
-        assert_eq!(rt.gate.pending().force_restart_id, None);
-        assert!(
-            matches!(
-                rt.debounced.decide_now(true, false),
-                polaris_switch_engine::DebouncedOutcome::Proceed(None)
-            ),
-            "new structural restart must select latest full disk D, not the old force id"
+        assert_eq!(rt.switch_mode(next).await, SwitchOutcome::Pending);
+        assert_eq!(
+            rt.pending_force_restart
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|entry| entry.0),
+            Some(42)
         );
+        assert_eq!(rt.gate.pending().force_restart_id, Some(42));
         assert_eq!(rt.config.current().unwrap()["mixedPort"], 7899);
         rt.gate.bump_generation(); // Synthetic running core must not execute the scheduled timer.
     }
@@ -3893,45 +3892,27 @@ async fn apply_pending_while_stopped_consumes_deferred_delete_side_effects() {
 }
 
 #[tokio::test]
-async fn apply_pending_applied_when_running_and_idle() {
+async fn apply_pending_without_runtime_baseline_is_unconfirmed_and_never_restarts() {
     let (rt, _dir) = test_runtime();
     mark_running(&rt);
-    assert_eq!(rt.apply_pending().await, "applied");
-    // applied 必须真的留下 force-restart 专用快照（drain/去抖据此重启到这份 cfg）。
-    assert!(
-        rt.pending_force_restart.read().unwrap().is_some(),
-        "applied 必须写 force-restart 快照，否则重启会回落旧 config（H-1 死循环）"
-    );
+    assert_eq!(rt.apply_pending().await, "unconfirmed");
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(rt.gate.pending().force_restart_id.is_none());
 }
 
-/// **「apply 之后差集必须为空」**（陈先生 2026-07-30 真机：点了「立即应用」核**真**重启了，
-/// 条上却仍是「立即应用」，连点三次形态相同）。
-///
-/// 走全链路的**纯状态半边**（不起真核）：起核快照 = 旧配置、磁盘 = 新配置 ⇒ 差集非空
-/// （**正向对照**，否则下面那句「为空」毫无信息量）→ `apply_pending` 排程并留下 force-restart
-/// 快照 → 模拟那次去抖重启落地（去抖回调按 id 取回该快照，`start_inner` 就绪腿把它装成新的
-/// 起核快照并清欠账）⇒ 差集必须为空。
-///
-/// **本条证不到的那一半**（如实标注）：`start_inner` 真的装了快照、真的清了欠账 —— 那要真起核，
-/// 由源码型守卫 `deferred_debt_is_cleared_where_the_startup_snapshot_is_written_and_cleared`
-/// 与 `pending_changes_push_is_wired_on_both_sides_of_the_diff` 兜。
-///
-/// 变异对照（真能转红的）：
-/// - `apply_pending` 改成拿 `current_config`（在飞 start 会覆盖它）而非 `self.config.current()`
-///   做快照 → 落地装回旧配置 → `added` 里 node-c 还在 → 红；
-/// - timer 的严格 id/世代认领若吞掉快照 → `expect` 炸或取到 None → 红；
-/// - `pending_changes` 的 `modified` 旧侧改成现算磁盘 → 差集恒空，本条的**正向对照**那一半先红。
 #[tokio::test]
 async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
     let (rt, _dir) = test_runtime();
     let base = two_node_config(7891, "node-a");
     rt.config.save_full(&base).expect("落盘");
     install_startup_snapshot(&rt, &base);
+    *rt.current_config.write().unwrap() = Some(base.clone());
     mark_running(&rt);
 
     // 条上「配置变更待应用」的两条来源各摆一个：①「保存不重启」的欠账 ② 一个尚未进核的新节点。
     rt.restart_deferred.store(true, Ordering::SeqCst);
     let mut next = base.clone();
+    next["mixedPort"] = serde_json::json!(7892);
     next["servers"]
         .as_array_mut()
         .unwrap()
@@ -3946,13 +3927,17 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
     );
     assert!(before.restart_deferred, "正向对照：欠账必须真的在");
 
-    // 用户点「立即应用」。
-    assert_eq!(rt.apply_pending().await, "applied");
+    // User explicitly confirms the exact saved candidate.
+    assert_eq!(rt.apply_confirmed_for_test().await.0, "applied");
     let id = rt
         .gate
         .pending()
         .force_restart_id
         .expect("applied 必须在 gate 里记下 force id");
+    assert!(matches!(
+        rt.pending_force_restart.read().unwrap().as_ref().unwrap().2,
+        ForceRestartSource::Confirmed { .. }
+    ));
 
     // 走真实去抖判定与严格认领；只替代会启动真实进程的 stop/start 半边。
     let scheduled_generation = rt.gate.generation();
@@ -3982,6 +3967,8 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
             modified: vec![],
             removed: vec![],
             restart_deferred: false,
+            pending_apply: false,
+            restart_required: false,
         },
         "重启落地后差集必须为空 —— 非空 = 条上继续挂「立即应用」，用户再点也清不掉"
     );
@@ -3991,28 +3978,14 @@ async fn diff_is_empty_after_the_restart_that_apply_pending_scheduled_lands() {
 /// 顺序颠倒 → restart 的 stop→start 空窗内（句柄暂空、depth>0）本次强制重启被静默丢弃，
 /// 用户重试遇 304 → 不再触发 force-restart → 死循环。
 #[tokio::test]
-async fn apply_pending_deferred_when_busy_even_though_core_appears_stopped() {
+async fn apply_pending_busy_is_conflict_without_queuing_restart() {
     let (rt, _dir) = test_runtime();
-    // 模拟 restart 的 stop→start 空窗：lifecycle 在飞，但状态尚未回到 running。
     rt.gate.begin();
-    assert!(!rt.core_running(), "前提：此刻句柄/状态看起来是「未运行」");
-
-    let r = rt.apply_pending().await;
-    assert_eq!(
-        r, "deferred",
-        "depth>0 必须先判 → deferred；若先判「未运行」会返回 skipped 并永久丢弃本次变更（H-1）"
-    );
-    // 必须排入 drain：restart_pending + force-restart 快照都要在。
-    let pending = rt.gate.pending();
-    assert!(
-        pending.restart_pending,
-        "deferred 必须置 restart_pending 供 end() 排空"
-    );
-    assert!(
-        pending.force_restart_id.is_some(),
-        "deferred 必须记 force-restart id"
-    );
-    assert!(rt.pending_force_restart.read().unwrap().is_some());
+    assert!(!rt.core_running());
+    assert_eq!(rt.apply_pending().await, "conflict");
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(rt.gate.pending().force_restart_id.is_none());
+    assert!(!rt.gate.pending().restart_pending);
 }
 
 #[tokio::test]
@@ -4020,7 +3993,13 @@ async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
     let (rt, _dir) = test_runtime();
     let generation = rt.gate.generation();
     let original = serde_json::json!({"selectedServerId": "node-a"});
-    *rt.pending_force_restart.write().unwrap() = Some((7, original, ForceRestartSource::Full));
+    *rt.pending_force_restart.write().unwrap() = Some((
+        7,
+        original,
+        ForceRestartSource::Confirmed {
+            intent_generation: rt.selector_reconcile.intent_generation(),
+        },
+    ));
     rt.gate.set_force_restart(7);
     let (tx, rx) = tokio::sync::oneshot::channel();
     rt.debounced
@@ -4036,7 +4015,13 @@ async fn timer_with_old_force_id_cannot_consume_a_new_apply_snapshot() {
     let next = serde_json::json!({"selectedServerId": "node-b", "logLevel": "debug"});
     {
         let mut pending = rt.pending_force_restart.write().unwrap();
-        *pending = Some((8, next.clone(), ForceRestartSource::Full));
+        *pending = Some((
+            8,
+            next.clone(),
+            ForceRestartSource::Confirmed {
+                intent_generation: rt.selector_reconcile.intent_generation(),
+            },
+        ));
         rt.gate.set_force_restart(8);
     }
     assert!(rt
@@ -4077,9 +4062,43 @@ async fn real_core_hot_switch_keeps_pid() {
     // ── ① 起核（两节点，选中 Node A）────────────────────────────────────────
     // 生产时序：save_full 落盘 → broadcast_config_changed → switch_mode。测试逐条照做，
     // 否则去抖重启回落读磁盘时会拿到默认配置（restart 腿的载荷来自 config.current()）。
+    // Keep the production default enabled; only replace unrelated Internet ZIP
+    // download with this test's own inert static bundle via the real resolver.
+    let dashboard = rt.config.dir().join("singbox-dashboard");
+    std::fs::create_dir_all(&dashboard).unwrap();
+    std::fs::write(
+        dashboard.join("index.html"),
+        "<!doctype html><title>controlled fixture</title>",
+    )
+    .unwrap();
+    assert_eq!(
+        super::super::core_binary::resolve_dashboard_serve_dir(rt.config.dir()),
+        Some(dashboard.to_string_lossy().into_owned())
+    );
     let cfg_a = two_node_config_ports(mixed, "node-a", pa, pb);
+    assert_eq!(
+        cfg_a["singboxDashboard"], true,
+        "production default dashboard must stay enabled"
+    );
     rt.config.save_full(&cfg_a).expect("落盘应成功");
-    let st = rt.start(cfg_a.clone()).await.expect("起核应成功");
+    let started = rt.start(cfg_a.clone()).await;
+    // These are the actual bytes written by the production generator for this
+    // isolated synthetic fixture, not a second serialization/reconstructed graph.
+    // Existing controlled-test logs carry the lossless string; the runner stores
+    // its original UTF-8 bytes and checks SHA before the normal start assertion.
+    if let Ok(raw) = std::fs::read(rt.runtime_config_path()) {
+        let record = serde_json::json!({
+            "schema":"polaris-controlled-production-graph-v1",
+            "processId":std::process::id(), "stage":"initial-start", "startSucceeded":started.is_ok(),
+            "source":"actual-runtime-config-path", "dashboardEnabled":true,
+            "dashboardPath":dashboard.to_string_lossy(), "bytes":raw.len(),
+            "sha256":polaris_updater::sha256_hex(&raw),
+            "configJson":String::from_utf8(raw).expect("generator emits UTF-8 JSON"),
+            "publicationEligible":false,
+        });
+        println!("\nPOLARIS_DEFAULT_GRAPH {record}");
+    }
+    let st = started.expect("起核应成功");
     let pid1 = st.pid;
     println!(
         "[①] start → pid={pid1} mixedPort={} apiPort={}",
@@ -4189,7 +4208,7 @@ async fn real_core_hot_switch_keeps_pid() {
     );
     assert_eq!(hits_b.load(Ordering::SeqCst), 0, "旧出口 B 不得承接新连接");
 
-    // ── ④ norm 内字段（端口）变更 → 走重启，PID 必须变 ──────────────────────
+    // Structural edit is deferred first. Only explicit confirmation may change PID.
     let mixed2 = free_port();
     let cfg_port = two_node_config_ports(mixed2, "node-b", pa, pb);
     rt.config.save_full(&cfg_port).expect("落盘应成功");
@@ -4197,17 +4216,32 @@ async fn real_core_hot_switch_keeps_pid() {
     println!("[④] switch_mode（改 mixedPort {mixed} → {mixed2}）→ {out:?}");
     assert_eq!(
         out,
-        SwitchOutcome::Restarting,
-        "[④] norm 内字段变更必须走重启腿（热切换切不了端口）"
+        SwitchOutcome::Deferred,
+        "[④] structural edit must wait for explicit restart permission"
     );
     assert_eq!(
         rt.current_config_snapshot().unwrap()["mixedPort"],
         mixed,
         "去抖等待期间运行态 R 仍须指向旧核端口"
     );
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(!rt.gate.pending().restart_pending);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        rt.status().pid,
+        pid1,
+        "no implicit restart during the decision window"
+    );
+    assert!(ps_alive(pid1));
+    let (confirmed, id) = rt.apply_confirmed_for_test().await;
+    assert_eq!(confirmed, "applied");
+    let (queued_id, queued, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+    assert_eq!(Some(queued_id), id);
+    assert_eq!(queued["mixedPort"], mixed2);
+    assert!(matches!(source, ForceRestartSource::Confirmed { .. }));
     let pid2 = wait_pid_change(&rt, pid1, 20)
         .await
-        .expect("[④] 去抖重启应在 20s 内换出新 pid");
+        .expect("[④] explicitly confirmed restart must produce a new PID within 20s");
     println!("[④] 重启完成：pid {pid1} → {pid2}");
     assert!(ps_alive(pid2), "[④] 新核必须在跑");
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -4220,7 +4254,7 @@ async fn real_core_hot_switch_keeps_pid() {
     assert_eq!(
         rt.current_config_snapshot().unwrap()["mixedPort"],
         mixed2,
-        "timer 须从最新 D 取配置，并在新核 ready 后才提交 R"
+        "timer must use the exact confirmed snapshot and commit R only after core readiness"
     );
     println!("[④] 旧核已退、新核监听 {mixed2} → 重启路径完好 ✓");
 
@@ -4299,28 +4333,123 @@ async fn real_core_auto_failover_attests_without_applying_saved_debt() {
     rt.stop().await.expect("stop real core");
 }
 
-/// ⑤ 热切换失败 → 回退重启，且**不卡死**。
-///
-/// 真实失败注入：直接把核杀掉，此时 switch_mode 会判热切腿 → gRPC 连不上 → ClientNotReady →
-/// 按 executor 契约退回去抖重启 → 新核起来。这同时实证了「热切换失败不会把变更吞掉、也不会挂起」。
-///
-/// 本测单独证明热切失败的 fallback owner，不与后台自愈竞速。杀核前复用 crash machine 的
-/// abort 标记抑制自愈；它不改 lifecycle 世代。fallback 是带 expected_generation 的接续
-/// start，不复位显式用户停止标记；新核与选中出口确认后，由测试恢复自己注入的隔离标记。
-/// 不能依赖「sleep 500ms < watcher 1s」：Windows 拒连检查本身也可能跨过自愈退避窗口。
-/// 自愈与世代让位仍由独立 recovery 测试覆盖；这里坚持只接受 Restarting。
+// Same loopback-only SOCKS5/no-auth HTTP response protocol as runtime/http tests.
+// No target connection is made: the RFC5737 destination is consumed locally.
+async fn controlled_socks_http_listener(
+    body: String,
+) -> (
+    u16,
+    Arc<std::sync::atomic::AtomicUsize>,
+    impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = hits.clone();
+    let server = async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let exchange = async {
+                let invalid = || std::io::Error::other("controlled SOCKS fixture mismatch");
+                let mut greeting = [0; 2];
+                socket.read_exact(&mut greeting).await?;
+                if greeting[0] != 5 {
+                    return Err(invalid());
+                }
+                let mut methods = vec![0; usize::from(greeting[1])];
+                socket.read_exact(&mut methods).await?;
+                if !methods.contains(&0) {
+                    return Err(invalid());
+                }
+                socket.write_all(&[5, 0]).await?;
+                let mut connect = [0; 10];
+                socket.read_exact(&mut connect).await?;
+                if connect != [5, 1, 0, 1, 192, 0, 2, 1, 0, 80] {
+                    return Err(invalid());
+                }
+                socket.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    if request.len() >= 8192 {
+                        return Err(invalid());
+                    }
+                    request.push(socket.read_u8().await?);
+                }
+                observed.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await?;
+                socket.flush().await
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(3), exchange).await;
+        }
+    };
+    (port, hits, server)
+}
+
+async fn controlled_http_request(mixed: u16, nonce: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", mixed)).await.unwrap();
+        socket.write_all(format!("GET http://192.0.2.1/{nonce} HTTP/1.1\r\nHost: 192.0.2.1\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        socket.take(16385).read_to_end(&mut response).await.unwrap();
+        assert!(response.len() <= 16384);
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        response
+    }).await.expect("one controlled HTTP exchange must complete without replay")
+}
+
+/// Real failed HOT remains deferred without restarting. An explicit confirmation
+/// cannot authorize a dead incarnation; a separate user Restart then exercises the
+/// existing lifecycle/selector recovery. Automatic recovery is isolated with the
+/// existing crash marker, so it cannot provide false success.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "真机验证：需 POLARIS_SINGBOX_PATH 指向真实 sing-box；非 CI 门"]
-async fn real_core_hot_switch_failure_falls_back_to_restart() {
+async fn real_core_hot_switch_failure_waits_for_explicit_restart_confirmation() {
     let _real_core_guard = lock_real_core_tests().await;
     let (rt, dir, _core) = real_core_runtime();
     let _cleanup = RealCoreCleanupGuard::new(&rt);
     crate::logging::init(&dir);
     let mixed = free_port();
 
-    let cfg_a = two_node_config(mixed, "node-a");
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let (pa, hits_a, task_a) = controlled_socks_http_listener(format!("A:{nonce}")).await;
+    let (pb, hits_b, task_b) = controlled_socks_http_listener(format!("B:{nonce}")).await;
+    // JoinSet owns both listener futures and aborts them even if an assertion panics.
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(task_a);
+    servers.spawn(task_b);
+    let mut cfg_a = two_node_config_ports(mixed, "node-a", pa, pb);
+    cfg_a["servers"] = serde_json::json!([
+        {"id":"node-a","name":"Node A","protocol":"socks","address":"127.0.0.1","port":pa},
+        {"id":"node-b","name":"Node B","protocol":"socks","address":"127.0.0.1","port":pb}
+    ]);
     rt.config.save_full(&cfg_a).expect("落盘应成功");
-    let st = rt.start(cfg_a).await.expect("起核应成功");
+    let st = rt.start(cfg_a.clone()).await.expect("起核应成功");
+    let client1 = polaris_singbox_grpc::SingBoxApiClient::connect(
+        polaris_singbox_grpc::Endpoint::new("127.0.0.1", st.clash_api_port),
+        FIXTURE_MANAGEMENT_SECRET.to_owned(),
+    )
+    .await
+    .expect("initial authenticated API");
+    let incarnation1 = client1
+        .get_runtime_capabilities()
+        .await
+        .expect("initial capabilities")
+        .active
+        .expect("initial active runtime")
+        .incarnation;
+    assert!(!incarnation1.is_empty());
+    assert!(controlled_http_request(mixed, &nonce)
+        .await
+        .ends_with(&format!("A:{nonce}")));
+    assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+    assert_eq!(hits_b.load(Ordering::SeqCst), 0);
     let pid1 = st.pid;
     println!("[⑤] 起核 pid={pid1}");
 
@@ -4349,12 +4478,12 @@ async fn real_core_hot_switch_failure_falls_back_to_restart() {
     assert!(api_dead, "[⑤] 核已被 SIGKILL → 管理 API 端口应不可连");
     assert!(
         rt.status().running,
-        "[⑤] fallback 前提：运行快照仍在，但真实管理 API 已不可达"
+        "[⑤] 显式重启确认前提：运行快照仍在，但真实管理 API 已不可达"
     );
     assert_eq!(
         rt.gate.generation(),
         generation,
-        "[⑤] 自愈不得抢占 fallback 世代"
+        "[⑤] 自愈不得抢占显式重启世代"
     );
     assert_eq!(
         rt.crash_lock().restart_count(),
@@ -4364,28 +4493,92 @@ async fn real_core_hot_switch_failure_falls_back_to_restart() {
     assert!(rt.crash_lock().auto_restart_aborted());
     println!("[⑤] 已 SIGKILL 核 pid={pid1}：管理 API 不可连，status 仍自称 running");
 
-    // 切节点 → 热切腿 → gRPC 连不上 → 回退重启。带超时断言「不卡死」。
-    let cfg_b = two_node_config(mixed, "node-b");
+    // Failed selector HOT must settle without an automatic restart.
+    let mut cfg_b = cfg_a;
+    cfg_b["selectedServerId"] = serde_json::json!("node-b");
     rt.config.save_full(&cfg_b).expect("落盘应成功");
-    let out = tokio::time::timeout(Duration::from_secs(15), rt.switch_mode(cfg_b))
+    let out = tokio::time::timeout(Duration::from_secs(15), rt.switch_mode(cfg_b.clone()))
         .await
         .expect("[⑤] switch_mode 必须在 15s 内返回 —— 卡死即失败");
     println!("[⑤] 核已死时 switch_mode → {out:?}");
     assert_eq!(
         out,
-        SwitchOutcome::Restarting,
-        "[⑤] 热切换失败必须退回重启，绝不能静默吞掉切节点"
+        SwitchOutcome::Deferred,
+        "[⑤] failed HOT must stay pending without implicit restart permission"
     );
 
-    // 回退的重启真的把核拉起来了（不是只喊了一声）。
-    let pid2 = wait_pid_change(&rt, pid1, 20)
-        .await
-        .expect("[⑤] 回退重启应在 20s 内起出新核");
-    println!(
-        "[⑤] 回退重启完成：pid {pid1} → {pid2}（新核存活={}）",
-        ps_alive(pid2)
+    assert_eq!(rt.status().pid, pid1);
+    assert_eq!(rt.gate.generation(), generation);
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-a"
     );
-    assert!(ps_alive(pid2), "[⑤] 回退重启必须真的起出新核");
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-b");
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(!rt.gate.pending().restart_pending);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        rt.status().pid,
+        pid1,
+        "failed HOT must not schedule a successor"
+    );
+    assert_eq!(rt.gate.generation(), generation);
+    let choice = rt.restart_choice_for_test();
+    assert_eq!(choice.status, "restartRequired");
+    let old_token = choice
+        .restart_confirmation
+        .expect("original generation choice token");
+    let confirmed = rt.apply_pending_transaction(Some(old_token.clone())).await;
+    assert_eq!(
+        confirmed.status, "unconfirmed",
+        "dead incarnation cannot authenticate confirmation"
+    );
+    assert!(confirmed.apply_id.is_none());
+    assert_eq!(rt.gate.generation(), generation);
+    assert_eq!(rt.status().pid, pid1);
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(!rt.gate.pending().restart_pending);
+
+    // A user Restart is a separate existing lifecycle action, not a bypass of
+    // the failed transaction's authenticated confirmation contract.
+    let restarted = tokio::time::timeout(Duration::from_secs(20), rt.restart(cfg_b))
+        .await
+        .expect("explicit user restart bounded")
+        .expect("explicit user restart succeeds");
+    let pid2 = restarted.pid;
+    assert_ne!(pid2, pid1);
+    assert!(ps_alive(pid2));
+    assert!(
+        !ps_alive(pid1),
+        "old owned child must be reaped by explicit restart"
+    );
+    assert!(rt.gate.generation() > generation);
+    let generation2 = rt.gate.generation();
+    let client2 = polaris_singbox_grpc::SingBoxApiClient::connect(
+        polaris_singbox_grpc::Endpoint::new("127.0.0.1", restarted.clash_api_port),
+        FIXTURE_MANAGEMENT_SECRET.to_owned(),
+    )
+    .await
+    .expect("successor authenticated API");
+    let incarnation2 = client2
+        .get_runtime_capabilities()
+        .await
+        .expect("successor capabilities")
+        .active
+        .expect("successor active runtime")
+        .incarnation;
+    assert!(!incarnation2.is_empty());
+    assert_ne!(incarnation2, incarnation1);
+    let stale = rt.apply_pending_transaction(Some(old_token)).await;
+    assert_eq!(
+        stale.status, "conflict",
+        "old choice must not operate on a successor"
+    );
+    assert!(stale.apply_id.is_none());
+    assert_eq!(rt.gate.generation(), generation2);
+    assert_eq!(rt.status().pid, pid2);
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(!rt.gate.pending().restart_pending);
 
     // PID 变化本身不等于 start 已完成；等既有 lifecycle settle 后读真实 selector。
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -4394,7 +4587,7 @@ async fn real_core_hot_switch_failure_falls_back_to_restart() {
         }
     })
     .await
-    .expect("[⑤] fallback start 必须完成");
+    .expect("[⑤] 用户显式 Restart 后的启动必须完成");
     assert!(rt.status().running);
     assert_eq!(rt.status().pid, pid2);
     let groups = rt
@@ -4402,17 +4595,32 @@ async fn real_core_hot_switch_failure_falls_back_to_restart() {
         .await
         .groups_snapshot()
         .await
-        .expect("[⑤] fallback 新核必须返回真实 selector 快照");
+        .expect("[⑤] 用户显式 Restart 后的新核必须返回真实 selector 快照");
     assert!(
         groups
             .iter()
             .any(|group| group.tag == "proxy-selector" && group.selected == "Node B"),
-        "[⑤] fallback 新核必须实际选中 Node B，不得吞掉切节点"
+        "[⑤] 用户显式 Restart 后的新核必须实际选中 Node B，不得吞掉切节点"
     );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectedServerId"],
+        "node-b"
+    );
+    let a_before = hits_a.load(Ordering::SeqCst);
+    let b_before = hits_b.load(Ordering::SeqCst);
+    assert!(controlled_http_request(restarted.mixed_port, &nonce)
+        .await
+        .ends_with(&format!("B:{nonce}")));
+    assert_eq!(
+        hits_a.load(Ordering::SeqCst),
+        a_before,
+        "successor must not send new traffic to A"
+    );
+    assert_eq!(hits_b.load(Ordering::SeqCst), b_before + 1);
     assert_eq!(
         rt.crash_lock().restart_count(),
         0,
-        "[⑤] 新核必须来自热切 fallback，不能借自愈通过"
+        "explicit user restart, not automatic recovery"
     );
     // restart_inner → start_guarded(..., Some(stop_generation)) 是条件接续，
     // 不走 expected_generation=None 的显式 Start reset。不要把测试注入的
@@ -4421,7 +4629,7 @@ async fn real_core_hot_switch_failure_falls_back_to_restart() {
         let mut crash = rt.crash_lock();
         assert!(
             crash.auto_restart_aborted(),
-            "[⑤] 接续 fallback 必须保留测试的自愈隔离"
+            "[⑤] 接续的显式重启 必须保留测试的自愈隔离"
         );
         if auto_restart_aborted_before {
             crash.mark_user_aborted();
@@ -4436,6 +4644,7 @@ async fn real_core_hot_switch_failure_falls_back_to_restart() {
     }
 
     rt.stop().await.expect("停核应成功");
+    servers.shutdown().await;
 }
 
 #[test]
@@ -6121,4 +6330,62 @@ async fn auto_failover_disk_rollback_failure_retains_persisted_target_for_reconc
     rt.config
         .save_full(&persisted)
         .expect("the injected persistence failure must be consumed exactly once");
+}
+
+#[test]
+fn selector_paths_recheck_original_physical_targets_after_inactive_hot_edit() {
+    // Pure route-target tests cover A->B inactive edits then activation. This
+    // source-wiring guard ensures refreshed switch fingerprints cannot bypass
+    // that check through the ordinary or specialized selector entry points.
+    let hot = crate::test_support::crate_source("runtime/proxy/hot_switch.rs");
+    let classify = hot
+        .split("pub(super) fn classify_switch")
+        .nth(1)
+        .or_else(|| hot.split("fn classify_switch").nth(1))
+        .expect("classifier");
+    assert!(classify.contains("runtime_route_targets_reusable(&old_cfg, &new_cfg, &binding_plan)"));
+    let reconcile = hot
+        .split("runtime_physical_targets_ready(&reconciled_runtime)")
+        .nth(1)
+        .expect("reconcile guard");
+    assert!(reconcile
+        .find("select_outbound(PROXY_SELECTOR_TAG")
+        .is_some());
+    let auto = crate::test_support::crate_source("runtime/proxy/native_auto.rs");
+    let toggle = auto
+        .split("pub(crate) async fn native_auto_set_enabled")
+        .nth(1)
+        .expect("toggle");
+    assert!(
+        toggle
+            .find("runtime_physical_targets_ready(&next)")
+            .unwrap()
+            < toggle
+                .find("self.native_put(&api, wrapper, member)")
+                .unwrap()
+    );
+    let select = auto
+        .split("pub(crate) async fn native_auto_select_default")
+        .nth(1)
+        .expect("default Auto");
+    assert!(
+        select
+            .find("runtime_physical_targets_ready(&target_projection)")
+            .unwrap()
+            < select
+                .find(".execute_hot_switch_plan_with_pre_switch_snapshot(")
+                .unwrap()
+    );
+    let manual = auto
+        .split("pub(super) async fn native_manual_exit")
+        .nth(1)
+        .expect("manual exit");
+    assert!(
+        manual
+            .find("runtime_physical_targets_ready(projected)")
+            .unwrap()
+            < manual.find("let plan = HotSwitchPlan").unwrap()
+    );
+    let runtime = crate::test_support::crate_source("runtime/proxy/runtime_config.rs");
+    assert!(runtime.contains("map_or(old, |value| &value.physical_route_config)"));
 }

@@ -307,7 +307,7 @@ const REGISTRY: readonly PromiseRow[] = [
     { file: 'ui/src/domain/utls.ts', needle: 'export function tlsFingerprintStatus' },
   ] } },
   {
-    snippet: '新配置预设为默认（Chrome）',
+    snippet: '新配置预设为跟随',
     evidence: {
       kind: 'anchors',
       items: [

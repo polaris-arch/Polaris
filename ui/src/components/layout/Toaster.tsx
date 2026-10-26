@@ -191,7 +191,7 @@ export function Toaster() {
             </button>
           )}
           <div className="toast-msg">{it.msg}</div>
-          {it.desc && <div className="toast-desc">{it.desc}</div>}
+          {it.desc && <div className="toast-desc" tabIndex={it.dismiss ? 0 : undefined}>{it.desc}</div>}
           {it.actions && it.actions.length > 0 && (
             <div className="toast-actions">
               {it.actions.map((action) => (

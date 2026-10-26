@@ -178,7 +178,7 @@ async fn cancelled_session_query_stops_normally_and_reopens_without_a_permanent_
     assert_eq!(marker.read_checked(), ProxyMarkerRead::Missing);
     assert!(!*rt.desktop_shutdown.lock().unwrap());
     assert!(rt
-        .start(serde_json::json!({}))
+        .start(post_admission_failure_config())
         .await
         .unwrap_err()
         .message

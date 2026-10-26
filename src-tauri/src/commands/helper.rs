@@ -74,6 +74,7 @@ pub async fn helper_install(
     if !mode.supported_on(helper.platform()) {
         return Ok(ApiResponse::ok(HelperActionResult {
             success: false,
+            execution_diagnostic: None,
             error_code: Some(HelperActionErrorCode::Unsupported),
             diagnostic: Some(
                 "explicit helper stop-and-upgrade is supported only on macOS".to_owned(),
@@ -87,6 +88,7 @@ pub async fn helper_install(
     {
         return Ok(ApiResponse::ok(HelperActionResult {
             success: false,
+            execution_diagnostic: None,
             error_code: Some(HelperActionErrorCode::ProxyRunning),
             diagnostic: Some("stop the helper-managed proxy before upgrading helper".to_owned()),
             status: helper.status(),

@@ -43,6 +43,7 @@ final class TunnelLifecycle {
     private var stopPending = false
     private var quarantined = false
     private var runtimeStopped: Bool?
+    private var runtimeAdmission: TunnelRuntimeAdmission?
     private var cleanupError: String?
     private var lastError: String?
     private var operationRequestID: String?
@@ -60,6 +61,7 @@ final class TunnelLifecycle {
             throw lifecycleError("A tunnel operation is active or uncertain; a new core cannot be started")
         }
         generation += 1
+        runtimeAdmission = nil
         self.identity = identity
         operationRequestID = identity.requestID
         phase = "starting"
@@ -77,6 +79,7 @@ final class TunnelLifecycle {
         lock.lock(); defer { lock.unlock() }
         guard !stopPending else { return nil }
         generation += 1 // invalidates any start/settings/reload receipt immediately
+        runtimeAdmission = nil
         stopPending = true
         phase = "stopping"
         return generation
@@ -88,6 +91,7 @@ final class TunnelLifecycle {
             throw lifecycleError("The tunnel cannot accept reload while a lifecycle operation is active or uncertain")
         }
         generation += 1
+        runtimeAdmission = nil
         operationRequestID = "rpc-reload:" + UUID().uuidString
         phase = "reloadAccepted"
         return generation
@@ -148,10 +152,23 @@ final class TunnelLifecycle {
         return publication()
     }
 
+    /// Bind post-Start protocol/instance evidence to this generation before ready publication.
+    func admitRuntimeProtocol(_ token: UInt64, admission: TunnelRuntimeAdmission) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard generation == token, !quarantined, !stopPending,
+              phase == "starting" || phase == "reloadAccepted" else { return false }
+        runtimeAdmission = admission
+        return true
+    }
+
     @discardableResult
     func complete(_ token: UInt64, phase: String, stopped: Bool?, error: String? = nil, cleanup: String? = nil) -> Bool {
         lock.lock()
         guard generation == token else { lock.unlock(); return false }
+        // The acceptance check and ready publication are atomic with Stop/timeout.
+        if phase == "running" && (quarantined || stopPending || runtimeAdmission == nil) {
+            lock.unlock(); return false
+        }
         if phase == "stopped" { stopPending = false }
         self.phase = quarantined ? "uncertain" : phase
         runtimeStopped = stopped
@@ -267,4 +284,111 @@ struct TunnelSettingsTimeout: LocalizedError {
 
 private func lifecycleError(_ message: String) -> NSError {
     NSError(domain: "PolarisPacketTunnel", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+}
+
+/// Observed protocol metadata is not artifact provenance or a compiled expected manifest.
+/// Existing source/carrier receipts remain the source identity boundary.
+struct TunnelRuntimeAdmission {
+    struct Identity {
+        let incarnation: String
+        let appliedRevision: String
+        let effectiveDigest: String
+    }
+    let manifestDigest: String
+    let identity: Identity?
+    let controlRevision: String
+    let unsupportedPaths: [String]
+
+    private struct Document: Decodable {
+        let contract_version: UInt32
+        let connected_hot_enabled: Bool?
+        let implementation_manifest_digest: String
+        let active: Active?
+        let fields: [Field]
+        let control_revision: String?
+    }
+    private struct Active: Decodable {
+        let incarnation: String?
+        let applied_revision: String?
+        let effective_digest: String?
+    }
+    private struct Field: Decodable {
+        let effective_path: String?
+        let variant: String?
+        let platform_build: String?
+        let adapter_version: String?
+        let update_class: String?
+        let conditions: [String]?
+    }
+
+    private static let methods = ["GetRuntimeCapabilities", "PlanRuntimeConfig", "ApplyRuntimeConfig",
+        "GetRuntimeConfigStatus", "RetryRuntimePersistence", "AcknowledgeRuntimePersistence"]
+
+    private static func isDigest(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
+    /// protojson encodes uint64 as decimal strings and omits zero. Never use NSNumber/Double.
+    private static func uint64(_ encoded: String?) throws -> String {
+        let value = encoded ?? "0"
+        let max = "18446744073709551615"
+        guard !value.isEmpty, value.utf8.count <= 20,
+              value.utf8.allSatisfy({ (48...57).contains($0) }),
+              value == "0" || value.first != "0",
+              value.utf8.count < 20 || value <= max else { throw lifecycleError("Invalid runtime integer") }
+        return value
+    }
+
+    static func decode(_ document: String, platform: String) throws -> TunnelRuntimeAdmission {
+        guard (1...(1024 * 1024)).contains(document.utf8.count) else { throw lifecycleError("Runtime capabilities exceed budget") }
+        let value = try JSONDecoder().decode(Document.self, from: Data(document.utf8))
+        let protocols = value.fields.filter { $0.effective_path == "runtime.protocol" }
+        guard value.contract_version == 1, isDigest(value.implementation_manifest_digest),
+              protocols.count == 1, let entry = protocols.first,
+              entry.variant == "polaris-daily-runtime-v1", entry.adapter_version == "1",
+              entry.platform_build == platform, entry.conditions == methods,
+              entry.update_class == nil || entry.update_class == "RUNTIME_UPDATE_UNSPECIFIED" else {
+            throw lifecycleError("Runtime protocol mismatch")
+        }
+        var startedUnsupported = false
+        var unsupported: [String] = []
+        for reason in value.fields where reason.effective_path == "runtime.instance" {
+            let paths = reason.conditions ?? []
+            switch reason.variant {
+            case "OWNER_PERSISTENCE_UNBOUND":
+                guard paths == ["runtime.persistence"] else { throw lifecycleError("Invalid runtime persistence warning") }
+            case "RUNTIME_STARTED_UNSUPPORTED":
+                guard !startedUnsupported, paths == ["runtime"] else { throw lifecycleError("Invalid unsupported runtime lifecycle") }
+                startedUnsupported = true
+            case "PENDING_ADAPTER":
+                guard paths.count == 1, let path = paths.first,
+                      !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, path != "runtime" else {
+                    throw lifecycleError("Missing unsupported runtime graph path")
+                }
+                unsupported.append(path)
+            default:
+                // Starting/stopped/unavailable/unknown instance states are not native ready.
+                throw lifecycleError("Runtime instance is not ready")
+            }
+        }
+        let incarnation = value.active?.incarnation ?? ""
+        let revision = try uint64(value.active?.applied_revision)
+        let effective = value.active?.effective_digest ?? ""
+        let identity: Identity?
+        if value.connected_hot_enabled ?? false {
+            guard !startedUnsupported, unsupported.isEmpty,
+                  !incarnation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  incarnation.utf8.count <= 256, revision != "0", isDigest(effective) else {
+                throw lifecycleError("Runtime ready identity is invalid")
+            }
+            identity = Identity(incarnation: incarnation, appliedRevision: revision, effectiveDigest: effective)
+        } else {
+            guard startedUnsupported, !unsupported.isEmpty, incarnation.isEmpty,
+                  revision == "0", effective.isEmpty else { throw lifecycleError("Runtime readiness is unproved") }
+            identity = nil
+        }
+        // Full-schema support and unknown build-tag metadata never disable a live supported graph.
+        return TunnelRuntimeAdmission(manifestDigest: value.implementation_manifest_digest, identity: identity,
+            controlRevision: try uint64(value.control_revision), unsupportedPaths: unsupported)
+    }
 }

@@ -1918,6 +1918,36 @@ pub(crate) fn broadcast_config_changed_with_completion<F>(
     }
 }
 
+/// Subscription publication uses an intent already registered against the exact saved
+/// snapshot under the configuration writer. Never register a second intent here: a late
+/// old task must not invalidate a newer edit's queued application.
+pub(crate) fn broadcast_config_changed_with_registered_intent<F>(
+    app: &AppHandle,
+    proxy: &std::sync::Arc<ProxyRuntime>,
+    new_value: &Value,
+    intent_generation: u64,
+    completion: F,
+) where
+    F: FnOnce(&std::sync::Arc<ProxyRuntime>, Option<SwitchOutcome>) + Send + 'static,
+{
+    let mut cfg = new_value.clone();
+    strip_privacy_secrets(&mut cfg);
+    emit_config_changed_signal(app);
+    let app = app.clone();
+    let proxy = std::sync::Arc::clone(proxy);
+    tauri::async_runtime::spawn(async move {
+        apply_config_broadcast_core(
+            &proxy,
+            cfg,
+            false,
+            intent_generation,
+            move |current| apply_process_config_projections(&app, current),
+            completion,
+        )
+        .await;
+    });
+}
+
 /// The production broadcast task and behavior tests share the actual Apply/settle boundary.
 pub(crate) async fn apply_config_broadcast_core<F, C>(
     proxy: &std::sync::Arc<ProxyRuntime>,

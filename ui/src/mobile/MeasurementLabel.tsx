@@ -1,3 +1,4 @@
+import { visionTransportReason } from '@/domain/node-compatibility';
 import { useTranslation } from 'react-i18next';
 import { useLatencyStore } from '@/store/use-latency-store';
 import { measurementText, UNMEASURED_PROJECTION } from '@/domain/measurement-display';
@@ -7,7 +8,7 @@ import type { ServerConfig } from '@/contracts/types';
 import type { MeasurementProjection } from '@/contracts/measurement-display';
 
 /** Shared desktop/mobile presentation. The store owns qualification and purpose. */
-export function MeasurementLabel({ serverId, purpose = 'candidate', displayedServer, translate }: { serverId: string; purpose?: 'candidate' | 'current'; displayedServer?: ServerConfig; translate?: (key: string, vars?: Record<string, unknown>) => string }) {
+export function MeasurementLabel({ serverId, purpose = 'candidate', displayedServer, translate, compact = false }: { serverId: string; compact?: boolean; purpose?: 'candidate' | 'current'; displayedServer?: ServerConfig; translate?: (key: string, vars?: Record<string, unknown>) => string }) {
   const { t: sharedT } = useTranslation();
   const t = translate ?? sharedT;
   const result = useLatencyStore(state => {
@@ -22,7 +23,11 @@ export function MeasurementLabel({ serverId, purpose = 'candidate', displayedSer
   const projected: MeasurementProjection = result === UNMEASURED_PROJECTION && paused ? { state: 'paused', reason: pauseReason } : result;
   const visible: MeasurementProjection = displayedServer && (!saved || configCanonicalText(displayedServer) !== configCanonicalText(saved))
     ? { state: 'unmeasured' as const, notIncluded: 'displayedEdit' } : projected;
-  return <span data-measurement-state={visible.state} data-measurement-purpose={visible.purpose ?? purpose}
-    style={{ overflowWrap: 'anywhere' }}>{readError ? t('measurement.unavailable') : measurementText(visible, t)}
-    {purpose === 'current' && visible.purpose === 'candidate' ? ` · ${t('measurement.nodePath')}` : ''}</span>;
+  const incompatible = (displayedServer ?? saved) && visionTransportReason((displayedServer ?? saved)!);
+  const detail = incompatible ? t('nodes.invalidVisionTransport') : readError ? t('measurement.unavailable') : measurementText(visible, t)
+    + (purpose === 'current' && visible.purpose === 'candidate' ? ` · ${t('measurement.nodePath')}` : '');
+  const text = incompatible ? t('nodes.nodeInvalid') : compact && !readError ? measurementText({ ...visible, disconnected: false, purpose: undefined,
+    notIncluded: undefined, bindingMismatch: false }, t) : detail;
+  return <span data-tip={incompatible ? detail : compact ? detail + (visible.state === 'expired' ? ` · ${t('measurement.expiredHint')}` : '') : undefined} data-measurement-state={visible.state} data-measurement-purpose={visible.purpose ?? purpose}
+    style={{ overflowWrap: 'anywhere', minWidth: 0 }}>{text}</span>;
 }

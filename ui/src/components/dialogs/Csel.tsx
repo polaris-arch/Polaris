@@ -198,7 +198,7 @@ export function Csel({
     const update = () => {
       const rect = trigger.getBoundingClientRect();
       const vp = { width: window.innerWidth, height: window.innerHeight };
-      const boundary = getControlBoundary(trigger, { left: 0, top: 0, ...vp });
+      const boundary = getControlBoundary(trigger, { left: 0, top: 0, ...vp }, false);
       const maxWidth = Math.max(0, Math.min(320, boundary.width - 2 * CSEL_EDGE));
       // Apply width constraints BEFORE measuring: wrapping changes the required height.
       menu.style.width = 'max-content';
@@ -222,6 +222,7 @@ export function Csel({
     observer.observe(trigger);
     for (const boundary of new Set([
       trigger.closest('[data-overlay-boundary], .card, .dlg-body, dialog'),
+      trigger.closest('[data-overlay-boundary]'),
       trigger.closest('.dlg-body'),
       trigger.closest('dialog'),
     ])) {
@@ -293,7 +294,7 @@ export function Csel({
     } else if (action === 'choose') choose(active);
   };
 
-  // Measure content width within the nearest card, then use those same dimensions for placement.
+  // Align width to the nearest card; ordinary shallow cards do not clip portalled list height.
   const menuStyle: React.CSSProperties = {
     position: 'fixed',
     boxSizing: 'border-box',

@@ -1437,3 +1437,108 @@ fn windows_installer_stage_codes_are_presentation_only_and_platform_scoped() {
         "helper installer exited unsuccessfully"
     );
 }
+
+#[test]
+fn execution_diagnostic_is_fixed_non_authoritative_and_bounded() {
+    for (text, marker) in [
+        (
+            "pkexec must be setuid root",
+            HelperExecutionMarker::NotSetuidRoot,
+        ),
+        (
+            "Error executing command as another user: No authentication agent found.",
+            HelperExecutionMarker::NoAuthenticationAgent,
+        ),
+        (
+            "Error executing command as another user: Not authorized",
+            HelperExecutionMarker::NotAuthorized,
+        ),
+        (
+            "Error creating textual authentication agent: PRIVATE",
+            HelperExecutionMarker::TextAgentCreationFailed,
+        ),
+        (
+            "Error registering local authentication agent: PRIVATE",
+            HelperExecutionMarker::TextAgentRegistrationFailed,
+        ),
+        (
+            "Error checking for authorization PRIVATE",
+            HelperExecutionMarker::AuthorizationCheckFailed,
+        ),
+    ] {
+        let value = helper_execution_diagnostic(Platform::Linux, 127, text).unwrap();
+        assert_eq!(value.marker, marker);
+        assert_eq!(value.exit_code, 127);
+        assert_eq!(value.scope, "child-stderr-marker-not-verified-emitter");
+        assert!(!serde_json::to_string(&value).unwrap().contains("PRIVATE"));
+        assert_eq!(
+            helper_execution_diagnostic(Platform::Linux, 126, text)
+                .unwrap()
+                .marker,
+            HelperExecutionMarker::Unknown
+        );
+    }
+    for text in [
+        "PRIVATE password",
+        "pkexec must be setuid root suffix",
+        "translated message",
+        "pkexec must be setuid root\nError executing command as another user: Not authorized",
+    ] {
+        assert_eq!(
+            helper_execution_diagnostic(Platform::Linux, 127, text)
+                .unwrap()
+                .marker,
+            HelperExecutionMarker::Unknown
+        );
+    }
+    assert_eq!(
+        helper_execution_diagnostic(Platform::Linux, 127, &"x".repeat(16385))
+            .unwrap()
+            .marker,
+        HelperExecutionMarker::Unknown
+    );
+    assert!(helper_execution_diagnostic(Platform::Mac, 127, "PRIVATE").is_none());
+    assert!(helper_execution_diagnostic(Platform::Win, 127, "PRIVATE").is_none());
+}
+
+#[test]
+fn helper_execution_optional_field_does_not_change_legacy_action_json() {
+    let result = HelperActionResult {
+        success: false,
+        execution_diagnostic: None,
+        error_code: Some(HelperActionErrorCode::Cancelled),
+        diagnostic: None,
+        status: HelperStatusSnapshot::default(),
+    };
+    let value = serde_json::to_value(result).unwrap();
+    assert!(value.get("executionDiagnostic").is_none());
+    assert_eq!(value["errorCode"], "cancelled");
+    assert_eq!(value["success"], false);
+}
+
+#[test]
+fn installer_failure_stage_is_bounded_non_authorizing_and_preserves_recovery_unknown() {
+    let early = "POLARIS_HELPER_FAILURE_V1:manager-property:recovery-unconfirmed";
+    let finished = format!("{early}\nPOLARIS_HELPER_FAILURE_V1:manager-property:rollback-returned");
+    for (text, expected) in [
+        (early, "recovery-unconfirmed"),
+        (finished.as_str(), "rollback-returned"),
+    ] {
+        let diagnostic = helper_execution_diagnostic(Platform::Linux, 1, text).unwrap();
+        assert_eq!(diagnostic.scope, "child-stderr-marker-not-verified-emitter");
+        let failure = diagnostic.installer_failure.unwrap();
+        assert_eq!(failure.stage, "manager-property");
+        assert_eq!(failure.recovery, expected);
+    }
+    for text in ["POLARIS_HELPER_FAILURE_V1:secret-path:cleanup-returned",
+        "POLARIS_HELPER_FAILURE_V1:manager-property:SECRET",
+        "POLARIS_HELPER_FAILURE_V1:manager-property:cleanup-returned:secret",
+        "POLARIS_HELPER_FAILURE_V1:lease:recovery-unconfirmed\nPOLARIS_HELPER_FAILURE_V1:manager-property:rollback-returned"] {
+        assert!(helper_installer_failure(text).is_none());
+    }
+    assert!(helper_installer_failure(&"x".repeat(16385)).is_none());
+    assert!(helper_execution_diagnostic(Platform::Linux, 0, early)
+        .unwrap()
+        .installer_failure
+        .is_none());
+}

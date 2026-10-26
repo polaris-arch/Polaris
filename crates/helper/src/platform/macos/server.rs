@@ -422,7 +422,7 @@ mod sys {
         classify_accept_error, AcceptAction, LogThrottle, ACCEPT_BACKOFF, ACCEPT_LOG_INTERVAL,
     };
     use crate::platform::conn_limit::{ConnLimiter, MAX_CONCURRENT_CONNECTIONS};
-    use crate::platform::macos::exec::{CommandRunner, SystemRunner, EXEC_TIMEOUT};
+    use crate::platform::macos::exec::SystemRunner;
     use crate::platform::macos::handler::{ChildHandle, SpawnError, TerminateOutcome};
     use crate::platform::macos::native_birth::{NativeBirth, NativeChild, NativeCustody};
     use crate::platform::macos::proc_start::{
@@ -523,20 +523,8 @@ mod sys {
                     SpawnError::Failed(format!("native birth entropy failed: {error}"))
                 })?;
             let birth_token = HelperBirthToken::from_bytes(entropy);
-            let forwarding_started = Instant::now();
-            if params.fwd {
-                let _ = self.runner.run(
-                    EXEC_TIMEOUT,
-                    "/usr/sbin/sysctl",
-                    &["-w", "net.inet.ip.forwarding=1"],
-                );
-                let _ = self.runner.run(
-                    EXEC_TIMEOUT,
-                    "/usr/sbin/sysctl",
-                    &["-w", "net.inet6.ip6.forwarding=1"],
-                );
-            }
-            let forwarding_ms = crate::elapsed_ms(forwarding_started);
+            // Keep the wire timing field; proxy LAN listening is not host router management.
+            let forwarding_ms = 0;
             let process_started = Instant::now();
             prepare_cache_for_user(conf_dir).map_err(SpawnError::Failed)?;
             let mut command = std::process::Command::new(core.directory.join("sing-box"));

@@ -27,6 +27,25 @@ export type BackupErrorCode =
 // subscriptionApi
 // ============================================================================
 
+export interface SubscriptionRefreshResult {
+  success: boolean;
+  addedServers: number;
+  updatedServers: number;
+  deletedServers: number;
+  errorKind?: SubscriptionErrorKind;
+  httpStatus?: number;
+  error?: string;
+  unchanged?: boolean;
+  superseded?: boolean;
+  generation?: number;
+}
+export interface SubscriptionEditResult {
+  saved: true;
+  editRequestId?: string | null;
+  publication: 'scheduled' | 'superseded' | 'failed';
+  refresh: SubscriptionRefreshResult | null;
+}
+
 export const subscriptionApi = {
   async createStart(
     operationId: string,
@@ -62,28 +81,15 @@ export const subscriptionApi = {
     return listenReady(IPC_CHANNELS.EVENT_SUBSCRIPTION_CREATE_PROGRESS, listener);
   },
 
-  async update(subscription: SubscriptionConfig): Promise<void> {
-    return invoke(IPC_CHANNELS.SUBSCRIPTION_UPDATE, { subscription });
+  async update(subscription: SubscriptionConfig, editRequestId?: string): Promise<SubscriptionEditResult> {
+    return invoke(IPC_CHANNELS.SUBSCRIPTION_UPDATE, { subscription, editRequestId });
   },
 
   async delete(subscriptionId: string): Promise<void> {
     return invoke(IPC_CHANNELS.SUBSCRIPTION_DELETE, { subscriptionId });
   },
 
-  async updateServers(subscriptionId: string): Promise<{
-    success: boolean;
-    addedServers: number;
-    updatedServers: number;
-    deletedServers: number;
-    /** 已分类的失败原因；渲染端必须按 kind 本地化，不能展示 error 诊断。 */
-    errorKind?: SubscriptionErrorKind;
-    /** HTTP 类失败的状态码，仅用于 i18n 插值。 */
-    httpStatus?: number;
-    /** 已脱敏的诊断，仅供日志/兼容载荷，不能直接展示。 */
-    error?: string;
-    /** §16.3.4：304/无内容变化 → true（UI 弹「订阅无变化」toast）。 */
-    unchanged?: boolean;
-  }> {
+  async updateServers(subscriptionId: string): Promise<SubscriptionRefreshResult> {
     return invoke(IPC_CHANNELS.SUBSCRIPTION_UPDATE_SERVERS, { subscriptionId });
   },
 
@@ -124,6 +130,10 @@ export const subscriptionApi = {
    * 监听单订阅更新的逐阶段进度（手动刷新与后台 scheduler **共用**同一发射点）。
    * 消费点 = `store/use-subscription-progress-store.ts`（窗口级持久订阅 → 订阅信息栏）。
    */
+  async onUpdateProgressReady(listener: (data: SubscriptionUpdateProgress) => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_SUBSCRIPTION_UPDATE_PROGRESS, listener);
+  },
+
   onUpdateProgress(listener: (data: SubscriptionUpdateProgress) => void): () => void {
     return listen(IPC_CHANNELS.EVENT_SUBSCRIPTION_UPDATE_PROGRESS, listener);
   },

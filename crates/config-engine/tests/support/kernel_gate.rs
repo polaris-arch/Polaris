@@ -270,19 +270,19 @@ pub struct FixtureCredentialArtifact {
 pub const FIXTURE_CREDENTIAL_ARTIFACTS: &[FixtureCredentialArtifact] = &[
     FixtureCredentialArtifact {
         name: "多协议 outbound",
-        diagnostic: "FATAL[0000] initialize outbound[1]: invalid uuid: uuid: incorrect UUID length",
+        diagnostic: "FATAL[0000] invalid uuid: uuid: incorrect UUID length",
     },
     FixtureCredentialArtifact {
         name: "vless reality + shadowsocks shadow-tls",
-        diagnostic: "FATAL[0000] initialize outbound[0]: invalid public_key",
+        diagnostic: "FATAL[0000] invalid public_key",
     },
     FixtureCredentialArtifact {
         name: "抗封增强（ECH+TLS fragment+multiplex）",
-        diagnostic: "FATAL[0000] initialize outbound[0]: invalid ECH configs pem",
+        diagnostic: "FATAL[0000] invalid ECH configs pem",
     },
     FixtureCredentialArtifact {
         name: "ssh outbound",
-        diagnostic: "FATAL[0000] initialize outbound[0]: parse private key: ssh: no key found",
+        diagnostic: "FATAL[0000] parse private key: ssh: no key found",
     },
 ];
 

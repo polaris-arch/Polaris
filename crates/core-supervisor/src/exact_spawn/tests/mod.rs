@@ -208,6 +208,66 @@ fn publisher_repack_keeps_one_check_semantics_and_distinct_actual_bytes() {
     }
 }
 
+#[test]
+fn published_patch_keeps_one_check_semantics_and_distinct_actual_bytes() {
+    let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::E814DA else {
+        panic!("814da must use the fixed PlainTcpCheckV1 semantics");
+    };
+    assert_eq!(
+        identity.binary_sha256,
+        "363261029cea32333adcdd67288b23e4ae4084efa96b7f2b157af6e9d39946ee"
+    );
+    for historical in [
+        LinuxInputProfile::B609,
+        LinuxInputProfile::FE182,
+        LinuxInputProfile::C002,
+        LinuxInputProfile::A4D085,
+    ] {
+        assert_ne!(LinuxInputProfile::E814DA, historical);
+    }
+}
+
+#[test]
+fn next_patch_keeps_one_check_semantics_and_distinct_actual_bytes() {
+    let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::C6C0D8 else {
+        panic!("c6c0d8 must use the fixed PlainTcpCheckV1 semantics");
+    };
+    assert_eq!(
+        identity.binary_sha256,
+        "80e21e78875f2f1cbfb1356dd977d6043a7776179df61f57897a4d811eaa1eaf"
+    );
+    for historical in [
+        LinuxInputProfile::B609,
+        LinuxInputProfile::FE182,
+        LinuxInputProfile::C002,
+        LinuxInputProfile::A4D085,
+        LinuxInputProfile::E814DA,
+    ] {
+        assert_ne!(LinuxInputProfile::C6C0D8, historical);
+    }
+}
+
+#[test]
+fn alpha124_keeps_one_check_semantics_and_distinct_actual_bytes() {
+    let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::E0CFA24 else {
+        panic!("0cfa24 must use the fixed PlainTcpCheckV1 semantics");
+    };
+    assert_eq!(
+        identity.binary_sha256,
+        "7fde19e331e654280e134a89c26af5be706e4364e3003a74b7619c220d5a03aa"
+    );
+    for historical in [
+        LinuxInputProfile::B609,
+        LinuxInputProfile::FE182,
+        LinuxInputProfile::C002,
+        LinuxInputProfile::A4D085,
+        LinuxInputProfile::E814DA,
+        LinuxInputProfile::C6C0D8,
+    ] {
+        assert_ne!(LinuxInputProfile::E0CFA24, historical);
+    }
+}
+
 #[tokio::test]
 async fn source_symlink_rejected_and_replacement_cannot_change_protected_bytes() {
     use std::os::unix::fs::DirBuilderExt;

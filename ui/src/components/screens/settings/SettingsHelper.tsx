@@ -18,7 +18,7 @@ import { helperApi, type HelperActionErrorCode, type HelperInstallMode } from '@
 import { useNavStore } from '@/store/nav-store';
 import { toast } from '@/lib/error-handler';
 import type { HelperStatus } from '@/contracts/types/runtime';
-import { Phead, SetBlock, SetRow, Pill, Dot, Button, Spinner } from './Primitives';
+import { Phead, SetBlock, SetRow, Pill, Dot, Button, Spinner, FeedbackNotice } from './Primitives';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { helperActionErrorText } from '@/domain/action-error-text';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
@@ -272,10 +272,16 @@ export default function SettingsHelper() {
 
         <div className="hc-body">
           {installFailure && (
-            <div role="alert" data-testid="helper-install-failure" className="helper-state">
-              <b>{t('helper.installFail')}</b>
-              <p>{helperActionErrorText(installFailure, t)}</p>
-              <p>{t('helper.failureNextStep')}</p>
+            <div data-testid="helper-install-failure" className="helper-state">
+              <FeedbackNotice title={t('helper.installFail')} detail={helperActionErrorText(installFailure, t)}
+                hint={t('helper.failureNextStep')} announce={false} actions={<>
+              {/* Recovery remains status-only. States already exposing recheck below
+                  keep their single action; none/repair/upgrade failures need it here. */}
+              {!['checking', 'installed', 'cleanup-pending', 'needs-btm'].includes(state) && (
+                <Button variant="ghost" size="sm" onClick={recheck} disabled={busy}>
+                  <span>{t('helper.recheck')}</span>
+                </Button>
+              )}
               {shellPlatformFromDataOs() === 'mac' && installFailure === 'upgradeDeferred' && (
                 <Button variant="ghost" size="sm" disabled={busy} onClick={stopAndUpgrade}>
                   {t('helper.stopAndUpgradeAction')}
@@ -284,6 +290,7 @@ export default function SettingsHelper() {
               <Button variant="ghost" size="sm" onClick={() => useNavStore.getState().navigate('logs')}>
                 {t('helper.viewLogsAction')}
               </Button>
+              </>} />
             </div>
           )}
           {status?.selectedCore && (

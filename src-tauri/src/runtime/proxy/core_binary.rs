@@ -133,27 +133,14 @@ pub(crate) fn first_existing_bundle_candidate(candidates: &[PathBuf]) -> Option<
     candidates.iter().find(|path| path.is_file()).cloned()
 }
 
-/// 内核路径的开发态超驰。**只在 debug / test 构型编译**；release 构型里这个函数不存在，
-/// 发行包对进程环境里的任何内核路径变量都不读取。
+/// A process environment variable cannot admit a replacement core. Explicit
+/// per-runtime cfg(test) injection remains separate from shipped debug code.
 #[cfg(any(debug_assertions, test))]
-/// 读 `POLARIS_SINGBOX_PATH`：命中即用，指向不存在的文件即 `Err`（不静默回落）。
-///
-/// 为什么 release 不保留「路径须落在可信目录内」那一档：应用应当运行与本应用版本配套的
-/// 内核，而「路径在某个目录里」不等于「内容配套」。能让发行包换一个内核文件的入口，只要
-/// 存在，就是绕开配套约束的入口。`tests/release_escape_hatches.rs` 钉着 release 侧零读取。
 fn dev_core_binary_override() -> Result<Option<PathBuf>, String> {
-    let Ok(raw) = std::env::var("POLARIS_SINGBOX_PATH") else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(raw);
-    if path.is_file() {
-        Ok(Some(path))
-    } else {
-        Err(format!(
-            "POLARIS_SINGBOX_PATH 指向的文件不存在：{}",
-            path.display()
-        ))
+    if std::env::var_os("POLARIS_SINGBOX_PATH").is_some() {
+        return Err("POLARIS_SINGBOX_PATH 不允许替换配套内核；请使用已验证的编译期内核选择".into());
     }
+    Ok(None)
 }
 
 /// Captured by the existing verified resolver. This is an invalidation token
@@ -167,8 +154,6 @@ pub(super) struct CoreSelectionObservation {
 #[derive(Clone, Debug)]
 enum SelectionOrigin {
     Bundled(Vec<PathBuf>),
-    #[cfg(any(debug_assertions, test))]
-    Development,
     #[cfg(test)]
     Fixture,
 }
@@ -186,10 +171,6 @@ impl CoreSelectionObservation {
                     return false;
                 }
                 first_existing_bundle_candidate(candidates).as_deref() == Some(self.path.as_path())
-            }
-            #[cfg(any(debug_assertions, test))]
-            SelectionOrigin::Development => {
-                dev_core_binary_override().ok().flatten().as_deref() == Some(self.path.as_path())
             }
             #[cfg(test)]
             SelectionOrigin::Fixture => true, // The owning per-runtime fixture checks its selection slot.
@@ -220,7 +201,7 @@ pub(super) fn verified_selection_observation() -> Option<CoreSelectionObservatio
 
 /// 应用侧的内核解析：只认随包核（[`resolve_bundled_core_binary`]）。
 ///
-/// debug / test 构型在它之前多一级开发态超驰（见 `dev_core_binary_override`，release 不编译）。
+/// debug / test 构型明确拒绝环境路径超驰；release 不读取该变量。
 /// 用户配置目录、`PATH`、配置字段都不参与解析。本函数给出的是路径；那个路径上的文件是否
 /// 仍是出厂内容、经提权助手运行时实际执行的是哪一份，不由本函数保证。
 ///
@@ -228,16 +209,7 @@ pub(super) fn verified_selection_observation() -> Option<CoreSelectionObservatio
 pub(crate) fn resolve_core_binary() -> Result<PathBuf, String> {
     #[cfg(any(debug_assertions, test))]
     {
-        if let Some(core) = dev_core_binary_override()? {
-            if let Ok(mut selected) = VERIFIED_SELECTION.lock() {
-                *selected = Some(CoreSelectionObservation {
-                    path: core.clone(),
-                    origin: SelectionOrigin::Development,
-                    bundle: None,
-                });
-            }
-            return Ok(core);
-        }
+        dev_core_binary_override()?;
     }
     resolve_bundled_core_binary()
 }

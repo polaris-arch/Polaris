@@ -1,0 +1,16 @@
+{
+  "ndkRevision": "30.0.16248370",
+  "ndkSourceRevision": "30.0.16248370",
+  "ndkPackage": "android-ndk-r30",
+  "sourcePropertiesBytes": 107,
+  "sourcePropertiesSha256": "e73b7dc557cea2da9212c09ee1795434957d62e63b7550eef69fd1887a355d94",
+  "licenseId": "android-sdk-license",
+  "licenseSha1": "24333f8a63b6825ea9c5514f83c2829b004d1fee",
+  "archive": {
+    "url": "https://dl.google.com/android/repository/android-ndk-r30-linux.zip",
+    "bytes": 738633529,
+    "sha1": "5107f898313790e449e87eee2183d9a20602dee9",
+    "sha256": "753611f410d002cfcd3f3dc2ef49aad532089d3180b436c060a90bf0fcb64df2",
+    "archiveRoot": "android-ndk-r30"
+  }
+}

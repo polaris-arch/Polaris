@@ -24,15 +24,15 @@ class ToolchainTests(unittest.TestCase):
         self.assertEqual(row['actualCompiler'], 'go1.26.8')
 
     def test_checked_in_formal_contract_without_toolchain(self):
-        contract = json.loads((HERE.parent / 'desktop-core/historical-release-contract-577d4b9.json').read_text())
+        contract = json.loads((HERE.parent / 'desktop-core/historical-release-contract-577d4b9.json').read_text(encoding='utf-8'))
         source = contract['platforms']['win']['sourceCommit']
         self.assertEqual(source, '577d4b9a089b71d2f0a4ca334b87264b55c10478')
         self.assertEqual(resolve(MOD, 'formal', source, contract)['selectedCompiler'], 'go1.25.5')
 
     def test_current_upstream_formal_uses_exact_native_producer_fact(self):
-        contract = json.loads((HERE.parent / 'desktop-core/release-contract.json').read_text())
+        contract = json.loads((HERE.parent / 'desktop-core/release-contract.json').read_text(encoding='utf-8'))
         source = contract['sourceCommit']
-        self.assertEqual(source, 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae')
+        self.assertEqual(source, '0cfa24573ff34c26608151068334329268cfdf14')
         mod = b'module github.com/sagernet/sing-box\ngo 1.27.0\ntoolchain go1.27.2\n'
         self.assertEqual(resolve(mod, 'formal', source, contract, 'go1.27.2')['selectedCompiler'], 'go1.27.2')
         for key, bad in [('sourceCommit', 'b' * 40), ('sourceTree', 'b' * 40),
@@ -91,12 +91,12 @@ class ToolchainTests(unittest.TestCase):
                     '--mode', 'candidate', '--source', SOURCE, '--github-output', str(output)]
             result = subprocess.run(args, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(output.read_text(), 'version=1.25.5\n')
+            self.assertEqual(output.read_text(encoding='utf-8'), 'version=1.25.5\n')
             self.assertIsNone(json.loads(result.stdout)['actualCompiler'])
             (root / 'go.mod').write_bytes(MOD + b'toolchain default\n')
             result = subprocess.run(args, text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(output.read_text(), 'version=1.25.5\n')
+            self.assertEqual(output.read_text(encoding='utf-8'), 'version=1.25.5\n')
 
 
 if __name__ == '__main__':

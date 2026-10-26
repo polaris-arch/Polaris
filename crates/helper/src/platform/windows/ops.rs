@@ -111,7 +111,7 @@ pub trait ProcOps: Send + Sync {
     ///
     /// 返回子进程 pid 与 helper 内部阶段耗时（Go 返回 `*exec.Cmd`，本 trait 只需 pid + 可终止语义）。
     /// `log_path` 非空 → 子进程 stdout/stderr 经 shared 有界 writer 写入两代文件（早期启动诊断）。
-    /// `fwd`（allowLan）= true → 启动前 best-effort 开 IP 转发（`enableIPForwarding`）。
+    /// `fwd` is retained for wire compatibility only; LAN listening never manages host IP forwarding.
     fn start_singbox(
         &self,
         singbox_bin: &str,
@@ -120,7 +120,7 @@ pub trait ProcOps: Send + Sync {
         fwd: bool,
     ) -> std::io::Result<CoreStart>;
 
-    /// Mint an OS-random birth before spawning or changing forwarding.
+    /// Mint an OS-random birth before spawning.
     fn mint_native_birth(&self) -> std::io::Result<HelperBirthToken> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -183,13 +183,6 @@ pub trait ProcOps: Send + Sync {
     /// Optional native resolver-cache operation as SYSTEM. No console child is created.
     /// Admission covers worker creation; the caller has a bounded wait, not cancellation.
     fn flush_dns(&self, admission: &DnsFlushAdmission) -> Result<(), String>;
-
-    /// 开 IP 转发（`winproc.go:414-427` `enableIPForwarding`）。
-    ///
-    /// IPv4：注册表 `IPEnableRouter=1`（持久写入，stop/卸载不还原 —— 已知限制，镜像 Go 现状）。
-    /// IPv6：`netsh interface ipv6 set global forwarding=enabled`（运行时开关）。
-    /// best-effort，失败不阻塞 start。
-    fn enable_ip_forwarding(&self);
 
     /// route-add / route-del 执行（`helper.go:222-240`）：对单个已校验 CIDR 跑
     /// `netsh interface <ipv4|ipv6> add|delete route prefix=<cidr> interface=<iface> store=active`。
@@ -301,8 +294,6 @@ struct MockProcOpsInner {
     pub reap_calls: std::sync::atomic::AtomicUsize,
     /// `spawn_self_uninstall` 累计调用次数。
     pub spawn_uninstall_calls: std::sync::atomic::AtomicUsize,
-    /// `enable_ip_forwarding` 累计调用次数。
-    pub ip_forward_calls: std::sync::atomic::AtomicUsize,
     /// `process_alive` 返回值（默认 true=存活，宁漏勿误）。
     pub alive_return: std::sync::atomic::AtomicBool,
     /// `process_image_name` 的 pid → 映像路径映射（freeport 测试用）。
@@ -449,7 +440,6 @@ impl MockProcOps {
             terminate_calls: self.inner.terminate_calls.load(Ordering::SeqCst),
             reap_calls: self.inner.reap_calls.load(Ordering::SeqCst),
             spawn_uninstall_calls: self.inner.spawn_uninstall_calls.load(Ordering::SeqCst),
-            ip_forward_calls: self.inner.ip_forward_calls.load(Ordering::SeqCst),
             route_calls: self.inner.route_calls.load(Ordering::SeqCst),
             watch_parent_calls: self.inner.watch_parent_calls.load(Ordering::SeqCst),
         }
@@ -534,7 +524,6 @@ pub struct MockSnapshot {
     pub terminate_calls: usize,
     pub reap_calls: usize,
     pub spawn_uninstall_calls: usize,
-    pub ip_forward_calls: usize,
     pub route_calls: usize,
     pub watch_parent_calls: usize,
 }
@@ -576,15 +565,11 @@ impl ProcOps for MockProcOps {
         _singbox_bin: &str,
         _cfg: &str,
         _log_path: &str,
-        fwd: bool,
+        _fwd: bool,
     ) -> std::io::Result<CoreStart> {
         self.inner
             .start_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if fwd {
-            // 模拟生产：fwd=true 会调 enable_ip_forwarding（Go: if fwd=="1" { enableIPForwarding() }）
-            self.enable_ip_forwarding();
-        }
         if let Some(e) = self.inner.start_error.lock().unwrap().take() {
             return Err(e);
         }
@@ -747,12 +732,6 @@ impl ProcOps for MockProcOps {
             .unwrap()
             .clone()
             .map_or(Ok(()), Err)
-    }
-
-    fn enable_ip_forwarding(&self) {
-        self.inner
-            .ip_forward_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn flush_dns(&self, admission: &DnsFlushAdmission) -> Result<(), String> {

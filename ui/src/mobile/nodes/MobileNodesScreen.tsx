@@ -224,7 +224,7 @@ export function MobileNodesScreen(): ReactElement {
 
   const stagedOnly = useMemo(() => stagedOnlyIds(servers, diskServers), [servers, diskServers]);
   const speedTestCaps = useMemo<SpeedTestCaps>(() => manualSpeedTestCaps(proxyRunning), [proxyRunning]);
-  const invalidIndex = useMemo(() => invalidNodeIndex(invalidNodes), [invalidNodes]);
+  const invalidIndex = useMemo(() => invalidNodeIndex(invalidNodes, servers), [invalidNodes, servers]);
   /* 新报告带运行代和加载证据；旧 absorbed 仅精确字串去重，不能充当本层归属。 */
   const [meshRoute, setMeshRoute] = useState<{
     report: MeshRouteReport | null; previous: boolean; legacy: boolean;
@@ -406,7 +406,10 @@ export function MobileNodesScreen(): ReactElement {
       setRefreshBusy(true);
       void runWrite(async () => {
         const r = await refreshSubscriptionWithToast(subId, t);
-        if (!r.ok) setNotice({ tone: 'err', text: r.detail });
+        if (!r.ok) {
+          if (r.superseded) return;
+          setNotice({ tone: 'err', text: r.detail });
+        }
       }, () => t('nodes.subRefreshFail')).finally(() => {
         refreshInFlight.current = false;
         setRefreshBusy(false);

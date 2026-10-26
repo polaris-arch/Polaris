@@ -30,6 +30,7 @@ pub enum MeshRouteConfigSource {
 #[serde(rename_all = "camelCase")]
 pub enum MeshRouteLoadEvidence {
     StartupReady,
+    RuntimeCommitted,
     FileWrittenUnacknowledged,
     LoadFailed,
     Unknown,
@@ -244,7 +245,10 @@ pub fn resolve_mesh_route_snapshot(mut snapshot: MeshRouteSnapshot) -> MeshRoute
                 .config_version
                 .as_ref()
                 .is_none_or(String::is_empty)
-            || snapshot.load_evidence != MeshRouteLoadEvidence::StartupReady
+            || !matches!(
+                snapshot.load_evidence,
+                MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted
+            )
             || snapshot.config_source != MeshRouteConfigSource::Running
             || snapshot.snapshot_stale)
     {

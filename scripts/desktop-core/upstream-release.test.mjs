@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { nativeReleaseGoVersion } from '../native-payload-input.mjs';
-import { digest, desktopSourceGoVersion, upstreamSourceGoVersion } from './source-graph.mjs';
+import { digest, desktopSourceGoVersion, upstreamSourceGoVersion, reviewedSourcePolicy } from './source-graph.mjs';
 import { ADAPTER_FILES, consumeRelease, verifyPackagedRelease, portableCanonical, RELEASE_TARGETS, validateReleaseContract, releasePayloadMembers, publicBytes, verifyReleaseCore, releaseSingTunDependency, validateReleaseNotice, releaseInstallationContract, UPSTREAM_INSTALLATION_DOMAIN } from './release-consumer.mjs';
 import { selectedCoreManifest } from '../lib/core-identity.mjs';
 import { managedFormalSelection } from './managed-mesh-core.mjs';
@@ -19,11 +19,11 @@ import { validateUpstreamIndex, upstreamMetadata, upstreamPayloadPins, contractP
 // not assert that a release exists or that any native artifact has passed.
 const hash = 'a'.repeat(64), commit = '55300c55560bcc604fd9675c5526b5713db81cc1',
   tree = '7767ba9a9901a061ff07db7716baed7896cfefbc';
-function fixture() {
+function fixture(version = '1.15.0-polaris-alpha.12') {
   let id = 1;
   const contract = { schema: 'polaris-upstream-native-release-consumer-v1', providerContract: 'polaris-upstream-native-release-v1',
     repository: 'polaris-arch/sing-box-polaris', repositoryId: 1421657509, releaseId: 100,
-    version: '1.15.0-polaris-alpha.12', tag: 'v1.15.0-polaris-alpha.12', tagObject: 'd'.repeat(40), sourceCommit: commit, sourceTree: tree,
+    version, tag: `v${version}`, tagObject: 'd'.repeat(40), sourceCommit: commit, sourceTree: tree,
     producer: { repository: 'polaris-arch/sing-box-polaris', repositoryId: 1421657509, workflow: '.github/workflows/build.yml', workflowCommit: commit, runId: 1, runAttempt: 1, nativeJobs: Object.fromEntries(Object.entries({ linux: 'linux-amd64-purego', win: 'windows-amd64', 'mac-x64': 'darwin-amd64', 'mac-arm64': 'darwin-arm64' }).map(([key, id], i) => [key, { id: i + 1, name: `Native final-package Cronet and gVisor smoke (${id})` }])) },
     legalFiles: ['LICENSE', 'NOTICE'].map((name) => ({ path: `licenses/${name}`, content: name, bytes: Buffer.byteLength(name), sha256: digest(name) })), platforms: {} };
   const asset = (name) => ({ name, bytes: 1, sha256: hash, assetId: id++, releaseId: 100,
@@ -340,7 +340,7 @@ test('only the exact frozen new source admits Go 1.27.2; legacy G4 and v1 keep t
 });
 
 // Test-only facts. No real candidate/release/asset is selected by these values.
-function reviewedFixture() {
+function reviewedFixture(v2 = false) {
   const contract = utlsFixture();
   contract.sourceCommit = '1'.repeat(40); contract.sourceTree = '2'.repeat(40);
   contract.producer.workflowCommit = contract.sourceCommit;
@@ -361,6 +361,29 @@ function reviewedFixture() {
       path: contract.sourcePolicy.metacubex.replacementPath, tree: contract.sourcePolicy.metacubex.replacementTree });
     row.buildGraph.localReplacements.push({ module: 'github.com/metacubex/utls', version: 'v1.8.8', h1: '',
       replacement: { module: './third_party/metacubex-utls', version: '(devel)', h1: '' } });
+  }
+  if (v2) {
+    const directories = {
+      'github.com/sagernet/sing-tun': 'sing-tun', 'github.com/sagernet/tailscale': 'tailscale',
+      'github.com/metacubex/utls': 'metacubex-utls', 'github.com/sagernet/cronet-go': 'cronet-go',
+      'github.com/sagernet/fswatch': 'fswatch', 'github.com/sagernet/sing': 'sing',
+      'github.com/sagernet/sing-quic': 'sing-quic', 'github.com/sagernet/wireguard-go': 'wireguard-go',
+      'github.com/database64128/tfo-go/v2': 'tfo-go',
+    };
+    if (v2 === 3) directories['github.com/sagernet/sing-vmess'] = 'sing-vmess';
+    contract.sourcePolicy.schema = v2 === 3 ? 'polaris-reviewed-kernel-source-v3' : 'polaris-reviewed-kernel-source-v2';
+    contract.sourcePolicy.vendors = Object.fromEntries(Object.entries(directories).map(([name, directory], index) => [name,
+      name === contract.sourcePolicy.metacubex.module
+        ? Object.fromEntries(['version', 'replacementPath', 'replacementTree', 'replacementFileCount']
+          .map(key => [key, contract.sourcePolicy.metacubex[key]]))
+        : { version: 'v0.0.0-fixture', replacementPath: `./third_party/${directory}`,
+          replacementTree: (index + 1).toString(16).repeat(40), replacementFileCount: index + 1 }]));
+    for (const row of Object.values(contract.platforms)) {
+      row.sourceIdentity.replacements = Object.entries(contract.sourcePolicy.vendors).map(([module, pin]) =>
+        ({ module, path: pin.replacementPath, tree: pin.replacementTree }));
+      row.buildGraph.localReplacements = Object.entries(contract.sourcePolicy.vendors).map(([module, pin]) =>
+        ({ module, version: pin.version, h1: '', replacement: { module: pin.replacementPath, version: '(devel)', h1: '' } }));
+    }
   }
   return contract;
 }
@@ -387,6 +410,111 @@ test('reviewed final-source pair admits only its exact Go and Meta source facts'
     c => { c.platforms.linux.buildGraph.localReplacements.push({ module: 'example.invalid/extra', version: 'v1', h1: '', replacement: { module: './extra', version: '(devel)', h1: '' } }); },
   ];
   for (const change of changes) { const changed = structuredClone(contract); change(changed); assert.throws(() => validateReleaseContract(changed)); }
+});
+test('reviewed v2 schema requires all nine exact vendor declarations and agrees with the shared archive validator', () => {
+  const contract = reviewedFixture(true), policy = contract.sourcePolicy;
+  assert.equal(reviewedSourcePolicy(contract), policy);
+  assert.equal(validateReleaseContract(contract), contract);
+  assert.equal(upstreamSourceGoVersion(contract), 'go1.27.2');
+  const python = readFileSync(new URL('../mobile-core/source_policy.py', import.meta.url), 'utf8');
+  const declaration = python.match(/VENDOR_DIRECTORIES = \{([\s\S]*?)\n\}/);
+  assert.ok(declaration, 'shared Python schema inventory must remain inspectable without executing it');
+  const directories = Object.fromEntries([...declaration[1].matchAll(/'([^']+)': '([^']+)'/g)].map(m => [m[1], m[2]]));
+  assert.deepEqual(Object.fromEntries(Object.entries(policy.vendors).map(([name, pin]) =>
+    [name, pin.replacementPath.slice('./third_party/'.length)])), directories);
+  const changes = [
+    c => { c.sourcePolicy.schema = 'polaris-reviewed-kernel-source-v3'; },
+    c => { c.sourcePolicy.schema = 'polaris-reviewed-kernel-source-v1'; },
+    c => { delete c.sourcePolicy.vendors; }, c => { c.sourcePolicy.vendors = null; },
+    c => { c.sourcePolicy.vendors = []; }, c => { c.sourcePolicy.extra = true; },
+    c => { c.sourcePolicy.vendors['example.invalid/extra'] = structuredClone(policy.vendors['github.com/sagernet/sing']); },
+    c => { c.sourcePolicy.sourceCommit = '0'.repeat(40); }, c => { c.sourcePolicy.sourceTree = '0'.repeat(40); },
+    c => { c.sourcePolicy.goDirective = '1.27.2'; }, c => { c.sourcePolicy.goVersion = '1.28.0'; },
+    c => { c.sourcePolicy.toolchain = 'go1.27.1'; }, c => { c.sourcePolicy.goModSha256 = 'bad'; },
+    c => { c.sourcePolicy.metacubex.replacementTree = '0'.repeat(40); },
+  ];
+  for (const name of Object.keys(policy.vendors)) {
+    changes.push(c => { delete c.sourcePolicy.vendors[name]; });
+    for (const [field, value] of [['extra', true], ['version', null], ['version', 'v1'], ['version', 'v1.2.3\n'],
+      ['replacementPath', './third_party/../outside'], ['replacementTree', 'bad'], ['replacementTree', 'A'.repeat(40)],
+      ['replacementFileCount', 0], ['replacementFileCount', true], ['replacementFileCount', 1.5], ['replacementFileCount', 65537]])
+      changes.push(c => { c.sourcePolicy.vendors[name][field] = value; });
+    for (const field of ['version', 'replacementPath', 'replacementTree', 'replacementFileCount'])
+      changes.push(c => { delete c.sourcePolicy.vendors[name][field]; });
+  }
+  for (const change of changes) {
+    const changed = structuredClone(contract); change(changed);
+    assert.throws(() => reviewedSourcePolicy(changed));
+  }
+  assert.equal(validateReleaseContract(reviewedFixture()).sourcePolicy.schema, 'polaris-reviewed-kernel-source-v1');
+});
+test('reviewed v3 admits exactly ten vendors without changing historical v2 or inventing release facts', () => {
+  const contract = reviewedFixture(3);
+  assert.equal(validateReleaseContract(contract), contract);
+  assert.equal(Object.keys(reviewedSourcePolicy(contract).vendors).length, 10);
+  assert.equal(Object.keys(reviewedSourcePolicy(reviewedFixture(true)).vendors).length, 9);
+  const changes = [
+    c => { c.sourcePolicy.schema = 'polaris-reviewed-kernel-source-v2'; },
+    c => { c.sourcePolicy.schema = 'polaris-reviewed-kernel-source-v4'; },
+    c => { delete c.sourcePolicy.vendors; },
+    c => { c.sourcePolicy.vendors.extra = c.sourcePolicy.vendors['github.com/sagernet/sing']; },
+    c => { c.tagObject = null; }, c => { c.releaseId = null; },
+    c => { c.producer.runId = null; }, c => { c.assetIndex.sha256 = '0'.repeat(64); c.assetIndex.bytes = 0; },
+  ];
+  for (const name of Object.keys(contract.sourcePolicy.vendors)) {
+    changes.push(c => { delete c.sourcePolicy.vendors[name]; });
+    for (const [field, value] of [['version', 'v1'], ['replacementPath', './third_party/../outside'],
+      ['replacementTree', 'bad'], ['replacementFileCount', 0], ['replacementFileCount', true]])
+      changes.push(c => { c.sourcePolicy.vendors[name][field] = value; });
+  }
+  for (const change of changes) {
+    const changed = structuredClone(contract); change(changed);
+    assert.throws(() => validateReleaseContract(changed));
+  }
+});
+for (const schema of [true, 3]) test(`reviewed ${schema === 3 ? 'v3 ten' : 'v2 nine'} desktop rows retain exact source and linked inventories on every platform`, () => {
+  const contract = reviewedFixture(schema);
+  for (const key of Object.keys(contract.platforms)) {
+    for (const name of Object.keys(contract.sourcePolicy.vendors)) {
+      const changes = [
+        (r, s) => { s.tree = '0'.repeat(40); }, (r, s) => { s.path = './outside'; },
+        r => { r.sourceIdentity.replacements = r.sourceIdentity.replacements.filter(s => s.module !== name); },
+        (r, s) => { r.sourceIdentity.replacements.push(structuredClone(s)); },
+        r => { r.buildGraph.localReplacements = r.buildGraph.localReplacements.filter(l => l.module !== name); },
+        (r, s, l) => { r.buildGraph.localReplacements.push(structuredClone(l)); },
+        (r, s, l) => { l.version = 'v9.9.9'; }, (r, s, l) => { l.h1 = 'h1:YQ='; },
+        (r, s, l) => { l.replacement.module = './outside'; },
+        (r, s, l) => { l.replacement.version = 'v1.0.0'; }, (r, s, l) => { l.replacement.h1 = 'h1:YQ='; },
+        (r, s, l) => { l.replacement = { module: name, version: 'v1.0.0', h1: 'h1:YQ=' }; },
+        r => { r.buildGraph.localReplacements = r.buildGraph.localReplacements.filter(l => l.module !== name);
+          r.buildGraph.normalModules.push({ module: name, version: 'v1.0.0', h1: 'h1:YQ=' }); },
+      ];
+      for (const change of changes) {
+        const changed = structuredClone(contract), row = changed.platforms[key];
+        change(row, row.sourceIdentity.replacements.find(s => s.module === name), row.buildGraph.localReplacements.find(l => l.module === name));
+        assert.throws(() => validateReleaseContract(changed), undefined, `${key}: ${name}`);
+      }
+    }
+  }
+  for (const change of [
+    c => { c.platforms.linux.sourceIdentity.replacements.push({ module: 'example.invalid/extra', path: './extra', tree }); },
+    c => { c.platforms.linux.buildGraph.localReplacements.push({ module: 'example.invalid/extra', version: 'v1.0.0', h1: '',
+      replacement: { module: './extra', version: '(devel)', h1: '' } }); },
+    c => { c.platforms.linux.sourceIdentity.goSumSha256 = '0'.repeat(64); },
+    c => { c.platforms.linux.goVersion = 'go1.26.8'; },
+  ]) { const changed = structuredClone(contract); change(changed); assert.throws(() => validateReleaseContract(changed)); }
+});
+test('reviewed v2 source schema never supplies missing final tag producer or public asset facts', () => {
+  const contract = reviewedFixture(true);
+  for (const change of [c => { c.tagObject = null; }, c => { c.releaseId = null; },
+    c => { c.producer.runId = null; }, c => { c.producer.workflowCommit = '0'.repeat(40); },
+    c => { c.platforms.linux.releaseAsset.sha256 = '0'.repeat(64); },
+    c => { c.platforms.linux.finalPackageCronetSmoke.status = 'pending'; },
+    c => { c.sourceArchive.sha256 = null; }]) {
+    const changed = structuredClone(contract); change(changed);
+    assert.equal(reviewedSourcePolicy(changed), changed.sourcePolicy);
+    assert.throws(() => validateReleaseContract(changed));
+  }
 });
 test('same release version cannot reuse an old contract SHA or source selection', () => {
   const old = fixture().contract, next = reviewedFixture();
@@ -431,6 +559,36 @@ test('actual Go1.27.2 BuildInfo preserves real local devel identity with no inve
     assert.throws(() => verifyReleaseCore(path, row, 'linux', run(raw), 'linux', undefined, mismatched), /source pair/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+for (const schema of [true, 3]) test(`reviewed ${schema === 3 ? 'v3 ten' : 'v2 nine'} inert BuildInfo matches all linked vendors on all four desktop targets`, () => {
+  const contract = reviewedFixture(schema), root = mkdtempSync(join(tmpdir(), 'reviewed-vendor-buildinfo-'));
+  try {
+    for (const [key, row] of Object.entries(contract.platforms)) {
+      const target = RELEASE_TARGETS[key], bytes = Buffer.alloc(256), path = join(root, key);
+      if (key === 'mac-arm64') row.signatureObservation = { state: 'signed', cdHash: '4'.repeat(40), trustValidated: false };
+      if (key === 'linux') { bytes.set([127,69,76,70,2,1]); bytes.writeUInt16LE(62,18); }
+      else if (key === 'win') { bytes.write('MZ'); bytes.writeUInt32LE(128,60); bytes.write('PE\0\0',128); bytes.writeUInt16LE(0x8664,132); }
+      else { bytes.writeUInt32LE(0xfeedfacf); bytes.writeUInt32LE(key === 'mac-x64' ? 0x1000007 : 0x100000c,4); }
+      row.core = { ...row.core, bytes: bytes.length, sha256: digest(bytes) };
+      writeFileSync(path, bytes);
+      row.buildGraph.settings = { GOOS: target.os, GOARCH: target.arch, CGO_ENABLED: target.cgo, '-trimpath': 'true', '-tags': row.tags };
+      const raw = `fixture: ${row.goVersion}\n\tpath\tgithub.com/sagernet/sing-box/cmd/sing-box\n\tmod\tgithub.com/sagernet/sing-box\t(devel)\n`
+        + row.buildGraph.normalModules.map(m => `\tdep\t${m.module}\t${m.version}\t${m.h1}\n`).join('')
+        + row.buildGraph.localReplacements.map(m => `\tdep\t${m.module}\t${m.version}\n\t=>\t${m.replacement.module}\t(devel)\n`).join('')
+        + Object.entries(row.buildGraph.settings).map(([k,v]) => `\tbuild\t${k}=${v}\n`).join('');
+      row.rawBuildInfo = raw;
+      const run = text => (command, args) => { assert.equal(command, 'go');
+        assert.ok(args[0] === 'version' || args[0] === 'tool' && args[1] === 'buildid');
+        return args[0] === 'version' ? text : row.buildID; };
+      assert.deepEqual(verifyReleaseCore(path, row, key, run(raw), 'linux', undefined, contract), row.buildGraph);
+      for (const local of row.buildGraph.localReplacements) {
+        const line = `\tdep\t${local.module}\t${local.version}\n\t=>\t${local.replacement.module}\t(devel)\n`;
+        for (const changed of [raw.replace(line, ''), raw.replace(line, line.replace('(devel)', 'v9.9.9')),
+          raw.replace(line, line.replace(local.replacement.module, './outside'))])
+          assert.throws(() => verifyReleaseCore(path, row, key, run(changed), 'linux', undefined, contract), /BuildInfo|graph/);
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('unknown historical source pairs never inherit a toolchain from a release label', () => {
   const { contract } = fixture();
@@ -452,8 +610,8 @@ test('source replacement inventory cannot claim an unlinked module or invented l
   }
 });
 
-function brandedFixture() {
-  const value = fixture();
+function brandedFixture(version) {
+  const value = fixture(version);
   value.index = structuredClone(value.index);
   for (const row of value.index.platforms) {
     row.archive.releaseName = 'sing-box-polaris-' + row.archive.name.slice('sing-box-'.length);
@@ -755,4 +913,68 @@ else:
   }}),/identity changed/);
   // Failed acquisitions never replace the already installed, verified payload.
   verifyPackagedRelease(root,manifest,'linux',join(root,'resources/linux/sing-box'),run,'linux');
+});
+
+
+const versionCases = JSON.parse(readFileSync(new URL('../lib/polaris-version-fixtures.json', import.meta.url), 'utf8'));
+test('shared version corpus retains patch tags and exact original/public archive mapping', () => {
+  assert.ok(ADAPTER_FILES.includes('scripts/lib/polaris-version.json'));
+  for (const version of versionCases.accepted) {
+    const { contract, index } = brandedFixture(version);
+    assert.equal(validateReleaseContract(contract), contract, version);
+    assert.equal(validateUpstreamIndex(index, contract), index, version);
+    for (const row of Object.values(contract.platforms)) {
+      assert.equal(row.version, version);
+      assert.equal(row.tag, `v${version}`);
+      assert.ok(row.archive.root.startsWith(`sing-box-${version}-`));
+      assert.ok(row.releaseAsset.name.startsWith(`sing-box-polaris-${version.replace('-polaris-', '-')}-`));
+      assert.ok(row.releaseAsset.url.includes(`/v${version}/`));
+      assert.deepEqual(JSON.parse(upstreamMetadata(contract, row)['provenance.json']).receipt,
+        index.platforms.find(original => original.id === row.id));
+    }
+    const legacy = fixture(version);
+    validateReleaseContract(legacy.contract);
+    validateUpstreamIndex(legacy.index, legacy.contract);
+  }
+  for (const version of versionCases.rejected) {
+    assert.throws(() => validateReleaseContract(brandedFixture(version).contract), undefined, JSON.stringify(version));
+  }
+});
+test('alpha.12.4 keeps its complete version in producer and public archive identities', () => {
+  const version = '1.15.0-polaris-alpha.12.4';
+  const { contract, index } = brandedFixture(version);
+  assert.equal(validateReleaseContract(contract), contract);
+  assert.equal(validateUpstreamIndex(index, contract), index);
+  for (const row of Object.values(contract.platforms)) {
+    assert.equal(row.version, version);
+    assert.equal(row.tag, `v${version}`);
+    assert.ok(row.releaseAsset.url.includes(`/v${version}/`));
+  }
+  for (const alter of [
+    c => { c.tag = 'v1.15.0-polaris-alpha.12'; },
+    c => { c.platforms.linux.version = '1.15.0-polaris-alpha.12.3'; },
+    c => { c.platforms.linux.sourceCommit = 'f'.repeat(40); },
+  ]) { const changed = structuredClone(contract); alter(changed); assert.throws(() => validateReleaseContract(changed)); }
+});
+test('patch syntax never substitutes for complete release identity or matching raw versions', () => {
+  const version = '1.15.0-polaris-alpha.12.1';
+  for (const mutate of [
+    c => { c.tag = 'v1.15.0-polaris-alpha.12'; },
+    c => { c.repository = 'SagerNet/sing-box'; },
+    c => { c.repositoryId = 1407705262; },
+    c => { c.platforms.linux.version = '1.15.0-polaris-alpha.12'; },
+    c => { c.platforms.linux.sourceCommit = 'f'.repeat(40); },
+    c => { c.platforms.linux.sourceTree = 'f'.repeat(40); },
+    c => { c.platforms.linux.releaseAsset.releaseId++; },
+    c => { c.platforms.linux.releaseAsset.sha256 = 'f'.repeat(64); },
+    c => { c.platforms.linux.releaseAsset.url = c.platforms.linux.releaseAsset.url.replace('.12.1/', '.12/'); },
+    c => { c.platforms.linux.archive.releaseName = c.platforms.linux.archive.releaseName.replace('.12.1-', '.12-'); },
+  ]) {
+    const { contract } = brandedFixture(version); mutate(contract);
+    assert.throws(() => validateReleaseContract(contract));
+  }
+  for (const key of ['version', 'tag', 'tagObject', 'sourceCommit', 'sourceTree']) {
+    const { contract, index } = brandedFixture(version); index[key] += 'changed';
+    assert.throws(() => validateUpstreamIndex(index, contract));
+  }
 });

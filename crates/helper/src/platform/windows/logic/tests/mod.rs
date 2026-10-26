@@ -479,7 +479,7 @@ fn windows_native_dns_wait_is_bounded_without_a_subprocess() {
         .split("    fn flush_dns(")
         .nth(1)
         .unwrap()
-        .split("    fn enable_ip_forwarding(")
+        .split("    fn read_object_security(")
         .next()
         .unwrap();
     assert!(body.contains("admission.launch(polaris_system_integration::windows_dns::begin_flush)"));
@@ -689,4 +689,23 @@ fn config_confinement_rejects_traversal_and_windows_aliases() {
         assert!(!cfg_allowed(path, base), "accepted alias {path}");
     }
     assert!(cfg_allowed(r"C:\registered\配置.json", base));
+}
+
+#[test]
+fn lan_listening_has_no_native_host_router_writer() {
+    let source = polaris_source_probe::crate_source!("platform/windows/winproc/win.rs");
+    for forbidden in [
+        "enable_ip_forwarding",
+        "IPEnableRouter",
+        "forwarding=enabled",
+        "RegSetValueExW",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "implicit host router writer returned: {forbidden}"
+        );
+    }
+    assert!(source.contains("let forwarding_ms = 0;"));
+    let ops = polaris_source_probe::crate_source!("platform/windows/ops.rs");
+    assert!(!ops.contains("fn enable_ip_forwarding"));
 }

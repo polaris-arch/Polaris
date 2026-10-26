@@ -16,6 +16,8 @@ use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 use tokio::io::AsyncReadExt;
 
+use polaris_net_stack::subscription::ProviderResolveControl;
+
 use polaris_config_engine::builder::endpoint_routes::{
     is_mesh_node_unroutable, mesh_node_carries_full_tunnel,
 };
@@ -30,7 +32,7 @@ use polaris_net_stack::subscription::default_subscription_user_agent;
 use polaris_net_stack::subscription::{Conditional, ProviderFetchError, SubscriptionParseLimits};
 use polaris_net_stack::subscription_error::SubscriptionErrorKind;
 
-use crate::commands::config::{broadcast_config_changed, broadcast_config_changed_with_completion};
+use crate::commands::config::broadcast_config_changed;
 use crate::commands::picked_file::{
     classify, file_name_of, open_picked_for_read, PickedTarget, PluginFiles,
 };
@@ -170,24 +172,89 @@ pub(crate) fn invalidate_validators_on_global_ua_change(
     reason = "Tauri IPC command owns its deserialized payload across the call"
 )]
 #[tauri::command]
-pub fn subscription_update(
+pub async fn subscription_update(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     subscription: Value,
-) -> ApiResponse<()> {
-    match subscription_update_core(state.config(), subscription) {
-        Ok(cfg) => {
-            broadcast_config_changed(&app, &cfg);
-            ok_void()
-        }
-        Err(error) => ApiResponse::err(error),
+    edit_request_id: Option<String>,
+) -> Result<ApiResponse<Value>, ()> {
+    // Tauri async commands with borrowed State require a Result transport wrapper.
+    // Domain failures remain resolved ApiResponse envelopes, not transport rejections.
+    if edit_request_id
+        .as_deref()
+        .is_some_and(|id| !valid_edit_request_id(id))
+    {
+        return Ok(ApiResponse::err(
+            "invalid subscription edit request identity",
+        ));
     }
+    let started = std::time::Instant::now();
+    Ok(
+        match subscription_update_core(state.config(), subscription, &state.subscription_refresh) {
+            Ok((cfg, owner)) => {
+                let save_ms = started.elapsed().as_millis();
+                let publication = match prepare_subscription_publication(
+                    state.config(),
+                    state.proxy(),
+                    &cfg,
+                    owner.as_ref().map(|o| o.token()).as_ref(),
+                ) {
+                    Ok(Some(intent)) => {
+                        super::config::broadcast_config_changed_with_registered_intent(
+                            &app,
+                            &state.proxy,
+                            &cfg,
+                            intent,
+                            |_, _| {},
+                        );
+                        "scheduled"
+                    }
+                    Ok(None) => "superseded",
+                    Err(_) => "failed",
+                };
+                let refresh = if let Some(owner) = owner {
+                    Some(
+                        perform_owned_subscription_update(
+                            &app,
+                            state.inner(),
+                            &owner,
+                            edit_request_id.as_deref(),
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                log::info!(
+                    "subscription edit timing: save_ms={save_ms} total_ms={} refreshed={}",
+                    started.elapsed().as_millis(),
+                    refresh.is_some()
+                );
+                ApiResponse::ok(
+                    json!({"saved": true, "editRequestId": edit_request_id, "publication": publication, "refresh": refresh}),
+                )
+            }
+            Err(error) => ApiResponse::err(error),
+        },
+    )
+}
+
+fn valid_edit_request_id(id: &str) -> bool {
+    id.len() == 36
+        && uuid::Uuid::parse_str(id).is_ok_and(|value| value.hyphenated().to_string() == id)
 }
 
 fn subscription_update_core(
     config: &crate::runtime::config::ConfigManager,
     subscription: Value,
-) -> Result<Value, String> {
+    admission: &crate::runtime::subscription_refresh::SubscriptionRefreshAdmission,
+) -> Result<
+    (
+        Value,
+        Option<crate::runtime::subscription_refresh::SubscriptionRefreshOwner>,
+    ),
+    String,
+> {
     let subscription = normalized_subscription_update(subscription)?;
     let id = subscription
         .get("id")
@@ -198,7 +265,7 @@ fn subscription_update_core(
         None => return Err("subscription.id required".to_owned()),
     };
     let mut subscription = subscription;
-    match config.update(|cfg| {
+    match config.update_subscription_edit(admission, |cfg| {
         let Some(idx) = cfg
             .get("subscriptions")
             .and_then(Value::as_array)
@@ -207,8 +274,11 @@ fn subscription_update_core(
                     .position(|s| s.get("id").and_then(Value::as_str) == Some(&id))
             })
         else {
-            return Decision::Skip(Err(format!("订阅不存在: {id}")));
+            return Decision::Skip((Err(format!("订阅不存在: {id}")), None));
         };
+        let previous_identity = SubscriptionFetchIdentity::new(cfg, &cfg["subscriptions"][idx]);
+        let next_identity = SubscriptionFetchIdentity::new(cfg, &subscription);
+        let refresh_needed = previous_identity != next_identity;
         let arr = cfg
             .get_mut("subscriptions")
             .and_then(Value::as_array_mut)
@@ -221,13 +291,28 @@ fn subscription_update_core(
             set_or_remove(&mut subscription, "lastModified", None);
         }
         arr[idx] = subscription;
-        Decision::Write(Ok(()))
+        Decision::Write((Ok(()), refresh_needed.then(|| id.clone())))
     }) {
-        Ok((Ok(()), Some(cfg))) => Ok(cfg),
-        Ok((Err(error), None)) => Err(error),
+        Ok((Ok(()), Some(cfg), owner)) => Ok((cfg, owner)),
+        Ok((Err(error), None, None)) => Err(error),
         Ok(_) => unreachable!("subscription_update decision and persistence must agree"),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn prepare_subscription_publication(
+    config: &crate::runtime::config::ConfigManager,
+    proxy: &ProxyRuntime,
+    expected: &Value,
+    owner: Option<&crate::runtime::subscription_refresh::SubscriptionRefreshToken>,
+) -> Result<Option<u64>, String> {
+    config
+        .update(|current| {
+            let matches = current == expected && owner.is_none_or(|owner| owner.is_current());
+            Decision::Skip(matches.then(|| proxy.register_selector_intent()))
+        })
+        .map(|(intent, _)| intent)
+        .map_err(|error| error.to_string())
 }
 
 /// 删订阅的纯 `Value` 变换（订阅本身 + 其下全部节点 + 悬挂选中置 null）。
@@ -603,6 +688,8 @@ pub(crate) trait UpdateProgressSink: Send + Sync {
 struct BroadcastUpdateProgress {
     app: AppHandle,
     subscription_id: String,
+    token: crate::runtime::subscription_refresh::SubscriptionRefreshToken,
+    edit_request_id: Option<String>,
 }
 
 impl UpdateProgressSink for BroadcastUpdateProgress {
@@ -610,7 +697,15 @@ impl UpdateProgressSink for BroadcastUpdateProgress {
         if let Some(obj) = frame.as_object_mut() {
             obj.insert("subscriptionId".to_string(), json!(self.subscription_id));
         }
-        broadcast(&self.app, EVENT_SUBSCRIPTION_UPDATE_PROGRESS, frame);
+        if let Some(obj) = frame.as_object_mut() {
+            obj.insert("generation".to_string(), json!(self.token.generation()));
+            if let Some(id) = &self.edit_request_id {
+                obj.insert("editRequestId".to_string(), json!(id));
+                obj.insert("saved".to_string(), json!(true));
+            }
+        }
+        self.token
+            .with_current(|| broadcast(&self.app, EVENT_SUBSCRIPTION_UPDATE_PROGRESS, frame));
     }
 }
 
@@ -655,17 +750,42 @@ pub(crate) async fn perform_subscription_update(
 ) -> Value {
     // Reject overlaps before emitting progress: a rejected request must not publish a
     // terminal frame over the current owner's still-running progress.
-    let Some(_refresh_owner) = state.subscription_refresh.try_admit(subscription_id) else {
+    let Some(owner) = state.subscription_refresh.try_admit(subscription_id) else {
         return update_failure("该订阅正在更新，请等待当前更新完成后重试");
     };
+    perform_owned_subscription_update(app, state, &owner, None).await
+}
+
+async fn perform_owned_subscription_update(
+    app: &AppHandle,
+    state: &AppRuntime,
+    owner: &crate::runtime::subscription_refresh::SubscriptionRefreshOwner,
+    edit_request_id: Option<&str>,
+) -> Value {
+    let started = std::time::Instant::now();
+    let token = owner.token();
+    let subscription_id = token.subscription_id();
     let sink: Arc<dyn UpdateProgressSink> = Arc::new(BroadcastUpdateProgress {
         app: app.clone(),
-        subscription_id: subscription_id.to_string(),
+        subscription_id: subscription_id.to_owned(),
+        token: token.clone(),
+        edit_request_id: edit_request_id.map(str::to_owned),
     });
-    // 起手即报「拉取中」：这一帧之前的活（load_full / UA 求值）是微秒级，不值一个独立阶段。
     sink.emit(json!({ "phase": "fetching" }));
-    let result = perform_subscription_update_inner(app, state, subscription_id, &sink).await;
+    let mut result =
+        perform_subscription_update_inner(app, state, subscription_id, &sink, owner).await;
+    if !token.is_current() {
+        result = json!({"success":false,"superseded":true,"addedServers":0,"updatedServers":0,"deletedServers":0});
+    }
+    result["generation"] = json!(token.generation());
     sink.emit(terminal_progress_frame(&result));
+    log::info!(
+        "subscription refresh lifecycle: generation={} total_ms={} success={} superseded={}",
+        token.generation(),
+        started.elapsed().as_millis(),
+        result["success"] == true,
+        result["superseded"] == true
+    );
     result
 }
 
@@ -676,6 +796,7 @@ async fn perform_subscription_update_inner(
     state: &AppRuntime,
     subscription_id: &str,
     sink: &Arc<dyn UpdateProgressSink>,
+    owner: &crate::runtime::subscription_refresh::SubscriptionRefreshOwner,
 ) -> Value {
     let update_started = std::time::Instant::now();
     let operation_deadline = update_started + SUBSCRIPTION_OPERATION_TIMEOUT;
@@ -742,7 +863,9 @@ async fn perform_subscription_update_inner(
         );
     }
 
+    let pipeline_started = std::time::Instant::now();
     let lookup = SystemDnsLookup;
+    let provider_control = ProviderResolveControl::default();
     let pipeline = fetch_parse_resolve(
         client,
         &lookup,
@@ -752,46 +875,45 @@ async fn perform_subscription_update_inner(
         user_agent.as_deref(),
         conditional.as_ref(),
         Some(sink),
-        None,
+        Some(&provider_control),
         Arc::clone(state.subscription_parse()),
         operation_deadline,
     );
-    let outcome = match tokio::time::timeout_at(operation_deadline.into(), pipeline).await {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(err_value)) => return update_classified_failure(&err_value),
-        Err(_) => return update_classified_failure(&operation_timeout_error()),
+    let outcome = match await_refresh_pipeline(
+        owner,
+        &provider_control,
+        operation_deadline,
+        pipeline,
+    )
+    .await
+    {
+        Some(Ok(Ok(outcome))) => outcome,
+        Some(Ok(Err(err_value))) => return update_classified_failure(&err_value),
+        Some(Err(_)) => return update_classified_failure(&operation_timeout_error()),
+        None => {
+            return json!({"success":false,"superseded":true,"addedServers":0,"updatedServers":0,"deletedServers":0})
+        }
     };
-    let network_ms = update_started.elapsed().as_millis();
+    let fetch_pipeline_ms = pipeline_started.elapsed().as_millis();
 
-    // 3) 304 无变化 → 仅刷元数据（lastUpdated + 验证器），不 reconcile、不广播（零节点扰动、不断流）。
+    // 3) 304 无变化 → 仅刷元数据（lastUpdated + 验证器），不 reconcile；落盘后发空配置失效信号，不发布 HOT 事务。
     if outcome.not_modified {
         let apply_started = std::time::Instant::now();
         let transaction_started = std::time::Instant::now();
-        let result = state.config().update(|cfg| {
-            if let Err(error) = fetch_identity.check_current(cfg, subscription_id) {
-                return Decision::Skip(Err(error));
-            }
-            let Some(s) = find_subscription_mut(cfg, subscription_id) else {
-                return Decision::Skip(Err(format!("订阅不存在: {subscription_id}")));
-            };
-            s["lastUpdated"] = json!(current_iso());
-            if let Some(e) = &outcome.etag {
-                s["etag"] = json!(e);
-            }
-            if let Some(lm) = &outcome.last_modified {
-                s["lastModified"] = json!(lm);
-            }
-            Decision::Write(Ok(()))
-        });
-        let transaction_ms = transaction_started.elapsed().as_millis();
-        match result {
-            Ok((Ok(()), Some(_))) => {}
-            Ok((Err(error), None)) => return update_failure(error),
-            Ok(_) => unreachable!("not-modified subscription transaction must be consistent"),
-            Err(e) => return update_failure(format!("{e}")),
+        if let Err(error) = refresh_not_modified_metadata(
+            state.config(),
+            subscription_id,
+            &fetch_identity,
+            &owner.token(),
+            outcome.etag.as_deref(),
+            outcome.last_modified.as_deref(),
+            || super::config::emit_config_changed_signal(app),
+        ) {
+            return update_failure(error);
         }
+        let transaction_ms = transaction_started.elapsed().as_millis();
         log::info!(
-            "subscription reconcile timing: outcome=not_modified initial_config_ms={initial_config_ms} network_ms={network_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
+            "subscription reconcile timing: outcome=not_modified initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
             apply_started.elapsed().as_millis(),
             update_started.elapsed().as_millis()
         );
@@ -818,6 +940,9 @@ async fn perform_subscription_update_inner(
     // 拉取期间可能已有别的写入落盘；对账、删除 journal 与保存必须在同一写临界区，以最新配置为基准。
     // 这里统一走 deferred-cleanup 形态：无删除时不会生成 journal，有删除时则保证旧核退出前不清理资产。
     let transaction = state.config().update_deferred_cleanup(|cfg| {
+        if !owner.token().is_current() {
+            return Decision::Skip(Err("subscription refresh superseded".to_owned()));
+        }
         if let Err(error) = fetch_identity.check_current(cfg, subscription_id) {
             return Decision::Skip(Err(error));
         }
@@ -876,10 +1001,13 @@ async fn perform_subscription_update_inner(
     };
 
     // 7) L-5：200 但节点集内容等价（!content_changed && !partial）→ 仅刷元数据 return unchanged，
-    //    **不广播**（避免字节级无变化也 switch_mode 断流）。
+    //    仅发空配置变化信号供现有监听者重读；不走 switch_mode/HOT。
     if !content_changed && !partial {
+        publish_subscription_metadata(&owner.token(), || {
+            super::config::emit_config_changed_signal(app);
+        });
         log::info!(
-            "subscription reconcile timing: outcome=unchanged initial_config_ms={initial_config_ms} network_ms={network_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
+            "subscription reconcile timing: outcome=unchanged initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
             apply_started.elapsed().as_millis(),
             update_started.elapsed().as_millis()
         );
@@ -887,21 +1015,52 @@ async fn perform_subscription_update_inner(
     }
 
     // 8) 内容变 / partial → 广播（汇流点自动热切换）+ 出口变则作废解锁缓存。
+    let token = owner.token();
+    let intent = match prepare_subscription_publication(
+        state.config(),
+        state.proxy(),
+        &cfg,
+        Some(&token),
+    ) {
+        Ok(Some(intent)) => intent,
+        Ok(None) => {
+            return json!({"success":false,"superseded":true,"addedServers":0,"updatedServers":0,"deletedServers":0})
+        }
+        Err(_) => return update_failure("subscription publication unavailable"),
+    };
     let record_config = cfg.clone();
     let record_from = old_selected.clone();
-    broadcast_config_changed_with_completion(app, &cfg, false, move |proxy, outcome| {
-        record_auto_exit_after_removal(proxy, &record_config, record_from.as_deref(), outcome);
-    });
-    if selected_exit_changed(
+    let unlock = Arc::clone(&state.unlock);
+    let completion_app = app.clone();
+    let exit_changed = selected_exit_changed(
         old_selected.as_deref(),
         cfg.get("selectedServerId").and_then(Value::as_str),
-    ) {
-        let sink = BroadcastSink::new(app);
-        let running = state.proxy().status().running;
-        state.unlock().invalidate(&sink, running, false);
-    }
+    );
+    super::config::broadcast_config_changed_with_registered_intent(
+        app,
+        &state.proxy,
+        &cfg,
+        intent,
+        move |proxy, outcome| {
+            // The runtime's generation fence has already rejected a superseded application.
+            if outcome.is_some() && proxy.selector_intent_is_current(intent) {
+                record_auto_exit_after_removal(
+                    proxy,
+                    &record_config,
+                    record_from.as_deref(),
+                    outcome,
+                );
+                if exit_changed {
+                    let sink = BroadcastSink::new(&completion_app);
+                    unlock.invalidate(&sink, proxy.status().running, false);
+                }
+            }
+        },
+    );
+    // Unlock-cache invalidation is tied to this exact saved publication, not an old task's
+    // local selected-ID comparison. The registered runtime apply remains the authority.
     log::info!(
-        "subscription reconcile timing: outcome=changed initial_config_ms={initial_config_ms} network_ms={network_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
+        "subscription reconcile timing: outcome=changed initial_config_ms={initial_config_ms} fetch_pipeline_ms={fetch_pipeline_ms} config_transaction_ms={transaction_ms} reconcile_total_ms={} total_ms={}",
         apply_started.elapsed().as_millis(),
         update_started.elapsed().as_millis()
     );
@@ -912,6 +1071,76 @@ async fn perform_subscription_update_inner(
         false,
         user_info.as_ref(),
     )
+}
+
+/// Dropping the pipeline abandons network/provider futures and queued parser ownership.
+/// Already-running CPU parsing is not claimed physically preempted; its result has no commit path.
+async fn await_refresh_pipeline<T>(
+    owner: &crate::runtime::subscription_refresh::SubscriptionRefreshOwner,
+    provider_control: &ProviderResolveControl,
+    deadline: std::time::Instant,
+    pipeline: impl std::future::Future<Output = T>,
+) -> Option<Result<T, tokio::time::error::Elapsed>> {
+    tokio::select! {
+        biased;
+        () = owner.cancelled() => { provider_control.cancel(); None }
+        outcome = tokio::time::timeout_at(deadline.into(), pipeline) => {
+            if outcome.is_err() { provider_control.cancel(); }
+            Some(outcome)
+        },
+    }
+}
+
+/// Publish only an invalidation signal, never a saved snapshot or runtime intent.
+/// Native event listeners may read config synchronously. Release the token lock first;
+/// a supersession after this check can only cause an extra reload of the latest disk state.
+fn publish_subscription_metadata(
+    token: &crate::runtime::subscription_refresh::SubscriptionRefreshToken,
+    signal: impl FnOnce(),
+) {
+    if token.is_current() {
+        signal();
+    }
+}
+
+/// The real 304 transaction, shared with tests; no signal on failed/skipped persistence.
+fn refresh_not_modified_metadata(
+    config: &crate::runtime::config::ConfigManager,
+    subscription_id: &str,
+    fetch_identity: &SubscriptionFetchIdentity,
+    token: &crate::runtime::subscription_refresh::SubscriptionRefreshToken,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    signal: impl FnOnce(),
+) -> Result<(), String> {
+    let result = config.update(|cfg| {
+        if !token.is_current() {
+            return Decision::Skip(Err("subscription refresh superseded".to_owned()));
+        }
+        if let Err(error) = fetch_identity.check_current(cfg, subscription_id) {
+            return Decision::Skip(Err(error));
+        }
+        let Some(s) = find_subscription_mut(cfg, subscription_id) else {
+            return Decision::Skip(Err(format!("订阅不存在: {subscription_id}")));
+        };
+        s["lastUpdated"] = json!(current_iso());
+        if let Some(value) = etag {
+            s["etag"] = json!(value);
+        }
+        if let Some(value) = last_modified {
+            s["lastModified"] = json!(value);
+        }
+        Decision::Write(Ok(()))
+    });
+    match result {
+        Ok((Ok(()), Some(_))) => {
+            publish_subscription_metadata(token, signal);
+            Ok(())
+        }
+        Ok((Err(error), None)) => Err(error),
+        Ok(_) => unreachable!("not-modified subscription transaction must be consistent"),
+        Err(error) => Err(format!("{error}")),
+    }
 }
 
 /// Response identity is captured before await and checked under the configuration writer lock.

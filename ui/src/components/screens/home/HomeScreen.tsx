@@ -553,6 +553,9 @@ export function HomeScreen() {
         return;
       }
       setConnectError(true);
+      const reportConnectionFailure = (detail: string) => toast.error(
+        t(action === 'stop' ? 'feedback.stopFailed' : 'feedback.connectionFailed'), detail,
+      );
       // helper 未安装 → 可操作对话框（去安装 → 设置›Helper），而非把裸 socket ENOENT 串塞进不可交互的
       // toast。toast 是 fire-and-forget（pointer-events:none + 2.2s 自动消失），承载不了「去安装」按钮。
       //
@@ -576,7 +579,7 @@ export function HomeScreen() {
       }
       // TUN 出口未夺到（其他 VPN 占默认路由）→ 专属可操作文案（非「启动失败」：核确起了、只是被硬闸拒标）。
       if (code === ProxyErrorCode.TUN_ROUTE_NOT_CAPTURED) {
-        toast.error(
+        reportConnectionFailure(
           t('errors.tunRouteNotCaptured'),
         );
         return;
@@ -585,26 +588,29 @@ export function HomeScreen() {
       // 服务器配置」：wintun 驱动被拦/网卡建不出来与服务器配置毫无关系，照那句改永远修不好。
       // 也不能复用上一条：那条指向「断开其他 VPN」，对本现场同样是错的指引。
       if (code === ProxyErrorCode.TUN_ADAPTER_MISSING) {
-        toast.error(
+        reportConnectionFailure(
           t('errors.tunAdapterMissing'),
         );
         return;
       }
       if (code === ProxyErrorCode.OUTBOUND_INTERFACE_UNAVAILABLE) {
-        toast.error(
+        reportConnectionFailure(
           t('errors.outboundInterfaceUnavailable'),
         );
         return;
       }
-      if (code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID) {
-        toast.error(proxyErrorText({ errorCode: code }, key => t(key)));
+      if (code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID ||
+          code === ProxyErrorCode.VISION_TRANSPORT_UNSUPPORTED ||
+          code === ProxyErrorCode.LAN_GATEWAY_FORWARDING_REQUIRED ||
+          code === ProxyErrorCode.LAN_GATEWAY_FORWARDING_UNCONFIRMED) {
+        reportConnectionFailure(proxyErrorText({ errorCode: code }, key => t(key)));
         return;
       }
       // 残留 root 孤儿阻断起核 → 专属标题，**不能**落到下面的「sing-box 启动失败，请检查服务器
       // 配置」：那句话把用户导向错误的下一步（残留进程与服务器配置毫无关系，照它改永远修不好）。
       // Rust 诊断会带 pid/命令，只进脱敏日志；这里只显示稳定码对应的本地化处置指引。
       if (code === ProxyErrorCode.ROOT_ORPHAN_BLOCKED) {
-        toast.error(
+        reportConnectionFailure(
           t('errors.rootOrphanBlocked'),
         );
         return;
@@ -612,7 +618,7 @@ export function HomeScreen() {
       // 随包内核文件缺少可执行权限 → 起核前即被拒绝。同样不能落到下面那句「请检查服务器配置」：
       // 与服务器配置无关，下一步是重新安装应用。
       if (code === ProxyErrorCode.CORE_NOT_EXECUTABLE) {
-        toast.error(t('errors.coreNotExecutable'));
+        reportConnectionFailure(t('errors.coreNotExecutable'));
         return;
       }
       // 确认不了提权助手里的内核与本应用配套 → 拒绝以 TUN 起核。下一步是重装或升级助手，
@@ -621,16 +627,16 @@ export function HomeScreen() {
           code === ProxyErrorCode.HELPER_CORE_OCCUPIED ||
           code === ProxyErrorCode.HELPER_CORE_ABSENT ||
           code === ProxyErrorCode.HELPER_CORE_INVALID) {
-        toast.error(proxyErrorText({ errorCode: code }, key => t(key)));
+        reportConnectionFailure(proxyErrorText({ errorCode: code }, key => t(key)));
         if (needsHelperRecovery(code)) void revealHelperRecovery();
         return;
       }
       if (code === ProxyErrorCode.HELPER_CORE_MISMATCH) {
-        toast.error(t('errors.helperCoreMismatch'));
+        reportConnectionFailure(t('errors.helperCoreMismatch'));
         void revealHelperRecovery();
         return;
       }
-      toast.error(
+      reportConnectionFailure(
         action === 'stop' ? t('home.stopProxyFailed') : t('errors.startupFailed'),
       );
     } finally {

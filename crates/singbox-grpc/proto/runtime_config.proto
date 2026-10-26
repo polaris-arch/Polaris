@@ -1,0 +1,81 @@
+syntax = "proto3";
+package daemon;
+option go_package = "github.com/sagernet/sing-box/daemon";
+import "google/protobuf/empty.proto";
+
+// Additive API. StartedService v4 remains wire-compatible. Capability must be
+// queried; presence of this service does not imply complete schema support.
+service RuntimeConfigService {
+  rpc GetRuntimeCapabilities(google.protobuf.Empty) returns (RuntimeCapabilities);
+  rpc PlanRuntimeConfig(PlanRuntimeConfigRequest) returns (RuntimeConfigPlan);
+  rpc ApplyRuntimeConfig(ApplyRuntimeConfigRequest) returns (RuntimeConfigOperation);
+  rpc GetRuntimeConfigStatus(RuntimeConfigStatusRequest) returns (RuntimeConfigStatus);
+  rpc RetryRuntimePersistence(RuntimePersistenceRetryRequest) returns (RuntimeConfigOperation);
+  rpc AcknowledgeRuntimePersistence(RuntimePersistenceAcknowledgementRequest) returns (RuntimeConfigOperation);
+}
+message RuntimeIdentity { string incarnation = 1; uint64 applied_revision = 2; string effective_digest = 3; }
+enum RuntimeUpdateClass { RUNTIME_UPDATE_UNSPECIFIED = 0; IN_PLACE = 1; LOCAL_REPLACE = 2; AFFECTED_RECONNECT = 3; PENDING_ADAPTER = 4; RESTART_REQUIRED = 5; }
+message RuntimeFieldCapability {
+  string effective_path = 1; string variant = 2; string platform_build = 3;
+  RuntimeUpdateClass update_class = 4; string adapter_version = 5; repeated string conditions = 6;
+}
+message RuntimeCapabilities {
+  uint32 contract_version = 1; bool connected_hot_enabled = 2; string implementation_manifest_digest = 3;
+  RuntimeIdentity active = 4; repeated RuntimeFieldCapability fields = 5; uint64 receipt_retention_seconds = 6;
+  uint32 max_receipts = 7; bool full_effective_schema_supported = 8; uint64 control_revision = 9;
+}
+// Explicit snapshot; absent and empty package lists retain their protobuf
+// semantics. Native directory custody is never accepted through this message.
+message RuntimeOverrideOptions { bool auto_redirect = 1; repeated string include_package = 2; repeated string exclude_package = 3; }
+message PlanRuntimeConfigRequest {
+  uint32 contract_version = 1; RuntimeIdentity expected = 2; string config_content = 3; RuntimeOverrideOptions overrides = 4;
+  uint64 expected_control_revision = 5; repeated RuntimeSelectorIntent selector_intents = 6;
+}
+message RuntimeSelectorIntent { string group = 1; string selected = 2; repeated string expected_selection_path = 3; bool pin_current_tcp = 4; }
+message RuntimeConfigPlan {
+  uint32 contract_version = 1; string plan_id = 2; RuntimeIdentity expected = 3; string candidate_digest = 4;
+  string dependency_digest = 5; string impact_digest = 6; repeated RuntimeImpact impacts = 7;
+  repeated RuntimePlanError errors = 8; int64 expires_at_unix_milli = 9; bool applicable = 10;
+  uint64 expected_control_revision = 11; string transaction_id = 12; bool no_op = 13;
+}
+message RuntimeImpact {
+  string resource_id = 1; string effective_path = 2; RuntimeUpdateClass update_class = 3;
+  string reason = 4; repeated string affected_session_classes = 5; bool reconnect_required = 6;
+}
+message RuntimePlanError { string code = 1; string effective_path = 2; repeated string dependency_path = 3; string message = 4; }
+message ApplyRuntimeConfigRequest {
+  uint32 contract_version = 1; string transaction_id = 2; string plan_id = 3; RuntimeIdentity expected = 4;
+  string candidate_digest = 5; string accepted_impact_digest = 6; uint64 expected_control_revision = 7;
+}
+enum RuntimeOperationState { RUNTIME_OPERATION_UNSPECIFIED = 0; PREPARING = 1; REJECTED_UNAPPLIED = 2; COMMITTED = 3; COMMITTED_DURABILITY_PENDING = 4; ABORTING_UNAPPLIED = 5; ABORTED_UNAPPLIED = 6; ABORTED_DEGRADED = 7; }
+message RuntimeConfigOperation {
+  uint32 contract_version = 1; string transaction_id = 2; RuntimeOperationState state = 3; RuntimeIdentity before = 4;
+  RuntimeIdentity active = 5; string candidate_digest = 6; string impact_digest = 7; repeated RuntimeImpact impacts = 8;
+  repeated RuntimePlanError errors = 9; bool durable = 10; string retirement_state = 11; uint64 control_revision = 12;
+  string persistence_mode = 13; bool owner_reload_acknowledged = 14;
+  string desired_state_digest = 15; string desired_state_revision = 16;
+}
+message RuntimeConfigStatusRequest { uint32 contract_version = 1; string transaction_id = 2; string runtime_incarnation = 3; }
+enum RuntimeLookupState { ACTIVE_ONLY = 0; FOUND = 1; UNKNOWN_OR_EXPIRED = 2; WRONG_INCARNATION = 3; }
+message RuntimeConfigStatus {
+  uint32 contract_version = 1; RuntimeIdentity active = 2; optional RuntimeConfigOperation operation = 3;
+  RuntimeLookupState lookup_state = 4; string durable_applied_digest = 5; uint64 control_revision = 6;
+  string persistence_mode = 7; string durable_desired_state_digest = 8;
+  string durable_desired_state_revision = 9; bool durable_owner_reload_acknowledged = 10;
+}
+
+// The authenticated original owner attests its captured durable desired state.
+// Regeneration mode does not promise replay of identical effective JSON bytes.
+message RuntimePersistenceAcknowledgementRequest {
+  uint32 contract_version = 1; string transaction_id = 2; RuntimeIdentity active = 3;
+  uint64 control_revision = 4; string persistence_mode = 5;
+  string desired_state_digest = 6; string desired_state_revision = 7;
+}
+
+// Explicit original-transaction durability retry, never graph re-application.
+// The authenticated original actor and every identity field must still match.
+// No configuration, path or replacement desired-state evidence is accepted.
+message RuntimePersistenceRetryRequest {
+  uint32 contract_version = 1; string transaction_id = 2; RuntimeIdentity active = 3;
+  uint64 control_revision = 4; string persistence_mode = 5;
+}

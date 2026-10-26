@@ -1,3 +1,5 @@
+import { isSavedEditProgress, presentSubscriptionRefreshResult, subscriptionEditProgressText } from '@/domain/subscription-refresh';
+import { useSubscriptionProgress } from '@/store/use-subscription-progress-store';
 import { useInputRequest } from '@/hooks/use-input-request';
 /**
  * 移动端**订阅表单**（新增 / 编辑；「重命名」与「编辑」按 `focus` 落到同一张表的不同字段）。
@@ -125,7 +127,7 @@ export function SubFormPanel({
   const [busy, setBusy] = useState(false);
   const [previewing, setPreviewing] = useState(false);
   const [operationId, setOperationId] = useState<string | null>(null);
-  const [notice, setNotice] = useState<{ tone: 'ok' | 'info' | 'err'; text: string } | undefined>();
+  const [notice, setNotice] = useState<{ tone: 'ok' | 'info' | 'err'; title?: string; text: string } | undefined>();
 
   const snapshot = useSubscriptionCreateOperationStore((s) =>
     operationId === null ? null : (s.snapshots[operationId] ?? null),
@@ -231,7 +233,7 @@ export function SubFormPanel({
       } else {
         const key = r.errorKind === undefined ? undefined : SUBSCRIPTION_ERROR_I18N_KEY[r.errorKind];
         setNotice({
-          tone: 'err',
+          tone: 'err', title: t('sub.previewFail'),
           text:
             key !== undefined ? subscriptionErrorDetail(r, t, 'sub.previewFail') : t('sub.previewFail'),
         });
@@ -240,14 +242,21 @@ export function SubFormPanel({
       if (!isCurrent()) return;
       // IPC 原始诊断只进日志：提示必须跨语言稳定。
       console.error('[mobile-sub-form] preview failed:', e);
-      setNotice({ tone: 'err', text: t('sub.previewFail') });
+      setNotice({ tone: 'err', title: t('sub.previewFail'), text: t('sub.previewFail') });
     } finally {
       if (isCurrent() && hasInstance(instanceId)) setPreviewing(false);
     }
   };
 
+  const beginEditSave = useInputRequest(JSON.stringify([name, url, ua, autoUpdate, viaProxy, proxyBindInterface, periodic.checked, periodic.interval]));
+  const editProgress = useSubscriptionProgress(base?.id ?? '');
+  const beginSaveRequest = useInputRequest(instanceId);
+  const activeEdit = useRef<() => boolean>(() => false);
+  const savePending = useRef<string | null>(null);
+  const [, renderSavedAck] = useState(0);
+
   const submit = async (): Promise<void> => {
-    if (busy || operationBusy) return;
+    if ((isEdit ? (savePending.current !== null || activeEdit.current()) : busy) || operationBusy) return;
     const nameEmpty = name.trim() === '';
     const urlBad = !isSubscriptionUrl(url);
     setErrName(nameEmpty);
@@ -255,6 +264,13 @@ export function SubFormPanel({
     const periodicFields = periodic.commit();
     if (nameEmpty || urlBad || periodicFields === null) return;
 
+    const isCurrentEdit = beginEditSave();
+    const isCurrentRequest = beginSaveRequest();
+    activeEdit.current = isCurrentEdit;
+    let saved = false;
+    const editRequestId = crypto.randomUUID();
+    if (isEdit) savePending.current = editRequestId;
+    let stopProgress: (() => void) | undefined;
     setBusy(true);
     try {
       if (isEdit && base !== undefined) {
@@ -268,11 +284,25 @@ export function SubFormPanel({
           proxyBindInterface: proxyBindInterface || undefined,
           ...periodicFields,
         };
-        // 编辑只写 config（对齐桌面：edit 不自动拉取）。
-        await api.subscription.update(next);
+        stopProgress = await api.subscription.onUpdateProgressReady((frame) => {
+          if (!isCurrentRequest() || savePending.current !== editRequestId
+            || !isSavedEditProgress(frame, next.id, editRequestId)) return;
+          saved = true;
+          savePending.current = null;
+          renderSavedAck((value) => value + 1);
+        });
+        // Unmount while listener registration was pending must not start a mutation.
+        if (!isCurrentRequest()) return;
+        const result = await api.subscription.update(next, editRequestId);
+        if (result.saved !== true || result.editRequestId !== editRequestId) throw new Error('subscription-edit-result-invalid');
+        saved = true;
         await loadConfig(true);
-        closeInstance(instanceId);
+        // Closing a view never cancels a native save; a stale reply cannot close newer edits.
+        if (!isCurrentEdit() || result.publication === 'superseded' || result.refresh?.superseded) return;
         toast.success(t('sub.updated'));
+        if (result.publication === 'failed') toast.error(t('feedback.subscriptionSaved'), t('feedback.followupIncomplete'));
+        if (result.refresh) presentSubscriptionRefreshResult(result.refresh, t);
+        closeInstance(instanceId);
         return;
       }
       /* 新增：调用方自持 operationId（响应丢失后按同一个 id 重挂，见头注）。 */
@@ -288,11 +318,13 @@ export function SubFormPanel({
         ...periodicFields,
       });
       /* 不在这里关表：终态由上面那条 effect 处置（成功才关，失败留在原地显详情）。 */
-    } catch (e) {
-      console.error('[mobile-sub-form] save failed:', e);
-      setNotice({ tone: 'err', text: t('common.saveFailed') });
+    } catch {
+      if (!isCurrentEdit()) return;
+      console.error('[mobile-sub-form] save failed');
+      setNotice({ tone: 'err', title: t(saved ? 'feedback.subscriptionSaved' : 'common.saveFailed'), text: saved ? t('feedback.followupIncomplete') : t('common.saveFailed') });
     } finally {
-      if (hasInstance(instanceId)) setBusy(false);
+      stopProgress?.();
+      if (isCurrentRequest() && hasInstance(instanceId)) { savePending.current = null; activeEdit.current = () => false; setBusy(false); }
     }
   };
 
@@ -306,9 +338,9 @@ export function SubFormPanel({
       closeLabel={t('common.close')}
       cancelLabel={t('common.cancel')}
       submitLabel={isEdit ? t('common.save') : t('sub.add')}
-      submitDisabled={busy || previewing || operationBusy}
+      submitDisabled={(busy && (!isEdit || savePending.current !== null || activeEdit.current())) || previewing || operationBusy}
       onSubmit={() => void submit()}
-      notice={progress !== undefined ? { tone: 'info', text: progress } : notice}
+      notice={busy && isEdit ? { tone: 'info', text: subscriptionEditProgressText(editProgress, t) } : progress !== undefined ? { tone: 'info', text: progress } : notice}
     >
       <div className="m-form-row">
         <label className="m-form-label" htmlFor="msf-name">
@@ -570,7 +602,7 @@ export function SubCreateTaskPanel({
   const [settling, setSettling] = useState(false);
   const [completionFailed, setCompletionFailed] = useState(false);
   const [publishAttempt, setPublishAttempt] = useState(0);
-  const [notice, setNotice] = useState<{ tone: 'ok' | 'info' | 'err'; text: string } | undefined>();
+  const [notice, setNotice] = useState<{ tone: 'ok' | 'info' | 'err'; title?: string; text: string } | undefined>();
   const cancelInFlight = useRef(false);
   const handledAttempt = useRef<string | null>(null);
 
@@ -679,7 +711,7 @@ export function SubCreateTaskPanel({
             cancelInFlight.current = false;
             if (hasInstance(instanceId)) {
               setCancelling(false);
-              setNotice({ tone: 'err', text: t('sub.previewFail') });
+              setNotice({ tone: 'err', title: t('sub.previewFail'), text: t('sub.previewFail') });
             }
           }
         },

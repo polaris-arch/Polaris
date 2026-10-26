@@ -3,6 +3,8 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SOURCE_TESTS, BOOTSTRAP_TESTS } from './run-native-dns-controlled-tests.mjs';
+import { TESTS as LOOPBACK_TESTS } from './runtime-config-loopback.mjs';
 
 // gate-rust.sh 与 ci.yml 的 Rust 门必须逐字一致——起因见 gate-rust.sh 头注：本机手跑门用的
 // 命令曾比 CI 弱，且这个仓已经被「判据取材面吃到注释里的同名字样」打脸过三次，这里不能再来一次。
@@ -34,14 +36,14 @@ function stripComments(text) {
     .join('\n');
 }
 
-/** 抠出 ci.yml 里 `- name: <stepName>` 到下一个同缩进 `- name:` 之间的整段（已剥注释）。 */
+/** Read one named step, bounded by every sibling step or the end of its job. */
 function extractCiStepBlock(strippedYaml, stepName) {
   const lines = strippedYaml.split('\n');
   const startIdx = lines.findIndex((l) => l.trim() === `- name: ${stepName}`);
   assert.ok(startIdx !== -1, `ci.yml 里找不到步骤 "- name: ${stepName}"`);
   let endIdx = lines.length;
   for (let i = startIdx + 1; i < lines.length; i++) {
-    if (/^\s{6}- name:/.test(lines[i])) {
+    if (/^ {6}- |^ {0,4}\S/.test(lines[i])) {
       endIdx = i;
       break;
     }
@@ -152,6 +154,11 @@ const ANDROID_FACE_STEP = 'Android impact face must be registered (dep-info 对�
 // replace any ordinary gate. assertCandidateOnlySteps pins their exact opt-in
 // scope and commands below; native-dns-ci-routing.test.mjs checks admission,
 // payload identity, exact Rust namespaces and failure/evidence routing.
+const CI_ONLY_SOURCE_STEP = 'Test additive RuntimeConfig client against loopback mocks';
+const CI_ONLY_LOOPBACK_STEP = 'Run exact real App to paired kernel HOT loopback tests';
+const CI_ONLY_SUBSCRIPTION_STEP = 'Verify native subscription JSON URI and UA preservation';
+const CI_ONLY_BOOTSTRAP_STEP = 'Verify native helper bootstrap descriptor primitives';
+const CI_ONLY_COMPILE_STEP = 'Compile native consumer test binaries without execution';
 const CANDIDATE_BUILD_STEP = 'Build actual candidate helper bytes and freeze the separate App identity';
 const CANDIDATE_RUNTIME_STEP = 'Run exact controlled App lifecycle hot-switch and stats tests';
 const MIRRORED_BUT_NOT_VERBATIM = [
@@ -185,7 +192,7 @@ function assertCandidateOnlySteps(ci, controlled) {
   assert.match(runtime, /node --test scripts\/native-dns-ci-routing\.test\.mjs/);
   assert.match(runtime, /scripts\/run-native-dns-controlled-tests\.test\.mjs/);
   assert.ok(controlled.includes("args: ['test', '--locked', '-p', 'polaris', '--lib', '--no-run', '--message-format=json']"));
-  assert.equal((controlled.match(/'--no-run'/g) ?? []).length, 1);
+  assert.equal((controlled.match(/'--no-run'/g) ?? []).length, 2);
   assert.ok(controlled.includes("args: [name, '--exact', '--ignored', '--nocapture', '--test-threads=1']"));
   assert.match(controlled, /summaries\.length === 1/);
   assert.match(controlled, /test result: ok\. 1 passed; 0 failed; 0 ignored;/);
@@ -372,8 +379,7 @@ test('切片自检：android-face 块的抠取不吃块外/注释里的同名 ca
  * 没有这条断言，CI 新增一个 Rust 门时本机脚本会静默落后 —— 覆盖面就由夹具（GATES 这张写死的表）
  * 决定，而不是由判据（ci.yml 里实际有哪些 cargo 门）决定。本仓踩过这个形状，故钉死。
  */
-test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字镜像名单里', () => {
-  const { ci } = loadStripped();
+function assertCargoStepCoverage(ci) {
   const lines = ci.split('\n');
   const cargoSteps = [];
   for (let i = 0; i < lines.length; i++) {
@@ -397,12 +403,13 @@ test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字�
     });
     // The controlled step delegates its single Cargo build to this exact runner;
     // assertCandidateOnlySteps above pins both the call and the runner's selectors.
-    const delegatedGate = body.includes('node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"');
+    const delegatedGate = /\bnode scripts\/run-native-dns-controlled-tests\.mjs(?:\s|$)/.test(body)
+      || /\bnode scripts\/runtime-config-loopback\.mjs run\b/.test(body);
     if (isGate || delegatedGate) cargoSteps.push(m[1]);
   }
   assert.ok(cargoSteps.length > 0, '一个跑 cargo 的步骤都没抠到 —— 取材面是空的，本断言恒真');
 
-  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM]);
+  const covered = new Set([...GATES.map((g) => g.ci), ...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP]);
   const orphans = cargoSteps.filter((n) => !covered.has(n));
   assert.deepEqual(
     orphans,
@@ -412,8 +419,18 @@ test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字�
       '要么（多行 shell 块，抠不出单行）加进 MIRRORED_BUT_NOT_VERBATIM 并为它补一条针对性对拍。'
   );
 
-  const stale = MIRRORED_BUT_NOT_VERBATIM.filter((n) => !cargoSteps.includes(n));
+  const stale = [...MIRRORED_BUT_NOT_VERBATIM, CI_ONLY_COMPILE_STEP, CI_ONLY_SOURCE_STEP, CI_ONLY_LOOPBACK_STEP, CI_ONLY_BOOTSTRAP_STEP, CI_ONLY_SUBSCRIPTION_STEP].filter((n) => !cargoSteps.includes(n));
   assert.deepEqual(stale, [], `非逐字镜像名单里有 ci.yml 已经没有的步骤（名单陈旧）：${JSON.stringify(stale)}`);
+}
+
+test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字镜像名单里', () => {
+  const { ci } = loadStripped();
+  assertCargoStepCoverage(ci);
+  for (const command of ['cargo deny check', 'node scripts/runtime-config-loopback.mjs run', 'node scripts/run-native-dns-controlled-tests.mjs --source-contracts']) {
+    const added = ci + `\n  orphan_fixture:\n    steps:\n      - name: Unregistered native gate\n        run: ${command}\n`;
+    assert.throws(() => assertCargoStepCoverage(added), /Unregistered native gate/);
+  }
+  assert.throws(() => assertCargoStepCoverage(ci.replace('run: node scripts/runtime-config-loopback.mjs run', 'run: echo omitted')), /名单陈旧/);
 });
 
 for (const gate of GATES) {
@@ -474,4 +491,191 @@ test('切片自检：行内 # 诱饵不会截断真实命令参数', () => {
   const block = extractCiStepBlock(stripped, 'Check formatting');
   const command = extractRunCommand(block, 'synthetic');
   assert.equal(command, 'cargo fmt --all -- --check');
+});
+
+// This explicit manual compiler check does not replace or broaden the local gate.
+function assertCompileOnlyStep(ci) {
+  const block = extractCiStepBlock(ci, CI_ONLY_COMPILE_STEP);
+  assert.equal(extractRunCommand(block, CI_ONLY_COMPILE_STEP), 'cargo test --locked --workspace --no-run');
+  assert.deepEqual([...block.matchAll(/^        if: (.+)$/gm)].map((m) => m[1]),
+    ["needs.cheap_format.outputs.app_native_compile_only == 'true'"]);
+  assert.doesNotMatch(block, /continue-on-error|--ignored|--release|\|\| true/);
+  assert.match(ci, /app_native_compile_candidate:\n        description:.*\n        type: string\n        default: ''/);
+  const admission = extractCiStepBlock(ci, 'Admit exact App native compile-only request');
+  assert.match(admission, /github\.event_name == 'workflow_dispatch'/);
+  assert.match(admission, /candidate !== e\.GITHUB_SHA/);
+  assert.match(admission, /selected\.os !== 'ubuntu-22\.04'/);
+  assert.match(admission, /compile_only=true/);
+}
+test('manual native compilation compiles test binaries without executing or replacing ordinary gates', () => {
+  const { ci } = loadStripped();
+  assertCompileOnlyStep(ci);
+  for (const [before, after] of [
+    ['cargo test --locked --workspace --no-run', 'cargo test --locked --workspace'],
+    ["if: needs.cheap_format.outputs.app_native_compile_only == 'true'", 'if: true'],
+    ["selected.os !== 'ubuntu-22.04'", 'false'],
+  ]) assert.throws(() => assertCompileOnlyStep(ci.replaceAll(before, after)));
+});
+
+// Existing RuntimeConfig source tests are independent CI-only checks, not a local
+// Rust-gate replacement; their complete isolation is checked by the routing suite.
+test('existing RuntimeConfig CI-only command has an explicit narrow registration', () => {
+  const { ci } = loadStripped();
+  const block = extractCiStepBlock(ci, CI_ONLY_SOURCE_STEP);
+  assert.equal(extractRunCommand(block, CI_ONLY_SOURCE_STEP), 'cargo test --locked -p polaris-singbox-grpc --test runtime_config');
+  const source = extractCiJobBlock(ci, 'runtime_config_source_tests');
+  assert.ok(source.includes(block));
+  assert.doesNotMatch(source, /fetch-core|prepare-core-identity|sudo|--ignored|--release|continue-on-error/);
+  assert.match(source, /This job is not full CI, native or HOT acceptance/);
+});
+
+
+function extractCiJobBlock(ci, name) {
+  const tail = ci.split(`\n  ${name}:\n`)[1];
+  assert.ok(tail, `Missing CI job ${name}`);
+  return tail.split(/\n {2}[a-z][a-z0-9_-]*:\n/)[0];
+}
+
+function assertLoopbackOnlyStep(ci, sh, runner) {
+  const job = extractCiJobBlock(ci, 'runtime_config_loopback');
+  const block = extractCiStepBlock(job, CI_ONLY_LOOPBACK_STEP);
+  assert.equal(extractRunCommand(block, CI_ONLY_LOOPBACK_STEP), 'node scripts/runtime-config-loopback.mjs run');
+  assert.match(block, /RUNTIME_CONFIG_LOOPBACK_INPUTS: \$\{\{ toJSON\(inputs\) \}\}/);
+  assert.match(job, /^    needs: cheap_format$/m);
+  assert.match(job, /^    if: needs\.cheap_format\.outputs\.runtime_config_loopback_only == 'true'$/m);
+  assert.doesNotMatch(job, /continue-on-error|fetch-core|prepare-core-identity|Swatinem\/rust-cache|\|\| true/);
+  assert.doesNotMatch(sh, /runtime-config-loopback|real_hot_dispatcher|real_hot_public_rpc/);
+  assert.match(runner, /import \{ exactPass, runtimeEnvironment, selectExecutable \} from '\.\/run-native-dns-controlled-tests\.mjs'/);
+  const cargoCalls = [...runner.matchAll(/(?:capture|execute)\([^;\n]*?'cargo', (\[[^\]]+\])/g)].map((match) => match[1]);
+  assert.deepEqual(cargoCalls, [
+    "['metadata', '--locked', '--no-deps', '--format-version=1']",
+    "['test', '--locked', '-p', 'polaris', '--lib', '--no-run', '--message-format=json']",
+  ]);
+  const names = [...runner.matchAll(/'(runtime::proxy::tests::runtime_config_real_core::[a-z_]+)'/g)].map((match) => match[1]);
+  assert.deepEqual(names, [
+    'runtime::proxy::tests::runtime_config_real_core::real_hot_dispatcher_apply_and_status',
+    'runtime::proxy::tests::runtime_config_real_core::real_hot_dispatcher_persistence_retry',
+    'runtime::proxy::tests::runtime_config_real_core::real_hot_public_rpc_contract',
+    'runtime::proxy::tests::runtime_config_real_core::real_hot_dispatcher_rejections_preserve_runtime',
+  ]);
+  assert.deepEqual(LOOPBACK_TESTS, names);
+  assert.match(runner, /for \(const name of TESTS\)/);
+  assert.match(runner, /program: selected\.executable,/);
+  assert.match(runner, /args: \[name, '--exact', '--ignored', '--nocapture', '--test-threads=1'\]/);
+  assert.match(runner, /selectExecutable\(messages, metadata, ROOT\)/);
+  assert.match(runner, /demand\(exactPass\(observed\),/);
+  assert.match(runner, /demand\(result\.tests\.length === 4,/);
+  assert.doesNotMatch(runner, /cargo test[^\n]*--ignored|--test-threads=0|--include-ignored/);
+}
+
+test('real HOT delegated runner is explicitly CI-only with exact compile and four libtest selectors', () => {
+  const { ci, sh } = loadStripped();
+  const runner = readFileSync(join(ROOT, 'scripts/runtime-config-loopback.mjs'), 'utf8');
+  assertLoopbackOnlyStep(ci, sh, runner);
+  for (const [before, after] of [
+    ["'--lib', '--no-run'", "'--lib'"],
+    ["'-p', 'polaris', '--lib'", "'--workspace'"],
+    ["args: [name, '--exact', '--ignored'", "args: [name, '--ignored'"],
+    ['demand(exactPass(observed),', 'demand(true,'],
+    ['demand(result.tests.length === 4,', 'demand(result.tests.length >= 0,'],
+    ['real_hot_public_rpc_contract', 'other_ignored_test'],
+  ]) {
+    assert.ok(runner.includes(before), before);
+    assert.throws(() => assertLoopbackOnlyStep(ci, sh, runner.replaceAll(before, after)), before);
+  }
+  for (const [before, after] of [
+    ["if: needs.cheap_format.outputs.runtime_config_loopback_only == 'true'", 'if: true'],
+    ['run: node scripts/runtime-config-loopback.mjs run', 'run: node scripts/runtime-config-loopback.mjs run --all'],
+  ]) assert.throws(() => assertLoopbackOnlyStep(ci.replace(before, after), sh, runner));
+});
+
+test('CI step and source-job scanners stop at sibling jobs and unnamed steps', () => {
+  const fixture = '  first:\n    steps:\n      - name: Exact\n        run: cargo check --locked\n'
+    + '      - uses: actions/checkout@v7\n        with:\n          persist-credentials: false\n'
+    + '  second:\n    steps:\n      - name: Other\n        run: cargo deny check\n';
+  assert.equal(extractRunCommand(extractCiStepBlock(fixture, 'Exact'), 'Exact'), 'cargo check --locked');
+  assert.doesNotMatch(extractCiStepBlock(fixture, 'Exact'), /checkout|second|cargo deny/);
+  const last = fixture.replace('      - uses: actions/checkout@v7\n        with:\n          persist-credentials: false\n', '');
+  assert.doesNotMatch(extractCiStepBlock(last, 'Exact'), /second|cargo deny/);
+  const { ci } = loadStripped();
+  const added = ci.replace('\n  windows_launcher_diagnostics:\n', '\n  sibling_fixture:\n    steps:\n      - run: sudo cargo test --ignored\n\n  windows_launcher_diagnostics:\n');
+  assert.doesNotMatch(extractCiJobBlock(added, 'runtime_config_source_tests'), /sudo|--ignored|sibling_fixture/);
+});
+
+
+test('formal HOT adds only the exact helper build and existing identity preparation before App compile', () => {
+  const source = readFileSync(join(ROOT, 'scripts/runtime-config-loopback-formal.mjs'), 'utf8');
+  assert.match(source, /\['build', '--locked', '-p', 'polaris-helper', '--bin', 'polaris-helper', '--message-format=json'\]/);
+  assert.match(source, /selectFormalHelper\(messages, metadata, root, target\)/);
+  assert.match(source, /scripts\/prepare-core-identity\.mjs/);
+  assert.doesNotMatch(source, /--ignored|--include-ignored|cargo test|program:.*polaris-helper/);
+  const runner = readFileSync(join(ROOT, 'scripts/runtime-config-loopback.mjs'), 'utf8');
+  assert.ok(runner.indexOf('await prepareFormalCarrier') < runner.indexOf("execute('app-test-build'"));
+});
+
+function assertBootstrapPrimitives(ci) {
+  const block = extractCiStepBlock(ci, CI_ONLY_BOOTSTRAP_STEP);
+  assert.ok(block.includes("runner.os == 'macOS' || runner.os == 'Linux'"));
+  assert.ok(block.includes("needs.cheap_format.outputs.app_native_compile_only != 'true'"));
+  assert.ok(block.includes('!cancelled()'));
+  assert.ok(block.includes('run: node scripts/run-native-dns-controlled-tests.mjs --bootstrap-contracts'));
+  assert.deepEqual(BOOTSTRAP_TESTS, [
+    'polaris-helper-client:manager::tests::bootstrap_identity::bootstrap_identity_render_is_platform_specific',
+    'polaris-helper-client:manager::tests::bootstrap_identity::native_bootstrap_descriptor_identity',
+  ]);
+  assert.ok(!block.includes('sudo'));
+}
+test('native bootstrap primitives execute exact nonempty Linux and macOS tests without administrator operations', () => {
+  const { ci } = loadStripped(); assertBootstrapPrimitives(ci);
+  for (const original of ['--bootstrap-contracts', "runner.os == 'macOS'", '!cancelled()']) {
+    const block = extractCiStepBlock(ci, CI_ONLY_BOOTSTRAP_STEP);
+    assert.throws(() => assertBootstrapPrimitives(ci.replace(block, block.replace(original, 'omitted'))), { name: 'AssertionError' });
+  }
+});
+
+const SUBSCRIPTION_NATIVE_TESTS = [
+  "polaris-store:tests::store_tests::unsupported_vision_transport_remains_repairable_across_real_store",
+  "polaris:runtime::speedtest::tests::vision_transport_temp_plan_reports_fixed_failure_without_losing_good_nodes",
+  "polaris-config-engine:builder::outbound::tests::vision_transport_admission_preserves_supported_native_streams",
+  "polaris-config-engine:builder::outbounds::tests::vision_invalid_nodes_preserve_explicit_targets_and_good_auto_candidates",
+  "polaris-net-stack:share_link::tests::vision_transport_import_retains_original_nodes_and_safe_warnings",
+  "polaris-net-stack:singbox_import::tests::vision_extra_transports_are_retained_with_repairable_warning",
+  "polaris-net-stack:singbox_import::tests::naive_json_h2_h3_survive_dedup_serde_and_full_generation",
+  "polaris-net-stack:singbox_import::tests::naive_json_quic_flag_is_not_an_unsupported_transport_object",
+  "polaris-net-stack:share_link::tests::naive_quic_community_uri_preserves_h3_and_existing_tls_query",
+  "polaris-net-stack:share_link::tests::naive_quic_multiline_subscription_keeps_h2_and_h3",
+  "polaris-net-stack:subscription::tests::fetch_tests::generated_default_and_custom_ua_reach_real_fetch_init",
+  "polaris:commands::subscription::tests::reconcile_tests::naive_json_refresh_reorder_preserves_h3_through_real_store",
+  "polaris:commands::subscription::tests::ua_tests::effective_ua_default_and_persisted_override_matrix",
+  "polaris:runtime::http::tests::subscription_default_and_override_ua_are_real_wire_headers",
+  "polaris:runtime::config::tests::subscription_edit_publishes_owner_only_after_real_storage_success",
+  "polaris:commands::subscription::tests::boundary_regressions::edit_supersession_drops_the_actual_awaited_pipeline_and_cancels_providers",
+  "polaris:commands::subscription::tests::boundary_regressions::refresh_pipeline_obeys_existing_deadline_without_retrying_or_disabling_owner",
+  "polaris:commands::subscription::tests::boundary_regressions::late_refresh_publication_cannot_invalidate_new_saved_edit_intent",
+  "polaris:commands::subscription::tests::boundary_regressions::edit_refresh_uses_effective_request_identity_not_metadata_or_requested_ua_text",
+  "polaris:runtime::subscription_refresh::tests::saved_edit_supersedes_old_work_without_old_drop_releasing_new_owner",
+  "polaris:runtime::subscription_refresh::tests::repeated_edits_and_aba_cannot_publish_old_progress_or_commit",
+  "polaris:runtime::subscription_scheduler::tests::superseded_refresh_is_not_a_scheduler_failure_or_announcement",
+  "polaris-config-engine:user_config::app_config::tests::utls_default_initialization_and_missing_fields_preserve_explicit_policies",
+  "polaris-config-engine:user_config::utls::tests::initial_missing_and_null_policy_follow_saved_fingerprint_in_real_generator",
+  "polaris-config-engine:user_config::utls::tests::policy_projection_enters_refresh_and_missing_is_follow",
+  "polaris-config-engine:user_config::utls::tests::node_intent_global_policy_protocol_matrix_keeps_stored_nodes_unchanged",
+  "polaris-store:tests::store_tests::new_installation_uses_follow_and_preserves_explicit_saved_policies",
+  "polaris:runtime::proxy::pending_changes::tests::global_utls_change_creates_runtime_debt_and_missing_restores_follow_projection"
+];
+function assertSubscriptionNative(ci) {
+  const block = extractCiStepBlock(ci, CI_ONLY_SUBSCRIPTION_STEP);
+  assert.ok(block.includes("runner.os == 'macOS' || runner.os == 'Linux'"));
+  assert.ok(block.includes("needs.cheap_format.outputs.app_native_compile_only != 'true'"));
+  assert.ok(block.includes('!cancelled()'));
+  assert.ok(block.includes('run: node scripts/run-native-dns-controlled-tests.mjs --source-contracts'));
+  assert.deepEqual(SOURCE_TESTS, SUBSCRIPTION_NATIVE_TESTS);
+  assert.ok(!block.includes('sudo'));
+}
+test('subscription native gate preserves exact JSON URI edit ownership uTLS and actual wire selectors', () => {
+  const { ci } = loadStripped(); assertSubscriptionNative(ci);
+  for (const original of ['--source-contracts', "runner.os == 'macOS'", '!cancelled()']) {
+    const block = extractCiStepBlock(ci, CI_ONLY_SUBSCRIPTION_STEP);
+    assert.throws(() => assertSubscriptionNative(ci.replace(block, block.replace(original, 'omitted'))), { name: 'AssertionError' });
+  }
 });

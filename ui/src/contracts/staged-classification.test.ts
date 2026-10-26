@@ -90,14 +90,14 @@ describe('StagedDecision 跨语言锁', () => {
     );
   });
 
-  it('restartRequired 是“保存后仍待应用”的投影，只有 noOp 为假', () => {
-    // 保存策略禁止修改运行核：本性可热切的条目也要等“立即应用”。字段名为兼容 IPC 保留。
-    const restartRequired = (d: StagedDecision) => d !== 'noOp';
-    expect(FRONTEND_DECISIONS.filter(restartRequired)).toEqual([
+  it('pendingApply tracks saved differences independently of actual restart need', () => {
+    // Saving alone never applies the runtime change; HOT is pending without requiring restart.
+    const pendingApply = (d: StagedDecision) => d !== 'noOp';
+    expect(FRONTEND_DECISIONS.filter(pendingApply)).toEqual([
       'hotSwitch',
       'defer',
       'restart',
     ]);
-    expect(FRONTEND_DECISIONS.filter((d) => !restartRequired(d))).toEqual(['noOp']);
+    expect(FRONTEND_DECISIONS.filter((d) => !pendingApply(d))).toEqual(['noOp']);
   });
 });

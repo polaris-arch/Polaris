@@ -147,7 +147,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
 
   return (
     <>
-      <SavedAutoSelectControls t={t} variant="switch" />
+      <SavedAutoSelectControls t={t} variant="switch" settingsLayout="mobile" />
       <SettingsGroup header={t('settings.network.interfaceBlock')}>
         <SettingsRow
           first
@@ -217,7 +217,7 @@ export function NetworkPage({ config, update, commit }: MobileSettingsPageProps)
         />
         <SettingsRow stacked id="utls-policy" label={t('settings.utls.label')} desc={[t('settings.utls.description'), isSavedUtlsSelection(config.utlsPolicy) ? t('node.utls.savedHint') : null, tlsFingerprintStatus(tlsFingerprints, t)].filter(Boolean).join(' ')}
           control={
-            <MobileSelect value={config.utlsPolicy ?? 'default'} ariaLabel={t('settings.utls.label')}
+            <MobileSelect value={config.utlsPolicy ?? 'follow'} ariaLabel={t('settings.utls.label')}
               onChange={(value) => commit('utls-policy', update({ utlsPolicy: value }))}>
               {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
                 <option key={value} value={value}>{label.startsWith('node.utls.') || label.startsWith('settings.utls.') ? t(label) : label}</option>
