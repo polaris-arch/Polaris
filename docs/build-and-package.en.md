@@ -75,7 +75,7 @@ create a second compatibility layer.
 
 ### Fetching assets (sing-box core / cronet / dashboard)
 
-Current desktop and mobile inputs both select the pinned alpha.12.4 source from [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). Desktop release assets and mobile source have separate contracts below. Verify repository, source commit, tag object and digests together; do not mechanically rewrite historical asset URLs or reuse historical receipts.
+Current desktop and mobile inputs both select the pinned alpha.12.5 source from [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). Desktop release assets and mobile source have separate contracts below. Verify repository, source commit, tag object and digests together; do not mechanically rewrite historical asset URLs or reuse historical receipts.
 
 Current desktop packaging starts from `desktopRelease` in `src-tauri/core-manifest.json` and consumes the pinned
 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) release through `scripts/desktop-core/release-contract.json`.

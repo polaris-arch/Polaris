@@ -11,12 +11,12 @@ import { canonical } from '../desktop-core/source-graph.mjs';
 import { releaseInstallationContract } from '../desktop-core/release-consumer.mjs';
 import { coreIdentityId, selectedCoreManifest } from '../lib/core-identity.mjs';
 
-export const KERNEL = '0cfa24573ff34c26608151068334329268cfdf14';
+export const KERNEL = '332935c310e78e15319d434f33a9103329200931';
 export const AUTH_MODE = 'temporary-existing-runner-password';
 export const AUTH_PHRASE = 'AUTHORIZE TEMPORARY RUNNER PASSWORD AND RELOCK FOR THIS RUN';
 export const AUTH_GROUP_MODE = 'temporary-existing-runner-password-and-sudo-group';
 export const AUTH_GROUP_PHRASE = 'AUTHORIZE TEMPORARY RUNNER PASSWORD AND SUDO GROUP MEMBERSHIP WITH RELOCK AND REMOVAL FOR THIS RUN';
-export const VERSION = '1.15.0-polaris-alpha.12.4';
+export const VERSION = '1.15.0-polaris-alpha.12.5';
 export const CASES = ['default_graph', 'tun_data_plane', 'graph_apply', 'daily_switch',
   'auto_preserves', 'manual_preserve', 'manual_disconnect', 'uncovered_target_restart', 'synthetic_route', 'normal_cleanup'];
 const demand = (ok, reason) => { if (!ok) throw Error(reason); };
@@ -102,7 +102,7 @@ export function verifyAuthenticationAdmission(admission, facts) {
 export function verifyKernel(contract) {
   demand(contract?.repository === 'polaris-arch/sing-box-polaris' && contract.sourceCommit === KERNEL
     && contract.version === VERSION && contract.tag === 'v' + VERSION,
-  'Complete genuine 0cfa alpha.12.4 formal materials required; historical c6/814 are not substitutes');
+  'Complete genuine 332935 alpha.12.5 formal materials required; historical 0cfa/c6/814 are not substitutes');
   return contract;
 }
 export function verifyHelper(inspection, carrier, contract, appVersion) {

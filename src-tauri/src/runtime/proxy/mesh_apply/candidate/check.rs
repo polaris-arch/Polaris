@@ -34,7 +34,7 @@ struct ReviewedCheckIdentity {
     memfd_name: &'static str,
 }
 
-static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 7] = [
+static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 8] = [
     ReviewedCheckIdentity {
         source_commit: "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
         contract_sha256: None,
@@ -131,6 +131,20 @@ static REVIEWED_CHECK_IDENTITIES: [ReviewedCheckIdentity; 7] = [
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         memfd_name: "polaris-strict-check-0cfa24",
     },
+    // Exact S332935 source/contract and producer ELF identity, matched to
+    // public archive metadata. Public consumption and sealed-runtime evidence
+    // remain separate gates; no historical observation or launch right transfers.
+    ReviewedCheckIdentity {
+        source_commit: "332935c310e78e15319d434f33a9103329200931",
+        contract_sha256: Some("98b85fea9aeb8e09f883fa092eda56aca40cc2e20b234d2ab486881d6931ee6a"),
+        evidence_label: "linux-x86_64-332935:runtime-evidence-pending:env-empty:cwd-root:sealed-fd0:--disable-color check -c /proc/self/fd/0",
+        #[cfg(target_os = "linux")]
+        binary_sha256: "d34fd051f8e089610bf32e58a5cf95ac36411827e46845157777baba078893ad",
+        #[cfg(target_os = "linux")]
+        input_profile: LinuxInputProfile::E332935,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        memfd_name: "polaris-strict-check-332935",
+    },
 ];
 
 /// Check/preparation identity only. The private rows cannot be constructed from
@@ -153,6 +167,8 @@ impl LinuxCheckProfile {
     pub(super) const C6C0D8: Self = Self(&REVIEWED_CHECK_IDENTITIES[5]);
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     pub(super) const E0CFA24: Self = Self(&REVIEWED_CHECK_IDENTITIES[6]);
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    pub(super) const E332935: Self = Self(&REVIEWED_CHECK_IDENTITIES[7]);
 
     pub(super) const fn execution_profile(self) -> &'static str {
         self.0.evidence_label

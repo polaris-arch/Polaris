@@ -22,11 +22,11 @@ class MobileInputs(unittest.TestCase):
 
     def test_selected_patch_source_has_real_final_tag_but_no_artifact_acceptance(self):
         value = json.loads(CONTRACT.read_bytes())
-        self.assertEqual(validate(value)['sourceCommit'], '0cfa24573ff34c26608151068334329268cfdf14')
-        self.assertEqual(value['sourceTree'], '412b1640c777831b1e8811b4c596cfb6df27fdb0')
-        self.assertEqual(value['sourceTagObject'], '9a309913a06c91263a344c12f8c39a8fc3fb2210')
+        self.assertEqual(validate(value)['sourceCommit'], '332935c310e78e15319d434f33a9103329200931')
+        self.assertEqual(value['sourceTree'], '6a8371b425370326528658e9b0cace926cf76b2d')
+        self.assertEqual(value['sourceTagObject'], '76e4f7db6767472952d09e4cf35b2cf90c223fbf')
         self.assertEqual((value['version'], value['sourceTag']),
-                         ('1.15.0-polaris-alpha.12.4', 'v1.15.0-polaris-alpha.12.4'))
+                         ('1.15.0-polaris-alpha.12.5', 'v1.15.0-polaris-alpha.12.5'))
         self.assertEqual(value['sourcePolicy']['schema'], 'polaris-reviewed-kernel-source-v3')
         self.assertEqual(len(value['sourcePolicy']['vendors']), 10)
         self.assertEqual(sum(pin['replacementFileCount'] for pin in value['sourcePolicy']['vendors'].values()), 2876)
@@ -36,7 +36,8 @@ class MobileInputs(unittest.TestCase):
             self.assertIs(value[key], False)
         from fork_input import linker_flags
         self.assertIn('DirectoryRetirementSourceIdentity=' + value['sourceCommit'], linker_flags(value, 'a' * 64))
-        for previous in ('c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
+        for previous in ('0cfa24573ff34c26608151068334329268cfdf14',
+                         'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
                          '368b2489784dbe06498a18e83cc2257f94868c46',
                          '814da362838e96e54f904836a92c2b0d8c3ae29b',
                          'ba73fcfca84f257680f6f46b87fdcce98b5ab94d',
@@ -73,7 +74,7 @@ class MobileInputs(unittest.TestCase):
         self.assertEqual(pending['tagObject'], selected['sourceTagObject'])
         self.assertEqual(pending['mobileSourceContractSha256'], sha(CONTRACT.read_bytes()))
         self.assertEqual(pending['sourcePolicy'], selected['sourcePolicy'])
-        self.assertEqual(selected['sourceCommit'], '0cfa24573ff34c26608151068334329268cfdf14')
+        self.assertEqual(selected['sourceCommit'], '332935c310e78e15319d434f33a9103329200931')
         self.assertNotEqual(pending['sourceCommit'], historical['sourceCommit'])
         self.assertNotEqual(pending['tagObject'], historical['sourceTagObject'])
         self.assertNotEqual(pending['mobileSourceContractSha256'], sha(historical_bytes))
@@ -499,7 +500,7 @@ class FormalStableNdk(unittest.TestCase):
                 changed = deepcopy(original); changed['android'][key] = other['android'][key]
                 with self.subTest(key=key, repository=original['repository']), self.assertRaisesRegex(RuntimeError, 'formal Android NDK differs'):
                     validate(changed)
-        self.assertEqual(current['sourceCommit'], '0cfa24573ff34c26608151068334329268cfdf14')
+        self.assertEqual(current['sourceCommit'], '332935c310e78e15319d434f33a9103329200931')
         self.assertEqual((self.root / 'scripts/android-rust-ndk.version').read_text().strip(), '27.3.13750724')
 
     def test_exact_reviewed_profile_rejects_alternate_path_bytes_keys_and_types(self):

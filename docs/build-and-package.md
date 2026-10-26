@@ -74,7 +74,7 @@ TypeScript 7 不再沿用旧的 `createSourceFile(..., ScriptTarget, ..., Script
 
 ### 资源拉取（sing-box 核 / cronet / 面板）
 
-当前桌面与移动端输入均选择 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) 的固定 alpha.12.4 来源。桌面发布资产与移动端源码分别由下述契约锁定；仓库名、源码提交、tag 对象和摘要须一起核验，不能机械改写旧资产 URL 或复用历史收据。
+当前桌面与移动端输入均选择 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) 的固定 alpha.12.5 来源。桌面发布资产与移动端源码分别由下述契约锁定；仓库名、源码提交、tag 对象和摘要须一起核验，不能机械改写旧资产 URL 或复用历史收据。
 
 当前桌面打包以 `src-tauri/core-manifest.json` 的 `desktopRelease` 为入口，按
 `scripts/desktop-core/release-contract.json` 消费固定的 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)
