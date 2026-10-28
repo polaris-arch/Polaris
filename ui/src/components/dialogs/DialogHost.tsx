@@ -1,3 +1,4 @@
+import { HelperRecoveryDialog } from './HelperRecoveryDialog';
 import { IdentityRepairDialog } from './IdentityRepairDialog';
 /**
  * DialogHost —— 弹窗唯一挂载点（挂 AppShell 内，§1.3）。
@@ -41,6 +42,7 @@ import { VpnAuthDialog } from './VpnAuthDialog';
 
 function renderDialog(desc: DialogEntry) {
   switch (desc.kind) {
+    case 'helper-recovery': return <HelperRecoveryDialog instanceId={desc.instanceId} />;
     case 'identity-repair': return <IdentityRepairDialog instanceId={desc.instanceId} />;
     case 'res-url':
       return <ResUrlDialog instanceId={desc.instanceId} />;

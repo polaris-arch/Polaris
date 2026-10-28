@@ -10,8 +10,8 @@ GUI, helper installation, authentication or TUN run**.
 - Reuse the original package transport, formal source gate, acquisition receipt
   and final-package native proof. No App/core rebuild, repack, fake producer,
   diagnostic-as-formal receipt or replacement core.
-- Require the genuine `332935c310e78e15319d434f33a9103329200931` formal
-  `v1.15.0-polaris-alpha.12.5` materials selected by this App's committed contract.
+- Require the genuine `bfcdf96b244f63e0fe84736ee4a4edd58f6b209e` formal
+  `v1.15.0-polaris-alpha.12.6` materials selected by this App's committed contract.
   Historical c6 / alpha.12.2 and 814 contracts or receipts cannot satisfy this
   new selection. Preserve their original bytes and identity; do not relabel them.
 - Verify the packaged helper against the adjacent original selected-core
@@ -214,7 +214,7 @@ was not selected, existing baseline publication requirements remain unchanged;
 no TUN PASS is asserted. `publicationEligible=false` on the TUN report means that
 it cannot independently replace the formal baseline receipt.
 
-Before a real run, the genuine 332935 / alpha.12.5 formal carrier/receipt and committed source
+Before a real run, the genuine bfcdf96 / alpha.12.6 formal carrier/receipt and committed source
 must exist; the hosted image's WebKit driver/default sandbox, systemd, TUN,
 polkit/PAM, process visibility and tshark must work as observed. There is no
 fallback that disables protections. Temporary-password mode additionally requires

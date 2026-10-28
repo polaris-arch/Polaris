@@ -45,7 +45,7 @@ def launch(mode='existing-session'):
              'driver': {'pid': 20, 'startTime': '1234'}, 'guiHome': '/tmp/qa/home',
              'helperScriptDir': '/tmp/qa/home/config/polaris', 'runtimePath': '/tmp/qa/home/config/polaris/singbox-runtime.json',
              'appSha256': H, 'helperSha256': H, 'coreSha256': H, 'carrierSha256': H,
-             'kernelCommit': '332935c310e78e15319d434f33a9103329200931', 'originalAdmission': 'verified',
+             'kernelCommit': 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e', 'originalAdmission': 'verified',
              'vmContext': {'githubHosted': True, 'dedicatedVM': True}, 'materialsDownloaded': True,
              'codeHashes': dict.fromkeys(m.FILES, H), 'authenticationMode': mode, 'execution': execution,
              'authorization': None, 'rpcProbePath': '/tmp/admitted-test-probe', 'rpcProbeSha256': H}
@@ -155,7 +155,7 @@ class LaunchTests(unittest.TestCase):
                        '814da362838e96e54f904836a92c2b0d8c3ae29b'):
             with self.subTest(commit=commit):
                 v = launch(); v['kernelCommit'] = commit; before = copy.deepcopy(v)
-                with self.assertRaisesRegex(ValueError, 'complete reviewed alpha.12.5 carrier admission required'):
+                with self.assertRaisesRegex(ValueError, 'complete reviewed alpha.12.6 carrier admission required'):
                     m.validate_launch(v)
                 self.assertEqual(v, before)
     def test_boolean_authority_denied(self):

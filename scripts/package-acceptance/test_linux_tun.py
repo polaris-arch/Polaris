@@ -106,7 +106,7 @@ def fixture_evidence():
 
 class PureContracts(unittest.TestCase):
     def test_historical_admission_is_rejected_before_carrier_or_product(self):
-        self.assertEqual(M.tun.KERNEL_COMMIT, '332935c310e78e15319d434f33a9103329200931')
+        self.assertEqual(M.tun.KERNEL_COMMIT, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e')
         for commit in ('0cfa24573ff34c26608151068334329268cfdf14',
                        'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
                        '814da362838e96e54f904836a92c2b0d8c3ae29b'):

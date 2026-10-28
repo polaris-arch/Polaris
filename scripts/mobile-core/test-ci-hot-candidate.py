@@ -200,8 +200,8 @@ class PureFixtures(unittest.TestCase):
                       'inputs': {'hot_consumer_candidate': self.sha, 'preserve_run': 'true'}}
 
     def test_final_kernel_identity_and_runtime_api_source_are_frozen(self):
-        self.assertEqual(hot.KERNEL_COMMIT, '332935c310e78e15319d434f33a9103329200931')
-        self.assertEqual(hot.KERNEL_TREE, '6a8371b425370326528658e9b0cace926cf76b2d')
+        self.assertEqual(hot.KERNEL_COMMIT, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e')
+        self.assertEqual(hot.KERNEL_TREE, '4c0fdb31d59967f41c808ea6b63f87ca9661c2cf')
         self.assertEqual(hot.SOURCE_HASHES['experimental/libbox/command_runtime.go'],
                          '3041a85bbda753e961b2b9b19ce1881b5afe000e3bcd6352d786679118055dc9')
         self.assertEqual(hot.SOURCE_HASHES['daemon/runtime_config.proto'], hot.PROTO)
@@ -217,6 +217,21 @@ class PureFixtures(unittest.TestCase):
                     patch.object(hot, 'clean'), patch.object(hot, 'slot') as slot, \
                     patch.object(hot, 'FORMAL_HASH',
                         '3740b0fe0739ae8f811b2a2a3665cfb0d0dc0d7882ffaec796956fed7714e5b6'), \
+                    self.assertRaisesRegex(RuntimeError, '^formal pin changed$'):
+                hot.admit()
+            slot.assert_not_called()
+
+    def test_alpha125_formal_hash_cannot_authorize_current_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            event_path = Path(tmp) / 'event.json'
+            event_path.write_text(json.dumps(self.event))
+            env = dict(self.env, GITHUB_EVENT_PATH=str(event_path),
+                       HOT_CONSUMER_INPUTS=json.dumps(self.inputs))
+            with patch.dict(hot.os.environ, env, clear=True), \
+                    patch.object(hot, 'git', return_value=self.sha), \
+                    patch.object(hot, 'clean'), patch.object(hot, 'slot') as slot, \
+                    patch.object(hot, 'FORMAL_HASH',
+                        '2933510a43097440b336a4d146eca790a3d1a744a3f75e8acad8d8c5a386ce5a'), \
                     self.assertRaisesRegex(RuntimeError, '^formal pin changed$'):
                 hot.admit()
             slot.assert_not_called()

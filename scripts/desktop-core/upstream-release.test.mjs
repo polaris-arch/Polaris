@@ -956,8 +956,8 @@ test('alpha.12.4 keeps its complete version in producer and public archive ident
     c => { c.platforms.linux.sourceCommit = 'f'.repeat(40); },
   ]) { const changed = structuredClone(contract); alter(changed); assert.throws(() => validateReleaseContract(changed)); }
 });
-test('alpha.12.5 keeps its complete version in producer and public archive identities', () => {
-  const version = '1.15.0-polaris-alpha.12.5';
+test('alpha.12.6 keeps its complete version in producer and public archive identities', () => {
+  const version = '1.15.0-polaris-alpha.12.6';
   const { contract, index } = brandedFixture(version);
   assert.equal(validateReleaseContract(contract), contract);
   assert.equal(validateUpstreamIndex(index, contract), index);

@@ -148,8 +148,8 @@ def validate_launch(value, recovery=False):
     exact(value['codeHashes'], FILES)
     for h in [value[k] for k in ('appSha256', 'helperSha256', 'coreSha256', 'carrierSha256', 'rpcProbeSha256')] + list(value['codeHashes'].values()):
         require(type(h) is str and re.fullmatch(r'[0-9a-f]{64}', h), 'frozen hash required')
-    require(value['kernelCommit'] == '332935c310e78e15319d434f33a9103329200931' and
-            value['originalAdmission'] == 'verified', 'complete reviewed alpha.12.5 carrier admission required')
+    require(value['kernelCommit'] == 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e' and
+            value['originalAdmission'] == 'verified', 'complete reviewed alpha.12.6 carrier admission required')
     validate_execution(value['execution'])
     require(Path(value['rpcProbePath']).is_absolute(), 'fixed admitted test probe required')
     require(value['authenticationMode'] in ('existing-session', 'pkttyagent-observe', *CREDENTIAL_MODES), 'unknown authentication mode')

@@ -1,6 +1,7 @@
 import { invoke, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { SubscriptionConfig, ImportParseResult } from '../../contracts/types';
+import type { SubscriptionUserAgentInfo } from '../../contracts/subscription-user-agent';
 import type { SubscriptionErrorKind, SubscriptionPreviewResult } from '../../contracts/subscription-preview';
 import type { SubscriptionUpdateProgress } from '../../contracts/subscription-progress';
 import type { BackupCategory } from '../../domain/backup-categories';
@@ -47,6 +48,11 @@ export interface SubscriptionEditResult {
 }
 
 export const subscriptionApi = {
+  /** Actual backend default + draft/global precedence; does not save or fetch. */
+  async userAgentInfo(userAgent: string): Promise<SubscriptionUserAgentInfo> {
+    return invoke(IPC_CHANNELS.SUBSCRIPTION_USER_AGENT_INFO, { userAgent });
+  },
+
   async createStart(
     operationId: string,
     subscription: SubscriptionCreateInput,

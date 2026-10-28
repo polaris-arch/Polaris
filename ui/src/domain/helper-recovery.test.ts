@@ -9,7 +9,7 @@ vi.mock('@/lib/desktop-notify', () => ({ notifyDesktop: vi.fn() }));
 
 beforeEach(() => vi.resetAllMocks());
 
-describe('Helper recovery uses the existing visible settings flow', () => {
+describe('Helper recovery uses the existing cancellable main-window explanation', () => {
   it.each(['HELPER_CORE_MISMATCH', 'HELPER_CORE_ABSENT', 'HELPER_CORE_INVALID'])('routes %s', code => {
     expect(needsHelperRecovery(code)).toBe(true);
   });
@@ -18,7 +18,7 @@ describe('Helper recovery uses the existing visible settings flow', () => {
   });
   it('asks the native window lifecycle to reveal/recreate main and deliver the narrow Helper intent', async () => {
     expect(await revealHelperRecovery()).toBe(true);
-    expect(invoke.mock.calls).toEqual([['tray_show_main', { screen: 'settings-helper' }]]);
+    expect(invoke.mock.calls).toEqual([['tray_show_main', { screen: 'helper-recovery' }]]);
   });
   it('handles a failed window command without retrying or installing', async () => {
     invoke.mockRejectedValue(new Error('window unavailable'));
@@ -31,7 +31,7 @@ describe('Helper recovery uses the existing visible settings flow', () => {
     const refreshProxyStatus = vi.fn(async () => {});
     handleProxyErrorEvent({ errorCode: code, message: 'private diagnostic' }, { t: key => key, refreshProxyStatus });
     expect(refreshProxyStatus).toHaveBeenCalledOnce();
-    expect(invoke.mock.calls).toEqual([['tray_show_main', { screen: 'settings-helper' }]]);
+    expect(invoke.mock.calls).toEqual([['tray_show_main', { screen: 'helper-recovery' }]]);
   });
   it('tray failure path is wired without depending on main renderer availability', () => {
     const source = readFileSync(new URL('../tray/TrayMenu.tsx', import.meta.url), 'utf8');
@@ -46,7 +46,10 @@ describe('Helper recovery uses the existing visible settings flow', () => {
   });
   it('installation failure stays visible and offers logs without rendering raw diagnostics', () => {
     const source = readFileSync(new URL('../components/screens/settings/SettingsHelper.tsx', import.meta.url), 'utf8');
-    expect(source).toContain("setInstallFailure(r.errorCode ?? 'failed')");
+    expect(source).toContain("failure = r.success ? null : r.errorCode ?? 'failed'");
+    expect(source).toContain('completeHelperInstall(request, failure)');
+    expect(source).toContain('subscribeHelperInstall(({ busy: installing, failure }) => {');
+    expect(source).toContain('setInstallFailure(failure)');
     expect(source).toContain('data-testid="helper-install-failure"');
     expect(source).toContain('helperActionErrorText(installFailure, t)');
     expect(source).toContain("navigate('logs')");
@@ -60,6 +63,24 @@ it.each(['en-US', 'zh-CN', 'zh-TW', 'ru', 'fa'])('all installation stages have l
     expect(translations.helper.actionError[code]).toEqual(expect.any(String));
     expect(translations.helper.actionError[code].length).toBeGreaterThan(10);
   }
+  for (const key of ['connectionRecoveryTitle', 'connectionRecoveryMessage', 'connectionRecoverySettings']) {
+    expect(translations.helper[key]).toEqual(expect.any(String));
+    expect(translations.helper[key].length).toBeGreaterThan(key === 'connectionRecoveryMessage' ? 30 : 5);
+  }
   expect(translations.helper.failureNextStep).toBeTruthy();
   expect(translations.helper.viewLogsAction).toBeTruthy();
+});
+
+it('Home, event routing and tray retain their existing claims while sharing the same recovery intent', () => {
+  const home = readFileSync(new URL('../components/screens/home/HomeScreen.tsx', import.meta.url), 'utf8');
+  const routing = readFileSync(new URL('./proxy-error-routing.ts', import.meta.url), 'utf8');
+  const tray = readFileSync(new URL('../tray/TrayMenu.tsx', import.meta.url), 'utf8');
+  for (const source of [home, routing, tray]) {
+    expect(source).toContain('needsHelperRecovery');
+    expect(source).toContain('void revealHelperRecovery()');
+  }
+  expect(home).toContain('withProxyStartClaim');
+  const branch = routing.slice(routing.indexOf("if (data.errorCode === 'CORE_BUNDLE_MISMATCH'"));
+  expect(branch).toContain('if (isProxyStartClaimed()) return');
+  expect(branch.indexOf('if (isProxyStartClaimed()) return')).toBeLessThan(branch.indexOf('void revealHelperRecovery()'));
 });

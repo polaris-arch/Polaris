@@ -1,11 +1,11 @@
 # Formal mobile source and binding input
 
-## Selected alpha.12.5 source input
+## Selected alpha.12.6 source input
 
 The selected Polaris App mobile producer input is
-`332935c310e78e15319d434f33a9103329200931`, tree
-`6a8371b425370326528658e9b0cace926cf76b2d`, annotated tag
-`v1.15.0-polaris-alpha.12.5` / object `76e4f7db6767472952d09e4cf35b2cf90c223fbf`.
+`bfcdf96b244f63e0fe84736ee4a4edd58f6b209e`, tree
+`4c0fdb31d59967f41c808ea6b63f87ca9661c2cf`, annotated tag
+`v1.15.0-polaris-alpha.12.6` / object `8a230c1d34cb4855b261944e2935ce36f9cd14de`.
 The tag object peels directly to this reviewed commit. The complete published
 source tree and its bytes/modes, module files and source-owned libbox declaration
 were checked; a tag alone is not an AAR/XCFramework or App acceptance receipt.
@@ -30,7 +30,7 @@ v2/nine-vendor policies retain their original strict meaning, not an optional
 tenth module. The prior alpha.12.2 c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a
 source and its original receipts remain historical and are not rewritten. The prior
 alpha.12.4 / 0cfa source, component observations and f236 App results also retain
-their original identity; none is a new alpha.12.5 component receipt.
+their original identity; none is a new alpha.12.6 component receipt.
 
 Input declarations never issue artifact acceptance: `artifactPins` and
 `producerReceipt` stay null, and `AppAccepted`, `devicePassed` and
@@ -49,7 +49,7 @@ or a receipt. Old a4d/c002/fe182 sources and diagnostic results are not relabele
 alpha.12.1 source `814da362838e96e54f904836a92c2b0d8c3ae29b`, tree
 `ad574f93026557b49edecb492bd7ecdb851057c1`, and tag object
 `8ecda357ea755a1295336a35ec7eaf1fe2daebc2` retain their original evidence;
-none of those receipts attest the current alpha.12.5 source.
+none of those receipts attest the current alpha.12.6 source.
 
 The formal tools remain Go **1.27.2**, with source minimum Go **1.27.0**, and
 gomobile/gobind **v0.1.13** on both platforms. This remains the original
@@ -84,7 +84,7 @@ Formal binding plans are explicit:
 - Tags are copied from the actual source-owned libbox declaration, including
   gvisor, Naive, Tailscale and Apple-only DHCP/low-memory flags. The Go module
   remains `github.com/sagernet/sing-box`; the pinned source repository is
-  `polaris-arch/sing-box-polaris` at `v1.15.0-polaris-alpha.12.5`. Published core
+  `polaris-arch/sing-box-polaris` at `v1.15.0-polaris-alpha.12.6`. Published core
   assets use `sing-box-polaris-*`; formal mobile output remains Libbox.
 - Version is passed through fixed ldflags. `ReadTag`/`git describe`, an upstream
   cache tag, or a reused CLI BuildID cannot provide formal mobile identity.
@@ -109,7 +109,7 @@ The hosted entry retains source.properties and its pinned observation even if a
 later producer step fails. Rust keeps its separate NDK 27.3.13750724.
 
 The earlier stable-r30 migration was toolchain-only on a4d085/alpha.12; its
-source and receipts remain historical. This alpha.12.5 source migration does not
+source and receipts remain historical. This alpha.12.6 source migration does not
 change that stable profile or claim new-App compatibility, four-ABI production
 results, APK/device acceptance or publication eligibility before actual checks.
 

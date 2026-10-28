@@ -542,6 +542,107 @@ fn resolve_subscription_ua(cfg: &Value, sub: &Value) -> Option<String> {
     pick_ua(sub.get("userAgent")).or_else(|| pick_ua(cfg.get(SUBSCRIPTION_USER_AGENT_KEY)))
 }
 
+/// Read-only display of the same UA identity and precedence used by subscription fetches.
+/// The kernel version is selected bundled build identity, not a live-core probe.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionUserAgentInfo {
+    app_version: String,
+    core_version: String,
+    default_user_agent: String,
+    effective_status: &'static str,
+    fallback_user_agent: Option<String>,
+    effective_user_agent: Option<String>,
+    source: Option<&'static str>,
+}
+
+fn describe_subscription_user_agent(
+    cfg: Option<&Value>,
+    draft: &Value,
+    app_version: &str,
+    core_version: &str,
+    default_user_agent: String,
+) -> Result<SubscriptionUserAgentInfo, &'static str> {
+    // Do not present core_version's compatibility sentinel as a measured version.
+    if [app_version, core_version, default_user_agent.as_str()]
+        .iter()
+        .any(|value| value.trim().is_empty() || *value == "unknown")
+    {
+        return Err("Selected application/kernel User-Agent identity is unavailable");
+    }
+    // A cold/busy saved config must not conceal known build identity, but neither
+    // may its absence promote the app default to an allegedly effective UA.
+    let mut info = SubscriptionUserAgentInfo {
+        app_version: app_version.to_owned(),
+        core_version: core_version.to_owned(),
+        default_user_agent,
+        effective_status: "unavailable",
+        fallback_user_agent: None,
+        effective_user_agent: None,
+        source: None,
+    };
+    if let Some(cfg) = cfg {
+        info.fallback_user_agent = Some(
+            resolve_subscription_ua(cfg, &json!({}))
+                .unwrap_or_else(|| info.default_user_agent.clone()),
+        );
+        info.effective_user_agent = Some(
+            resolve_subscription_ua(cfg, draft).unwrap_or_else(|| info.default_user_agent.clone()),
+        );
+        info.source = Some(if pick_ua(draft.get("userAgent")).is_some() {
+            "subscription"
+        } else if pick_ua(cfg.get(SUBSCRIPTION_USER_AGENT_KEY)).is_some() {
+            "global"
+        } else {
+            "default"
+        });
+        info.effective_status = "ready";
+    }
+    Ok(info)
+}
+
+/// No fetch, persistence, process start or runtime probe; an unsaved UA is only display input.
+#[tauri::command]
+pub async fn subscription_user_agent_info(
+    state: State<'_, AppRuntime>,
+    user_agent: Option<String>,
+) -> Result<ApiResponse<SubscriptionUserAgentInfo>, ()> {
+    // Resolve build identity outside the saved-state fence; its projection is memory-only.
+    let app_version = env!("CARGO_PKG_VERSION");
+    let core_version = crate::runtime::core_version::selected_bundled_version();
+    let default_user_agent = crate::runtime::http::app_user_agent();
+    let draft = json!({ "userAgent": user_agent });
+    let build_info = match describe_subscription_user_agent(
+        None,
+        &draft,
+        app_version,
+        core_version,
+        default_user_agent.clone(),
+    ) {
+        Ok(info) => info,
+        Err(error) => {
+            return Ok(ApiResponse::err_with_code(
+                error,
+                "subscriptionUserAgentUnavailable",
+            ));
+        }
+    };
+    let result = state.config().try_with_saved_commit(|cfg| {
+        describe_subscription_user_agent(
+            Some(cfg),
+            &draft,
+            app_version,
+            core_version,
+            default_user_agent,
+        )
+    });
+    Ok(match result {
+        Ok(Ok(info)) => ApiResponse::ok(info),
+        Ok(Err(error)) => ApiResponse::err_with_code(error, "subscriptionUserAgentUnavailable"),
+        Err(_) => ApiResponse::ok(build_info),
+    })
+}
+
 /// 上游 `SUBSCRIPTION_UPDATE_SERVERS`：拉取订阅 + 对账节点集（net-stack）+ 持久化。
 ///
 /// **已接线**（此前为「HTTP 栈依赖未拍板」占位；该结论已过时——`runtime/http.rs` 的 `HttpRuntime`

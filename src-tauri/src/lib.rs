@@ -1204,6 +1204,7 @@ pub fn run() {
             subscription_delete,
             subscription_update_servers,
             subscription_preview,
+            subscription_user_agent_info,
             subscription_create_start,
             subscription_create_status,
             subscription_create_list,

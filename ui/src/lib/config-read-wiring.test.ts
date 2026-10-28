@@ -211,6 +211,12 @@ interface Site {
 
 const SITES: readonly Site[] = [
   {
+    file: 'hooks/use-subscription-user-agent.ts',
+    shape: 'useAppStore(state=>state.config?.subscriptionUserAgent)',
+    route: 'disk',
+    why: '后端对账：已保存全局 UA 变更仅撤回旧读回并重新查询；实际版本/有效 UA 全由后端 resolve_subscription_ua 返回，不将未落盘暂存冒成实际请求身份。',
+  },
+  {
     file: 'components/screens/home/TsExitWarning.tsx',
     shape: 'useAppStore((s)=>configuredExitId(s.proxyStatus,s.config))',
     route: 'disk',

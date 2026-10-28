@@ -145,44 +145,49 @@ function code(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/.*$/gm, '$1');
 }
 
-/** 同文件里 `const NAME = '值'` 的解析（key 常量与前缀常量都走这条）。 */
-function constValue(src: string, name: string): string | null {
-  const re = new RegExp(`const\\s+${name}\\s*=\\s*'([^']*)'`);
-  return re.exec(src)?.[1] ?? null;
+/** Unique same-file const initializer, never let/var, a guessed prefix, or first-match ambiguity. */
+function constExpression(src: string, name: string): string | null {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`\\bconst\\s+${escaped}\\s*=\\s*([^;\\n]+)(?:;|$)`, 'gm');
+  const matches = [...src.matchAll(re)];
+  return matches.length === 1 ? matches[0]![1]!.trim() : null;
 }
 
 /**
- * 解析 `confirmTwice(<arg1>, …)` 的静态 key。三种写法：
- *  1. 裸串 `'geo-reset'`；
- *  2. 常量 `GEO_RESET_KEY` → 同文件 const 值；
- *  3. 模板串 `` `node-del:${id}` `` / `` `${RES_DEL_PREFIX}${id}` `` → 取 `${}` 之前的静态前缀
- *     （前缀为空则取首个 `${IDENT}` 的常量值）。
- * 末尾 `:` 剥掉 —— 那是「一站点多实例」的实例分隔符，不是站点名的一部分。
+ * Resolve the static site prefix, including a named const template such as
+ * deleteIntentKey = `${RULE_DEL_KEY}:${plane}:${identity}`. Instance suffixes do
+ * not define a new site. Unknown/dynamic prefixes, duplicate bindings and cycles
+ * remain errors; this only inventories a site, not its runtime intent binding.
  */
+function staticConfirmKey(src: string, raw: string, seen = new Set<string>()): string | null {
+  if (/^'[^'\\]*'$/.test(raw)) return raw.slice(1, -1) || null;
+  if (/^[A-Za-z_$][\w$]*$/.test(raw)) {
+    if (seen.has(raw)) return null;
+    const expression = constExpression(src, raw);
+    if (expression === null) return null;
+    return staticConfirmKey(src, expression, new Set([...seen, raw]));
+  }
+  if (!/^`[^`]*`$/.test(raw)) return null;
+  const literal = /^`([^`$\\]*)\$\{/.exec(raw)?.[1];
+  if (literal) return literal;
+  const ident = /^`\$\{([A-Za-z_$][\w$]*)\}/.exec(raw)?.[1];
+  return ident ? staticConfirmKey(src, ident, seen) : null;
+}
+
 function implConfirmKeys(rel: string, src: string): { key: string; file: string }[] {
   const out: { key: string; file: string }[] = [];
   const re = /(^|[^A-Za-z0-9_$.])confirmTwice\(\s*([^,]+),/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(src))) {
     const raw = m[2].trim();
-    let key: string | null = null;
-    if (/^'[^']*'$/.test(raw)) key = raw.slice(1, -1);
-    else if (/^[A-Za-z_$][\w$]*$/.test(raw)) key = constValue(src, raw);
-    else if (raw.startsWith('`')) {
-      const lit = /^`([^`$]*)\$\{/.exec(raw)?.[1];
-      if (lit) key = lit;
-      else {
-        const ident = /^`\$\{([A-Za-z_$][\w$]*)\}/.exec(raw)?.[1];
-        if (ident) key = constValue(src, ident);
-      }
-    }
-    if (key === null) {
+    const key = staticConfirmKey(src, raw)?.replace(/:$/, '');
+    if (!key) {
       throw new Error(
         `[prototype-confirm-parity] ${rel} 里的 confirmTwice(${raw}, …) 解析不出静态 key —— ` +
           '新写法必须让本守卫看得懂，否则这个确认站点就从对账里消失了',
       );
     }
-    out.push({ key: key.replace(/:$/, ''), file: rel });
+    out.push({ key, file: rel });
   }
   return out;
 }
@@ -519,6 +524,33 @@ describe('守卫自检：两侧判据面都真的存在（防空转恒绿）', (
       'delta',
       'beta',
     ]);
+  });
+
+  it('named const templates preserve the real desktop/mobile rule-delete site prefixes', () => {
+    const source = [
+      "const RULE_DEL_KEY = 'rule-del-dlg';",
+      'const deleteIntentKey = `${RULE_DEL_KEY}:${initialPlane}:${configCanonicalText(base ?? null)}`;',
+      'confirmTwice(deleteIntentKey, () => {});',
+      "const RULE_DEL_PREFIX = 'mobile-rule-del:';",
+      'const confirmationKey = `${RULE_DEL_PREFIX}${plane}:${rule.id}`;',
+      'confirmTwice(confirmationKey, () => {});',
+    ].join('\n');
+    expect(implConfirmKeys('sample.ts', source).map(s => s.key)).toEqual(['rule-del-dlg', 'mobile-rule-del']);
+  });
+
+  it.each([
+    "confirmTwice(UNKNOWN, () => {});",
+    "let key = 'unsafe'; confirmTwice(key, () => {});",
+    "const key = getKey(); confirmTwice(key, () => {});",
+    "const key = 'safe' + dynamic; confirmTwice(key, () => {});",
+    'const key = `${dynamic}:${id}`; confirmTwice(key, () => {});',
+    'const key = `${getKey()}:${id}`; confirmTwice(key, () => {});',
+    "const key = 'first'; const key = 'second'; confirmTwice(key, () => {});",
+    'const a = b; const b = a; confirmTwice(a, () => {});',
+    'const key = `${key}:${id}`; confirmTwice(key, () => {});',
+    "const key = ''; confirmTwice(key, () => {});",
+  ])('unresolved or ambiguous confirmation key still fails closed: %s', source => {
+    expect(() => implConfirmKeys('negative.ts', source)).toThrow('解析不出静态 key');
   });
 
   it('`useConfirmTwice()` 不会被误当成调用点（大小写敏感的负向对照）', () => {

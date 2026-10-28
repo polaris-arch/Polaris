@@ -89,6 +89,7 @@ fn protected_images_are_sealed_and_profile_specific() {
         LinuxInputProfile::C6C0D8,
         LinuxInputProfile::E0CFA24,
         LinuxInputProfile::E332935,
+        LinuxInputProfile::BFCDF96,
     ] {
         assert_eq!(
             inputs.validate_protection(profile),
@@ -153,6 +154,7 @@ fn reject_scripts_rules_empty_and_oversized_inputs() {
         LinuxInputProfile::C6C0D8,
         LinuxInputProfile::E0CFA24,
         LinuxInputProfile::E332935,
+        LinuxInputProfile::BFCDF96,
     ] {
         assert!(matches!(
             prepare_linux_protected_inputs(binary.clone(), b"{}".to_vec(), &[], profile, vec![]),
@@ -285,7 +287,7 @@ fn alpha124_keeps_one_check_semantics_and_distinct_actual_bytes() {
 
 #[test]
 fn alpha125_keeps_one_check_semantics_and_distinct_actual_bytes() {
-    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 8);
+    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 9);
     let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::E332935 else {
         panic!("332935 must use the fixed PlainTcpCheckV1 semantics");
     };
@@ -303,6 +305,30 @@ fn alpha125_keeps_one_check_semantics_and_distinct_actual_bytes() {
         LinuxInputProfile::E0CFA24,
     ] {
         assert_ne!(LinuxInputProfile::E332935, historical);
+    }
+}
+
+#[test]
+fn alpha126_keeps_one_check_semantics_and_distinct_actual_bytes() {
+    assert_eq!(REVIEWED_PLAIN_TCP_CHECK_IDENTITIES.len(), 9);
+    let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::BFCDF96 else {
+        panic!("bfcdf96 must use the fixed PlainTcpCheckV1 semantics");
+    };
+    assert_eq!(
+        identity.binary_sha256,
+        "9089e0a78616d714eeb63d052dff8505a8b21ed9ba24285ed7444067cde69988"
+    );
+    for historical in [
+        LinuxInputProfile::B609,
+        LinuxInputProfile::FE182,
+        LinuxInputProfile::C002,
+        LinuxInputProfile::A4D085,
+        LinuxInputProfile::E814DA,
+        LinuxInputProfile::C6C0D8,
+        LinuxInputProfile::E0CFA24,
+        LinuxInputProfile::E332935,
+    ] {
+        assert_ne!(LinuxInputProfile::BFCDF96, historical);
     }
 }
 

@@ -166,12 +166,13 @@ pub const ROUTING_MODES: [&str; 3] = ["smart", "global", "direct"];
 /// 托盘可导航的目标屏**白名单**（纯函数，可单测）。
 ///
 /// 返回 `'static` 串而非透传入参：发出去的值域被本函数钉死 ⇒ 前端传任意字符串也只能命中登记项，
-/// 通道不会退化成通用路由。`settings` 打开通用设置，`settings-helper` 复用助手修复页。
+/// 通道不会退化成通用路由。`settings` 打开通用设置，`settings-helper` 复用助手修复页，`helper-recovery` 仅显示可取消的说明。
 #[must_use]
 pub fn normalize_tray_screen(screen: &str) -> Option<&'static str> {
     match screen.trim() {
         "settings" => Some("settings"),
         "settings-helper" => Some("settings-helper"),
+        "helper-recovery" => Some("helper-recovery"),
         _ => None,
     }
 }

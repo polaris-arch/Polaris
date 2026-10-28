@@ -57,6 +57,14 @@ body {
   box-shadow: none;
 }
 
+/* 自然内容独立于外卡片的 100vh 高度；flow-root 收住首尾子项 margin，保证量到完整内容。
+ * 外层仍铺满并滚动，不能把这个内层设成 100% / flex-grow / viewport 高。 */
+.tray-menu-content {
+  display: flow-root;
+  height: auto;
+  min-height: 0;
+}
+
 /* `data-tray-edge` 由 Rust 按托盘锚点所在 monitor/work area 播种并在热开时同步。卡片靠系统栏的一侧
  * 不再留透明 margin（窗口本身已经由工作区边界留出 DWM 安全像素），全部安全边移到远侧；每个方向的
  * 横/纵 margin 总量保持 22px / 12px 不变，因此固定

@@ -56,6 +56,7 @@ export interface ConfirmPayload {
 export type DialogDesc =
   | { kind: 'res-url' }
   | { kind: 'identity-repair' }
+  | { kind: 'helper-recovery' }
   | { kind: 'confirm'; payload: ConfirmPayload }
   // D2：节点表单 + 手动导入
   | { kind: 'node'; serverId?: string; initialProto?: 'openconnect' | 'openvpn-client' | 'masque-client' } // initialProto 仅用于组网隧道入口预选

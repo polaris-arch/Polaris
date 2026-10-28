@@ -1,3 +1,5 @@
+import { useSubscriptionUserAgent } from '@/hooks/use-subscription-user-agent';
+import { SubscriptionUserAgentHint } from '@/components/dialogs/SubscriptionUserAgentHint';
 import { FeedbackNotice } from '@/components/screens/settings/Primitives';
 import { isSavedEditProgress, presentSubscriptionRefreshResult, subscriptionEditProgressText } from '@/domain/subscription-refresh';
 import { useSubscriptionProgress } from '@/store/use-subscription-progress-store';
@@ -89,6 +91,7 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
   const [name, setName] = useState(base?.name ?? '');
   const [url, setUrl] = useState(base?.url ?? '');
   const [ua, setUa] = useState(base?.userAgent ?? '');
+  const uaInfo = useSubscriptionUserAgent(ua);
   const [autoUpdate, setAutoUpdate] = useState(base?.autoUpdate ?? false);
   // per-sub「经代理更新」覆盖（默认关）：写回 SubscriptionConfig.updateViaProxy。
   const [viaProxy, setViaProxy] = useState(base?.updateViaProxy ?? false);
@@ -377,8 +380,10 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
             setUa(e.target.value);
             touch();
           }}
-          placeholder={t('sub.uaPh')}
+          placeholder={uaInfo.status === 'ready' && uaInfo.info.effectiveStatus === 'ready' ? uaInfo.info.fallbackUserAgent : t('sub.uaPh')}
+          aria-describedby="sub-ua-info"
         />
+        <SubscriptionUserAgentHint id="sub-ua-info" model={uaInfo} />
       </div>
 
       <Fold title={t('common.advanced')}>

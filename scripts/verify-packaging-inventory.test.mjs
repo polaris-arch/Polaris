@@ -261,7 +261,7 @@ test('temporary default keeps exact original legal member paths without formal-r
 
 test('formal inventory requires exact archived legal paths and rejects temporary carrier relabels', t => {
   const manifest = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json')));
-  assert.equal(loadReleaseContract(repo, manifest).sourceCommit, '332935c310e78e15319d434f33a9103329200931');
+  assert.equal(loadReleaseContract(repo, manifest).sourceCommit, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e');
   const missing = fixture(t, 'windows', [cleaner], root =>
     rmSync(join(root, '_up_/resources/win/core-release/TLS-DEPENDENCY-NOTICES.txt')));
   assert.equal(missing.code, 1, missing.output);

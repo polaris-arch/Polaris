@@ -373,8 +373,21 @@ fn tray_screen_whitelist_only_admits_registered_targets() {
         Some("settings"),
         "容忍空白"
     );
+    assert_eq!(
+        normalize_tray_screen("helper-recovery"),
+        Some("helper-recovery")
+    );
     // 通道**不是**通用路由：未登记值一律拒绝（拒绝 = 只显示主窗、不导航，而不是把串透传出去）。
-    for evil in ["", "home", "/settings", "Settings", "nodes", "../settings"] {
+    for evil in [
+        "",
+        "home",
+        "/settings",
+        "Settings",
+        "nodes",
+        "../settings",
+        "helper-recovery/install",
+        "Helper-Recovery",
+    ] {
         assert_eq!(normalize_tray_screen(evil), None, "{evil} 不该被放行");
     }
 }
@@ -387,6 +400,11 @@ fn tray_screen_boot_script_only_ever_carries_whitelisted_values() {
     assert_eq!(
         tray_screen_boot_script(s),
         "window.__POLARIS_TRAY_SCREEN__ = 'settings';\n"
+    );
+    let recovery = normalize_tray_screen("helper-recovery").expect("registered explanation");
+    assert_eq!(
+        tray_screen_boot_script(recovery),
+        "window.__POLARIS_TRAY_SCREEN__ = 'helper-recovery';\n"
     );
 }
 

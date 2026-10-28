@@ -21,7 +21,7 @@ import subprocess
 import time
 
 SCHEMA = 'polaris-linux-tun-support-v1'
-KERNEL_COMMIT = '332935c310e78e15319d434f33a9103329200931'
+KERNEL_COMMIT = 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e'
 BASE = Path('/run/polaris-tun-acceptance')
 FIXTURE_BASE = Path('/run/polaris-tun-fixtures')
 SERVICE = 'polaris-helper.service'

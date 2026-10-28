@@ -476,10 +476,10 @@ mod linux_tests {
     }
 
     #[test]
-    fn alpha125_requires_its_exact_source_contract_and_actual_elf() {
+    fn historical_alpha125_retains_its_exact_source_contract_and_actual_elf() {
         use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
         use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
-        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 8);
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 9);
         let replacement = &REVIEWED_CHECK_IDENTITIES[7];
         assert_eq!(
             replacement.source_commit,
@@ -493,17 +493,6 @@ mod linux_tests {
         assert_eq!(
             reviewed_compiled_profile(replacement.source_commit, contract),
             Ok(LinuxCheckProfile::E332935)
-        );
-        let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
-        assert_eq!(
-            polaris_updater::verify::sha256_hex(binding.as_bytes()),
-            contract
-        );
-        let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
-        assert_eq!(binding["sourceCommit"], replacement.source_commit);
-        assert_eq!(
-            binding["platforms"]["linux"]["core"]["sha256"],
-            replacement.binary_sha256
         );
         assert_eq!(
             LinuxCheckProfile::E332935.binary_sha256(),
@@ -530,6 +519,7 @@ mod linux_tests {
             REVIEWED_CHECK_IDENTITIES[4].contract_sha256.unwrap(),
             REVIEWED_CHECK_IDENTITIES[5].contract_sha256.unwrap(),
             REVIEWED_CHECK_IDENTITIES[6].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[8].contract_sha256.unwrap(),
         ] {
             assert_eq!(
                 reviewed_compiled_profile(replacement.source_commit, digest),
@@ -546,6 +536,96 @@ mod linux_tests {
             REVIEWED_CHECK_IDENTITIES[4].source_commit,
             REVIEWED_CHECK_IDENTITIES[5].source_commit,
             REVIEWED_CHECK_IDENTITIES[6].source_commit,
+            REVIEWED_CHECK_IDENTITIES[8].source_commit,
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(source, contract),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        assert_eq!(
+            reviewed_compiled_profile(&replacement.source_commit.to_ascii_uppercase(), contract),
+            Err(CandidateCheckError::Unsupported)
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, &contract.to_ascii_uppercase()),
+            Err(CandidateCheckError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn alpha126_requires_its_exact_source_contract_and_actual_elf() {
+        use super::super::{reviewed_compiled_profile, REVIEWED_CHECK_IDENTITIES};
+        use polaris_core_supervisor::exact_spawn::LinuxInputProfile;
+        assert_eq!(REVIEWED_CHECK_IDENTITIES.len(), 9);
+        let replacement = &REVIEWED_CHECK_IDENTITIES[8];
+        assert_eq!(
+            replacement.source_commit,
+            "bfcdf96b244f63e0fe84736ee4a4edd58f6b209e"
+        );
+        let contract = replacement.contract_sha256.unwrap();
+        assert_eq!(
+            contract,
+            "66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f"
+        );
+        assert_eq!(
+            reviewed_compiled_profile(replacement.source_commit, contract),
+            Ok(LinuxCheckProfile::BFCDF96)
+        );
+        let binding = crate::test_support::repo_file("scripts/desktop-core/release-contract.json");
+        assert_eq!(
+            polaris_updater::verify::sha256_hex(binding.as_bytes()),
+            contract
+        );
+        let binding: serde_json::Value = serde_json::from_str(&binding).unwrap();
+        assert_eq!(binding["sourceCommit"], replacement.source_commit);
+        assert_eq!(
+            binding["platforms"]["linux"]["core"]["sha256"],
+            replacement.binary_sha256
+        );
+        assert_eq!(
+            LinuxCheckProfile::BFCDF96.binary_sha256(),
+            "9089e0a78616d714eeb63d052dff8505a8b21ed9ba24285ed7444067cde69988"
+        );
+        assert_eq!(
+            LinuxCheckProfile::BFCDF96.input_profile(),
+            LinuxInputProfile::BFCDF96
+        );
+        assert!(matches!(
+            LinuxCheckProfile::BFCDF96.input_profile(),
+            LinuxInputProfile::PlainTcpCheckV1(_)
+        ));
+        assert!(LinuxCheckProfile::BFCDF96
+            .execution_profile()
+            .contains("bfcdf96:runtime-evidence-pending"));
+        for digest in [
+            "",
+            "unknown",
+            replacement.binary_sha256,
+            REVIEWED_CHECK_IDENTITIES[1].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[2].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[3].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[4].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[5].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[6].contract_sha256.unwrap(),
+            REVIEWED_CHECK_IDENTITIES[7].contract_sha256.unwrap(),
+        ] {
+            assert_eq!(
+                reviewed_compiled_profile(replacement.source_commit, digest),
+                Err(CandidateCheckError::Unsupported)
+            );
+        }
+        for source in [
+            "",
+            "unknown",
+            REVIEWED_CHECK_IDENTITIES[0].source_commit,
+            REVIEWED_CHECK_IDENTITIES[1].source_commit,
+            REVIEWED_CHECK_IDENTITIES[2].source_commit,
+            REVIEWED_CHECK_IDENTITIES[3].source_commit,
+            REVIEWED_CHECK_IDENTITIES[4].source_commit,
+            REVIEWED_CHECK_IDENTITIES[5].source_commit,
+            REVIEWED_CHECK_IDENTITIES[6].source_commit,
+            REVIEWED_CHECK_IDENTITIES[7].source_commit,
         ] {
             assert_eq!(
                 reviewed_compiled_profile(source, contract),
@@ -581,6 +661,7 @@ mod linux_tests {
             LinuxCheckProfile::C6C0D8,
             LinuxCheckProfile::E0CFA24,
             LinuxCheckProfile::E332935,
+            LinuxCheckProfile::BFCDF96,
         ] {
             for required in [false, true] {
                 assert_eq!(
@@ -603,6 +684,10 @@ mod linux_tests {
                 "c002",
                 "a4d085",
                 "0cfa24",
+                "bfcdf96",
+                "bfcdf96b244f63e0fe84736ee4a4edd58f6b209e",
+                "66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f",
+                "9089e0a78616d714eeb63d052dff8505a8b21ed9ba24285ed7444067cde69988",
                 "332935",
                 "332935c310e78e15319d434f33a9103329200931",
                 "98b85fea9aeb8e09f883fa092eda56aca40cc2e20b234d2ab486881d6931ee6a",
@@ -676,6 +761,7 @@ mod linux_tests {
             LinuxCheckProfile::C6C0D8,
             LinuxCheckProfile::E0CFA24,
             LinuxCheckProfile::E332935,
+            LinuxCheckProfile::BFCDF96,
         ] {
             for path in [dir.join("missing"), wrong.clone(), link.clone()] {
                 assert!(matches!(
@@ -707,6 +793,10 @@ mod linux_tests {
             (LinuxCheckProfile::C002, LinuxCheckProfile::A4D085),
             (LinuxCheckProfile::E0CFA24, LinuxCheckProfile::C6C0D8),
             (LinuxCheckProfile::C6C0D8, LinuxCheckProfile::E0CFA24),
+            (LinuxCheckProfile::BFCDF96, LinuxCheckProfile::E332935),
+            (LinuxCheckProfile::E332935, LinuxCheckProfile::BFCDF96),
+            (LinuxCheckProfile::BFCDF96, LinuxCheckProfile::E0CFA24),
+            (LinuxCheckProfile::E0CFA24, LinuxCheckProfile::BFCDF96),
             (LinuxCheckProfile::E332935, LinuxCheckProfile::E0CFA24),
             (LinuxCheckProfile::E0CFA24, LinuxCheckProfile::E332935),
             (LinuxCheckProfile::E332935, LinuxCheckProfile::C6C0D8),
@@ -1015,6 +1105,7 @@ mod linux_tests {
             LinuxCheckProfile::C6C0D8,
             LinuxCheckProfile::E0CFA24,
             LinuxCheckProfile::E332935,
+            LinuxCheckProfile::BFCDF96,
         ] {
             if substituted != profile {
                 assert!(matches!(
