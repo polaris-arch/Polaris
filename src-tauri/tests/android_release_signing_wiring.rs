@@ -1089,7 +1089,7 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
         }
     }
 
-    // ── ⑥d 登记表里那几条是「唯一观测面」，它们的步骤连 `if:` 都不许有 ──
+    // ── ⑥d 唯一观测面只允许精确的候选隔离条件；默认 release 仍无条件执行 ──
     //
     // 派生面上的 `if:` 有正当用法（`if: steps.libbox.outputs.cache-hit != 'true'`），
     // 故上面那个循环不禁它。但登记表这几条是各自那件事**唯一**会说话的地方：
@@ -1102,12 +1102,18 @@ fn the_ci_legs_that_can_only_speak_through_artifacts_are_still_wired() {
     //    —— 行为裁判、wry 对拍、开箱验 —— 一次都不跑。这一形今天没有门。
     //    （⑥e 那条 `continue-on-error` 是全份文件计数，job 级的能抓住；`if:` 没有对应的一条，
     //    因为 workflow 里本来就有正当的 job 级 `if:`，全份禁掉会把判据改成噪声。）
+    // Empty/absent selector is the complete historical release path. A nonempty selector
+    // must first pass the exact direct-dispatch admission gate and runs only the isolated
+    // arm64 diagnostic consumer; it cannot claim R8/S5/release acceptance. The focused
+    // Python routing contract checks all reachable steps and baseline default snapshots.
+    // No outcome/mode output or arbitrary condition may silence these release gates.
     for (line, _, _) in CI_EXIT_CODE_BEARING_LINES {
         for (index, text) in derived.iter().filter(|(_, text)| text == line) {
             let (start, end) = step_block(&workflow_lines, *index, ANDROID_WORKFLOW);
             for candidate in &workflow_lines[start..end] {
                 assert!(
-                    !candidate.trim().starts_with("if:"),
+                    !candidate.trim().starts_with("if:")
+                        || candidate.trim() == "if: (inputs.hot_consumer_candidate || '') == ''",
                     "{ANDROID_WORKFLOW}:{}：唯一观测面那几步里出现了 `if:`：\n  承重行：{text}\n  \
                      条件行：{}\n\
                      求值为假时整步静默跳过，而「跳过」与「跑过且通过」在腿的结论上不可分辨。\

@@ -1501,61 +1501,6 @@ impl ProxyRuntime {
         }
     }
 
-    /// **显式路径的裁决**：用户点某订阅的「自动选择」时的首次落点、「立即切换」。目标由与后台
-    /// 择优同一个 [`auto_select::decide`] 给出，差别只在 [`Facts::explicit`]：不受冷却与后台的
-    /// 几道闸门约束，候选也不要求能零重启切过去（显式路径允许整核重启）。
-    ///
-    /// `config` 由调用方给（配置写事务里的那一份）；核不在运行时账本里没有当前结果，裁决为不评估。
-    pub(crate) fn auto_select_explicit(
-        &self,
-        config: &Value,
-        subscription: &str,
-    ) -> SelectDecision {
-        self.auto_select_explicit_from(config, subscription, &SelectReadings::live())
-    }
-
-    pub(super) fn auto_select_explicit_from(
-        &self,
-        config: &Value,
-        subscription: &str,
-        readings: &SelectReadings<'_>,
-    ) -> SelectDecision {
-        let core_running = self.core_running();
-        let generation = self.core_generation();
-        let auto = AutoView::of(
-            config,
-            subscription,
-            core_running.then_some(generation),
-            self.network_epoch(),
-            self.helper.platform(),
-            self.measurement_core_sha256(),
-        );
-        let selected = selected_of(config);
-        let read = auto.read(&auto.members, readings);
-        let intent = Intent::Auto {
-            subscription_id: subscription.to_string(),
-        };
-        let mut facts = self.auto_select_facts(
-            &intent,
-            &auto,
-            selected.as_deref(),
-            &read,
-            readings,
-            generation,
-            core_running,
-            true,
-            None,
-        );
-        let candidates: Vec<Candidate> = read
-            .selectable
-            .iter()
-            .filter(|candidate| Some(candidate.node_id.as_str()) != selected.as_deref())
-            .cloned()
-            .collect();
-        facts.candidates = &candidates;
-        auto_select::decide(&facts, &mut self.auto_select_slot().memory)
-    }
-
     /// 订阅刷新删掉当前出口时的改选：在意图指向的订阅里，优先未屏蔽的最低延迟可选点
     /// （仍存在且未改动的才有当前结果）。仅无可选未屏蔽成员时救援屏蔽成员；不经择优的迟滞。
     pub(crate) fn auto_select_fallback(&self, config: &Value) -> Option<Candidate> {
@@ -1729,19 +1674,9 @@ impl ProxyRuntime {
     }
 
     /// 自动选择在这里不可用的原因（总开关关着、本平台未开放）；可用时为 `None`。
+    #[cfg(test)]
     pub(crate) fn auto_select_closed(&self) -> Option<auto_select::Gate> {
         auto_select::closed(Switches::PRODUCTION, self.helper.platform())
-    }
-
-    /// 自动意图刚被写入：清掉上一个意图留下的评估，记下写入时刻，唤醒心跳任务立即评估一次。
-    pub(crate) fn auto_select_armed(&self) {
-        {
-            let mut slot = self.auto_select_slot();
-            slot.leave();
-            slot.intent_set_mono = Some(monotonic_now_ms());
-        }
-        self.auto_select_wake.notify_one();
-        self.auto_select_announce();
     }
 
     /// 意图回到手动（用户点了节点，或意图指向的订阅被删）。
@@ -1778,11 +1713,6 @@ impl ProxyRuntime {
             slot.record_switch(record, now);
         }
         self.auto_select_announce();
-    }
-
-    /// 选择状态（状态命令与状态事件共用）。读时投影：评估任务不在运行时也答得出来。
-    pub(crate) fn auto_select_status(&self) -> auto_select::Status {
-        self.auto_select_status_from(&SelectReadings::live())
     }
 
     pub(super) fn auto_select_status_from(

@@ -48,6 +48,7 @@ type ConnectionScript = Vec<Result<ConnectionEvents, Status>>;
 #[derive(Default)]
 struct MockState {
     clash_mode: Arc<std::sync::Mutex<String>>,
+    url_test_calls: Arc<std::sync::Mutex<Vec<String>>>,
     select_calls: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     close_calls: Arc<std::sync::Mutex<Vec<String>>>,
     close_all_count: Arc<AtomicU64>,
@@ -533,6 +534,20 @@ impl StartedService for MockService {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn url_test(
+        &self,
+        req: Request<daemon::UrlTestRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        check_auth(&req, &self.secret)?;
+        self.state
+            .url_test_calls
+            .lock()
+            .unwrap()
+            .push(req.into_inner().outbound_tag);
+        // Acceptance does not manufacture a SubscribeGroups measurement.
+        Ok(Response::new(Empty {}))
     }
 
     async fn select_outbound(
@@ -1939,4 +1954,30 @@ async fn status_reset_marks_first_frame_of_each_transport_subscription() {
             .unwrap();
         assert_eq!(reset, expected_reset);
     }
+}
+
+#[tokio::test]
+async fn url_test_preserves_tag_auth_and_acceptance_only_contract() {
+    let (addr, state, _h) = spawn_server(SECRET, 0).await;
+    let endpoint = Endpoint::new("127.0.0.1", addr.port());
+    let client = SingBoxApiClient::connect(endpoint, SECRET).await.unwrap();
+    client.url_test("🇯🇵-selector").await.unwrap();
+    assert_eq!(
+        *state.url_test_calls.lock().unwrap(),
+        vec!["🇯🇵-selector".to_string()]
+    );
+    assert!(
+        state.groups.lock().unwrap().is_empty(),
+        "acceptance must not fabricate measurements"
+    );
+    let unauthenticated = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", addr.port()), "")
+        .await
+        .unwrap();
+    match unauthenticated.url_test("unauthorized").await.unwrap_err() {
+        polaris_singbox_grpc::ClientError::Status(status) => {
+            assert_eq!(status.code(), tonic::Code::Unauthenticated)
+        }
+        other => panic!("expected authentication failure, got {other:?}"),
+    }
+    assert_eq!(state.url_test_calls.lock().unwrap().len(), 1);
 }

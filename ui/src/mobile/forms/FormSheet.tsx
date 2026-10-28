@@ -45,7 +45,7 @@ export interface FormSheetProps {
   readonly submitDisabled?: boolean;
   readonly submitDanger?: boolean;
   /** 表单级错误/提示，落在脚上方（不是 toast：一屏表单里「哪一格错了」要留在原地）。 */
-  readonly notice?: { readonly tone: 'ok' | 'info' | 'err'; readonly text: string };
+  readonly notice?: { readonly tone: 'ok' | 'info' | 'err'; readonly title?: string; readonly text: string };
   readonly children: ReactNode;
 }
 
@@ -79,7 +79,10 @@ export function FormSheet(props: FormSheetProps): ReactElement {
           className="m-form-head" titleClassName="m-form-title" closeClassName="m-form-x" />
         <div className="m-form-body">{props.children}</div>
         {props.notice !== undefined && (
-          <p className={`m-form-notice ${props.notice.tone}`} role="status">
+          props.notice.title ? <section className={`m-form-notice m-form-notice-detailed ${props.notice.tone}`} role="status" aria-label={props.notice.title} tabIndex={0}>
+            <strong>{props.notice.title}</strong>
+            {props.notice.text !== props.notice.title && <p>{props.notice.text}</p>}
+          </section> : <p className={`m-form-notice ${props.notice.tone}`} role="status">
             {props.notice.text}
           </p>
         )}

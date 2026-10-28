@@ -59,7 +59,6 @@ pub mod update_install;
 pub mod update_popup;
 pub mod updater;
 pub mod vpn_status;
-pub mod win_console;
 #[cfg(windows)]
 pub(crate) mod windows_network_change;
 #[cfg(windows)]

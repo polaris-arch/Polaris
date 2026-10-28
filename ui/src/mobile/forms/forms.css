@@ -164,6 +164,12 @@
   cursor: pointer;
 }
 
+/* Footer actions retain the form contract's 48px hit target even when the
+   mobile redesign paints other compact controls using its separate 44px token. */
+.m-form-foot .m-form-btn {
+  min-height: var(--tap-min);
+}
+
 /* Only footer action rows divide available width; body actions keep their content height. */
 .m-form-body > .m-form-btn {
   flex: 0 0 auto;
@@ -724,3 +730,9 @@
 
 
 :root[data-mobile-os='ios'] .m-form-layer { left: 0; right: 0; width: 100%; padding-left: 0; padding-right: 0; justify-content: flex-end; }
+
+/* Only detailed notices opt into a bounded scroll area; legacy one-line notices stay unchanged. */
+.m-form-notice-detailed{ min-height:0; max-height:30vh;  overflow-y:auto; overflow-wrap:anywhere; flex:0 1 auto; }
+.m-form-notice-detailed strong{ display:block; font-size:0.875rem; line-height:1.4; }
+.m-form-notice-detailed p{ margin:var(--sp-1) 0 0; color:hsl(var(--fg)); line-height:1.5; }
+.m-form-notice-detailed:focus-visible{ outline:2px solid hsl(var(--ring)); outline-offset:-2px; }

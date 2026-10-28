@@ -353,3 +353,81 @@ async fn live_route_planner_returns_a_real_interface() {
         eprintln!("live route planner retained native auto_detect_interface");
     }
 }
+
+// This guard uses Platform::current; unsupported mobile platforms deliberately
+// have no inferred route candidates, so exercise substantive roots on desktops.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn runtime_reuse_allows_same_host_credentials_without_mutating_accepted_facts() {
+    let old = UserConfig {
+        proxy_mode_type: ProxyModeType::Tun,
+        selected_server_id: Some("node-a".into()),
+        servers: vec![server("node-a", "1.1.1.1")],
+        ..Default::default()
+    };
+    let plan = RuntimeBindingPlan {
+        covered_roots: BTreeSet::from(["node-a".to_string()]),
+        bindings: BTreeMap::from([("node-a".to_string(), "accepted-interface".to_string())]),
+        probe_ips: BTreeMap::from([("node-a".to_string(), "1.1.1.1".parse().unwrap())]),
+        ..Default::default()
+    };
+    let accepted = plan.clone();
+    let mut next = old.clone();
+    next.servers[0].uuid = Some("new-credential".into());
+    next.servers[0].port = 8443;
+    assert!(!automatic_runtime_binding_root_ids(&next).is_empty());
+    assert!(runtime_binding_targets_reusable(&old, &next, &plan));
+    assert_eq!(plan, accepted, "reuse must retain the accepted route facts");
+    next.servers[0].address = "2.2.2.2".into();
+    assert!(
+        !runtime_binding_targets_reusable(&old, &next, &plan),
+        "the same server ID does not attest a changed route target"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn runtime_reuse_rejects_new_or_preexisting_uncovered_active_roots() {
+    let old = UserConfig {
+        proxy_mode_type: ProxyModeType::Tun,
+        selected_server_id: Some("node-a".into()),
+        servers: vec![server("node-a", "1.1.1.1"), server("node-b", "2.2.2.2")],
+        ..Default::default()
+    };
+    let mut plan = RuntimeBindingPlan {
+        covered_roots: BTreeSet::from(["node-a".to_string()]),
+        ..Default::default()
+    };
+    let mut next = old.clone();
+    next.selected_server_id = Some("node-b".into());
+    assert!(!runtime_binding_targets_reusable(&old, &next, &plan));
+    plan.covered_roots.insert("node-b".into());
+    assert!(
+        runtime_binding_targets_reusable(&old, &next, &plan),
+        "positive control: an unchanged already covered target is reusable"
+    );
+    let mut inactive_edit = old.clone();
+    inactive_edit.servers[1].address = "4.4.4.4".into();
+    assert!(
+        runtime_binding_targets_reusable(&old, &inactive_edit, &plan),
+        "an inactive host edit need not consume an old route fact yet"
+    );
+    let mut activated = inactive_edit.clone();
+    activated.selected_server_id = Some("node-b".into());
+    assert!(
+        !runtime_binding_targets_reusable(&old, &activated, &plan),
+        "activation must compare against trusted startup host, not later HOT runtime content"
+    );
+    assert!(
+        runtime_binding_targets_reusable(&inactive_edit, &activated, &plan),
+        "negative baseline control: using edited R would incorrectly appear reusable"
+    );
+    next.servers.push(server("new-root", "3.3.3.3"));
+    next.selected_server_id = Some("new-root".into());
+    assert!(!runtime_binding_targets_reusable(&old, &next, &plan));
+    plan.covered_roots.insert("new-root".into());
+    assert!(
+        !runtime_binding_targets_reusable(&old, &next, &plan),
+        "coverage alone cannot invent a previous accepted route target"
+    );
+}

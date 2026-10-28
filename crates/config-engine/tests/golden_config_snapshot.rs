@@ -11,6 +11,10 @@
 //! 无私网 DNS 时 LAN 返回 SERVFAIL；唯一注入场景 dns-lan 从 DHCP 改为 UDP 192.168.1.1。
 //! 未从 Rust 输出重录；独立按上述规则变换冻结期望，防止把无关差异带入金样。
 //!
+//! 2026-10-19 uTLS 默认语义定向更新：仅 TUN+trojan 的 linux/darwin/win32 三个场景，
+//! 未显式关闭且使用受支持普通 TLS 的出口补 utls={enabled:true,fingerprint:"chrome"}。
+//! CI 旧 expected/got 的全量结构差异恰为这三处；未重录 Rust 输出或改写其它快照字段。
+//!
 //! 纪律：serde_json::Value 比较（规范化结构等价，忽略键序/空白）。路径分隔符归一化（\ → /）。
 //!
 //! # 夹具的来历与「定向更新」的例外（读之前必看）

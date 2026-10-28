@@ -290,6 +290,149 @@ const fn uninstall_failure_code(platform: Platform, code: i32) -> HelperActionEr
     }
 }
 
+/// Safe presentation-only observation. A child can imitate these stderr markers;
+/// this never proves the emitter, polkit authorization, or privileged cleanup.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HelperExecutionDiagnostic {
+    pub schema: &'static str,
+    pub exit_code: i32,
+    pub marker: HelperExecutionMarker,
+    pub scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installer_failure: Option<HelperInstallerFailure>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HelperInstallerFailure {
+    pub schema: &'static str,
+    pub stage: &'static str,
+    pub recovery: &'static str,
+}
+
+fn helper_installer_failure(stderr: &str) -> Option<HelperInstallerFailure> {
+    if stderr.len() > 16 * 1024 {
+        return None;
+    }
+    let mut result: Option<HelperInstallerFailure> = None;
+    for line in stderr.lines() {
+        let Some(value) = line.strip_prefix("POLARIS_HELPER_FAILURE_V1:") else {
+            continue;
+        };
+        let (stage, recovery) = value.split_once(':')?;
+        let stage = match stage {
+            "preparation" => "preparation",
+            "directories" => "directories",
+            "staging" => "staging",
+            "lease" => "lease",
+            "journal" => "journal",
+            "core-install" => "core-install",
+            "policy" => "policy",
+            "service-snapshot" => "service-snapshot",
+            "manager-identity" => "manager-identity",
+            "manager-property" => "manager-property",
+            "pid1-cgroup" => "pid1-cgroup",
+            "cgroup-mount" => "cgroup-mount",
+            "unit-config" => "unit-config",
+            "service-stop" => "service-stop",
+            "service-closure" => "service-closure",
+            "registration" => "registration",
+            "service-install" => "service-install",
+            "service-start" => "service-start",
+            "takeover" => "takeover",
+            "uninstall-remove" => "uninstall-remove",
+            "cleanup" => "cleanup",
+            "rollback" => "rollback",
+            "unknown" => "unknown",
+            _ => return None,
+        };
+        let recovery = match recovery {
+            "not-started" => "not-started",
+            "cleanup-returned" => "cleanup-returned",
+            "rollback-returned" => "rollback-returned",
+            "recovery-unconfirmed" => "recovery-unconfirmed",
+            _ => return None,
+        };
+        if let Some(prior) = &result {
+            if prior.stage != stage || prior.recovery != "recovery-unconfirmed" {
+                return None;
+            }
+        }
+        result = Some(HelperInstallerFailure {
+            schema: "polaris-helper-installer-failure-v1",
+            stage,
+            recovery,
+        });
+    }
+    result
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum HelperExecutionMarker {
+    Unknown,
+    NotSetuidRoot,
+    NoAuthenticationAgent,
+    NotAuthorized,
+    TextAgentCreationFailed,
+    TextAgentRegistrationFailed,
+    AuthorizationCheckFailed,
+}
+
+fn helper_execution_diagnostic(
+    platform: Platform,
+    code: i32,
+    stderr: &str,
+) -> Option<HelperExecutionDiagnostic> {
+    if platform != Platform::Linux {
+        return None;
+    }
+    // Reviewed polkit 0.105 + Ubuntu 0.105-33ubuntu0.2 patch series.
+    // Bound inspection, never copy suffixes containing paths/users/PAM text.
+    // Conflicting markers, translations and unknown output remain unknown.
+    let mut marker = HelperExecutionMarker::Unknown;
+    if code == 127 && stderr.len() <= 16 * 1024 {
+        for line in stderr.lines() {
+            let current = match line.trim() {
+                "pkexec must be setuid root" => HelperExecutionMarker::NotSetuidRoot,
+                "Error executing command as another user: No authentication agent found." => {
+                    HelperExecutionMarker::NoAuthenticationAgent
+                }
+                "Error executing command as another user: Not authorized" => {
+                    HelperExecutionMarker::NotAuthorized
+                }
+                text if text.starts_with("Error creating textual authentication agent: ") => {
+                    HelperExecutionMarker::TextAgentCreationFailed
+                }
+                text if text.starts_with("Error registering local authentication agent: ") => {
+                    HelperExecutionMarker::TextAgentRegistrationFailed
+                }
+                text if text.starts_with("Error checking for authorization ") => {
+                    HelperExecutionMarker::AuthorizationCheckFailed
+                }
+                _ => continue,
+            };
+            if marker != HelperExecutionMarker::Unknown && marker != current {
+                marker = HelperExecutionMarker::Unknown;
+                break;
+            }
+            marker = current;
+        }
+    }
+    Some(HelperExecutionDiagnostic {
+        schema: "polaris-helper-execution-diagnostic-v1",
+        exit_code: code,
+        marker,
+        scope: "child-stderr-marker-not-verified-emitter",
+        installer_failure: if code != 0 {
+            helper_installer_failure(stderr)
+        } else {
+            None
+        },
+    })
+}
+
 /// install/uninstall 结果信封（前端 `helperApi.install/uninstall` 期望
 /// `{ success, errorCode?, diagnostic?, status }`）。
 ///
@@ -299,6 +442,8 @@ const fn uninstall_failure_code(platform: Platform, code: i32) -> HelperActionEr
 #[serde(rename_all = "camelCase")]
 pub struct HelperActionResult {
     pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_diagnostic: Option<HelperExecutionDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<HelperActionErrorCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -950,6 +1095,7 @@ impl HelperRuntime {
     ) -> HelperActionResult {
         HelperActionResult {
             success: false,
+            execution_diagnostic: None,
             error_code: Some(code),
             diagnostic: Some(diagnostic.into()),
             status: self.status(),
@@ -1011,6 +1157,7 @@ impl HelperRuntime {
                 if helper_install_reached_expected_build(&status) {
                     HelperActionResult {
                         success: true,
+                        execution_diagnostic: None,
                         error_code: None,
                         diagnostic: None,
                         status,
@@ -1018,6 +1165,7 @@ impl HelperRuntime {
                 } else {
                     HelperActionResult {
                         success: false,
+                        execution_diagnostic: None,
                         error_code: Some(HelperActionErrorCode::NotReady),
                         diagnostic: Some(
                             "helper protocol or selected core is not ready after installation"
@@ -1033,10 +1181,13 @@ impl HelperRuntime {
             ),
             Ok(EscalationOutcome::Failed { stderr, code }) => {
                 log::warn!("helper install command failed (exit {code}): {stderr}");
-                self.action_failed(
+                let mut result = self.action_failed(
                     install_command_failure_code(self.platform, code, &stderr),
                     install_command_diagnostic(self.platform, code),
-                )
+                );
+                result.execution_diagnostic =
+                    helper_execution_diagnostic(self.platform, code, &stderr);
+                result
             }
             Err(e) => {
                 log::warn!("helper install failed: {e}");
@@ -1076,6 +1227,7 @@ impl HelperRuntime {
         match manager.uninstall_with_maintenance(&self.dir, utility.as_ref(), &StdExecutor) {
             Ok(EscalationOutcome::Success) => HelperActionResult {
                 success: true,
+                execution_diagnostic: None,
                 error_code: None,
                 diagnostic: None,
                 status: self.status(),
@@ -1086,10 +1238,13 @@ impl HelperRuntime {
             ),
             Ok(EscalationOutcome::Failed { stderr, code }) => {
                 log::warn!("helper uninstall command failed (exit {code}): {stderr}");
-                self.action_failed(
+                let mut result = self.action_failed(
                     uninstall_failure_code(self.platform, code),
                     "helper uninstaller exited unsuccessfully",
-                )
+                );
+                result.execution_diagnostic =
+                    helper_execution_diagnostic(self.platform, code, &stderr);
+                result
             }
             Err(e) => {
                 log::warn!("helper uninstall failed: {e}");
@@ -1448,6 +1603,7 @@ impl HelperRuntime {
     /// （`cleanup_stale_cores`，此时本会话尚无受管核）。运行期停核走 `stop_core`。
     ///
     /// **真机门**：真杀 root 进程需 mac/win 真机 + 已装就绪 helper。
+    #[cfg(not(unix))]
     pub fn cleanup_cores(&self) -> Result<(), String> {
         self.register_core_mutation()?;
         let client = self.build_client()?;

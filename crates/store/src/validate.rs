@@ -383,8 +383,6 @@ pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
             )));
         }
     }
-    validate_real_query_fallback_reference(value)
-        .map_err(|error| crate::StoreError::DnsDependency(error.to_string()))?;
     // Project only the DNS-owned fields: unrelated optional node data must not make
     // this graph check a second whole-config deserializer. Absent collections retain
     // UserConfig's legacy defaults; explicit collections remain authoritative.
@@ -423,6 +421,11 @@ pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
             },
         )
         .collect();
+    // Use the same legacy-default view as the dependency graph. An absent collection
+    // inherits typed defaults; an explicit collection remains authoritative. This
+    // validation view never fills defaults into the caller's raw saved document.
+    validate_real_query_fallback_reference(value, &dns.dns_servers)
+        .map_err(|error| crate::StoreError::DnsDependency(error.to_string()))?;
     polaris_config_engine::user_config::dns_policy::validate_dns_dependencies(&dns)
         .map_err(crate::StoreError::DnsDependency)?;
     Ok(())
@@ -465,9 +468,12 @@ pub(crate) fn validate_raw_real_query_fallback_action(
     real_query_fallback_action(value).map(|_| ())
 }
 
-fn validate_real_query_fallback_reference(value: &Value) -> Result<(), crate::StoreError> {
+fn validate_real_query_fallback_reference(
+    value: &Value,
+    servers: &[polaris_config_engine::user_config::DnsServerResource],
+) -> Result<(), crate::StoreError> {
     use polaris_config_engine::user_config::{
-        DnsPolicyAction, DnsServerKind, DnsServerResource, BUILTIN_NETENV_DHCP_ID,
+        DnsPolicyAction, DnsServerKind, BUILTIN_NETENV_DHCP_ID,
     };
     let Some(DnsPolicyAction::Server { server_id }) = real_query_fallback_action(value)? else {
         return Ok(());
@@ -477,19 +483,9 @@ fn validate_real_query_fallback_reference(value: &Value) -> Result<(), crate::St
         return Ok(());
     }
     let exists = !server_id.trim().is_empty()
-        && value
-            .get("dnsServers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|resource| {
-                serde_json::from_value::<DnsServerResource>(resource.clone()).ok()
-            })
-            .any(|resource| {
-                resource.id == server_id
-                    && resource.enabled
-                    && resource.kind != DnsServerKind::Hosts
-            });
+        && servers.iter().any(|resource| {
+            resource.id == server_id && resource.enabled && resource.kind != DnsServerKind::Hosts
+        });
     if !exists {
         return Err(crate::StoreError::validation(format!(
             "dnsDefaults.realQueryFallbackAction: DNS server \"{server_id}\" is missing, disabled, or hosts-only"
@@ -662,67 +658,4 @@ pub(crate) fn validate_raw_rule_ids(config: &Value) -> Result<(), crate::StoreEr
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod rule_identity_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn identities_are_plane_local_but_duplicates_in_each_input_are_rejected() {
-        assert!(validate_raw_rule_ids(&json!({
-            "trafficRules": [{"id":"same"}], "dnsRules": [{"id":"same"}]
-        }))
-        .is_ok());
-        for key in ["trafficRules", "dnsRules", "policyRules", "customRules"] {
-            assert!(validate_raw_rule_ids(&json!({key: [{"id":"same"}, {"id":"same"}]})).is_err());
-        }
-    }
-
-    #[test]
-    fn batch_or_import_rejects_duplicates_before_sanitizer_can_hide_them() {
-        let mut input = crate::default_config();
-        let rule = json!({"id":"same", "type":"domain", "values":["example.com"],
-            "action":"proxy", "enabled":true});
-        input["trafficRules"] = json!([rule.clone()]);
-        // Positive control: unrelated shape/default errors must not satisfy this test.
-        assert!(crate::ConfigStore::canonicalize_for_save(&input).is_ok());
-        input["trafficRules"] = json!([rule.clone(), rule]);
-        assert!(crate::ConfigStore::canonicalize_for_save(&input).is_err());
-        assert_eq!(input["trafficRules"].as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn persisted_legacy_duplicates_remain_readable_and_complete_repair_can_save() {
-        let mut input = crate::default_config();
-        let rule = json!({"id":"same", "type":"domain", "values":["example.com"],
-            "action":"proxy", "enabled":true});
-        input["configSchemaVersion"] = json!(4);
-        for key in ["trafficRules", "policyRules", "customRules"] {
-            input[key] = json!([rule.clone(), rule.clone()]);
-        }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("polaris-rule-ids-{}-{stamp}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("config.json");
-        let bytes = serde_json::to_vec(&input).unwrap();
-        std::fs::write(&path, &bytes).unwrap();
-        let loaded = crate::ConfigStore::load(&crate::StdFs, &path);
-        assert!(loaded.loaded_from_disk);
-        assert!(loaded.error.is_none());
-        assert_eq!(loaded.config["trafficRules"].as_array().unwrap().len(), 2);
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert!(crate::ConfigStore::canonicalize_for_save(&loaded.config).is_err());
-        let mut repaired = loaded.config;
-        for key in ["trafficRules", "policyRules", "customRules"] {
-            repaired[key] = json!([rule.clone()]);
-        }
-        assert!(crate::ConfigStore::canonicalize_for_save(&repaired).is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
 }

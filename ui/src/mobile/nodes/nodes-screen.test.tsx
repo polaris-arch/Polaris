@@ -3205,8 +3205,8 @@ describe('⑮ 无效节点：接线层真的把剔除理由喂进了行 VM（两
     );
   });
 
-  it('索引由 `invalidNodeIndex(invalidNodes)` 算出，且 `invalidNodes` 真的读的是 store', () => {
-    expect(WIRING, '没有 `invalidNodeIndex` 这一跳').toContain('invalidNodeIndex(invalidNodes)');
+  it('索引由 `invalidNodeIndex(invalidNodes, servers)` 算出，且 `invalidNodes` 真的读的是 store', () => {
+    expect(WIRING, '没有 `invalidNodeIndex` 这一跳').toContain('invalidNodeIndex(invalidNodes, servers)');
     expect(
       WIRING,
       '`invalidNodes` 不是从 store 读的 —— 那条订阅写进去的表就没人取',

@@ -62,6 +62,7 @@ function temporaryFixture(t, label, extra = [], mutate = () => {}) {
   // These inert inventory fixtures neither acquire nor execute a native payload.
   for (const path of [
     'scripts/verify-packaging.mjs', 'scripts/postprocess-appimage.mjs', 'scripts/release-assets.mjs',
+    'scripts/lib/polaris-version.json',
     ...['cronet-payload', 'cronet-contract', 'nsis-core-sweep', 'nsis-helper-cleanup', 'core-identity', 'macos-open-guide']
       .map(name => `scripts/lib/${name}.mjs`),
     ...['source-graph', 'bundle', 'release-consumer', 'native-dns-candidate', 'upstream-release', 'validation-origin', 'native-dns-gates']
@@ -260,7 +261,7 @@ test('temporary default keeps exact original legal member paths without formal-r
 
 test('formal inventory requires exact archived legal paths and rejects temporary carrier relabels', t => {
   const manifest = JSON.parse(readFileSync(join(repo, 'src-tauri/core-manifest.json')));
-  assert.equal(loadReleaseContract(repo, manifest).sourceCommit, 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae');
+  assert.equal(loadReleaseContract(repo, manifest).sourceCommit, '0cfa24573ff34c26608151068334329268cfdf14');
   const missing = fixture(t, 'windows', [cleaner], root =>
     rmSync(join(root, '_up_/resources/win/core-release/TLS-DEPENDENCY-NOTICES.txt')));
   assert.equal(missing.code, 1, missing.output);

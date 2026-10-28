@@ -20,3 +20,6 @@ sha1 = "0.11"
 polaris-source-probe = { version = "1.0.0", path = "../source-probe" }
 # 真核配置门的所有临时配置、cache 与日志路径必须由 TempDir 承载，避免测试污染宿主 /tmp。
 tempfile = "3"
+
+# Match WireGuard dual-family UDP leases in runtime fixtures; already locked workspace dependency.
+socket2 = "0.6"

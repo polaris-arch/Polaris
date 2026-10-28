@@ -547,98 +547,100 @@ fn process_conn_pinned_start_full_flow_with_native_peer() {
         core_protocol::{PinnedBirthStart, PinnedStartParams},
         NativeBirthStart, Platform, Response, ResponseKind, StartParams,
     };
-    let params = PinnedStartParams {
-        id: CoreId::parse(&"a".repeat(64)).unwrap(),
-        common: StartParams {
-            cfg: "/Users/test/Polaris/c.json".into(),
-            log: String::new(),
-            fwd: false,
-            parent_pid: None,
-        },
-    };
-    let svc = TestServices::pinned_fixture("T");
-    let bytes = codec::encode(
-        Platform::Mac,
-        "T",
-        &Request::NativeStartPinned(params.clone()),
-    );
-    let mut output = Vec::new();
-    let outcome = process_connection_from_peer(
-        Cursor::new(bytes),
-        &mut output,
-        &svc,
-        &test_config(),
-        None,
-        Some(1000),
-    );
-    assert!(matches!(outcome, ConnOutcome::Done));
-    // The real frame decoder and peer admission reach only the injected native
-    // pinned service. No executable or native process is run by this fixture.
-    let target = polaris_helper_proto::HelperBirthTarget::parse_wire(
-        "4242",
-        "01010101010101010101010101010101",
-    )
-    .unwrap();
-    assert_eq!(
-        Response::parse(String::from_utf8(output).unwrap().trim_end()),
-        Response::Ok(ResponseKind::PinnedStart {
-            id: params.id.clone(),
-            start: PinnedBirthStart::Native(NativeBirthStart::Started {
-                target,
-                timing: None,
-                created: None,
-            }),
-        })
-    );
-    assert_eq!(*svc.pinned_calls.lock().unwrap(), [(params.clone(), 1000)]);
-    assert_eq!(svc.runner_calls(), 0);
-    assert!(svc.child.lock().unwrap().is_none());
-    for (token, uid, id, expected_code) in [
-        (
-            "wrong-token",
-            Some(1000),
-            params.id.clone(),
-            polaris_helper_proto::ErrorCode::Auth,
-        ),
-        (
-            "T",
-            None,
-            params.id.clone(),
-            polaris_helper_proto::ErrorCode::Auth,
-        ),
-        (
-            "T",
-            Some(1001),
-            params.id.clone(),
-            polaris_helper_proto::ErrorCode::Start,
-        ),
-        (
-            "T",
-            Some(1000),
-            CoreId::parse(&"b".repeat(64)).unwrap(),
-            polaris_helper_proto::ErrorCode::Start,
-        ),
-    ] {
+    for fwd in [false, true] {
+        let params = PinnedStartParams {
+            id: CoreId::parse(&"a".repeat(64)).unwrap(),
+            common: StartParams {
+                cfg: "/Users/test/Polaris/c.json".into(),
+                log: String::new(),
+                fwd,
+                parent_pid: None,
+            },
+        };
         let svc = TestServices::pinned_fixture("T");
-        let mut rejected = params.clone();
-        rejected.id = id;
-        let bytes = codec::encode(Platform::Mac, token, &Request::NativeStartPinned(rejected));
+        let bytes = codec::encode(
+            Platform::Mac,
+            "T",
+            &Request::NativeStartPinned(params.clone()),
+        );
         let mut output = Vec::new();
-        process_connection_from_peer(
+        let outcome = process_connection_from_peer(
             Cursor::new(bytes),
             &mut output,
             &svc,
             &test_config(),
             None,
-            uid,
+            Some(1000),
         );
-        assert!(
-            matches!(Response::parse(String::from_utf8(output).unwrap().trim_end()),
-            Response::Err(error) if error.code == expected_code)
+        assert!(matches!(outcome, ConnOutcome::Done));
+        // The real frame decoder and peer admission reach only the injected native
+        // pinned service. No executable or native process is run by this fixture.
+        let target = polaris_helper_proto::HelperBirthTarget::parse_wire(
+            "4242",
+            "01010101010101010101010101010101",
+        )
+        .unwrap();
+        assert_eq!(
+            Response::parse(String::from_utf8(output).unwrap().trim_end()),
+            Response::Ok(ResponseKind::PinnedStart {
+                id: params.id.clone(),
+                start: PinnedBirthStart::Native(NativeBirthStart::Started {
+                    target,
+                    timing: None,
+                    created: None,
+                }),
+            })
         );
-        assert!(svc.pinned_calls.lock().unwrap().is_empty());
+        assert_eq!(*svc.pinned_calls.lock().unwrap(), [(params.clone(), 1000)]);
         assert_eq!(svc.runner_calls(), 0);
         assert!(svc.child.lock().unwrap().is_none());
+        for (token, uid, id, expected_code) in [
+            (
+                "wrong-token",
+                Some(1000),
+                params.id.clone(),
+                polaris_helper_proto::ErrorCode::Auth,
+            ),
+            (
+                "T",
+                None,
+                params.id.clone(),
+                polaris_helper_proto::ErrorCode::Auth,
+            ),
+            (
+                "T",
+                Some(1001),
+                params.id.clone(),
+                polaris_helper_proto::ErrorCode::Start,
+            ),
+            (
+                "T",
+                Some(1000),
+                CoreId::parse(&"b".repeat(64)).unwrap(),
+                polaris_helper_proto::ErrorCode::Start,
+            ),
+        ] {
+            let svc = TestServices::pinned_fixture("T");
+            let mut rejected = params.clone();
+            rejected.id = id;
+            let bytes = codec::encode(Platform::Mac, token, &Request::NativeStartPinned(rejected));
+            let mut output = Vec::new();
+            process_connection_from_peer(
+                Cursor::new(bytes),
+                &mut output,
+                &svc,
+                &test_config(),
+                None,
+                uid,
+            );
+            assert!(
+                matches!(Response::parse(String::from_utf8(output).unwrap().trim_end()),
+            Response::Err(error) if error.code == expected_code)
+            );
+            assert!(svc.pinned_calls.lock().unwrap().is_empty());
+            assert_eq!(svc.runner_calls(), 0);
+            assert!(svc.child.lock().unwrap().is_none());
+        }
     }
 }
 
@@ -845,4 +847,20 @@ fn accept_loop_takes_a_permit_before_spawning_and_backs_off_on_errors() {
         !body.contains("Err(_) => continue"),
         "accept 错误仍有一条不分类的裸 continue"
     );
+}
+
+#[test]
+fn lan_listening_has_no_native_host_router_writer() {
+    let source = polaris_source_probe::crate_source!("platform/macos/server.rs");
+    for forbidden in [
+        "net.inet.ip.forwarding",
+        "net.inet6.ip6.forwarding",
+        "if params.fwd",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "implicit host router writer returned: {forbidden}"
+        );
+    }
+    assert!(source.contains("let forwarding_ms = 0;"));
 }

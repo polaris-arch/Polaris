@@ -18,6 +18,7 @@ export const SUPPORTED_URL_SCHEMES = [
   'naive',
   'http2',
   'naive+https',
+  'naive+quic',
   'socks5',
   'socks',
   's5',

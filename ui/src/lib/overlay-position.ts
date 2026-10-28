@@ -160,12 +160,13 @@ export function placeTip(
 /** Inner content boundary for portalled controls; never use a small row/field as a boundary.
  * The closest semantic card wins, with the viewport and enclosing dialog still constraining it.
  */
-export function getControlBoundary(trigger: HTMLElement, viewport: OverlayBox): OverlayBox {
+export function getControlBoundary(trigger: HTMLElement, viewport: OverlayBox, cardBlock = true): OverlayBox {
   const card = trigger.closest<HTMLElement>('[data-overlay-boundary], .card, .dlg-body, dialog');
+  const explicit = trigger.closest<HTMLElement>('[data-overlay-boundary]');
   const body = trigger.closest<HTMLElement>('.dlg-body');
   const dialog = trigger.closest<HTMLElement>('dialog');
   let box = viewport;
-  for (const element of new Set([card, body, dialog])) {
+  for (const element of new Set([card, explicit, body, dialog])) {
     if (!element) continue;
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
@@ -174,7 +175,13 @@ export function getControlBoundary(trigger: HTMLElement, viewport: OverlayBox): 
     const top = rect.top + n(style.borderTopWidth) + n(style.paddingTop);
     const right = rect.right - n(style.borderRightWidth) - n(style.paddingRight);
     const bottom = rect.bottom - n(style.borderBottomWidth) - n(style.paddingBottom);
-    box = intersectOverlayBoxes(box, { left, top, width: Math.max(0, right - left), height: Math.max(0, bottom - top) });
+    // Ordinary cards align controls horizontally, but a portalled select must not
+    // be reduced to one option by a shallow card. Explicit boundaries and dialogs
+    // remain fully containing; other callers retain the original two-axis policy.
+    const horizontalOnly = !cardBlock && element === card
+      && element.matches('.card') && !element.matches('[data-overlay-boundary], .dlg-body, dialog');
+    box = intersectOverlayBoxes(box, { left, top: horizontalOnly ? viewport.top : top,
+      width: Math.max(0, right - left), height: horizontalOnly ? viewport.height : Math.max(0, bottom - top) });
   }
   return box;
 }

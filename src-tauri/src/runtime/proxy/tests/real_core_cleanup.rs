@@ -8,16 +8,21 @@ use std::time::{Duration, Instant};
 
 pub(crate) struct RealCoreCleanupGuard {
     runtime: Arc<ProxyRuntime>,
+    test_name: String,
 }
 
 impl RealCoreCleanupGuard {
     pub(crate) fn new(runtime: &Arc<ProxyRuntime>) -> Self {
         Self {
             runtime: Arc::clone(runtime),
+            test_name: std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_owned(),
         }
     }
 
-    fn reap_owned_child(&self) -> Result<bool, String> {
+    fn reap_owned_child(&self) -> Result<(bool, serde_json::Value), String> {
         // Shares the spawn admission lock: a birth already in flight must attach its
         // Child before this fence returns, and later births cannot pass the fence.
         self.runtime.begin_shutdown()?;
@@ -32,14 +37,22 @@ impl RealCoreCleanupGuard {
             slot.running_for_test()
         };
         let Some(run) = run else {
-            return Ok(false);
+            return Ok((
+                false,
+                serde_json::json!({"state":"empty-after-shutdown-fence", "runRef":null, "corePid":null}),
+            ));
         };
+        let run_ref = run.identity.persisted_ref().to_owned();
+        let core_pid = run.child_id_for_test();
         if run
             .try_wait_with(|child| child.try_wait())
             .map_err(|e| e.to_string())?
             .is_some()
         {
-            return Ok(false);
+            return Ok((
+                false,
+                serde_json::json!({"state":"retained-child-exit-observed", "runRef":run_ref, "corePid":core_pid}),
+            ));
         }
         // Use the original owned Child, never a rediscovered PID. Synchronous
         // try_wait is essential here: the Tokio runtime is about to be dropped.
@@ -52,7 +65,10 @@ impl RealCoreCleanupGuard {
                 .map_err(|e| e.to_string())?
                 .is_some()
             {
-                return Ok(true);
+                return Ok((
+                    true,
+                    serde_json::json!({"state":"emergency-owned-child-reaped", "runRef":run_ref, "corePid":core_pid}),
+                ));
             }
             if Instant::now() >= deadline {
                 return Err("real-core cleanup: owned Child was not reaped in 10s".into());
@@ -72,7 +88,17 @@ impl Drop for RealCoreCleanupGuard {
                 Err("real-core cleanup panicked before custody was confirmed".into())
             });
         match cleanup {
-            Ok(killed) => {
+            Ok((killed, custody)) => {
+                // Positive original-Child observation, not absence of a stderr warning.
+                // The runner binds this one record to its actual spawned test PID/name.
+                let record = serde_json::json!({
+                    "schema":"polaris-controlled-cleanup-v1", "testName":self.test_name,
+                    "processId":std::process::id(), "generation":self.runtime.core_generation(),
+                    "shutdownFenced":true, "custody":custody, "publicationEligible":false,
+                });
+                let mut output = std::io::stdout().lock();
+                let _ = writeln!(output, "\nPOLARIS_CONTROLLED_CLEANUP {record}");
+                let _ = output.flush();
                 // Preserve an existing assertion panic. Otherwise expose missing
                 // normal cleanup rather than silently making a broken test pass.
                 assert!(

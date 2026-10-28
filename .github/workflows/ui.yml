@@ -123,9 +123,10 @@ jobs:
         run: pnpm exec vitest run --maxWorkers=2 --exclude 'src/lib/prototype-confirm-parity.test.ts'
 
       - name: Browser form round trip (mock IPC, no app or core)
+        id: browser_forms
         run: |
           pnpm exec playwright install --with-deps chromium
-          POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts --maxWorkers=1
+          POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts src/components/dialogs/app-transactions.browser.test.ts --maxWorkers=1
           pnpm exec playwright test --config playwright.config.ts
 
       - name: Browser form failure evidence (mock fixture only)
@@ -135,4 +136,13 @@ jobs:
           name: mesh-form-playwright-${{ github.run_id }}-${{ github.run_attempt }}
           path: ui/test-results/
           if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Feedback fixture screenshots (no user data)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: feedback-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ui/test-results/feedback/
+          if-no-files-found: ${{ steps.browser_forms.outcome == 'success' && 'error' || 'ignore' }}
           retention-days: 3

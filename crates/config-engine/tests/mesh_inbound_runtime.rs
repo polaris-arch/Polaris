@@ -134,6 +134,11 @@ fn startup_receipt_child_fixture() {
             eprintln!("INFO[0000] sing-box started (0.01s)");
             thread::sleep(Duration::from_secs(30));
         }
+        Ok("wg-bind-conflict") => {
+            eprintln!("ERROR[0000] endpoint/wireguard[WG-A]: unable to update bind: listen udp4 :61548: bind: address already in use");
+            eprintln!("INFO[0000] sing-box started (0.01s)");
+            thread::sleep(Duration::from_secs(30));
+        }
         Ok("timeout") => thread::sleep(Duration::from_secs(30)),
         _ => {}
     }
@@ -261,20 +266,51 @@ fn free_udp_port() -> u16 {
         .port()
 }
 
-fn reserve_wireguard_port(excluded: &[u16]) -> UdpSocket {
-    // WireGuard binds the IPv6 wildcard even when its peers dial IPv4 loopback.
-    // Keep the selected port bound until handoff, and exclude this fixture's
-    // IPv4 listeners too on hosts with IPv6-only sockets. Retain rejected
-    // reservations during selection so a port cannot be selected repeatedly.
+struct WireguardPortReservation {
+    ipv4: UdpSocket,
+    _ipv6: UdpSocket,
+}
+impl WireguardPortReservation {
+    fn port(&self) -> u16 {
+        self.ipv4.local_addr().unwrap().port()
+    }
+}
+
+fn bind_ipv6_only_udp(port: u16) -> std::io::Result<UdpSocket> {
+    let _guard = port_handoff();
+    bind_ipv6_only_udp_unlocked(port)
+}
+fn bind_ipv6_only_udp_unlocked(port: u16) -> std::io::Result<UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_only_v6(true)?;
+    socket.bind(&SocketAddr::from(([0u16; 8], port)).into())?;
+    Ok(socket.into())
+}
+
+fn reserve_wireguard_port(excluded: &[u16]) -> WireguardPortReservation {
+    // The pinned StdNetBind opens udp4 and udp6 wildcard sockets on the SAME
+    // port. An IPv6-only lease cannot exclude an existing IPv4 socket.
+    // No SO_REUSE* options: both families stay owned until startup handoff.
+    let _guard = port_handoff();
     let mut rejected = Vec::new();
     for _ in 0..64 {
-        let socket = bind_udp("[::]:0").expect("reserve WireGuard wildcard port");
-        if !excluded.contains(&socket.local_addr().unwrap().port()) {
-            return socket;
+        let ipv4 = UdpSocket::bind("0.0.0.0:0").expect("reserve WireGuard IPv4 wildcard port");
+        let port = ipv4.local_addr().unwrap().port();
+        if excluded.contains(&port) {
+            rejected.push(ipv4);
+            continue;
         }
-        rejected.push(socket);
+        match bind_ipv6_only_udp_unlocked(port) {
+            Ok(ipv6) => return WireguardPortReservation { ipv4, _ipv6: ipv6 },
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => rejected.push(ipv4),
+            Err(error) => panic!("reserve WireGuard IPv6 wildcard port: {error}"),
+        }
     }
-    panic!("no distinct WireGuard port within 64 reservations");
+    panic!("no distinct dual-family WireGuard port within 64 reservations");
 }
 
 #[test]
@@ -287,8 +323,8 @@ fn wireguard_port_reservations_exclude_live_listeners_and_keep_peers_distinct() 
     ];
     let a = reserve_wireguard_port(&excluded);
     let b = reserve_wireguard_port(&excluded);
-    let a_port = a.local_addr().unwrap().port();
-    let b_port = b.local_addr().unwrap().port();
+    let a_port = a.port();
+    let b_port = b.port();
     assert!(!excluded.contains(&a_port) && !excluded.contains(&b_port));
     assert_ne!(a_port, b_port);
     // Match WireGuard's wildcard bind. Windows permits a same-user specific
@@ -302,10 +338,95 @@ fn wireguard_port_reservations_exclude_live_listeners_and_keep_peers_distinct() 
         assert_eq!(b_loopback.local_addr().unwrap().port(), b_port);
     }
     for port in [a_port, b_port] {
-        let error = bind_udp(("::", port)).unwrap_err();
+        let error = bind_udp(("0.0.0.0", port)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        let error = bind_ipv6_only_udp(port).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
     }
 }
+#[test]
+fn wireguard_lease_covers_ipv4_even_when_ipv6_on_that_port_is_available() {
+    let occupied = bind_udp("0.0.0.0:0").unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    let ipv6_only = bind_ipv6_only_udp(port).unwrap();
+    // This was the old false assurance: the IPv6 socket succeeds while udp4
+    // cannot bind. The dual-family allocator must choose a different port.
+    assert_eq!(
+        bind_udp(("0.0.0.0", port)).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    let lease = reserve_wireguard_port(&[]);
+    assert_ne!(lease.port(), port);
+    assert_eq!(ipv6_only.local_addr().unwrap().port(), port);
+}
+
+#[test]
+fn wireguard_bind_retry_requires_exact_endpoint_port_and_error_and_is_bounded() {
+    let exact = "ERROR[0000] endpoint/wireguard[WG-A]: unable to update bind: listen udp4 :61548: bind: address already in use";
+    assert!(wireguard_bind_conflict(exact, "WG-A", 61548));
+    assert!(wireguard_bind_conflict(
+        &exact.replace("udp4 :61548", "udp6 [::]:61548"),
+        "WG-A",
+        61548
+    ));
+    for other in [
+        exact.replace("WG-A", "WG-B"),
+        exact.replace(":61548:", ":61549:"),
+        exact.replace("address already in use", "permission denied"),
+        exact.replace("unable to update bind", "outbound connection failed"),
+        "probe read timed out; sing-box started (0.01s)".into(),
+    ] {
+        assert!(!wireguard_bind_conflict(&other, "WG-A", 61548), "{other}");
+    }
+    let conflict = StartupFailure::WireguardBindConflict {
+        tag: "WG-A".into(),
+        port: 61548,
+        pid: 1,
+        log: exact.into(),
+    };
+    assert!(retry_wireguard_startup(&conflict, 0));
+    assert!(retry_wireguard_startup(&conflict, 1));
+    assert!(!retry_wireguard_startup(&conflict, 2));
+    for message in [
+        "spawn failed",
+        "startup timeout",
+        "read timeout",
+        "routing rejected",
+    ] {
+        assert!(!retry_wireguard_startup(
+            &StartupFailure::Other(message.into()),
+            0
+        ));
+    }
+}
+
+#[test]
+fn wireguard_bind_failure_cannot_become_a_successful_start_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("startup.stderr");
+    let lock = Mutex::new(());
+    let result = handoff_with(&lock, (), || {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "startup_receipt_child_fixture", "--nocapture"])
+            .env("POLARIS_MESH_STARTUP_TEST", "wg-bind-conflict")
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        finish_startup_checked(
+            Running { child, log },
+            Duration::from_secs(2),
+            Some(("WG-A", 61548)),
+        )
+    });
+    assert!(matches!(
+        result,
+        Err(StartupFailure::WireguardBindConflict { port: 61548, .. })
+    ));
+    assert!(!lock.is_poisoned());
+    drop(lock_port_handoff(&lock));
+}
+
 fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
@@ -700,7 +821,57 @@ impl Drop for Running {
         let _ = self.child.wait();
     }
 }
+#[derive(Debug)]
+enum StartupFailure {
+    WireguardBindConflict {
+        tag: String,
+        port: u16,
+        pid: u32,
+        log: String,
+    },
+    Other(String),
+}
+impl std::fmt::Display for StartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WireguardBindConflict {
+                tag,
+                port,
+                pid,
+                log,
+            } => write!(
+                f,
+                "WG startup bind collision tag={tag} port={port} pid={pid}; stderr={log}"
+            ),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+const WG_STARTUP_ATTEMPTS: usize = 3; // initial allocation plus at most two re-selections
+fn retry_wireguard_startup(error: &StartupFailure, attempt: usize) -> bool {
+    matches!(error, StartupFailure::WireguardBindConflict { .. })
+        && attempt + 1 < WG_STARTUP_ATTEMPTS
+}
+fn wireguard_bind_conflict(log: &str, tag: &str, port: u16) -> bool {
+    let endpoint = format!("endpoint/wireguard[{tag}]: unable to update bind: ");
+    let ipv4 = format!("listen udp4 :{port}: bind: address already in use");
+    let ipv6 = format!("listen udp6 [::]:{port}: bind: address already in use");
+    log.lines().any(|line| {
+        line.split_once(&endpoint)
+            .is_some_and(|(_, error)| error == ipv4 || error == ipv6)
+    })
+}
 fn run(core: &Path, config: &Path, temp: &TempDir, reservations: impl Sized) -> Running {
+    try_run(core, config, temp, reservations, None)
+        .unwrap_or_else(|error| panic!("mesh core startup failed: {error}"))
+}
+fn try_run(
+    core: &Path,
+    config: &Path,
+    temp: &TempDir,
+    reservations: impl Sized,
+    wireguard: Option<(&str, u16)>,
+) -> Result<Running, StartupFailure> {
     let (ok, diag) = check(core, config);
     assert!(ok, "mesh config rejected by bundled core: {diag}");
     let log = temp.path().join("core.stderr");
@@ -718,33 +889,52 @@ fn run(core: &Path, config: &Path, temp: &TempDir, reservations: impl Sized) -> 
     handoff(reservations, || {
         let child = command
             .spawn()
-            .map_err(|error| format!("spawn core: {error}"))?;
-        finish_startup(Running { child, log }, Duration::from_secs(10))
+            .map_err(|error| StartupFailure::Other(format!("spawn core: {error}")))?;
+        finish_startup_checked(Running { child, log }, Duration::from_secs(10), wireguard)
     })
-    .unwrap_or_else(|error| panic!("mesh core startup failed: {error}"))
 }
 // In the bundled core (577d4b9), Box.Start emits this only after all Start,
 // PostStart and Started stages succeeded. Direct listeners bind synchronously;
 // MASQUE's client.Start launches its session goroutine without waiting for an
 // address. This is service startup readiness, not tunnel/peer readiness.
-fn finish_startup(mut running: Running, timeout: Duration) -> Result<Running, String> {
+fn finish_startup(running: Running, timeout: Duration) -> Result<Running, String> {
+    finish_startup_checked(running, timeout, None).map_err(|error| error.to_string())
+}
+fn finish_startup_checked(
+    mut running: Running,
+    timeout: Duration,
+    wireguard: Option<(&str, u16)>,
+) -> Result<Running, StartupFailure> {
     let until = Instant::now() + timeout;
     loop {
         let log = running.log();
-        let exited = running
-            .child
-            .try_wait()
-            .map_err(|error| format!("inspect child startup: {error}; stderr={log}"))?;
+        // WireGuard may log BindUpdate failure yet Box.Start still emits "started".
+        // Reject that exact endpoint/port failure before considering readiness.
+        if let Some((tag, port)) = wireguard {
+            if wireguard_bind_conflict(&log, tag, port) {
+                return Err(StartupFailure::WireguardBindConflict {
+                    tag: tag.to_owned(),
+                    port,
+                    pid: running.child.id(),
+                    log,
+                });
+            }
+        }
+        let exited = running.child.try_wait().map_err(|error| {
+            StartupFailure::Other(format!("inspect child startup: {error}; stderr={log}"))
+        })?;
         if let Some(status) = exited {
-            return Err(format!(
+            return Err(StartupFailure::Other(format!(
                 "core exited before startup: {status}; stderr={log}"
-            ));
+            )));
         }
         if log.lines().any(|line| line.contains("sing-box started (")) {
             return Ok(running);
         }
         if Instant::now() >= until {
-            return Err(format!("core startup deadline exceeded; stderr={log}"));
+            return Err(StartupFailure::Other(format!(
+                "core startup deadline exceeded; stderr={log}"
+            )));
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -829,284 +1019,321 @@ fn wireguard_family(core: &Path, ipv6: bool) {
     for (label, policy, should_allow) in
         policy_cases(peer_cidr, wrong_source, wide_target, a_tcp.port, a_udp.port)
     {
-        // Fresh leases each policy: prior cores are killed and reaped on drop,
-        // and their released ports must not be assumed free for the next run.
-        let mut a_ports = InboundPortReservations::default();
-        let mut b_ports = InboundPortReservations::default();
-        let a_out_tcp = a_ports.tcp();
-        let a_out_udp = a_ports.udp();
-        let a_warm_dns = a_ports.udp();
-        let b_in_tcp = b_ports.tcp();
-        let b_in_denied_tcp = b_ports.tcp();
-        let b_in_udp = b_ports.udp();
-        let b_in_dns = b_ports.udp();
-        let a_probes = [
-            Probe {
-                tag: "a-to-b-tcp",
-                listen: a_out_tcp,
-                target: b_ip,
-                port: b_tcp.port,
-                udp: false,
-            },
-            Probe {
-                tag: "a-to-b-udp",
-                listen: a_out_udp,
-                target: b_ip,
-                port: b_udp.port,
-                udp: true,
-            },
-            Probe {
-                tag: "warm-dns",
-                listen: a_warm_dns,
-                target: "127.0.0.1",
-                port: a_warm_dns,
-                udp: true,
-            },
-        ];
-        let b_probes = [
-            Probe {
-                tag: "b-to-a-tcp",
-                listen: b_in_tcp,
-                target: a_ip,
-                port: a_tcp.port,
-                udp: false,
-            },
-            Probe {
-                tag: "b-to-a-denied",
-                listen: b_in_denied_tcp,
-                target: a_ip,
-                port: a_denied_tcp.port,
-                udp: false,
-            },
-            Probe {
-                tag: "b-to-a-udp",
-                listen: b_in_udp,
-                target: a_ip,
-                port: a_udp.port,
-                udp: true,
-            },
-            Probe {
-                tag: "b-to-a-dns",
-                listen: b_in_dns,
-                target: a_ip,
-                port: 53,
-                udp: true,
-            },
-        ];
-        // Allocate after all live echo/DNS listeners. Their IPv6 ports must not
-        // be reused by the wildcard WireGuard endpoints (original CI collision).
-        // Each policy gets fresh leases; kernel execution itself is never retried.
-        let excluded = [
-            a_udp.port,
-            b_udp.port,
-            upstream.port,
-            a_out_udp,
-            a_warm_dns,
-            b_in_udp,
-            b_in_dns,
-        ];
-        let a_lease = reserve_wireguard_port(&excluded);
-        let b_lease = reserve_wireguard_port(&excluded);
-        let a_wg = a_lease.local_addr().unwrap().port();
-        let b_wg = b_lease.local_addr().unwrap().port();
-        let policy_baseline = diagnostics::listener_snapshots(&listeners);
-        let has_policy = policy.is_some();
-        // 每轮独立路径与双核，避免旧 UDP flow、peer 状态和磁盘 DNS cache 跨策略轮次复用。
-        let a_temp = tempfile::tempdir().unwrap();
-        let b_temp = tempfile::tempdir().unwrap();
-        let b = runtime_config(
-            wg_config(false, ipv6, a_wg, None),
-            &b_temp,
-            Some(b_wg),
-            &b_probes,
-            None,
-        );
-        let b_path = write_config(&b_temp, &b);
-        let mut b_core = run(core, &b_path, &b_temp, (b_ports, b_lease));
-        let a = runtime_config(
-            wg_config(true, ipv6, b_wg, policy),
-            &a_temp,
-            Some(a_wg),
-            &a_probes,
-            Some(upstream.port),
-        );
-        let a_path = write_config(&a_temp, &a);
-        let mut a_core = run(core, &a_path, &a_temp, (a_ports, a_lease));
-        // 正向 A→B 先成功，证明两核隧道及回包通，且 B 学到了 A 的 peer 地址。
-        let (forward_tcp, listener_observations) = diagnostics::observe_forward_tcp_with_logs(
-            a_out_tcp,
-            &listeners,
-            &policy_baseline,
-            &[("a", &a_core.log), ("b", &b_core.log)],
-        );
-        // Retain the same bounded metadata for successful cases, so a later
-        // failure can be compared with actual observations, not regenerated data.
-        eprintln!(
-            "WG_FORWARD_OBSERVATION={}",
-            json!({"family":family,"policy":label,"observation":listener_observations})
-        );
-        if let Err(error) = &forward_tcp {
-            failure::capture(
-                failure::Context {
-                    phase: "forward-before-ingress",
-                    family,
-                    policy: label,
-                    error,
-                    core,
-                    a: &a,
-                    b: &b,
-                    listener_observations: &listener_observations,
+        // Only a confirmed pre-probe WG bind conflict can reselect ports.
+        // Once either forwarding assertion begins there is no retry path.
+        for startup_attempt in 0..WG_STARTUP_ATTEMPTS {
+            // Fresh leases each policy: prior cores are killed and reaped on drop,
+            // and their released ports must not be assumed free for the next run.
+            let mut a_ports = InboundPortReservations::default();
+            let mut b_ports = InboundPortReservations::default();
+            let a_out_tcp = a_ports.tcp();
+            let a_out_udp = a_ports.udp();
+            let a_warm_dns = a_ports.udp();
+            let b_in_tcp = b_ports.tcp();
+            let b_in_denied_tcp = b_ports.tcp();
+            let b_in_udp = b_ports.udp();
+            let b_in_dns = b_ports.udp();
+            let a_probes = [
+                Probe {
+                    tag: "a-to-b-tcp",
+                    listen: a_out_tcp,
+                    target: b_ip,
+                    port: b_tcp.port,
+                    udp: false,
                 },
-                &mut a_core,
-                &mut b_core,
+                Probe {
+                    tag: "a-to-b-udp",
+                    listen: a_out_udp,
+                    target: b_ip,
+                    port: b_udp.port,
+                    udp: true,
+                },
+                Probe {
+                    tag: "warm-dns",
+                    listen: a_warm_dns,
+                    target: "127.0.0.1",
+                    port: a_warm_dns,
+                    udp: true,
+                },
+            ];
+            let b_probes = [
+                Probe {
+                    tag: "b-to-a-tcp",
+                    listen: b_in_tcp,
+                    target: a_ip,
+                    port: a_tcp.port,
+                    udp: false,
+                },
+                Probe {
+                    tag: "b-to-a-denied",
+                    listen: b_in_denied_tcp,
+                    target: a_ip,
+                    port: a_denied_tcp.port,
+                    udp: false,
+                },
+                Probe {
+                    tag: "b-to-a-udp",
+                    listen: b_in_udp,
+                    target: a_ip,
+                    port: a_udp.port,
+                    udp: true,
+                },
+                Probe {
+                    tag: "b-to-a-dns",
+                    listen: b_in_dns,
+                    target: a_ip,
+                    port: 53,
+                    udp: true,
+                },
+            ];
+            // Allocate after all live echo/DNS listeners. Their IPv6 ports must not
+            // be reused by the wildcard WireGuard endpoints (original CI collision).
+            // Each attempt gets fresh leases; only a pre-probe bind collision can reselect.
+            let excluded = [
+                a_udp.port,
+                b_udp.port,
+                upstream.port,
+                a_out_udp,
+                a_warm_dns,
+                b_in_udp,
+                b_in_dns,
+            ];
+            let a_lease = reserve_wireguard_port(&excluded);
+            let b_lease = reserve_wireguard_port(&excluded);
+            let a_wg = a_lease.port();
+            let b_wg = b_lease.port();
+            let policy_baseline = diagnostics::listener_snapshots(&listeners);
+            let has_policy = policy.is_some();
+            // 每轮独立路径与双核，避免旧 UDP flow、peer 状态和磁盘 DNS cache 跨策略轮次复用。
+            let a_temp = tempfile::tempdir().unwrap();
+            let b_temp = tempfile::tempdir().unwrap();
+            let b = runtime_config(
+                wg_config(false, ipv6, a_wg, None),
+                &b_temp,
+                Some(b_wg),
+                &b_probes,
+                None,
             );
-        }
-        assert!(
+            let b_path = write_config(&b_temp, &b);
+            let mut b_core = match try_run(
+                core,
+                &b_path,
+                &b_temp,
+                (b_ports, b_lease),
+                Some(("WG-B", b_wg)),
+            ) {
+                Ok(running) => running,
+                Err(error) => {
+                    eprintln!("WG_STARTUP_ATTEMPT family={family} policy={label} attempt={} aPort={a_wg} bPort={b_wg} error={error}", startup_attempt + 1);
+                    if retry_wireguard_startup(&error, startup_attempt) {
+                        continue;
+                    }
+                    panic!("WG startup failed: {error}");
+                }
+            };
+            let a = runtime_config(
+                wg_config(true, ipv6, b_wg, policy.clone()),
+                &a_temp,
+                Some(a_wg),
+                &a_probes,
+                Some(upstream.port),
+            );
+            let a_path = write_config(&a_temp, &a);
+            let mut a_core = match try_run(
+                core,
+                &a_path,
+                &a_temp,
+                (a_ports, a_lease),
+                Some(("WG-A", a_wg)),
+            ) {
+                Ok(running) => running,
+                Err(error) => {
+                    eprintln!("WG_STARTUP_ATTEMPT family={family} policy={label} attempt={} aPort={a_wg} bPort={b_wg} bPid={} bLog={} error={error}", startup_attempt + 1, b_core.child.id(), b_core.log());
+                    if retry_wireguard_startup(&error, startup_attempt) {
+                        continue;
+                    }
+                    panic!("WG startup failed: {error}");
+                }
+            };
+            // 正向 A→B 先成功，证明两核隧道及回包通，且 B 学到了 A 的 peer 地址。
+            let (forward_tcp, listener_observations) = diagnostics::observe_forward_tcp_with_logs(
+                a_out_tcp,
+                &listeners,
+                &policy_baseline,
+                &[("a", &a_core.log), ("b", &b_core.log)],
+            );
+            // Retain the same bounded metadata for successful cases, so a later
+            // failure can be compared with actual observations, not regenerated data.
+            eprintln!(
+                "WG_FORWARD_OBSERVATION={}",
+                json!({"family":family,"policy":label,"observation":listener_observations})
+            );
+            if let Err(error) = &forward_tcp {
+                failure::capture(
+                    failure::Context {
+                        phase: "forward-before-ingress",
+                        family,
+                        policy: label,
+                        error,
+                        core,
+                        a: &a,
+                        b: &b,
+                        listener_observations: &listener_observations,
+                    },
+                    &mut a_core,
+                    &mut b_core,
+                );
+            }
+            assert!(
             forward_tcp.is_ok(),
             "{family}/{label}: A→B TCP unavailable: A={} / B={}; probe={forward_tcp:?}; listener={}",
             a_core.log(),
             b_core.log(),
             listener_observations
         );
-        assert!(
-            eventually(|| udp(a_out_udp, &[0x48]) == Some(vec![0x48])),
-            "{family}/{label}: A→B UDP unavailable: A={} / B={}",
-            a_core.log(),
-            b_core.log()
-        );
-        assert!(
-            b_tcp.count() > 0 && b_udp.count() > 0,
-            "{family}/{label}: forward probes missed live services"
-        );
-        let before_tcp = a_tcp.count();
-        let before_udp = a_udp.count();
-        if should_allow {
             assert!(
-                eventually(|| tcp(b_in_tcp)),
-                "allowed B→A TCP failed: {}",
-                a_core.log()
+                eventually(|| udp(a_out_udp, &[0x48]) == Some(vec![0x48])),
+                "{family}/{label}: A→B UDP unavailable: A={} / B={}",
+                a_core.log(),
+                b_core.log()
             );
             assert!(
-                eventually(|| udp(b_in_udp, &[0x55]) == Some(vec![0x55])),
-                "allowed B→A UDP failed: {}",
-                a_core.log()
+                b_tcp.count() > 0 && b_udp.count() > 0,
+                "{family}/{label}: forward probes missed live services"
             );
-            assert!(a_tcp.count() > before_tcp && a_udp.count() > before_udp);
-            if has_policy {
-                let denied_before = a_denied_tcp.count();
+            let before_tcp = a_tcp.count();
+            let before_udp = a_udp.count();
+            if should_allow {
                 assert!(
-                    !tcp(b_in_denied_tcp),
-                    "wrong port unexpectedly reached live TCP service"
+                    eventually(|| tcp(b_in_tcp)),
+                    "allowed B→A TCP failed: {}",
+                    a_core.log()
+                );
+                assert!(
+                    eventually(|| udp(b_in_udp, &[0x55]) == Some(vec![0x55])),
+                    "allowed B→A UDP failed: {}",
+                    a_core.log()
+                );
+                assert!(a_tcp.count() > before_tcp && a_udp.count() > before_udp);
+                if has_policy {
+                    let denied_before = a_denied_tcp.count();
+                    assert!(
+                        !tcp(b_in_denied_tcp),
+                        "wrong port unexpectedly reached live TCP service"
+                    );
+                    thread::sleep(Duration::from_millis(150));
+                    assert_eq!(
+                        a_denied_tcp.count(),
+                        denied_before,
+                        "wrong port listener was contacted"
+                    );
+                }
+                // 同一本地允许入口连续查询；第二次仍成功但不再访问上游，证明确实已有热缓存。
+                let upstream_before_warm = upstream.count();
+                assert!(
+                    eventually(
+                        || udp(a_warm_dns, &dns_query()).is_some_and(|p| dns_answers(&p) > 0)
+                    ),
+                    "local warm DNS query did not reach test upstream: {}",
+                    a_core.log()
+                );
+                let upstream_before = upstream.count();
+                assert!(
+                    upstream_before > upstream_before_warm,
+                    "warm DNS query did not reach live upstream"
+                );
+                assert!(
+                    udp(a_warm_dns, &dns_query()).is_some_and(|p| dns_answers(&p) > 0),
+                    "second local DNS query did not return cached answer"
                 );
                 thread::sleep(Duration::from_millis(150));
                 assert_eq!(
-                    a_denied_tcp.count(),
-                    denied_before,
-                    "wrong port listener was contacted"
+                    upstream.count(),
+                    upstream_before,
+                    "second local DNS query missed cache"
                 );
-            }
-            // 同一本地允许入口连续查询；第二次仍成功但不再访问上游，证明确实已有热缓存。
-            let upstream_before_warm = upstream.count();
-            assert!(
-                eventually(|| udp(a_warm_dns, &dns_query()).is_some_and(|p| dns_answers(&p) > 0)),
-                "local warm DNS query did not reach test upstream: {}",
-                a_core.log()
-            );
-            let upstream_before = upstream.count();
-            assert!(
-                upstream_before > upstream_before_warm,
-                "warm DNS query did not reach live upstream"
-            );
-            assert!(
-                udp(a_warm_dns, &dns_query()).is_some_and(|p| dns_answers(&p) > 0),
-                "second local DNS query did not return cached answer"
-            );
-            thread::sleep(Duration::from_millis(150));
-            assert_eq!(
-                upstream.count(),
-                upstream_before,
-                "second local DNS query missed cache"
-            );
-            let protected = udp(b_in_dns, &dns_query());
-            if has_policy {
-                assert!(
-                    protected.as_deref().is_none_or(|p| dns_answers(p) == 0),
-                    "protected endpoint returned cached DNS answer"
+                let protected = udp(b_in_dns, &dns_query());
+                if has_policy {
+                    assert!(
+                        protected.as_deref().is_none_or(|p| dns_answers(p) == 0),
+                        "protected endpoint returned cached DNS answer"
+                    );
+                } else {
+                    assert!(
+                        protected.as_deref().is_some_and(|p| dns_answers(p) > 0),
+                        "legacy endpoint did not return cached DNS answer: {}",
+                        a_core.log()
+                    );
+                }
+                thread::sleep(Duration::from_millis(150));
+                assert_eq!(
+                    upstream.count(),
+                    upstream_before,
+                    "protected DNS query reached upstream"
                 );
             } else {
-                assert!(
-                    protected.as_deref().is_some_and(|p| dns_answers(p) > 0),
-                    "legacy endpoint did not return cached DNS answer: {}",
-                    a_core.log()
+                assert!(!tcp(b_in_tcp), "{label}: denied TCP returned service echo");
+                assert_ne!(
+                    udp(b_in_udp, &[0x55]),
+                    Some(vec![0x55]),
+                    "{label}: denied UDP returned service echo"
+                );
+                thread::sleep(Duration::from_millis(150));
+                assert_eq!(
+                    a_tcp.count(),
+                    before_tcp,
+                    "{label}: TCP listener was contacted"
+                );
+                assert_eq!(
+                    a_udp.count(),
+                    before_udp,
+                    "{label}: UDP listener was contacted"
                 );
             }
-            thread::sleep(Duration::from_millis(150));
-            assert_eq!(
-                upstream.count(),
-                upstream_before,
-                "protected DNS query reached upstream"
-            );
-        } else {
-            assert!(!tcp(b_in_tcp), "{label}: denied TCP returned service echo");
-            assert_ne!(
-                udp(b_in_udp, &[0x55]),
-                Some(vec![0x55]),
-                "{label}: denied UDP returned service echo"
-            );
-            thread::sleep(Duration::from_millis(150));
-            assert_eq!(
-                a_tcp.count(),
-                before_tcp,
-                "{label}: TCP listener was contacted"
-            );
-            assert_eq!(
-                a_udp.count(),
-                before_udp,
-                "{label}: UDP listener was contacted"
-            );
-        }
-        let before_forward_tcp = b_tcp.count();
-        let before_forward_udp = b_udp.count();
-        let (forward_tcp, listener_observations) =
-            diagnostics::observe_forward_tcp(a_out_tcp, &listeners, &policy_baseline);
-        if let Err(error) = &forward_tcp {
-            failure::capture(
-                failure::Context {
-                    phase: "forward-after-ingress",
-                    family,
-                    policy: label,
-                    error,
-                    core,
-                    a: &a,
-                    b: &b,
-                    listener_observations: &listener_observations,
-                },
-                &mut a_core,
-                &mut b_core,
-            );
-        }
-        assert!(
+            let before_forward_tcp = b_tcp.count();
+            let before_forward_udp = b_udp.count();
+            let (forward_tcp, listener_observations) =
+                diagnostics::observe_forward_tcp(a_out_tcp, &listeners, &policy_baseline);
+            if let Err(error) = &forward_tcp {
+                failure::capture(
+                    failure::Context {
+                        phase: "forward-after-ingress",
+                        family,
+                        policy: label,
+                        error,
+                        core,
+                        a: &a,
+                        b: &b,
+                        listener_observations: &listener_observations,
+                    },
+                    &mut a_core,
+                    &mut b_core,
+                );
+            }
+            assert!(
             forward_tcp.is_ok(),
             "{family}/{label}: A→B TCP died after ingress checks: A={} / B={}; probe={forward_tcp:?}; listener={}",
             a_core.log(),
             b_core.log(),
             listener_observations
         );
-        assert!(
-            eventually(|| udp(a_out_udp, &[0x49]) == Some(vec![0x49])),
-            "{family}/{label}: A→B UDP died after ingress checks: A={} / B={}",
-            a_core.log(),
-            b_core.log()
-        );
-        assert!(
-            b_tcp.count() > before_forward_tcp && b_udp.count() > before_forward_udp,
-            "{family}/{label}: post-check forward probes missed live services"
-        );
-        a_core.assert_alive();
-        b_core.assert_alive();
-        eprintln!("mesh runtime passed: WG {family}/{label}");
-        drop(a_core);
-        drop(b_core);
+            assert!(
+                eventually(|| udp(a_out_udp, &[0x49]) == Some(vec![0x49])),
+                "{family}/{label}: A→B UDP died after ingress checks: A={} / B={}",
+                a_core.log(),
+                b_core.log()
+            );
+            assert!(
+                b_tcp.count() > before_forward_tcp && b_udp.count() > before_forward_udp,
+                "{family}/{label}: post-check forward probes missed live services"
+            );
+            a_core.assert_alive();
+            b_core.assert_alive();
+            eprintln!("mesh runtime passed: WG {family}/{label}");
+            drop(a_core);
+            drop(b_core);
+            break;
+        }
     }
 }
 

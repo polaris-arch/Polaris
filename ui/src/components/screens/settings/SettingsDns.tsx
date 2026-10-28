@@ -22,6 +22,7 @@ import {
 } from '@/domain/dns-connection-resolution';
 import {
   Phead,
+  Button,
   SetBlock,
   SetRow,
   SetRowGroup,
@@ -32,6 +33,7 @@ import {
 } from './Primitives';
 import { api } from '@/ipc';
 import { useAppStore } from '@/store/app-store';
+import { useNavStore } from '@/store/nav-store';
 import { ListEditor } from './ListEditor';
 import {
   DNS_FALLBACK,
@@ -346,6 +348,12 @@ export default function SettingsDns({
             <option value="dnsRules">{t('settings.dns.connectionLocal')}</option>
           </Select>
         </SetRow>
+
+        {hasDnsPolicyV2 && <SetRow label="FakeIP" tip={t('settings.dns.fakeIpPolicyLocation')}>
+          <Button variant="ghost" size="sm" onClick={() => useNavStore.getState().navigate('dnsrules')}>
+            {t('rules.dnsWorkspace.rulesTab')}
+          </Button>
+        </SetRow>}
 
         {!hasDnsPolicyV2 && <SetRow label="FakeIP" tip={t('settings.dns.fakeIpDesc')}>
           <Switch

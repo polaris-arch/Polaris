@@ -526,3 +526,33 @@ fn recorded_selection_cannot_consume_an_independent_ready_event() {
         "a consumed wake must not create an unbounded loop"
     );
 }
+
+#[test]
+fn superseded_refresh_is_not_a_scheduler_failure_or_announcement() {
+    assert_eq!(
+        refresh_completion_status(&json!({"success":false,"superseded":true})),
+        None
+    );
+    assert_eq!(
+        refresh_completion_status(&json!({"success":false})),
+        Some(false)
+    );
+    assert_eq!(
+        refresh_completion_status(&json!({"success":true})),
+        Some(true)
+    );
+    assert_eq!(
+        refresh_completion_status(&json!({"success":false,"superseded":"true"})),
+        Some(false)
+    );
+    let source = crate::test_support::crate_code("runtime/subscription_scheduler.rs");
+    let run = source
+        .split("let result = perform_subscription_update(")
+        .nth(1)
+        .unwrap();
+    assert!(
+        run.find("refresh_completion_status(&result)").unwrap()
+            < run.find("build_autoupdate_payload(").unwrap()
+    );
+    assert!(run.find("continue;").unwrap() < run.find("inner.backoff.record_failure(").unwrap());
+}

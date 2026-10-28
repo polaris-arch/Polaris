@@ -14,12 +14,12 @@ import time
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
-# Settings consumer pins include the APPLE-01 success-only publication repair.
+# Settings consumer pins include success-only publication and paired-runtime admission.
 # These hashes identify source bytes; they are not independent review receipts.
 # Swift/SDK/ABI acceptance remains pending.
 CONSUMERS = {
-    'PacketTunnelProvider.swift': '840a5cf052087c3cc4e97b7818ab2d5c4a138fd0b1804de79ae13e04cd17532a',
-    'TunnelLifecycle.swift': '61264efc31c595f6cc2d9a086d51da045472be6adb266cb300be53036f9e0cd1',
+    'PacketTunnelProvider.swift': '451fdd0e4ee6afc83979949e1550f16f45e5caf81daa7e6fd307a6c9acd92cbd',
+    'TunnelLifecycle.swift': '921822cd4cfeaae90a481c32a7e472a6419f266b6f5076d101f802be0c1e8bcd',
     'TunnelMonitorSession.swift': '8d20d4a9f2a4a170ef5d553f2e10679993d4236fd409d1d9b9b803c51cae1ed3',
     'TunnelPlatform.swift': '34c4af7f0bc27baed35607d24fbe6ee183ee1928ec1331862d20187d8bb7d54a',
 }
@@ -431,8 +431,12 @@ import Libbox
 func c2Witness(_ handler: LibboxCommandServerHandlerProtocol, _ platform: LibboxPlatformInterfaceProtocol,
                _ result: LibboxConfigValidationResult, _ exchange: LibboxExchangeContext,
                _ callback: LibboxFuncProtocol, _ transport: LibboxLocalDNSTransportProtocol,
-               _ listener: LibboxInterfaceUpdateListenerProtocol) throws {
+               _ listener: LibboxInterfaceUpdateListenerProtocol, _ server: LibboxCommandServer,
+               _ persistence: LibboxRuntimePersistenceHandlerProtocol) throws {
     var error: NSError?
+    // Compile-only witness: Swift imports the ObjC With... selector as a label.
+    try server.startOrReloadService(withRetryableRuntimePersistence: "{}", options: LibboxOverrideOptions(), handler: persistence)
+    let _: String = server.runtimeCapabilities(&error)
     let _: LibboxCommandServer? = LibboxNewStrictCommandServer(handler, platform, &error)
     let _: LibboxCommandServer? = LibboxNewTransientCommandServer(handler, platform, &error)
     let _: LibboxConfigValidationResult? = LibboxCheckConfigWithResult("{}", "c2-typecheck", 1)

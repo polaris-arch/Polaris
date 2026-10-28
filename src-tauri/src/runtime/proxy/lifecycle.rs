@@ -32,7 +32,46 @@ use polaris_switch_engine::DebouncedOutcome;
 use super::route_replan::RuntimeBindingState;
 use super::system_takeover::should_clear_system_proxy_between_restart;
 use super::{ProxyRuntime, ProxyStatus, StartError};
-use crate::runtime::config::LegacyStartLease;
+use crate::runtime::config::{LegacyStartLease, SavedCommitError};
+
+/// Public status failure is not a partial status or an owned Stop capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyStatusReadError {
+    Saved(SavedCommitError),
+    StatusUnavailable,
+}
+
+impl ProxyStatusReadError {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Saved(SavedCommitError::WriterBusy) => "PROXY_STATUS_WRITER_BUSY",
+            Self::Saved(SavedCommitError::CacheBusy) => "PROXY_STATUS_CACHE_BUSY",
+            Self::Saved(SavedCommitError::WriterPoisoned) => "PROXY_STATUS_WRITER_POISONED",
+            Self::Saved(SavedCommitError::CachePoisoned) => "PROXY_STATUS_CACHE_POISONED",
+            Self::Saved(SavedCommitError::Cold) => "PROXY_STATUS_CACHE_COLD",
+            Self::StatusUnavailable => "PROXY_STATUS_UNAVAILABLE",
+        }
+    }
+}
+
+impl std::fmt::Display for ProxyStatusReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+fn gateway_start_preflight(config: &Value) -> Result<(), StartError> {
+    super::lan_gateway::check_user_config(config, super::platform_tag()).map_err(
+        |error| match error {
+            super::lan_gateway::UserPreflightError::InvalidConfig => {
+                StartError::from("配置解析失败（UserConfig）".to_owned())
+            }
+            super::lan_gateway::UserPreflightError::Gateway(code) => {
+                StartError::coded(code.to_owned(), code)
+            }
+        },
+    )
+}
 
 pub(super) enum StartLeg {
     Finished(Result<ProxyStatus, StartError>, Option<u64>),
@@ -401,14 +440,40 @@ impl ProxyRuntime {
     /// `uptime` 在此**现算**（`now - start_time`，秒）而非读存储值：存储的 uptime 写于起核那一刻，
     /// 读可能在几小时后 → 存了必假。见 [`ProxyStatus`] 文档。
     pub fn status(&self) -> ProxyStatus {
+        let generation = self.gate.generation();
         let mut snap = self.status.read().map(|g| g.clone()).unwrap_or_default();
-        snap.main_generation = self.gate.generation();
-        snap.actual_server_id = self.native_actual_server_id();
+        self.project_status_memory(&mut snap, generation);
+        self.project_status_platform(&mut snap);
+        snap
+    }
+
+    /// Shared read-time fields; no publication lock is acquired here because
+    /// internal callers may already own it. Never attach a native observation
+    /// from a newer incarnation to the captured main generation.
+    pub(super) fn project_status_memory(&self, snap: &mut ProxyStatus, generation: u64) {
+        snap.main_generation = generation;
+        snap.actual_server_id = if snap.running {
+            self.native_actual_server_id_memory(generation)
+        } else {
+            None
+        };
+        if self.gate.generation() != generation
+            || !self
+                .status
+                .read()
+                .map(|status| status.running)
+                .unwrap_or(false)
+        {
+            snap.actual_server_id = None;
+        }
         snap.uptime = snap
             .start_time
             .map(|t0| now_ms().saturating_sub(t0) / 1_000);
-        // 读时投影（同 uptime）：起核腿在飞 ⇒ starting=true。存储态恒 false，故读这一处即全部真值。
         snap.starting = self.start_inflight.load(Ordering::SeqCst) > 0;
+    }
+
+    /// Platform observations remain outside saved-config/intent/publication guards.
+    fn project_status_platform(&self, snap: &mut ProxyStatus) {
         #[cfg(target_os = "android")]
         {
             snap.reconnect_required = native_reconnect_required(self.config.dir());
@@ -422,7 +487,8 @@ impl ProxyRuntime {
                 snap.actual_server_id = None;
             }
         }
-        snap
+        #[cfg(not(target_os = "android"))]
+        let _ = snap;
     }
 
     /// Actual ready-core snapshot, updated only after startup succeeds; saved/pending configuration is separate.
@@ -615,6 +681,7 @@ impl ProxyRuntime {
     ///
     /// **边界**：系统代理 enable / TUN / helper 提权起核**不在本批次**——见模块级声明。
     pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {
+        gateway_start_preflight(&config)?;
         self.wait_start_completion(self.explicit_start_completion(config)?)
             .await
     }
@@ -624,6 +691,7 @@ impl ProxyRuntime {
         config: Value,
         admission: super::prerequisite::StartupAdmission,
     ) -> Result<ProxyStatus, StartError> {
+        gateway_start_preflight(&config)?;
         self.wait_start_completion(self.startup_start_completion(config, admission)?)
             .await
     }
@@ -662,6 +730,12 @@ impl ProxyRuntime {
         expected_generation: Option<u64>,
         attribution: LifecycleAttribution,
     ) -> StartLeg {
+        if expected_generation.is_some_and(|generation| self.gate.generation() != generation) {
+            return StartLeg::Superseded;
+        }
+        if let Err(error) = gateway_start_preflight(&config) {
+            return StartLeg::Finished(Err(error), None);
+        }
         let (mut receiver, claim) =
             match self.guarded_start_completion(&config, expected_generation) {
                 Ok(completion) => completion,
@@ -731,6 +805,12 @@ impl ProxyRuntime {
         completion: Option<&super::prerequisite::NormalStartClaim>,
         attribution: LifecycleAttribution,
     ) -> StartLeg {
+        if expected_generation.is_some_and(|generation| self.gate.generation() != generation) {
+            return StartLeg::Superseded;
+        }
+        if let Err(error) = gateway_start_preflight(&config) {
+            return StartLeg::Finished(Err(error), None);
+        }
         if !cfg!(target_os = "android") {
             match self.desktop_shutdown.lock() {
                 Ok(closing) if *closing || self.system_proxy.session_query_active() => {
@@ -1209,18 +1289,24 @@ impl ProxyRuntime {
     /// real configuration writer is active or cache is unavailable: cache.read alone
     /// can pair old D with the intent already registered by an unpublished writer.
     /// The fence callback only reads memory; platform observations run after it.
-    pub(crate) fn status_with_owned_stop_context(&self) -> Result<ProxyStatus, String> {
+    pub(crate) fn status_with_owned_stop_context(
+        &self,
+    ) -> Result<ProxyStatus, ProxyStatusReadError> {
         let mut status = self
             .config
-            .try_with_saved_commit(|config| {
+            .try_with_saved_commit_classified(|config| {
                 self.selector_reconcile.with_intent_claim(|intent| {
+                    // Same config -> intent -> publication order as owned Stop.
+                    // The native groups and main generation are captured together;
+                    // no awaited read or event callback runs under these guards.
+                    let _publication = self.gate.lock_generation_publication();
+                    let generation = self.gate.generation();
                     let mut status = self
                         .status
                         .read()
-                        .map_err(|_| "proxy status unavailable".to_owned())?
+                        .map_err(|_| ProxyStatusReadError::StatusUnavailable)?
                         .clone();
-                    status.main_generation = self.gate.generation();
-                    status.starting = self.start_inflight.load(Ordering::SeqCst) > 0;
+                    self.project_status_memory(&mut status, generation);
                     status.owned_stop_context = Some(OwnedStopContext {
                         selected_server_id: config
                             .get("selectedServerId")
@@ -1228,17 +1314,11 @@ impl ProxyRuntime {
                             .map(str::to_owned),
                         selection_intent_generation: intent,
                     });
-                    Ok::<_, String>(status)
+                    Ok::<_, ProxyStatusReadError>(status)
                 })
             })
-            .map_err(|error| error.to_string())??;
-        status.uptime = status
-            .start_time
-            .map(|t0| now_ms().saturating_sub(t0) / 1_000);
-        #[cfg(target_os = "android")]
-        {
-            status.reconnect_required = native_reconnect_required(self.config.dir());
-        }
+            .map_err(ProxyStatusReadError::Saved)??;
+        self.project_status_platform(&mut status);
         Ok(status)
     }
 
@@ -1481,6 +1561,7 @@ impl ProxyRuntime {
         if let Ok(mut snap) = self.startup_snapshot.write() {
             *snap = None;
         }
+        self.clear_runtime_config_baseline();
         if let Ok(mut ready) = self.ready_main.write() {
             *ready = None;
         }
@@ -1570,6 +1651,12 @@ impl ProxyRuntime {
         config: Value,
         expected_generation: Option<u64>,
     ) -> RestartLeg {
+        if expected_generation.is_some_and(|generation| self.gate.generation() != generation) {
+            return RestartLeg::Superseded;
+        }
+        if let Err(error) = gateway_start_preflight(&config) {
+            return RestartLeg::Finished(Err(error), None);
+        }
         if !cfg!(target_os = "android") {
             match self.desktop_shutdown.lock() {
                 Ok(closing) if *closing || self.system_proxy.session_query_active() => {
@@ -1724,6 +1811,14 @@ impl ProxyRuntime {
         claim: StopClaim<'_>,
         attribution: LifecycleAttribution,
     ) -> RestartLeg {
+        if let Err(error) = gateway_start_preflight(&config) {
+            let generation = match &claim {
+                StopClaim::AlreadyClaimed(generation)
+                | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
+                StopClaim::Request(_) => None,
+            };
+            return RestartLeg::Finished(Err(error), generation);
+        }
         let already_claimed = match &claim {
             StopClaim::AlreadyClaimed(generation)
             | StopClaim::AlreadyClaimedUnderGate(generation, _) => Some(*generation),
@@ -2039,48 +2134,74 @@ impl ProxyRuntime {
                 return None;
             }
         };
-        self.selector_reconcile.with_intent_claim(|current_intent| {
-            let mut pending = self
-                .pending_force_restart
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !self.debounced.is_current_ticket(ticket) {
-                return None;
-            }
-            let snapshot = match (force_id, pending.as_ref()) {
-                (Some(want), Some((id, value, source))) if want == *id => {
-                    if let super::ForceRestartSource::Selected { intent_generation } = source {
-                        if *intent_generation != current_intent {
-                            *pending = None;
-                            if self.gate.pending().force_restart_id == Some(want) {
-                                self.gate.clear_force_restart();
-                            }
-                            return None;
-                        }
+        self.config
+            .try_with_saved_commit(|desired| {
+                self.selector_reconcile.with_intent_claim(|current_intent| {
+                    let mut pending = self
+                        .pending_force_restart
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !self.debounced.is_current_ticket(ticket) {
+                        return None;
                     }
-                    Some(value.clone())
-                }
-                (None, None) => None,
-                // A newer Apply replaced the snapshot after the timer decided, or a force
-                // snapshot appeared after a plain timer decided. Leave the new owner intact.
-                _ => return None,
-            };
-            let generation = self
-                .gate
-                .try_begin_restart(scheduled_generation, force_id)?;
-            // This successful claim precedes the AlreadyClaimed stop leg and every cleanup await.
-            self.coex.claim(generation, false);
-            starts.book_restart(
-                Arc::clone(&self.stop_domain),
-                scheduled_generation,
-                Some(generation),
-            );
-            self.gen_changed.notify_waiters();
-            if force_id.is_some() {
-                *pending = None;
-            }
-            Some((snapshot, generation, legacy_lease))
-        })
+                    let snapshot = match (force_id, pending.as_ref()) {
+                        (Some(want), Some((id, value, source))) if want == *id => {
+                            if matches!(source, super::ForceRestartSource::Confirmed { .. })
+                                && value != desired
+                            {
+                                *pending = None;
+                                self.gate.clear_force_restart();
+                                return None;
+                            }
+                            if let super::ForceRestartSource::Selected { intent_generation }
+                            | super::ForceRestartSource::Confirmed { intent_generation } = source
+                            {
+                                if *intent_generation != current_intent {
+                                    *pending = None;
+                                    if self.gate.pending().force_restart_id == Some(want) {
+                                        self.gate.clear_force_restart();
+                                    }
+                                    return None;
+                                }
+                            }
+                            Some(value.clone())
+                        }
+                        (None, None) => None,
+                        // A newer Apply replaced the snapshot after the timer decided, or a force
+                        // snapshot appeared after a plain timer decided. Leave the new owner intact.
+                        _ => return None,
+                    };
+                    // Reject the exact selected snapshot before claiming a generation or
+                    // stopping the existing child; final generation checks again at Start.
+                    if let Err(error) =
+                        gateway_start_preflight(snapshot.as_ref().unwrap_or(desired))
+                    {
+                        self.publish_owned_restart_failure(
+                            &error,
+                            LifecycleAttribution::restart(force_id),
+                            scheduled_generation,
+                        );
+                        return None;
+                    }
+                    let generation = self
+                        .gate
+                        .try_begin_restart(scheduled_generation, force_id)?;
+                    // This successful claim precedes the AlreadyClaimed stop leg and every cleanup await.
+                    self.coex.claim(generation, false);
+                    starts.book_restart(
+                        Arc::clone(&self.stop_domain),
+                        scheduled_generation,
+                        Some(generation),
+                    );
+                    self.gen_changed.notify_waiters();
+                    if force_id.is_some() {
+                        *pending = None;
+                    }
+                    Some((snapshot, generation, legacy_lease))
+                })
+            })
+            .ok()
+            .flatten()
     }
 
     /// 置错误态（起核失败）。

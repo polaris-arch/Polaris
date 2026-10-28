@@ -16,6 +16,8 @@ import zipfile
 
 HERE = Path(__file__).resolve().parent
 BINDING = HERE / 'native-dns-source-binding.json'
+# Syntax parity does not activate this staging-only entry or widen its channels.
+POLARIS_VERSION = re.compile(json.loads((HERE.parent / 'lib/polaris-version.json').read_bytes())['pattern'])
 spec = importlib.util.spec_from_file_location('native_dns_source_archive', HERE / 'release-archive.py')
 archive = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(archive)
@@ -54,9 +56,9 @@ def validate(binding):
     require(binding['repository'] == 'polaris-arch/sing-box-polaris' and
             type(binding['repositoryId']) is int and binding['repositoryId'] == 1421657509,
             'source repository differs')
+    version = POLARIS_VERSION.fullmatch(binding['version']) if isinstance(binding['version'], str) else None
     require(all(hexadecimal(binding[key], 40) for key in ('sourceCommit', 'sourceTree')) and
-            isinstance(binding['version'], str) and
-            re.fullmatch(r'\d+\.\d+\.\d+-polaris-alpha\.\d+', binding['version']), 'source identity invalid')
+            version and version[3] == 'alpha', 'source identity invalid')
     producer = binding['producer']
     require(isinstance(producer, dict) and set(producer) == {'workflow', 'workflowCommit', 'runId', 'runAttempt'} and
             producer['workflow'] == '.github/workflows/build.yml' and

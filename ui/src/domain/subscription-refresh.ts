@@ -27,6 +27,8 @@
  */
 import type { TFunction } from 'i18next';
 import { api } from '@/ipc';
+import type { SubscriptionUpdateProgress } from '@/contracts/subscription-progress';
+import type { SubscriptionRefreshResult } from '@/ipc/api/subscriptions';
 import { toast } from '@/lib/error-handler';
 import { subscriptionErrorDetail } from './subscription-error-text';
 
@@ -36,7 +38,7 @@ import { subscriptionErrorDetail } from './subscription-error-text';
  */
 export type SubscriptionRefreshOutcome =
   | { readonly ok: true }
-  | { readonly ok: false; readonly detail: string };
+  | { readonly ok: false; readonly detail: string; readonly superseded?: boolean };
 
 /**
  * 拉取指定订阅并弹三态 toast。
@@ -50,6 +52,21 @@ export async function refreshSubscriptionWithToast(
 ): Promise<SubscriptionRefreshOutcome> {
   try {
     const r = await api.subscription.updateServers(subId);
+    return presentSubscriptionRefreshResult(r, t);
+  } catch (err) {
+    console.error('[subscription-refresh]', err);
+    // IPC reject 不保证来自本命令；不能把潜在的 Rust/transport 文案直接带到 UI。
+    toast.error(t('nodes.subRefreshFail'), t('nodes.subRefreshFail'));
+    return { ok: false, detail: t('nodes.subRefreshFail') };
+  }
+}
+
+/** Present one completed backend result; never initiates a second request. */
+export function presentSubscriptionRefreshResult(
+  r: SubscriptionRefreshResult,
+  t: TFunction,
+): SubscriptionRefreshOutcome {
+  if (r.superseded) return { ok: false, detail: '', superseded: true };
     if (!r.success) {
       const detail = subscriptionErrorDetail(r, t);
       toast.error(t('nodes.subRefreshFail'), detail);
@@ -64,10 +81,20 @@ export async function refreshSubscriptionWithToast(
       t('nodes.subRefreshOk', { count: changed })
     );
     return { ok: true };
-  } catch (err) {
-    console.error('[subscription-refresh]', err);
-    // IPC reject 不保证来自本命令；不能把潜在的 Rust/transport 文案直接带到 UI。
-    toast.error(t('nodes.subRefreshFail'), t('nodes.subRefreshFail'));
-    return { ok: false, detail: t('nodes.subRefreshFail') };
-  }
+}
+
+/** Existing truthful phases, shared by desktop/mobile edit forms. */
+export function subscriptionEditProgressText(progress: SubscriptionUpdateProgress | null, t: TFunction): string {
+  if (progress?.phase === 'providers') return t('nodes.subUpdatingProviders', {done: progress.done ?? 0, total: progress.total ?? 0});
+  if (progress?.phase === 'reconciling') return t('nodes.subUpdatingReconciling');
+  if (progress?.phase === 'fetching') return t('nodes.subUpdatingFetching');
+  return t('common.saving');
+}
+
+
+/** Only the matching native post-save owner frame can unlock a second mutation. */
+export function isSavedEditProgress(frame: SubscriptionUpdateProgress, subscriptionId: string, requestId: string): boolean {
+  return frame.subscriptionId === subscriptionId && frame.editRequestId === requestId
+    && frame.saved === true && Number.isSafeInteger(frame.generation) && (frame.generation ?? 0) > 0
+    && ['fetching','providers','reconciling','done','unchanged','failed'].includes(frame.phase);
 }

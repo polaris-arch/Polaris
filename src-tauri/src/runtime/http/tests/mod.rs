@@ -1770,3 +1770,64 @@ async fn executable_download_guard_rejects_private_and_insecure_targets_without_
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn subscription_default_and_override_ua_are_real_wire_headers() {
+    // Synthetic ordinary loopback only. No subscription endpoint or credentials.
+    let default = app_user_agent();
+    for (input, expected) in [
+        (String::new(), default.clone()),
+        (default.clone(), default.clone()),
+        ("global/2".into(), "global/2".into()),
+        ("per-sub/3".into(), "per-sub/3".into()),
+        ("Polaris/1.0".into(), "Polaris/1.0".into()),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                assert_eq!(socket.read(&mut byte).unwrap(), 1);
+                request.push(byte[0]);
+                assert!(request.len() <= 16384);
+            }
+            tx.send(String::from_utf8(request).unwrap()).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let runtime = HttpRuntime::new().unwrap();
+        let response = runtime
+            .fetch_guarded(
+                &format!("http://ua-fixture.invalid:{}/list", addr.port()),
+                &FetchInit {
+                    user_agent: input,
+                    timeout_ms: Some(3000),
+                    max_body_bytes: Some(1024),
+                    ..Default::default()
+                },
+                &GuardedTarget {
+                    host: "ua-fixture.invalid".into(),
+                    addresses: vec![addr.ip()],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"ok");
+        let request = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let headers: Vec<_> = request
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter(|(key, _)| key.eq_ignore_ascii_case("user-agent"))
+            .collect();
+        assert_eq!(headers.len(), 1, "exactly one UA header");
+        assert_eq!(headers[0].1.trim(), expected);
+        server.join().unwrap();
+    }
+}

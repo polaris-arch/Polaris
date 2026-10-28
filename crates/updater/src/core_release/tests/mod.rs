@@ -9,26 +9,37 @@ fn selection() -> Value {
     pending["selection"].clone()
 }
 
+fn current_release_contract() -> Value {
+    serde_json::from_str(&polaris_source_probe::repo_file!(
+        "scripts/desktop-core/release-contract.json"
+    ))
+    .unwrap()
+}
+
 #[test]
 fn complete_release_identity_is_distinct_from_source_identity() {
     let value = selection();
+    let contract = current_release_contract();
+    assert_eq!(value["sourceCommit"], contract["sourceCommit"]);
+    assert_ne!(contract["sourceCommit"], contract["sourceTree"]);
     assert_eq!(
         desktop_release_identity(&value),
         Some((
-            "1.15.0-polaris-alpha.12",
-            "830f7256af499e5ad3e7da9a79f0a377ca38fc77"
+            contract["version"].as_str().unwrap(),
+            contract["sourceTree"].as_str().unwrap()
         ))
     );
 }
 
 #[test]
-fn final_polaris_alpha12_is_admitted_only_with_the_complete_exact_release_binding() {
+fn current_formal_release_is_admitted_only_with_the_complete_exact_release_binding() {
     let value = &selection();
+    let contract = current_release_contract();
     assert_eq!(
         desktop_release_identity(value),
         Some((
-            "1.15.0-polaris-alpha.12",
-            "830f7256af499e5ad3e7da9a79f0a377ca38fc77"
+            contract["version"].as_str().unwrap(),
+            contract["sourceTree"].as_str().unwrap()
         ))
     );
     let mut invalid = value.clone();
@@ -246,4 +257,52 @@ fn archived_formal_identity_cannot_replace_the_current_compiled_release() {
         ))
     );
     assert!(desktop_release_identity(old).is_none());
+}
+
+#[test]
+fn shared_version_corpus_preserves_raw_patch_identity_without_promoting_pins() {
+    let cases: Value = serde_json::from_str(&polaris_source_probe::repo_file!(
+        "scripts/lib/polaris-version-fixtures.json"
+    ))
+    .unwrap();
+    for (group, accepted) in [("accepted", true), ("rejected", false)] {
+        for value in cases[group].as_array().unwrap() {
+            let version = value.as_str().unwrap();
+            assert_eq!(upstream_release_version(version), accepted, "{version:?}");
+            let (selection, raw) = bound_fixture(version, true);
+            let identity = desktop_release_identity_from_contract(&selection, &raw);
+            assert_eq!(identity.is_some(), accepted, "{version:?}");
+            if accepted {
+                assert_eq!(identity.unwrap().0, version);
+            }
+            // Synthetic valid syntax is not the currently compiled release.
+            assert!(desktop_release_identity(&selection).is_none());
+        }
+    }
+}
+
+#[test]
+fn patch_identity_requires_independent_contract_tag_source_and_asset_bindings() {
+    let (value, raw) = bound_fixture("1.15.0-polaris-alpha.12.1", true);
+    for (key, bad) in [
+        ("version", json!("1.15.0-polaris-alpha.12")),
+        ("tag", json!("v1.15.0-polaris-alpha.12")),
+        ("tagObject", json!("f".repeat(40))),
+        ("sourceCommit", json!("f".repeat(40))),
+        ("sourceTree", json!("f".repeat(40))),
+        ("releaseId", json!(18)),
+        ("contractSha256", json!("f".repeat(64))),
+    ] {
+        let mut changed = value.clone();
+        changed[key] = bad;
+        assert!(
+            desktop_release_identity_from_contract(&changed, &raw).is_none(),
+            "{key}"
+        );
+    }
+    for platform in ["linux", "win"] {
+        let mut changed = value.clone();
+        changed["librarySha256"][platform] = json!("f".repeat(64));
+        assert!(desktop_release_identity_from_contract(&changed, &raw).is_none());
+    }
 }

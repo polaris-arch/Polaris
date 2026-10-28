@@ -326,7 +326,7 @@ const SILENT_TOAST_BASELINE = 0;
  * ——它按整个移动端层叠上下文取材，谁新加一个更高的层就当场红。
  * 🔴 抬这个数之前仍要先过上面那几条，否则就是又写了几处静音反馈还把账做平了。
  */
-const SILENT_TOAST_WITHOUT_HOST = 77; // Added visible mobile rule mutation failure feedback; host-removal controls remain exact.
+const SILENT_TOAST_WITHOUT_HOST = 78; // SubFormPanel now has 4 reachable toasts: creation, edit saved, refresh failure, recovered creation; host-removal controls remain exact.
 
 /* ══════════════════════════ 断言 ══════════════════════════ */
 
@@ -601,6 +601,7 @@ describe('半真文案的事实门', () => {
         ['components/layout/Toaster.tsx'],
         toastHostInstallSites(),
       );
+      expect(withoutHost.perFile['mobile/forms/SubFormPanel.tsx']).toBe(4);
       expect(
         withoutHost.total,
         `宿主不在时的静音数应为 ${SILENT_TOAST_WITHOUT_HOST}。` +

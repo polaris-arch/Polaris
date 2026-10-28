@@ -167,7 +167,9 @@ async fn protected_main_run(
 ) {
     use super::super::super::prerequisite::NormalStartCompletion;
     let gate = rt.mesh.tailscale_state_gate().await;
-    let mut completion = rt.normal_start_completion(serde_json::Value::Null).unwrap();
+    let mut completion = rt
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while matches!(
             &*completion.borrow_and_update(),
@@ -741,19 +743,19 @@ async fn shutdown_fence_rejects_public_and_guarded_starts_and_runtime_restart() 
     rt.begin_shutdown().unwrap();
     let generation = rt.gate.generation();
     assert!(rt
-        .start(serde_json::Value::Null)
+        .start(post_admission_failure_config())
         .await
         .unwrap_err()
         .message
         .contains("shutting down"));
     assert!(rt
-        .restart(serde_json::Value::Null)
+        .restart(post_admission_failure_config())
         .await
         .unwrap_err()
         .message
         .contains("shutting down"));
     assert!(matches!(
-        rt.start_guarded(serde_json::Value::Null, Some(generation))
+        rt.start_guarded(post_admission_failure_config(), Some(generation))
             .await,
         super::super::super::lifecycle::StartLeg::Finished(Err(_), None)
     ));
@@ -807,7 +809,7 @@ async fn strict_exit_registry_error_retains_native_custody_and_stays_closed() {
         .contains("poisoned"));
     assert_retained_main(&rt, "exit-registry-error", pid);
     assert!(rt
-        .start(serde_json::Value::Null)
+        .start(post_admission_failure_config())
         .await
         .unwrap_err()
         .message
@@ -965,7 +967,9 @@ async fn synchronous_drain_panic_retains_factory_entered_unknown_after_dispatch_
     use super::super::super::prerequisite::NormalStartCompletion;
     let (rt, _dir) = test_runtime();
     let gate = rt.mesh.tailscale_state_gate().await;
-    let mut completion = rt.normal_start_completion(serde_json::Value::Null).unwrap();
+    let mut completion = rt
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         while matches!(
             &*completion.borrow_and_update(),
@@ -1112,9 +1116,11 @@ async fn f1_original_main_membership_survives_stop_generation_and_explicit_surre
     let (foreign, _foreign_dir) = test_runtime();
     assert!(pause.surrender(&foreign).is_err());
     drop(observer);
-    assert!(rt.normal_start_completion(serde_json::Value::Null).is_err());
+    assert!(rt
+        .normal_start_completion(post_admission_failure_config())
+        .is_err());
     assert!(matches!(
-        rt.restart_guarded_outcome(serde_json::Value::Null, Some(generation))
+        rt.restart_guarded_outcome(post_admission_failure_config(), Some(generation))
             .await,
         super::super::super::lifecycle::RestartLeg::Finished(Err(_), _)
     ));

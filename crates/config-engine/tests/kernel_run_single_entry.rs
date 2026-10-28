@@ -134,9 +134,11 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
             5,
             5,
         ),
-        // Five socket/process controls and one config check do not run a core;
+        // Eight socket/process/diagnostic controls and one config check do not run
+        // a core. The three added WireGuard controls cover IPv4 lease ownership,
+        // bounded exact bind-conflict retry and failure receipt classification;
         // the WireGuard and MASQUE runtime tests still require both kernel gates.
-        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 8, 2),
+        ("crates/config-engine/tests/mesh_inbound_runtime.rs", 11, 2),
         (
             "crates/config-engine/tests/subscription_update_guard_runtime.rs",
             2,
@@ -209,6 +211,15 @@ fn known_kernel_run_tests_are_wired_to_the_helper() {
 /// CI 可以只读拒绝继承的禁核开关，但不能设置或注入它。
 /// 只识别现有 admission 的严格相等 + 立即 throw 形态；其它引用仍保守拒收，
 /// 不按工作流名字豁免整份文件，也不让一处合法拒绝掩盖同文件的写入。
+// Exact selector presence rejection: no environment writes, not a file-wide exception.
+const READ_ONLY_SELECTOR_REJECTION: &[&str] = &[
+    "for (const key of ['CORE_CANDIDATE', 'CORE_PLATFORM', 'POLARIS_NATIVE_DNS_CANDIDATE', 'POLARIS_NATIVE_DNS_FORMAL',",
+    "'POLARIS_NATIVE_PAYLOAD_VALIDATION', 'POLARIS_NATIVE_DNS_PLATFORM', 'POLARIS_SINGBOX_PATH', 'POLARIS_TEST_CORE',",
+    "'POLARIS_CORE_IDENTITY_FILE', 'POLARIS_CORE_CARRIER_DIR', 'POLARIS_REQUIRE_KERNEL_GATE', 'POLARIS_KERNEL_GATE_TARGET',",
+    "'POLARIS_NO_KERNEL_RUN', 'POLARIS_BUILD_ID', 'POLARIS_RUNTIME_CONFIG_PROTO_SOURCE', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'])",
+    "if (Object.hasOwn(e, key)) throw Error(`App compile-only must not inherit runtime selectors: ${key}`);",
+];
+
 fn workflow_no_kernel_run_violations(text: &str) -> Vec<usize> {
     let lines: Vec<_> = text.lines().map(str::trim).collect();
     lines
@@ -222,7 +233,9 @@ fn workflow_no_kernel_run_violations(text: &str) -> Vec<usize> {
                 && lines
                     .get(i + 1)
                     .is_some_and(|next| next.starts_with("throw Error(") && next.ends_with(");"));
-            (!read_only_rejection).then_some(i + 1)
+            let read_only_presence =
+                i >= 3 && lines.get(i - 3..i + 2) == Some(READ_ONLY_SELECTOR_REJECTION);
+            (!read_only_rejection && !read_only_presence).then_some(i + 1)
         })
         .collect()
 }
@@ -281,6 +294,32 @@ fn workflow_switch_check_allows_only_read_only_rejection() {
         assert!(
             !workflow_no_kernel_run_violations(&invalid).is_empty(),
             "赋值、非拒绝或混入写入不得被当成只读拒绝：{invalid}"
+        );
+    }
+}
+
+#[test]
+fn selector_presence_guard_is_exact_read_only_and_cannot_mask_writes() {
+    let reject = READ_ONLY_SELECTOR_REJECTION.join("\n");
+    assert!(workflow_no_kernel_run_violations(&reject).is_empty());
+    for invalid in [
+        reject.replace("Object.hasOwn(e, key)", "e[key] = '1'"),
+        reject.replace("throw Error(", "console.log("),
+        reject.replace("throw Error(", "// throw Error("),
+        reject.replace("for (const key", "// for (const key"),
+        reject.replace("const key", "let key"),
+        reject.replace("'POLARIS_NO_KERNEL_RUN'", "\"POLARIS_NO_KERNEL_RUN\""),
+        reject.replace("${key}`);", "${key}`); e[key] = '1';"),
+        format!("{reject}\ne.POLARIS_NO_KERNEL_RUN = '1';"),
+        format!("{reject}\nPOLARIS_NO_KERNEL_RUN: '1'"),
+    ] {
+        assert_ne!(
+            invalid, reject,
+            "negative mutation must actually change the guard"
+        );
+        assert!(
+            !workflow_no_kernel_run_violations(&invalid).is_empty(),
+            "{invalid}"
         );
     }
 }

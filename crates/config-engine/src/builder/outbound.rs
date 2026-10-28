@@ -41,6 +41,18 @@ pub fn protocol_can_carry_transport(protocol: Protocol) -> bool {
     TRANSPORT_CAPABLE.contains(&protocol)
 }
 
+/// Current core supports Vision only on the native TLS/Reality stream.
+/// Preserve the user's transport/flow; never silently turn this into raw TCP.
+pub fn validate_vision_transport(server: &ServerConfig) -> Result<(), &'static str> {
+    if server.protocol == Protocol::Vless
+        && server.flow.as_deref().and_then(normalize_token).as_deref() == Some("xtls-rprx-vision")
+        && generate_transport_config(server).is_some()
+    {
+        return Err("vision-transport-unsupported");
+    }
+    Ok(())
+}
+
 /// Tailcat 透传袋里必须剥掉的键：生成侧自己写的建模键（袋里再留一份会与具名值打架）、
 /// 装配层决定的 Dial Fields（`detour` / `domain_resolver`，`Outbound` 上是具名字段，袋里再有一份就会
 /// 序列化出重复键），以及由 DERP 模式推导的 `http_client`（写错指向会自锁，见 Tailcat 分支）。
@@ -77,6 +89,7 @@ pub fn build_proxy_outbound(
     platform: &str,
 ) -> Result<Outbound, &'static str> {
     tls_pin::validate_server_cert_pins(server)?;
+    validate_vision_transport(server)?;
     let protocol = protocol_str(server.protocol);
 
     // 自定义协议（逃生舱）：**真透传** —— 用户给什么就下发什么，只做两处既有且有理由的改写
@@ -797,8 +810,8 @@ pub(crate) fn custom_passthrough_parts(
 
 /// 生成传输层配置。上游 `generateTransportConfig`。
 fn generate_transport_config(server: &ServerConfig) -> Option<Transport> {
-    let net = server.network.as_deref()?;
-    match net {
+    let net = server.network.as_deref().and_then(normalize_token)?;
+    match net.as_str() {
         "ws" => {
             let ws = server.ws_settings.as_ref();
             let raw_path = ws.and_then(|w| w.path.as_deref()).unwrap_or("/");

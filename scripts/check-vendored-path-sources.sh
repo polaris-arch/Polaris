@@ -58,7 +58,7 @@ for entry in "${VENDORED[@]}"; do
     # 下面就没有东西可数（实测：两条警告在屏幕上，数出来却是 0）。
     # 不接管道、`|| built=$?`：cargo 自己的退出码要留着，但编不过时也得先把诊断原文打出来再红。
     built=0
-    PATH="${extra}${PATH}" cargo clippy --target "$t" -p "$name" --message-format=json > "$out/$name-$t.json" || built=$?
+    PATH="${extra}${PATH}" cargo clippy --target "$t" -p "$name" --keep-going --message-format=json > "$out/$name-$t.json" || built=$?
     jq -r --arg id "$id" 'select(.reason == "compiler-message" and .package_id == $id)
       | select(.message.level == "warning" or .message.level == "error")
       | .message.rendered' "$out/$name-$t.json" > "$out/$name-$t.txt"

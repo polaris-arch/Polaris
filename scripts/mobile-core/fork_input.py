@@ -10,10 +10,12 @@ import json
 from pathlib import Path
 import re
 import subprocess
-from source_policy import validate_source_policy, verify_source_policy_files
+from source_policy import validate_source_policy, verify_source_policy_files, verify_vendor_sources
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT = Path(__file__).with_name('source-contract.json')
+# Shared desktop/mobile grammar; this entry retains its existing alpha-only scope.
+POLARIS_VERSION = re.compile(json.loads((ROOT / 'scripts/lib/polaris-version.json').read_bytes())['pattern'])
 ANDROID_TARGETS = ['android/arm64', 'android/arm', 'android/386', 'android/amd64']
 APPLE_TARGETS = ['ios/arm64', 'iossimulator/arm64']
 ANDROID_ABIS = ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']
@@ -58,9 +60,11 @@ def validate(value):
                        ('goModSha256', 64), ('goSumSha256', 64)]:
         require(isinstance(value.get(key), str) and re.fullmatch('[0-9a-f]{%d}' % width, value[key]),
                 'actual immutable source field required: ' + key)
-    version_pattern = r'\d+\.\d+\.\d+-alpha\.\d+' if historical else r'\d+\.\d+\.\d+-polaris-alpha\.\d+'
-    require(re.fullmatch(version_pattern, value.get('version', '')) and
-            value.get('sourceTag') == 'v' + value['version'], 'mobile source tag/version differs')
+    version = value.get('version')
+    version_match = (re.fullmatch(r'\d+\.\d+\.\d+-alpha\.\d+', version) if historical
+                     else POLARIS_VERSION.fullmatch(version)) if isinstance(version, str) else None
+    require(version_match and (historical or version_match[3] == 'alpha') and
+            value.get('sourceTag') == 'v' + version, 'mobile source tag/version differs')
     require(historical or 'sourcePolicy' in value, 'new mobile repository requires an explicit reviewed source policy')
     policy = validate_source_policy(value['sourcePolicy'], value) if 'sourcePolicy' in value else None
     require(type(value.get('sourceOverlay')) is int and value['sourceOverlay'] == 0 and
@@ -77,8 +81,10 @@ def validate(value):
             android['minimumAPI'] == 24 and android['minimumLoadAlignment'] == 16384 and
             android['javaMajor'] == 17 and android['legacyAPI21Enabled'] is False,
             'formal Android requires one API24/four-ABI AAR and no legacy variant')
-    require(android['ndkRevision'] == '30.0.16138531' and
-            android.get('ndkSourceRevision') == '30.0.16138531-beta3' and android['ndkPackage'] == 'android-ndk-r30-beta3',
+    ndk = ('30.0.16138531', '30.0.16138531-beta3', 'android-ndk-r30-beta3',
+           'scripts/libbox-patches/ndk-linux-archive.json') if historical else (
+           '30.0.16248370', '30.0.16248370', 'android-ndk-r30', 'scripts/mobile-core/ndk-r30-linux.json')
+    require(tuple(android.get(key) for key in ('ndkRevision', 'ndkSourceRevision', 'ndkPackage', 'ndkArchivePath')) == ndk,
             'formal Android NDK differs')
     require(apple['targets'] == APPLE_TARGETS and
             apple['slices'] == ['ios-arm64', 'ios-arm64-simulator'] and
@@ -164,9 +170,14 @@ def verify_source(source, value, *, generator_outputs=False):
     if policy:
         meta = policy['metacubex']
         prefix = meta['replacementPath'][2:]
-        names = git(source, 'ls-tree', '-r', '--name-only', 'HEAD', '--', prefix).splitlines()
-        require(len(names) == meta['replacementFileCount'], 'actual Meta tracked inventory differs')
-        files, total_bytes = {}, 0
+        files, total_bytes, vendor_evidence = {}, 0, {}
+        if 'vendors' in policy:
+            _, files, modes, trees = verify_vendor_sources(source, policy['vendors'], git)
+            vendor_evidence = {'vendor_modes': modes, 'vendor_trees': trees}
+            names = []  # The complete tracked nine-vendor bytes/modes are already read.
+        else:
+            names = git(source, 'ls-tree', '-r', '--name-only', 'HEAD', '--', prefix).splitlines()
+            require(len(names) == meta['replacementFileCount'], 'actual Meta tracked inventory differs')
         for name in names + ['go.mod', 'go.sum', meta['bindingPath'], meta['patchPath']]:
             path = source / name
             require(path.is_file() and not path.is_symlink() and path.resolve(strict=True).is_relative_to(source),
@@ -176,7 +187,7 @@ def verify_source(source, value, *, generator_outputs=False):
             require(total_bytes <= 32 * 1024 * 1024, 'reviewed source proof exceeds bound')
             files[name] = path.read_bytes()
         reviewed['reviewedSource'] = verify_source_policy_files(policy, value, files,
-            git(source, 'rev-parse', 'HEAD:' + prefix))
+            git(source, 'rev-parse', 'HEAD:' + prefix), **vendor_evidence)
     return {'schema': 'polaris-mobile-source-observation-v1', 'sourceCommit': value['sourceCommit'],
             'sourceTree': value['sourceTree'], 'sourceTag': value['sourceTag'],
             'sourceTagObject': value['sourceTagObject'], 'sourceOverlay': 0,

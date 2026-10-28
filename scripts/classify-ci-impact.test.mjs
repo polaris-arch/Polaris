@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   ALL_PACKAGE_PLATFORMS,
+  ANDROID_IMPACT_SCOPES,
   NO_PACKAGE_IMPACT_SCOPES,
   classifyImpact,
   classifyNativeImpact,
@@ -493,5 +494,30 @@ test('workflow efficiency contract alone triggers all desktop installers without
   assert.equal(classifyImpact(['scripts/ci-workflow-efficiency.test.mjs']).android, false);
   for (const path of ['scripts/ci-workflow-efficiency.test.mjs.bak', 'docs/ci-workflow-efficiency.test.mjs']) {
     assert.deepEqual(compact([path]), { kernel: false, platforms: [], preflight: false, hasPackage: false });
+  }
+});
+
+test('Android lifecycle observations are explicitly registered for APK validation', () => {
+  const path = 'src-tauri/src/runtime/proxy/android_bridge/lifecycle_observation.rs';
+  assert(Object.hasOwn(ANDROID_IMPACT_SCOPES, path));
+  assert.match(ANDROID_IMPACT_SCOPES[path].why, /APK Rust cdylib/);
+  assert.equal(classifyImpact([path]).android, true);
+});
+
+// Imported siblings affect the same real packaged Linux acceptance as the CLI entries.
+test('Linux package acceptance directory cannot silently lose its package signal', () => {
+  for (const leaf of [
+    'transport.mjs', 'tun-transport.mjs', 'linux.py', 'linux_tun.py',
+    'root_controller.py', 'tun.py', 'future/owned-module.py',
+  ]) {
+    const impact = classifyImpact([`scripts/package-acceptance/${leaf}`]);
+    assert.deepEqual(impact.platforms, ['linux']);
+    assert.equal(impact.hasPackage, true);
+    assert.equal(impact.preflight, true);
+    assert.equal(impact.kernel, false);
+    assert.equal(impact.android, false);
+  }
+  for (const path of ['scripts/package-acceptance-other/linux.py', 'docs/package-acceptance.md']) {
+    assert.equal(classifyImpact([path]).hasPackage, false);
   }
 });

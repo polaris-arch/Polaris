@@ -55,7 +55,7 @@ vi.mock('@/ipc', () => ({
   },
 }));
 
-import { refreshSubscriptionWithToast } from './subscription-refresh';
+import { isSavedEditProgress, refreshSubscriptionWithToast, presentSubscriptionRefreshResult, subscriptionEditProgressText } from './subscription-refresh';
 
 // ── 假 toast 宿主：记录每一次调用（通道 + 实参）─────────────────────────────────
 interface ToastCall {
@@ -236,5 +236,43 @@ describe('③ 回放修复前的形态 —— 判据必须当场判它有罪', (
     const r = await refreshSubscriptionWithToast('sub-1', t);
     expect(Object.prototype.hasOwnProperty.call(r, 'detail')).toBe(true);
     expect(r.ok ? undefined : r.detail).toBe(calls[0]?.desc);
+  });
+});
+
+
+describe('saved edit presentation never re-fetches', () => {
+  it('presents the completed refresh and keeps saved/fetch outcomes distinct', () => {
+    expect(presentSubscriptionRefreshResult({success:false,addedServers:0,updatedServers:0,deletedServers:0,errorKind:'timeout'}, t).ok).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].channel).toBe('error');
+    expect(updateServers).not.toHaveBeenCalled();
+  });
+  it('does not announce a superseded old result as a failure or success', () => {
+    expect(presentSubscriptionRefreshResult({success:false,superseded:true,generation:1,addedServers:0,updatedServers:0,deletedServers:0}, t)).toEqual({ok:false,detail:'',superseded:true});
+    expect(calls).toEqual([]);
+    expect(updateServers).not.toHaveBeenCalled();
+  });
+  it('shows saving separately from the actual network/provider/reconcile stages', () => {
+    expect(subscriptionEditProgressText(null, t)).toBe('common.saving');
+    expect(subscriptionEditProgressText({subscriptionId:'s',phase:'fetching'}, t)).toBe('nodes.subUpdatingFetching');
+    expect(subscriptionEditProgressText({subscriptionId:'s',phase:'reconciling'}, t)).toBe('nodes.subUpdatingReconciling');
+    expect(subscriptionEditProgressText({subscriptionId:'s',phase:'providers',done:1,total:3}, t)).toContain('"done":1');
+  });
+});
+
+
+describe('correlated native durable-save acknowledgement', () => {
+  const frame = {subscriptionId:'s',editRequestId:'request-a',saved:true as const,generation:1,phase:'fetching' as const};
+  it('accepts only a saved native owner frame for this subscription and request', () => {
+    expect(isSavedEditProgress(frame,'s','request-a')).toBe(true);
+    for (const patch of [{subscriptionId:'other'},{editRequestId:'request-b'},{saved:false},{saved:undefined},
+      {generation:0},{generation:NaN},{generation:'1'},{phase:'unknown'}, {editRequestId:undefined}]) {
+      expect(isSavedEditProgress({...frame,...patch} as never,'s','request-a')).toBe(false);
+    }
+  });
+  it('old or ABA request acknowledgements cannot unlock a successor', () => {
+    expect(isSavedEditProgress(frame,'s','request-b')).toBe(false);
+    expect(isSavedEditProgress({...frame,generation:3},'s','request-b')).toBe(false);
+    expect(isSavedEditProgress({...frame,editRequestId:'request-b',generation:2},'s','request-b')).toBe(true);
   });
 });

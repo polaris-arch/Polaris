@@ -325,23 +325,15 @@ export const RULES_PARITY: ScreenParityRegister = {
      * 形态差一句话说完：桌面「页头入口 → 列表弹窗 → 编辑弹窗叠在上面」，移动端「屏头溢出 → 二级页
      * （`NetworkProfilesPage`）→ 表单宿主一层（`forms/NetworkProfileFormPanel`）」，与 DNS 服务器 / 分组同形。
      * 判据（校验 / 落盘形态 / 引用计数 / 探测显示态）与后端探测结果两端同一份，见两个文件的头注。
-     * 同一段 JSX 在桌面被数成两颗（`<ConfigShell render={…}>` 的开标签里含 `onClick`，外壳与里面那层
-     * `<Modal>` 各算一颗，后者带 `#2`），两颗各自落在移动端对应的那一格上。 */
+     * 渲染槽中的子按钮按真实动作登记；ConfigShell/Modal 本身不因槽内 onClick 再算动作。
+     * 原外壳内容证据由 screen-parity 的 slot content 回归继续验证。 */
     {
       id: 'RulesScreen.tsx|k:rules.networkProfile.entry',
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: "label: tr('rules.networkProfile.entry')," } },
       note: '规则页的「网络场景」入口（两个平面共用，spec §6.1）。移动端屏头动作封顶两颗（§3.1 #10），入口进溢出面板：流量段与 DNS 段各一颗溢出、进同一张二级页。',
     },
-    {
-      id: 'NetworkProfilePanel.tsx|k:common.close+rules.networkProfile.add+rules.networkProfile.intro',
-      disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: "if (page === 'network-profiles') {" } },
-      note: '场景列表弹窗的读取外壳（`<ConfigShell>` 那一颗）。移动端是规则屏的二级页分支：读取态（加载中 / 读失败 / 就绪）由容器从同一个 `useConfig()` 算出来交给页面。',
-    },
-    {
-      id: 'NetworkProfilePanel.tsx|k:common.close+rules.networkProfile.add+rules.networkProfile.intro#2',
-      disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/NetworkProfilesPage.tsx', mustContain: "{t('mobileRules.networkProfile.intro')}" } },
-      note: '场景列表弹窗本体（说明 + 列表）。移动端二级页顶上同一句说明 —— 措辞换成「手机连着该网络时」（桌面那句写的是「电脑」，在手机上是错的），其余同源。',
-    },
+    
+    
     {
       id: 'NetworkProfilePanel.tsx|k:common.close#2',
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: 'onClick={() => setPage(null)}' } },
@@ -362,11 +354,7 @@ export const RULES_PARITY: ScreenParityRegister = {
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: 'const requestDeleteNetworkProfile = useCallback(' } },
       note: '删除一个场景（二次确认）。桌面是原地二次点击、武装态里写「N 条规则将停止生效」；移动端叠一层确认面板（`ConfirmPanel`），同一句后果写在正文里 —— 触屏上武装态那一行在拇指底下被手指挡住（`destructive-confirm-wiring` 清册移动端段头注同一条理由）。引用计数走同一个 `profileRefCounts`。',
     },
-    {
-      id: 'NetworkProfilePanel.tsx|k:common.close+common.configLoadFail+common.retry',
-      disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/forms/NetworkProfileFormPanel.tsx', mustContain: 'if (cfg.config === null) {' } },
-      note: '配置读取失败 / 加载中的外壳（桌面 `ConfigShell` 的非就绪分支）。移动端两处都有：表单宿主那层（锚）与二级页（`NetworkProfilesPage` 的 `loadState`）。读失败时**不**画空表 —— 空表一提交会拿「空集合 + 新场景」覆盖盘上全部场景。',
-    },
+    
     {
       id: 'NetworkProfilePanel.tsx|k:common.close',
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/forms/NetworkProfileFormPanel.tsx', mustContain: 'onRequestClose={close}' } },
@@ -377,11 +365,7 @@ export const RULES_PARITY: ScreenParityRegister = {
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/forms/NetworkProfileFormPanel.tsx', mustContain: '() => void cfg.reload()' } },
       note: '读取失败后的「重试」。移动端表单那层与二级页各一颗（后者 `NetworkProfilesPage` 的 `onRetry`），都落到 `useConfig().reload`。',
     },
-    {
-      id: 'NetworkProfilePanel.tsx|k:common.add+common.bulkImport+common.cancel+rules.networkProfile.cidrs+rules.networkProfile.cidrsHint+rules.networkProfile.cidrsPh+rules.networkProfile.criteriaHint+rules.networkProfile.domains+rules.networkProfile.domainsHint+rules.networkProfile.domainsPh+rules.networkProfile.enabled+rules.networkProfile.enabledHint+rules.networkProfile.name+rules.networkProfile.namePh+rules.networkProfile.probe+rules.networkProfile.probeAuto+rules.networkProfile.probeDhcp+rules.networkProfile.probeHint+rules.networkProfile.probeSystem',
-      disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/forms/NetworkProfileFormPanel.tsx', mustContain: 'function ProfileForm(' } },
-      note: '场景编辑表单整块（名称 / 地址段 / 搜索域 / 探测方式 / 启用）。移动端同五格；三格说明从 InfoIcon 落成常驻行（§4.12）；探测方式是 `m-form-seg` 三段，DHCP 那一档在本机不可用时置灰并写原因（后端 `builtinDhcpStatus`，与 dhcp 源场景同一个判据）。',
-    },
+    
     {
       id: 'NetworkProfilePanel.tsx|k:common.cancel',
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/forms/NetworkProfileFormPanel.tsx', mustContain: "cancelLabel={tr('common.cancel')}" } },
@@ -392,16 +376,8 @@ export const RULES_PARITY: ScreenParityRegister = {
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/forms/NetworkProfileFormPanel.tsx', mustContain: "submitLabel={tr(isEdit ? 'common.save' : 'common.add')}" } },
       note: '表单提交。校验与落盘形态走同一组 `validateNetworkProfileDraft` / `buildNetworkProfile`，写腿同一条 `useConfig().update`；带 `onSaved` 打开时（规则表单「新建场景…」）建完回填。',
     },
-    {
-      id: 'NetworkProfilePanel.tsx|k:common.close+rules.networkProfile.missing',
-      disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/forms/NetworkProfileFormPanel.tsx', mustContain: 'if (profileId && !base) {' } },
-      note: '编辑的场景已不在（外壳那一颗）。移动端同一分支：说清「已被删除」，不悄悄变成新建。',
-    },
-    {
-      id: 'NetworkProfilePanel.tsx|k:common.close+rules.networkProfile.missing#2',
-      disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/forms/NetworkProfileFormPanel.tsx', mustContain: "{t('rules.networkProfile.missing')}" } },
-      note: '「这个网络场景已被删除」那张卡本体。移动端同一句（同键）。',
-    },
+    
+    
     {
       id: 'NetworkProfilePanel.tsx|k:common.close#3',
       disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/forms/NetworkProfileFormPanel.tsx', mustContain: "cancelLabel={t('common.close')}" } },

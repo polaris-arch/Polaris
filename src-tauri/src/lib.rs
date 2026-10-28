@@ -1193,6 +1193,7 @@ pub fn run() {
             proxy_get_status,
             proxy_get_pending_changes,
             proxy_apply_pending_changes,
+            proxy_runtime_apply_status,
             kernel_probe_outbound,
             connections_close,
             connections_close_all,

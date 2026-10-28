@@ -422,3 +422,22 @@ it('explicit current-node selection can pin an Auto winner manually', () => {
   expect(nodeUseAction('a', 'a', false, 'button', true)).toBe('switch');
   expect(nodeUseAction('a', 'a', false, 'card', true)).toBe('confirm');
 });
+
+describe('Naive configured transport is visible without inventing a new protocol', () => {
+  it('distinguishes H3 from H2 while preserving the shared Naive protocol label', async () => {
+    const { transferSummary, protocolLabel } = await import('./nodes-logic');
+    const h3 = srv('h3', { protocol: 'naive', naiveSettings: { useHttp3: true } });
+    const h2 = srv('h2', { protocol: 'naive', naiveSettings: { useHttp3: false } });
+    expect(protocolLabel(h3.protocol)).toBe('Naive');
+    expect(protocolLabel(h2.protocol)).toBe('Naive');
+    expect(transferSummary(h3)).toBe('h3 · tls');
+    expect(transferSummary(h2)).toBe('h2 · tls');
+    expect(transferSummary(srv('default', { protocol: 'naive' }))).toBe('h2 · tls');
+    const { projectVisibleServers } = await import('./nodes-list-projection');
+    const group = { id: 'sub', name: 'fixture', isManual: false, servers: [h2, h3] };
+    expect(projectVisibleServers(group, '', '', 'default', {})).toHaveLength(2);
+    expect(projectVisibleServers(group, '', 'naive', 'default', {}).map(n => n.id)).toEqual(['h2', 'h3']);
+    expect(projectVisibleServers(group, 'h3', '', 'default', {}).map(n => n.id)).toEqual(['h3']);
+
+  });
+});

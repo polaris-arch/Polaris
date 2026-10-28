@@ -350,3 +350,100 @@ fn a_save_that_drops_the_subscription_drops_the_intent_with_it() {
     config_save_core(&mgr, &mut without_subscription, None, false).expect("save");
     assert!(mgr.load_full().unwrap().get("selectionIntent").is_none());
 }
+
+#[test]
+fn subscription_deletion_clears_only_its_owned_intent_on_save_and_patch() {
+    for patch in [false, true] {
+        for (scope, id, cleared) in [
+            ("subscription", Some("sub"), true),
+            ("subscription", Some("already-missing"), false),
+            ("global", None, false),
+            ("manual", None, false),
+            ("mesh", None, false),
+        ] {
+            let dir = temp_dir("selection-intent-deletion");
+            let mgr = ConfigManager::new(dir.clone());
+            let mut config = mgr.load_full().unwrap();
+            config["subscriptions"] =
+                json!([{ "id":"sub", "name":"S", "url":"https://a.example/x" }]);
+            let mut intent = json!({"mode":"auto", "scope":scope});
+            if let Some(id) = id {
+                intent["subscriptionId"] = json!(id);
+            }
+            config["selectionIntent"] = intent.clone();
+            mgr.save_full(&config).unwrap();
+            if patch {
+                let mut fields = serde_json::Map::new();
+                fields.insert("subscriptions".into(), json!([]));
+                config_patch_core(&mgr, fields).unwrap();
+            } else {
+                config["subscriptions"] = json!([]);
+                config_save_core(&mgr, &mut config, None, false).unwrap();
+            }
+            let saved = mgr.load_full().unwrap();
+            if cleared {
+                assert!(saved.get("selectionIntent").is_none());
+            } else {
+                assert_eq!(saved["selectionIntent"], intent);
+            }
+        }
+    }
+}
+
+/// Full ordinary-save transaction: Auto ownership is not granted by a saved receipt.
+#[test]
+fn ordinary_save_mirrors_auto_authority_and_returns_actual_saved_config() {
+    for enabled in [false, true] {
+        let dir = temp_dir(if enabled {
+            "auto-owner-on"
+        } else {
+            "auto-owner-off"
+        });
+        let mgr = ConfigManager::new(dir.clone());
+        let mut original = mgr.load_full().unwrap();
+        original["servers"] = json!([{"id":"node-a", "name":"A", "protocol":"socks", "address":"127.0.0.1", "port":1080}]);
+        original["autoSelectEnabled"] = json!(enabled);
+        original["autoSelectPins"] = if enabled {
+            json!([{"target":{"scope":"global"},"serverId":"node-a"}])
+        } else {
+            json!([])
+        };
+        if enabled {
+            original["selectionIntent"] = json!({"mode":"auto","scope":"global"});
+        } else {
+            original.as_object_mut().unwrap().remove("selectionIntent");
+        }
+        mgr.save_full(&original).unwrap();
+        let before = mgr.load_full().unwrap();
+        let mut requested = before.clone();
+        requested["autoSelectEnabled"] = json!(!enabled);
+        requested["autoSelectPins"] = if enabled {
+            json!([])
+        } else {
+            json!([{"target":{"scope":"global"},"serverId":"node-a"}])
+        };
+        if enabled {
+            requested.as_object_mut().unwrap().remove("selectionIntent");
+        } else {
+            requested["selectionIntent"] = json!({"mode":"auto","scope":"global"});
+        }
+        requested["interruptConnectionsOnSwitch"] = json!(true);
+        let version = config_version(&before);
+        let (outcome, _) = config_save_core(&mgr, &mut requested, Some(&version), false).unwrap();
+        let SaveOutcome::Saved { config: reply, .. } = outcome else {
+            panic!("expected actual saved outcome")
+        };
+        let disk = ConfigManager::new(dir.clone()).load_full().unwrap();
+        for key in ["autoSelectEnabled", "autoSelectPins", "selectionIntent"] {
+            assert_eq!(reply.get(key), before.get(key), "reply {key}");
+            assert_eq!(disk.get(key), before.get(key), "disk {key}");
+            assert_eq!(
+                requested.get(key),
+                before.get(key),
+                "normalized input {key}"
+            );
+        }
+        assert_eq!(reply["interruptConnectionsOnSwitch"], json!(true));
+        assert_eq!(disk["interruptConnectionsOnSwitch"], json!(true));
+    }
+}

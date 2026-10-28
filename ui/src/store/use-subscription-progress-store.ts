@@ -73,6 +73,7 @@ export function reduceSubscriptionProgress(
 
 interface SubscriptionProgressState {
   progress: SubscriptionProgressMap;
+  generations: Record<string, number>;
   /** 收到一帧（事件流的**唯一**写入口——没有手动 dismiss：失败徽标该由「重试成功」清掉，
    *  而不是由「假装没看见」清掉。 */
   applyProgress: (ev: SubscriptionUpdateProgress) => void;
@@ -81,11 +82,21 @@ interface SubscriptionProgressState {
 
 export const useSubscriptionProgressStore = create<SubscriptionProgressState>((set) => ({
   progress: {},
-  applyProgress: (ev) => set((s) => ({ progress: reduceSubscriptionProgress(s.progress, ev) })),
+  generations: {},
+  applyProgress: (ev) => set((s) => {
+    const previous = s.generations[ev.subscriptionId];
+    if (ev.generation !== undefined && (!Number.isSafeInteger(ev.generation) || ev.generation < 1)) return s;
+    if (previous !== undefined && (ev.generation === undefined || ev.generation < previous)) return s;
+    return {
+      progress: reduceSubscriptionProgress(s.progress, ev),
+      generations: ev.generation === undefined ? s.generations : {...s.generations, [ev.subscriptionId]: ev.generation},
+    };
+  }),
   retainSubscriptionIds: (subscriptionIds) =>
     set((state) => {
       const progress = retainRecordKeys(state.progress, new Set(subscriptionIds));
-      return progress === state.progress ? state : { progress };
+      const generations = retainRecordKeys(state.generations, new Set(subscriptionIds));
+      return progress === state.progress && generations === state.generations ? state : { progress, generations };
     }),
 }));
 

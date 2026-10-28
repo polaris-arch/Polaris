@@ -455,7 +455,12 @@ fn fifo_replacement_after_lstat_is_rejected_without_waiting_for_writer() {
     let file = dir.join("candidate.json");
     fs::write(&file, b"{}\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        read_checked(dir.path(), "candidate.json", 4096).unwrap(),
+        b"{}\n"
+    );
     let replaced = std::cell::Cell::new(false);
     let result = read_checked_after_lstat(dir.path(), "candidate.json", 4096, || {
         replaced.set(true);

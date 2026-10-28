@@ -34,7 +34,7 @@
 //! | Linux AppImage | `buildLinuxAppImageScript`（同目录暂存核验 + rename 替换/失败恢复） | 同上 |
 //! | Linux deb | `buildLinuxDebScript`（`pkexec apt-get install`） | 同上 |
 //! | Android | **上游没有这一腿**（ 上游 是桌面 Electron 应用） | [`InstallPlatform::Android`]：不生成脚本，经 FileProvider 交系统安装器（`android_bridge::hand_apk_to_system_installer`） |
-//! | 形态错配 | 不强制 root，回退 `shell.openPath` 交系统（`UpdateService.ts:427-436`） | [`InstallReject::FormMismatch`]，command 层回退 `shell.open` |
+//! | 形态错配 | 不强制 root，回退 `shell.openPath` 交系统（`UpdateService.ts:427-436`） | [`InstallReject::FormMismatch`]，command 层直接拒绝，不打开不兼容安装件 |
 
 use std::path::{Path, PathBuf};
 
@@ -208,25 +208,6 @@ pub enum InstallReject {
     },
     /// 文件名无法识别为任何已知安装件形态。
     UnknownAsset { file_name: String },
-}
-
-impl InstallReject {
-    /// 被拒之后是否把安装件交给系统默认处理器打开。
-    ///
-    /// 唯一不交的一格：**便携形态拿到 Windows 安装程序**。系统对 `.exe` 的「打开」就是运行它，
-    /// 结果是在别处装出第二份程序，而用户正在用的这一份原样没动 —— 那正是判成错配要避免的事。
-    /// 其余错配（如 AppImage 运行拿到 `.deb`）交出去只是让系统的包管理器界面接手，由用户决定。
-    ///
-    /// 判据只看资产形态与运行形态，不看平台名：`.exe` 安装程序只在 Windows 上有意义，别的平台
-    /// 的便携形态拿到它，同样没有理由去运行。
-    #[must_use]
-    pub fn hands_to_system(&self) -> bool {
-        !matches!(
-            self,
-            Self::FormMismatch { installer, form: RunForm::Loose, .. }
-                if classify_installer(installer) == Some(InstallerKind::WinExe)
-        )
-    }
 }
 
 /// Probe destination-side admission before irreversibly draining the app.

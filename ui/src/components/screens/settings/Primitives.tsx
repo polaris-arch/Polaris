@@ -461,3 +461,21 @@ export function Spinner({ className }: { className?: string }) {
   const { t } = useTranslation();
   return <span className={cn('spinner', className)} role="status" aria-label={t('common.loading')} />;
 }
+
+/** Persistent feedback; callers retain every action and decide whether a toast already announced it. */
+export function FeedbackNotice({ title, detail, hint, actions, announce = true }: {
+  title: string;
+  detail?: string;
+  hint?: string;
+  actions?: ReactNode;
+  announce?: boolean;
+}) {
+  const titleId = useId();
+  return <section className="feedback-notice" data-feedback-notice="" role={announce ? 'status' : 'region'}
+    aria-live={announce ? 'polite' : undefined} aria-labelledby={titleId}>
+    <strong className="feedback-notice-title" id={titleId}>{title}</strong>
+    {detail && detail !== title && <p className="feedback-notice-detail">{detail}</p>}
+    {hint && hint !== detail && <p className="feedback-notice-hint">{hint}</p>}
+    {actions && <div className="feedback-notice-actions">{actions}</div>}
+  </section>;
+}

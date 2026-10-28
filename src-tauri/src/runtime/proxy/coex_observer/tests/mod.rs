@@ -682,7 +682,11 @@ async fn actual_debounced_restart_invalidates_before_blocked_failed_cleanup_and_
     rt.coex = o.clone();
     let rt = Arc::new(rt);
     let generation = rt.claim_generation(None, LifecycleKind::Start).unwrap();
-    rt.commit_coex_current_config(json!({"actualRestartFixture":true}));
+    let saved = polaris_store::default_config();
+    rt.config
+        .save_full(&saved)
+        .expect("seed durable desired config");
+    rt.commit_coex_current_config(saved);
     let token = o.begin_watcher(generation).unwrap();
     o.watcher(generation, token, true);
     o.lock().binding.phase = "ready";

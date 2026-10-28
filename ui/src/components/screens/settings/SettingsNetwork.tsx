@@ -1,5 +1,6 @@
 import { isSpeedTestUrl, speedTestUrlInvalid as invalidSpeedUrl, adoptSpeedTestUrlDraft } from '@/domain/periodic-speed-test';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
+import { AutoSelectSettingsSwitch } from './AutoSelectSettingsSwitch';
 import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
 /**
  * SettingsNetwork —— 网络子页（原型 [data-sec="network"] L2119-2169）。
@@ -499,7 +500,7 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
         </SetRow>
         <SetRow label={t('settings.utls.label')} tip={t('settings.utls.description')} desc={[isSavedUtlsSelection(config.utlsPolicy) ? t('node.utls.savedHint') : null, tlsFingerprintStatus(tlsFingerprints, t)].filter(Boolean).join(' ')}>
           <Select
-            value={config.utlsPolicy ?? 'default'}
+            value={config.utlsPolicy ?? 'follow'}
             aria-label={t('settings.utls.label')}
             onChange={(event) => void update({ utlsPolicy: event.currentTarget.value })}
           >
@@ -590,7 +591,7 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
           />
           {speedUrlErr && <div className="err-line">{t('settings.network.speedTestUrlInvalid')}</div>}
         </SetRow>
-        <SavedAutoSelectControls t={t} variant="switch" />
+        <SavedAutoSelectControls t={t} variant="switch" renderSettingsSwitch={AutoSelectSettingsSwitch} />
         <SetRow
           label={t('settings.network.periodicSpeedTest')}
           tip={t('settings.network.periodicSpeedTestDesc')}

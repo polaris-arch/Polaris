@@ -494,6 +494,7 @@ def tool_facts(args, value, env):
 
 PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-core/fork_input.py', 'scripts/mobile-core/source_policy.py',
              'scripts/mobile-core/plan.py', 'scripts/mobile-core/android_sdk.py',
+                 'scripts/lib/polaris-version.json',
              'scripts/mobile-core/artifacts.py', 'scripts/mobile-core/producer.py',
              'scripts/mobile-core/budget.py', 'scripts/mobile-core/ci_android.py',
              'scripts/mobile-core/consume.py', 'scripts/mobile-core/carriers.py',
@@ -504,6 +505,7 @@ PRODUCER_FILES = ('scripts/mobile-core/source-contract.json', 'scripts/mobile-co
              'scripts/mobile-core/build_apple_app.py', 'scripts/mobile-core/native_inputs.py',
              'scripts/mobile-core/transaction.py',
              'scripts/libbox-patches/prepare-ndk-linux.py', 'scripts/libbox-patches/ndk-linux-archive.json',
+             'scripts/mobile-core/ndk-r30-linux.json',
              'scripts/libbox-patches/android-source.py', 'scripts/apple-carrier.py')
 ANDROID_BUILD_CODE_POLICY = 'polaris-android-build-code-v2'
 ANDROID_UNRELATED_CODE = frozenset({

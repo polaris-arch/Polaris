@@ -1,3 +1,5 @@
+mod bootstrap_identity;
+
 use super::*;
 use crate::transport::MockStream;
 use std::collections::HashSet;
@@ -733,14 +735,38 @@ fn installation_seals_bytes_before_executing_the_administrator_utility() {
         let manifest_hash = script
             .find("[ \"$(hash_file \"$TXDIR/core-manifest.json\")\"")
             .unwrap();
-        let install = script.find("\"$TXDIR/helper\" core-install").unwrap();
-        assert!(helper_hash < install && manifest_hash < install);
+        // The sealed utility router keeps macOS bootstrap custody separate from
+        // the staged Linux helper. Neither path may bypass byte verification.
+        let admin = script
+            .split("admin() {\n")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert_eq!(
+            admin.trim(),
+            r#"if [ -n "$BOOT" ]; then "$BOOT/helper" "$@"; else "$TXDIR/helper" "$@"; fi"#
+        );
+        let acquire = script.find("admin lease-acquire --lock").unwrap();
+        let install = script.find("admin core-install --root").unwrap();
+        assert!(helper_hash < acquire && manifest_hash < acquire && acquire < install);
+        if script.contains("BOOT=$(") {
+            let bootstrap_hash = script.find("/dev/fd/8 | /usr/bin/awk").unwrap();
+            let bootstrap_identity = script.find("\"$BOOT_FD_ID\" = \"$BOOT_FILE_ID\"").unwrap();
+            let validate = script
+                .find("\"$BOOT/helper\" validate-install-path")
+                .unwrap();
+            assert!(bootstrap_hash < bootstrap_identity && bootstrap_identity < validate);
+        }
         assert!(script.contains("--source-owner 'u1000'"));
         assert!(script.contains("chmod 0700 \"$TXDIR\""));
         assert!(script.contains("--manifest \"$TXDIR/core-manifest.json\""));
         assert!(!script.contains(".seed.new"));
         assert!(!script.contains("codesign --force"));
-        assert!(!script.contains("find "));
+        // No installer payload discovery. The later Linux closure proof has a
+        // separate, bounded enumeration of the exact system cgroup parent.
+        assert!(!script[..install].contains("find "));
     }
 }
 
@@ -820,9 +846,11 @@ fn linux_auth_merge_retains_other_users_and_matches_private_reader_contract() {
     assert!(script.contains("invalid-authfile-owner"));
     assert!(script.contains("'helper-policy retain') KEEP_HELPER=1"));
     assert!(script.contains("retain-probe --support \"$SUPPORT\" --id"));
-    let stopped = script
-        .find("if [ \"$WAS_ACTIVE\" -eq 1 ]; then stop_service; fi")
+    let admitted = script.rfind("trap rollback EXIT\n").unwrap();
+    let stopped = admitted + script[admitted..]
+        .find("if [ \"$WAS_ACTIVE\" -eq 1 ] || [ \"$REQUIRE_CLOSURE\" -eq 1 ]; then stop_service; fi")
         .unwrap();
+    assert!(script.contains("REQUIRE_CLOSURE=1"));
     let grant = script.rfind("\nmerge_authorization\n").unwrap();
     let start = script.rfind("systemctl restart \"$SERVICE\"").unwrap();
     assert!(
@@ -1455,16 +1483,72 @@ fn unix_install_publishes_initialized_journal_only_after_admission_and_cleans_be
             .split("\n}\n")
             .next()
             .unwrap();
-        assert!(rollback.find("rm -rf \"$TXDIR\"").unwrap() < rollback.find("exec 9>&-").unwrap());
+        // Unconfirmed shutdown releases the lease while retaining the journal;
+        // only the successful recovery branch may delete it before final unlock.
+        let failed_stop = rollback
+            .split("if ! stop_service; then\n")
+            .nth(1)
+            .unwrap()
+            .split("\n    fi")
+            .next()
+            .unwrap();
+        assert!(
+            failed_stop
+                .find("touch \"$TXDIR/recovery-required\"")
+                .unwrap()
+                < failed_stop.find("exec 9>&-").unwrap()
+        );
+        assert!(failed_stop.contains("exit 1"));
+        assert!(!failed_stop.contains("rm -rf"));
+        // Both Unix renderers share this guarded rollback tail. Match the whole
+        // branch so failed cleanup cannot become unconditional journal removal.
+        let cleanup_line = r#"  if [ "$OK" -eq 1 ]; then rm -rf "$TXDIR" || cleanup_failure; else touch "$TXDIR/recovery-required"; echo "helper rollback incomplete; recovery transaction retained: $TXDIR" >&2; fi"#;
+        let cleanup = rollback
+            .rfind(cleanup_line)
+            .expect("exact guarded rollback journal branch");
+        let unlock = rollback
+            .rfind("  exec 9>&- || cleanup_failure")
+            .expect("guarded final lease release");
+        assert!(cleanup < unlock);
+        assert!(rollback[cleanup + cleanup_line.len()..unlock]
+            .trim()
+            .is_empty());
         assert!(!rollback.contains("lease-release"));
         assert!(script.contains("case \"$(cat \"$OLD/transaction-phase\")\" in"));
         assert!(script.contains("staging) rm -rf \"$OLD\";;"));
         assert!(script.contains("admission)"));
-        assert!(script.contains("completed) rm -rf \"$OLD\";;"));
+        assert!(script.contains("completed|rolled-back)"));
+        assert!(script.contains("if [ -f \"$OLD/migration-preserve\" ]; then"));
+        assert!(script.contains("mv \"$OLD\" \"$RETIRED\""));
+        assert!(script.contains("else rm -rf \"$OLD\"; fi;;"));
         assert!(script.contains("*) echo \"HELPER_INSTALL_RECOVERY_REQUIRED $OLD\""));
         assert!(script.contains("set_phase service-mutation"));
         assert!(script.contains("set_phase completed"));
     }
+}
+
+// Same closure discipline as the App's shared executable fixture writer:
+// this test process never holds a write fd on the directly executed file.
+// A single cp child opens/closes it before any cancellation CLI invocation.
+#[cfg(unix)]
+fn write_executable_stand_in(path: &Path, contents: impl AsRef<[u8]>) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".staged");
+    let staged = PathBuf::from(staged);
+    fs::write(&staged, contents).unwrap();
+    let status = Command::new("cp")
+        .arg(&staged)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "test executable writer failed: {status}");
+    fs::remove_file(staged).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[cfg(unix)]
@@ -1474,29 +1558,10 @@ mod unix_journal_recovery {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
-    // Same closure discipline as the App's shared executable fixture writer:
-    // this test process never holds a write fd on the directly executed file.
-    // A single cp child opens/closes it before any cancellation CLI invocation.
-    fn write_executable_stand_in(path: &Path, contents: impl AsRef<[u8]>) {
-        let mut staged = path.as_os_str().to_owned();
-        staged.push(".staged");
-        let staged = PathBuf::from(staged);
-        fs::write(&staged, contents).unwrap();
-        let status = Command::new("cp")
-            .arg(&staged)
-            .arg(path)
-            .stdin(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "test executable writer failed: {status}");
-        fs::remove_file(staged).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
     fn recover(
         phase: &str,
         cancel_succeeds: bool,
-        unknown: bool,
+        damage: Option<&str>,
     ) -> (tempfile::TempDir, PathBuf, bool) {
         let fixture = tempfile::tempdir().unwrap();
         let support = fixture.path();
@@ -1510,27 +1575,70 @@ mod unix_journal_recovery {
         fs::write(old.join("transaction-destination"), dest.to_str().unwrap()).unwrap();
         fs::write(old.join("transaction-phase"), format!("{phase}\n")).unwrap();
         fs::write(old.join("helper"), b"previous bundled helper bytes").unwrap();
-        if unknown {
-            fs::remove_file(old.join("transaction-kind")).unwrap();
+        match damage {
+            Some("missing-kind") => fs::remove_file(old.join("transaction-kind")).unwrap(),
+            Some("wrong-destination") => {
+                fs::write(old.join("transaction-destination"), "other-helper").unwrap()
+            }
+            Some("unsafe-directory") => {
+                fs::set_permissions(&old, fs::Permissions::from_mode(0o777)).unwrap()
+            }
+            Some("linked-marker") => {
+                let marker = old.join("transaction-kind");
+                fs::remove_file(&marker).unwrap();
+                std::os::unix::fs::symlink(old.join("helper"), &marker).unwrap();
+            }
+            Some("recovery-required") => {
+                fs::write(old.join("recovery-required"), b"retained").unwrap()
+            }
+            None | Some("native-rejection") => {}
+            Some(other) => panic!("unknown recovery fixture damage: {other}"),
         }
         write_executable_stand_in(
             &admission.join("helper"),
-            format!("#!/bin/sh\n[ \"$1\" = cancel-upgrade ] || exit 1\nprintf cancelled > \"$3/cancelled\"\nexit {}\n", if cancel_succeeds { 0 } else { 1 }),
+            format!(
+                r#"#!/bin/sh
+set -eu
+[ "$#" -eq 3 ] || exit 90
+case "$1:$2" in
+  validate-install-path:--path)
+    printf '%s\n' "$3" >> {validated}
+    [ {reject_native} -eq 0 ] || exit 1
+    [ -e "$3" ] && [ ! -L "$3" ] || exit 1;;
+  cancel-upgrade:--support)
+    printf cancelled > "$3/cancelled"
+    exit {cancel_exit};;
+  *) exit 90;;
+esac
+"#,
+                validated = shell_quote(support.join("validated").to_str().unwrap()),
+                reject_native = u8::from(damage == Some("native-rejection")),
+                cancel_exit = if cancel_succeeds { 0 } else { 1 },
+            ),
         );
         let script = unix_scripts().into_iter().nth(1).unwrap();
         let begin = script
             .find("for OLD in \"$SUPPORT\"/helper-upgrade.*; do")
             .unwrap();
         let end = begin + script[begin..].find("\nPUBLISHED=").unwrap();
-        // Root ownership is a simulated identity in this unprivileged fixture;
-        // actual mode/link/marker/phase/destination operations are unchanged.
+        let admin = script
+            .split("admin() {\n")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        // Root ownership is a simulated identity in this unprivileged fixture.
+        // Real admin routing, mode/link/marker/phase/destination operations stay
+        // unchanged; the sealed utility's native validation has explicit success
+        // and rejection outcomes and cannot execute an old journal's helper.
         let owner = if cfg!(target_os = "macos") {
             "stat -f '%Lp' \"$1\""
         } else {
             "stat -c '%a' \"$1\""
         };
         let prefix = format!(
-            "set -eu\nSUPPORT={}\nDEST={}\nTXDIR={}\nowner_mode() {{ printf '0:'; {owner}; }}\n",
+            "set -eu\nSUPPORT={}\nDEST={}\nTXDIR={}\nBOOT=''\nMIGRATION=0\nadmin() {{\n{admin}\n}}\nowner_mode() {{ printf '0:'; {owner}; }}\n",
             shell_quote(support.to_str().unwrap()),
             shell_quote(dest.to_str().unwrap()),
             shell_quote(admission.to_str().unwrap())
@@ -1540,36 +1648,69 @@ mod unix_journal_recovery {
             .arg(format!("{prefix}{}", &script[begin..end]))
             .output()
             .unwrap();
+        if damage.is_none() {
+            let validated = fs::read_to_string(support.join("validated")).unwrap();
+            let expected: Vec<_> = std::iter::once(old.clone())
+                .chain(
+                    [
+                        "transaction-kind",
+                        "transaction-destination",
+                        "transaction-phase",
+                        "helper",
+                    ]
+                    .into_iter()
+                    .map(|name| old.join(name)),
+                )
+                .collect();
+            assert_eq!(
+                validated.lines().map(PathBuf::from).collect::<Vec<_>>(),
+                expected,
+                "recovery must validate the directory and each exact journal object"
+            );
+        }
         (fixture, old, output.status.success())
     }
 
     #[test]
     fn known_pre_mutation_or_completed_journal_retires_but_partial_service_mutation_does_not() {
-        for phase in ["staging", "completed"] {
-            let (_fixture, old, success) = recover(phase, false, false);
+        for phase in ["staging", "completed", "rolled-back"] {
+            let (_fixture, old, success) = recover(phase, false, None);
             assert!(success, "{phase}");
             assert!(!old.exists());
         }
         for phase in ["service-mutation", "unknown"] {
-            let (_fixture, old, success) = recover(phase, true, false);
+            let (_fixture, old, success) = recover(phase, true, None);
             assert!(!success, "{phase}");
             assert!(old.exists());
         }
-        let (_fixture, old, success) = recover("staging", true, true);
-        assert!(!success);
-        assert!(old.exists());
+        for damage in [
+            "missing-kind",
+            "wrong-destination",
+            "unsafe-directory",
+            "linked-marker",
+            "recovery-required",
+            "native-rejection",
+        ] {
+            let (fixture, old, success) = recover("staging", true, Some(damage));
+            assert!(!success, "{damage}");
+            assert!(
+                old.exists(),
+                "invalid recovery evidence must be retained: {damage}"
+            );
+            assert!(!fixture.path().join("cancelled").exists(), "{damage}");
+        }
     }
 
     #[test]
     fn possibly_accepted_upgrade_reservation_is_cancelled_before_retirement_and_failed_cancel_is_retained(
     ) {
         for accepted in [true, false] {
-            let (fixture, old, success) = recover("admission", accepted, false);
+            let (fixture, old, success) = recover("admission", accepted, None);
             assert_eq!(success, accepted);
             assert_eq!(old.exists(), !accepted);
             assert!(fixture.path().join("cancelled").exists());
         }
-        let (fixture, _old, success) = recover("staging", false, false);
+        let (fixture, _old, success) = recover("staging", false, None);
         assert!(success);
         assert!(
             !fixture.path().join("cancelled").exists(),
@@ -1789,7 +1930,9 @@ fn windows_registration_rollback_proves_atomic_bytes_and_original_security() {
     assert!(script.contains("Check-Hash $registrationBackup $registrationSnapshot.Hash"));
     assert!(script.contains("[IO.FileMode]::CreateNew"));
     assert!(script.contains("$output.Flush($true)"));
-    assert!(script.contains("[IO.File]::Replace($temporary, $snapshot.Path, $null)"));
+    assert!(script.contains(
+        "[IO.File]::Replace($temporary, $snapshot.Path, [System.Management.Automation.Language.NullString]::Value)"
+    ));
     assert!(script.contains("[IO.File]::Move($temporary, $snapshot.Path)"));
     assert!(script.contains(
         "$security.SetSecurityDescriptorSddlForm($snapshot.Sddl, $registrationSections)"
@@ -1804,6 +1947,7 @@ fn windows_registration_rollback_proves_atomic_bytes_and_original_security() {
         .next()
         .unwrap();
     assert!(!restore.contains("Seal-File $snapshot.Path"));
+    assert!(!restore.contains("[IO.File]::Replace($temporary, $snapshot.Path, $null)"));
 }
 
 /// Runs the real restore function against synthetic files only. The existing
@@ -1819,10 +1963,11 @@ fn windows_registration_rollback_native_fixture_faults() {
         .find("function Stop-ServiceChecked")
         .unwrap()
         + start;
-    let harness = include_str!("registration-rollback.ps1").replace(
-        "# PRODUCTION_REGISTRATION_ROLLBACK_FUNCTIONS",
-        &script[start..end],
-    );
+    let harness = polaris_source_probe::crate_file!("src/manager/tests/registration-rollback.ps1")
+        .replace(
+            "# PRODUCTION_REGISTRATION_ROLLBACK_FUNCTIONS",
+            &script[start..end],
+        );
     let fixture = tempfile::tempdir().unwrap();
     let path = fixture.path().join("registration rollback fixture.ps1");
     let mut bytes = vec![0xef, 0xbb, 0xbf];
@@ -1830,6 +1975,10 @@ fn windows_registration_rollback_native_fixture_faults() {
     std::fs::write(&path, bytes).unwrap();
     let output =
         std::process::Command::new(crate::windows_system::powershell_executable().unwrap())
+            // CI is pwsh -> cargo -> this process -> Windows PowerShell. As in
+            // StdExecutor, discard only the child module-path inheritance so
+            // its own Windows PowerShell modules supply the real ACL cmdlets.
+            .env_remove("PSModulePath")
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&path)
             .output()
@@ -1976,4 +2125,79 @@ fn retained_windows_helper_requires_framing_before_service_or_registration_chang
     assert!(probe < registration && probe < admission);
     assert!(source.contains("retained newer helper capability unavailable while stopped"));
     assert!(source.contains(".Hash.ToLowerInvariant() -cne '{helper_hash}'"));
+}
+
+/// Both fixtures are complete outputs from the real split Unix producers, with
+/// synthetic values only. Never execute these administrator script bytes.
+#[test]
+fn linux_script_producer_matches_package_acceptance_fixtures() {
+    // Existing Package exact-test entry also executes the shared service proof
+    // with inert command fixtures, never the generated administrator payload.
+    #[cfg(target_os = "linux")]
+    {
+        linux_uninstall::linux_uninstall_requires_effective_unit_and_hierarchical_closure();
+        linux_uninstall::linux_install_inactive_snapshot_still_requires_production_closure();
+        linux_uninstall::linux_cleanup_failure_markers_do_not_change_success_or_recovery();
+        linux_uninstall::linux_maintenance_traps_keep_success_silent_and_cleanup_unknown();
+    }
+    let paths = InstallPaths::linux();
+    // Target is Linux even when this pure producer test runs on Windows.
+    let staged_helper = PathBuf::from("/tmp/producer fixture/用户's stage/polaris-helper");
+    let mut params = install_params(
+        PathBuf::from("/tmp/producer fixture/用户's config"),
+        staged_helper.clone(),
+    );
+    params.conf_dir = params.script_dir.clone();
+    params.uid = 1001;
+    params.user_identity = polaris_helper_proto::core_protocol::CallerIdentity::Unix(1001);
+    let install = build_linux_install_script(&paths, &params, &"e".repeat(64));
+    let utility = MaintenanceUtility {
+        src_binary: staged_helper,
+        helper_sha256: "a".repeat(64),
+    };
+    let uninstall = uninstall_unix::build_linux_uninstall_script(&paths, &utility);
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/package-acceptance/fixtures");
+    for (kind, bytes) in [
+        ("install", install.as_bytes()),
+        ("uninstall", uninstall.as_bytes()),
+    ] {
+        let expected = std::fs::read(fixtures.join(format!("linux-helper-{kind}.sh"))).unwrap();
+        assert_eq!(
+            bytes,
+            expected.as_slice(),
+            "complete {kind} producer bytes differ"
+        );
+        assert!(bytes.starts_with(b"#!/bin/sh\nset -eu\n"));
+        assert!(!bytes.starts_with(b"#!/bin/bash"));
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert!(text.contains(&shell_quote(&utility.src_binary.to_string_lossy())));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let name = format!("polaris-helper-{kind}.sh");
+            let path = write_secure_script(dir.path(), &name, text).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                path.file_name().unwrap().to_str().unwrap().len(),
+                25 + name.len()
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            // Model run_privileged_script's finally unlink without executing it.
+            let mut held = std::fs::File::open(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let mut still_held = Vec::new();
+            std::io::Read::read_to_end(&mut held, &mut still_held).unwrap();
+            assert_eq!(still_held, bytes);
+            assert!(!path.exists());
+        }
+    }
 }

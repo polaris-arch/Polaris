@@ -293,3 +293,62 @@ fn fetch_identity_preserves_custom_ua_and_shares_default() {
         crate::runtime::http::app_user_agent()
     );
 }
+
+#[test]
+fn effective_ua_default_and_persisted_override_matrix() {
+    use super::super::SubscriptionFetchIdentity;
+    let default = crate::runtime::http::app_user_agent();
+    assert_eq!(
+        default,
+        polaris_net_stack::subscription::default_subscription_user_agent(
+            env!("CARGO_PKG_VERSION"),
+            crate::runtime::core_version::selected_bundled_version()
+        )
+    );
+    assert!(default.starts_with("Polaris/"));
+    assert!(default.contains(" sing-box/"));
+    for (global, sub, expected) in [
+        (json!({}), json!({}), default.clone()),
+        (
+            json!({"subscriptionUserAgent":"  "}),
+            json!({"userAgent":""}),
+            default.clone(),
+        ),
+        (
+            json!({"subscriptionUserAgent":"global/2"}),
+            json!({}),
+            "global/2".into(),
+        ),
+        (
+            json!({"subscriptionUserAgent":"global/2"}),
+            json!({"userAgent":"per-sub/3"}),
+            "per-sub/3".into(),
+        ),
+        (
+            json!({"subscriptionUserAgent":"global/2"}),
+            json!({"userAgent":"  "}),
+            "global/2".into(),
+        ),
+        (
+            json!({}),
+            json!({"userAgent":"Polaris/1.0"}),
+            "Polaris/1.0".into(),
+        ),
+    ] {
+        let mut cfg = polaris_store::default_config();
+        if let Some(value) = global.get("subscriptionUserAgent") {
+            cfg["subscriptionUserAgent"] = value.clone();
+        }
+        let mut subscription =
+            json!({"id":"sub","name":"fixture","url":"https://subscription.example/list"});
+        if let Some(value) = sub.get("userAgent") {
+            subscription["userAgent"] = value.clone();
+        }
+        cfg["subscriptions"] = json!([subscription]);
+        let sanitized = polaris_store::sanitize_config(&cfg.to_string()).unwrap();
+        assert_eq!(
+            SubscriptionFetchIdentity::new(&sanitized, &sanitized["subscriptions"][0]).user_agent,
+            expected
+        );
+    }
+}

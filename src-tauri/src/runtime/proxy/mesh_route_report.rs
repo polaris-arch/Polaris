@@ -180,6 +180,37 @@ impl ProxyRuntime {
     )]
     pub(super) fn prepare_mesh_route_run(
         &self,
+        candidates: Vec<MeshRouteEmissionCandidate>,
+        total_candidate_count: usize,
+        diagnostics_limited: bool,
+        dns_owner_server_id: Option<String>,
+        invalid_nodes: &[InvalidNode],
+        original_config: &UserConfig,
+        core_config: &SingBoxConfig,
+        core_config_path: &Path,
+        core_config_json: &str,
+        run_generation: u64,
+    ) -> MeshRouteRunEvidence {
+        self.prepare_mesh_route_run_with_receipt(
+            candidates,
+            total_candidate_count,
+            diagnostics_limited,
+            dns_owner_server_id,
+            invalid_nodes,
+            original_config,
+            core_config,
+            core_config_path,
+            core_config_json,
+            run_generation,
+            false,
+        )
+    }
+
+    /// Candidate evidence from submitted bytes; only a verified committed receipt
+    /// may publish this as RuntimeCommitted. It is never a claim about disk bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_mesh_route_run_with_receipt(
+        &self,
         mut candidates: Vec<MeshRouteEmissionCandidate>,
         total_candidate_count: usize,
         diagnostics_limited: bool,
@@ -190,6 +221,7 @@ impl ProxyRuntime {
         core_config_path: &Path,
         core_config_json: &str,
         run_generation: u64,
+        runtime_receipt: bool,
     ) -> MeshRouteRunEvidence {
         let mut limited = diagnostics_limited;
         let generated_ids: BTreeSet<&str> = candidates
@@ -263,7 +295,9 @@ impl ProxyRuntime {
             preceding_exceptions.push("appRuleMayOverride".into());
         }
         let epoch_before = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
-        let core_file = if core_config_json.len() <= MAX_CORE_CONFIG_BYTES {
+        let core_file = if runtime_receipt && core_config_json.len() <= MAX_CORE_CONFIG_BYTES {
+            Some(core_config_json.to_owned())
+        } else if core_config_json.len() <= MAX_CORE_CONFIG_BYTES {
             read_bounded(&core_config_path.to_string_lossy(), MAX_CORE_CONFIG_BYTES).ok()
         } else {
             limited = true;
@@ -410,6 +444,29 @@ impl ProxyRuntime {
         }
     }
 
+    /// Caller has validated Plan/Apply identity and candidate digest. Recheck local
+    /// source baselines without pretending the startup file was rewritten.
+    pub(super) fn publish_mesh_route_runtime_receipt(&self, mut evidence: MeshRouteRunEvidence) {
+        let epoch = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
+        let stable = evidence.eligible_for_ack
+            && epoch == evidence.write_epoch
+            && epoch.is_multiple_of(2)
+            && evidence.file_baselines.iter().all(|(path, baseline)| {
+                read_bounded(path, MAX_RULE_FILE_BYTES).as_deref() == Ok(baseline.as_str())
+            });
+        evidence.load_evidence = if stable {
+            MeshRouteLoadEvidence::RuntimeCommitted
+        } else {
+            MeshRouteLoadEvidence::FileWrittenUnacknowledged
+        };
+        evidence.ready_at_ms = self.status().start_time;
+        if let Ok(mut slot) = self.mesh_route_run.write() {
+            if self.gate.generation() == evidence.run_generation {
+                *slot = Some(evidence);
+            }
+        }
+    }
+
     /// A report may have cloned StartupReady before another reader revoked it.
     /// Only the current claim for the same startup can authorize Applied.
     pub(super) fn reconcile_mesh_route_report_ack(
@@ -417,19 +474,25 @@ impl ProxyRuntime {
         evidence: &MeshRouteRunEvidence,
         snapshot: &mut MeshRouteSnapshot,
     ) {
-        if snapshot.load_evidence != MeshRouteLoadEvidence::StartupReady {
+        if !matches!(
+            snapshot.load_evidence,
+            MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted
+        ) {
             return;
         }
         let current = self.mesh_route_run.read().ok().and_then(|slot| {
             slot.as_ref().and_then(|current| {
                 (current.run_generation == evidence.run_generation
                     && current.ready_at_ms == evidence.ready_at_ms
+                    && current.core_config_sha256 == evidence.core_config_sha256
+                    && current.file_baselines == evidence.file_baselines
                     && current.write_epoch == evidence.write_epoch)
                     .then_some(current.load_evidence)
             })
         });
         match current {
-            Some(MeshRouteLoadEvidence::StartupReady) => {}
+            Some(MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted) => {
+            }
             Some(revoked) => {
                 snapshot.load_evidence = revoked;
                 snapshot.scope = MeshRouteScope::PersistedUnknown;
@@ -531,10 +594,16 @@ impl ProxyRuntime {
             .map(|item| item.candidate)
             .collect();
         let after = self.tailnet_file_write_epoch.load(Ordering::SeqCst);
-        let core_config_read = evidence.core_config_sha256.as_ref().map(|expected| {
-            read_bounded(&evidence.core_config_path, MAX_CORE_CONFIG_BYTES)
-                .map(|content| polaris_updater::verify::sha256_hex(content.as_bytes()) == *expected)
-        });
+        let core_config_read = if evidence.load_evidence == MeshRouteLoadEvidence::RuntimeCommitted
+        {
+            evidence.core_config_sha256.as_ref().map(|_| Ok(true))
+        } else {
+            evidence.core_config_sha256.as_ref().map(|expected| {
+                read_bounded(&evidence.core_config_path, MAX_CORE_CONFIG_BYTES).map(|content| {
+                    polaris_updater::verify::sha256_hex(content.as_bytes()) == *expected
+                })
+            })
+        };
         let observed_invalidation = if file_failed
             || core_config_read.is_none()
             || core_config_read.as_ref().is_some_and(Result::is_err)
@@ -558,8 +627,14 @@ impl ProxyRuntime {
                 if let Some(current) = slot.as_mut() {
                     if current.run_generation == evidence.run_generation
                         && current.ready_at_ms == evidence.ready_at_ms
+                        && current.core_config_sha256 == evidence.core_config_sha256
+                        && current.file_baselines == evidence.file_baselines
                         && current.write_epoch == evidence.write_epoch
-                        && current.load_evidence == MeshRouteLoadEvidence::StartupReady
+                        && matches!(
+                            current.load_evidence,
+                            MeshRouteLoadEvidence::StartupReady
+                                | MeshRouteLoadEvidence::RuntimeCommitted
+                        )
                     {
                         current.load_evidence = invalidated;
                         current.eligible_for_ack = false;
@@ -571,7 +646,10 @@ impl ProxyRuntime {
         if status.running
             && !status.starting
             && status.start_time == evidence.ready_at_ms
-            && snapshot.load_evidence == MeshRouteLoadEvidence::StartupReady
+            && matches!(
+                snapshot.load_evidence,
+                MeshRouteLoadEvidence::StartupReady | MeshRouteLoadEvidence::RuntimeCommitted
+            )
         {
             snapshot.scope = MeshRouteScope::Applied;
         }

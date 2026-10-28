@@ -110,7 +110,6 @@ fn legacy_start_is_rejected_before_forwarding_or_process_creation() {
         matches!(reply, HandleOutcome::Respond(Response::Err(error)) if error.code == polaris_helper_proto::ErrorCode::Unknown)
     );
     assert_eq!(ops.snapshot().start_calls, 0);
-    assert_eq!(ops.snapshot().ip_forward_calls, 0);
 }
 
 #[test]
@@ -189,7 +188,6 @@ fn pending_and_wait_error_keep_exact_native_custody_and_block_replacement_side_e
             matches!(reply, HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(NativeBirthStart::NotAdmittedPending { target: observed } | NativeBirthStart::NotAdmittedUnknown { target: Some(observed) }))) if observed == target)
         );
         assert_eq!(ops.snapshot().start_calls, 1);
-        assert_eq!(ops.snapshot().ip_forward_calls, 0);
         assert_eq!(
             ops.snapshot().reap_calls,
             0,
@@ -259,7 +257,6 @@ fn native_exit_with_unconfirmed_tail_keeps_birth_and_refuses_new_forwarding_or_s
         matches!(reply, HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(NativeBirthStart::NotAdmittedUnknown { target: Some(observed) }))) if observed == target)
     );
     assert_eq!(ops.snapshot().start_calls, 1);
-    assert_eq!(ops.snapshot().ip_forward_calls, 0);
     ops.set_native_retire_allowed(true);
     assert_eq!(stop(&h, target), NativeBirthStop::Stopped { target });
     assert_ne!(start(&h, false).birth, target.birth);
@@ -466,7 +463,6 @@ fn shutdown_pending_wait_error_and_logger_tail_failure_cannot_confirm_exit() {
         assert!(ops.native_custody_empty());
         h.reap_child_on_exit().unwrap();
         assert_eq!(ops.snapshot().start_calls, 1);
-        assert_eq!(ops.snapshot().ip_forward_calls, 0);
         assert_eq!(ops.snapshot().reap_calls, 0);
         assert_eq!(ops.snapshot().terminate_calls, 0);
     }
@@ -587,9 +583,12 @@ fn shutdown_cannot_guess_empty_from_missing_upper_entry_or_legacy_pid() {
     let birth = ops.mint_native_birth().unwrap();
     ops.start_native_singbox(
         "bin",
-        "cfg",
-        "",
-        false,
+        &StartParams {
+            cfg: "cfg".into(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        },
         birth,
         "conf",
         &polaris_helper_proto::core_protocol::CallerIdentity::Windows("S-1-5-21-1".into()),
@@ -690,7 +689,6 @@ fn other_native_user_cannot_start_stop_or_observe_an_owned_slot() {
     }
     assert_eq!(ops.snapshot().start_calls, before.start_calls);
     assert_eq!(ops.native_stop_calls(), 0);
-    assert_eq!(ops.snapshot().ip_forward_calls, before.ip_forward_calls);
     assert_eq!(stop(&h, target), NativeBirthStop::Stopped { target });
     assert!(matches!(
         h.dispatch(Request::NativeStopBirth { target }, Some(&other)),
@@ -839,7 +837,23 @@ fn lost_helper_record_with_retained_native_handle_blocks_replacement() {
 
 #[test]
 fn windows_native_config_uses_verified_object_without_path_reopen() {
-    let source = include_str!("../../winproc/win.rs");
+    let source = polaris_source_probe::crate_source!("platform/windows/winproc/win.rs");
+    let source = polaris_source_probe::mask_comments(&source);
+    assert_eq!(source.matches("fn start_native_singbox(").count(), 1);
+    let native_start = source
+        .split("fn start_native_singbox(")
+        .nth(1)
+        .unwrap()
+        .split("fn poll_native_child(")
+        .next()
+        .unwrap();
+    let confined = native_start
+        .find("open_confined_config(&params.cfg, conf_dir, owner)?")
+        .unwrap();
+    let spawned = native_start
+        .find("self.spawn_tracked(bin, &params.cfg, &params.log, params.fwd, birth, config)")
+        .unwrap();
+    assert!(confined < spawned);
     let gate = source
         .split("fn open_confined_config(")
         .nth(1)

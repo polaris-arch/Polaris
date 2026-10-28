@@ -1,4 +1,5 @@
 mod probe_tests;
+mod rule_pattern_admission_tests;
 
 /// [`parse_probe_diagnostic`] 结构化提取门。样本来源标注在每条测试里：**真机**＝真跑随包
 /// `resources/linux/sing-box`（`version` 自报 `1.14.0-beta.7`）对构造出的坏 config 执行

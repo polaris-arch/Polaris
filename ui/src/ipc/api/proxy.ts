@@ -1,6 +1,6 @@
 import { invoke, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
-import type { ProxyStatus, ProxyErrorCode, SystemProxyStatus, InvalidNodeInfo, PendingNodeChanges, ProxyLifecycleEvent, ExpectedMainCoreStop, ExpectedMainCoreStopResult } from '../../contracts/types';
+import type { PendingApplyResult, ProxyStatus, ProxyErrorCode, SystemProxyStatus, InvalidNodeInfo, PendingNodeChanges, ProxyLifecycleEvent, ExpectedMainCoreStop, ExpectedMainCoreStopResult } from '../../contracts/types';
 import type { TailscaleStatusEvent } from '../../contracts/tailscale-status';
 import type { AutoNodeSwitchedPayload } from '../../contracts/auto-select';
 import type { TailscaleLoginProgress } from '../../domain/tailscale-login-progress';
@@ -85,13 +85,21 @@ export const proxyApi = {
     return invoke(IPC_CHANNELS.PROXY_GET_PENDING_CHANGES);
   },
 
-  /** §2 动作条「立即应用」：把最新 config force-restart 入核。 */
-  async applyPendingChanges(): Promise<{
-    ok: boolean;
-    status: 'applied' | 'deferred' | 'skipped';
-    applyId?: number | null;
-  }> {
-    return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES);
+  /** Read the original pending transaction; never submits Plan or Apply. */
+  async runtimeApplyStatus(transactionId: string): Promise<PendingApplyResult> {
+    return invoke(IPC_CHANNELS.PROXY_RUNTIME_APPLY_STATUS, { transactionId });
+  },
+
+  /** Explicit same-transaction persistence recovery; never saves or reapplies D. */
+  async retryRuntimePersistence(transactionId: string): Promise<PendingApplyResult> {
+    return invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { retryPersistenceTransactionId: transactionId });
+  },
+
+  /** Plan/apply the saved candidate. A restart requires its exact confirmation token. */
+  async applyPendingChanges(restartConfirmation?: string): Promise<PendingApplyResult> {
+    return restartConfirmation === undefined
+      ? invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES)
+      : invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES, { restartConfirmation });
   },
 
   /**

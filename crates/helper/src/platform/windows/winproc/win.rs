@@ -13,7 +13,7 @@ use crate::platform::windows::logic::{
 };
 use crate::platform::windows::ops::{CoreStart, ManagedIdentity, NetTableOps, ProcOps};
 use crate::platform::windows::ops::{NativeChildPoll, ParentProcess};
-use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
+use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken, StartParams};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::os::windows::ffi::OsStrExt;
@@ -58,10 +58,6 @@ use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
-use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE,
-    REG_DWORD, REG_OPTION_NON_VOLATILE,
 };
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
@@ -388,7 +384,7 @@ impl WinProcOps {
         singbox_bin: &str,
         cfg: &str,
         log_path: &str,
-        fwd: bool,
+        _fwd: bool,
         birth: HelperBirthToken,
         config: ConfinedConfig,
     ) -> std::io::Result<CoreStart> {
@@ -415,13 +411,9 @@ impl WinProcOps {
         let path =
             std::env::join_paths([core_directory.to_path_buf(), system_root.join("System32")])
                 .map_err(std::io::Error::other)?;
-        // winproc.go:21-49 startSingbox + winproc.go:414-427 enableIPForwarding。
         let total_started = Instant::now();
-        let forwarding_started = Instant::now();
-        if fwd {
-            self.enable_ip_forwarding();
-        }
-        let forwarding_ms = crate::elapsed_ms(forwarding_started);
+        // Compatibility timing field: LAN listening does not manage the host router.
+        let forwarding_ms = 0;
         // B3/W26：改用 std Command 的 pipe，不再把 child 直接绑到一个永不重开的 append handle。
         // shared writer 在已预开的 current/.1 对象之间 copy/truncate，形成跨平台硬上限。
         let mut cmd = std::process::Command::new(singbox_bin);
@@ -741,15 +733,13 @@ impl ProcOps for WinProcOps {
     fn start_native_singbox(
         &self,
         bin: &str,
-        cfg: &str,
-        log: &str,
-        fwd: bool,
+        params: &StartParams,
         birth: HelperBirthToken,
         conf_dir: &str,
         owner: &polaris_helper_proto::core_protocol::CallerIdentity,
     ) -> std::io::Result<CoreStart> {
-        let config = open_confined_config(cfg, conf_dir, owner)?;
-        self.spawn_tracked(bin, cfg, log, fwd, birth, config)
+        let config = open_confined_config(&params.cfg, conf_dir, owner)?;
+        self.spawn_tracked(bin, &params.cfg, &params.log, params.fwd, birth, config)
     }
 
     fn poll_native_child(&self, target: HelperBirthTarget) -> NativeChildPoll {
@@ -930,15 +920,6 @@ impl ProcOps for WinProcOps {
         pending.wait(std::time::Duration::from_millis(u64::from(
             crate::platform::windows::logic::FLUSH_DNS_TIMEOUT_MS,
         )))
-    }
-
-    fn enable_ip_forwarding(&self) {
-        // winproc.go:414-427 enableIPForwarding：IPv4 注册表 IPEnableRouter=1（持久写入）+
-        // IPv6 netsh（运行时开关）。best-effort，失败不阻塞 start。
-        enable_ip_forwarding_ipv4_registry();
-        let _ = std::process::Command::new("netsh")
-            .args(["interface", "ipv6", "set", "global", "forwarding=enabled"])
-            .spawn();
     }
 
     fn read_object_security(&self, path: &str) -> Result<ObjectSecurity, String> {
@@ -1369,57 +1350,6 @@ fn enum_tcp_listener_rows(family: u32) -> std::io::Result<Vec<(u32, u32)>> {
         }
     }
     Ok(out)
-}
-
-/// enableIPForwarding IPv4 注册表写入（`winproc.go:417-424`）。
-///
-/// HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\IPEnableRouter=1（DWORD）。
-/// 持久写入（stop/卸载不还原 —— 已知限制 M3，镜像 Go 现状）。
-#[allow(
-    unsafe_code,
-    reason = "opens, writes and closes the fixed TCP/IP Parameters registry key"
-)]
-fn enable_ip_forwarding_ipv4_registry() {
-    let subkey: Vec<u16> = OsString::from("SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let value_name: Vec<u16> = OsString::from("IPEnableRouter")
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut hkey: HKEY = std::ptr::null_mut();
-    // SAFETY: RegCreateKeyExW 打开/创建注册表键。KEY_SET_VALUE 权限。SYSTEM 有权。
-    let rc = unsafe {
-        RegCreateKeyExW(
-            HKEY_LOCAL_MACHINE,
-            subkey.as_ptr(),
-            0,
-            std::ptr::null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            std::ptr::null(),
-            &mut hkey,
-            std::ptr::null_mut(),
-        )
-    };
-    if rc != 0 {
-        return;
-    }
-    let data: u32 = 1;
-    // SAFETY: RegSetValueExW 写 IPEnableRouter=1（DWORD）。hkey 由上方 RegCreateKeyExW 返回。
-    let _ = unsafe {
-        RegSetValueExW(
-            hkey,
-            value_name.as_ptr(),
-            0,
-            REG_DWORD,
-            &data as *const _ as *const u8,
-            std::mem::size_of::<u32>() as u32,
-        )
-    };
-    // SAFETY: 关键句柄。
-    unsafe { RegCloseKey(hkey) };
 }
 
 // ===== P4：受保护核目录的 owner/DACL 读取（搬运腿，判据在 `coreacl`）=====

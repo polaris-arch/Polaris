@@ -25,6 +25,7 @@
 
 /** reason token → i18n 键。键集由 `contracts/invalid-node-reason-coverage.test.ts` 与 Rust 源码对账。 */
 export const INVALID_NODE_REASON_KEY: Readonly<Record<string, string>> = {
+  'vision-transport-unsupported': 'nodes.invalidVisionTransport',
   'reality-utls-disabled': 'node.utls.realityRequired',
   'detour-cascade': 'nodes.invalidDetourCascade',
   'system-interface-requires-helper': 'errors.systemInterfaceRequiresHelper',

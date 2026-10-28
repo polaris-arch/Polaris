@@ -467,9 +467,7 @@ fn pipe_to_log_yields_forwarding_on_handoff_but_never_yields_fatal_classificatio
     );
     // 分类在闸**外**：缩进 12 空格 = 与 `if` 同层；被塞进 `if` 里就会变成 16 空格。
     assert!(
-        body.contains(
-            "\n            let Some(kind) = classify_core_fatal_line(&line, level) else {"
-        ),
+        body.contains("\n            let kind = if record.truncated && secrets.is_empty() {"),
         "FATAL 分类不得被交接闸挡住：就绪之后核以 log.Fatal 死掉时，那条行只走 stderr"
     );
 }
@@ -540,4 +538,39 @@ fn login_diagnostics_hide_exact_headscale_key_api_secret_and_auth_url() {
         redact_known_process_secrets("INFO normal diagnostic", &["secret".into()]),
         "INFO normal diagnostic"
     );
+}
+
+#[tokio::test]
+async fn handed_off_pipe_still_classifies_normal_and_oversized_fatal_lines() {
+    use tokio::io::AsyncWriteExt;
+    for (oversized, token, expected) in [
+        (false, "FATAL ", Some(CoreFatalKind::DhcpMonitorMissing)),
+        (true, "FATAL ", Some(CoreFatalKind::DhcpMonitorMissing)),
+        (false, "INFO ", None),
+        (true, "INFO ", None),
+    ] {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let fatal: CoreFatalSlot = Arc::new(std::sync::Mutex::new(None));
+        let task = pipe_to_log_with_secrets_owned(
+            reader,
+            "fixture-core",
+            Some(Arc::clone(&fatal)),
+            Some(Arc::new(AtomicBool::new(true))),
+            vec![],
+        );
+        let mut line = token.as_bytes().to_vec();
+        if oversized {
+            line.extend(vec![b'x'; 70 * 1024]);
+        }
+        line.extend_from_slice(DHCP_MONITOR_MISSING_TOKEN.as_bytes());
+        line.push(b'\n');
+        tokio::time::timeout(Duration::from_secs(5), async {
+            writer.write_all(&line).await.unwrap();
+            writer.shutdown().await.unwrap();
+            task.await.unwrap().unwrap();
+        })
+        .await
+        .expect("handoff cannot stop byte draining");
+        assert_eq!(*fatal.lock().unwrap(), expected);
+    }
 }

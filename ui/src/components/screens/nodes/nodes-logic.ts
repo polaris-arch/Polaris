@@ -1,3 +1,4 @@
+import { visionTransportReason, VISION_TRANSPORT_REASON } from '@/domain/node-compatibility';
 /**
  * 节点屏纯逻辑 —— 抽出以便 node 环境 vitest 直测（本仓 vitest `environment:'node'`，无 jsdom）。
  *
@@ -173,12 +174,21 @@ export function speedTestBlockReason(
  */
 export function invalidNodeIndex(
   nodes: readonly InvalidNodeInfo[] | null | undefined,
+  servers: readonly ServerConfig[] = [],
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const n of nodes ?? []) {
     if (!n?.id) continue;
+    const current = servers.find(server => server.id === n.id);
+    // This deterministic reason is re-evaluated against the actual displayed node.
+    // A repaired node must not remain disabled by a previous runtime snapshot.
+    if (n.reason === VISION_TRANSPORT_REASON && current && !visionTransportReason(current)) continue;
     // reason 可能为空串（后端只给了 tag）——仍要建索引（置灰照做），tooltip 由消费方兜底文案。
     out[n.id] = n.reason ?? '';
+  }
+  for (const server of servers) {
+    const reason = visionTransportReason(server);
+    if (reason) out[server.id] = reason;
   }
   return out;
 }
@@ -426,6 +436,7 @@ export function protocolLabel(proto: string): string {
 /** 传输/安全摘要（原型 .nd-xfer：reality · tcp / ws · tls / quic 等）。 */
 export function transferSummary(server: ServerConfig): string {
   const proto = server.protocol.toLowerCase();
+  if (proto === 'naive') return `${server.naiveSettings?.useHttp3 === true ? 'h3' : 'h2'} · tls`;
   if (proto === 'wireguard') return 'udp · wg';
   // Tailscale 的协议标签已足够；静态实现摘要不能说明当前连接/认证状态。
   if (proto === 'tailscale') return '';

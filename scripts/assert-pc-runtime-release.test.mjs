@@ -66,8 +66,9 @@ function requireCandidateSources(candidate) {
   // function differs: `!cancelled()` (2026-10-07) lets a superseded run stop its
   // in-flight installer legs, whereas `always()` kept them running to the end.
   // Both disable default skip propagation, which is what this allowlist relies on.
+  // The authorization-only preflight must not enter this installer matrix.
   assert.doesNotMatch(candidate, /^      always\(\)/m, 'installer legs must stay cancellable');
-  assert.match(candidate, /^    if: >-\n      !cancelled\(\) && needs\.setup\.result == 'success'\n      && \(needs\.desktop_core\.result == 'success'\n        \|\| \(needs\.desktop_core\.result == 'skipped' && inputs\.core_bundle_artifact != ''\)\)$/m);
+  assert.match(candidate, /^    if: >-\n      inputs\.linux_auth_preflight_only != true && \(!cancelled\(\) && needs\.setup\.result == 'success'\n      && \(needs\.desktop_core\.result == 'success'\n        \|\| \(needs\.desktop_core\.result == 'skipped' && inputs\.core_bundle_artifact != ''\)\)\)$/m);
 }
 
 function requireRiskPolicy(yaml) {
@@ -241,7 +242,7 @@ test('arguments, skip flags and claimed receipts cannot bypass source checks or 
     const fixturePaths = [...inputPaths, 'scripts/assert-pc-runtime-release.mjs',
       'scripts/desktop-core/source-graph.mjs', 'scripts/desktop-core/release-consumer.mjs',
       // release-consumer statically imports the upstream adapter even for legacy inputs.
-      'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/native-dns-candidate.mjs',
+      'scripts/desktop-core/upstream-release.mjs', 'scripts/lib/polaris-version.json', 'scripts/desktop-core/native-dns-candidate.mjs',
       'scripts/lib/core-identity.mjs',
       'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs'];
     for (const path of fixturePaths) {
@@ -298,6 +299,22 @@ test('removing, skipping or swallowing a release clearance fails the policy', ()
 test('candidate matrix preserves strict source consumption and states unobserved acceptance', () => {
   const candidate = job(packageYaml, 'package');
   requireCandidateSources(candidate);
+  const condition = candidate.match(/^    if: >-\n(?:      .*\n)+/m)?.[0];
+  assert.ok(condition, 'candidate condition must be present for negative controls');
+  for (const [before, after] of [
+    ['inputs.linux_auth_preflight_only != true && ', ''],
+    ['inputs.linux_auth_preflight_only != true', 'inputs.linux_auth_preflight_only == true'],
+    ['inputs.linux_auth_preflight_only != true && ', 'inputs.linux_auth_preflight_only != true || '],
+    ['!cancelled()', 'always()'],
+    ["needs.setup.result == 'success'", "needs.setup.result != 'failure'"],
+    ["needs.desktop_core.result == 'success'", "needs.desktop_core.result != 'failure'"],
+    ["needs.desktop_core.result == 'skipped' && inputs.core_bundle_artifact != ''",
+      "needs.desktop_core.result == 'skipped' || inputs.core_bundle_artifact != ''"],
+  ]) {
+    const changed = condition.replace(before, after);
+    assert.notEqual(changed, condition, `mutation must exercise ${before}`);
+    assert.throws(() => requireCandidateSources(candidate.replace(condition, changed)));
+  }
   assert.doesNotMatch(candidate, /assert-pc-runtime-release|pc_runtime_release_policy/);
   const summary = step(candidate, 'Describe source-first desktop artifacts').text;
   assert.ok(summary.includes('GITHUB_STEP_SUMMARY'));
@@ -432,7 +449,7 @@ function formalPolicyFixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'formal-source-publication-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const paths = ['scripts/assert-pc-runtime-release.mjs', 'scripts/desktop-core/source-graph.mjs',
-    'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs',
+    'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/lib/polaris-version.json',
     'scripts/desktop-core/native-dns-candidate.mjs', 'scripts/lib/core-identity.mjs',
     'scripts/lib/cronet-payload.mjs', 'scripts/lib/cronet-contract.mjs', manifestPath,
     'scripts/desktop-core/release-contract.json', 'scripts/desktop-core/release-asset-index.json'];
@@ -444,6 +461,15 @@ function formalPolicyFixture(t) {
   reset();
   return { directory, files, reset, run: env => runPolicy([], env, join(directory, 'scripts/assert-pc-runtime-release.mjs')) };
 }
+
+test('copied release adapter requires its shared grammar with no missing-file fallback', t => {
+  const f = formalPolicyFixture(t);
+  rmSync(join(f.directory, 'scripts/lib/polaris-version.json'));
+  const result = f.run({});
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /ENOENT/);
+  assert.match(result.stderr, /polaris-version\.json/);
+});
 
 test('formal publication source admission uses the exact strict selected contract and committed index', t => {
   const f = formalPolicyFixture(t), manifest = JSON.parse(f.files.get(manifestPath));

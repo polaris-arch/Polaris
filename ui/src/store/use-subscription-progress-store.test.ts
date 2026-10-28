@@ -130,3 +130,33 @@ describe('订阅进度接线不变量', () => {
     expect(ts).toContain("EVENT_SUBSCRIPTION_UPDATE_PROGRESS: 'event:subscriptionUpdateProgress'");
   });
 });
+
+import { useSubscriptionProgressStore } from './use-subscription-progress-store';
+describe('refresh owner generation', () => {
+  it('does not let superseded frames overwrite newer progress, even after terminal deletion', () => {
+    useSubscriptionProgressStore.setState({progress: {}, generations: {}});
+    const apply = useSubscriptionProgressStore.getState().applyProgress;
+    apply(frame({phase: 'fetching', generation: 1}));
+    apply(frame({phase: 'fetching', generation: 2}));
+    apply(frame({phase: 'failed', generation: 1}));
+    expect(useSubscriptionProgressStore.getState().progress['sub-a'].generation).toBe(2);
+    apply(frame({phase: 'done', generation: 2}));
+    expect(useSubscriptionProgressStore.getState().progress['sub-a']).toBeUndefined();
+    apply(frame({phase: 'providers', generation: 1}));
+    apply(frame({phase: 'failed'}));
+    expect(useSubscriptionProgressStore.getState().progress['sub-a']).toBeUndefined();
+    apply(frame({phase: 'fetching', generation: 3}));
+    expect(useSubscriptionProgressStore.getState().progress['sub-a'].generation).toBe(3);
+  });
+});
+
+
+it('rejects malformed owner generations without clearing the current result', () => {
+  useSubscriptionProgressStore.setState({progress: {}, generations: {}});
+  const apply = useSubscriptionProgressStore.getState().applyProgress;
+  apply(frame({phase:'fetching',generation:2}));
+  for (const generation of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    apply(frame({phase:'done',generation}));
+    expect(useSubscriptionProgressStore.getState().progress['sub-a'].generation).toBe(2);
+  }
+});

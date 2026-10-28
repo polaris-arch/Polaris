@@ -616,14 +616,15 @@ fn rel(root: &Path, p: &Path) -> String {
 }
 
 /// `mod NAME;`（无 body）在文件系统上的两个候选落点。
-fn child_paths(parent: &Path, name: &str) -> [PathBuf; 2] {
+fn child_paths(parent: &Path, inline: &[String], name: &str) -> [PathBuf; 2] {
     let dir = parent.parent().unwrap_or(Path::new("."));
     let stem = parent.file_stem().map(|s| s.to_string_lossy().to_string());
-    let base = match stem.as_deref() {
+    let mut base = match stem.as_deref() {
         Some("mod") | Some("lib") | Some("main") => dir.to_path_buf(),
         Some(s) => dir.join(s),
         None => dir.to_path_buf(),
     };
+    base.extend(inline);
     [
         base.join(format!("{name}.rs")),
         base.join(name).join("mod.rs"),
@@ -691,6 +692,9 @@ fn file_level_gates(
     for p in files {
         let (code, _, attr_surface) = &masked[p];
         let mut pend = String::new();
+        // As in scan_file, track actual brace scopes. Inline modules contribute
+        // their name to Rust's external-child path and propagate ancestor gates.
+        let mut stack: Vec<(bool, Option<String>)> = Vec::new();
         for ch in chunks(code, attr_surface) {
             match ch {
                 Chunk::Attr { cfg_text, .. } => {
@@ -699,15 +703,29 @@ fn file_level_gates(
                 }
                 Chunk::Line { text, .. } => {
                     let t = text.trim();
-                    if let Some((kw, name)) = parse_item(&text) {
+                    let item = parse_item(&text);
+                    let g = is_gated(&pend) || stack.iter().any(|(gate, _)| *gate);
+                    if let Some((kw, name)) = &item {
                         if kw == "mod" && t.ends_with(';') {
-                            let g = is_gated(&pend);
-                            for cp in child_paths(p, &name) {
+                            let inline: Vec<String> =
+                                stack.iter().filter_map(|(_, name)| name.clone()).collect();
+                            for cp in child_paths(p, &inline, name) {
                                 if known.contains(&cp) {
                                     edges.push((cp, p.clone(), g));
                                 }
                             }
                         }
+                    }
+                    let name = match &item {
+                        Some((kw, name)) if kw == "mod" => Some(name.clone()),
+                        _ => None,
+                    };
+                    let depth = text.matches('{').count() as i32 - text.matches('}').count() as i32;
+                    for k in 0..depth.max(0) {
+                        stack.push((g, if k == 0 { name.clone() } else { None }));
+                    }
+                    for _ in 0..(-depth).max(0) {
+                        stack.pop();
                     }
                     if !t.is_empty() {
                         pend.clear();
@@ -729,6 +747,57 @@ fn file_level_gates(
         }
     }
     gated
+}
+
+#[test]
+fn file_gates_follow_inline_module_paths_and_do_not_leak_to_siblings() {
+    let parent = PathBuf::from("src/source.rs");
+    let child = PathBuf::from("src/source/android/tests/mod.rs");
+    let sibling = PathBuf::from("src/source/tests/mod.rs");
+    let nested = PathBuf::from("src/source/android/tests/nested.rs");
+    let files = vec![
+        parent.clone(),
+        child.clone(),
+        sibling.clone(),
+        nested.clone(),
+    ];
+    for (source, should_gate) in [
+        (
+            "mod android {\n    #[cfg(test)]\n    mod tests;\n}\nmod tests;",
+            true,
+        ),
+        (
+            "#[cfg(test)]\nmod android {\n    mod tests;\n}\nmod tests;",
+            true,
+        ),
+        ("mod android {\n    mod tests;\n}\nmod tests;", false),
+        (
+            "mod android {\n    // #[cfg(test)]\n    mod tests;\n}\nmod tests;",
+            false,
+        ),
+        (
+            "mod android {\n    #[cfg(test)]\n    // mod tests;\n}\nmod tests;",
+            false,
+        ),
+        (
+            "mod other {\n    #[cfg(test)]\n    mod tests;\n}\nmod tests;",
+            false,
+        ),
+    ] {
+        let masked = BTreeMap::from([
+            (parent.clone(), mask(source)),
+            (child.clone(), mask("mod nested;")),
+            (sibling.clone(), mask("")),
+            (nested.clone(), mask("")),
+        ]);
+        let gated = file_level_gates(&files, &masked);
+        assert_eq!(gated.contains(&child), should_gate, "{source}");
+        assert_eq!(gated.contains(&nested), should_gate, "{source}");
+        assert!(
+            !gated.contains(&sibling),
+            "inline gate must not cover its sibling: {source}"
+        );
+    }
 }
 
 // ===================== 扫描 =====================

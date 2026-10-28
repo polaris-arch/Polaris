@@ -33,12 +33,15 @@ await (await import('@/i18n')).i18nReady;
 const { helperApi } = await import('@/ipc/api-client');
 const { useDialogStore } = await import('@/components/dialogs/dialog-store');
 const { default: Screen } = await import('./SettingsHelper');
+const { FeedbackNotice } = await import('./Primitives');
+const { toast } = await import('@/lib/error-handler');
 const absent = { supported: true, installed: false, ready: false, upgradeable: false, needsRepair: false };
 function render() { h.stateIndex = h.refIndex = 0; return Screen(); }
 function nodes(node: unknown): ReactElement<Record<string, unknown>>[] {
   if (Array.isArray(node)) return node.flatMap(nodes);
   if (!isValidElement<Record<string, unknown>>(node)) return [];
-  return [node, ...nodes(node.props.children)];
+  // The real presenter renders its actions slot; do not execute hook-bearing components here.
+  return [node, ...nodes(node.props.children), ...(node.type === FeedbackNotice ? nodes(node.props.actions) : [])];
 }
 function text(node: unknown): string {
   if (Array.isArray(node)) return node.map(text).join('');
@@ -167,4 +170,15 @@ it('an in-flight request deduplicates even previously captured click handlers', 
   expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
   complete({ success: true, status: absent } as never);
   await vi.waitFor(() => expect(h.state[2]).toBe(false));
+});
+
+
+it('classified install failure remains in the global toast after settings unmounts', async () => {
+  const unmount = await mounted();
+  vi.mocked(helperApi.install).mockResolvedValue({ success: false, errorCode: 'installerFailed', status: absent } as never);
+  click('helper.installAction');
+  await vi.waitFor(() => expect(h.state[3]).toBe('installerFailed'));
+  unmount();
+  expect(toast.error).toHaveBeenCalledExactlyOnceWith('helper.installFail', 'helper.actionError.installerFailed');
+  expect(helperApi.install).toHaveBeenCalledExactlyOnceWith();
 });

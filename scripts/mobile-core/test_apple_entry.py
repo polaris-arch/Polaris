@@ -915,14 +915,28 @@ class AppleEntryTests(unittest.TestCase):
             root = Path(temporary)
             data = root / 'resources/data'; data.mkdir(parents=True)
             for n in range(28):
-                (data / f'geo-{n}.srs').write_bytes(b'SRS' + bytes([n]))
+                source = data / f'geo-{n}.srs'
+                source.write_bytes(b'SRS' + bytes([n])); source.chmod(0o644)
             for name in ('LICENSE', 'NOTICE', 'THIRD-PARTY-LICENSES.md'):
-                (root / name).write_bytes(('actual ' + name).encode())
+                source = root / name
+                source.write_bytes(('actual ' + name).encode()); source.chmod(0o644)
             config = root / 'src-tauri/tauri.ios.conf.json'; config.parent.mkdir(parents=True)
             config.write_text(json.dumps({'bundle': {'resources': ['../resources/data/',
                 '../THIRD-PARTY-LICENSES.md', '../NOTICE', '../LICENSE']}}))
             (root / 'src-tauri/gen/apple').mkdir(parents=True)
             with mock.patch.object(consume, 'ROOT', root):
+                # Only these synthetic positive inputs get the required mode;
+                # caller umask is not part of their contract and is not changed.
+                # The real gate must still reject, not normalize, invalid modes.
+                for source in (data / 'geo-0.srs', root / 'NOTICE'):
+                    for mode in (0o600, 0o664, 0o755):
+                        source.chmod(mode)
+                        with self.assertRaisesRegex(RuntimeError, 'resource source mode differs'):
+                            consume.materialize_apple_resources()
+                        self.assertEqual(source.stat().st_mode & 0o777, mode)
+                        self.assertFalse((root / 'src-tauri/gen/apple/assets').exists())
+                        self.assertFalse((root / 'src-tauri/gen/apple/assets.formal-stage').exists())
+                    source.chmod(0o644)
                 expected = consume.materialize_apple_resources()
                 self.assertEqual(len(expected), 31)
                 self.assertEqual(consume.materialize_apple_resources(), expected)
@@ -935,6 +949,17 @@ class AppleEntryTests(unittest.TestCase):
                 with zipfile.ZipFile(io.BytesIO(stream.getvalue())) as package:
                     observed = verify_apple_resources(package, 'Payload/Polaris.app/', expected)
                     self.assertEqual(len(observed), 31)
+                    for mode in (0o600, 0o664, 0o755):
+                        altered = io.BytesIO()
+                        with zipfile.ZipFile(altered, 'w') as invalid:
+                            for n, entry in enumerate(package.infolist()):
+                                copied = deepcopy(entry)
+                                if n == 0:
+                                    copied.external_attr = (0o100000 | mode) << 16
+                                invalid.writestr(copied, package.read(entry.filename))
+                        with zipfile.ZipFile(io.BytesIO(altered.getvalue())) as invalid, \
+                                self.assertRaisesRegex(RuntimeError, 'bytes/mode'):
+                            verify_apple_resources(invalid, 'Payload/Polaris.app/', expected)
                     changed = {key: dict(row) for key, row in expected.items()}
                     key = next(iter(changed)); changed[key]['sha256'] = '0' * 64
                     with self.assertRaisesRegex(RuntimeError, 'bytes/mode'):
@@ -1515,45 +1540,97 @@ class AppleCacheIdentityTests(unittest.TestCase):
                             apple_cache.manifest(second, 'device-arm64'))
 
     def test_prepare_emits_separate_keys_and_ignores_unrelated_tracked_test_bytes(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary).resolve(); source = base / 'checkout'; source.mkdir()
-            root = base / 'run'; root.mkdir(); home = base / 'home'; (home / '.cargo').mkdir(parents=True)
-            inputs = self.inputs(); tools = inputs['tools']; tools['rustc'] = inputs['rustc']
-            for name in inputs['config']:
-                path = source / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(name)
-            paths = {}
-            for name in ('cargo', 'rustc'):
-                paths[name] = base / name; paths[name].write_text(name + ' actual executable')
-            tracked = [*inputs['config'], 'scripts/mobile-core/test_apple_entry.py',
-                       'scripts/mobile-core/android_sdk.py', 'ui/test-fixture.ts']
-            def run(command, **kwargs):
-                key = tuple(command)
-                values = {('git', 'check-ignore', '--', apple_cache.STAGE.as_posix()): apple_cache.STAGE.as_posix(),
-                    ('git', 'ls-files', '-z'): '\0'.join(tracked) + '\0', ('rustc', '-vV'): inputs['rustc'],
-                    ('cargo', '-V'): inputs['cargo']}
-                values.update({('rustup', 'which', name): str(path) for name, path in paths.items()})
-                self.assertIn(key, values, 'cache preparation must not compile or fetch')
-                return values[key]
-            env = {'RUNNER_TEMP': str(base), 'GITHUB_OUTPUT': str(base / 'outputs')}
-            original = deepcopy(tools)
-            with mock.patch.dict(os.environ, env, clear=True), \
-                    mock.patch.object(apple_cache, 'ROOT', source), \
-                    mock.patch.object(apple_cache, 'location', return_value=root), \
-                    mock.patch.object(apple_cache.Path, 'home', return_value=home), \
-                    mock.patch.object(apple_cache, 'read_receipt', return_value=tools), \
-                    mock.patch.object(apple_cache, 'run', side_effect=run), \
-                    mock.patch.object(apple_cache, 'context', return_value={'candidate': 'a' * 40}), \
-                    mock.patch.object(apple_cache, 'check_space', return_value=40 * 1024 ** 3), \
-                    mock.patch.object(apple_cache, 'note') as note:
-                apple_cache.prepare()
-            emitted = dict(line.split('=', 1) for line in (base / 'outputs').read_text().splitlines())
-            self.assertEqual(set(emitted), {'identity', 'registry_identity'})
-            self.assertNotEqual(emitted['identity'], emitted['registry_identity'])
-            owner = json.loads((source / apple_cache.STAGE / 'owner.json').read_text())
-            self.assertEqual(owner['identity'], emitted['identity'])
-            self.assertEqual(owner['registryIdentity'], emitted['registry_identity'])
-            self.assertEqual(note.call_args.kwargs['registryIdentity'], emitted['registry_identity'])
-            self.assertEqual(tools, original)
+        identities = []
+        cases = [(False, False, None), (False, True, None), (True, False, None),
+                 (True, True, None), (True, False, 'warm-downloads'),
+                 (False, False, 'dangling-home'), (False, False, 'external-config')]
+        cases.extend((True, False, (relative, kind))
+                     for relative in ('registry', 'registry/index', 'registry/cache', 'git', 'git/db')
+                     for kind in ('file', 'symlink', 'dangling', 'wrong-owner'))
+        for warm, explicit, fault in cases:
+            with tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve(); source = base / 'checkout'; source.mkdir()
+                root = base / 'run'; root.mkdir(); home = base / 'home'; home.mkdir()
+                if warm:
+                    (home / '.cargo').mkdir()
+                inputs = self.inputs(); tools = inputs['tools']; tools['rustc'] = inputs['rustc']
+                for name in inputs['config']:
+                    path = source / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(name)
+                paths = {}
+                for name in ('cargo', 'rustc'):
+                    paths[name] = base / name; paths[name].write_text(name + ' actual executable')
+                tracked = [*inputs['config'], 'scripts/mobile-core/test_apple_entry.py',
+                           'scripts/mobile-core/android_sdk.py', 'ui/test-fixture.ts']
+                def run(command, **kwargs):
+                    key = tuple(command)
+                    values = {('git', 'check-ignore', '--', apple_cache.STAGE.as_posix()): apple_cache.STAGE.as_posix(),
+                        ('git', 'ls-files', '-z'): '\0'.join(tracked) + '\0', ('rustc', '-vV'): inputs['rustc'],
+                        ('cargo', '-V'): inputs['cargo']}
+                    values.update({('rustup', 'which', name): str(path) for name, path in paths.items()})
+                    self.assertIn(key, values, 'cache preparation must not compile or fetch')
+                    return values[key]
+                env = {'RUNNER_TEMP': str(base), 'GITHUB_OUTPUT': str(base / 'outputs')}
+                if explicit:
+                    env['CARGO_HOME'] = str(home / '.cargo')
+                if fault == 'dangling-home':
+                    (home / '.cargo').symlink_to(base / 'missing-cargo')
+                elif fault == 'external-config':
+                    (home / '.cargo').mkdir()
+                    (home / '.cargo/config.toml').write_bytes(b'unbound source replacement')
+                elif fault == 'warm-downloads':
+                    for name in apple_cache.REGISTRY_DIRS:
+                        directory = home / '.cargo' / name; directory.mkdir(parents=True, exist_ok=True)
+                        (directory / 'download').write_bytes(b'cached download; not an identity input')
+                elif isinstance(fault, tuple):
+                    relative, kind = fault; bad = home / '.cargo' / relative
+                    bad.parent.mkdir(parents=True, exist_ok=True)
+                    if kind == 'file':
+                        bad.write_bytes(b'not a directory')
+                    elif kind == 'wrong-owner':
+                        bad.mkdir()
+                    else:
+                        target = base / 'cache-link-target'
+                        if kind == 'symlink':
+                            target.mkdir()
+                        bad.symlink_to(target)
+                original_lstat = Path.lstat
+                def lstat(current, *args, **kwargs):
+                    result = original_lstat(current, *args, **kwargs)
+                    if isinstance(fault, tuple) and fault[1] == 'wrong-owner' and current == bad:
+                        values = list(result); values[4] = os.getuid() + 1
+                        return os.stat_result(values)
+                    return result
+                original = deepcopy(tools)
+                with mock.patch.object(Path, 'lstat', lstat), \
+                        mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(apple_cache, 'ROOT', source), \
+                        mock.patch.object(apple_cache, 'location', return_value=root), \
+                        mock.patch.object(apple_cache.Path, 'home', return_value=home), \
+                        mock.patch.object(apple_cache, 'read_receipt', return_value=tools), \
+                        mock.patch.object(apple_cache, 'run', side_effect=run), \
+                        mock.patch.object(apple_cache, 'context', return_value={'candidate': 'a' * 40}), \
+                        mock.patch.object(apple_cache, 'check_space', return_value=40 * 1024 ** 3), \
+                        mock.patch.object(apple_cache, 'note') as note:
+                    if fault not in (None, 'warm-downloads'):
+                        with self.assertRaisesRegex(RuntimeError, 'symlink|unbound Cargo home|registry cache directory'):
+                            apple_cache.prepare()
+                        self.assertFalse((source / apple_cache.STAGE / 'owner.json').exists())
+                        self.assertFalse((base / 'outputs').exists())
+                        note.assert_not_called()
+                        continue
+                    apple_cache.prepare()
+                emitted = dict(line.split('=', 1) for line in (base / 'outputs').read_text().splitlines())
+                self.assertEqual(set(emitted), {'identity', 'registry_identity'})
+                self.assertNotEqual(emitted['identity'], emitted['registry_identity'])
+                owner = json.loads((source / apple_cache.STAGE / 'owner.json').read_text())
+                self.assertEqual(owner['identity'], emitted['identity'])
+                self.assertEqual(owner['registryIdentity'], emitted['registry_identity'])
+                self.assertEqual(note.call_args.kwargs['registryIdentity'], emitted['registry_identity'])
+                self.assertEqual(tools, original)
+                self.assertEqual((home / '.cargo').exists(), warm, 'prepare must not fabricate cache roots')
+                self.assertEqual((home / '.cargo/registry').exists(), fault == 'warm-downloads')
+                identities.append(emitted)
+        self.assertTrue(all(value == identities[0] for value in identities))
 
     def test_workflow_uses_exact_independent_versioned_keys_without_restore_prefixes(self):
         workflow = (apple_cache.ROOT / '.github/workflows/apple.yml').read_text()
@@ -1571,6 +1648,160 @@ class AppleCacheIdentityTests(unittest.TestCase):
 
 
 class AppleDependencyCacheTests(unittest.TestCase):
+    def test_cargo_home_rejects_overrides_and_redirected_or_unowned_home(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve(); home = base / 'home'; home.mkdir()
+            other = base / 'other'; other.mkdir(); alias = base / 'alias'; alias.symlink_to(home)
+            for value in ('', '.cargo', '../home/.cargo', str(other), str(alias / '.cargo')):
+                with self.subTest(override=value), mock.patch.object(Path, 'home', return_value=home), \
+                        mock.patch.dict(os.environ, {'CARGO_HOME': value}, clear=True), \
+                        self.assertRaisesRegex(RuntimeError, 'actual Cargo home'):
+                    apple_cache.cargo_home()
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with mock.patch.object(Path, 'home', return_value=alias), \
+                        self.assertRaisesRegex(RuntimeError, 'ancestry redirected'):
+                    apple_cache.cargo_home()
+                with mock.patch.object(Path, 'home', return_value=home), \
+                        mock.patch.object(apple_cache.os, 'getuid', return_value=os.getuid() + 1), \
+                        self.assertRaisesRegex(RuntimeError, 'home ownership/type'):
+                    apple_cache.cargo_home()
+            self.assertFalse((home / '.cargo').exists())
+
+    def test_cargo_home_refuses_unbound_external_config_without_reading_it(self):
+        for name in ('config', 'config.toml'):
+            for kind in ('file', 'directory', 'symlink', 'dangling'):
+                with self.subTest(name=name, kind=kind), tempfile.TemporaryDirectory() as temporary:
+                    home = Path(temporary).resolve(); cargo = home / '.cargo'; cargo.mkdir()
+                    path = cargo / name
+                    if kind == 'file':
+                        path.write_bytes(b'configuration may contain private transport values')
+                    elif kind == 'directory':
+                        path.mkdir()
+                    else:
+                        target = home / 'config-target'
+                        if kind == 'symlink':
+                            target.write_bytes(b'never read a linked configuration')
+                        path.symlink_to(target)
+                    with mock.patch.object(Path, 'home', return_value=home), \
+                            mock.patch.dict(os.environ, {}, clear=True), \
+                            mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('private bytes read')), \
+                            mock.patch.object(Path, 'read_text', side_effect=AssertionError('private text read')), \
+                            self.assertRaisesRegex(RuntimeError, 'unbound Cargo home configuration'):
+                        apple_cache.cargo_home()
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve(); cargo = home / '.cargo'; cargo.mkdir()
+            (cargo / 'credentials.toml').write_bytes(b'fixture-only credential transport; never identity')
+            with mock.patch.object(Path, 'home', return_value=home), \
+                    mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('credentials read')):
+                self.assertEqual(apple_cache.cargo_home(), cargo)
+
+    def test_registry_missing_roots_stay_missing_and_empty_caches_cannot_be_saved(self):
+        for deepest in (None, '.cargo', '.cargo/registry', '.cargo/registry/index', '.cargo/git/db'):
+            with self.subTest(deepest=deepest), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                if deepest:
+                    (home / deepest).mkdir(parents=True)
+                before = sorted(str(p.relative_to(home)) for p in home.rglob('*'))
+                with mock.patch.object(Path, 'home', return_value=home), \
+                        mock.patch.dict(os.environ, {}, clear=True), \
+                        mock.patch.object(apple_cache, 'location', return_value=home), \
+                        mock.patch.object(apple_cache, 'check_space') as space, \
+                        mock.patch.object(apple_cache, 'note') as note, \
+                        self.assertRaisesRegex(RuntimeError, 'bounded nonempty registry cache'):
+                    apple_cache.registry_ready()
+                self.assertEqual(sorted(str(p.relative_to(home)) for p in home.rglob('*')), before)
+                space.assert_not_called(); note.assert_not_called()
+
+    def test_registry_partial_real_downloads_allow_only_genuinely_missing_branches(self):
+        for relative in ('registry/index', 'registry/cache', 'git/db'):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve(); folder = home / '.cargo' / relative
+                folder.mkdir(parents=True); (folder / 'download').write_bytes(b'real fixture bytes')
+                before = sorted(str(p.relative_to(home)) for p in home.rglob('*'))
+                with mock.patch.object(Path, 'home', return_value=home), \
+                        mock.patch.dict(os.environ, {'RUNNER_TEMP': str(home)}, clear=True), \
+                        mock.patch.object(apple_cache, 'location', return_value=home), \
+                        mock.patch.object(apple_cache, 'check_space', return_value=12345) as space, \
+                        mock.patch.object(apple_cache, 'note') as note:
+                    apple_cache.registry_ready()
+                size = len(b'real fixture bytes')
+                space.assert_called_once_with(home, size * 9 // 8 + 2 * 4096)
+                self.assertEqual(note.call_args.args, (home, 'registry-save'))
+                self.assertEqual(note.call_args.kwargs['dependencyBytes'], size)
+                self.assertEqual(sorted(str(p.relative_to(home)) for p in home.rglob('*')), before)
+
+    def test_registry_directory_types_ownership_and_dangling_ancestors_cannot_be_cache_misses(self):
+        for relative in ('.cargo', '.cargo/registry', '.cargo/registry/index',
+                         '.cargo/registry/cache', '.cargo/git', '.cargo/git/db'):
+            for kind in ('file', 'fifo', 'symlink', 'dangling', 'wrong-owner'):
+                with self.subTest(relative=relative, kind=kind), tempfile.TemporaryDirectory() as temporary:
+                    home = Path(temporary).resolve()
+                    for name in ('registry/index', 'registry/cache', 'git/db'):
+                        folder = home / '.cargo' / name; folder.mkdir(parents=True, exist_ok=True)
+                        (folder / 'download').write_bytes(b'ordinary nonempty cache')
+                    path = home / relative
+                    if kind != 'wrong-owner':
+                        held = home / 'retained-directory'; path.rename(held)
+                        if kind == 'file':
+                            path.write_bytes(b'not a directory')
+                        elif kind == 'fifo':
+                            os.mkfifo(path)
+                        else:
+                            path.symlink_to(held if kind == 'symlink' else home / 'missing-target')
+                    original_lstat = Path.lstat
+                    def lstat(current, *args, **kwargs):
+                        result = original_lstat(current, *args, **kwargs)
+                        if kind == 'wrong-owner' and current == path:
+                            values = list(result); values[4] = os.getuid() + 1
+                            return os.stat_result(values)
+                        return result
+                    with mock.patch.object(Path, 'home', return_value=home), \
+                            mock.patch.dict(os.environ, {'RUNNER_TEMP': str(home)}, clear=True), \
+                            mock.patch.object(Path, 'lstat', lstat), \
+                            mock.patch.object(apple_cache, 'location', return_value=home), \
+                            mock.patch.object(apple_cache, 'check_space') as space, \
+                            mock.patch.object(apple_cache, 'note') as note, \
+                            self.assertRaisesRegex(RuntimeError, 'registry cache directory'):
+                        apple_cache.registry_ready()
+                    space.assert_not_called(); note.assert_not_called()
+
+    def test_registry_permission_and_io_errors_are_not_cold_misses(self):
+        for error in (PermissionError(errno.EACCES, 'unreadable cache'), OSError(errno.EIO, 'cache I/O error')):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve(); (home / '.cargo').mkdir()
+                path = home / '.cargo/registry'; original_lstat = Path.lstat
+                def lstat(current, *args, **kwargs):
+                    if current == path:
+                        raise error
+                    return original_lstat(current, *args, **kwargs)
+                with mock.patch.object(Path, 'home', return_value=home), \
+                        mock.patch.dict(os.environ, {}, clear=True), \
+                        mock.patch.object(Path, 'lstat', lstat), \
+                        mock.patch.object(apple_cache, 'location', return_value=home), \
+                        mock.patch.object(apple_cache, 'check_space') as space, \
+                        mock.patch.object(apple_cache, 'note') as note, self.assertRaises(type(error)):
+                    apple_cache.registry_ready()
+                space.assert_not_called(); note.assert_not_called()
+
+    def test_registry_combined_bounds_and_headroom_remain_mandatory(self):
+        for failure in ('bytes', 'count', 'headroom'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary).resolve()
+                for name in ('registry/index', 'git/db'):
+                    folder = home / '.cargo' / name; folder.mkdir(parents=True)
+                    (folder / 'download').write_bytes(b'four')
+                with mock.patch.object(Path, 'home', return_value=home), \
+                        mock.patch.dict(os.environ, {'RUNNER_TEMP': str(home)}, clear=True), \
+                        mock.patch.object(apple_cache, 'location', return_value=home), \
+                        mock.patch.object(apple_cache, 'REGISTRY_MAX_BYTES', 7 if failure == 'bytes' else apple_cache.REGISTRY_MAX_BYTES), \
+                        mock.patch.object(apple_cache, 'MAX_ENTRIES', 3 if failure == 'count' else apple_cache.MAX_ENTRIES), \
+                        mock.patch.object(apple_cache.os, 'statvfs', return_value=mock.Mock(f_bavail=0, f_frsize=4096)), \
+                        mock.patch.object(apple_cache, 'note') as note, \
+                        self.assertRaisesRegex(RuntimeError, 'headroom' if failure == 'headroom' else 'bounded nonempty'):
+                    apple_cache.registry_ready()
+                note.assert_not_called()
+
     def test_actual_app_package_and_library_outputs_are_never_cache_dependencies(self):
         for name in ('polaris-0123456789abcdef', 'libpolaris_lib-0123456789abcdef.a',
                      'polaris_lib-0123456789abcdef.d', 'libpolaris_lib.a', 'polaris.d'):
@@ -1903,22 +2134,37 @@ class AppleDependencyCacheTests(unittest.TestCase):
                         transfer.assert_not_called(); move.assert_not_called()
                     self.assertFalse(dep.exists()); self.assertEqual(app.read_bytes(), b'App native archive')
                     self.assertEqual(final.read_bytes(), b'original final staticlib')
-        for position in ('root', 'nested'):
-            with self.subTest(registry=position), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp).resolve(); home = root / 'home'; home.mkdir()
-                folder = home / '.cargo/registry/index'; folder.mkdir(parents=True)
-                (folder / 'ordinary').write_bytes(b'registry bytes')
-                if position == 'root':
-                    folder.rename(home / 'held-index'); folder.symlink_to(home / 'held-index')
-                else:
-                    (folder / 'injected-link').symlink_to(root / 'missing-registry-target')
-                with mock.patch.object(Path, 'home', return_value=home), \
-                        mock.patch.object(apple_cache, 'location', return_value=root), \
-                        mock.patch.object(apple_cache, 'check_space') as space, \
-                        mock.patch.object(apple_cache, 'note') as note, \
-                        self.assertRaisesRegex(RuntimeError, 'symlink|redirected'):
-                    apple_cache.registry_ready()
-                space.assert_not_called(); note.assert_not_called()
+        for caller in ({}, {'HOME': '/fixture-caller/home', 'CARGO_HOME': '/fixture-caller/cargo',
+                            'RUNNER_TEMP': '/fixture-caller/temp'}):
+            with mock.patch.dict(os.environ, caller, clear=True):
+                for position in ('root', 'nested'):
+                    with self.subTest(registry=position), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp).resolve(); home = root / 'home'; home.mkdir()
+                        folder = home / '.cargo/registry/index'; folder.mkdir(parents=True)
+                        (folder / 'ordinary').write_bytes(b'registry bytes')
+                        if position == 'root':
+                            folder.rename(home / 'held-index'); folder.symlink_to(home / 'held-index')
+                        else:
+                            (folder / 'injected-link').symlink_to(root / 'missing-registry-target')
+                        with mock.patch.object(Path, 'home', return_value=home), \
+                                mock.patch.dict(os.environ, {'HOME': str(home),
+                                    'CARGO_HOME': str(home / '.cargo'), 'RUNNER_TEMP': str(root)}, clear=True), \
+                                mock.patch.object(apple_cache, 'location', return_value=root), \
+                                mock.patch.object(apple_cache, 'registry_directory',
+                                    wraps=apple_cache.registry_directory) as directories, \
+                                mock.patch.object(apple_cache, 'checked_tree',
+                                    wraps=apple_cache.checked_tree) as checked, \
+                                mock.patch.object(apple_cache, 'check_space') as space, \
+                                mock.patch.object(apple_cache, 'note') as note, \
+                                self.assertRaisesRegex(RuntimeError, 'symlink|redirected'):
+                            apple_cache.registry_ready()
+                        self.assertIn(mock.call(folder), directories.call_args_list)
+                        if position == 'root':
+                            checked.assert_not_called()
+                        else:
+                            checked.assert_called_once_with(folder, maximum=apple_cache.REGISTRY_MAX_BYTES)
+                        space.assert_not_called(); note.assert_not_called()
+                self.assertEqual(dict(os.environ), caller, 'fixture must restore caller environment')
 
     def test_export_redirected_stage_native_ancestor_base_and_group_are_hard_failures(self):
         for position in ('stage', 'native-ancestor', 'native-base', 'group', 'dangling-group'):

@@ -102,15 +102,22 @@ fn field_names_has_no_duplicates() {
 
 #[test]
 fn utls_default_initialization_and_missing_fields_preserve_explicit_policies() {
-    assert_eq!(
-        UserConfig::default().utls_policy.as_deref(),
-        Some("default")
-    );
+    assert_eq!(UserConfig::default().utls_policy.as_deref(), Some("follow"));
     let mut raw = serde_json::to_value(UserConfig::default()).unwrap();
     raw.as_object_mut().unwrap().remove("utlsPolicy");
     let missing: UserConfig = serde_json::from_value(raw.clone()).unwrap();
-    assert_eq!(missing.utls_policy.as_deref(), Some("default"));
-    for policy in ["follow", "default", "random", "randomized", "firefox"] {
+    assert_eq!(missing.utls_policy.as_deref(), Some("follow"));
+    raw["utlsPolicy"] = serde_json::Value::Null;
+    let explicit_null: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(explicit_null.utls_policy, None);
+    for policy in [
+        "follow",
+        "default",
+        "random",
+        "randomized",
+        "firefox",
+        "future-custom",
+    ] {
         raw["utlsPolicy"] = serde_json::json!(policy);
         let parsed: UserConfig = serde_json::from_value(raw.clone()).unwrap();
         assert_eq!(parsed.utls_policy.as_deref(), Some(policy));

@@ -120,7 +120,9 @@ function Restore-Registration($snapshot) {{
   Check-Hash $temporary $snapshot.Hash
   if (Test-Path -LiteralPath $snapshot.Path) {{
     Assert-Regular $snapshot.Path
-    [IO.File]::Replace($temporary, $snapshot.Path, $null)
+    # Ordinary $null binds to an empty string, which is an invalid backup path
+    # on Windows PowerShell/.NET Framework. Pass a real CLR null string.
+    [IO.File]::Replace($temporary, $snapshot.Path, [System.Management.Automation.Language.NullString]::Value)
   }} else {{ [IO.File]::Move($temporary, $snapshot.Path) }}
   # ReplaceFile preserves destination ACLs. Reapply the captured owner/group/
   # DACL (including inheritance protection), then prove bytes AND security

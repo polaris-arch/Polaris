@@ -50,6 +50,19 @@ function details(report: MeshRouteReport, serverId: string, contextMismatch: boo
 }
 
 describe('mobile running report versus visible edit', () => {
+  it('accepts runtime commit evidence without claiming durable persistence', () => {
+    const report = applied(base());
+    report.snapshot.loadEvidence = 'runtimeCommitted';
+    expect(asMeshRouteReport(report)).not.toBeNull();
+    expect(meshRouteState(report, 'a')).toBe('full');
+    const markup = details(report, 'a', false);
+    expect(markup).toContain(translate('mobileMeshRouteEvidence.load.runtimeCommitted'));
+    expect(markup).toContain(translate('mobileMeshRouteEvidence.loadedRanges'));
+    report.snapshot.snapshotStale = true;
+    expect(details(report, 'a', false)).not.toContain(translate('mobileMeshRouteEvidence.loadedRanges'));
+    expect(asMeshRouteReport({ ...report, snapshot: { ...report.snapshot, loadEvidence: 'unrecognized' } })).toBeNull();
+  });
+
   it('keeps a staged-only node and a saved but unapplied edit out of the running conclusion', () => {
     const running = base();
     const report = applied(running);

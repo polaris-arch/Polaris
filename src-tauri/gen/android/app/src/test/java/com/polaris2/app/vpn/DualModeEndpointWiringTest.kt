@@ -13,14 +13,14 @@ class DualModeEndpointWiringTest {
         val start = service.substringAfter("private fun startKernel(").substringBefore("// ── CommandServerHandler")
         val claim = start.indexOf("MainDualModeEndpointTombstone.claimBirth(config)")
         val create = start.indexOf("Libbox.newStrictCommandServer(")
-        val nativeStart = start.indexOf("server.startOrReloadService(config, OverrideOptions())")
+        val nativeStart = start.indexOf("server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(),")
         assertTrue(claim >= 0 && claim < create && create < nativeStart)
     }
 
     @Test fun dualReloadRefusalPrecedesNativeReloadAndKeepsLiveCore() {
         val reload = service.substringAfter("private fun serviceReload(").substringBefore("private fun setReloadError(")
         val guard = reload.indexOf("requireReloadAllowed(attempt.dualModeApiPort != null, config)")
-        val nativeReload = reload.indexOf("server.startOrReloadService(config, OverrideOptions())")
+        val nativeReload = reload.indexOf("server.startOrReloadServiceWithRetryableRuntimePersistence(config, OverrideOptions(),")
         assertTrue(guard >= 0 && guard < nativeReload)
         val producer = File("src/main/java/com/polaris2/app/vpn/AndroidNativeMainControls.kt").readText()
         assertTrue(producer.contains("catch (_: DualModeEndpointTombstone.ReloadRequiresReconnect)"))

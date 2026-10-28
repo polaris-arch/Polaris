@@ -261,6 +261,20 @@ class ProducerCalls(unittest.TestCase):
         extra['producer']['files']['scripts/new-component-input.py'] = {'bytes': 1, 'sha256': 'c'*64}
         self.assertFalse(producer.equivalent_binding(original, extra))
 
+    def test_stable_ndk_profile_and_installer_are_full_receipt_and_cache_inputs(self):
+        original = self.android_projection_binding()
+        for name in ('scripts/mobile-core/ndk-r30-linux.json', 'scripts/libbox-patches/prepare-ndk-linux.py'):
+            self.assertIn(name, producer.PRODUCER_FILES)
+            self.assertNotIn(name, producer.ANDROID_UNRELATED_CODE)
+            changed = json.loads(json.dumps(original))
+            changed['producer']['files'][name]['sha256'] = '0' * 64
+            with self.subTest(name=name):
+                self.assertFalse(producer.equivalent_binding(original, changed))
+                self.assertNotEqual(producer.receipt_digest(original), producer.receipt_digest(changed))
+                missing = json.loads(json.dumps(original)); del missing['producer']['files'][name]
+                with self.assertRaisesRegex(RuntimeError, 'complete original producer code inventory'):
+                    producer.android_build_code(missing['producer'])
+
     def test_apple_target_contract_changes_binding_and_never_relabels_legacy_receipt(self):
         current = self.android_projection_binding()
         current.update(platform='apple', sourceContract=load())
@@ -343,6 +357,10 @@ class ProducerCalls(unittest.TestCase):
         helper = 'scripts/mobile-core/source_policy.py'
         self.assertEqual(actual_producer['files'][helper], producer.file_pin(producer.ROOT / helper))
         self.assertEqual(actual_consumer['consumerCode'][helper], producer.file_pin(producer.ROOT / helper))
+        helper = 'scripts/lib/polaris-version.json'
+        self.assertEqual(actual_producer['files'][helper], producer.file_pin(producer.ROOT / helper))
+        self.assertEqual(actual_consumer['consumerCode'][helper], producer.file_pin(producer.ROOT / helper))
+        self.assertIn(helper, producer.android_build_code(actual_producer)['files'])
         link_helper = 'scripts/mobile-core/apple_tls_fingerprint.py'
         for project in ('src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'):
             source = (producer.ROOT / project).read_text()

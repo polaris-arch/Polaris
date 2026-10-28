@@ -2928,8 +2928,12 @@ fn the_only_child_stream_drain_reads_bytes_not_lines() {
         "core_log.rs 又用回了 `lines()`：遇一个非 UTF-8 字节即静默退出 drain，核随后被自己的输出堵死"
     );
     assert!(
-        src.contains("read_until(b'\\n'"),
-        "core_log.rs 必须按字节读（`read_until`），坏字节经 from_utf8_lossy 渲染而不是中断排空"
+        src.contains("read_bounded_core_log_line(&mut reader).await?")
+            && src.contains("reader.fill_buf().await?")
+            && src.contains("reader.consume(count)")
+            && src.contains("String::from_utf8_lossy(&record.bytes)")
+            && src.contains("CORE_LOG_LINE_LIMIT - record.bytes.len()"),
+        "core_log.rs must drain bounded byte frames, consume their input, and render invalid UTF-8 lossily"
     );
     let login = crate_code("runtime/tailscale_login_core.rs");
     assert!(
@@ -5224,4 +5228,24 @@ fn temporary_probe_rejects_invalid_pin_even_when_insecure() {
         build_temp_node(&server, "pin-probe", &env(), None).err(),
         Some("TLS_PIN_INVALID")
     );
+}
+
+#[test]
+fn vision_transport_temp_plan_reports_fixed_failure_without_losing_good_nodes() {
+    let servers: Vec<ServerConfig> = serde_json::from_value(json!([
+        {"id":"bad","name":"RepairMe","protocol":"vless","address":"private.example","port":443,"flow":"xtls-rprx-vision","network":"httpupgrade"},
+        {"id":"good","name":"Good","protocol":"vless","address":"good.example","port":443}
+    ])).unwrap();
+    let before = serde_json::to_value(&servers).unwrap();
+    let plan = plan_temp_core_with_utls_policy(&servers, &env(), &BTreeMap::new(), Some("follow"));
+    assert_eq!(plan.testable.len(), 1);
+    assert_eq!(plan.testable[0].id, "good");
+    assert_eq!(
+        plan.unusable,
+        vec![(
+            "bad".into(),
+            UnusableReason::BuildFailed("vision-transport-unsupported")
+        )]
+    );
+    assert_eq!(serde_json::to_value(&servers).unwrap(), before);
 }

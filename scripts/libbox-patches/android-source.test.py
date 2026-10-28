@@ -83,7 +83,8 @@ class RetiredAndroidProducerContract(unittest.TestCase):
         classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest',
                    'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest',
                    'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest',
-                   'MainNativeAdmissionWiringTest']
+                   'MainNativeAdmissionWiringTest', 'DualModeEndpointWiringTest',
+                   'RuntimePersistenceSourceTest']
         declared = re.search(r'^          classes = (\[[^\n]+\])$', source, re.M)
         self.assertIsNotNone(declared)
         self.assertEqual(ast.literal_eval(declared.group(1)), classes)

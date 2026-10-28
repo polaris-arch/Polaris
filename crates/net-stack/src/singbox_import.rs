@@ -290,7 +290,6 @@ fn apply_transport(server: &mut ServerConfig, transport: &Value) {
                 },
                 max_early_data: num_val(transport.get("max_early_data")),
                 early_data_header_name: str_ne(transport.get("early_data_header_name")),
-                ..Default::default()
             }));
         }
         "grpc" => {
@@ -1286,6 +1285,7 @@ fn parse_singbox_endpoints_unresolved(
 ///   导入时保持用户态默认值；用户态并不禁止入站，是否可反向接入由路由与对端配置决定。
 /// - **`listen_port` / `udp_timeout` / `name`**：`WireGuardSettings` 无落点；
 ///   导入汇合处应向用户报告这些字段未保留。
+///
 /// `detour` is resolved from the document tag namespace to local IDs after both arrays.
 ///
 /// [`build_wireguard_endpoint`]: polaris_config_engine::builder::endpoints::build_wireguard_endpoint

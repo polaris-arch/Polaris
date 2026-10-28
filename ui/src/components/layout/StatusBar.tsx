@@ -219,7 +219,7 @@ export default function StatusBar() {
         style={latencyStale ? { opacity: 0.45 } : undefined}
         data-tip={latencyStale ? t('home.latencyStaleHint') : undefined}
       >
-        {showLatency && selectedServerId ? <MeasurementLabel serverId={selectedServerId} purpose="current" /> : latency}
+        {showLatency && selectedServerId ? <MeasurementLabel serverId={selectedServerId} purpose="current" compact /> : latency}
       </span>
 
       {/* 速率/连接数**仅连接态**显示（契约「状态栏」：`实时速率/连接数(仅连接态)`）。断开时这两个数

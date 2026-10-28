@@ -1,4 +1,6 @@
 pub(crate) mod real_core_cleanup;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod runtime_config_real_core;
 use real_core_cleanup::RealCoreCleanupGuard;
 
 use super::core_log::*;
@@ -381,7 +383,32 @@ fn two_node_config_ports(mixed: u16, selected: &str, pa: u16, pb: u16) -> Value 
     // 安全硬约束：绝不可改成 tun/systemProxy（会破坏工作机网络）。
     obj.insert("proxyModeType".into(), serde_json::json!("manual"));
     obj.insert("mixedPort".into(), serde_json::json!(mixed));
+    // Every start/switch/restart snapshot uses the same authenticated management API.
+    obj.insert(
+        "clashApiSecret".into(),
+        serde_json::json!(FIXTURE_MANAGEMENT_SECRET),
+    );
     cfg
+}
+
+#[test]
+fn two_node_fixtures_keep_one_secret_across_selection_and_port_changes() {
+    let initial = two_node_config_ports(17890, "node-a", 18001, 18002);
+    let switched = two_node_config_ports(17890, "node-b", 18001, 18002);
+    let restarted = two_node_config_ports(17891, "node-b", 18001, 18002);
+    for config in [initial, switched, restarted] {
+        assert_eq!(config["clashApiSecret"], FIXTURE_MANAGEMENT_SECRET);
+        assert_eq!(
+            config["clashApiSecret"],
+            local_only_config(17890)["clashApiSecret"]
+        );
+        assert_eq!(config["proxyModeType"], "manual");
+        assert!(config["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["address"] == "127.0.0.1"));
+    }
 }
 
 /// 两节点 + 指定选中节点的本地安全配置（节点指向本地死端口，纯决策类测试用）。
@@ -489,9 +516,29 @@ fn mark_running(rt: &ProxyRuntime) {
     };
 }
 
-/// 坏配置：反序列化为 UserConfig 必失败（非对象顶层）→ start_inner 首步即 Err，无任何副作用。
-fn bad_config() -> Value {
-    serde_json::json!("not-a-user-config-object")
+/// Schema-valid, non-gateway configuration that fails the existing raw Auto
+/// invariant inside start_inner, after admission but before any product spawn.
+/// Duplicate pins deliberately exercise an un-coded validation failure; no host
+/// capability is mocked and no early gateway/identity gate is bypassed.
+pub(super) fn post_admission_failure_config() -> Value {
+    let pin = serde_json::json!({"target":{"scope":"global"},"serverId":"fixture"});
+    serde_json::json!({"servers":[],"autoSelectPins":[pin.clone(),pin]})
+}
+
+#[test]
+fn lifecycle_failure_fixture_passes_schema_and_gateway_but_fails_raw_validation() {
+    let config = post_admission_failure_config();
+    assert!(
+        serde_json::from_value::<polaris_config_engine::user_config::UserConfig>(config.clone())
+            .is_ok()
+    );
+    assert!(polaris_store::auto_select::validate_raw(&config).is_err());
+    for platform in ["linux", "darwin", "win32"] {
+        assert_eq!(
+            super::lan_gateway::check_user_config(&config, platform),
+            Ok(())
+        );
+    }
 }
 
 /// 假核落盘（0o755）。`run_body` 是收到 `run` 子命令时的 shell 体。
@@ -565,13 +612,17 @@ fn free_port() -> u16 {
 }
 
 /// 真机验证用最小 config：manual 模式 + 全局直连 + 仅本地混合入站。
-fn local_only_config(mixed: u16) -> Value {
+// Shared by the proxy and stats real-core fixtures; never compiled into production.
+pub(in crate::runtime) const FIXTURE_MANAGEMENT_SECRET: &str = "fixture-management-secret";
+
+pub(in crate::runtime) fn local_only_config(mixed: u16) -> Value {
     serde_json::json!({
         "servers": [],
         "selectedServerId": "__direct__", // DIRECT_SERVER_ID：全局直连，无真实节点
         "proxyMode": "direct",
         "proxyModeType": "manual",        // 安全：不接管系统代理、不建 TUN
         "mixedPort": mixed,
+        "clashApiSecret": FIXTURE_MANAGEMENT_SECRET,
     })
 }
 

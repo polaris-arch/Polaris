@@ -205,6 +205,18 @@ const PENDING_TRUST_GATE: &[Entry] = &[];
 /// **同形但非读取**的串。每条同样要求恰好命中一次 —— 那个串一旦消失，条目必须跟着走。
 const TEXT_ONLY: &[Entry] = &[
     Entry {
+        name: "POLARIS_DIAGNOSTICS",
+        reason: "Generated maintenance shell diagnostic selector, set to 1 by the fixed Linux DIAGNOSTICS prelude before transactions. Shell reads only gate failure-marker emission, never admission, cleanup success or exit status; Mac has no Linux diagnostic function, and an inherited value can at most attempt that ignored diagnostic call. Not a Rust environment-driven release escape hatch.",
+    },
+    Entry {
+        name: "POLARIS_HELPER_FAILURE_V1",
+        reason: "Fixed stderr marker emitted by the Linux diagnostic function and parsed under stage/recovery/length bounds. Explicitly not verified emitter, authorization or recovery proof; no environment read.",
+    },
+    Entry {
+        name: "POLARIS_PID1_MEMBERS",
+        reason: "Shell heredoc delimiter for previously sampled cgroup.procs membership; the body is checked for PID 1. Not an environment key or admission override.",
+    },
+    Entry {
         name: "POLARIS_BUILD_ID",
         reason: "`crates/helper-proto/src/lib.rs` 的 `option_env!(\"POLARIS_BUILD_ID\")` —— \
                  **编译期**读取：发布流水线把同一份 `github.sha` 注入 helper 与 app 的构建环境，\
@@ -225,6 +237,22 @@ const TEXT_ONLY: &[Entry] = &[
     Entry {
         name: "POLARIS_DESCRIPTOR_EOF",
         reason: "helper-client install_unix 的 Linux unit / Mac plist 共用 quoted descriptor heredoc 定界符；旧 UNIT_EOF / PLIST_EOF 随原生成器移除，不读取进程环境。",
+    },
+    Entry {
+        name: "POLARIS_CGROUP_CHILDREN",
+        reason: "linux_service_stop 的 heredoc 定界符，正文来自当前已验证 cgroup 父目录的有界子目录枚举；不是环境键读取。",
+    },
+    Entry {
+        name: "POLARIS_CGROUP_EVENTS",
+        reason: "linux_service_stop 的 heredoc 定界符，正文来自已验证 cgroup.events 文件；不是环境键读取。",
+    },
+    Entry {
+        name: "POLARIS_MOUNTINFO",
+        reason: "linux_service_stop 的 heredoc 定界符，正文来自 /proc/self/mountinfo；不是环境键读取。",
+    },
+    Entry {
+        name: "POLARIS_CLOSED_DESCRIPTOR_EOF",
+        reason: "install_unix 的 quoted heredoc 定界符，写出迁移期间关闭 admission 的 launchd descriptor；不是环境键读取。",
     },
     Entry {
         name: "POLARIS_ELEVATE",
@@ -2236,7 +2264,28 @@ fn current_unix_descriptor_delimiter_is_live_in_both_branches_and_retired_names_
         !owner.in_tests_dir && !owner.release_off_file,
         "live production generator cannot be swallowed by parent cfg"
     );
+    let closure =
+        polaris_source_probe::repo_file!("crates/helper-client/src/manager/linux_service_stop.rs");
+    for (name, input) in [
+        ("POLARIS_CGROUP_CHILDREN", "$CHILDREN"),
+        ("POLARIS_CGROUP_EVENTS", "$EVENTS"),
+        ("POLARIS_MOUNTINFO", "$MOUNTS"),
+    ] {
+        assert_eq!(closure.matches(name).count(), 2, "paired delimiter: {name}");
+        assert!(closure.contains(&format!("done <<{name}\n{input}\n{name}")));
+    }
+    assert_eq!(source.matches("POLARIS_CLOSED_DESCRIPTOR_EOF").count(), 2);
+    assert!(source.contains("<<'POLARIS_CLOSED_DESCRIPTOR_EOF'"));
     let observed = scan();
+    for name in [
+        "POLARIS_CGROUP_CHILDREN",
+        "POLARIS_CGROUP_EVENTS",
+        "POLARIS_MOUNTINFO",
+        "POLARIS_CLOSED_DESCRIPTOR_EOF",
+    ] {
+        assert!(observed.names.contains_key(name));
+        assert!(!observed.release_reads().contains_key(name));
+    }
     assert!(observed.names.contains_key("POLARIS_DESCRIPTOR_EOF"));
     assert!(!observed
         .release_reads()

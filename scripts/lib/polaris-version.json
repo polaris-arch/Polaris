@@ -1,0 +1,12 @@
+{
+  "schema": "polaris-kernel-version-grammar-v1",
+  "grammar": "MAJOR.MINOR.PATCH-polaris-CHANNEL.UPSTREAM_N[.POLARIS_REV]",
+  "numericIdentifier": "0|[1-9][0-9]*",
+  "pattern": "^((?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*))-polaris-((alpha|beta|rc)\\.(?:0|[1-9][0-9]*)(?:\\.(?:0|[1-9][0-9]*))?)$",
+  "captures": [
+    "triplet",
+    "prerelease",
+    "channel"
+  ],
+  "scope": "Syntax only; source/tag/release/asset identity remains independently pinned. Desktop supports alpha/beta/rc; mobile and inactive staging retain alpha only. No sorting or pin promotion."
+}

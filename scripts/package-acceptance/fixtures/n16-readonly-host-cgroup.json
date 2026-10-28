@@ -1,0 +1,103 @@
+{
+  "acceptance": false,
+  "cleanup": "not-assessed",
+  "context": {
+    "attempt": "1",
+    "job": "setup",
+    "ref": "refs/heads/hot/app-runtime-consumer-20261020",
+    "runId": "40074321479",
+    "sourceSha": "c77d6b376491007c701a049a2dab9ecf0dbd6a5b"
+  },
+  "currentUid": 1001,
+  "groupObservation": {
+    "errorType": "none",
+    "groupRequirementSatisfied": false,
+    "groups": {
+      "admin": {
+        "exists": true,
+        "explicitSupplementaryMatch": false,
+        "primaryMatch": false
+      },
+      "sudo": {
+        "exists": true,
+        "explicitSupplementaryMatch": false,
+        "primaryMatch": false
+      }
+    },
+    "guard": "account-groups-required",
+    "lookupState": "observed",
+    "schema": "polaris-existing-admin-groups-v1"
+  },
+  "hostFacts": {
+    "membershipStability": "stable",
+    "observations": {
+      "cgroupMount": {
+        "error": "none",
+        "state": "observed",
+        "value": "root-cgroup2"
+      },
+      "cgroupNamespace": {
+        "error": "permission",
+        "state": "unknown",
+        "value": null
+      },
+      "initScope": {
+        "error": "none",
+        "state": "observed",
+        "value": {
+          "active": "active",
+          "controlGroup": "explicit-empty",
+          "load": "loaded"
+        }
+      },
+      "managerControlGroup": {
+        "error": "none",
+        "state": "observed",
+        "value": "explicit-empty"
+      },
+      "mntNamespace": {
+        "error": "permission",
+        "state": "unknown",
+        "value": null
+      },
+      "pid1Comm": {
+        "error": "none",
+        "state": "observed",
+        "value": "systemd"
+      },
+      "pid1HierarchyAfter": {
+        "error": "none",
+        "state": "observed",
+        "value": "init-scope"
+      },
+      "pid1HierarchyBefore": {
+        "error": "none",
+        "state": "observed",
+        "value": "init-scope"
+      },
+      "pid1Membership": {
+        "error": "none",
+        "state": "observed",
+        "value": "present"
+      },
+      "pid1Owner": {
+        "error": "none",
+        "state": "observed",
+        "value": "root"
+      },
+      "pidNamespace": {
+        "error": "permission",
+        "state": "unknown",
+        "value": null
+      }
+    },
+    "queryCountLimit": 2,
+    "queryTimeoutSeconds": 3,
+    "schema": "polaris-readonly-host-cgroup-observation-v1",
+    "scope": "sampled-host-diagnostic-not-vm-or-credential-authority"
+  },
+  "publicationEligible": false,
+  "runtime": "not-started",
+  "schema": "polaris-linux-auth-preflight-diagnostic-v1",
+  "scope": "read-only-account-group-diagnostic-not-credential-authority"
+}

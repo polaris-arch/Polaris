@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 import zipfile
 
 from fork_input import ROOT, canonical, load, sha, validate
-from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_validation_getter_contract, tree_inventory, zip_entries
+from artifacts import check_buildinfo, component_output_identity, framework_entry_targets, inspect_framework, module, module_stream, objc_hot_contract, objc_validation_getter_contract, tree_inventory, zip_entries
 from android_sdk import prepare_view, revision_from_properties, observe_ndk_input
 from budget import capacity_limit, native_capacity, native_environment, reservation
 from ci_android import emit_outputs, prepare_source, prepare
@@ -23,9 +23,277 @@ import artifacts
 from producer import write_json
 
 
+# Exact retained javap -s output from diagnostic run 39562122098, result.json
+# SHA256 cab4336ea2975412264b4eaab68b44a714b8e2fe20fdb4a66cbbe077ab7abeb1.
+# Historical observed generator forms only, never final-source native acceptance.
+HOT_JAVA_FIXTURE = {
+    'CommandServer': """Compiled from "CommandServer.java"
+public final class io.nekohasekai.libbox.CommandServer implements go.Seq$Proxy {
+  public final int refnum;
+    descriptor: I
+  public final int incRefnum();
+    descriptor: ()I
+
+  public io.nekohasekai.libbox.CommandServer(io.nekohasekai.libbox.CommandServerHandler, io.nekohasekai.libbox.PlatformInterface);
+    descriptor: (Lio/nekohasekai/libbox/CommandServerHandler;Lio/nekohasekai/libbox/PlatformInterface;)V
+
+  io.nekohasekai.libbox.CommandServer(int);
+    descriptor: (I)V
+
+  public native java.lang.String acknowledgeRuntimePersistence(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void activateTailscaleDirectoryDomain(java.lang.String, java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Ljava/lang/String;)V
+
+  public native java.lang.String applyRuntimeConfig(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void cancelNotification(java.lang.String, int) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;I)V
+
+  public native void close();
+    descriptor: ()V
+
+  public native void closeService() throws java.lang.Exception;
+    descriptor: ()V
+
+  public native java.lang.String exportTailscaleDirectoryCapability();
+    descriptor: ()Ljava/lang/String;
+
+  public native java.lang.String exportTailscaleDirectoryRetirement();
+    descriptor: ()Ljava/lang/String;
+
+  public native java.lang.String exportTailscaleStoreRetirement();
+    descriptor: ()Ljava/lang/String;
+
+  public native boolean needFindProcess();
+    descriptor: ()Z
+
+  public native boolean needWIFIState();
+    descriptor: ()Z
+
+  public native void pause();
+    descriptor: ()V
+
+  public native java.lang.String planRuntimeConfig(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void recordScreenState(boolean);
+    descriptor: (Z)V
+
+  public native void resetNetwork();
+    descriptor: ()V
+
+  public native java.lang.String runtimeCapabilities() throws java.lang.Exception;
+    descriptor: ()Ljava/lang/String;
+
+  public native java.lang.String runtimeConfigStatus(java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;)Ljava/lang/String;
+
+  public native void setError(java.lang.String);
+    descriptor: (Ljava/lang/String;)V
+
+  public native void start() throws java.lang.Exception;
+    descriptor: ()V
+
+  public native void startOrReloadService(java.lang.String, io.nekohasekai.libbox.OverrideOptions) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;)V
+
+  public native void startOrReloadServiceWithRetryableRuntimePersistence(java.lang.String, io.nekohasekai.libbox.OverrideOptions, io.nekohasekai.libbox.RuntimePersistenceHandler) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V
+
+  public native void startOrReloadServiceWithRuntimePersistence(java.lang.String, io.nekohasekai.libbox.OverrideOptions, io.nekohasekai.libbox.RuntimePersistenceHandler) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V
+
+  public native void updateWIFIState();
+    descriptor: ()V
+
+  public native void wake();
+    descriptor: ()V
+
+  public native void wakeNow();
+    descriptor: ()V
+
+  public native void writeMessage(int, java.lang.String);
+    descriptor: (ILjava/lang/String;)V
+
+  public boolean equals(java.lang.Object);
+    descriptor: (Ljava/lang/Object;)Z
+
+  public int hashCode();
+    descriptor: ()I
+
+  public java.lang.String toString();
+    descriptor: ()Ljava/lang/String;
+
+  static {};
+    descriptor: ()V
+}
+""",
+    'Libbox$proxyRuntimePersistenceHandler': """Compiled from "Libbox.java"
+final class io.nekohasekai.libbox.Libbox$proxyRuntimePersistenceHandler implements go.Seq$Proxy,io.nekohasekai.libbox.RuntimePersistenceHandler {
+  public final int refnum;
+    descriptor: I
+  public final int incRefnum();
+    descriptor: ()I
+
+  io.nekohasekai.libbox.Libbox$proxyRuntimePersistenceHandler(int);
+    descriptor: (I)V
+
+  public native void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V
+
+  public native java.lang.String runtimePersistenceMode();
+    descriptor: ()Ljava/lang/String;
+}
+""",
+    'OverrideOptions': """Compiled from "OverrideOptions.java"
+public final class io.nekohasekai.libbox.OverrideOptions implements go.Seq$Proxy {
+  public final int refnum;
+    descriptor: I
+  public final int incRefnum();
+    descriptor: ()I
+
+  io.nekohasekai.libbox.OverrideOptions(int);
+    descriptor: (I)V
+
+  public io.nekohasekai.libbox.OverrideOptions();
+    descriptor: ()V
+
+  public final native boolean getAutoRedirect();
+    descriptor: ()Z
+
+  public final native void setAutoRedirect(boolean);
+    descriptor: (Z)V
+
+  public final native io.nekohasekai.libbox.StringIterator getIncludePackage();
+    descriptor: ()Lio/nekohasekai/libbox/StringIterator;
+
+  public final native void setIncludePackage(io.nekohasekai.libbox.StringIterator);
+    descriptor: (Lio/nekohasekai/libbox/StringIterator;)V
+
+  public final native io.nekohasekai.libbox.StringIterator getExcludePackage();
+    descriptor: ()Lio/nekohasekai/libbox/StringIterator;
+
+  public final native void setExcludePackage(io.nekohasekai.libbox.StringIterator);
+    descriptor: (Lio/nekohasekai/libbox/StringIterator;)V
+
+  public boolean equals(java.lang.Object);
+    descriptor: (Ljava/lang/Object;)Z
+
+  public int hashCode();
+    descriptor: ()I
+
+  public java.lang.String toString();
+    descriptor: ()Ljava/lang/String;
+
+  static {};
+    descriptor: ()V
+}
+""",
+    'RuntimePersistenceHandler': """Compiled from "RuntimePersistenceHandler.java"
+public interface io.nekohasekai.libbox.RuntimePersistenceHandler {
+  public abstract void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;
+    descriptor: (Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V
+
+  public abstract java.lang.String runtimePersistenceMode();
+    descriptor: ()Ljava/lang/String;
+}
+""",
+}
+
+
 class FormalOutputs(unittest.TestCase):
     def setUp(self):
         self.value = validate(json.loads((Path(__file__).with_name('fixtures') / 'legacy-source-contract.json').read_bytes()))
+
+    def test_hot_java_accepts_actual_retained_generated_forms(self):
+        with patch('subprocess.Popen', side_effect=AssertionError('no external tools in fixture')):
+            self.assertIs(artifacts.hot_java_contract(HOT_JAVA_FIXTURE), HOT_JAVA_FIXTURE)
+            self.assertIn('OverrideOptions(int)', HOT_JAVA_FIXTURE['OverrideOptions'])
+            calls = []
+            def observed(command):
+                calls.append(command)
+                return HOT_JAVA_FIXTURE[command[-1].removeprefix('io.nekohasekai.libbox.')]
+            self.assertEqual(artifacts.inspect_hot_java(Path('/fixture/classes.jar'), {'javap': 'never-executed'}, observed), HOT_JAVA_FIXTURE)
+            self.assertEqual(len(calls), 4)
+            self.assertTrue(all(command[:4] == ['never-executed', '-s', '-classpath', '/fixture/classes.jar'] for command in calls))
+
+    def test_hot_java_rejects_wrong_receiver_modifier_descriptor_and_error_channels(self):
+        for name, methods in artifacts.HOT_JAVA_API.items():
+            for declaration, descriptor in methods:
+                mutations = [declaration.replace('public ', 'public static ', 1),
+                             declaration.replace('public ', 'protected ', 1),
+                             declaration.replace('public ', '', 1),
+                             declaration.replace('(', 'Wrong(', 1)]
+                if ' native ' in declaration:
+                    mutations.append(declaration.replace(' native ', ' '))
+                if ' abstract ' in declaration:
+                    mutations.append(declaration.replace(' abstract ', ' '))
+                if ' throws java.lang.Exception;' in declaration:
+                    mutations.extend([declaration.replace(' throws java.lang.Exception', ''),
+                                      declaration.replace('java.lang.Exception', 'java.lang.Error')])
+                else:
+                    mutations.append(declaration.replace(';', ' throws java.lang.Exception;'))
+                pair = declaration + '\n    descriptor: ' + descriptor
+                for wrong in mutations + ['']:
+                    java = dict(HOT_JAVA_FIXTURE)
+                    java[name] = java[name].replace(declaration, wrong)
+                    with self.subTest(name=name, declaration=declaration, mutation=wrong), self.assertRaises(RuntimeError):
+                        artifacts.hot_java_contract(java)
+                for wrong in [pair.replace(descriptor, '()I'), pair + '\n  ' + pair,
+                              pair + '\n  ' + declaration.replace('()', '(int)') + '\n    descriptor: (I)V']:
+                    java = dict(HOT_JAVA_FIXTURE); java[name] = java[name].replace(pair, wrong)
+                    # The observed refnum(int) constructor is a distinct valid
+                    # constructor; overloaded required HOT methods are rejected.
+                    if name == 'OverrideOptions' and '(I)V' in wrong:
+                        continue
+                    with self.subTest(name=name, descriptor=wrong), self.assertRaises(RuntimeError):
+                        artifacts.hot_java_contract(java)
+        for name, text in HOT_JAVA_FIXTURE.items():
+            java = dict(HOT_JAVA_FIXTURE)
+            java[name] = text.replace('class io.nekohasekai.libbox.' + name,
+                                      'class io.nekohasekai.libbox.ForeignReceiver').replace(
+                                          'interface io.nekohasekai.libbox.' + name,
+                                          'class io.nekohasekai.libbox.' + name)
+            with self.subTest(receiver=name), self.assertRaises(RuntimeError):
+                artifacts.hot_java_contract(java)
+        java = dict(HOT_JAVA_FIXTURE)
+        java['Libbox$proxyRuntimePersistenceHandler'] = java['Libbox$proxyRuntimePersistenceHandler'].replace(
+            ',io.nekohasekai.libbox.RuntimePersistenceHandler', '')
+        with self.assertRaises(RuntimeError): artifacts.hot_java_contract(java)
+        with self.assertRaises(RuntimeError): artifacts.hot_java_contract({})
+
+    def test_hot_java_noarg_constructor_cannot_be_replaced_by_refnum_constructor(self):
+        java = dict(HOT_JAVA_FIXTURE)
+        java['OverrideOptions'] = java['OverrideOptions'].replace(
+            '  public io.nekohasekai.libbox.OverrideOptions();\n    descriptor: ()V\n', '')
+        self.assertIn('OverrideOptions(int)', java['OverrideOptions'])
+        with self.assertRaises(RuntimeError): artifacts.hot_java_contract(java)
+
+    def test_hot_jni_requires_each_exact_defined_bridge(self):
+        exports = set(artifacts.HOT_JNI_EXPORTS) | {'Java_go_Seq_incRef', 'unrelated'}
+        self.assertEqual(artifacts.hot_jni_contract(exports), sorted(artifacts.HOT_JNI_EXPORTS))
+        for missing in artifacts.HOT_JNI_EXPORTS:
+            with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                artifacts.hot_jni_contract(exports - {missing})
+            with self.subTest(receiver=missing), self.assertRaises(RuntimeError):
+                artifacts.hot_jni_contract((exports - {missing}) | {missing.replace('CommandServer', 'CommandClient') if 'CommandServer' in missing else missing + 'Wrong'})
+
+    def test_common_aar_keeps_legacy_checks_and_requires_shared_hot_predicates(self):
+        source = Path(artifacts.__file__).read_text()
+        body = source.split('def inspect_aar(', 1)[1].split('def tree_inventory(', 1)[0]
+        self.assertIn('hot_jni_contract(exported)', body)
+        self.assertIn('inspect_hot_java(classes, tools, run)', body)
+        for required in ['formal AAR must contain all four ABIs', 'check_buildinfo(facts, value, graph',
+                         "'Java_go_Seq_'", '16KiB PT_LOAD required', 'ELF Android API differs',
+                         'newTransientCommandServer(', 'newStrictCommandServer(', 'newManagedStrictCommandServer(',
+                         'interfaceUpdateListenerIdentity(', 'checkConfigWithResult(', 'exportTailscaleStoreRetirement();',
+                         'exportTailscaleDirectoryCapability();', 'exportTailscaleDirectoryRetirement();',
+                         'activateTailscaleDirectoryDomain(', 'void wakeNow()', 'void recordScreenState(boolean)',
+                         'validation result must be readonly']:
+            self.assertIn(required, body)
 
     def test_native_capacity_caps_current_runner_by_load_affinity_quota_and_memory(self):
         facts = {'logicalCPUs': 16, 'affinityCPUs': 8, 'quotaCPUs': 4.5, 'load1': 1.1,
@@ -333,6 +601,97 @@ class FormalOutputs(unittest.TestCase):
                 artifacts.read_receipt(path)
             decode.assert_not_called()
 
+    def hot_objc_header(self):
+        # Source-derived expectations from fresh libbox Go signatures plus
+        # sagernet/gomobile v0.1.13 genobjc.go/types.go, not a fresh generated
+        # framework observation or evidence that Swift compilation succeeded.
+        return '''@class LibboxCommandServer;
+@protocol LibboxRuntimePersistenceHandler;
+@class LibboxRuntimePersistenceHandler;
+@protocol LibboxRuntimePersistenceHandler <NSObject>
+- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;
+- (NSString* _Nonnull)runtimePersistenceMode;
+@end
+@interface LibboxCommandServer : NSObject <goSeqRefInterface> {
+}
+@property(strong, readonly) _Nonnull id _ref;
+- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;
+- (BOOL)startOrReloadServiceWithRetryableRuntimePersistence:(NSString* _Nullable)configContent options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler error:(NSError* _Nullable* _Nullable)error;
+@end
+@interface LibboxOverrideOptions : NSObject <goSeqRefInterface> {
+}
+@property(strong, readonly) _Nonnull id _ref;
+- (nonnull instancetype)initWithRef:(_Nonnull id)ref;
+- (nonnull instancetype)init;
+@end
+@class LibboxRuntimePersistenceHandler;
+@interface LibboxRuntimePersistenceHandler : NSObject <goSeqRefInterface, LibboxRuntimePersistenceHandler> {
+}
+@property(strong, readonly) _Nonnull id _ref;
+- (nonnull instancetype)initWithRef:(_Nonnull id)ref;
+- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;
+- (NSString* _Nonnull)runtimePersistenceMode;
+@end
+'''
+
+    def test_objc_hot_contract_requires_exact_owners_and_pinned_generator_types(self):
+        header = self.hot_objc_header()
+        facts = objc_hot_contract(header)
+        self.assertEqual(set(facts), {'@interface LibboxCommandServer',
+                         '@protocol LibboxRuntimePersistenceHandler',
+                         '@interface LibboxRuntimePersistenceHandler', '@interface LibboxOverrideOptions'})
+        self.assertEqual(objc_hot_contract(header.replace('\n', ' ')), facts)
+        self.assertEqual(objc_hot_contract(header.replace('*', ' * ').replace(':', ' : ')), facts)
+        capability = '- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;'
+        retry = next(line for line in header.splitlines() if ')startOrReloadServiceWithRetryable' in line)
+        persist = next(line for line in header.splitlines() if ')persistRuntimeConfiguration:' in line)
+        mode = '- (NSString* _Nonnull)runtimePersistenceMode;'
+        cases = [
+            header.replace('LibboxCommandServer :', 'LibboxOtherReceiver :'),
+            header.replace(capability, '') + '@interface Other : NSObject\n' + capability + '\n@end',
+            header.replace(capability, '// ' + capability),
+            header.replace(capability, '/* ' + capability + ' */'),
+            header.replace(capability, capability + ' ' + capability),
+            header.replace(capability, capability.replace('- ', '+ ')),
+            header.replace(capability, capability.replace('NSString* _Nonnull', 'BOOL')),
+            header.replace(capability, capability.replace('_Nonnull', '_Nullable')),
+            header.replace(capability, '- (BOOL)runtimeCapabilities:(NSString* _Nonnull* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;'),
+            header.replace(retry, retry.replace('BOOL', 'void')),
+            header.replace(retry, retry.replace('options:', 'overrideOptions:')),
+            header.replace(retry, retry.replace('options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler',
+                                                'handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler options:(LibboxOverrideOptions* _Nullable)options')),
+            header.replace(retry, retry.replace('id<LibboxRuntimePersistenceHandler> _Nullable', 'LibboxRuntimePersistenceHandler* _Nullable')),
+            header.replace(persist, persist.replace('revision:(int64_t)', 'revision:(int32_t)'), 1),
+            header.replace(persist, persist.replace('effectiveDigest:', 'effectiveDigestWrong:'), 1),
+            header.replace(persist, persist.replace('BOOL', 'void'), 1),
+            header.replace(mode, mode.replace('_Nonnull', '_Nullable'), 1),
+            header.replace('@protocol LibboxRuntimePersistenceHandler <NSObject>', '@protocol LibboxRuntimePersistenceHandler <Other>'),
+            header.replace('<goSeqRefInterface, LibboxRuntimePersistenceHandler>', '<goSeqRefInterface>'),
+            header.replace('<goSeqRefInterface, LibboxRuntimePersistenceHandler>', '<LibboxRuntimePersistenceHandler>'),
+            header.replace('<goSeqRefInterface, LibboxRuntimePersistenceHandler>', '<goSeqRefInterface, Other>'),
+            header.replace('- (nonnull instancetype)init;', '- (nullable instancetype)init;'),
+            header.replace('@protocol LibboxRuntimePersistenceHandler <NSObject>', '@protocol LibboxRuntimePersistenceHandler <NSObject>\n@optional'),
+            header + header,
+        ]
+        # Each pointer/nullability position and both callback owners matter.
+        for declaration in (capability, retry, persist):
+            for wrong_error in ('NSError* _Nullable', 'NSError* _Nonnull* _Nullable',
+                                'NSError* _Nullable* _Nonnull', 'NSString* _Nullable* _Nullable'):
+                cases.append(header.replace(declaration, declaration.replace('NSError* _Nullable* _Nullable', wrong_error), 1))
+        for original in ('NSString* _Nullable', 'LibboxOverrideOptions* _Nullable',
+                         'id<LibboxRuntimePersistenceHandler> _Nullable'):
+            cases.append(header.replace(retry, retry.replace(original, original.replace('_Nullable', '_Nonnull')), 1))
+        proxy = header.index('@interface LibboxRuntimePersistenceHandler :')
+        for declaration in (persist, mode):
+            cases.append(header[:proxy] + header[proxy:].replace(declaration, '', 1))
+            cases.append(header[:proxy] + header[proxy:].replace(declaration, declaration.replace('- ', '+ '), 1))
+        protocol_start = header.index('@protocol LibboxRuntimePersistenceHandler <')
+        protocol_end = header.index('@end', protocol_start) + len('@end')
+        cases.append(header[:protocol_start] + header[protocol_end:])
+        for wrong in cases:
+            with self.subTest(header=wrong[:180]), self.assertRaises(RuntimeError):
+                objc_hot_contract(wrong)
+
     def validation_result_objc_header(self):
         # Declaration spelling/receiver/return type from the preserved original
         # ac6 Libbox.objc.h (129711B, e743b050...), not the former bare-name stub.
@@ -436,6 +795,114 @@ class FormalOutputs(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'Go version'): check(changed)
         finally:
             self.value = old
+
+    def nine_vendor_buildinfo(self, source, *, apple=False, simulator=False):
+        from test_source_policy import future_mobile_fixture_v2, future_mobile_fixture_v3
+        make = future_mobile_fixture_v3 if getattr(self, '_ten_vendor_fixture', False) else future_mobile_fixture_v2
+        self.value, _, _, _ = make()
+        facts = self.facts(apple=apple, simulator=simulator)
+        facts['goVersion'] = self.value['goVersion']
+        facts['modules'][self.value['goModule']]['replacement'] = str(source)
+        graph = [{'Path': 'example.org/module', 'Version': 'v1.2.3', 'Sum': 'h1:fixed'},
+                 {'Path': self.value['goModule'], 'Main': True, 'Dir': str(source)}]
+        for name, pin in self.value['sourcePolicy']['vendors'].items():
+            directory = source / pin['replacementPath'][2:]; directory.mkdir(parents=True, exist_ok=True)
+            graph.append({'Path': name, 'Version': pin['version'],
+                          'Replace': {'Path': pin['replacementPath'], 'Dir': str(directory)}})
+            facts['modules'][name] = {'kind': 'dep', 'version': pin['version'], 'sum': '',
+                'replacement': pin['replacementPath'], 'replacementVersion': '(devel)', 'replacementSum': ''}
+        return facts, graph
+
+    def check_nine_vendor_buildinfo(self, facts, graph, *, apple=False, simulator=False):
+        check_buildinfo(facts, self.value, graph, os_name='ios' if apple else 'android', arch='arm64',
+                        mode='c-archive' if apple else 'c-shared', simulator=simulator,
+                        expected_id='polaris-mobile-' + 'a' * 64, actual_id='polaris-mobile-' + 'a' * 64)
+
+    def test_v3_ten_vendor_native_consistency_allows_only_unrequired_link_pruning(self):
+        self._ten_vendor_fixture = True
+        try:
+            self.test_v2_nine_vendor_native_consistency_allows_only_unrequired_link_pruning()
+        finally:
+            self._ten_vendor_fixture = False
+
+    def test_v3_buildinfo_rejects_every_linked_vendor_identity_mutation(self):
+        self._ten_vendor_fixture = True
+        try:
+            self.test_v2_buildinfo_rejects_every_linked_vendor_identity_mutation()
+        finally:
+            self._ten_vendor_fixture = False
+
+    def test_v3_complete_graph_is_checked_even_for_native_pruned_modules(self):
+        self._ten_vendor_fixture = True
+        try:
+            self.test_v2_complete_graph_is_checked_even_for_native_pruned_modules()
+        finally:
+            self._ten_vendor_fixture = False
+
+    def test_v2_nine_vendor_native_consistency_allows_only_unrequired_link_pruning(self):
+        required = {'github.com/metacubex/utls', 'github.com/sagernet/sing-tun'}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve()
+            for apple, simulator in [(False, False), (True, False), (True, True)]:
+                facts, graph = self.nine_vendor_buildinfo(source, apple=apple, simulator=simulator)
+                frozen = deepcopy(facts)
+                self.check_nine_vendor_buildinfo(facts, graph, apple=apple, simulator=simulator)
+                self.assertEqual(facts, frozen)
+                for name in self.value['sourcePolicy']['vendors']:
+                    changed = deepcopy(facts); del changed['modules'][name]
+                    with self.subTest(apple=apple, simulator=simulator, name=name):
+                        if name in required:
+                            with self.assertRaisesRegex(RuntimeError, 'required local source module'):
+                                self.check_nine_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
+                        else:
+                            self.check_nine_vendor_buildinfo(changed, graph, apple=apple, simulator=simulator)
+                pruned = deepcopy(facts)
+                for name in set(self.value['sourcePolicy']['vendors']) - required: del pruned['modules'][name]
+                self.check_nine_vendor_buildinfo(pruned, graph, apple=apple, simulator=simulator)
+
+    def test_v2_buildinfo_rejects_every_linked_vendor_identity_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve(); facts, graph = self.nine_vendor_buildinfo(source)
+            for name in self.value['sourcePolicy']['vendors']:
+                for field, bad in [('version', 'v9.9.9'), ('replacement', './third_party/stock'),
+                                   ('replacementVersion', 'v1.0.0'), ('replacementSum', 'h1:invented'),
+                                   ('sum', 'h1:invented'), ('kind', 'mod')]:
+                    changed = deepcopy(facts); changed['modules'][name][field] = bad
+                    with self.subTest(name=name, field=field), self.assertRaises(RuntimeError):
+                        self.check_nine_vendor_buildinfo(changed, graph)
+            changed = deepcopy(facts)
+            changed['modules']['example.invalid/unreviewed'] = {'kind': 'dep', 'version': 'v1.0.0', 'sum': 'h1:invented'}
+            with self.assertRaisesRegex(RuntimeError, 'not in actual source graph'):
+                self.check_nine_vendor_buildinfo(changed, graph)
+            # Source-owned absolute aliases remain admissible for non-Meta vendors.
+            changed = deepcopy(facts)
+            name = 'github.com/sagernet/sing'
+            changed['modules'][name]['replacement'] = str(source / 'third_party/sing')
+            self.check_nine_vendor_buildinfo(changed, graph)
+
+    def test_v2_complete_graph_is_checked_even_for_native_pruned_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp).resolve(); facts, graph = self.nine_vendor_buildinfo(source)
+            name = 'github.com/sagernet/fswatch'
+            del facts['modules'][name]
+            index = next(i for i, row in enumerate(graph) if row['Path'] == name)
+            for case in ('missing', 'duplicate', 'version', 'sum', 'path', 'directory', 'replacement-sum', 'stock', 'extra', 'main'):
+                changed = deepcopy(graph); row = changed[index]
+                if case == 'missing': changed.pop(index)
+                elif case == 'duplicate': changed.append(deepcopy(row))
+                elif case == 'version': row['Version'] = 'v9.9.9'
+                elif case == 'sum': row['Sum'] = 'h1:invented'
+                elif case == 'path': row['Replace']['Path'] = '../outside'
+                elif case == 'directory': row['Replace']['Dir'] = str(source / 'third_party/sing')
+                elif case == 'replacement-sum': row['Replace']['Sum'] = 'h1:invented'
+                elif case == 'stock': row.pop('Replace')
+                elif case == 'extra': changed.append({'Path': 'example.invalid/extra', 'Replace': {'Path': './extra', 'Dir': str(source / 'extra')}})
+                else: row['Main'] = True
+                with self.subTest(case=case), self.assertRaises(RuntimeError): self.check_nine_vendor_buildinfo(facts, changed)
+            outside = source / 'outside'; outside.mkdir()
+            escaped = source / 'third_party/fswatch'; escaped.rmdir(); escaped.symlink_to(source.parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
+                self.check_nine_vendor_buildinfo(facts, graph)
 
     def test_trimpath_does_not_invent_absent_ldflags(self):
         self.check(self.facts())
@@ -702,7 +1169,9 @@ class FormalOutputs(unittest.TestCase):
                 prepare_view(work, sdk, ndk, profile)
 
     def test_prepare_refusal_retains_ndk_inputs_without_success_outputs(self):
-        properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16138531-beta3\nPkg.BaseRevision = 30.0.16138531\nPkg.ReleaseName = r30-beta3\n'
+        from fork_input import load
+        value = load()
+        properties = b'Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\nPkg.BaseRevision = 30.0.16248370\nPkg.ReleaseName = r30\n'
         # Execute the real prepare/observe path, with all external tool operations
         # controlled. Both admission refusal and a later source refusal happen
         # before emit_outputs, so the work output cannot be the evidence root.
@@ -710,7 +1179,7 @@ class FormalOutputs(unittest.TestCase):
             with self.subTest(admission_refuses=admission_refuses), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 ndk = root / 'ndk'; ndk.mkdir()
-                raw = properties.replace(b'-beta3', b'-beta2') if admission_refuses else properties
+                raw = properties.replace(b'30.0.16248370', b'30.0.16138531-beta3') if admission_refuses else properties
                 (ndk / 'source.properties').write_bytes(raw)
                 jdk = root / 'jdk'; jdk.mkdir()
                 sdk = root / 'sdk'; sdk.mkdir()
@@ -721,19 +1190,23 @@ class FormalOutputs(unittest.TestCase):
                     if command == ['which', 'go']:
                         return '/controlled/go'
                     if command == ['/controlled/go', 'version']:
-                        return 'go version go' + self.value['goVersion'] + ' linux/amd64'
+                        return 'go version go' + value['goVersion'] + ' linux/amd64'
                     if command == ['/controlled/go', 'install',
-                            'github.com/sagernet/gomobile/cmd/gomobile@' + self.value['gomobileVersion'],
-                            'github.com/sagernet/gomobile/cmd/gobind@' + self.value['gobindVersion']]:
+                            'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
+                            'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']]:
                         return ''
-                    if len(command) == 3 and command[1:] == [str(ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py'), str(root)]:
+                    installer = [str(ROOT / 'scripts/libbox-patches/prepare-ndk-linux.py'), '--profile',
+                                 str(ROOT / value['android']['ndkArchivePath']), '--sdk', str(sdk)]
+                    if command[1:] == installer + ['--check-license-only']:
+                        return ''
+                    if command[1:] == installer + [str(root)]:
                         return str(ndk)
                     self.fail('unexpected external operation: ' + repr(command))
 
                 reason = 'revision/base/release differs' if admission_refuses else 'controlled source refusal'
                 with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'JAVA_HOME_17_X64': str(jdk),
                         'ANDROID_SDK_ROOT': str(sdk), 'GITHUB_OUTPUT': str(output), 'GITHUB_ENV': str(environment)}, clear=True), \
-                        patch('ci_android.load', return_value=self.value), \
+                        patch('ci_android.load', return_value=value), \
                         patch('ci_android.location', return_value=root), \
                         patch('ci_android.producer_code', return_value={'files': []}), \
                         patch('ci_android.native_capacity', return_value=
@@ -756,7 +1229,7 @@ class FormalOutputs(unittest.TestCase):
                 observation = json.loads((root / 'sdk-input-observation.json').read_bytes())
                 self.assertEqual(observation['sourceProperties']['sha256'], sha(raw))
                 self.assertEqual(observation['revision'], revision_from_properties(raw.decode()))
-                self.assertEqual(observation['requiredRevision'], self.value['android']['ndkSourceRevision'])
+                self.assertEqual(observation['requiredRevision'], value['android']['ndkSourceRevision'])
                 self.assertFalse(observation['devicePassed'])
                 self.assertFalse(observation['publicationEligible'])
 
@@ -803,7 +1276,7 @@ class FormalOutputs(unittest.TestCase):
                     'activateTailscaleDirectoryDomain', 'exportTailscaleDirectoryRetirement', 'NewTransientCommandServer', 'NewStrictCommandServer', 'InterfaceUpdateListenerIdentity',
                     'CheckConfigWithResult', 'ConfigValidationContractVersion', 'exportTailscaleStoreRetirement',
                     'wakeNow', 'recordScreenState']
-                (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' + self.validation_result_objc_header())
+                (lib / 'Headers/Libbox.h').write_text('\n'.join(symbols) + '\n' + self.validation_result_objc_header() + self.hot_objc_header())
             info = framework / 'Info.plist'; info.write_bytes(plistlib.dumps({'AvailableLibraries': entries}))
             with patch('artifacts.check_buildinfo') as buildinfo:
                 output = inspect_framework(framework, self.value, [], expected_id)
@@ -811,6 +1284,14 @@ class FormalOutputs(unittest.TestCase):
                 self.assertEqual(buildinfo.call_count, 2)
                 for row in output['slices'].values():
                     self.assertEqual(row['validationResultGetterContract']['receiver'], 'LibboxConfigValidationResult')
+                    self.assertEqual(row['hotObjectiveCContract'], objc_hot_contract(self.hot_objc_header()))
+                for entry in entries:
+                    path = framework / entry['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
+                    original = path.read_text()
+                    path.write_text(original.replace(')runtimeCapabilities:', ')omittedCapabilities:'))
+                    with self.subTest(component=entry['LibraryIdentifier']), self.assertRaisesRegex(RuntimeError, 'HOT method'):
+                        inspect_framework(framework, self.value, [], expected_id)
+                    path.write_text(original)
                 original_header = framework / entries[0]['LibraryIdentifier'] / 'Libbox.framework/Headers/Libbox.h'
                 text = original_header.read_text()
                 for missing in ['NewManagedStrictCommandServer', 'exportTailscaleDirectoryCapability',

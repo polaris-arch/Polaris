@@ -145,6 +145,16 @@ impl ConfigStore {
         crate::validate::validate_raw_tls_pins(config)?;
         crate::auto_select::validate_raw(config)?;
         crate::sanitize::validate_collection_shapes(config)?;
+        // Only truly absent legacy resources inherit defaults. A malformed explicit
+        // collection must not be erased by the tolerant load sanitizer on save.
+        if config
+            .get("dnsServers")
+            .is_some_and(|value| !value.is_array())
+        {
+            return Err(StoreError::DnsDependency(
+                "dnsServers must be an array".into(),
+            ));
+        }
         crate::mesh_guard::validate_raw(config)?;
         // 安全字段不能先 sanitize：显式坏策略若被改成 block 后再校验，写入者会误以为原值已生效。
         crate::validate::validate_raw_mesh_inbound_policies(config)?;
@@ -280,8 +290,12 @@ pub fn finalize_config(value: &mut Value) -> Result<(), StoreError> {
             .or_insert_with(|| Value::Array(vec![]));
         obj.entry("dnsRuleOrder")
             .or_insert_with(|| Value::Array(vec![]));
-        obj.entry("dnsServers")
-            .or_insert_with(|| Value::Array(vec![]));
+        obj.entry("dnsServers").or_insert_with(|| {
+            serde_json::to_value(
+                polaris_config_engine::user_config::dns_policy::builtin_dns_server_resources(),
+            )
+            .expect("built-in DNS resources serialize")
+        });
         obj.entry("dnsServerGroups")
             .or_insert_with(|| Value::Array(vec![]));
         obj.entry("servers").or_insert_with(|| Value::Array(vec![]));
@@ -307,7 +321,7 @@ pub fn default_config() -> Value {
         // 均合法（global/smart/direct），此处只动出厂默认。
         "proxyMode": "smart",
         "proxyModeType": "systemProxy",
-        "utlsPolicy": "default",
+        "utlsPolicy": "follow",
         // mtu **刻意缺席** = 自动（生成期不下发 `mtu` 键，由 sing-box 内核取默认，见 config-engine `TunModeConfig::mtu`）。
         // 新装写一个具体数会把「当时的默认」冻在磁盘上，此后默认值再变也追不上——那正是存量
         // 1350/1400 需要 `migrate_tun_mtu` 清一遍的成因。

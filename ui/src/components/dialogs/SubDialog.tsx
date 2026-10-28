@@ -1,3 +1,6 @@
+import { FeedbackNotice } from '@/components/screens/settings/Primitives';
+import { isSavedEditProgress, presentSubscriptionRefreshResult, subscriptionEditProgressText } from '@/domain/subscription-refresh';
+import { useSubscriptionProgress } from '@/store/use-subscription-progress-store';
 import { useInputRequest } from '@/hooks/use-input-request';
 /**
  * SubDialog —— 添加/编辑订阅弹窗（原型 #sub-dialog :2550；subEdit 编辑态 :3745）。
@@ -22,7 +25,7 @@ import { useInputRequest } from '@/hooks/use-input-request';
  *    `resolveSubscriptionViaProxy`）。提交把 `updateViaProxy` 写回 config；预检 viaProxy 用「策略 × 本开关实时值」求值。
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore, useEffectiveConfig } from '@/store/app-store';
 import { api } from '@/ipc';
@@ -218,8 +221,15 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
     }
   };
 
+  const beginEditSave = useInputRequest(JSON.stringify([name, url, ua, autoUpdate, viaProxy, proxyBindInterface, periodic.checked, periodic.interval]));
+  const editProgress = useSubscriptionProgress(base?.id ?? '');
+  const beginSaveRequest = useInputRequest(instanceId);
+  const activeEdit = useRef<() => boolean>(() => false);
+  const savePending = useRef<string | null>(null);
+  const [, renderSavedAck] = useState(0);
+
   const handleSubmit = async () => {
-    if (starting || cancelling || (isEdit ? submitting : operationBusy)) return;
+    if (starting || cancelling || (isEdit ? (savePending.current !== null || activeEdit.current()) : operationBusy)) return;
     const nameEmpty = !name.trim();
     const urlBad = !isSubscriptionUrl(url);
     setErrName(nameEmpty);
@@ -227,6 +237,13 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
     const periodicFields = periodic.commit();
     if (nameEmpty || urlBad || periodicFields === null) return;
 
+    const isCurrentEdit = beginEditSave();
+    const isCurrentRequest = beginSaveRequest();
+    activeEdit.current = isCurrentEdit;
+    let saved = false;
+    const editRequestId = crypto.randomUUID();
+    if (isEdit) savePending.current = editRequestId;
+    let stopProgress: (() => void) | undefined;
     setSubmitting(true);
     try {
       if (isEdit && base) {
@@ -240,10 +257,24 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
           proxyBindInterface: proxyBindInterface || undefined,
           ...periodicFields,
         };
-        // 编辑：仅写 config（对齐 上游 updateSubscription——edit 不自动拉取）+ 成功 toast。
-        await api.subscription.update(next);
-        toast.success(t('sub.updated'));
+        stopProgress = await api.subscription.onUpdateProgressReady((frame) => {
+          if (!isCurrentRequest() || savePending.current !== editRequestId
+            || !isSavedEditProgress(frame, next.id, editRequestId)) return;
+          saved = true;
+          savePending.current = null;
+          renderSavedAck((value) => value + 1);
+        });
+        // Unmount while listener registration was pending must not start a mutation.
+        if (!isCurrentRequest()) return;
+        const result = await api.subscription.update(next, editRequestId);
+        if (result.saved !== true || result.editRequestId !== editRequestId) throw new Error('subscription-edit-result-invalid');
+        saved = true;
         await loadConfig(true);
+        // Closing a view never cancels a native save; a stale reply cannot close newer edits.
+        if (!isCurrentEdit() || result.publication === 'superseded' || result.refresh?.superseded) return;
+        toast.success(t('sub.updated'));
+        if (result.publication === 'failed') toast.error(t('feedback.subscriptionSaved'), t('feedback.followupIncomplete'));
+        if (result.refresh) presentSubscriptionRefreshResult(result.refresh, t);
         closeInstance(instanceId);
       } else {
         await startCreate({
@@ -256,11 +287,13 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
           ...periodicFields,
         });
       }
-    } catch (e) {
-      console.error('[SubDialog] save failed:', e);
-      toast.error(t('common.saveFailed'));
+    } catch {
+      if (!isCurrentEdit()) return;
+      console.error('[SubDialog] save failed');
+      toast.error(t(saved ? 'feedback.subscriptionSaved' : 'common.saveFailed'), saved ? t('feedback.followupIncomplete') : undefined);
     } finally {
-      setSubmitting(false);
+      stopProgress?.();
+      if (isCurrentRequest()) { savePending.current = null; activeEdit.current = () => false; setSubmitting(false); }
     }
   };
 
@@ -284,12 +317,13 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
           <button type="button" className="btn ghost" onClick={requestOperationClose} disabled={closeLocked}>
             {t('common.cancel')}
           </button>
-          <button type="button" className="btn flow" onClick={() => void handleSubmit()} disabled={submitting || starting || cancelling || operationBusy}>
+          <button type="button" className="btn flow" onClick={() => void handleSubmit()} disabled={(submitting && (!isEdit || savePending.current !== null || activeEdit.current())) || starting || cancelling || operationBusy}>
             {isEdit ? t('common.save') : t('sub.add')}
           </button>
         </>
       }
     >
+      {submitting && isEdit && <p role="status">{subscriptionEditProgressText(editProgress, t)}</p>}
       <div className="fld">
         <label className="fld-l" htmlFor="sub-name">
           <span>{t('sub.name')}</span> <span className="req-star">*</span>
@@ -475,18 +509,12 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
       </Fold>
 
       {previewMsg && (
-        <div className={previewMsg.ok ? 'mesh-success' : 'dlg-err'}>
-          {previewMsg.ok ? (
-            <>
+        previewMsg.ok ? <div className="mesh-success">
               <svg viewBox="0 0 24 24" width={18} fill="none" stroke="currentColor" strokeWidth={2.6} style={{ color: 'hsl(var(--ok))' }}>
                 <path d="M20 6L9 17l-5-5" />
               </svg>
               <div><b>{previewMsg.text}</b></div>
-            </>
-          ) : (
-            previewMsg.text
-          )}
-        </div>
+        </div> : <FeedbackNotice title={t('sub.previewFail')} detail={previewMsg.text} />
       )}
     </Modal>
   );

@@ -1,4 +1,10 @@
 {
+  "feedback": {
+    "connectionFailed": "連線失敗",
+    "stopFailed": "中斷連線失敗",
+    "subscriptionSaved": "訂閱已儲存",
+    "followupIncomplete": "後續處理未完成，請確認目前訂閱狀態後再決定是否重試。"
+  },
   "helper": {
     "title": "提權助手",
     "statusChecking": "偵測中…",
@@ -65,7 +71,7 @@
       "invalid": "驗證失敗",
       "unavailable": "無法使用"
     },
-    "failureNextStep": "請查看日誌中的 Helper 安裝記錄以確認失敗原因。重新偵測不會再次安裝 Helper。",
+    "failureNextStep": "重新偵測只檢查目前狀態，不會再次安裝 Helper。",
     "viewLogsAction": "查看日誌",
     "installSelectedCoreAction": "安裝本版本配套核心",
     "stopAndUpgradeAction": "停止連線並升級…",
@@ -87,6 +93,7 @@
     "delete": "刪除",
     "edit": "編輯",
     "save": "儲存",
+    "saving": "正在儲存…",
     "saved": "已儲存",
     "copyFail": "複製失敗",
     "retry": "重試",
@@ -384,6 +391,25 @@
     "pendingDetailTip": "需重啟核心生效 · 點擊查看明細",
     "pendingDetailTipStaged": "點擊查看明細",
     "pendingEffectNeedsRestart": "儲存後待套用",
+    "restartApplyTitle": "需要重新啟動",
+    "restartApplyDescription": "此變更需要重新啟動，會中斷目前連線。",
+    "restartApplyConfirm": "重新啟動並套用",
+    "restartApplyKeepConnection": "保留目前連線",
+    "restartApplyUnsupportedCore": "已安裝的核心無法即時套用此變更。",
+    "restartApplyTun": "TUN 設定已變更。",
+    "restartApplyListener": "監聽連接埠設定已變更。",
+    "restartApplyNamespace": "網路命名空間已變更。",
+    "restartApplyServices": "服務生命週期設定已變更。",
+    "restartApplyCache": "持久快取路徑已變更。",
+    "restartApplyStructural": "執行階段結構性設定已變更。",
+    "pendingHotApplied": "已套用至執行中的核心。",
+    "pendingHotDurabilityPending": "執行階段已套用，持久化仍待完成。",
+    "pendingRetryPersistenceBtn": "重試持久化",
+    "pendingExitPersistenceRecoveryBtn": "結束此次復原",
+    "pendingHotConflict": "設定或執行狀態已變更，請檢查後重試。",
+    "pendingHotOwnerSuperseded": "已儲存的設定已變更。請套用最新設定，以完成重新啟動設定的更新。",
+    "pendingHotRejected": "變更遭拒，已儲存的變更仍待套用。",
+    "pendingHotUnconfirmed": "套用結果尚未確認，請勿視為成功。",
     "pendingEffectOnSave": "僅需儲存",
     "pendingGroupAdded": "尚未進入執行核心",
     "pendingGroupConfig": "設定變更 · 需重啟核心生效",
@@ -506,7 +532,7 @@
   "settings": {
     "utls": {
       "label": "全域 uTLS 指紋",
-      "description": "新設定的初始選項為預設（Chrome）。跟隨保留節點指紋；預設、隨機或瀏覽器選項覆寫未明確關閉的適用節點，節點明確關閉優先。隨機在每次核心啟動時選擇一種瀏覽器範本。",
+      "description": "新設定預設為跟隨，保留節點指紋。預設（Chrome）、隨機或瀏覽器選項覆寫未明確關閉的適用節點；節點明確關閉優先。隨機在每次核心啟動時選擇一種瀏覽器範本。",
       "follow": "跟隨"
     },
     "coex": {
@@ -804,6 +830,7 @@
       "autoSwitchNode": "節點故障自動切換",
       "autoSwitchNodeDesc": "目前節點偵測到故障時自動切到可用節點。只走內網的組網節點不參與判定——沒有可替代的節點，不會被自動切走。",
       "disableLogFileDescFull": "關閉磁碟日誌後，即時日誌與日誌診斷將無法使用；崩潰偵測仍可使用。執行中需儲存後點「立即套用」；未執行時下次連線生效。",
+      "lanGatewayPrerequisite": "區域網共享僅開放代理監聽，Polaris 不修改主機 IP 轉送。路由型區域網 MAC 篩選需要預先設定閘道並開啟 TUN 位址族的轉送；條件缺失或無法讀取時拒絕啟動/套用。區域網短名解析不要求路由器模式。",
       "lanGateway": "區域網閘道",
       "neighborDomains": "區域網短名解析",
       "neighborDomainsHint": "每行一個後綴（自動補前導點）；對該後綴下無點的短名（如 nas.lan）走區域網裝置解析。",
@@ -1086,6 +1113,7 @@
         },
         "load": {
           "startupReady": "啟動載入已確認",
+          "runtimeCommitted": "執行階段載入已提交",
           "fileWrittenUnacknowledged": "檔案已寫入，核心載入未確認",
           "loadFailed": "載入失敗",
           "unknown": "載入狀態未知"
@@ -1249,6 +1277,7 @@
       "resourceRefServer": "DNS 伺服器「{{name}}」",
       "resourceRefDefault": "預設項目「{{name}}」",
       "fakeIpDesc": "對 A/AAAA 查詢回傳合成位址，避免 DNS 污染",
+      "fakeIpPolicyLocation": "FakeIP 由 DNS → 解析規則中的規則動作或預設規則控制。",
       "remoteDns": "遠端 DNS",
       "remoteDnsDesc": "解析海外網域的上游",
       "domesticDns": "國內 DNS",
@@ -1259,7 +1288,7 @@
       "takeoverSystemDnsDesc": "當機或斷電後自動還原原系統 DNS",
       "nodeResolverBlock": "節點網域解析",
       "raceStrategy": "解析策略",
-      "raceStrategyDesc": "由核心先競速加密上游，必要時再查詢備用上游。採用最先返回的乾淨位址回應；空回應保留到競速結束再決定。",
+      "raceStrategyDesc": "由核心先競速加密上游，必要時再查詢備用上游。採用最先返回的乾淨位址回應；空回應保留到競速結束再決定。 關閉競速仍支援網域節點解析，改用單上游。競速在快取未命中時可能增加多上游及 A/AAAA 查詢。",
       "raceMode": "併發競速",
       "singleMode": "單一上游",
       "raceUpstreams": "競速上游",
@@ -1713,7 +1742,7 @@
     "previewOk": "預檢通過：解析到 {{n}} 個節點",
     "ua": "自訂 User-Agent",
     "uaHint": "拉取此訂閱時攜帶的 User-Agent，留空則使用預設值",
-    "uaPh": "預設 Polaris/1.0",
+    "uaPh": "預設：應用程式與核心版本",
     "url": "訂閱連結",
     "viaProxy": "經代理更新",
     "viaProxyHint": "經執行中的代理拉取而非直連（全域策略可覆蓋，見設定）",
@@ -1736,6 +1765,8 @@
     "createTaskRecoveredHint": "訂閱新增在背景執行，應用程式重新啟動後會在這裡繼續顯示進度。"
   },
   "errors": {
+    "lanGatewayForwardingRequired": "所需位址族的區域網閘道轉送未開啟。請在 Polaris 之外設定閘道，或關閉路由型區域網 MAC 篩選。未修改主機網路設定。",
+    "lanGatewayForwardingUnconfirmed": "無法確認所需的區域網閘道轉送狀態，已拒絕啟動/套用。請檢查閘道設定。未修改主機網路設定。",
     "dnsDependencyInvalid": "DNS 伺服器或群組的參照無效或仍被使用。請檢查 DNS 規則、預設 DNS 和群組參照後重試。",
     "iosSessionActive": "系統中已有 Polaris VPN 工作階段，請先在 iOS 系統設定中停止該工作階段，再連線。",
     "operationFailed": "操作失敗，請稍後重試",
@@ -2187,6 +2218,7 @@
     "onDemandHint": "只有被目前選取的出口或路由規則引用時才連線；未被引用時中斷。Tailscale 會交出 tailnet 位址並停用 MagicDNS，登入狀態保留。掛起期間收不到 Taildrop 檔案。"
   },
   "nodes": {
+    "invalidVisionTransport": "目前核心的 Vision 僅支援原生 TLS/Reality TCP，不支援此額外傳輸。原參數已保留，請選擇相容節點或修正設定。",
     "previousSubscriptions": "查看前面的訂閱",
     "nextSubscriptions": "查看後面的訂閱",
     "add": "新增",
@@ -3106,6 +3138,7 @@
     },
     "load": {
       "startupReady": "核心啟動已確認載入代。",
+      "runtimeCommitted": "執行階段回執已確認載入；持久化狀態另行追蹤。",
       "fileWrittenUnacknowledged": "檔案已寫入，重新載入未確認。",
       "loadFailed": "載入失敗，網段歸屬未知。",
       "unknown": "沒有可用的載入證據。"
@@ -3261,11 +3294,12 @@
     "success": "成功",
     "failed": "失敗",
     "unmeasured": "未測",
-    "expired": "過期",
+    "expired": "測速已過期",
+    "expiredHint": "原測速結果已逾時，或不再符合目前連線、設定或網路；不會顯示為新結果，可手動重新測速。",
     "paused": "暫停",
     "notIncluded": "未納入",
     "disconnected": "未連線測量",
-    "systemPath": "系統路徑",
+    "systemPath": "按系統路由測量（可能代理或直連）",
     "selectedPath": "目前出口",
     "nodePath": "節點測量",
     "bindingMismatch": "實際承載與請求節點不同",

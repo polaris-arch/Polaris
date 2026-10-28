@@ -109,7 +109,8 @@ run_gate() {
 }
 
 run_gate fmt cargo fmt --all -- --check
-run_gate clippy env RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets -- -D warnings
+# Match CI: gather independent-crate failures without weakening the verdict.
+run_gate clippy env RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --keep-going -- -D warnings
 run_gate rustdoc env RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::invalid_html_tags -D rustdoc::private_intra_doc_links -D rustdoc::redundant_explicit_links" cargo doc --no-deps --workspace --bins --lib --document-private-items
 run_gate build cargo build --workspace --verbose
 # ── 本机专属：禁起核（陈先生决策 2026-09-25）──
@@ -188,11 +189,11 @@ if [ "$WITH_CROSS" = 1 ]; then
       # PATH 只在 android 那一格前置：NDK bin 里有 clang/ld/llvm-*，全局前置会影响宿主编译。
       extra=""
       [ "$t" = aarch64-linux-android ] && extra="$NDK_BIN:"
-      PATH="${extra}${PATH}" cargo clippy --target "$t" --all-targets "${TARGETS[@]}" -- -D warnings
+      PATH="${extra}${PATH}" cargo clippy --target "$t" --all-targets "${TARGETS[@]}" --keep-going -- -D warnings
       if [ "${#LIBONLY[@]}" -gt 0 ]; then
         LIB_ARGS=()
         for p in "${LIBONLY[@]}"; do LIB_ARGS+=("-p" "$p"); done
-        PATH="${extra}${PATH}" cargo clippy --target "$t" "${LIB_ARGS[@]}" -- -D warnings
+        PATH="${extra}${PATH}" cargo clippy --target "$t" "${LIB_ARGS[@]}" --keep-going -- -D warnings
       fi
     done
     # polaris 在 android 上被豁免出 clippy 循环（既有 lint 债，理由在豁免表），但编译面不能跟着丢：
@@ -264,7 +265,7 @@ if [ "$WITH_CROSS" = 1 ]; then
     fi
     for e in $(jq -r "keys[]" scripts/cross-target-exempt.json); do
       for t in $(jq -r --arg e "$e" ".[\$e].targets[]" scripts/cross-target-exempt.json); do
-        if cargo clippy --target "$t" --all-targets -p "$e" -- -D warnings >/dev/null 2>&1; then
+        if cargo clippy --target "$t" --all-targets -p "$e" --keep-going -- -D warnings >/dev/null 2>&1; then
           echo "豁免已腐烂：$e 现在能过 $t —— 从 scripts/cross-target-exempt.json 删掉它" >&2
           rot=1
         fi

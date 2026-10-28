@@ -71,10 +71,10 @@ async fn managed_marker_rejects_legacy_start_and_restart_before_generation_or_sw
     let generation = rt.gate.generation();
     let sweeps = rt.stale_sweep_runs.load(Ordering::SeqCst);
 
-    assert!(rt.start(bad_config()).await.is_err());
+    assert!(rt.start(post_admission_failure_config()).await.is_err());
     assert_eq!(rt.gate.generation(), generation);
     assert_eq!(rt.stale_sweep_runs.load(Ordering::SeqCst), sweeps);
-    assert!(rt.restart(bad_config()).await.is_err());
+    assert!(rt.restart(post_admission_failure_config()).await.is_err());
     assert_eq!(rt.gate.generation(), generation);
     assert!(
         !rt.gate.is_busy(),
@@ -122,14 +122,14 @@ async fn stop_terminal_discards_pending_switch() {
 }
 
 #[tokio::test]
-async fn apply_during_a_restart_stop_wait_keeps_its_exact_snapshot() {
+async fn apply_during_a_restart_stop_wait_conflicts_without_creating_a_force_snapshot() {
     let (rt, _dir) = test_runtime();
     let disk = two_node_config(7891, "node-b");
     rt.config.save_full(&disk).unwrap();
     let held = rt.mesh.tailscale_state_gate().await;
     let restart = {
         let rt = Arc::clone(&rt);
-        tokio::spawn(async move { rt.restart(bad_config()).await })
+        tokio::spawn(async move { rt.restart(post_admission_failure_config()).await })
     };
     for _ in 0..10_000 {
         if rt.gate.is_busy() && rt.gate.generation() > 0 {
@@ -141,20 +141,15 @@ async fn apply_during_a_restart_stop_wait_keeps_its_exact_snapshot() {
         rt.gate.is_busy(),
         "restart must own its outer lifecycle while stop waits"
     );
-    assert_eq!(rt.apply_pending().await, "deferred");
-    let (id, saved, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
-    assert_eq!(saved, rt.config.current().unwrap());
-    assert_eq!(source, ForceRestartSource::Full);
+    let before = rt.config.current().unwrap();
+    assert_eq!(rt.apply_pending().await, "conflict");
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert_eq!(rt.config.current().unwrap(), before);
     drop(held);
-    let _ = restart.await.unwrap(); // synthetic bad start may fail; the pending Apply must survive.
-    assert_eq!(
-        rt.pending_force_restart
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|(next, _, _)| *next),
-        Some(id),
-        "the transient stop leg must not clear an Apply received during its await"
+    let _ = restart.await.unwrap(); // synthetic bad start may fail; no Apply was authorized.
+    assert!(
+        rt.pending_force_restart.read().unwrap().is_none(),
+        "a busy Apply must not leave an implicit restart behind"
     );
     rt.gate.bump_generation();
 }
@@ -278,9 +273,17 @@ fn running_effective_proxy_mode_type_tracks_the_running_snapshot_only() {
 #[tokio::test]
 async fn stop_terminal_discards_pending_force_restart() {
     let (rt, _dir) = test_runtime();
+    let running = two_node_config(7891, "node-a");
+    rt.config.save_full(&running).unwrap();
+    mark_running(&rt);
+    *rt.current_config.write().unwrap() = Some(rt.config.current().unwrap());
+    let (status, id) = rt.apply_confirmed_for_test().await;
+    assert_eq!(status, "applied");
+    let (queued_id, saved, source) = rt.pending_force_restart.read().unwrap().clone().unwrap();
+    assert_eq!(Some(queued_id), id);
+    assert_eq!(saved, rt.config.current().unwrap());
+    assert!(matches!(source, ForceRestartSource::Confirmed { .. }));
     rt.gate.begin();
-    let _ = rt.apply_pending().await; // deferred，置下 pending
-    assert!(rt.pending_force_restart.read().unwrap().is_some());
 
     // 收尾为 Stop → 丢弃全部 pending，且本层的专用快照同步清空。
     rt.finish_lifecycle(LifecycleKind::Stop);
@@ -301,7 +304,7 @@ async fn stop_terminal_discards_pending_force_restart() {
 // 故这里打的是 `start 真失败 → controller 真被调 → mock 记录到 ensure_cleared 被触发` 这条组合路径，
 // 并单独覆盖 restart 失败腿（本不变式的主场景）。本机绝不真跑 networksetup/gsettings/reg。
 //
-// 坏配置（非对象 JSON）→ UserConfig 反序列化在 start_inner **第一步**即失败 → 不 spawn、不写盘、
+// schema-valid 非网关配置（重复 Auto pin）→ 既有 raw Auto 校验在 start_inner **第一步**即失败 → 不 spawn、不写盘、
 // 不解析端口 → 返回 Err，零宿主副作用。`stale_sweep_disabled=true` 预置跳过 /proc 孤儿清扫。
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -310,7 +313,7 @@ async fn stop_terminal_discards_pending_force_restart() {
 async fn start_failure_invokes_system_proxy_clearer() {
     let (rt, _dir, calls) = test_runtime_recording();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst); // 跳过孤儿清扫（/proc 扫描），聚焦失败腿。
-    let r = rt.start(bad_config()).await;
+    let r = rt.start(post_admission_failure_config()).await;
     assert!(r.is_err(), "坏配置必失败");
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -327,7 +330,7 @@ async fn restart_start_leg_failure_invokes_system_proxy_clearer() {
     let (rt, _dir, calls) = test_runtime_recording();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
     // 无旧核快照，restart 的跨模式收口门不命中；start(bad) 失败腿负责清。
-    let r = rt.restart(bad_config()).await;
+    let r = rt.restart(post_admission_failure_config()).await;
     assert!(r.is_err(), "restart 的 start 腿坏配置必失败");
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -408,7 +411,7 @@ async fn restart_replays_pending_switch_via_outer_lifecycle_wrapper() {
     ));
     rt.gate.set_switch_pending(id);
 
-    let _ = rt.restart(bad_config()).await; // start 腿坏配置快速失败，不 spawn。
+    let _ = rt.restart(post_admission_failure_config()).await; // start 腿坏配置快速失败，不 spawn。
 
     // 轮询 current_config 直到被重放的 switch 落定（spawn 的重放任务近即执行；有界等待防超长）。
     let mut replayed = false;
@@ -611,7 +614,7 @@ async fn production_controller_inert_on_start_failure() {
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
     let marker = dir.join(polaris_system_integration::PROXY_MARKER_FILENAME);
     assert!(!marker.exists(), "前置：无 marker");
-    let r = rt.start(bad_config()).await;
+    let r = rt.start(post_admission_failure_config()).await;
     assert!(r.is_err(), "坏配置必失败");
     assert!(
         !marker.exists(),
@@ -804,7 +807,7 @@ fn stop_teardown_yields_after_every_await() {
 async fn restart_stop_leg_does_not_clear_system_proxy() {
     let (rt, _dir, calls) = test_runtime_recording();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst); // 跳过 /proc 孤儿清扫，聚焦清理计数。
-    let r = rt.restart(bad_config()).await;
+    let r = rt.restart(post_admission_failure_config()).await;
     assert!(r.is_err(), "restart 的 start 腿坏配置必失败");
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -837,7 +840,7 @@ async fn restart_stop_leg_taken_over_by_user_stop_never_starts() {
     let initial = rt.gate.generation();
     let restart = {
         let rt = Arc::clone(&rt);
-        tokio::spawn(async move { rt.restart(bad_config()).await })
+        tokio::spawn(async move { rt.restart(post_admission_failure_config()).await })
     };
     let mut spins = 0;
     while rt.gate.generation() == initial {
@@ -881,7 +884,8 @@ async fn stop_between_restart_legs_rejects_guarded_start() {
     rt.stop().await.unwrap();
     let newer_stop = rt.gate.generation();
     assert!(matches!(
-        rt.start_guarded(bad_config(), Some(stop_generation)).await,
+        rt.start_guarded(post_admission_failure_config(), Some(stop_generation))
+            .await,
         StartLeg::Superseded
     ));
     assert_eq!(rt.gate.generation(), newer_stop);
@@ -899,7 +903,10 @@ async fn obsolete_restart_waiting_for_tailscale_gate_does_not_enter_start_leg() 
         let gate = rt.mesh.tailscale_state_gate().await;
         let old = {
             let rt = Arc::clone(&rt);
-            tokio::spawn(async move { rt.start_guarded(bad_config(), Some(expected)).await })
+            tokio::spawn(async move {
+                rt.start_guarded(post_admission_failure_config(), Some(expected))
+                    .await
+            })
         };
         for _ in 0..1000 {
             if rt.start_inflight.load(Ordering::SeqCst) > 0 {
@@ -922,7 +929,7 @@ async fn explicit_start_waiting_for_tailscale_gate_yields_to_later_user_stop() {
     let gate = rt.mesh.tailscale_state_gate().await;
     let old_start = {
         let rt = Arc::clone(&rt);
-        tokio::spawn(async move { rt.start(bad_config()).await })
+        tokio::spawn(async move { rt.start(post_admission_failure_config()).await })
     };
     for _ in 0..1000 {
         if rt.start_inflight.load(Ordering::SeqCst) > 0 {
@@ -961,7 +968,7 @@ async fn later_explicit_start_owns_generation_while_earlier_start_waits() {
     let gate = rt.mesh.tailscale_state_gate().await;
     let first = {
         let rt = Arc::clone(&rt);
-        tokio::spawn(async move { rt.start(bad_config()).await })
+        tokio::spawn(async move { rt.start(post_admission_failure_config()).await })
     };
     for _ in 0..1000 {
         if rt.start_inflight.load(Ordering::SeqCst) == 1 {
@@ -972,7 +979,7 @@ async fn later_explicit_start_owns_generation_while_earlier_start_waits() {
     let first_generation = rt.gate.generation();
     let second = {
         let rt = Arc::clone(&rt);
-        tokio::spawn(async move { rt.start(bad_config()).await })
+        tokio::spawn(async move { rt.start(post_admission_failure_config()).await })
     };
     for _ in 0..1000 {
         if rt.gate.generation() > first_generation {
@@ -1001,7 +1008,7 @@ async fn delayed_debounced_restart_cannot_start_after_stop() {
     rt.stop().await.unwrap();
     let stopped_generation = rt.gate.generation();
     let result = rt
-        .restart_guarded(bad_config(), Some(scheduled_generation))
+        .restart_guarded(post_admission_failure_config(), Some(scheduled_generation))
         .await
         .unwrap();
     assert!(!result.running);
@@ -1080,9 +1087,12 @@ async fn real_core_full_lifecycle() {
     println!("[①] ps -p {} → 进程存在 ✓", st.pid);
 
     // ── ② 管理 API 真的通（h2c gRPC unary RPC，非 clash REST）─────────────────
-    let client = SingBoxApiClient::connect(Endpoint::new("127.0.0.1", st.clash_api_port), "")
-        .await
-        .expect("[②] 管理 API gRPC 连接应成功");
+    let client = SingBoxApiClient::connect(
+        Endpoint::new("127.0.0.1", st.clash_api_port),
+        FIXTURE_MANAGEMENT_SECRET,
+    )
+    .await
+    .expect("[②] 管理 API gRPC 连接应成功");
     client
         .close_all_connections()
         .await
@@ -1198,9 +1208,9 @@ async fn real_core_full_lifecycle() {
         "[③] Status 必须是真实运行数据"
     );
 
-    // ── ⑤ apply_pending 真实状态（运行中 + 非在飞 → applied）──────────────────
-    let ap = rt.apply_pending().await;
-    println!("[⑤] apply_pending（运行中）→ {ap}");
+    // ── ⑤ explicitly confirmed restart scheduling, not implicit HOT success ──
+    let (ap, _) = rt.apply_confirmed_for_test().await;
+    println!("[⑤] explicitly confirmed restart scheduling → {ap}");
     assert_eq!(ap, "applied");
 
     // ── ④ 停核干净、无孤儿 ──────────────────────────────────────────────────
@@ -1294,6 +1304,7 @@ fn proxy_status_serializes_camel_case_contract() {
     let s = ProxyStatus {
         running: true,
         main_generation: 7,
+        actual_server_id: Some("measured-node".into()),
         owned_stop_context: None,
         pid: 42,
         start_time: Some(1_700_000_000_000),
@@ -1311,6 +1322,7 @@ fn proxy_status_serializes_camel_case_contract() {
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(v["running"], true);
     assert_eq!(v["mainGeneration"], 7);
+    assert_eq!(v["actualServerId"], "measured-node");
     assert_eq!(v["pid"], 42);
     assert_eq!(v["mixedPort"], 7890);
     assert_eq!(v["clashApiPort"], 19090);
@@ -1417,7 +1429,7 @@ async fn start_failure_is_observable_even_when_it_never_reaches_set_error() {
     let (rt, _dir, errors, lifecycle) = test_runtime_recording_lifecycle();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst); // 跳过孤儿清扫（/proc 扫描），聚焦失败腿。
 
-    let r = rt.start(bad_config()).await;
+    let r = rt.start(post_admission_failure_config()).await;
     assert!(r.is_err(), "前提：坏配置必失败");
 
     assert!(
@@ -1458,7 +1470,7 @@ async fn restart_start_leg_failure_emits_stopped_then_failed_in_order() {
     let (rt, _dir, _errors, lifecycle) = test_runtime_recording_lifecycle();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
 
-    let r = rt.restart(bad_config()).await;
+    let r = rt.restart(post_admission_failure_config()).await;
     assert!(r.is_err(), "前提：坏配置必失败");
 
     let phases: Vec<&str> = lifecycle.lock().unwrap().iter().map(|e| e.phase).collect();
@@ -2263,7 +2275,8 @@ async fn dispatched_apply_early_failures_emit_one_owned_terminal_without_teardow
                 std::fs::write(&marker, b"injected invalid admission marker").unwrap();
             }
         }));
-        let (status, id) = rt.apply_pending_owned().await;
+        *rt.current_config.write().unwrap() = Some(rt.config.current().unwrap());
+        let (status, id) = rt.apply_confirmed_for_test().await;
         assert_eq!(status, "applied");
         let id = id.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -2308,7 +2321,8 @@ async fn dispatched_apply_superseded_after_claim_does_not_publish_failure() {
         weak.upgrade().unwrap().bump_generation();
         signal.store(true, Ordering::SeqCst);
     }));
-    assert_eq!(rt.apply_pending_owned().await.0, "applied");
+    *rt.current_config.write().unwrap() = Some(rt.config.current().unwrap());
+    assert_eq!(rt.apply_confirmed_for_test().await.0, "applied");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if seen.load(Ordering::SeqCst) && !rt.gate.is_busy() {
@@ -2424,7 +2438,14 @@ async fn actual_config_writer_barrier_excludes_mixed_owned_stop_capture_and_clai
     release_tx.send(()).unwrap();
     writer.join().unwrap().unwrap();
     assert_eq!(cached_selected.as_deref(), Some("node-a"));
-    assert!(captured_during_writer.is_err() && second_capture.is_err());
+    assert_eq!(
+        captured_during_writer.unwrap_err().code(),
+        "PROXY_STATUS_WRITER_BUSY"
+    );
+    assert_eq!(
+        second_capture.unwrap_err().code(),
+        "PROXY_STATUS_WRITER_BUSY"
+    );
     assert!(prior_stop.is_err() && mixed_stop.is_err());
     assert!(
         unchanged,
@@ -2613,4 +2634,70 @@ async fn current_proxy_cleanup_reuses_existing_restore_controller() {
     let (rt, _dir, calls) = test_runtime_recording();
     rt.clear_system_proxy_if_current(rt.gate.generation()).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn public_status_busy_envelope_never_contains_owned_stop_context() {
+    let (rt, dir, _) = test_runtime_recording();
+    let cold = crate::commands::proxy::proxy_status_response(&rt);
+    let cold = serde_json::to_value(cold).unwrap();
+    assert_eq!(cold["success"], false);
+    assert_eq!(cold["code"], "PROXY_STATUS_CACHE_COLD");
+    assert!(cold.get("data").is_none());
+    assert!(!dir.join("config.json").exists());
+    rt.config
+        .save_full(&two_node_config(7890, "node-a"))
+        .unwrap();
+    mark_running(&rt);
+    rt.bump_generation();
+    let before = rt.core_generation();
+    {
+        let _writer = rt.config.hold_write_lock_for_test();
+        let busy =
+            serde_json::to_value(crate::commands::proxy::proxy_status_response(&rt)).unwrap();
+        assert_eq!(busy["success"], false);
+        assert_eq!(busy["code"], "PROXY_STATUS_WRITER_BUSY");
+        assert!(busy.get("data").is_none());
+        assert_eq!(rt.core_generation(), before);
+    }
+    let ready = serde_json::to_value(crate::commands::proxy::proxy_status_response(&rt)).unwrap();
+    assert_eq!(ready["success"], true);
+    assert_eq!(ready["data"]["mainGeneration"], before);
+    assert_eq!(
+        ready["data"]["ownedStopContext"]["selectedServerId"],
+        "node-a"
+    );
+    assert!(ready.get("code").is_none());
+    // Existing real writer barrier proves no mixed tuple/Stop can escape.
+    // Covered by the separately targeted actual_config_writer_barrier test.
+}
+
+#[tokio::test]
+async fn malformed_config_is_rejected_before_claim_stop_or_proxy_cleanup() {
+    let (rt, _dir, calls) = test_runtime_recording();
+    mark_running(&rt);
+    let generation = rt.core_generation();
+    let pid = rt.status().pid;
+    for config in [
+        Value::Null,
+        serde_json::json!({}),
+        serde_json::json!({"servers":[],"proxyModeType":12345}),
+    ] {
+        let start = rt
+            .start(config.clone())
+            .await
+            .expect_err("schema rejection");
+        assert!(start.message.contains("配置解析失败"));
+        assert_eq!(start.code, None);
+        let restart = rt
+            .restart(config)
+            .await
+            .expect_err("schema rejection before Stop");
+        assert!(restart.message.contains("配置解析失败"));
+        assert_eq!(restart.code, None);
+        assert_eq!(rt.core_generation(), generation);
+        assert_eq!(rt.status().pid, pid);
+        assert!(rt.status().running);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 }

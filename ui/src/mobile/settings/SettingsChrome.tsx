@@ -153,7 +153,7 @@ export function SettingsRow({
         {/* 写失败：紧贴这颗控件的行内提示。它与 `problem` 并存而不是二选一 ——
             「这个值不合法」与「这次没存进去」是两件不同的事，盖掉任一条都会让人修错方向。 */}
         {writeError !== undefined && (
-          <span data-write-error={id} style={{ ...ROW_DESC, color: 'hsl(var(--err))' }}>
+          <span role="status" data-write-error={id} style={{ ...ROW_DESC, color: 'hsl(var(--err))' }}>
             {writeError}
           </span>
         )}

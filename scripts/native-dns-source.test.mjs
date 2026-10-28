@@ -14,7 +14,7 @@ test('native DNS source binding controls are offline and make no runtime accepta
       env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', POLARIS_NO_KERNEL_RUN: '1' },
     });
   assert.equal(result.status, 0, `${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 10 tests/);
+  assert.match(result.stderr, /Ran 11 tests/);
 });
 
 test('inactive staging source binding cannot enter the formal release consumer', () => {

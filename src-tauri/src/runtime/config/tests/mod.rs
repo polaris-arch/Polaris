@@ -6,6 +6,74 @@ fn temp_dir(tag: &str) -> TestDir {
 }
 
 #[test]
+fn durable_runtime_owner_attests_exact_disk_bytes_and_saved_version() {
+    let directory = temp_dir("durable-runtime-owner");
+    let config = ConfigManager::new(directory.clone());
+    let initial = config.current().unwrap();
+    config.save_full(&initial).unwrap();
+    let saved = config.current().unwrap();
+    let bytes = std::fs::read(directory.join("config.json")).unwrap();
+    let called = std::cell::Cell::new(false);
+    let receipt = config
+        .with_durable_runtime_owner(&saved, |digest, revision| {
+            called.set(true);
+            assert_eq!(digest, polaris_updater::sha256_hex(&bytes));
+            assert_eq!(revision, config_version(&saved));
+            (digest, revision)
+        })
+        .unwrap();
+    assert!(called.get());
+    assert!(!receipt.0.is_empty() && !receipt.1.is_empty());
+}
+
+#[test]
+fn durable_runtime_owner_rejects_newer_desired_without_acknowledgement() {
+    let directory = temp_dir("durable-runtime-newer");
+    let config = ConfigManager::new(directory.clone());
+    let initial = config.current().unwrap();
+    config.save_full(&initial).unwrap();
+    let saved = config.current().unwrap();
+    let mut newer = saved.clone();
+    newer["logLevel"] = serde_json::json!("debug");
+    config.save_full(&newer).unwrap();
+    let called = std::cell::Cell::new(false);
+    assert!(config
+        .with_durable_runtime_owner(&saved, |_, _| called.set(true))
+        .is_err());
+    assert!(!called.get());
+    assert_eq!(config.current().unwrap()["logLevel"], "debug");
+}
+
+#[test]
+fn durable_runtime_owner_rejects_mismatched_or_unreadable_disk_without_acknowledgement() {
+    for corrupt in [false, true] {
+        let directory = temp_dir("durable-runtime-disk");
+        let config = ConfigManager::new(directory.clone());
+        let initial = config.current().unwrap();
+        config.save_full(&initial).unwrap();
+        let saved = config.current().unwrap();
+        let mut changed = saved.clone();
+        changed["logLevel"] = serde_json::json!("debug");
+        let bytes = if corrupt {
+            b"not-json".to_vec()
+        } else {
+            serde_json::to_vec(&changed).unwrap()
+        };
+        std::fs::write(directory.join("config.json"), &bytes).unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(config
+            .with_durable_runtime_owner(&saved, |_, _| called.set(true))
+            .is_err());
+        assert!(!called.get());
+        assert_eq!(
+            std::fs::read(directory.join("config.json")).unwrap(),
+            bytes,
+            "attestation must not repair or rewrite a mismatched durable owner"
+        );
+    }
+}
+
+#[test]
 fn saved_commit_is_warm_only_and_never_waits_for_a_config_writer() {
     let directory = temp_dir("saved-commit");
     let config = ConfigManager::new(directory.clone());
@@ -2923,6 +2991,79 @@ fn deferred_save_writes_intent_without_running_cleanup() {
 }
 
 #[test]
+fn runtime_deletion_scope_never_consumes_or_drops_later_queued_entries() {
+    let dir = temp_dir("runtime-delete-scope");
+    let mgr = ConfigManager::new(dir.clone());
+    let fixture = deletion_fixture();
+    let mut initial = mgr.current().unwrap();
+    initial["ruleResources"] = fixture["ruleResources"].clone();
+    initial["customAppPresets"] = fixture["customAppPresets"].clone();
+    mgr.save_full(&initial).unwrap();
+    let initial = mgr.current().unwrap();
+
+    let mut first = initial.clone();
+    first["ruleResources"] = serde_json::json!([]);
+    mgr.save_full_deferred_cleanup(&initial, &first).unwrap();
+    let first = mgr.current().unwrap();
+    let scope = mgr
+        .runtime_deletion_scope(&first, &initial, &first)
+        .unwrap();
+    assert!(
+        mgr.runtime_deletion_scope(&first, &first, &first)
+            .unwrap()
+            .is_empty(),
+        "a later no-op cannot acquire the earlier undrained removal"
+    );
+    assert_eq!(
+        scope.len(),
+        1,
+        "only the original rule resource removal is captured"
+    );
+
+    let mut later = first.clone();
+    later["customAppPresets"] = serde_json::json!([]);
+    mgr.save_full_deferred_cleanup(&first, &later).unwrap();
+    let queued = mgr.load_deferred_deletions_locked().unwrap().entries;
+    let later_entries: Vec<_> = queued
+        .into_iter()
+        .filter(|entry| !scope.contains(entry))
+        .collect();
+    assert_eq!(
+        later_entries.len(),
+        1,
+        "a later icon deletion must really be queued"
+    );
+    let mut calls = Vec::new();
+    let summary = mgr
+        .process_deferred_deletions_scoped(Some(&scope), |entry, _| {
+            calls.push(entry.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        calls, scope,
+        "the old receipt cannot execute a later deletion"
+    );
+    assert_eq!(summary.applied, 1);
+    assert_eq!(
+        mgr.load_deferred_deletions_locked().unwrap().entries,
+        later_entries,
+        "out-of-scope work must survive journal rewriting unchanged"
+    );
+
+    let mut remaining_calls = Vec::new();
+    mgr.process_deferred_deletions(|entry, _| {
+        remaining_calls.push(entry.clone());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        remaining_calls, later_entries,
+        "the later owner still has its cleanup work"
+    );
+}
+
+#[test]
 fn deferred_deletions_cancel_readded_entities_and_retry_failures() {
     let dir = temp_dir("deferred-delete-reconcile");
     let mgr = ConfigManager::new(dir.clone());
@@ -3387,4 +3528,129 @@ fn managed_load_rejects_sanitizer_removed_server_before_cache_or_persistence() {
     assert!(mgr.load_full().is_err());
     assert!(mgr.cache.read().unwrap().is_none());
     assert_eq!(std::fs::read(dir.join("config.json")).unwrap(), bytes);
+}
+
+#[test]
+fn saved_commit_classifies_busy_poison_and_cold_without_loading_or_committing() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let directory = temp_dir("saved-commit-classified");
+    let config = ConfigManager::new(directory.clone());
+    let called = std::cell::Cell::new(false);
+    assert_eq!(
+        config.try_with_saved_commit_classified(|_| called.set(true)),
+        Err(SavedCommitError::Cold)
+    );
+    assert!(!called.get());
+    assert!(!directory.join("config.json").exists());
+    config.current().unwrap();
+    let bytes = std::fs::read(directory.join("config.json")).unwrap();
+    {
+        let _writer = config.hold_write_lock_for_test();
+        assert_eq!(
+            config.try_with_saved_commit_classified(|_| called.set(true)),
+            Err(SavedCommitError::WriterBusy)
+        );
+        assert!(config.try_with_saved_commit(|_| called.set(true)).is_err());
+    }
+    {
+        let _cache = config.cache.write().unwrap();
+        assert_eq!(
+            config.try_with_saved_commit_classified(|_| called.set(true)),
+            Err(SavedCommitError::CacheBusy)
+        );
+        assert!(config.try_with_saved_commit(|_| called.set(true)).is_err());
+    }
+    assert!(!called.get());
+    config
+        .try_with_saved_commit_classified(|_| called.set(true))
+        .unwrap();
+    assert!(called.get());
+    assert_eq!(std::fs::read(directory.join("config.json")).unwrap(), bytes);
+    for writer in [true, false] {
+        let directory = temp_dir("saved-commit-poison");
+        let config = ConfigManager::new(directory.clone());
+        config.current().unwrap();
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            if writer {
+                let _guard = config.write_lock.lock().unwrap();
+                panic!("synthetic writer poison");
+            } else {
+                let _guard = config.cache.write().unwrap();
+                panic!("synthetic cache poison");
+            }
+        }));
+        assert!(poisoned.is_err());
+        let expected = if writer {
+            SavedCommitError::WriterPoisoned
+        } else {
+            SavedCommitError::CachePoisoned
+        };
+        assert_eq!(
+            config.try_with_saved_commit_classified(|_| ()),
+            Err(expected)
+        );
+        assert!(config.try_with_saved_commit(|_| ()).is_err());
+    }
+}
+
+#[test]
+fn subscription_edit_publishes_owner_only_after_real_storage_success() {
+    use crate::runtime::subscription_refresh::SubscriptionRefreshAdmission;
+    let directory = temp_dir("subscription-edit-owner");
+    let config = ConfigManager::new(directory.clone());
+    let initial = config.current().unwrap();
+    config.save_full(&initial).unwrap();
+    let admission = SubscriptionRefreshAdmission::default();
+    let old = admission.try_admit("s").unwrap();
+    let old_token = old.token();
+    let moved = directory.path().with_extension("moved-for-save-failure");
+    let failed = config.update_subscription_edit(&admission, |cfg| {
+        cfg["logLevel"] = serde_json::json!("debug");
+        // Fail the actual writer after loading config, without root-dependent chmod behavior.
+        std::fs::rename(directory.path(), &moved).unwrap();
+        std::fs::write(directory.path(), b"not a directory").unwrap();
+        Decision::Write(((), Some("s".to_owned())))
+    });
+    std::fs::remove_file(directory.path()).unwrap();
+    std::fs::rename(&moved, directory.path()).unwrap();
+    assert!(failed.is_err());
+    assert!(
+        old_token.is_current(),
+        "failed save cannot cancel the previous fetch"
+    );
+    config
+        .update(|cfg| {
+            assert!(
+                old_token.is_current(),
+                "old response still owns its commit after failed edit"
+            );
+            cfg["logLevel"] = serde_json::json!("info");
+            Decision::Write(())
+        })
+        .unwrap();
+    let (_, saved, replacement) = config
+        .update_subscription_edit(&admission, |cfg| {
+            assert!(
+                old_token.is_current(),
+                "old owner remains valid before persistence"
+            );
+            cfg["logLevel"] = serde_json::json!("debug");
+            Decision::Write(((), Some("s".to_owned())))
+        })
+        .unwrap();
+    let replacement = replacement.unwrap();
+    assert!(saved.is_some());
+    assert!(!old_token.is_current());
+    assert!(replacement.token().is_current());
+    config
+        .update(|_| {
+            assert!(
+                !old_token.is_current(),
+                "old response cannot cross the writer after saved edit"
+            );
+            Decision::Skip(())
+        })
+        .unwrap();
+    drop(old);
+    assert!(replacement.token().is_current());
 }

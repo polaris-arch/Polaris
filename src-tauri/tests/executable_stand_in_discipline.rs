@@ -56,8 +56,14 @@ enum Kind {
 
 /// 既有命中的逐文件登记：`(文件, 判据, 数量, 为什么它不是「落替身再执行」)`。
 const REGISTERED: &[(&str, Kind, usize, &str)] = &[
+    ("crates/helper-client/src/manager/tests/mod.rs", Kind::Shebang, 2,
+     "Golden Linux installer/uninstaller generated script prefixes are asserted as strings only; these assertions neither create nor execute an executable stand-in."),
+    ("src-tauri/src/runtime/proxy/mesh_apply/artifact/tests/mod.rs", Kind::ExecBit, 1,
+        "FIFO replacement fixture sets only its private directory to 0700 before exercising the lstat/open boundary; no executable file is created"),
     ("src-tauri/src/runtime/core_identity/tests/mod.rs", Kind::ExecBit, 1,
         "FIFO fixture directory mode 0700 permits private traversal; no executable file is written"),
+    ("crates/helper/src/user_control/tests/mod.rs", Kind::ExecBit, 1,
+        "Only the private users/<identity> directory gets mode 0700; registration bytes stay nonexecutable and are only snapshotted/restored"),
     ("crates/helper/src/pinned_core/tests/mod.rs", Kind::ExecBit, 1,
         "Private root/source directories for inert content status fixtures"),
     ("crates/helper/src/core_objects/tests/mod.rs", Kind::ExecBit, 1,
@@ -85,8 +91,8 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
     (
         "crates/helper-client/src/manager/tests/mod.rs",
         Kind::ExecBit,
-        2,
-        "One private journal directory; one same-crate shared writer chmod after cp child closes target fd",
+        3,
+        "Private/unsafe journal directory modes for custody checks; one same-crate shared writer chmod after cp child closes target fd",
     ),
     (
         "crates/helper/src/platform/linux/handler/tests/mod.rs",
@@ -133,8 +139,8 @@ const REGISTERED: &[(&str, Kind, usize, &str)] = &[
     (
         "src-tauri/src/runtime/proxy/tests/startup.rs",
         Kind::Shebang,
-        5,
-        "两项只验路径解析/可执行权限；另三项是 TLS 证明的原文件、缓存压力文件与同长度替换文件，仅哈希/身份校验，Native 探测见 shebang 即拒绝执行",
+        9,
+        "两项路径/权限、三项 TLS 身份及四项 startup proof/captured custody/replacement 身份夹具。后七项只取哈希/身份，Native probe 识别 shebang 后拒绝执行；并非可运行的假内核",
     ),
     (
         "src-tauri/src/runtime/proxy/tests/startup.rs",

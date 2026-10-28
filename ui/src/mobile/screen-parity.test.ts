@@ -312,7 +312,15 @@ function actionElementsOf(body: string): { tag: string; seg: string; index: numb
     if (tagEnd === -1) continue;
     const tag = body.slice(start, tagEnd + 1);
     const name = m[1]!;
-    if (name !== 'button' && !/\bonClick=/.test(tag) && !ACTION_ROLE.test(tag)) continue;
+    // JSX-valued props can contain child actions; those belong to the nested tags,
+    // not to this presenter. Preserve top-level attribute names, mask their values.
+    let attrDepth = 0;
+    const ownAttributes = [...tag].map(c => {
+      if (c === '{') { attrDepth += 1; return '{'; }
+      if (c === '}') { attrDepth -= 1; return '}'; }
+      return attrDepth > 0 ? ' ' : c;
+    }).join('');
+    if (name !== 'button' && !/\bonClick=/.test(ownAttributes) && !ACTION_ROLE.test(ownAttributes)) continue;
     out.push({ tag: tag.replace(/\s+/g, ' '), seg: elementBody(body, name, start, tagEnd), index: start });
   }
   return out;
@@ -1043,7 +1051,8 @@ describe('⓪ 自检：四个取材面都是活的，且判据没被自己污染
     // Sharing the measurement implementation across desktop/mobile does not make
     // its owned status/path copy a common-only primitive.
     expect(screenKeysOf('ui/src/mobile/MeasurementLabel.tsx')).toEqual([
-      'measurement.nodePath', 'measurement.unavailable',
+      'measurement.expiredHint', 'measurement.nodePath', 'measurement.unavailable',
+      'nodes.invalidVisionTransport', 'nodes.nodeInvalid',
     ]);
     expect(HOME_PARITY.extraBlockSources).toContain('ui/src/mobile/MeasurementLabel.tsx');
     expect(HOME_PARITY.sharedPrimitives).not.toContain('ui/src/mobile/MeasurementLabel.tsx');
@@ -1716,4 +1725,46 @@ describe('⑦ 判词纪律：理由不许是排期，缺席理由键必须真的
       ).toBe(true);
     }
   });
+});
+
+
+
+it('JSX action slots expose their real buttons, not a synthetic presenter action', () => {
+  const source = `<FeedbackNotice title={t('helper.installFail')} actions={<><Button onClick={stopAndUpgrade}>{t('helper.stopAndUpgradeAction')}</Button><Button onClick={() => navigate('logs')}>{t('helper.viewLogsAction')}</Button></>} />`;
+  expect(actionElementsOf(source).map(actionId)).toEqual(['k:helper.stopAndUpgradeAction', 'k:helper.viewLogsAction']);
+  expect(actionElementsOf(`<span role="switch" onClick={toggle}>{t('toggle')}</span>`).map(actionId)).toEqual(['k:toggle']);
+  expect(actionElementsOf(`<Widget onClick={() => invoke('action')} />`)).toHaveLength(1);
+});
+
+
+it('render-slot content evidence remains checked separately from actual actions', () => {
+  // Former container entries remain content checks, not extra clickable controls.
+  for (const evidence of [
+    { file: "src-tauri/src/commands/coexistence_snapshot.rs", mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' },
+    { file: "ui/src/mobile/settings/TunReports.tsx", mustContain: "t('settings.tun.forceRouteLoading')" },
+    { file: "ui/src/mobile/settings/TunReports.tsx", mustContain: 'className="ms-force-refresh" onClick={onRefresh} disabled={loading}' },
+    { file: "ui/src/mobile/settings/DnsPage.tsx", mustContain: 'toggleFakeIp' },
+    { file: "ui/src/mobile/screens/rules/RulesScreen.tsx", mustContain: "if (page === 'network-profiles') {" },
+    { file: "ui/src/mobile/screens/rules/NetworkProfilesPage.tsx", mustContain: "{t('mobileRules.networkProfile.intro')}" },
+    { file: "ui/src/mobile/forms/NetworkProfileFormPanel.tsx", mustContain: 'if (cfg.config === null) {' },
+    { file: "ui/src/mobile/forms/NetworkProfileFormPanel.tsx", mustContain: 'function ProfileForm(' },
+    { file: "ui/src/mobile/forms/NetworkProfileFormPanel.tsx", mustContain: 'if (profileId && !base) {' },
+    { file: "ui/src/mobile/forms/NetworkProfileFormPanel.tsx", mustContain: "{t('rules.networkProfile.missing')}" },
+  ]) expect(readFileSync(join(REPO, evidence.file), 'utf8')).toContain(evidence.mustContain);
+});
+
+it('actual render-slot producers retain nested controls without counting their containers', () => {
+  const cases = [
+    { file: 'components/screens/rules/NetworkProfilePanel.tsx', containers: ['Modal', 'ConfigShell'], controls: ['k:common.close', 'k:rules.networkProfile.add'] },
+    { file: 'components/screens/settings/CoexWindowsSources.tsx', containers: ['Field'], controls: ['k:settings.coex.previous', 'k:settings.coex.next'] },
+    { file: 'components/screens/settings/MeshRouteEvidenceBlock.tsx', containers: ['SetBlock'], controls: ['k:common.refresh'] },
+    { file: 'components/screens/settings/EndpointForceRouteBlock.tsx', containers: ['SetBlock'], controls: ['k:common.refresh+settings.tun.forceRouteLoading'] },
+    { file: 'components/screens/settings/SettingsTun.tsx', containers: ['SetRow'], controls: ['k:settings.network.enableFakeIpAction'] },
+  ];
+  for (const example of cases) {
+    const source = strip(readFileSync(join(UI_SRC, example.file), 'utf8'));
+    const actions = actionElementsOf(source);
+    for (const container of example.containers) expect(actions.filter(action => action.tag.startsWith(`<${container} `)), example.file).toEqual([]);
+    for (const control of example.controls) expect(actions.map(actionId), example.file).toContain(control);
+  }
 });

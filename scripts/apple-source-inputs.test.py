@@ -24,9 +24,9 @@ def load(name, filename):
 collector = load('c2_pure_collector', 'apple-source-inputs.py')
 builder = load('c2_pure_builder', 'ios-libbox.py')
 helper = builder.source_helpers()
-# The old C2 producer's frozen CONSUMERS policy is retained. Pure source/tool
-# controls use an explicit fixture projection of this candidate's App bytes;
-# this cannot approve an alpha8 framework for the new formal App entry.
+# C2 retains its historical source policy and receipt identity. CONSUMERS pins
+# current App source bytes; pure source/tool controls use an explicit fixture
+# projection, not generated ABI or alpha8/current formal App acceptance.
 collector.CONSUMERS = {name: helper.file_hash(collector.ROOT / 'src-tauri/gen/apple/PacketTunnel' / name)
                       for name in collector.CONSUMERS}
 COUNT = 0
@@ -226,6 +226,8 @@ def observer_mocks(root, failure=None):
             if failure == 'graph':rows.pop()
             output = '\n'.join(json.dumps(row) for row in rows)
         elif argv[1] == '-typecheck':
+            check(Path(argv[-1]).name == 'abi-witness.swift' and Path(argv[-1]).read_text() == collector.witness(),
+                  'existing importer command receives the exact rendered Swift witness')
             if failure == 'swift':code, error_output = 1, 'fixture real-consumer conformance failure'
             if failure == 'tool-drift':Path(tools['go']['path']).write_text('changed fixture tool')
             if failure == 'sdk-drift':(Path(tools['iphoneos']['path']) / 'sdk.h').write_text('changed fixture SDK')
@@ -449,6 +451,16 @@ def pure_tests():
     rejected(lambda: collector.render_headers(TEMPLATES.replace('appleModuleMapTmpl', 'missingMap')), 'template missing')
     rejected(lambda: collector.render_headers(TEMPLATES.replace('export *', '{{unknown}}')), 'unsupported')
     check(all('result.get' + getter + '()' in collector.witness() for getter in collector.GETTERS), 'finite Swift witness getters')
+    witness = collector.witness()
+    check('_ server: LibboxCommandServer' in witness and
+          '_ persistence: LibboxRuntimePersistenceHandlerProtocol' in witness,
+          'Swift witness keeps the generated HOT receiver and handler protocol')
+    check('try server.startOrReloadService(withRetryableRuntimePersistence: "{}", options: LibboxOverrideOptions(), handler: persistence)' in witness,
+          'Swift witness uses the imported retryable label and exact argument order')
+    check('let _: String = server.runtimeCapabilities(&error)' in witness,
+          'Swift witness retains generated nonnull String and NSError pointer convention')
+    check('startOrReloadServiceWith' not in witness and 'startOrReloadService("{}"' not in witness,
+          'Swift witness cannot use the ObjC spelling or ordinary nonretryable start')
     with tempfile.TemporaryDirectory(prefix='polaris-c2-pure-') as temp:
         root = Path(temp)
         fixture = graph_fixture(root)

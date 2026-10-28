@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { TESTS, selectExecutable, runtimeEnvironment, exactPass, runTests } from './run-native-dns-controlled-tests.mjs';
+import { TESTS, SOURCE_TESTS, BOOTSTRAP_TESTS, contractGroups, runContractTests, selectExecutable, runtimeEnvironment, exactPass, runTests, confirmedCleanup, preserveProductionGraph } from './run-native-dns-controlled-tests.mjs';
 
 test('only this invocation’s exact package/library test artifact is selectable', () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'controlled-artifact-')));
@@ -16,9 +17,10 @@ test('only this invocation’s exact package/library test artifact is selectable
     const metadata = { target_directory: join(root, 'target'), packages: [
       { id: 'current-polaris-id', name: 'polaris', manifest_path: join(root, 'src-tauri/Cargo.toml'), targets: [target] },
     ] };
-    const row = { reason: 'compiler-artifact', package_id: 'current-polaris-id', profile: { test: true }, target, executable: exe };
+    const row = { reason: 'compiler-artifact', package_id: 'current-polaris-id', profile: { test: true }, features: [], target, executable: exe };
     assert.equal(selectExecutable([row], metadata, root).executable, exe);
     for (const patch of [{ package_id: 'other' }, { profile: { test: false } }, { executable: null },
+      { features: undefined }, { features: ['default', 'default'] }, { features: [null] },
       { target: { ...target, kind: ['bin'] } }, { target: { ...target, src_path: '/wrong/lib.rs' } }])
       assert.throws(() => selectExecutable([{ ...row, ...patch }], metadata, root));
     assert.throws(() => selectExecutable([], metadata, root));
@@ -70,37 +72,172 @@ test('exact one-test verdict rejects zero, ignored, failed, duplicated and inter
   const names = [...workflow.matchAll(/^            (runtime::[^\s]+)$/gm)].map((m) => m[1]);
   assert.deepEqual(names, TESTS);
   const runner = readFileSync(new URL('./run-native-dns-controlled-tests.mjs', import.meta.url), 'utf8');
-  assert.equal((runner.match(/'--no-run'/g) ?? []).length, 1);
+  assert.equal((runner.match(/'--no-run'/g) ?? []).length, 2);
   assert.match(runner, /root: dirname\(selected.manifest\)/);
-  assert.equal((runner.match(/hash\(selected.executable\) === digest/g) ?? []).length, 2);
+  for (const [start, end] of [['export async function runTests(', 'export function contractGroups('], ['export async function runContractTests(', 'async function runContractSuite(']]) {
+    const body = runner.slice(runner.indexOf(start), runner.indexOf(end));
+    assert.equal((body.match(/hash\(selected.executable\) === digest/g) ?? []).length, 2);
+  }
 });
 
-test('six exact processes retain package cwd, fail immediately and reject executable drift', async () => {
+const syntheticCleanup = (name, processId = 70) => ({
+  schema: 'polaris-controlled-cleanup-v1', testName: name, processId, generation: 3,
+  shutdownFenced: true, publicationEligible: false,
+  custody: { state: 'empty-after-shutdown-fence', runRef: null, corePid: null },
+});
+const syntheticGraph = () => {
+  const configJson = JSON.stringify({ services: [{ type: 'api', dashboard: { path: '/synthetic/dashboard' } }],
+    inbounds: [{ type: 'mixed', listen: '127.0.0.1' }], outbounds: [{ type: 'direct' }] });
+  return { schema: 'polaris-controlled-production-graph-v1', processId: 70, stage: 'initial-start',
+    startSucceeded: true, source: 'actual-runtime-config-path', dashboardEnabled: true,
+    dashboardPath: '/synthetic/dashboard', bytes: Buffer.byteLength(configJson),
+    sha256: createHash('sha256').update(configJson).digest('hex'), configJson, publicationEligible: false };
+};
+const syntheticResult = (name, failed = false) => ({
+  status: failed ? 1 : 0, processId: 70,
+  output: `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(syntheticCleanup(name))}\n`
+    + (name === TESTS[2] ? `POLARIS_DEFAULT_GRAPH ${JSON.stringify(syntheticGraph())}\n` : '')
+    + `test result: ${failed ? 'FAILED. 0 passed; 1 failed' : 'ok. 1 passed; 0 failed'}; 0 ignored;\n`,
+});
+
+test('six exact isolated cases aggregate ordinary failures only after positive owned-child cleanup', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'controlled-processes-')));
   try {
     const executable = join(root, 'fixture'), manifest = join(root, 'Cargo.toml');
     writeFileSync(executable, 'original');
     const selected = { executable, manifest };
-    let calls = [];
-    const execute = async (command, options) => {
-      calls.push(command);
-      assert.equal(options.root, root); assert.equal(options.env.FROZEN, 'yes');
-      return { status: 0, output: 'test result: ok. 1 passed; 0 failed; 0 ignored;\n' };
-    };
-    await runTests(selected, { FROZEN: 'yes' }, root, execute);
-    assert.deepEqual(calls.map((c) => c.args[0]), TESTS);
-    assert.ok(calls.every((c) => c.program === executable && c.args.slice(1).join(' ') === '--exact --ignored --nocapture --test-threads=1'));
-    for (const mode of ['zero', 'failure', 'drift']) {
-      calls = [];
+    for (const mode of ['pass', 'ordinary-failure', 'zero', 'unknown-cleanup', 'cleanup-failure', 'wrong-pid', 'wrong-test', 'drift']) {
+      const directory = join(root, mode); mkdirSync(directory);
+      const calls = [];
       writeFileSync(executable, 'original');
-      await assert.rejects(runTests(selected, { FROZEN: 'yes' }, root, async (...args) => {
-        const result = await execute(...args);
-        if (mode === 'zero') result.output = 'test result: ok. 0 passed; 0 failed; 0 ignored;';
-        if (mode === 'failure') result.status = 1;
+      const run = runTests(selected, { FROZEN: 'yes' }, directory, async (command, options) => {
+        calls.push(command);
+        assert.equal(options.root, root); assert.equal(options.env.FROZEN, 'yes');
+        const name = command.args[0], result = syntheticResult(name, mode === 'ordinary-failure');
+        if (mode === 'zero') result.output = result.output.replace('1 passed', '0 passed');
+        if (mode === 'unknown-cleanup') { result.status = 1; result.output = 'test result: FAILED. 0 passed; 1 failed; 0 ignored;\n'; }
+        if (mode === 'cleanup-failure') result.cleanupUncertain = true;
+        if (mode === 'wrong-pid') result.processId = 71;
+        if (mode === 'wrong-test') result.output = result.output.replace(name, TESTS[1]);
         if (mode === 'drift') writeFileSync(executable, 'different bytes');
         return result;
-      }));
-      assert.equal(calls.length, 1, 'failed test or byte drift must stop later invocations');
+      });
+      if (mode === 'pass') await run; else await assert.rejects(run);
+      assert.equal(calls.length, ['pass', 'ordinary-failure'].includes(mode) ? 6 : 1);
+      assert.ok(calls.every((c) => c.program === executable && c.args.slice(1).join(' ') === '--exact --ignored --nocapture --test-threads=1'));
+      if (calls.length === 6) assert.deepEqual(calls.map((c) => c.args[0]), TESTS);
+      if (mode === 'ordinary-failure') assert.equal((readFileSync(join(directory, 'runtime-status.txt'), 'utf8').match(/cleanup confirmed/g) ?? []).length, 6);
     }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('cleanup requires one affirmative current-process/current-test original-custody record', () => {
+  const name = TESTS[0], valid = syntheticResult(name, true);
+  assert.equal(confirmedCleanup(valid, name), true);
+  for (const patch of [{ processId: null }, { timedOut: true }, { interrupted: true }, { error: 'spawn' },
+    { status: null }, { output: valid.output + valid.output }, { output: '' }, { cleanupUncertain: true }]) {
+    assert.equal(confirmedCleanup({ ...valid, ...patch }, name), false);
+  }
+  for (const patch of [{ shutdownFenced: false }, { generation: -1 }, { publicationEligible: true },
+    { testName: TESTS[1] }, { processId: 71 }, { custody: { state: 'unknown' } }]) {
+    const output = `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify({ ...syntheticCleanup(name), ...patch })}\n`;
+    assert.equal(confirmedCleanup({ ...valid, output }, name), false);
+  }
+  for (const state of ['retained-child-exit-observed', 'emergency-owned-child-reaped']) {
+    const record = syntheticCleanup(name);
+    record.custody = { state, runRef: 'direct-00000000-0000-0000-0000-000000000001', corePid: 81 };
+    const result = { ...valid, output: `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(record)}\n` };
+    assert.equal(confirmedCleanup(result, name), true);
+    record.custody.runRef = 'rediscovered-by-name';
+    assert.equal(confirmedCleanup({ ...valid, output: `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(record)}\n` }, name), false);
+  }
+});
+
+test('default graph stores exact generator bytes, never reconstructs or accepts mismatched evidence', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'controlled-graph-')));
+  try {
+    const result = syntheticResult(TESTS[2]);
+    assert.equal(preserveProductionGraph(result, TESTS[2], root, 'a'.repeat(64)), true);
+    const raw = readFileSync(join(root, 'default-production-graph.json'));
+    assert.equal(raw.toString('utf8'), syntheticGraph().configJson);
+    assert.equal(createHash('sha256').update(raw).digest('hex'), syntheticGraph().sha256);
+    assert.throws(() => preserveProductionGraph(result, TESTS[2], root, 'a'.repeat(64)), /EEXIST/);
+    assert.deepEqual(readFileSync(join(root, 'default-production-graph.json')), raw);
+    const rejectedBeforeWrite = (bad, name = TESTS[2]) => {
+      // Fresh destination: a late EEXIST must never feed a broken admission gate green.
+      const empty = mkdtempSync(join(root, 'negative-'));
+      assert.throws(() => preserveProductionGraph(bad, name, empty, 'a'.repeat(64)));
+      assert.deepEqual(readdirSync(empty), []);
+    };
+    for (const patch of [{ processId: 71 }, { bytes: 1 }, { sha256: '0'.repeat(64) },
+      { dashboardEnabled: false }, { source: 'reconstructed' }, { publicationEligible: true },
+      { configJson: '{}' }, { dashboardPath: '/other' }]) {
+      const output = `POLARIS_DEFAULT_GRAPH ${JSON.stringify({ ...syntheticGraph(), ...patch })}\n`;
+      rejectedBeforeWrite({ ...result, output });
+    }
+    rejectedBeforeWrite({ ...result, output: result.output + result.output });
+    rejectedBeforeWrite(result, TESTS[0]);
+    for (const mutate of [(g) => { g.services = []; }, (g) => { g.inbounds[0].listen = '0.0.0.0'; },
+      (g) => { g.inbounds[0].type = 'tun'; }]) {
+      const graph = JSON.parse(syntheticGraph().configJson); mutate(graph);
+      const configJson = JSON.stringify(graph), bytes = Buffer.from(configJson);
+      const row = { ...syntheticGraph(), configJson, bytes: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex') };
+      rejectedBeforeWrite({ ...result, output: `POLARIS_DEFAULT_GRAPH ${JSON.stringify(row)}\n` });
+    }
+    assert.equal(preserveProductionGraph({ ...result, output: '' }, TESTS[2], root, 'a'.repeat(64)), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test('ordinary source suites retain thirty unique reviewed names and build groups', () => {
+  assert.equal(BOOTSTRAP_TESTS.length, 2); assert.equal(SOURCE_TESTS.length, 28);
+  assert.equal(new Set([...BOOTSTRAP_TESTS, ...SOURCE_TESTS]).size, 30);
+  assert.equal(contractGroups(BOOTSTRAP_TESTS).size, 1); assert.equal(contractGroups(SOURCE_TESTS).size, 4);
+  assert.throws(() => contractGroups([...SOURCE_TESTS]));
+  const wf = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  assert.equal((wf.match(/run-native-dns-controlled-tests.mjs --bootstrap-contracts/g) ?? []).length, 1);
+  assert.equal((wf.match(/run-native-dns-controlled-tests.mjs --source-contracts/g) ?? []).length, 1);
+});
+
+test('ordinary exact execution keeps per-test one-pass and immutable binary boundaries without replay', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'ordinary-contract-')));
+  try {
+    const executable = join(root, 'inert-fixture'), manifest = join(root, 'Cargo.toml');
+    for (const mode of ['pass', 'zero', 'duplicate', 'failed', 'timeout', 'cleanup', 'drift']) {
+      writeFileSync(executable, 'original'); const calls = [];
+      const execute = async (command, options) => {
+        calls.push(command); assert.equal(options.root, root); assert.equal(options.timeout, 20 * 60_000);
+        const row = { status: 0, output: 'test result: ok. 1 passed; 0 failed; 0 ignored;\n' };
+        if (mode === 'zero') row.output = row.output.replace('1 passed', '0 passed');
+        if (mode === 'duplicate') row.output += row.output;
+        if (mode === 'failed') row.status = 1;
+        if (mode === 'timeout') row.timedOut = true;
+        if (mode === 'cleanup') row.cleanupUncertain = true;
+        if (mode === 'drift') writeFileSync(executable, 'changed');
+        return row;
+      };
+      const action = () => runContractTests({ executable, manifest }, ['module::one', 'module::two'], {}, root, execute);
+      if (mode === 'pass') { await action(); assert.equal(calls.length, 2); }
+      else { await assert.rejects(action); assert.equal(calls.length, 1); }
+      for (const call of calls) assert.deepEqual(call.args.slice(1), ['--exact', '--nocapture', '--test-threads=1']);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('ordinary package artifact selection rejects another package, wrong manifest and multiple library outputs', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'ordinary-artifact-')));
+  try {
+    mkdirSync(join(root, 'target/debug'), { recursive: true });
+    const executable = join(root, 'target/debug/store-test'); writeFileSync(executable, 'inert');
+    const target = { name: 'polaris_store', kind: ['lib'], src_path: join(root, 'crates/store/src/lib.rs') };
+    const pkg = { id: 'store-id', name: 'polaris-store', manifest_path: join(root, 'crates/store/Cargo.toml'), targets: [target] };
+    const metadata = { packages: [pkg], target_directory: join(root, 'target') };
+    const row = { reason: 'compiler-artifact', package_id: pkg.id, profile: { test: true }, features: [], target, executable };
+    assert.equal(selectExecutable([row], metadata, root, 'polaris-store').packageId, pkg.id);
+    assert.throws(() => selectExecutable([], metadata, root, 'polaris-store'));
+    assert.throws(() => selectExecutable([row, row], metadata, root, 'polaris-store'));
+    assert.throws(() => selectExecutable([row], { ...metadata, packages: [{ ...pkg, manifest_path: join(root, 'other/Cargo.toml') }] }, root, 'polaris-store'));
+    assert.throws(() => selectExecutable([row], metadata, root, 'arbitrary-package'));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

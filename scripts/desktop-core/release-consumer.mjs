@@ -42,6 +42,7 @@ export const ADAPTER_FILES = ['scripts/desktop-core/native-dns-candidate.mjs', '
   'scripts/desktop-core/native-dns-gates.mjs',
   'scripts/desktop-core/release-consumer.mjs', 'scripts/desktop-core/upstream-release.mjs', 'scripts/desktop-core/release-archive.py', 'scripts/mobile-core/source_policy.py',
   'scripts/desktop-core/wire-input-handoff.mjs',
+  'scripts/lib/polaris-version.json',
   'scripts/prepare-core-identity.mjs', 'scripts/lib/core-identity.mjs',
   'scripts/postprocess-appimage.mjs', 'src-tauri/build.rs',
   'src-tauri/src/runtime/core_identity.rs', 'src-tauri/src/runtime/helper.rs',
@@ -832,10 +833,11 @@ export async function consumeRelease(root, manifest, keys = Object.keys(RELEASE_
     if (isUpstreamRelease(contract)) {
       sourceArchive = await read(contract.sourceArchive.url, contract.sourceArchive.bytes, true);
       demand(sourceArchive.length === contract.sourceArchive.bytes && digest(sourceArchive) === contract.sourceArchive.sha256, 'Downloaded complete source archive differs');
+      // loadReleaseContract already checks legal content; send pins, then reprove tar bytes.
       const sourceFile = join(work, contract.sourceArchive.name); writeFileSync(sourceFile, sourceArchive, { flag: 'wx' });
-      run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), sourceFile],
+      run(process.platform === 'win32' ? 'python' : 'python3', ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), sourceFile, '--source-legal-pins'],
         { input: JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
-          sourceTree: contract.sourceTree, sourceGitlinks: before.sourceGitlinks, legalFiles: contract.legalFiles, sourceIdentity: contract.platforms.linux.sourceIdentity,
+          sourceTree: contract.sourceTree, sourceGitlinks: before.sourceGitlinks, legalFiles: contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), sourceIdentity: contract.platforms.linux.sourceIdentity,
           buildReplacements: Object.values(contract.platforms).flatMap((r) => r.buildGraph.localReplacements),
           ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }), encoding: 'utf8', maxBuffer: 1024 * 1024 });
     }
@@ -944,12 +946,13 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
       && (lstatSync(original).mode & 0o7777) === (lstatSync(final).mode & 0o7777), 'Final release notice permissions differ');
   }
   if (isUpstreamRelease(contract)) {
+    // The validated contract binds legal content to these pins; Python still checks actual tar bytes.
     const started = performance.now();
     try {
       run(process.platform === 'win32' ? 'python' : 'python3',
-        ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), join(dirname(core), 'core-release/source', contract.sourceArchive.name)],
+        ['-B', join(dirname(fileURLToPath(import.meta.url)), 'release-archive.py'), join(dirname(core), 'core-release/source', contract.sourceArchive.name), '--source-legal-pins'],
         { input: JSON.stringify({ sourceArchive: contract.sourceArchive, sourceCommit: contract.sourceCommit,
-          sourceTree: contract.sourceTree, sourceGitlinks: snapshot.sourceGitlinks, legalFiles: contract.legalFiles, sourceIdentity: row.sourceIdentity,
+          sourceTree: contract.sourceTree, sourceGitlinks: snapshot.sourceGitlinks, legalFiles: contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })), sourceIdentity: row.sourceIdentity,
           buildReplacements: row.buildGraph.localReplacements, ...(contract.sourcePolicy ? { sourcePolicy: contract.sourcePolicy } : {}) }),
           encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: LOCAL_ARCHIVE_TIMEOUT_MS, killSignal: 'SIGKILL' });
     } catch (error) {

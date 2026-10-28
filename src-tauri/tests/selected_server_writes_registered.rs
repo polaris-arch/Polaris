@@ -64,6 +64,8 @@ const KEY_ALIASES: &[&str] = &[];
 enum Class {
     /// 用户显式选了出口。写入方必须在同一次写里处置选择意图（清掉，或显式路径明确保留）。
     User,
+    /// 用户明确操作原生 Auto：选择 scope 或切换模式，同一 CAS writer 处置意图与真实出口 seed。
+    UserAuto,
     /// 系统代选：故障切换、自动选择、删除或刷新之后的兜底。不得清意图。
     System,
     /// 系统代选，且同一个函数里确有对意图键的处置（说明里写明是什么、为什么）。
@@ -79,6 +81,23 @@ type Site = (Class, &'static str, &'static str);
 
 /// 登记表：文件 → 按出现顺序逐处的登记。
 const WRITES: &[(&str, &[Site])] = &[
+    (
+        "src-tauri/src/runtime/proxy/native_auto.rs",
+        &[
+            (Class::UserAuto, "native_auto_set_enabled",
+             "用户关闭 Auto：冻结已观测实际出口并清 Auto 意图，next 经同一 generation/intent/config CAS writer 落盘，不是系统代选"),
+            (Class::UserAuto, "native_auto_set_enabled",
+             "核未运行时用户关闭 Auto：沿已验证 eligible 的原 pin 冻结 default 并清选择意图，next 经同一 CAS writer 落盘"),
+            (Class::Projection, "native_auto_set_enabled",
+             "CAS 成功后已接受 pin 和模式投影到运行内存，不另写磁盘或重选出口"),
+            (Class::UserAuto, "native_auto_select_default",
+             "用户明确选择Auto scope，CAS写入意图与当前eligible真实出口seed，不运行App竞速"),
+            (Class::Projection, "native_auto_select_default",
+             "已接受的选择及真实seed投影到当前运行配置副本"),
+            (Class::Projection, "native_auto_select_default",
+             "运行配置缺选择时显式Null，只作投影，不编造真实出口"),
+        ],
+    ),
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         &[(
@@ -212,6 +231,11 @@ const WRITES: &[(&str, &[Site])] = &[
         &[
             (
                 Class::Projection,
+                "copy_selection_projection",
+                "将已准备选择的 selectedServerId/selectionIntent 一同复制或移除到运行快照，不独立选择出口",
+            ),
+            (
+                Class::Projection,
                 "switch_selected_server_if_current",
                 "把已落盘的显式选择投到运行态副本",
             ),
@@ -225,16 +249,9 @@ const WRITES: &[(&str, &[Site])] = &[
                 "reconcile_persisted_selector_with_api",
                 "对账用的运行态副本",
             ),
-            (
-                Class::Projection,
-                "commit_selected_projection",
-                "已排程的重启快照里刷新出口",
-            ),
-            (
-                Class::Projection,
-                "restart_selected_projection",
-                "已排程的重启快照里刷新出口",
-            ),
+            // commit_selected_projection publishes a prepared whole config;
+            // defer_selected_projection only marks pending. Neither writes this key.
+            // The constructing write sites above remain registered independently.
         ],
     ),
 ];
@@ -335,6 +352,11 @@ fn starts_assignment(rest: &str) -> bool {
 /// 键（带引号的字面量，或它的常量别名）的一处出现属于哪种形态。`before` / `after` 是它前后
 /// 的代码（已去掉相邻空白）。
 fn shape_of_key(before: &str, after: &str) -> Shape {
+    // Exact finite key loop used by copy_selection_projection. Classify it as a
+    // write owner (never OTHER/read); renamed or new loop shapes remain unknown.
+    if before.ends_with("for key in [") && after.starts_with(',') {
+        return Shape::Write;
+    }
     if ends_with_call(before, "insert")
         || ends_with_call(before, "remove")
         || ends_with_set_call(before)
@@ -614,6 +636,11 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
                      登记已过期，改回 System。",
                     write.line
                 ),
+                Class::UserAuto => assert!(
+                    write.touches_intent,
+                    "{path}:{}: explicit native Auto writer must settle selection intent in the same function",
+                    write.line
+                ),
                 Class::User | Class::Restore | Class::Projection => {}
             }
         }
@@ -647,6 +674,7 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
         .collect();
     for class in [
         Class::User,
+        Class::UserAuto,
         Class::System,
         Class::SystemTouchingIntent,
         Class::Restore,
@@ -660,7 +688,32 @@ fn every_write_of_the_selected_server_is_registered_with_its_class_and_function(
             .filter(|class| **class == Class::User)
             .count(),
         1,
-        "用户显式选择只应有一个落盘点；多出一个就多一处要记得处置意图的地方"
+        "既有手动选择只应有一个落盘点；原生Auto scope另有精确登记"
+    );
+    let user_auto: Vec<(&str, &str)> = WRITES
+        .iter()
+        .flat_map(|(path, sites)| {
+            sites.iter().filter_map(move |(class, function, _)| {
+                (*class == Class::UserAuto).then_some((*path, *function))
+            })
+        })
+        .collect();
+    assert_eq!(
+        user_auto,
+        vec![
+            (
+                "src-tauri/src/runtime/proxy/native_auto.rs",
+                "native_auto_set_enabled"
+            ),
+            (
+                "src-tauri/src/runtime/proxy/native_auto.rs",
+                "native_auto_set_enabled"
+            ),
+            (
+                "src-tauri/src/runtime/proxy/native_auto.rs",
+                "native_auto_select_default"
+            ),
+        ]
     );
 }
 
@@ -947,5 +1000,123 @@ fn native_code_never_touches_the_selected_server() {
         seen_roots.into_iter().collect::<Vec<_>>(),
         NATIVE_ROOTS.to_vec(),
         "登记的原生源码目录里有的已经没有源码了"
+    );
+}
+
+#[test]
+fn finite_selection_projection_loop_is_a_registered_write_owner() {
+    let source = r#"fn copy_selection_projection(destination: &mut Value, source: &Value) {
+        for key in ["selectedServerId", "selectionIntent"] {
+            if let Some(value) = source.get(key) {
+                destination.as_object_mut().unwrap().insert(key.into(), value.clone());
+            }
+        }
+    }"#;
+    let (writes, unknown) = scan(source);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].function, "copy_selection_projection");
+    assert!(writes[0].touches_intent);
+    assert_eq!(unknown, 0);
+    let changed = source.replace("for key in", "for field in");
+    assert_eq!(
+        scan(&changed).1,
+        1,
+        "unrecognized dynamic key loops must not be treated as reads"
+    );
+}
+
+/// Recognize the already-existing native Auto transaction, not a permissive writer count.
+fn native_auto_transaction_is_guarded(body: &str) -> bool {
+    let code = mask_comments(body);
+    let bare = mask_comments_and_strings(body);
+    let anchor = ".update(|latest| {";
+    if bare.matches(anchor).count() != 1 {
+        return false;
+    }
+    let start = bare.find(anchor).unwrap();
+    let range = fn_span(&bare, start);
+    let closure_code = &code[range.clone()];
+    let closure_bare = &bare[range];
+    let compact: String = closure_bare
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let seed_head = "if let Some(seed) = &seed {";
+    if closure_bare.matches(seed_head).count() != 1 {
+        return false;
+    }
+    let seed_range = fn_span(closure_bare, closure_bare.find(seed_head).unwrap());
+    let seed_code: String = closure_code[seed_range]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if seed_code != "ifletSome(seed)=&seed{latest[\"selectedServerId\"]=json!(seed);}" {
+        return false;
+    }
+    let guard = "if*latest!=saved||self.core_generation()!=started_generation||self.core_running()!=started_running||self.selector_reconcile.intent_generation()!=started_intent{returnDecision::Skip(None);}";
+    let intent = "latest[polaris_store::SELECTION_INTENT_KEY]=intent.clone();";
+    let seed = "ifletSome(seed)=&seed{latest[]=json!(seed);}";
+    let commit = "Decision::Write(Some(self.register_selector_intent()))";
+    let positions: Option<Vec<usize>> = [guard, intent, seed, commit]
+        .iter()
+        .map(|part| (compact.matches(part).count() == 1).then(|| compact.find(part).unwrap()))
+        .collect();
+    positions.is_some_and(|positions| positions.windows(2).all(|pair| pair[0] < pair[1]))
+}
+
+#[test]
+fn explicit_native_auto_seed_and_intent_share_the_guarded_writer() {
+    let source = polaris_source_probe::crate_source_in(
+        env!("CARGO_MANIFEST_DIR"),
+        "runtime/proxy/native_auto.rs",
+    );
+    let code = mask_comments(&source);
+    let bare = mask_comments_and_strings(&source);
+    let signature = "pub(crate) async fn native_auto_select_default(";
+    assert_eq!(bare.matches(signature).count(), 1);
+    let body = &code[fn_span(&bare, bare.find(signature).unwrap())];
+    assert!(native_auto_transaction_is_guarded(body));
+    let body_bare = mask_comments_and_strings(body);
+    let guard_range = fn_span(&body_bare, body_bare.find("if *latest != saved").unwrap());
+    let guard_text = &body[guard_range.clone()];
+    let fake_guard = format!("let _ = {:?};", guard_text);
+    let mut forged = body.to_owned();
+    forged.replace_range(guard_range, &fake_guard);
+    assert!(
+        !native_auto_transaction_is_guarded(&forged),
+        "string text cannot replace the live CAS guard"
+    );
+    let compact: String = body_bare.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("letseed=ifself.core_running(){self.native_auto_status().await.actual_server_id.filter(|id|model::eligible_members(&typed,&target).contains(id))}else{None};"));
+    for (old, replacement) in [
+        (
+            "latest[polaris_store::SELECTION_INTENT_KEY] = intent.clone();",
+            "",
+        ),
+        ("latest[\"selectedServerId\"] = json!(seed);", ""),
+        ("self.core_generation() != started_generation", "false"),
+        ("self.core_running() != started_running", "false"),
+        (
+            "self.selector_reconcile.intent_generation() != started_intent",
+            "false",
+        ),
+        ("return Decision::Skip(None);", "record(None);"),
+    ] {
+        assert!(body.contains(old), "mutation anchor {old}");
+        assert!(
+            !native_auto_transaction_is_guarded(&body.replacen(old, replacement, 1)),
+            "{old}"
+        );
+    }
+    let outside = body.replacen(
+        "latest[polaris_store::SELECTION_INTENT_KEY] = intent.clone();",
+        "",
+        1,
+    );
+    let outside =
+        format!("latest[polaris_store::SELECTION_INTENT_KEY] = intent.clone();\n{outside}");
+    assert!(
+        !native_auto_transaction_is_guarded(&outside),
+        "intent before the writer does not qualify"
     );
 }

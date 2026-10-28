@@ -542,6 +542,11 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   'scripts/release-assets.mjs': {
     why: 'Android 正式三包构建与聚合直接消费资产名、实际 ABI 集合及已验签字节摘要判据，须重验 APK 来源、内容与发布清单。',
   },
+  'src-tauri/src/runtime/proxy/android_bridge/lifecycle_observation.rs': {
+    why: 'Native Android lifecycle availability observations compile into the APK Rust cdylib. '
+      + 'The actual Android-minus-host dep-info confirms this exact source; changes require the Android compile/package leg. '
+      + 'This registration covers build impact, not device execution or native retirement/custody proof.',
+  },
   'src-tauri/src/runtime/proxy/android_bridge/tailscale_store.rs': {
     why: '原 android_bridge.rs 的 scoped store 模块外移后，父声明 cfg(any(android,test)) 使本文件在 '
       + 'production 中只参与 Android 编译；原实际 dep-info 的 Android − host 差集已确认该精确文件。'
@@ -1192,6 +1197,9 @@ const SHARED_PACKAGE_PATHS = new Set([
 ]);
 
 const LINUX_PACKAGE_PATHS = new Set(['scripts/postprocess-appimage.mjs']);
+// The Linux package acceptance orchestrators import sibling Python/Node modules.
+// Classify the whole owned directory, not just today's two workflow entry points.
+const LINUX_PACKAGE_PREFIXES = ['scripts/package-acceptance/'];
 
 function normalized(path) {
   return String(path).replaceAll('\\', '/').replace(/^\.\//, '').trim();
@@ -1316,7 +1324,7 @@ export function classifyImpact(rawPaths, { forceFull = false } = {}) {
       addAll();
       continue;
     }
-    if (LINUX_PACKAGE_PATHS.has(path) || isUiBuildConfig(path)) {
+    if (LINUX_PACKAGE_PATHS.has(path) || startsWithAny(path, LINUX_PACKAGE_PREFIXES) || isUiBuildConfig(path)) {
       platforms.add('linux');
       continue;
     }

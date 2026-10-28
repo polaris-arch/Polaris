@@ -180,6 +180,8 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    ("src-tauri/src/runtime/helper.rs", "if platform != Platform::Linux", 1,
+     "Only Linux installer stderr has the fixed diagnostic marker. Mac/Windows/Android/iOS/unknown return no Linux diagnostic; no authorization or cleanup success is inferred."),
     (
         "crates/helper-client/src/manager.rs",
         "matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)",
@@ -1524,6 +1526,18 @@ const STRING_DISPATCH_FLOOR: usize = 30;
 /// utls 的 apple engine）。详见该条第三列。
 type StringDispatch = (&'static str, &'static str, usize, &'static str);
 const STRING_DISPATCH_REGISTRY: &[StringDispatch] = &[
+    ("src-tauri/src/runtime/proxy/lan_gateway.rs", "if platform != \"linux\"", 3,
+     "Three early/final/shared checks inspect only emitted Linux MAC-filtered routed-LAN TUN prerequisites. Other platforms including Android/iOS and unknown skip Linux proc forwarding reads; they do not acquire router ownership or bypass their own TUN admission."),
+    (
+        "src-tauri/src/runtime/proxy/runtime_config.rs",
+        "\"macos\" => \"darwin\", other => other,",
+        1,
+        "Only macOS spelling becomes Go darwin. iOS, Android and unknown strings remain themselves; unknown is not mapped to a supported desktop carrier.",
+    ),
+    ("crates/config-engine/src/builder/outbound.rs", "if matches!( tls.get(\"engine\").and_then(serde_json::Value::as_str), Some(\"apple\" | \"windows\") ) && [\"fragment\", \"record_fragment\"] .iter() .any(|key| tls.get(*key).and_then(serde_json::Value::as_bool) == Some(true))", 1, "TLS native engine and fragmentation capabilities are incompatible; this is engine selection, not host OS dispatch."),
+    ("crates/config-engine/src/builder/outbound.rs", "if server .tls_settings .as_ref() .is_some_and(|t| t.fragment == Some(true)) && ob .tls .as_ref() .is_some_and(|tls| matches!(tls.engine.as_deref(), Some(\"apple\" | \"windows\")))", 1, "Explicit node fragment plus native engine is rejected consistently; unknown hosts do not gain native engine support."),
+    ("crates/config-engine/src/builder/outbound_helpers.rs", "!is_quic_managed_tls(protocol) && protocol != \"naive\" && !matches!(engine, Some(\"apple\" | \"windows\"))", 1, "TLS options follow protocol capability: QUIC, Naive and native engines do not receive incompatible uTLS/fragment options."),
+    ("src-tauri/src/commands/updater/app_update.rs", "if confirmed == Some(false) && os == \"windows\" && portable.is_some() && state.updater().custody.admits_install(&installer).is_err()", 1, "Only an unconfirmed stale Windows portable reminder receives read-only redownload guidance; confirmed installs and other platforms retain fresh custody checks."),
     (
         "crates/config-engine/src/user_config/utls.rs",
         "\"windows\" => \"win32\", \"macos\" => \"darwin\", other => other,",
@@ -2358,6 +2372,18 @@ enum IosSide {
 /// 加 40 个 iOS 答案而这一轴一句话都不说。
 type CfgSite = (&'static str, &'static str, usize, IosSide, &'static str);
 const CFG_REGISTRY: &[CfgSite] = &[
+    (
+        "src-tauri/src/runtime/proxy/startup.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
+        5,
+        IosSide::WithAndroid,
+        "Five additional desktop startup source/protocol custody captures and retained process checks cannot prove mobile loaded-libbox identity. Android and iOS both exclude CLI paths and retain native container admission.",
+    ),
+    ("src-tauri/src/commands/proxy.rs", "target_os = \"android\"", 1, IosSide::DiffersRight, "Explicit rule-pattern admission uses Android CheckConfig; iOS has no isolated construction proof and cannot use JNI."),
+    ("src-tauri/src/commands/proxy.rs", "target_os = \"ios\"", 1, IosSide::DiffersRight, "Rule-pattern admission explicitly reports unavailable on iOS; Android keeps its actual native checker."),
+    ("src-tauri/src/runtime/proxy/android_bridge.rs", "any(target_os = \"android\", test)", 1, IosSide::DiffersRight, "Android lifecycle_observation is shared by native consumption and host state tests; iOS keeps its own NE lifecycle, not Android observation types."),
+    ("src-tauri/src/runtime/proxy/lifecycle.rs", "target_os = \"android\"", 2, IosSide::DiffersRight, "Android core_running and writer_may_be_live add native-running observation and a conservative writer bit; iOS retains its existing NE/host status contract, not a new device proof."),
+    ("src-tauri/src/runtime/proxy/lifecycle.rs", "not(target_os = \"android\")", 2, IosSide::DiffersRight, "Non-Android core_running preserves the existing ready-state source; shared status platform projection is a no-op outside Android. Android alone adds JNI observation; existing iOS debts are unchanged."),
     // Retained CLI-observation evidence, from the b84e correction batch.
     (
         "src-tauri/src/runtime/proxy/startup.rs",
@@ -3196,9 +3222,9 @@ const CFG_REGISTRY: &[CfgSite] = &[
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "target_os = \"android\"",
-        8,
+        7,
         IosSide::DiffersUndecided,
-        "八处 Android reconnect、主核 claim/drain/stop 含新增 owned Stop 状态的 reconnect marker 投影；原 JNI instance 分派保持。iOS 启停租约与扩展宿主尚无实现，延续本文件未裁定而不将它标为已支持。",
+        "七处 Android reconnect、主核 claim/drain/stop；普通与 owned Stop 状态共用同一 guard 外 reconnect/native bridge 投影，不保留重复平台分支。原 JNI instance 分派保持。iOS 启停租约与扩展宿主尚无实现，延续本文件未裁定而不将它标为已支持。",
     ),
     (
         "src-tauri/src/runtime/proxy/process_supervision.rs",
@@ -3953,6 +3979,56 @@ fn independent_check_admission_excludes_ios_ne_but_retains_desktop_gate() {
     assert!(code.contains("polaris_core_supervisor::settle_check_cleanup()"));
 }
 
+fn cfg_registry_counts(
+    rows: &[(&str, &str, usize, IosSide, &str)],
+) -> BTreeMap<(String, String), usize> {
+    let mut counts = BTreeMap::new();
+    for (path, pred, count, _, _) in rows {
+        *counts.entry((path.to_string(), fold(pred))).or_default() += count;
+    }
+    counts
+}
+
+fn claimed_cfg_side(side: IosSide) -> (bool, bool) {
+    match side {
+        IosSide::WithAndroid => (true, true),
+        IosSide::DiffersOnlyInDebug => (true, false),
+        IosSide::DiffersRight | IosSide::DiffersWrongToday | IosSide::DiffersUndecided => {
+            (false, false)
+        }
+    }
+}
+
+#[test]
+fn cfg_counts_keep_distinct_purpose_verdicts_without_accepting_the_wrong_side() {
+    let predicate = "not(target_os = \"android\")";
+    let rows = [
+        (
+            "owner.rs",
+            predicate,
+            1,
+            IosSide::DiffersRight,
+            "observation",
+        ),
+        ("owner.rs", predicate, 2, IosSide::DiffersUndecided, "lease"),
+    ];
+    assert_eq!(
+        cfg_registry_counts(&rows)[&("owner.rs".into(), fold(predicate))],
+        3
+    );
+    for (_, pred, _, side, _) in rows {
+        assert_eq!(cfg_side_profile(pred), Some(claimed_cfg_side(side)));
+    }
+    assert_ne!(
+        cfg_side_profile(predicate),
+        Some(claimed_cfg_side(IosSide::WithAndroid))
+    );
+    assert_ne!(
+        cfg_side_profile(predicate),
+        Some(claimed_cfg_side(IosSide::DiffersOnlyInDebug))
+    );
+}
+
 /// cfg 轴登记门：新增即红 / 腐烂即红 / **写错边即红**。
 #[test]
 fn cfg_axis_platform_dispatch_is_registered() {
@@ -3991,19 +4067,12 @@ fn cfg_axis_platform_dispatch_is_registered() {
         unknown_atoms.join("\n    ")
     );
 
-    let mut registered: BTreeMap<(String, String), (usize, IosSide, &str)> = BTreeMap::new();
-    for (path, pred, count, side, why) in CFG_REGISTRY {
-        let key = ((*path).to_owned(), fold(pred));
-        let slot = registered.entry(key).or_insert((0, *side, why));
-        slot.0 += *count;
-        assert_eq!(
-            slot.1, *side,
-            "{path} 的同一条谓词被登记成了两种 iOS 侧：{:?} / {side:?}",
-            slot.1
-        );
-    }
-
-    let reg_count = |key: &(String, String)| registered.get(key).map_or(0, |(c, _, _)| *c);
+    // Count source predicates independently of the per-purpose audit verdict.
+    // One predicate can guard both an understood observation and an unresolved
+    // lease owner. Each row still has its computed side checked below, and the
+    // independent census/debt ledger retains every semantic verdict unchanged.
+    let registered = cfg_registry_counts(CFG_REGISTRY);
+    let reg_count = |key: &(String, String)| registered.get(key).copied().unwrap_or(0);
     // 未登记项直接把**算出来的两侧**打进消息里：作者不必自己去推 iOS 落哪边，
     // 少一次「登记时就理解错了」的机会。
     let unregistered: Vec<String> = found
@@ -4017,26 +4086,20 @@ fn cfg_axis_platform_dispatch_is_registered() {
         .collect();
     let rotten: Vec<String> = registered
         .iter()
-        .filter(|(k, (n, _, _))| found.get(*k).copied().unwrap_or(0) < *n)
-        .map(|((p, s), (n, _, _))| {
+        .filter(|(k, n)| found.get(*k).copied().unwrap_or(0) < **n)
+        .map(|((p, s), n)| {
             let f = found.get(&(p.clone(), s.clone())).copied().unwrap_or(0);
             format!("{p}  （登记 {n} 次，实到 {f} 次）\n      {s}")
         })
         .collect();
 
     // 第四列的机器复核：登记的「iOS 落哪一侧」必须与求值结果一致。
-    let mislabeled: Vec<String> = registered
+    let mislabeled: Vec<String> = CFG_REGISTRY
         .iter()
-        .filter(|(k, _)| found.contains_key(*k))
-        .filter_map(|((p, s), (_, side, _))| {
+        .filter(|(p, s, _, _, _)| found.contains_key(&(p.to_string(), fold(s))))
+        .filter_map(|(p, s, _, side, _)| {
             let actual = cfg_side_profile(s).unwrap();
-            let claimed = match side {
-                IosSide::WithAndroid => (true, true),
-                IosSide::DiffersOnlyInDebug => (true, false),
-                IosSide::DiffersRight
-                | IosSide::DiffersWrongToday
-                | IosSide::DiffersUndecided => (false, false),
-            };
+            let claimed = claimed_cfg_side(*side);
             (actual != claimed).then(|| {
                 format!(
                     "{p}  （登记 {side:?}={claimed:?}，实算 release/debug 同侧={actual:?}）\n      {s}"
@@ -4048,8 +4111,8 @@ fn cfg_axis_platform_dispatch_is_registered() {
     // 切片自检 + 总账：把算出来的分布打出来。扫到 0 处也「没有未登记项」，那种绿没有信息量。
     let found_total: usize = found.values().sum();
     let mut by_side: BTreeMap<String, usize> = BTreeMap::new();
-    for ((p, s), n) in &found {
-        if let Some((_, side, _)) = registered.get(&(p.clone(), s.clone())) {
+    for (p, s, n, side, _) in CFG_REGISTRY {
+        if found.contains_key(&(p.to_string(), fold(s))) {
             *by_side.entry(format!("{side:?}")).or_default() += *n;
         }
     }
@@ -4200,16 +4263,20 @@ fn cfg_axis_platform_dispatch_is_registered() {
 // UA identity: remove one obsolete updater Android-only site; add four
 // same-side selected-version sites. The test-only legacy cfg!(ios) remains
 // scanned in updater.rs; tests/ files are excluded. Existing debt is unchanged.
+// Source census closure: five desktop-only startup custody predicates were already
+// individually registered WithAndroid. Shared status platform projection removed
+// one duplicate Android reconnect branch (the existing Undecided group 8 -> 7)
+// and added one non-Android no-op projection (Right). No surviving debt is reclassified.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 330),
-    ("DiffersUndecided", 27),
+    ("DiffersRight", 337),
+    ("DiffersUndecided", 26),
     ("DiffersWrongToday", 142),
     // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1),
     // checked by eval_cfg for Android/iOS in both release/debug. No existing
     // verdict or debt site changes; this does not claim device validation.
-    ("WithAndroid", 130),
+    ("WithAndroid", 135),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。
@@ -4271,7 +4338,7 @@ const IOS_DEBT_SITES: &[(&str, &str, usize)] = &[
     (
         "src-tauri/src/runtime/proxy/lifecycle.rs",
         "target_os = \"android\"",
-        8,
+        7,
     ),
     (
         "src-tauri/src/runtime/proxy/mesh_apply/pc_owner_census.rs",

@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from source_policy import canonical, sha, validate_source_policy, verify_source_policy_files
+from source_policy import (VENDOR_DIRECTORIES, canonical, sha, validate_source_policy, verify_source_policy_files,
+                           vendor_tree)
 
 
 def source_fixture():
@@ -56,10 +57,272 @@ def future_mobile_fixture():
         value[key] = policy[key]
     for platform in ('android', 'apple'):
         value[platform]['outputName'] = value[platform]['outputName'].replace('1.15.0-alpha.12', value['version'])
+    value['android'].update(ndkRevision='30.0.16248370', ndkSourceRevision='30.0.16248370',
+                            ndkPackage='android-ndk-r30', ndkArchivePath='scripts/mobile-core/ndk-r30-linux.json')
     declaration = value['declaredTagsSource']['path']
     files[declaration] = b'synthetic source-owned tags declaration\n'
     value['declaredTagsSource']['sha256'] = sha(files[declaration])
     return value, files
+
+
+def nine_vendor_fixture():
+    """Synthetic v2 facts only, never a selected final tag or source declaration."""
+    policy, files = source_fixture()
+    vendors, modes, trees = {}, {}, {}
+    for name, directory in VENDOR_DIRECTORIES.items():
+        prefix = 'third_party/' + directory + '/'
+        if name != 'github.com/metacubex/utls':
+            files[prefix + 'fixture.go'] = ('synthetic module ' + name).encode()
+        if directory == 'tailscale':
+            files[prefix + '.gitignore'] = b'fixture-ignore\n'
+            files[prefix + '.stignore'] = b'.gitignore'
+        if directory == 'sing-tun':
+            files[prefix + 'fixture.sh'] = b'#!/bin/sh\n# inert fixture only\n'
+        names = [path for path in files if path.startswith(prefix)]
+        for path in names:
+            modes[path] = '120000' if path.endswith('/.stignore') else '100755' if path.endswith('.sh') else '100644'
+        tree = vendor_tree({path[len(prefix):]: (modes[path], files[path]) for path in names})
+        version = 'v1.8.8' if name == 'github.com/metacubex/utls' else 'v0.0.0-fixture'
+        vendors[name] = dict(version=version, replacementPath='./' + prefix[:-1],
+                             replacementTree=tree, replacementFileCount=len(names))
+        trees[name] = tree
+    files['go.mod'] = (b'module github.com/sagernet/sing-box\ngo 1.27.0\ntoolchain go1.27.2\nrequire (\n'
+        b' github.com/sagernet/gomobile v0.1.13\n' +
+        ''.join(' ' + name + ' ' + pin['version'] + '\n' for name, pin in vendors.items()).encode() + b')\nreplace (\n' +
+        ''.join(' ' + name + ' => ' + pin['replacementPath'] + '\n' for name, pin in vendors.items()).encode() + b')\n')
+    policy.update(schema='polaris-reviewed-kernel-source-v2', vendors=vendors, goModSha256=sha(files['go.mod']))
+    policy['metacubex']['replacementTree'] = trees['github.com/metacubex/utls']
+    return policy, files, modes, trees
+
+
+
+def ten_vendor_fixture():
+    """Synthetic explicit v3 facts; the historical v2 fixture is untouched."""
+    policy, files, modes, trees = nine_vendor_fixture()
+    name = 'github.com/sagernet/sing-vmess'
+    path = 'third_party/sing-vmess/fixture.go'
+    files[path] = b'synthetic sing-vmess only'
+    modes[path] = '100644'
+    tree = vendor_tree({'fixture.go': ('100644', files[path])})
+    policy['vendors'][name] = dict(version='v0.2.9-0.20260929152519-9b95ab8c9478',
+        replacementPath='./third_party/sing-vmess', replacementTree=tree, replacementFileCount=1)
+    trees[name] = tree
+    vendors = policy['vendors']
+    files['go.mod'] = (b'module github.com/sagernet/sing-box\ngo 1.27.0\ntoolchain go1.27.2\nrequire (\n'
+        b' github.com/sagernet/gomobile v0.1.13\n' +
+        ''.join(' ' + name + ' ' + pin['version'] + '\n' for name, pin in vendors.items()).encode() + b')\nreplace (\n' +
+        ''.join(' ' + name + ' => ' + pin['replacementPath'] + '\n' for name, pin in vendors.items()).encode() + b')\n')
+    policy.update(schema='polaris-reviewed-kernel-source-v3', goModSha256=sha(files['go.mod']))
+    return policy, files, modes, trees
+
+
+class TenVendorSourcePolicy(unittest.TestCase):
+    def test_v3_complete_bytes_modes_and_module_graph(self):
+        policy, files, modes, trees = ten_vendor_fixture()
+        self.assertIs(validate_source_policy(policy, policy), policy)
+        result = verify_source_policy_files(policy, policy, files, policy['metacubex']['replacementTree'],
+            vendor_modes=modes, vendor_trees=trees)
+        self.assertEqual(len(result['vendors']), 10)
+        self.assertEqual(result['sourcePolicySha256'], sha(canonical(policy)))
+
+    def test_schema_does_not_infer_or_mix_nine_and_ten(self):
+        for maker, wrong_schema in [(nine_vendor_fixture, 'polaris-reviewed-kernel-source-v3'),
+                                    (ten_vendor_fixture, 'polaris-reviewed-kernel-source-v2'),
+                                    (ten_vendor_fixture, 'polaris-reviewed-kernel-source-v4')]:
+            policy, _, _, _ = maker(); policy['schema'] = wrong_schema
+            with self.subTest(schema=wrong_schema), self.assertRaises(RuntimeError):
+                validate_source_policy(policy, policy)
+        for mutation in ['missing', 'extra', 'path', 'version', 'tree', 'count']:
+            policy, _, _, _ = ten_vendor_fixture(); pin = policy['vendors']['github.com/sagernet/sing-vmess']
+            if mutation == 'missing': del policy['vendors']['github.com/sagernet/sing-vmess']
+            elif mutation == 'extra': policy['vendors']['example.invalid/extra'] = dict(pin)
+            elif mutation == 'path': pin['replacementPath'] = '../sing-vmess'
+            elif mutation == 'version': pin['version'] = '(devel)'
+            elif mutation == 'tree': pin['replacementTree'] = 'x' * 40
+            else: pin['replacementFileCount'] = True
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError): validate_source_policy(policy, policy)
+
+    def test_ten_candidate_requires_explicit_schema(self):
+        from source_policy import candidate_vendors
+        policy, _, _, _ = ten_vendor_fixture()
+        pins = {name: [pin['replacementPath'].split('/')[-1], pin['replacementTree'], pin['replacementFileCount']]
+                for name, pin in policy['vendors'].items()}
+        with self.assertRaises(RuntimeError): candidate_vendors(pins)
+        self.assertEqual(len(candidate_vendors(pins, schema=policy['schema'])), 10)
+
+    def test_v3_rejects_missing_bytes_modes_wrong_tree_and_module_version(self):
+        for mutation in ['bytes', 'mode', 'tree', 'module_version']:
+            policy, files, modes, trees = ten_vendor_fixture()
+            name = 'github.com/sagernet/sing-vmess'; path = 'third_party/sing-vmess/fixture.go'
+            if mutation == 'bytes': del files[path]
+            elif mutation == 'mode': modes[path] = '100755'
+            elif mutation == 'tree': trees[name] = '0' * 40
+            else:
+                files['go.mod'] = files['go.mod'].replace(b'v0.2.9-0.20260929152519-9b95ab8c9478', b'v0.2.8')
+                policy['goModSha256'] = sha(files['go.mod'])
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                verify_source_policy_files(policy, policy, files, policy['metacubex']['replacementTree'],
+                    vendor_modes=modes, vendor_trees=trees)
+
+def future_mobile_fixture_v2():
+    value, old_files = future_mobile_fixture()
+    policy, files, modes, trees = nine_vendor_fixture()
+    declaration = value['declaredTagsSource']['path']
+    files[declaration] = old_files[declaration]
+    value['sourcePolicy'] = policy
+    for key in ('sourceCommit', 'sourceTree', 'goModSha256', 'goSumSha256'):
+        value[key] = policy[key]
+    return value, files, modes, trees
+
+
+def future_mobile_fixture_v3():
+    value, old_files = future_mobile_fixture()
+    policy, files, modes, trees = ten_vendor_fixture()
+    files[value['declaredTagsSource']['path']] = old_files[value['declaredTagsSource']['path']]
+    value['sourcePolicy'] = policy
+    for key in ('sourceCommit', 'sourceTree', 'goModSha256', 'goSumSha256'):
+        value[key] = policy[key]
+    return value, files, modes, trees
+
+
+class NineVendorSourcePolicy(unittest.TestCase):
+    def check(self, policy, files, modes=None, trees=None):
+        return verify_source_policy_files(policy, policy, files, policy['metacubex']['replacementTree'],
+                                          vendor_modes=modes, vendor_trees=trees)
+
+    def test_v2_is_explicit_complete_and_preserves_all_meta_provenance(self):
+        policy, files, modes, trees = nine_vendor_fixture()
+        self.assertIs(validate_source_policy(policy, policy), policy)
+        result = self.check(policy, files, modes, trees)
+        self.assertEqual(result['schema'], 'polaris-reviewed-source-observation-v2')
+        self.assertEqual(set(result['vendors']), set(VENDOR_DIRECTORIES))
+        self.assertEqual(result['replacementFileCount'], 355)
+        self.assertEqual(result['sourcePolicySha256'], sha(canonical(policy)))
+        from fork_input import validate
+        value, _, _, _ = future_mobile_fixture_v2()
+        self.assertIs(validate(value), value)
+        self.assertIsNone(value['artifactPins'])
+        self.assertFalse(value['AppAccepted'] or value['devicePassed'] or value['publicationEligible'])
+
+    def test_v2_cannot_fall_back_to_meta_only_archive_evidence(self):
+        policy, files, modes, trees = nine_vendor_fixture()
+        for actual_modes, actual_trees in [(None, None), (modes, None), (None, trees), ({}, trees), (modes, {})]:
+            with self.subTest(modes=actual_modes is None, trees=actual_trees is None), self.assertRaises(RuntimeError):
+                self.check(policy, files, actual_modes, actual_trees)
+
+    def test_schema_rejects_missing_extra_ambiguous_and_incoherent_vendor_pins(self):
+        for case in ('missing', 'extra', 'path', 'tree', 'count', 'bool-count', 'version', 'field', 'meta', 'v1-extra'):
+            policy, _, _, _ = nine_vendor_fixture()
+            vendor = policy['vendors']['github.com/sagernet/sing-tun']
+            if case == 'missing': policy['vendors'].pop('github.com/sagernet/sing')
+            elif case == 'extra': policy['vendors']['example.invalid/extra'] = deepcopy(vendor)
+            elif case == 'path': vendor['replacementPath'] = '../sing-tun'
+            elif case == 'tree': vendor['replacementTree'] = 'main'
+            elif case == 'count': vendor['replacementFileCount'] = 0
+            elif case == 'bool-count': vendor['replacementFileCount'] = True
+            elif case == 'version': vendor['version'] = '(devel)'
+            elif case == 'field': vendor['unknown'] = True
+            elif case == 'meta': policy['vendors']['github.com/metacubex/utls']['replacementTree'] = 'f' * 40
+            else: policy['schema'] = 'polaris-reviewed-kernel-source-v1'
+            with self.subTest(case=case), self.assertRaises(RuntimeError): validate_source_policy(policy, policy)
+
+    def test_all_nine_versions_must_match_actual_go_mod_bytes(self):
+        for name in VENDOR_DIRECTORIES:
+            policy, files, modes, trees = nine_vendor_fixture()
+            files['go.mod'] = files['go.mod'].replace((name + ' ' + policy['vendors'][name]['version']).encode(),
+                                                     (name + ' v9.9.9').encode())
+            policy['goModSha256'] = sha(files['go.mod'])
+            with self.subTest(name=name), self.assertRaises(RuntimeError): self.check(policy, files, modes, trees)
+
+    def test_complete_bytes_modes_paths_counts_and_trees_are_bound(self):
+        for case in ('bytes', 'missing', 'extra', 'mode', 'missing-mode', 'extra-mode', 'tree', 'count', 'escape', 'gitlink', 'symlink'):
+            policy, files, modes, trees = nine_vendor_fixture()
+            path = 'third_party/sing-tun/fixture.go'
+            if case == 'bytes': files[path] += b'changed'
+            elif case == 'missing': files.pop(path)
+            elif case == 'extra': files['third_party/sing-tun/extra.go'] = b'extra'; modes['third_party/sing-tun/extra.go'] = '100644'
+            elif case == 'mode': modes[path] = '100755'
+            elif case == 'missing-mode': modes.pop(path)
+            elif case == 'extra-mode': modes['outside.go'] = '100644'
+            elif case == 'tree': trees['github.com/sagernet/sing-tun'] = '0' * 40
+            elif case == 'count': policy['vendors']['github.com/sagernet/sing-tun']['replacementFileCount'] += 1
+            elif case == 'escape': files['third_party/sing-tun/../outside'] = b'extra'; modes['third_party/sing-tun/../outside'] = '100644'
+            elif case == 'gitlink': modes[path] = '160000'
+            else: modes[path] = '120000'; files[path] = b'fixture.go'
+            with self.subTest(case=case), self.assertRaises(RuntimeError): self.check(policy, files, modes, trees)
+
+    def test_allowed_tailscale_symlink_is_exact_and_mode_bound(self):
+        policy, files, modes, trees = nine_vendor_fixture()
+        self.check(policy, files, modes, trees)
+        path = 'third_party/tailscale/.stignore'
+        for raw, mode in [(b'../.gitignore', '120000'), (b'.gitignore', '100644'), (b'/.gitignore', '120000')]:
+            changed_files, changed_modes = dict(files), dict(modes)
+            changed_files[path], changed_modes[path] = raw, mode
+            with self.subTest(raw=raw, mode=mode), self.assertRaises(RuntimeError):
+                self.check(policy, changed_files, changed_modes, trees)
+
+    def test_extra_or_scoped_local_replacements_are_rejected(self):
+        for extra in [b'replace example.invalid/extra => ../outside\n',
+                      b'replace example.invalid/extra v1.0.0 => ./outside\n',
+                      b'replace example.invalid/extra => /outside\n']:
+            policy, files, modes, trees = nine_vendor_fixture()
+            files['go.mod'] += extra; policy['goModSha256'] = sha(files['go.mod'])
+            with self.subTest(extra=extra), self.assertRaises(RuntimeError): self.check(policy, files, modes, trees)
+
+    def test_git_tree_reconstruction_known_empty_and_one_file_objects(self):
+        import hashlib
+        self.assertEqual(vendor_tree({}), '4b825dc642cb6eb9a060e54bf8d69288fbee4904')
+        raw = b'fixture'
+        blob = hashlib.sha1(b'blob 7\0' + raw).digest()
+        tree = b'100644 a\0' + blob
+        expected = hashlib.sha1(b'tree ' + str(len(tree)).encode() + b'\0' + tree).hexdigest()
+        self.assertEqual(vendor_tree({'a': ('100644', raw)}), expected)
+
+    def test_git_tree_directory_order_modes_and_collisions_match_git_encoding(self):
+        import hashlib
+        def object_hash(kind, raw):
+            return hashlib.sha1(kind + b' ' + str(len(raw)).encode() + b'\0' + raw).digest()
+        entries = {'a/run': ('100755', b'run'), 'a.txt': ('100644', b'text'),
+                   'a0': ('120000', b'.gitignore'), 'z/deep/file': ('100644', b'deep')}
+        child_a = object_hash(b'tree', b'100755 run\0' + object_hash(b'blob', b'run'))
+        child_deep = object_hash(b'tree', b'100644 file\0' + object_hash(b'blob', b'deep'))
+        child_z = object_hash(b'tree', b'40000 deep\0' + child_deep)
+        # Git orders a directory as if its basename ends in '/': a.txt, a/, a0.
+        raw = (b'100644 a.txt\0' + object_hash(b'blob', b'text') + b'40000 a\0' + child_a +
+               b'120000 a0\0' + object_hash(b'blob', b'.gitignore') + b'40000 z\0' + child_z)
+        self.assertEqual(vendor_tree(entries), object_hash(b'tree', raw).hex())
+        self.assertEqual(vendor_tree(dict(reversed(list(entries.items())))), vendor_tree(entries))
+        for path in entries:
+            changed = dict(entries); mode, content = changed[path]
+            changed[path] = ('100755' if mode != '100755' else '100644', content)
+            self.assertNotEqual(vendor_tree(changed), vendor_tree(entries))
+        for entries in [{'a': ('100644', b'file'), 'a/b': ('100644', b'child')},
+                        {'a/b': ('100644', b'child'), 'a': ('100644', b'file')}]:
+            with self.assertRaisesRegex(RuntimeError, 'collision|duplicate'): vendor_tree(entries)
+
+    def test_git_tree_matches_existing_desktop_archive_closure_without_running_archive(self):
+        import ast
+        import hashlib
+        from source_policy import require
+        # Reuse only the two existing pure nested definitions as the reference;
+        # do not import or execute the desktop archive workflow or change it.
+        path = Path(__file__).resolve().parents[1] / 'desktop-core/release-archive.py'
+        module = ast.parse(path.read_text())
+        archive = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == 'verify_source_archive')
+        helpers = [node for node in archive.body if isinstance(node, ast.FunctionDef) and node.name in ('object_hash', 'tree_hash')]
+        self.assertEqual({node.name for node in helpers}, {'object_hash', 'tree_hash'})
+        namespace = {'hashlib': hashlib, 'require': require}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), str(path), 'exec'), namespace)
+        entries = {'a/run': ('100755', b'run'), 'a.txt': ('100644', b'text'),
+                   'a0': ('100644', b'zero'), 'tailscale/.gitignore': ('100644', b'ignore'),
+                   'tailscale/.stignore': ('120000', b'.gitignore'),
+                   'z/deep/file': ('100644', b'deep')}
+        tree = {}
+        for path, (mode, raw) in entries.items():
+            parts, node = path.split('/'), tree
+            for part in parts[:-1]: node = node.setdefault(part, {})
+            node[parts[-1]] = (mode.encode(), namespace['object_hash']('blob', raw))
+        self.assertEqual(vendor_tree(entries), namespace['tree_hash'](tree).hex())
 
 
 class ReviewedSourcePolicy(unittest.TestCase):
@@ -231,14 +494,56 @@ def current_mobile_graph_fixture(value, source):
     raw = 'path\tsynthetic/main\nmod\t' + value['goModule'] + '\t(devel)\t\n'
     if 'sourcePolicy' in value:
         meta = value['sourcePolicy']['metacubex']
-        for name, version, relative in [(meta['module'], meta['version'], meta['replacementPath']),
-                ('github.com/sagernet/sing-tun', 'v0.0.0-fixture', './third_party/sing-tun')]:
+        vendors = value['sourcePolicy'].get('vendors')
+        declarations = ([(name, pin['version'], pin['replacementPath']) for name, pin in vendors.items()]
+                        if vendors is not None else
+                        [(meta['module'], meta['version'], meta['replacementPath']),
+                         ('github.com/sagernet/sing-tun', 'v0.0.0-fixture', './third_party/sing-tun')])
+        for name, version, relative in declarations:
             directory = source / relative[2:]
             directory.mkdir(parents=True, exist_ok=True)
             graph.append({'Path': name, 'Version': version,
                           'Replace': {'Path': relative, 'Dir': str(directory)}})
             raw += 'dep\t' + name + '\t' + version + '\n=>\t' + relative + '\t(devel)\t\n'
     return graph, raw
+
+
+class CurrentMobileGraphFixture(unittest.TestCase):
+    def test_v3_selected_contract_fixture_keeps_exact_ten_source_replacements(self):
+        from fork_input import load
+        from source_policy import verify_vendor_graph
+        value = load()
+        self.assertEqual(value['sourcePolicy']['schema'], 'polaris-reviewed-kernel-source-v3')
+        vendors = value['sourcePolicy']['vendors']
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'source'
+            graph, raw = current_mobile_graph_fixture(value, source)
+            self.assertEqual(len(graph), 11)  # Main plus ten reviewed vendors.
+            self.assertIs(verify_vendor_graph(graph, source, vendors), graph)
+            for row in graph[1:]:
+                self.assertEqual(row['Version'], vendors[row['Path']]['version'])
+                self.assertIn('dep\t' + row['Path'] + '\t' + row['Version'] + '\n', raw)
+            for index in range(1, len(graph)):
+                with self.subTest(missing=graph[index]['Path']), self.assertRaisesRegex(RuntimeError, 'actual graph replacements differ'):
+                    verify_vendor_graph(graph[:index] + graph[index + 1:], source, vendors)
+                wrong = deepcopy(graph); wrong[index]['Version'] = 'v0.0.0-fixture'
+                with self.subTest(version=graph[index]['Path']), self.assertRaisesRegex(RuntimeError, 'actual vendor graph version differs'):
+                    verify_vendor_graph(wrong, source, vendors)
+                wrong = deepcopy(graph); wrong[index]['Replace']['Path'] += '-other'
+                with self.subTest(path=graph[index]['Path']), self.assertRaisesRegex(RuntimeError, 'local graph path differs'):
+                    verify_vendor_graph(wrong, source, vendors)
+
+    def test_v1_and_legacy_fixture_shapes_remain_historical(self):
+        value, _ = future_mobile_fixture()
+        legacy = json.loads((Path(__file__).with_name('fixtures') / 'legacy-source-contract.json').read_bytes())
+        with tempfile.TemporaryDirectory() as temporary:
+            graph, _ = current_mobile_graph_fixture(value, Path(temporary) / 'v1')
+            self.assertEqual([row['Path'] for row in graph],
+                             [value['goModule'], 'github.com/metacubex/utls', 'github.com/sagernet/sing-tun'])
+            self.assertEqual(graph[-1]['Version'], 'v0.0.0-fixture')
+            old_graph, _ = current_mobile_graph_fixture(legacy, Path(temporary) / 'legacy')
+            self.assertEqual(len(old_graph), 1)
+            self.assertTrue(old_graph[0]['Main'])
 
 
 if __name__ == '__main__':

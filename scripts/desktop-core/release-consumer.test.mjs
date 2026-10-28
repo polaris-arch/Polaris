@@ -1505,7 +1505,7 @@ function sourceProofCallFixture() {
     source.slice(start, end).replaceAll('import.meta.url', 'moduleURL'));
   const contract = { sourceArchive: { name: 'inert-source.tar.gz', bytes: 7, sha256: 'a'.repeat(64) },
     sourceCommit: 'b'.repeat(40), sourceTree: 'c'.repeat(40),
-    legalFiles: [{ path: 'licenses/LICENSE', content: 'never_log_source_proof_input' }], sourcePolicy: { fixture: true } };
+    legalFiles: [{ path: 'licenses/LICENSE', content: 'never_log_source_proof_input', bytes: 27, sha256: 'e'.repeat(64) }], sourcePolicy: { fixture: true } };
   const row = { sourceIdentity: { fixture: true }, buildGraph: { localReplacements: [{ fixture: true }] } };
   const snapshot = { sourceGitlinks: [{ path: 'inert', sha: 'd'.repeat(40) }] };
   return { contract, row, snapshot, run(key, child, upstream = true) {
@@ -1524,10 +1524,10 @@ test('source archive reproof preserves complete inputs and its existing 120-seco
       calls++;
       assert.equal(command, PYTHON);
       assert.deepEqual(args, ['-B', fileURLToPath(new URL('./release-archive.py', import.meta.url)),
-        join('inert', key, 'core-release/source', f.contract.sourceArchive.name)]);
+        join('inert', key, 'core-release/source', f.contract.sourceArchive.name), '--source-legal-pins']);
       assert.deepEqual(options, { input: JSON.stringify({ sourceArchive: f.contract.sourceArchive,
         sourceCommit: f.contract.sourceCommit, sourceTree: f.contract.sourceTree,
-        sourceGitlinks: f.snapshot.sourceGitlinks, legalFiles: f.contract.legalFiles,
+        sourceGitlinks: f.snapshot.sourceGitlinks, legalFiles: f.contract.legalFiles.map(({ path, bytes, sha256 }) => ({ path, bytes, sha256 })),
         sourceIdentity: f.row.sourceIdentity, buildReplacements: f.row.buildGraph.localReplacements,
         sourcePolicy: f.contract.sourcePolicy }), encoding: 'utf8', maxBuffer: 1024 * 1024,
         timeout: 120_000, killSignal: 'SIGKILL' });

@@ -278,23 +278,5 @@ fn trim_lossy(o: &std::process::Output) -> String {
     s.trim().to_string()
 }
 
-/// IP 转发开关（移植自 Go `setForward`，:172-179）。
-///
-/// allowLan 时开 IPv4+IPv6 转发（直写 /proc/sys）；stop 复位为 0，使转发态严格跟随运行中的核。
-/// best-effort（写失败静默忽略，Go: `_ = os.WriteFile(...)`）。
-///
-/// 抽象为闭包注入便于测试；生产用 [`set_forward_prod`]。
-pub fn set_forward_prod(on: bool) {
-    set_forward_with(on, |path, value| std::fs::write(path, value));
-}
-
-/// Keep the production best-effort contract while tests inject an inert writer.
-/// In particular, a failed IPv4 write must not prevent the IPv6 attempt.
-fn set_forward_with(on: bool, mut write: impl FnMut(&str, &[u8]) -> std::io::Result<()>) {
-    let value = if on { b"1" } else { b"0" };
-    let _ = write("/proc/sys/net/ipv4/ip_forward", value);
-    let _ = write("/proc/sys/net/ipv6/conf/all/forwarding", value);
-}
-
 #[cfg(test)]
 mod tests;

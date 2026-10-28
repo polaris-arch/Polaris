@@ -65,7 +65,7 @@ fn node_intent_global_policy_protocol_matrix_keeps_stored_nodes_unchanged() {
                 assert_eq!(value["tls"]["enabled"], true, "disabling uTLS keeps TLS");
                 let expected = match (mode, policy) {
                     (Some(UtlsMode::Disabled), _) => None,
-                    (_, None | Some("default")) => Some("chrome"),
+                    (_, Some("default")) => Some("chrome"),
                     (_, Some("random")) => Some("random"),
                     (_, Some("safari")) => Some("safari"),
                     _ => match mode {
@@ -178,13 +178,13 @@ fn global_policy_does_not_rewrite_quic_cronet_or_custom_nodes() {
 }
 
 #[test]
-fn policy_projection_enters_refresh_and_missing_is_default() {
+fn policy_projection_enters_refresh_and_missing_is_follow() {
     let base = UserConfig {
         servers: vec![server(Protocol::Vless)],
         ..Default::default()
     };
     let mut changed = base.clone();
-    changed.utls_policy = Some("follow".into());
+    changed.utls_policy = Some("default".into());
     assert_ne!(
         config_generation_norm(&base, None),
         config_generation_norm(&changed, None)
@@ -347,7 +347,7 @@ fn shadow_source_intent_and_global_overrides_preserve_stored_values() {
                 None
             } else {
                 match policy {
-                    None | Some("default") => Some("chrome"),
+                    Some("default") => Some("chrome"),
                     Some("randomized") => Some("randomized"),
                     Some("firefox") => Some("firefox"),
                     _ => expected,
@@ -540,4 +540,33 @@ fn default_and_global_profiles_skip_native_engines_but_explicit_node_conflicts_f
             }
         }
     }
+}
+
+#[test]
+fn initial_missing_and_null_policy_follow_saved_fingerprint_in_real_generator() {
+    let mut node = server(Protocol::Vless);
+    node.tls_settings = Some(TlsSettings {
+        utls_mode: Some(UtlsMode::Profile),
+        fingerprint: Some("firefox".into()),
+        ..Default::default()
+    });
+    let initial = UserConfig::default();
+    for policy in [initial.utls_policy.as_deref(), None, Some("follow")] {
+        assert_eq!(
+            generated(&node, policy)["tls"]["utls"]["fingerprint"],
+            "firefox"
+        );
+    }
+    assert_eq!(
+        generated(&node, Some("default"))["tls"]["utls"]["fingerprint"],
+        "chrome"
+    );
+    assert_eq!(
+        generated(&node, Some("safari"))["tls"]["utls"]["fingerprint"],
+        "safari"
+    );
+    assert_eq!(
+        node.tls_settings.as_ref().unwrap().fingerprint.as_deref(),
+        Some("firefox")
+    );
 }

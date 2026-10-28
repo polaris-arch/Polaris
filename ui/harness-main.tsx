@@ -9,6 +9,7 @@ import runtimeCoexFixture from './src/contracts/coex-runtime.rust.fixture.json';
  * 数据留在本文件里 = 任何自动化都碰不到它（本文件 import 即执行 createRoot），契约漂移只能等真机白屏。
  */
 import React from 'react';
+import { HarnessPrivacyRoot } from './harness-privacy-root';
 import ReactDOM from 'react-dom/client';
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { i18nReady, syncLanguageChoice } from './src/i18n';
@@ -215,8 +216,8 @@ void i18nReady.then(async () => {
       ...(mode === 'long' ? [{ id: 'choice-ts-work', name: 'Work', protocol: 'tailscale' as const, address: '', port: 0 }] : []),
     ];
     ReactDOM.createRoot(document.getElementById('root')!).render(
-      <MeshJoinDialogView servers={servers} tsStates={{ 'choice-ts': mode !== 'signed-out', 'choice-ts-work': true }}
-        onTsLogout={() => {}} onWarpReregister={() => {}} onWarpDeregister={() => {}} />,
+      <HarnessPrivacyRoot><MeshJoinDialogView servers={servers} tsStates={{ 'choice-ts': mode !== 'signed-out', 'choice-ts-work': true }}
+        onTsLogout={() => {}} onWarpReregister={() => {}} onWarpDeregister={() => {}} /></HarnessPrivacyRoot>,
     );
   } else if (meshIngressFixture) {
     const [{ useAppStore }, { DialogHost }, { useDialogStore }] = await Promise.all([
@@ -226,7 +227,7 @@ void i18nReady.then(async () => {
     await useAppStore.getState().loadConfig(true);
     useDialogStore.getState().open({ kind: 'ts-settings', serverId: 'mesh-ingress-ts' });
     ReactDOM.createRoot(document.getElementById('root')!).render(
-      <DialogHost />,
+      <HarnessPrivacyRoot><DialogHost /></HarnessPrivacyRoot>,
     );
   } else {
     ReactDOM.createRoot(document.getElementById('root')!).render(

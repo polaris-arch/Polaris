@@ -147,11 +147,11 @@ export function MobileToaster(): ReactElement | null {
           key={toastListKey(it)}
           className={`m-toast${it.kind === 'ok' ? ' m-toast-ok' : it.kind === 'err' ? ' m-toast-err' : ''}${
             it.leaving ? ' m-toast-leaving' : ''
-          }`}
+          }${it.dismiss ? ' m-toast-dismissible' : ''}`}
         >
           <div className="m-toast-body">
             <div className="m-toast-msg">{it.msg}</div>
-            {it.desc !== undefined && <div className="m-toast-desc">{it.desc}</div>}
+            {it.desc !== undefined && <div className="m-toast-desc" tabIndex={it.dismiss ? 0 : undefined}>{it.desc}</div>}
           </div>
           {it.actions !== undefined && it.actions.length > 0 && (
             <div className="m-toast-actions">

@@ -313,21 +313,33 @@ def check_buildinfo(facts, value, graph, *, os_name, arch, mode, expected_id, ac
             'actual source graph module rows differ')
     declared = {row['Path']: row for row in graph}
     require(len(declared) == len(graph), 'duplicate actual source graph module')
+    reviewed_vendors = {}
     if 'sourcePolicy' in value:
-        from source_policy import validate_source_policy
+        from source_policy import validate_source_policy, verify_vendor_graph
         policy = validate_source_policy(value['sourcePolicy'], value)
         meta = policy['metacubex']
-        local_expected = {meta['module']: meta['replacementPath'],
-                          'github.com/sagernet/sing-tun': './third_party/sing-tun'}
-        local_actual = {name: row['Replace'].get('Path') for name, row in declared.items()
-                        if row.get('Replace') and not row['Replace'].get('Version')}
-        require(local_actual == local_expected, 'actual source graph local replacement inventory differs')
-        for name, path in local_expected.items():
-            expected = declared[name]
-            replacement = expected['Replace']
-            require(expected.get('Sum', '') == '' and replacement.get('Sum', '') == '' and
-                    replacement.get('Version', '') == '', 'local source graph must not invent version or h1')
-            local_replacement_aliases(replacement, declared.get(value['goModule'], {}).get('Dir'), path, name)
+        required_native = {meta['module'], 'github.com/sagernet/sing-tun'}
+        reviewed_vendors = policy.get('vendors', {})
+        if reviewed_vendors:
+            source_row = declared.get(value['goModule'], {})
+            require(source_row.get('Main') is True and isinstance(source_row.get('Dir'), str),
+                    'actual main source graph root differs')
+            verify_vendor_graph(graph, source_row['Dir'], reviewed_vendors)
+        else:
+            local_expected = {meta['module']: meta['replacementPath'],
+                              'github.com/sagernet/sing-tun': './third_party/sing-tun'}
+            local_actual = {name: row['Replace'].get('Path') for name, row in declared.items()
+                            if row.get('Replace') and not row['Replace'].get('Version')}
+            require(local_actual == local_expected, 'actual source graph local replacement inventory differs')
+            for name, path in local_expected.items():
+                expected = declared[name]
+                replacement = expected['Replace']
+                require(expected.get('Sum', '') == '' and replacement.get('Sum', '') == '' and
+                        replacement.get('Version', '') == '', 'local source graph must not invent version or h1')
+                local_replacement_aliases(replacement, declared.get(value['goModule'], {}).get('Dir'), path, name)
+        # The resolved source graph contains all reviewed replacements. Go can
+        # prune unlinked vendors from native BuildInfo; these two remain required.
+        for name in required_native:
             require(name in facts['modules'], 'required local source module absent from native carrier: ' + name)
         require(declared[meta['module']].get('Version') == meta['version'], 'actual Meta source graph version differs')
         actual = facts['modules'].get(meta['module'])
@@ -342,6 +354,9 @@ def check_buildinfo(facts, value, graph, *, os_name, arch, mode, expected_id, ac
             continue
         require(name in declared, 'native module not in actual source graph: ' + name)
         expected = declared[name]
+        if name in reviewed_vendors:
+            require(observed.get('kind') == 'dep' and observed.get('sum', '') == '',
+                    'native local module must not invent h1 or main role: ' + name)
         if expected.get('Main'):
             if observed['kind'] == 'dep':
                 require(observed.get('replacement') == expected['Dir'] and
@@ -422,6 +437,76 @@ def android_api(raw):
     return result[0]
 
 
+
+# Observed generated Java forms for the Go CommandServer HOT owner API and
+# RuntimePersistenceHandler (sagernet/gomobile v0.1.13). Check the declaration
+# and descriptor together: a same-named static/foreign/overloaded method cannot
+# supply the instance callback/error contract used by the Android consumer.
+HOT_JAVA_API = {
+    'CommandServer': [
+        ('public native void startOrReloadServiceWithRetryableRuntimePersistence(java.lang.String, io.nekohasekai.libbox.OverrideOptions, io.nekohasekai.libbox.RuntimePersistenceHandler) throws java.lang.Exception;',
+         '(Ljava/lang/String;Lio/nekohasekai/libbox/OverrideOptions;Lio/nekohasekai/libbox/RuntimePersistenceHandler;)V'),
+        ('public native java.lang.String runtimeCapabilities() throws java.lang.Exception;', '()Ljava/lang/String;'),
+    ],
+    'RuntimePersistenceHandler': [
+        ('public abstract java.lang.String runtimePersistenceMode();', '()Ljava/lang/String;'),
+        ('public abstract void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;',
+         '(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V'),
+    ],
+    'Libbox$proxyRuntimePersistenceHandler': [
+        ('public native java.lang.String runtimePersistenceMode();', '()Ljava/lang/String;'),
+        ('public native void persistRuntimeConfiguration(java.lang.String, long, java.lang.String, java.lang.String) throws java.lang.Exception;',
+         '(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)V'),
+    ],
+    'OverrideOptions': [('public io.nekohasekai.libbox.OverrideOptions();', '()V')],
+}
+HOT_JNI_EXPORTS = frozenset({
+    'JNI_OnLoad',
+    'Java_io_nekohasekai_libbox_CommandServer_startOrReloadServiceWithRetryableRuntimePersistence',
+    'Java_io_nekohasekai_libbox_CommandServer_runtimeCapabilities',
+    'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_persistRuntimeConfiguration',
+    'Java_io_nekohasekai_libbox_Libbox_00024proxyRuntimePersistenceHandler_runtimePersistenceMode',
+})
+
+
+def hot_java_contract(java):
+    """Validate actual javap -s output, including owner, modifier and error ABI."""
+    require(isinstance(java, dict) and set(HOT_JAVA_API) <= set(java), 'HOT Java class inventory missing')
+    package = 'io.nekohasekai.libbox.'
+    for name, methods in HOT_JAVA_API.items():
+        text = java[name]
+        # javap emits one class/interface declaration. Keep its actual receiver
+        # identity and implemented callback interface, not just method substrings.
+        headers = re.findall(r'^([^\n]*\b(?:class|interface) [^\n]*\{)\s*$', text, re.M)
+        expected = ('public interface ' + package + name + ' {' if name == 'RuntimePersistenceHandler' else
+                    ('final class ' if name.startswith('Libbox$') else 'public final class ') + package + name +
+                    ' implements go.Seq$Proxy' +
+                    (',' + package + 'RuntimePersistenceHandler' if name.startswith('Libbox$') else '') + ' {')
+        normalize = lambda value: re.sub(r'\s*,\s*', ',', ' '.join(value.split()))
+        require(len(headers) == 1 and normalize(headers[0]) == normalize(expected), 'HOT Java receiver/interface differs: ' + name)
+        for declaration, descriptor in methods:
+            method = declaration.split('(', 1)[0].rsplit(' ', 1)[-1]
+            pairs = re.findall(r'^\s*([^\n]+;)\s*\n\s*descriptor: ([^\n]+)\s*$', text, re.M)
+            actual = [(normalize(decl), desc.strip()) for decl, desc in pairs
+                      if re.search(r'(?<![\w$])' + re.escape(method) + r'\(', decl)]
+            if name == 'OverrideOptions':
+                # gobind also emits its package-private refnum constructor.
+                # Only the public zero-argument consumer constructor is required.
+                actual = [(decl, desc) for decl, desc in actual if desc == '()V' or '()' in decl]
+            require(actual == [(normalize(declaration), descriptor)], 'HOT Java method/descriptor/error differs: ' + name + '.' + method)
+    return java
+
+
+def inspect_hot_java(classes, tools, run):
+    return hot_java_contract({name: run([tools['javap'], '-s', '-classpath', str(classes),
+                                        'io.nekohasekai.libbox.' + name]) for name in HOT_JAVA_API})
+
+
+def hot_jni_contract(exported):
+    require(HOT_JNI_EXPORTS <= set(exported), 'actual HOT JNI exports missing')
+    return sorted(HOT_JNI_EXPORTS)
+
+
 def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
     validate(value)
     helper = module('formal_mobile_buildinfo', 'scripts/libbox-patches/android-source.py')
@@ -462,11 +547,13 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
                 exported = {m[1] for m in re.finditer(r'GLOBAL\s+DEFAULT\s+(?!UND\b)\S+\s+(\S+)', symbols)}
                 require('JNI_OnLoad' in exported and any(n.startswith('Java_go_Seq_') for n in exported),
                         'actual generated JNI loader/sequence exports missing')
+                hot_jni_contract(exported)
                 row.update(goBuildInfo=info, parsedBuildInfo=facts, buildID=actual_id, androidAPI=24,
                            jniExports=sorted(n for n in exported if n.startswith(('Java_', 'JNI_'))))
             native[name] = row
         classes = scratch / 'classes.jar'
         classes.write_bytes(archive.read('classes.jar'))
+        hot_java = inspect_hot_java(classes, tools, run)
         interfaces = {}
         for name in ['Libbox', 'CommandServer', 'PlatformInterface', 'ConfigValidationResult', 'ExchangeContext', 'LocalDNSTransport', 'Func']:
             interfaces[name] = run([tools['javap'], '-constants', '-classpath', str(classes), 'io.nekohasekai.libbox.' + name])
@@ -488,7 +575,7 @@ def inspect_aar(aar, value, graph, tools, run, scratch, expected_id):
         for setter in ['setRequestID(', 'setConfigDigest(', 'setValidation(', 'setCleanup(', 'setTailscaleStoreRetirement(', 'setTailscaleStoreMembership(']:
             require(setter not in interfaces['ConfigValidationResult'], 'validation result must be readonly')
         return {'format': 'AAR', 'artifact': file_pin(aar), 'nativeLibraries': native,
-                'classes': file_pin(classes), 'javaInterfaces': interfaces,
+                'classes': file_pin(classes), 'javaInterfaces': interfaces, 'hotJavaInterfaces': hot_java,
                 'manifestSha256': sha(archive.read('AndroidManifest.xml')), 'minimumAPI': 24}
 
 
@@ -531,6 +618,62 @@ def framework_entry_targets(entry):
             len(architectures) == len(expected) and set(architectures) == set(expected),
             'framework declared architecture inventory differs')
     return ({'ios-arm64-simulator'} if entry.get('SupportedPlatformVariant') == 'simulator' else {'ios-arm64'})
+
+
+def objc_hot_contract(header):
+    # Expected declarations are derived from libbox's Go API and pinned
+    # sagernet/gomobile v0.1.13 (9f03b8f25789099c5c8abef4a02085da783ba923),
+    # bind/genobjc.go:funcSummary/asSignature/objcType/objcParamType and
+    # bind/types.go:isNullableType. They are not an observed fresh framework.
+    # In particular, (string, error) returns NSString* _Nonnull plus NSError**,
+    # not BOOL plus an NSString output argument. Actual framework inspection
+    # and Swift compilation remain required for each newly built source.
+    handler = {
+        'runtimePersistenceMode': '- (NSString* _Nonnull)runtimePersistenceMode;',
+        'persistRuntimeConfiguration': '- (BOOL)persistRuntimeConfiguration:(NSString* _Nullable)incarnation revision:(int64_t)revision effectiveDigest:(NSString* _Nullable)effectiveDigest configContent:(NSString* _Nullable)configContent error:(NSError* _Nullable* _Nullable)error;',
+    }
+    expected = {
+        ('interface', 'LibboxCommandServer', 'goSeqRefInterface'): {
+            'runtimeCapabilities': '- (NSString* _Nonnull)runtimeCapabilities:(NSError* _Nullable* _Nullable)error;',
+            'startOrReloadServiceWithRetryableRuntimePersistence': '- (BOOL)startOrReloadServiceWithRetryableRuntimePersistence:(NSString* _Nullable)configContent options:(LibboxOverrideOptions* _Nullable)options handler:(id<LibboxRuntimePersistenceHandler> _Nullable)handler error:(NSError* _Nullable* _Nullable)error;',
+        },
+        ('protocol', 'LibboxRuntimePersistenceHandler', 'NSObject'): handler,
+        ('interface', 'LibboxRuntimePersistenceHandler', 'goSeqRefInterface, LibboxRuntimePersistenceHandler'): handler,
+        ('interface', 'LibboxOverrideOptions', 'goSeqRefInterface'): {
+            'init': '- (nonnull instancetype)init;',
+        },
+    }
+    code = re.sub(r'/\*.*?\*/', '', header, flags=re.S)
+    code = re.sub(r'//[^\n]*', '', code)
+    tokens = lambda text: re.findall(r'[A-Za-z_]\w*|[^\s]', text)
+    observed = {}
+    for (kind, owner, protocols), declarations in expected.items():
+        prefix = '@' + kind + r'\s+' + owner + r'\b'
+        # Forward protocol declarations do not define a callable receiver.
+        require(len(re.findall(prefix + r'(?!\s*;)', code)) == 1,
+                'one generated Objective-C HOT receiver required: ' + kind + ' ' + owner)
+        base = r'\s*:\s*NSObject\s*' if kind == 'interface' else r'\s*'
+        body = r'\s*\{\s*\}' if kind == 'interface' else ''
+        receivers = re.findall(prefix + base + r'<([^<>]+)>' + body + r'(.*?)@end\b', code, re.S)
+        require(len(receivers) == 1 and tokens(receivers[0][0]) == tokens(protocols),
+                'generated Objective-C HOT receiver/conformance differs: ' + kind + ' ' + owner)
+        statements = receivers[0][1].split(';')
+        require(not statements[-1].strip(), 'unterminated Objective-C HOT declaration: ' + owner)
+        methods = {}
+        for statement in statements[:-1]:
+            statement = statement.strip()
+            if not statement:
+                continue
+            if statement.startswith('@property') and kind == 'interface':
+                continue
+            method = re.fullmatch(r'([-+])\s*\(([^()]*)\)\s*([A-Za-z_]\w*)\s*(.*)', statement, re.S)
+            require(method is not None, 'unexpected Objective-C HOT declaration: ' + owner)
+            methods.setdefault(method[3], []).append(tokens(statement + ';'))
+        for name, declaration in declarations.items():
+            require(methods.get(name) == [tokens(declaration)],
+                    'generated Objective-C HOT method differs: ' + kind + ' ' + owner + '.' + name)
+        observed['@' + kind + ' ' + owner] = declarations
+    return observed
 
 
 def objc_validation_getter_contract(header):
@@ -647,6 +790,7 @@ def _inspect_framework(framework, value, graph, expected_id, reads):
                        'getTailscaleStoreRetirement', 'getTailscaleStoreMembership', 'wakeNow', 'recordScreenState']:
             require(symbol in header, 'generated Objective-C API missing: ' + symbol)
         validation_getters = objc_validation_getter_contract(header)
+        hot_contract = objc_hot_contract(header)
         for slice_row in slices:
             members = [m for m in slice_row['archive']['members'] if m['classification'] == 'code']
             require(members, 'static archive has no code')
@@ -675,6 +819,7 @@ def _inspect_framework(framework, value, graph, expected_id, reads):
             observed[target] = {'libraryIdentifier': identifier, 'binary': binary_pin,
                 'headerSha256': {name: sha(text.encode()) for name, text in headers.items()},
                 'validationResultGetterContract': validation_getters,
+                'hotObjectiveCContract': hot_contract,
                 'goBuildInfo': infos[0], 'buildID': ids[0],
                 'linkerOptions': [{'memberOrdinal': m['ordinal'], 'memberName': m['name'],
                                   'memberSha256': m['sha256'], 'command': command}

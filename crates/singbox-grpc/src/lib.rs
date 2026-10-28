@@ -39,6 +39,8 @@ pub mod daemon {
 
 mod h2c;
 mod reconnect;
+mod runtime_config;
+pub use runtime_config::{RuntimeConfigError, RUNTIME_CONFIG_MAX_MESSAGE_BYTES};
 
 // vendored proto ⇄ 真核 wire 契约对拍器。**同一份文件被多处 `include!`**：
 // `build.rs`（release 硬门，对拍随包核）、`tests/` 下的 wire 测试（开发机 + 无核的机制自验）、

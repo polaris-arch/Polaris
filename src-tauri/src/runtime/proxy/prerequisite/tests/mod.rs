@@ -1,3 +1,4 @@
+use super::super::tests::post_admission_failure_config;
 use super::*;
 use std::sync::atomic::AtomicUsize;
 
@@ -704,7 +705,9 @@ fn stop_at_ready_commit_boundary_prevents_commit_and_started_publication() {
 async fn running_before_transaction_commit_only_joins_its_current_saved_producer() {
     let (runtime, _dir) = runtime();
     let state_gate = runtime.mesh.tailscale_state_gate().await;
-    let mut producer = runtime.normal_start_completion(Value::Null).unwrap();
+    let mut producer = runtime
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     while matches!(
         &*producer.borrow_and_update(),
         NormalStartCompletion::Pending(_)
@@ -713,12 +716,12 @@ async fn running_before_transaction_commit_only_joins_its_current_saved_producer
     }
     runtime.status.write().unwrap().running = true;
     let joined = runtime
-        .join_current_normal_start(&Value::Null)
+        .join_current_normal_start(&post_admission_failure_config())
         .unwrap()
         .unwrap();
     assert!(producer.same_channel(&joined));
     assert!(runtime
-        .join_current_normal_start(&serde_json::json!(false))
+        .join_current_normal_start(&different_failure_config())
         .unwrap()
         .is_none());
     assert!(runtime.ready_main.read().unwrap().is_none());
@@ -761,7 +764,9 @@ async fn current_same_config_producer_is_shared_and_waiter_drop_never_stops_it()
     let (runtime, _dir) = runtime();
     let state_gate = runtime.mesh.tailscale_state_gate().await;
     // Invalid input terminates before any spawn/probe after the gate is released.
-    let mut first = runtime.normal_start_completion(Value::Null).unwrap();
+    let mut first = runtime
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     while matches!(
         &*first.borrow_and_update(),
         NormalStartCompletion::Pending(_)
@@ -773,7 +778,9 @@ async fn current_same_config_producer_is_shared_and_waiter_drop_never_stops_it()
         .admitted_native_producer(generation)
         .unwrap()
         .unwrap();
-    let second = runtime.normal_start_completion(Value::Null).unwrap();
+    let second = runtime
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     assert!(Arc::ptr_eq(
         &original_cell,
         &runtime
@@ -821,7 +828,9 @@ async fn current_same_config_producer_is_shared_and_waiter_drop_never_stops_it()
 async fn different_config_cannot_join_and_old_completion_cannot_follow_successor() {
     let (runtime, _dir) = runtime();
     let state_gate = runtime.mesh.tailscale_state_gate().await;
-    let mut first = runtime.normal_start_completion(Value::Null).unwrap();
+    let mut first = runtime
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     while matches!(
         &*first.borrow_and_update(),
         NormalStartCompletion::Pending(_)
@@ -834,7 +843,7 @@ async fn different_config_cannot_join_and_old_completion_cannot_follow_successor
         .unwrap()
         .unwrap();
     let mut second = runtime
-        .normal_start_completion(serde_json::json!(false))
+        .normal_start_completion(different_failure_config())
         .unwrap();
     assert!(!first.same_channel(&second));
     assert!(!old_cell.reclaimable());
@@ -879,7 +888,9 @@ async fn explicit_same_config_replaces_pending_action_producer_before_dispatch()
     let base = runtime.core_generation();
     // Neither producer can run yet on the current-thread executor. Explicit Start must
     // replace even an identical pending action producer; subsequent actions join the new one.
-    let mut action = runtime.normal_start_completion(Value::Null).unwrap();
+    let mut action = runtime
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     let action_cell = Arc::clone(
         &runtime
             .normal_start
@@ -889,7 +900,9 @@ async fn explicit_same_config_replaces_pending_action_producer_before_dispatch()
             .unwrap()
             .identity,
     );
-    let mut explicit = runtime.explicit_start_completion(Value::Null).unwrap();
+    let mut explicit = runtime
+        .explicit_start_completion(post_admission_failure_config())
+        .unwrap();
     let explicit_cell = Arc::clone(
         &runtime
             .normal_start
@@ -901,7 +914,9 @@ async fn explicit_same_config_replaces_pending_action_producer_before_dispatch()
     );
     assert!(!Arc::ptr_eq(&action_cell, &explicit_cell));
     assert_eq!(runtime.normal_start.lock().unwrap().retained.len(), 2);
-    let joined_action = runtime.normal_start_completion(Value::Null).unwrap();
+    let joined_action = runtime
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     assert!(!action.same_channel(&explicit));
     assert!(explicit.same_channel(&joined_action));
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -947,9 +962,11 @@ async fn latest_different_config_registered_before_dispatch_wins_once() {
     let state_gate = runtime.mesh.tailscale_state_gate().await;
     let base = runtime.core_generation();
     // Current-thread runtime cannot poll either producer until both requests are registered.
-    let mut first = runtime.normal_start_completion(Value::Null).unwrap();
+    let mut first = runtime
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     let mut second = runtime
-        .normal_start_completion(serde_json::json!(false))
+        .normal_start_completion(different_failure_config())
         .unwrap();
     assert!(!first.same_channel(&second));
     while !matches!(
@@ -982,7 +999,9 @@ async fn latest_different_config_registered_before_dispatch_wins_once() {
 async fn stop_between_pending_and_dispatch_then_new_start_uses_new_producer() {
     let (runtime, _dir) = runtime();
     let state_gate = runtime.mesh.tailscale_state_gate().await;
-    let mut old = runtime.normal_start_completion(Value::Null).unwrap();
+    let mut old = runtime
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     let old_cell = Arc::clone(
         &runtime
             .normal_start
@@ -996,7 +1015,9 @@ async fn stop_between_pending_and_dispatch_then_new_start_uses_new_producer() {
         .gate
         .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop)
         .unwrap();
-    let mut new = runtime.normal_start_completion(Value::Null).unwrap();
+    let mut new = runtime
+        .normal_start_completion(post_admission_failure_config())
+        .unwrap();
     assert!(
         !old.same_channel(&new),
         "the new explicit action cannot join Stop's obsolete pending producer"
@@ -1030,7 +1051,7 @@ async fn guarded_requested_generation_is_not_final_native_birth_generation() {
     let producer_runtime = Arc::clone(&runtime);
     let task = tokio::spawn(async move {
         producer_runtime
-            .start_guarded(Value::Null, Some(base))
+            .start_guarded(post_admission_failure_config(), Some(base))
             .await
     });
     let (cell, mut completion) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1066,7 +1087,9 @@ async fn guarded_requested_generation_is_not_final_native_birth_generation() {
 async fn completed_prebirth_normal_requests_do_not_accumulate_native_catalog_entries() {
     let (runtime, _dir) = runtime();
     for _ in 0..16 {
-        let mut completion = runtime.explicit_start_completion(Value::Null).unwrap();
+        let mut completion = runtime
+            .explicit_start_completion(post_admission_failure_config())
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while !matches!(
                 &*completion.borrow_and_update(),
@@ -1132,16 +1155,22 @@ async fn action_producer_cannot_rebase_after_stop_or_cancellation() {
         .unwrap();
     assert!(runtime
         .register_normal_start(
-            serde_json::json!(false),
+            different_failure_config(),
             true,
-            Some((captured, Arc::clone(&attempt)))
+            Some((captured, Arc::clone(&attempt))),
+            None,
         )
         .is_err());
     assert_eq!(runtime.core_generation(), stopped);
     assert!(runtime.normal_start.lock().unwrap().as_ref().is_none());
     attempt.cancel();
     assert!(runtime
-        .register_normal_start(serde_json::json!(false), true, Some((stopped, attempt)))
+        .register_normal_start(
+            different_failure_config(),
+            true,
+            Some((stopped, attempt)),
+            None
+        )
         .is_err());
     assert_eq!(runtime.core_generation(), stopped);
     assert!(runtime.normal_start.lock().unwrap().as_ref().is_none());
@@ -1156,9 +1185,10 @@ async fn cancellation_after_queue_before_dispatch_cannot_birth_a_producer() {
     let captured = runtime.core_generation();
     let mut completion = runtime
         .register_normal_start(
-            serde_json::json!(false),
+            different_failure_config(),
             true,
             Some((captured, Arc::clone(&attempt))),
+            None,
         )
         .unwrap();
     attempt.cancel();
@@ -1395,4 +1425,10 @@ fn diagnostic_custom_keys_require_exact_committed_emission_and_generation() {
     core.committed.store(true, Ordering::SeqCst);
     runtime.gate.bump_generation();
     assert!(runtime.diagnostic_runtime_secret_keys(&emitted).is_none());
+}
+
+fn different_failure_config() -> Value {
+    let mut config = post_admission_failure_config();
+    config["selectedServerId"] = serde_json::json!("different-fixture");
+    config
 }

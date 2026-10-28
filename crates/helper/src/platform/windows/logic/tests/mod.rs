@@ -296,7 +296,7 @@ fn scm_stop_is_observed_without_a_client_connection() {
 
     let poll = service_function(&src, "fn connect_pipe_until_stopped(");
     let mode = poll
-        .find("let mode = PIPE_NOWAIT | PIPE_READMODE_BYTE;")
+        .find("let mode = PIPE_NOWAIT | PIPE_READMODE_MESSAGE;")
         .unwrap();
     let apply = poll.find("SetNamedPipeHandleState(h, &mode,").unwrap();
     let stop = poll.find("if stopped()").unwrap();
@@ -308,10 +308,13 @@ fn scm_stop_is_observed_without_a_client_connection() {
         .unwrap();
     let second_stop = connected.find("if stopped()").unwrap();
     let blocking = connected
-        .find("let blocking = PIPE_WAIT | PIPE_READMODE_BYTE;")
+        .find("let blocking = PIPE_WAIT | PIPE_READMODE_MESSAGE;")
         .unwrap();
     assert!(second_stop < blocking);
     assert!(connected.contains("SetNamedPipeHandleState(h, &blocking,"));
+    assert!(!poll.contains("PIPE_READMODE_BYTE"));
+    let create = service_function(&src, "fn create_pipe_instance(");
+    assert!(create.contains("PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT"));
     assert!(poll.contains("if error != ERROR_PIPE_LISTENING"));
     assert!(poll.contains("std::thread::sleep(std::time::Duration::from_millis(25))"));
 
@@ -323,11 +326,31 @@ fn scm_stop_is_observed_without_a_client_connection() {
 // Windows-only service glue is compiled by the cross-target gate; the host tests
 // above exercise native custody outcomes. These checks cover the final exit commit.
 fn service_function<'a>(source: &'a str, anchor: &str) -> &'a str {
+    assert_eq!(
+        source.matches(anchor).count(),
+        1,
+        "service anchor: {anchor}"
+    );
     let start = source.find(anchor).expect("service function missing");
-    let end = source[start..]
-        .find("\n}\n")
-        .expect("service function end missing");
-    &source[start..start + end]
+    let masked = polaris_source_probe::mask_comments_and_strings(source);
+    let open = start
+        + masked[start..]
+            .find('{')
+            .expect("service function body missing");
+    let mut depth = 0;
+    for (offset, byte) in masked.as_bytes().iter().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..=offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("service function end missing: {anchor}");
 }
 
 #[test]
@@ -400,11 +423,7 @@ fn response_write_is_bounded_and_unauthenticated_replies_never_wait_for_the_peer
     assert_eq!(src.matches("fn handle_connection<").count(), 1);
 
     // ① write_response 本体：有取消守卫 + flush 受 mode 约束（不再无条件 flush）。
-    let wat = src.find("fn write_response(").expect("write_response 消失");
-    let wend = src[wat..]
-        .find("\n/// 断开并关闭管道实例")
-        .map_or(src.len(), |i| wat + i);
-    let wbody = &src[wat..wend];
+    let wbody = service_function(&src, "fn write_response(");
     assert!(
         wbody.contains("IoTimeoutGuard::arm("),
         "写路径无取消守卫：FlushFileBuffers 可被不读数据的对端无限期钉住"
@@ -421,13 +440,16 @@ fn response_write_is_bounded_and_unauthenticated_replies_never_wait_for_the_peer
     // ② 调用点分档：档位判据已搬到跨平台的 `WinHelper::handle_frame`（行为门见
     //    `windows/helper/tests/wire_gate.rs`：token 不对 / 帧不合法 ⇒ NoWait，已鉴权 ⇒ WaitPeer，
     //    含已鉴权而命令未知的 `ERR unknown`）。这里只钉住 service 层**照档位执行、不自行改档**。
-    let hat = src
-        .find("fn handle_connection<")
-        .expect("handle_connection 消失");
-    let hend = src[hat..]
-        .find("\n/// 读一个请求帧")
-        .map_or(src.len(), |i| hat + i);
-    let hbody = &src[hat..hend];
+    let hbody = service_function(&src, "fn handle_connection<");
+    assert!(hbody.contains("helper.handle_frame_from_peer(&raw, Some(&peer))"));
+    assert!(
+        !hbody.contains("fn read_frame("),
+        "guard borrowed the next function"
+    );
+    assert!(
+        !hbody.contains("fn write_response("),
+        "guard borrowed flush implementation"
+    );
     assert!(hbody.contains("cleanup_pipe(h)"), "窗口没盖住连接处理");
     assert!(
         hbody.contains("write_response(h, reply.line.as_bytes(), reply.flush)"),
@@ -457,7 +479,7 @@ fn windows_native_dns_wait_is_bounded_without_a_subprocess() {
         .split("    fn flush_dns(")
         .nth(1)
         .unwrap()
-        .split("    fn enable_ip_forwarding(")
+        .split("    fn read_object_security(")
         .next()
         .unwrap();
     assert!(body.contains("admission.launch(polaris_system_integration::windows_dns::begin_flush)"));
@@ -667,4 +689,23 @@ fn config_confinement_rejects_traversal_and_windows_aliases() {
         assert!(!cfg_allowed(path, base), "accepted alias {path}");
     }
     assert!(cfg_allowed(r"C:\registered\配置.json", base));
+}
+
+#[test]
+fn lan_listening_has_no_native_host_router_writer() {
+    let source = polaris_source_probe::crate_source!("platform/windows/winproc/win.rs");
+    for forbidden in [
+        "enable_ip_forwarding",
+        "IPEnableRouter",
+        "forwarding=enabled",
+        "RegSetValueExW",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "implicit host router writer returned: {forbidden}"
+        );
+    }
+    assert!(source.contains("let forwarding_ms = 0;"));
+    let ops = polaris_source_probe::crate_source!("platform/windows/ops.rs");
+    assert!(!ops.contains("fn enable_ip_forwarding"));
 }

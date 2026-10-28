@@ -464,17 +464,18 @@ fn resolve_core_binary_env_override_rejects_missing_file() {
 }
 
 #[test]
-fn resolve_core_binary_env_override_accepts_real_file() {
-    let f = std::env::temp_dir().join(format!(
-        "polaris-fake-core-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
-    ));
+fn resolve_core_binary_env_override_rejects_same_name_foreign_file() {
+    let dir = crate::test_support::TestDir::new("polaris-foreign-core-");
+    let f = dir.join(if cfg!(windows) {
+        "sing-box.exe"
+    } else {
+        "sing-box"
+    });
     std::fs::write(&f, b"#!/bin/sh\n").unwrap();
     let path = f.to_string_lossy().into_owned();
     temp_env_var("POLARIS_SINGBOX_PATH", &path, || {
-        assert_eq!(resolve_core_binary().unwrap(), f);
+        let error = resolve_core_binary().unwrap_err();
+        assert!(error.contains("POLARIS_SINGBOX_PATH"));
     });
     let _ = std::fs::remove_file(&f);
 }
@@ -778,7 +779,8 @@ async fn main_start_rejects_final_system_endpoints_with_node_diagnostics() {
             // Test runtimes deny resolving a real binary, so a missing guard cannot spawn either.
             // The ownership code and node report prove this guard, rather than binary denial, fired.
             let config = serde_json::json!({"servers":[{"id":"vpn", "name":"System VPN", "protocol":protocol,
-                settings_key:settings}], "selectedServerId":"vpn", "proxyMode":"global", "proxyModeType":mode});
+                settings_key:settings}], "selectedServerId":"vpn", "proxyMode":"global", "proxyModeType":mode,
+                "clashApiSecret":FIXTURE_MANAGEMENT_SECRET});
             let error = rt.start(config).await.unwrap_err();
             assert_eq!(error.code, Some(code::SYSTEM_INTERFACE_REQUIRES_HELPER));
             assert!(error.message.contains("System VPN"));
@@ -4464,9 +4466,9 @@ fn the_management_secret_has_a_single_reader() {
     const READERS: &[(&str, usize, usize, &str)] = &[
         (
             "commands/config.rs",
-            5,
+            3,
             0,
-            "secret 的生成与回填方：读它是为了判断要不要生成，另有后端独写键的名单，都不是取来用。",
+            "安全维护的两次存在性读取（加载快照、事务内 latest）和一次生成值插入；不是客户端取值。secret 不属于后端独写键，前端重置仍有写入权。",
         ),
         (
             "commands/server.rs",
@@ -4480,6 +4482,12 @@ fn the_management_secret_has_a_single_reader() {
             1,
             0,
             "从原始配置 JSON 取这个键的单点。",
+        ),
+        (
+            "runtime/proxy/runtime_config.rs",
+            1,
+            0,
+            "structural_runtime_change compares opaque old/new values; it does not grant management credentials to clients.",
         ),
         (
             "runtime/proxy/startup.rs",
@@ -4670,6 +4678,125 @@ async fn startup_capability_proof_survives_eviction_but_rejects_real_replacement
         validate_startup_cli_proof(Some(&binary), &proof.snapshot, Some(&proof)),
         Err("Core bytes changed after capability query; retry startup".into())
     );
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::test]
+async fn direct_startup_requires_present_current_hashed_file_proof() {
+    use crate::runtime::proxy::startup::require_direct_startup_cli_proof;
+    use crate::runtime::tls_fingerprints::probe_cli_observation;
+    let (_rt, dir) = test_runtime();
+    let binary = dir.join("direct-proof");
+    // ProbeFile::Native recognizes a script without executing it. This is a
+    // real retained file observation, not a production missing-proof exemption.
+    std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
+    let proof = probe_cli_observation(&binary).await.unwrap();
+    assert!(proof.snapshot.document.is_none());
+    assert!(require_direct_startup_cli_proof(&binary, Some(&proof)).is_ok());
+    assert!(require_direct_startup_cli_proof(&binary, None).is_err());
+    assert!(require_direct_startup_cli_proof(&dir.join("other-core"), Some(&proof)).is_err());
+    let mut unhashed = proof.clone();
+    unhashed.snapshot.binary_sha256 = None;
+    assert!(require_direct_startup_cli_proof(&binary, Some(&unhashed)).is_err());
+    let replacement = dir.join("direct-replacement");
+    std::fs::write(&replacement, b"#!/bin/xx\n").unwrap();
+    std::fs::rename(&replacement, &binary).unwrap();
+    assert!(require_direct_startup_cli_proof(&binary, Some(&proof)).is_err());
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::test]
+async fn direct_startup_capture_rejects_missing_changed_and_poisoned_proof() {
+    use crate::runtime::proxy::process_supervision::RunIdentity;
+    use crate::runtime::tls_fingerprints::probe_cli_observation;
+    let (rt, dir) = test_runtime();
+    let binary = dir.join("direct-capture");
+    std::fs::write(&binary, b"#!/bin/sh\n").unwrap();
+    let proof = probe_cli_observation(&binary).await.unwrap();
+    let generation = rt.core_generation();
+    let identity = RunIdentity::new();
+    assert!(rt
+        .capture_direct_startup_cli_proof(&binary, None, generation, &identity)
+        .is_err());
+    assert!(rt.captured_cli_run.lock().unwrap().is_none());
+    rt.capture_direct_startup_cli_proof(&binary, Some(&proof), generation, &identity)
+        .unwrap();
+    {
+        let captured = rt.captured_cli_run.lock().unwrap();
+        let (actual_generation, actual_identity, actual_proof) = captured.as_ref().unwrap();
+        assert_eq!(*actual_generation, generation);
+        assert!(actual_identity.same_run(&identity));
+        assert_eq!(
+            actual_proof.snapshot.binary_sha256,
+            proof.snapshot.binary_sha256
+        );
+    }
+    let replacement = dir.join("capture-replacement");
+    std::fs::write(&replacement, b"#!/bin/xx\n").unwrap();
+    std::fs::rename(&replacement, &binary).unwrap();
+    assert!(rt
+        .capture_direct_startup_cli_proof(&binary, Some(&proof), generation, &identity)
+        .is_err());
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _captured = rt.captured_cli_run.lock().unwrap();
+        panic!("poison byte-proof custody for the negative fixture");
+    }));
+    assert!(poisoned.is_err());
+    assert!(rt
+        .capture_direct_startup_cli_proof(&binary, Some(&proof), generation, &identity)
+        .unwrap_err()
+        .contains("custody is unavailable"));
+}
+
+#[test]
+fn direct_startup_proof_rejection_preserves_actual_birth_cleanup() {
+    let source = crate::test_support::crate_code("runtime/proxy/startup.rs");
+    let start = method_body(&source, "    pub(super) async fn start_inner(");
+    let factory = start
+        .split_once("let direct_spawn = self.spawn_direct_native(")
+        .unwrap()
+        .1;
+    let factory = factory.split_once("if direct_spawn.is_err()").unwrap().0;
+    assert!(
+        factory.find("require_direct_startup_cli_proof(").unwrap()
+            < factory.find("TokioSpawner::new().spawn(req)").unwrap()
+    );
+    assert!(factory.contains("direct_proof_rejected.set(true)"));
+    let success = start
+        .split_once("Ok(Some((pid, identity))) => {")
+        .unwrap()
+        .1;
+    let success = success
+        .split_once("Ok(None) => return Ok(self.status()),")
+        .unwrap()
+        .0;
+    assert!(success.contains("capture_direct_startup_cli_proof("));
+    assert!(success.contains("reject_direct_startup_cli_proof(my_gen, &identity, ts_gate, reason)"));
+    assert!(!success.contains("confirmed_no_external_writer"));
+    assert!(
+        success.find("reject_direct_startup_cli_proof(").unwrap()
+            < success
+                .find("direct_run_identity = Some(identity)")
+                .unwrap()
+    );
+    let rejection = method_body(&source, "    async fn reject_direct_startup_cli_proof(");
+    assert!(
+        rejection.find("slot.running_matches(identity)").unwrap()
+            < rejection
+                .find("self.kill_core_and_release_main(ts_gate).await")
+                .unwrap()
+    );
+    assert!(rejection.contains("self.gate.generation() != generation"));
+    assert!(rejection.contains("code::CORE_BUNDLE_MISMATCH"));
+    assert!(!rejection.contains("confirmed_no_external_writer"));
+    assert!(!rejection.contains(".take()"));
+    let admission = crate::test_support::method_body(
+        &source,
+        "pub(super) fn require_direct_startup_cli_proof<'a>(",
+    );
+    assert!(admission.contains("proof.snapshot.binary_sha256.is_some() && proof.matches(binary)"));
+    assert!(!admission.contains("cfg(test)"));
+    assert!(start.contains("if via_helper\n                && startup_cli_proof"));
 }
 
 #[tokio::test]

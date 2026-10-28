@@ -103,7 +103,7 @@ function bundles(source) {
 // throws here. always() keeps an in-flight installer leg alive after its run is
 // cancelled (GitHub re-evaluates `if` on cancellation), which is what made a
 // superseded Release Risk run hold its concurrency group to the end.
-function jobAllows(source, name, setup, core, provided, runCancelled = false) {
+function jobAllows(source, name, setup, core, provided, runCancelled = false, linuxAuthPreflightOnly = false) {
   const block = /    if: >-\n((?:      .*\n)+)/.exec(job(source, name));
   assert.ok(block, `${name} needs explicit reusable-source skip allowlist`);
   const expression = block[1].split('\n').map((line) => line.trim()).join(' ');
@@ -111,10 +111,11 @@ function jobAllows(source, name, setup, core, provided, runCancelled = false) {
   // Only immutable status/input dictionaries are supplied; no workflow is run.
   return Boolean(Function('needs', 'inputs', 'cancelled', `return (${expression});`)(
     { setup: { result: setup }, desktop_core: { result: core } },
-    { core_bundle_artifact: provided ? 'desktop-core-bundle-exact-candidate' : '' }, () => runCancelled));
+    { core_bundle_artifact: provided ? 'desktop-core-bundle-exact-candidate' : '',
+      linux_auth_preflight_only: linuxAuthPreflightOnly }, () => runCancelled));
 }
 function checkAllowlist(source) {
-  assert.match(job(source, 'desktop_core'), /if: inputs.core_bundle_artifact == ''/);
+  assert.match(job(source, 'desktop_core'), /^    if: inputs\.linux_auth_preflight_only != true && \(inputs\.core_bundle_artifact == ''\)$/m);
   // Installer legs and the single wire job share one allowlist.
   for (const name of ['package', 'core_wire']) {
     for (const [setup, core, provided, allowed] of [
@@ -126,6 +127,8 @@ function checkAllowlist(source) {
       assert.equal(jobAllows(source, name, setup, core, provided), allowed, `${name}: ${setup}/${core}/provided=${provided}`);
       // A cancelled run stops the job on every row, including the two allowed ones.
       assert.equal(jobAllows(source, name, setup, core, provided, true), false, `${name}: cancelled run ${setup}/${core}/provided=${provided}`);
+      assert.equal(jobAllows(source, name, setup, core, provided, false, true), false,
+        `${name}: auth-preflight-only ${setup}/${core}/provided=${provided}`);
     }
   }
 }
@@ -249,6 +252,19 @@ test('exact same-run artifacts preserve platform directories and pass assemble p
 
 test('Package reuses the provided bundle without a second producer and rejects failed or cancelled source jobs', () => {
   checkAllowlist(files.package);
+  // Auth-preflight-only runs must never start producers, installers or wire consumers.
+  for (const name of ['desktop_core', 'package', 'core_wire']) {
+    const before = job(files.package, name);
+    for (const [guard, replacement] of [
+      ['inputs.linux_auth_preflight_only != true && ', ''],
+      ['inputs.linux_auth_preflight_only != true', 'inputs.linux_auth_preflight_only == true'],
+      ['inputs.linux_auth_preflight_only != true && ', 'inputs.linux_auth_preflight_only != true || '],
+    ]) {
+      const after = before.replace(guard, replacement);
+      assert.notEqual(after, before, `${name}: mutation must reach the actual preflight guard`);
+      assert.throws(() => checkAllowlist(files.package.replace(before, after)), `${name}: weakened preflight guard`);
+    }
+  }
   assert.throws(() => checkAllowlist(files.package.replace("needs.desktop_core.result == 'success'", "needs.desktop_core.result != 'failure'")));
   assert.throws(() => checkAllowlist(files.package.replaceAll(" && inputs.core_bundle_artifact != ''", '')));
   // Each job is held to the allowlist on its own: weakening only one of the two must fail.

@@ -157,7 +157,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     { file: 'ui/src/mobile/settings/MobileSettings.test.tsx', mustContain: '⑩ 写失败必须可见' },
   ],
   actions: [
-    { id: 'CoexWindowsSources.tsx|k:settings.coex.displayed+settings.coex.next+settings.coex.observedEmpty+settings.coex.previous+settings.coex.rows+settings.coex.total', disposition: { kind: 'platform-absent', evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' } }, note: 'Windows 来源行与分页总览；当前移动端 provider 返回 unavailable/Unknown，未挂载桌面来源 UI，不是永久 OS 能力结论。' },
+    
     { id: 'CoexWindowsSources.tsx|k:settings.coex.previous', disposition: { kind: 'platform-absent', evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' } }, note: 'Windows 五来源手动诊断分页；移动端未挂载，不调用桌面采集命令。' },
     { id: 'CoexWindowsSources.tsx|k:settings.coex.next', disposition: { kind: 'platform-absent', evidence: { file: 'src-tauri/src/commands/coexistence_snapshot.rs', mustContain: 'if !matches!(platform, Platform::Linux | Platform::Mac | Platform::Win) {' } }, note: 'Windows 五来源手动诊断分页；移动端未挂载，不调用桌面采集命令。' },
 
@@ -168,6 +168,11 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
      * 终端环境变量的两颗复制与 `proxy.clear` 就是从这条缝漏掉的（2026-09-06 复审 major）。
      */
 
+    {
+      id: 'SettingsDns.tsx|k:rules.dnsWorkspace.rulesTab',
+      disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: "{ id: 'dns' as const, label: tr('mobileRules.seg.dns'), count: dnsRows.length }" } },
+      note: '桌面 v2 FakeIP 的定位链接打开 DNS 规则；移动端同一编辑能力位于规则页 DNS 分段。登记的是实际目标能力，不声称移动设置页也有该快捷按钮；不新增 FakeIP 开关。',
+    },
     { id: 'AppUpdateCard.tsx|k:mobileSettings.update.openReleases', disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/settings/UpdatePage.tsx', mustContain: 'openReleases' } }, note: 'Manual release-page navigation is available in both update surfaces.' },
     /* ── 应用更新卡（整卡的处置见 blocks 面 AppUpdateCard 一条）──────────────── */
     {
@@ -362,24 +367,10 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       },
       note: '桌面报告标题中的刷新动作；移动端同一报告块在加载时禁用按钮，刷新失败保留上一份报告并显式报错。',
     },
-    {
-      id: 'MeshRouteEvidenceBlock.tsx|k:common.refresh#2',
-      disposition: {
-        kind: 'ported',
-        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: "t('settings.tun.forceRouteLoading')" },
-      },
-      note: '报告读取中的可见文案：初次加载占位、已有结果刷新时的行内状态共用此键。',
-    },
+    
     // 旧 EndpointForceRouteBlock 仍在桌面目录中、被动作提取器枚举；实际 SettingsTun 已换成
     // MeshRouteEvidenceBlock。它的刷新与加载能力同样由移动报告块承担。
-    {
-      id: 'EndpointForceRouteBlock.tsx|k:common.refresh+settings.tun.forceRouteBlock+settings.tun.forceRouteHint+settings.tun.forceRouteLoading',
-      disposition: {
-        kind: 'ported',
-        mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: 'className="ms-force-refresh" onClick={onRefresh} disabled={loading}' },
-      },
-      note: '旧桌面报告块的刷新入口，移动报告块仍提供相同动作；当前桌面路由使用 MeshRouteEvidenceBlock。',
-    },
+    
     {
       id: 'EndpointForceRouteBlock.tsx|k:common.refresh+settings.tun.forceRouteLoading',
       disposition: {
@@ -610,7 +601,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     {
       id: 'SettingsHelper.tsx|k:helper.recheck',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
-      note: '重新检测助手状态。移动端对应的「授权状态」由 `vpnAuthStatus` 读来并常驻在根页那一行上，不需要人工重检这一跳。',
+      note: '安装失败的只读恢复入口；已有状态重检的分支不重复显示。移动端无 helper，授权状态由 vpnAuthStatus 常驻呈现。',
     },
     {
       id: 'SettingsHelper.tsx|k:helper.recheck#2',
@@ -621,6 +612,12 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       id: 'SettingsHelper.tsx|k:helper.recheck#3',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
       note: '重新检测的第三个渲染位（另一档状态下出现）。同上，同一条腿。',
+    },
+
+    {
+      id: 'SettingsHelper.tsx|k:helper.recheck#4',
+      disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
+      note: 'BTM 禁用状态原有重检位置；与失败区恢复互斥，仍只调用状态查询，不安装或提权。',
     },
 
     {
@@ -686,11 +683,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       disposition: { kind: 'platform-absent', evidence: NO_MIXED_INBOUND },
       note: '「去首页切换接管方式」那条链接。Android 上接管方式恒为 TUN（不发 mixed inbound），首页那一维整个不存在，链接自然也没有落点。',
     },
-    {
-      id: 'SettingsTun.tsx|k:settings.general.enableIPv6+settings.network.enableFakeIpAction+settings.network.enableIPv6Desc+settings.network.ipv6NodeFakeIpHint',
-      disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/settings/DnsPage.tsx', mustContain: 'toggleFakeIp' } },
-      note: 'IPv6 那一行（整行可点，附带「节点走 FakeIP 时的注意」提示与一颗就地启用 FakeIP 的动作）。移动端把 IPv6 开关放在网络页、FakeIP 开关放在 DNS 页，两颗都在，只是不合并在一行里。',
-    },
+    
     {
       id: 'SettingsTun.tsx|k:settings.network.enableFakeIpAction',
       disposition: { kind: 'reachable-elsewhere', mobile: { file: 'ui/src/mobile/settings/DnsPage.tsx', mustContain: "<MobileSwitch checked={dns.enableFakeIp}" } },

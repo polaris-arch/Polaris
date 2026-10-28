@@ -42,8 +42,7 @@ struct Guarded {
     /// 抑制形态（可执行形，不是裸标识符）。
     suppressor: &'static str,
     /// 窗口自检串：窗口里必须先有它，否则说明窗口没盖住要守的东西 ⇒ 抑制断言恒真。
-    /// 多数点是 `Command::new(`；`win_console.rs` 那两个函数**接收**已构造好的 `Command`，
-    /// 它们自己不构造 ⇒ 自检改钉 cfg 门（抑制必须只在 Windows 生效，别在 Linux 上编不过）。
+    /// 必须是实际命令构造点，不能只登记一个无人调用的包装函数。
     self_check: &'static str,
     /// 从锚点起看多少行。各函数都远短于此；放宽只会让门更松，故取够用的最小值。
     ///
@@ -77,37 +76,6 @@ const CREATION_FORMS: &[&str] = &[".stdout(", ".spawn()"];
 /// 见 `dns_watcher_loop` 文档）、`mesh.rs::run_command_stdout`（mac `ifconfig` 反查）、
 /// `uninstall.rs::spawn_uninstaller`（拉起的是 Windows 卸载程序**自己的 GUI**，抑制窗口反而不对）。
 const GUARDED: &[Guarded] = &[
-    // ---- 本 crate：经 runtime/win_console.rs 收口 ----
-    Guarded {
-        file: "src-tauri/src/runtime/win_console.rs",
-        anchor: "pub(crate) fn no_console_window(",
-        suppressor: "creation_flags(0x0800_0000)",
-        self_check: "#[cfg(windows)]",
-        window: 14,
-        before: None,
-    },
-    // `no_console_window_async`（tokio 版）已随它仅有的两个调用点一起删除：那两处是自己写了一遍的
-    // `sing-box check`，已折叠进 `core-supervisor::config_gate::run_check_raw`（本表下方单独守）。
-    // 本 crate 于是不再有 Windows 可达的 tokio 子进程构造点。
-    // Phase 2 拆分：`core_version_first_line` 进 `proxy/process_supervision.rs`。同文件原先还有
-    // Windows 版 `send_signal`（起 `taskkill`）：孤儿清扫改为经扫描时留住的句柄结束进程后，
-    // 那个子进程构造点已不存在，条目随之删除。
-    Guarded {
-        file: "src-tauri/src/runtime/proxy/process_supervision.rs",
-        anchor: "fn core_version_first_line(",
-        suppressor: "no_console_window(",
-        self_check: "Command::new(",
-        window: 6,
-        before: None,
-    },
-    Guarded {
-        file: "src-tauri/src/runtime/updater.rs",
-        anchor: "pub fn read_core_version_line(",
-        suppressor: "no_console_window(",
-        self_check: "Command::new(",
-        window: 10,
-        before: None,
-    },
     // 这里曾有两条 `sing-box check` 的构造点（`tailscale_login_core.rs::SingBoxConfigChecker` 与
     // `commands/proxy.rs::run_probe_check`）。两处已不再自己构造子进程，改调
     // `core-supervisor::config_gate::run_check_raw`（本表下方那条守着它的 `creation_flags`），
@@ -116,15 +84,16 @@ const GUARDED: &[Guarded] = &[
     // [`no_new_console_program_spawn_escapes_the_suppression`] 只按程序名字面量反查，`sing-box`
     // 的路径是变量、两者都盖不住「有人在这两个文件里重新写一份 check」。那条新门把「这两处挂了
     // 抑制标志」换成了更强的「全仓只允许有一处 check 构造点」。
-    // ---- 另外三个 crate：与本 crate 无共同依赖，各自持等价实现 ----
+    // Version probes now delegate to StdCommandRunner; check probes use CheckCustody.
+    // The deleted App wrapper had no callers. Guard the actual spawn owners below.
     Guarded {
         file: "crates/system-integration/src/exec.rs",
         // 构造点搬进了固有方法 `run_observed`；`CommandRunner::run` 只转调它，不再有 `Command::new(`。
-        anchor: "impl StdCommandRunner {",
+        anchor: "pub fn run_observed(",
         suppressor: "creation_flags(CREATE_NO_WINDOW)",
         self_check: "Command::new(",
-        window: 20,
-        before: None,
+        window: 0,
+        before: Some(&[".spawn()"]),
     },
     Guarded {
         file: "crates/core-supervisor/src/spawner.rs",
@@ -157,8 +126,8 @@ const GUARDED: &[Guarded] = &[
         anchor: "impl Executor for StdExecutor {",
         suppressor: "creation_flags(0x0800_0000)",
         self_check: "Command::new(",
-        window: 18,
-        before: None,
+        window: 0,
+        before: Some(&[".output()"]),
     },
 ];
 
@@ -180,62 +149,66 @@ fn every_windows_reachable_spawn_suppresses_the_console() {
         let src = sources
             .entry(g.file)
             .or_insert_with(|| strip_comments(&read(g.file)));
-        let at = src.find(g.anchor).unwrap_or_else(|| {
-            panic!(
-                "{}：锚点 `{}` 消失（改名/删除？）——门已失去判据，不是「通过」",
-                g.file, g.anchor
-            )
-        });
-        assert!(
-            src[at + g.anchor.len()..].find(g.anchor).is_none(),
-            "{}：锚点 `{}` 不唯一，窗口可能落在另一个 cfg 变体上",
-            g.file,
-            g.anchor
-        );
-        let rest = &src[at..];
-        // 窗口两种取法：数行（`before: None`），或者取到「进程真被创建」那一处为止。
-        // 后者的宽度由源码结构给 —— 它守的属性就是「标志早于创建」，判据于是与行数无关。
-        let (window, scope) = match g.before {
-            None => (
-                rest.lines().take(g.window).collect::<Vec<_>>().join("\n"),
-                format!("之后 {} 行内", g.window),
-            ),
-            Some(forms) => {
-                let creation = forms.iter().filter_map(|f| rest.find(f)).min();
-                // 切点自检：找不到创建点 = 锚点漂了 / 构造搬走了 ⇒ 窗口无从界定，必须红。
-                // 没有这一条，`min()` 为 `None` 时无论怎么退化都是一次静默失效。
-                let creation = creation.unwrap_or_else(|| {
-                    panic!(
-                        "{}：`{}` 之后找不到 {forms:?} 里的任何一处 —— \
-                         这个块里没有子进程被创建（锚点漂了 / 构造搬走了），窗口无从界定，\
-                         抑制断言在这种状态下恒真",
-                        g.file, g.anchor
-                    )
-                });
-                (
-                    rest[..creation].to_owned(),
-                    format!("与首个 {forms:?} 之间"),
-                )
-            }
-        };
-        // 自检：窗口里必须真有子进程构造，否则说明窗口太小 / 锚点漂了，下面那条断言就没有意义。
-        assert!(
-            window.contains(g.self_check),
-            "{}：`{}` {scope}没有 `{}` —— 窗口没盖住要守的东西，抑制断言恒真",
-            g.file,
-            g.anchor,
-            g.self_check
-        );
-        assert!(
-            window.contains(g.suppressor),
-            "{}：`{}` 的子进程构造没挂 `{}`（{scope}）—— Windows 上会弹控制台窗口。\
-             `before` 形态下这句话的意思是：标志要么没了，要么被挪到了进程创建**之后** —— \
-             那时候再设已经不起作用",
-            g.file,
-            g.anchor,
-            g.suppressor
-        );
+        assert_guarded_source(g, src);
     }
+}
+
+fn assert_guarded_source(g: &Guarded, src: &str) {
+    let at = src.find(g.anchor).unwrap_or_else(|| {
+        panic!(
+            "{}：锚点 `{}` 消失（改名/删除？）——门已失去判据，不是「通过」",
+            g.file, g.anchor
+        )
+    });
+    assert!(
+        src[at + g.anchor.len()..].find(g.anchor).is_none(),
+        "{}：锚点 `{}` 不唯一，窗口可能落在另一个 cfg 变体上",
+        g.file,
+        g.anchor
+    );
+    let rest = &src[at..];
+    // 窗口两种取法：数行（`before: None`），或者取到「进程真被创建」那一处为止。
+    // 后者的宽度由源码结构给 —— 它守的属性就是「标志早于创建」，判据于是与行数无关。
+    let (window, scope) = match g.before {
+        None => (
+            rest.lines().take(g.window).collect::<Vec<_>>().join("\n"),
+            format!("之后 {} 行内", g.window),
+        ),
+        Some(forms) => {
+            let creation = forms.iter().filter_map(|f| rest.find(f)).min();
+            // 切点自检：找不到创建点 = 锚点漂了 / 构造搬走了 ⇒ 窗口无从界定，必须红。
+            // 没有这一条，`min()` 为 `None` 时无论怎么退化都是一次静默失效。
+            let creation = creation.unwrap_or_else(|| {
+                panic!(
+                    "{}：`{}` 之后找不到 {forms:?} 里的任何一处 —— \
+                     这个块里没有子进程被创建（锚点漂了 / 构造搬走了），窗口无从界定，\
+                     抑制断言在这种状态下恒真",
+                    g.file, g.anchor
+                )
+            });
+            (
+                rest[..creation].to_owned(),
+                format!("与首个 {forms:?} 之间"),
+            )
+        }
+    };
+    // 自检：窗口里必须真有子进程构造，否则说明窗口太小 / 锚点漂了，下面那条断言就没有意义。
+    assert!(
+        window.contains(g.self_check),
+        "{}：`{}` {scope}没有 `{}` —— 窗口没盖住要守的东西，抑制断言恒真",
+        g.file,
+        g.anchor,
+        g.self_check
+    );
+    assert!(
+        window.contains(g.suppressor),
+        "{}：`{}` 的子进程构造没挂 `{}`（{scope}）—— Windows 上会弹控制台窗口。\
+         `before` 形态下这句话的意思是：标志要么没了，要么被挪到了进程创建**之后** —— \
+         那时候再设已经不起作用",
+        g.file,
+        g.anchor,
+        g.suppressor
+    );
 }
 
 /// 已知会在 Windows 上执行的 console 程序名（字面量形态）。按**程序名反查**，与上面的清单互补：
@@ -300,9 +273,7 @@ fn no_new_console_program_spawn_escapes_the_suppression() {
                     .take(i - lo + 14)
                     .collect::<Vec<_>>()
                     .join("\n");
-                let guarded = ctx.contains("no_console_window")
-                    || ctx.contains("creation_flags")
-                    || ctx.contains("sc_command(");
+                let guarded = ctx.contains("creation_flags") || ctx.contains("sc_command(");
                 if !guarded {
                     offenders.push(format!("{rel}:{}: {}", i + 1, line.trim()));
                 }
@@ -511,6 +482,50 @@ fn linux_check_scope_does_not_borrow_a_function_outside_its_cfg() {
     assert!(std::panic::catch_unwind(|| braced_block("mod linux {", "mod linux {")).is_err());
 }
 
+/// Diagnostics may not execute cached or PID-derived paths, even via a guarded runner.
+#[test]
+fn version_probes_do_not_create_foreign_processes() {
+    let updater = strip_comments(&read("src-tauri/src/runtime/updater.rs"));
+    assert!(braced_block(&updater, "pub fn read_core_version_line(")
+        .contains("self.core_version_probe.first_line(&bin)"));
+    let supervision = strip_comments(&read("src-tauri/src/runtime/proxy/process_supervision.rs"));
+    let attestation = braced_block(&supervision, "async fn attest_running_core_binary(");
+    assert!(attestation.contains("attest_core_binary(expected, None, \"\", \"\")"));
+    assert!(!attestation.contains("first_line("));
+    let probe = strip_comments(&read("src-tauri/src/runtime/core_version_probe.rs"));
+    let body = braced_block(&probe, "pub(crate) fn first_line(");
+    assert!(body.contains("String::new()"));
+    for bypass in ["Command::", ".spawn()", ".output()", "run_observed("] {
+        assert!(!body.contains(bypass), "diagnostic execution: {bypass}");
+    }
+}
+
+#[test]
+fn shared_runner_suppression_guard_rejects_missing_commented_or_late_flags() {
+    let guard = GUARDED
+        .iter()
+        .find(|g| g.file == "crates/system-integration/src/exec.rs")
+        .expect("shared version runner must stay in the guarded inventory");
+    let source = read(guard.file);
+    assert_guarded_source(guard, &strip_comments(&source));
+    let flag = "builder.creation_flags(CREATE_NO_WINDOW);";
+    assert_eq!(source.matches(flag).count(), 1);
+    for mutated in [
+        source.replace(flag, ""),
+        source.replace(flag, &format!("// {flag}")),
+        source
+            .replace(flag, "")
+            .replace("builder.spawn()", &format!("builder.spawn(); {flag}")),
+        source.replace("std::process::Command::new(", "missing_constructor("),
+    ] {
+        assert!(std::panic::catch_unwind(|| assert_guarded_source(
+            guard,
+            &strip_comments(&mutated)
+        ))
+        .is_err());
+    }
+}
+
 /// 主程序直起的核必须被纳入「主程序消失即结束」的作业对象 —— 同样是只有 Windows 才编得到的一行。
 ///
 /// # 为什么也放在这里
@@ -559,14 +574,15 @@ fn direct_spawned_cores_join_the_kill_on_close_job() {
     assert!(lib.contains("#[cfg(windows)]\npub mod job_object;"));
 }
 
-/// 四份实现散在四个无共同依赖的 crate 里 —— 值必须逐字一致，否则「改了一处以为全改了」。
+/// The remaining spawn owners must agree on CREATE_NO_WINDOW, including CheckCustody.
 #[test]
-fn the_four_crates_agree_on_the_flag_value() {
+fn the_spawn_owners_agree_on_the_flag_value() {
     let bearers = [
-        "src-tauri/src/runtime/win_console.rs",
+        "crates/core-supervisor/src/config_gate/check_custody.rs",
         "crates/system-integration/src/exec.rs",
         "crates/core-supervisor/src/spawner.rs",
         "crates/helper-client/src/manager.rs",
+        "crates/helper-client/src/privilege.rs",
     ];
     for f in bearers {
         let src = strip_comments(&read(f));

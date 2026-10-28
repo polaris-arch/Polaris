@@ -1049,3 +1049,77 @@ fn partial_provider_leftover_edges_keep_stable_ids_and_source_removal_is_authori
     assert_eq!(cfg["servers"][0]["id"], "leftover");
     assert!(cfg["servers"][0].get("detour").is_none());
 }
+
+#[test]
+fn naive_json_refresh_reorder_preserves_h3_through_real_store() {
+    use polaris_store::{ConfigStore, StdFs};
+    let dir = crate::test_support::TestDir::new("naive-json-refresh-");
+    let path = dir.path().join("config.json");
+    let parse = |reverse: bool, prefix: &str| {
+        let mut rows = vec![
+            json!({"type":"naive","tag":"H2","server":"naive.example","server_port":443,"username":"user","password":"fixture","quic":false}),
+            json!({"type":"naive","tag":"H3","server":"naive.example","server_port":443,"username":"user","password":"fixture","quic":true}),
+        ];
+        if reverse {
+            rows.reverse();
+        }
+        let mut n = 0;
+        let parsed = polaris_net_stack::subscription::parse_subscription(
+            &json!({"outbounds":rows}).to_string(),
+            "sub",
+            "now",
+            &mut || {
+                n += 1;
+                format!("{prefix}-{n}")
+            },
+            polaris_net_stack::singbox_import::ImportOrigin::RemoteSubscription,
+        );
+        assert_eq!((parsed.failed, parsed.skipped), (0, 0));
+        polaris_net_stack::subscription::dedupe_by_fingerprint(parsed.servers)
+    };
+    let mut cfg = polaris_store::default_config();
+    cfg["subscriptions"] =
+        json!([{"id":"sub","name":"fixture","url":"https://subscription.example/list"}]);
+    cfg["selectedServerId"] = json!("__direct__");
+    reconcile_subscription_servers(&mut cfg, "sub", parse(false, "old"), false, &[]);
+    assert_eq!(cfg["servers"].as_array().unwrap().len(), 2);
+    ConfigStore::save(&StdFs, &path, &cfg, "abcdef012345").unwrap();
+    let loaded = ConfigStore::load(&StdFs, &path);
+    assert!(loaded.loaded_from_disk && loaded.error.is_none());
+    let mut cfg = loaded.config;
+    reconcile_subscription_servers(&mut cfg, "sub", parse(true, "incoming"), false, &[]);
+    ConfigStore::save(&StdFs, &path, &cfg, "abcdef012346").unwrap();
+    let loaded = ConfigStore::load(&StdFs, &path);
+    assert!(loaded.loaded_from_disk && loaded.error.is_none());
+    let nodes: Vec<ServerConfig> =
+        serde_json::from_value(loaded.config["servers"].clone()).unwrap();
+    assert_eq!(nodes.len(), 2);
+    let h3 = nodes
+        .iter()
+        .find(|n| n.naive_settings.as_ref().and_then(|s| s.use_http3) == Some(true))
+        .unwrap();
+    let h2 = nodes
+        .iter()
+        .find(|n| n.naive_settings.as_ref().and_then(|s| s.use_http3) != Some(true))
+        .unwrap();
+    assert_eq!(h3.id, "old-2");
+    assert_eq!(h2.id, "old-1");
+    assert_eq!(h3.name, "H3");
+    assert_eq!(h2.name, "H2");
+    for (node, expected) in [(h3, true), (h2, false)] {
+        let output = polaris_config_engine::builder::outbound::build_proxy_outbound(
+            node,
+            "fixture",
+            &polaris_config_engine::singbox::DomainResolver::Tag("dns-fixture".into()),
+            "aarch64",
+            "darwin",
+        )
+        .unwrap();
+        let value = serde_json::to_value(output).unwrap();
+        assert_eq!(value["type"], "naive");
+        assert_eq!(
+            value.get("quic").and_then(Value::as_bool) == Some(true),
+            expected
+        );
+    }
+}

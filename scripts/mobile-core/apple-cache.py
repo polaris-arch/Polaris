@@ -23,6 +23,7 @@ from producer import PRODUCER_FILES, private_dir, run, slot_locks, write_json
 STAGE = Path('target/apple-ci-cache')
 TARGETS = {'device-arm64': 'aarch64-apple-ios', 'sim-arm64': 'aarch64-apple-ios-sim'}
 GROUPS = ('deps', 'build', '.fingerprint')
+REGISTRY_DIRS = ('registry/index', 'registry/cache', 'git/db')
 MAX_BYTES, MAX_ENTRIES = 4 * 1024 ** 3, 131072
 REGISTRY_MAX_BYTES = 2 * 1024 ** 3
 HEADROOM = 1024 ** 3
@@ -90,6 +91,48 @@ def cache_identities(tools, rustc, cargo, tool_pins, config, environment):
         'config': {name: pin for name, pin in config.items() if cargo_source_config(name)},
         'sourceOverrides': sources}))
     return dependency, registry
+
+
+def registry_directory(path):
+    """True absence is a cold cache, not a redirected or unowned directory."""
+    home = Path.home()
+    require(home.is_absolute() and home.resolve(strict=True) == home,
+            'registry home ancestry redirected')
+    info = home.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid(),
+            'registry home ownership/type differs')
+    parts = Path(path).relative_to(home).parts
+    require(parts and parts[0] == '.cargo' and '..' not in parts,
+            'registry directory outside fixed Cargo home')
+    current = home
+    for part in parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            # Do not create a cache or resolve a missing leaf. Restore or the
+            # actual Cargo invocation may populate this fixed path afterwards.
+            return False
+        require(not stat.S_ISLNK(info.st_mode), 'registry cache directory symlink refused')
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid(),
+                'registry cache directory ownership/type differs')
+    return True
+
+
+def cargo_home():
+    home = Path.home() / '.cargo'
+    require(Path(os.environ.get('CARGO_HOME', str(home))) == home,
+            'registry cache path differs from actual Cargo home')
+    if registry_directory(home):
+        for name in ('config', 'config.toml'):
+            try:
+                (home / name).lstat()
+            except FileNotFoundError:
+                continue
+            # Only tracked source configurations enter cache_identities. Never
+            # read, hash or silently admit external config (possibly secrets).
+            require(False, 'unbound Cargo home configuration refused')
+    return home
 
 
 class ExternalCacheAlias(RuntimeError):
@@ -203,8 +246,11 @@ def prepare():
         # policy here. Android-only file edits still avoid unrelated cold misses.
         identity, registry_identity = cache_identities(
             tools, rustc, run(['cargo', '-V']), tool_pins, config, os.environ)
-        home = Path(os.environ.get('CARGO_HOME', str(Path.home() / '.cargo'))).resolve(strict=True)
-        require(home == Path.home() / '.cargo', 'registry cache path differs from actual Cargo home')
+        home = cargo_home()
+        # Restore runs next. Reject unsafe existing roots before the cache
+        # action can touch them; legitimate absent branches stay absent.
+        for name in REGISTRY_DIRS:
+            registry_directory(home / name)
         write_json(stage / 'owner.json', {'context': context(), 'scope': scope_fields(),
             'actualCargoTargetDir': str(root / 'cache/rust-target'), 'identity': identity,
             'registryIdentity': registry_identity})
@@ -399,10 +445,11 @@ def export_cache(slot):
 
 def registry_ready():
     root = location()
+    home = cargo_home()
     size, count = 0, 0
-    for name in ('registry/index', 'registry/cache', 'git/db'):
-        folder = Path.home() / '.cargo' / name
-        if folder.exists():
+    for name in REGISTRY_DIRS:
+        folder = home / name
+        if registry_directory(folder):
             amount, entries = checked_tree(folder, maximum=REGISTRY_MAX_BYTES)
             size += amount; count += entries
     require(size and size <= REGISTRY_MAX_BYTES and count <= MAX_ENTRIES, 'bounded nonempty registry cache required')

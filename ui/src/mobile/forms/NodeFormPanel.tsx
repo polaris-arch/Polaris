@@ -1,3 +1,4 @@
+import { visionTransportReason } from '@/domain/node-compatibility';
 import { useInputRequest } from '@/hooks/use-input-request';
 import { realityUtlsError } from '@/domain/utls';
 import { MobileInfo } from '../MobileInfo';
@@ -382,7 +383,7 @@ export function NodeFormPanel({
       // 同协议编辑 → base 起底保全非模型字段（R5）；改型/新增 → 干净 base 防旧协议残留。
       const codecBase = base !== undefined && base.protocol === proto ? { ...base, ...meta } : meta;
       const full = protoCodec[proto].toConfig(draft, codecBase);
-      const utlsError = realityUtlsError(full);
+      const utlsError = realityUtlsError(full) ?? (visionTransportReason(full) ? 'nodes.invalidVisionTransport' : undefined);
       if (utlsError) {
         revealGroup(nodeFieldGroup(proto, 'fp') ?? 'basic');
         setNotice({ tone: 'err', text: t(utlsError) });

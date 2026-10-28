@@ -128,6 +128,17 @@ impl ClashParseResult {
     /// 判据 `protocol_can_carry_transport` 从 `config-engine` 导入，**不在本 crate 复制一份名单**：
     /// 第二份判据迟早与内核漂移，而漂移的表现是「要么产出起不来的配置、要么把好配置误报成无效」。
     pub(crate) fn finish(mut self) -> Self {
+        // Retain full original configuration so the user can locate and repair it.
+        // This is a runtime compatibility warning, not an import parse failure.
+        for server in &self.servers {
+            if polaris_config_engine::builder::outbound::validate_vision_transport(server).is_err()
+            {
+                self.warnings.push(format!(
+                    "{}: vision-transport-unsupported (configuration retained)",
+                    server.name
+                ));
+            }
+        }
         let before = self.servers.len();
         self.servers.retain(|server| {
             polaris_config_engine::user_config::tls_pin::validate_server_cert_pins(server).is_ok()
@@ -1549,6 +1560,7 @@ fn map_node(
                     if m.get("skip-cert-verify").and_then(bool_val) == Some(true) {
                         tls.allow_insecure = Some(true);
                     }
+                    tls.fingerprint = m.get("client-fingerprint").and_then(str);
                     tls.certificate_sha256 = clash_cert_pin(m);
                     config.tls_settings = Some(tls);
                 }

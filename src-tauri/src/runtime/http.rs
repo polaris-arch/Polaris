@@ -355,6 +355,7 @@ impl HttpRuntime {
 
     /// 底层 client（供本模块内适配器共用）。
     #[must_use]
+    #[cfg(test)]
     pub fn client(&self) -> &reqwest::Client {
         &self.client
     }

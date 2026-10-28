@@ -42,7 +42,7 @@ pub struct SubscriptionInterfacePolicy {
 }
 
 fn default_utls_policy() -> Option<String> {
-    Some("default".into())
+    Some("follow".into())
 }
 
 /// 用户配置（增量子集）。上游 `UserConfig`。

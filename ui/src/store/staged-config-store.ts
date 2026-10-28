@@ -58,7 +58,8 @@ import {
 } from '@/lib/staged-config';
 
 /** 直接从 IPC 契约取，避免与 `pending-bar-logic.ts` 的同名联合各写一份（store 不该反向依赖组件层）。 */
-type ApplyStatus = Awaited<ReturnType<typeof api.proxy.applyPendingChanges>>['status'];
+type ApplyReceipt = Awaited<ReturnType<typeof api.proxy.applyPendingChanges>>;
+type ApplyStatus = ApplyReceipt['status'];
 
 /**
  * 冲突弹窗的一行：这条条目要改的实体，磁盘侧也被别人改过（Q8-b 第 4 步）。
@@ -77,7 +78,7 @@ export interface StagedConflict {
   readonly disk: string | null;
 }
 
-export interface ApplyNowResult {
+export interface ApplyNowResult extends Omit<ApplyReceipt, 'ok' | 'status' | 'applyId'> {
   /**
    * 保存这一半有没有过。**`false` ⇒ 根本没调过 `applyPendingChanges`** —— 调用方据此不要再叠一个
    * 「应用失败」：条已经由 A 维度显示「保存失败：<原因>」，两句话说同一次失败会让人以为炸了两回。
@@ -235,8 +236,8 @@ export interface StagedConfigState {
   resolveConflict: (keepEntryIds: readonly string[]) => Promise<boolean>;
   /** 关掉冲突弹窗、不保存（staged 一条不丢）。 */
   dismissConflict: () => void;
-  /** 「立即应用」= 保存 + `proxy:applyPendingChanges`（FR-6）。保存没过就**不**碰核。 */
-  applyNow: () => Promise<ApplyNowResult>;
+  /** Save then request Apply; an explicit restart token confirms the already saved candidate without re-saving. */
+  applyNow: (restartConfirmation?: string) => Promise<ApplyNowResult>;
   /**
    * 每次拿到磁盘 config 后调用。
    *  - 首次：**无条件恢复**存储里的条目，并连同存储里的 `baseline` 一起恢复（那是「这批编辑
@@ -327,10 +328,21 @@ export const useStagedConfigStore = create<StagedConfigState>((set, get) => ({
     set({ conflict: null, conflictBaseline: null });
   },
 
-  applyNow: async () => {
-    if (!(await get().save())) return { saved: false, status: null };
-    const r = await api.proxy.applyPendingChanges().catch(() => null);
-    return { saved: true, status: r?.status ?? null, ...(r?.applyId == null ? {} : { applyId: r.applyId }) };
+  applyNow: async (restartConfirmation) => {
+    // Confirmation is bound to the already saved candidate. Never save newer drafts here.
+    if (restartConfirmation === undefined && !(await get().save())) return { saved: false, status: null };
+    const r = await api.proxy.applyPendingChanges(restartConfirmation).catch(() => null);
+    return { saved: true, status: r?.status ?? null,
+      ...(r?.persistenceMode === undefined ? {} : { persistenceMode: r.persistenceMode }),
+      ...(r?.transactionId === undefined ? {} : { transactionId: r.transactionId }),
+      ...(r?.runtimeGeneration === undefined ? {} : { runtimeGeneration: r.runtimeGeneration }),
+      ...(r?.selectionIntentGeneration === undefined ? {} : { selectionIntentGeneration: r.selectionIntentGeneration }),
+      ...(r?.applyId == null ? {} : { applyId: r.applyId }),
+      ...(r?.restartConfirmation === undefined ? {} : { restartConfirmation: r.restartConfirmation }),
+      ...(r?.reasons === undefined ? {} : { reasons: r.reasons }),
+      ...(r?.pendingApply === undefined ? {} : { pendingApply: r.pendingApply }),
+      ...(r?.restartRequired === undefined ? {} : { restartRequired: r.restartRequired }),
+    };
   },
 
   hydrate: (config) => {

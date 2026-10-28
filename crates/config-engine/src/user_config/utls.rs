@@ -151,7 +151,7 @@ pub fn effective_server_for_platform<'a>(
 ) -> Result<Cow<'a, ServerConfig>, &'static str> {
     let policy = policy
         .and_then(normalize_token)
-        .unwrap_or_else(|| "default".into());
+        .unwrap_or_else(|| "follow".into());
     if policy != "follow" && policy != "default" && !SUPPORTED_PROFILES.contains(&policy.as_str()) {
         return Err("The global uTLS policy is not supported by the bundled core.");
     }

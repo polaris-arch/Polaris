@@ -251,9 +251,42 @@ fn plan_uses_pool_when_race_on_and_defaults_when_absent() {
 
     // 缺省（老配置无 resolveNodeDomainsAhead / 无 pool）→ 开 + 默认池。
     let r2 = plan_upstreams(Some(&DnsConfig::default()), NON_TUN).expect("缺省视为开");
-    assert!(r2.tier1.is_empty()); // Explicit unknown IDs must never select other resolvers.
+    assert_eq!(
+        r2.tier1
+            .iter()
+            .map(|upstream| upstream.id.as_str())
+            .collect::<Vec<_>>(),
+        DEFAULT_POOL_IDS
+    );
     let r3 = plan_upstreams(None, NON_TUN).expect("无 dnsConfig 也视为开");
-    assert_eq!(r3.tier1.len(), 2);
+    assert_eq!(r3, r2);
+    // An empty saved pool retains the existing default Tier1 policy.
+    // It is not an explicit selection of an unsupported resolver.
+    let empty = DnsConfig {
+        node_resolver_pool: Some(vec![]),
+        ..Default::default()
+    };
+    assert!(validate_selected_upstreams(Some(&empty)).is_ok());
+    assert_eq!(plan_upstreams(Some(&empty), NON_TUN).unwrap(), r2);
+}
+
+#[test]
+fn plan_never_substitutes_defaults_for_explicit_unknown_resolvers() {
+    for pool in [
+        ids(&["unknown-resolver"]),
+        ids(&["ali", "unknown-resolver"]),
+    ] {
+        let explicit = DnsConfig {
+            node_resolver_pool: Some(pool),
+            ..Default::default()
+        };
+        assert!(validate_selected_upstreams(Some(&explicit)).is_err());
+        let plan = plan_upstreams(Some(&explicit), NON_TUN).unwrap();
+        assert!(
+            plan.tier1.is_empty() && plan.tier2.is_empty(),
+            "an unsupported selection must never substitute default or partial resolvers"
+        );
+    }
 }
 
 #[test]
@@ -302,9 +335,11 @@ fn plan_consumes_custom_pool_entry_end_to_end() {
 
 #[test]
 fn explicit_unsupported_selection_fails_generation_validation_without_hydration_changes() {
-    let mut dns = DnsConfig::default();
-    dns.node_resolver_custom = Some(vec![custom("tls", "tls://1.1.1.1")]);
-    dns.node_resolver_pool = Some(ids(&["tls"]));
+    let mut dns = DnsConfig {
+        node_resolver_custom: Some(vec![custom("tls", "tls://1.1.1.1")]),
+        node_resolver_pool: Some(ids(&["tls"])),
+        ..Default::default()
+    };
     assert!(validate_selected_upstreams(Some(&dns))
         .unwrap_err()
         .starts_with("NODE_RESOLVER_UNSUPPORTED:"));

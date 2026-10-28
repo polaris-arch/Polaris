@@ -1,4 +1,10 @@
 {
+  "feedback": {
+    "connectionFailed": "连接失败",
+    "stopFailed": "断开失败",
+    "subscriptionSaved": "订阅已保存",
+    "followupIncomplete": "后续处理未完成，请确认当前订阅状态后再决定是否重试。"
+  },
   "helper": {
     "title": "提权助手",
     "statusChecking": "检测中…",
@@ -65,7 +71,7 @@
       "invalid": "核验失败",
       "unavailable": "不可用"
     },
-    "failureNextStep": "请查看日志中的 Helper 安装记录以确认失败原因。重新检测不会再次安装 Helper。",
+    "failureNextStep": "重新检测只检查当前状态，不会再次安装 Helper。",
     "viewLogsAction": "查看日志",
     "installSelectedCoreAction": "安装本版本配套内核",
     "stopAndUpgradeAction": "停止连接并升级…",
@@ -87,6 +93,7 @@
     "delete": "删除",
     "edit": "编辑",
     "save": "保存",
+    "saving": "正在保存…",
     "saved": "已保存",
     "copyFail": "复制失败",
     "retry": "重试",
@@ -384,6 +391,25 @@
     "pendingDetailTip": "需重启内核生效 · 点击查看明细",
     "pendingDetailTipStaged": "点击查看明细",
     "pendingEffectNeedsRestart": "保存后待应用",
+    "restartApplyTitle": "需要重启",
+    "restartApplyDescription": "此改动需要重启，会中断当前连接。",
+    "restartApplyConfirm": "重启并应用",
+    "restartApplyKeepConnection": "保持当前连接",
+    "restartApplyUnsupportedCore": "已安装的内核无法在线应用此改动。",
+    "restartApplyTun": "TUN 设置已改变。",
+    "restartApplyListener": "监听端口设置已改变。",
+    "restartApplyNamespace": "网络命名空间已改变。",
+    "restartApplyServices": "服务生命周期设置已改变。",
+    "restartApplyCache": "持久缓存路径已改变。",
+    "restartApplyStructural": "运行时结构性设置已改变。",
+    "pendingHotApplied": "已应用到运行中的内核。",
+    "pendingHotDurabilityPending": "运行时已应用，持久化仍待完成。",
+    "pendingRetryPersistenceBtn": "重试持久化",
+    "pendingExitPersistenceRecoveryBtn": "退出此次恢复",
+    "pendingHotConflict": "配置或运行状态已改变，请检查后重试。",
+    "pendingHotOwnerSuperseded": "已保存的设置已更改。请应用最新设置，以完成重启配置的更新。",
+    "pendingHotRejected": "改动被拒绝，已保存的改动仍待应用。",
+    "pendingHotUnconfirmed": "应用结果尚未确认，请勿视为成功。",
     "pendingEffectOnSave": "仅需保存",
     "pendingGroupAdded": "尚未进入运行内核",
     "pendingGroupConfig": "配置变更 · 需重启内核生效",
@@ -506,7 +532,7 @@
   "settings": {
     "utls": {
       "label": "全局 uTLS 指纹",
-      "description": "新配置预设为默认（Chrome）。跟随保留节点指纹；默认、随机或浏览器选项覆盖未显式关闭的适用节点，节点明确关闭优先。随机在每次内核启动时选择一种浏览器模板。",
+      "description": "新配置预设为跟随，保留节点指纹。默认（Chrome）、随机或浏览器选项覆盖未显式关闭的适用节点；节点明确关闭优先。随机在每次内核启动时选择一种浏览器模板。",
       "follow": "跟随"
     },
     "coex": {
@@ -804,6 +830,7 @@
       "autoSwitchNode": "节点故障自动切换",
       "autoSwitchNodeDesc": "当前节点检测到故障时自动切到可用节点。只走内网的组网节点不参与判定——没有可替代的节点，不会被自动切走。",
       "disableLogFileDescFull": "关闭磁盘日志后，实时日志与日志诊断不可用；崩溃检测仍可用。运行中需保存后点“立即应用”；未运行时下次连接生效。",
+      "lanGatewayPrerequisite": "局域网共享仅开放代理监听，Polaris 不修改主机 IP 转发。路由型局域网 MAC 过滤需要预先配置网关并开启 TUN 地址族的转发；条件缺失或无法读取时拒绝启动/应用。局域网短名解析不要求路由器模式。",
       "lanGateway": "局域网网关",
       "neighborDomains": "局域网短名解析",
       "neighborDomainsHint": "每行一个后缀（自动补前导点）；对该后缀下无点的短名（如 nas.lan）走局域网设备解析。",
@@ -1086,6 +1113,7 @@
         },
         "load": {
           "startupReady": "启动加载已确认",
+          "runtimeCommitted": "运行时加载已提交",
           "fileWrittenUnacknowledged": "文件已写入，内核加载未确认",
           "loadFailed": "加载失败",
           "unknown": "加载状态未知"
@@ -1249,6 +1277,7 @@
       "resourceRefServer": "DNS 服务器“{{name}}”",
       "resourceRefDefault": "默认项“{{name}}”",
       "fakeIpDesc": "对 A/AAAA 查询返回合成地址，避免 DNS 污染",
+      "fakeIpPolicyLocation": "FakeIP 由 DNS → 解析规则中的规则动作或默认规则控制。",
       "remoteDns": "远程 DNS",
       "remoteDnsDesc": "解析海外域名的上游",
       "domesticDns": "国内 DNS",
@@ -1259,7 +1288,7 @@
       "takeoverSystemDnsDesc": "崩溃或断电后自动恢复原系统 DNS",
       "nodeResolverBlock": "节点域名解析",
       "raceStrategy": "解析策略",
-      "raceStrategyDesc": "由内核先竞速加密上游，必要时再查询备用上游。采用最先返回的干净地址响应；空响应保留到竞速结束再决定。",
+      "raceStrategyDesc": "由内核先竞速加密上游，必要时再查询备用上游。采用最先返回的干净地址响应；空响应保留到竞速结束再决定。 关闭竞速仍支持域名节点解析，改用单上游。竞速在缓存未命中时可能增加多上游及 A/AAAA 查询。",
       "raceMode": "并发竞速",
       "singleMode": "单一上游",
       "raceUpstreams": "竞速上游",
@@ -1713,7 +1742,7 @@
     "previewOk": "预检通过：解析到 {{n}} 个节点",
     "ua": "自定义 User-Agent",
     "uaHint": "拉取此订阅时携带的 User-Agent，留空则使用默认值",
-    "uaPh": "默认 Polaris/1.0",
+    "uaPh": "默认：应用与内核版本",
     "url": "订阅链接",
     "viaProxy": "经代理更新",
     "viaProxyHint": "经运行中的代理拉取而非直连（全局策略可覆盖，见设置）",
@@ -1736,6 +1765,8 @@
     "createTaskRecoveredHint": "订阅添加在后台执行，应用重启后会在这里继续显示进度。"
   },
   "errors": {
+    "lanGatewayForwardingRequired": "所需地址族的局域网网关转发未开启。请在 Polaris 之外配置网关，或关闭路由型局域网 MAC 过滤。未修改主机网络设置。",
+    "lanGatewayForwardingUnconfirmed": "无法确认所需的局域网网关转发状态，已拒绝启动/应用。请检查网关配置。未修改主机网络设置。",
     "dnsDependencyInvalid": "DNS 服务器或分组的引用无效或仍被使用。请检查 DNS 规则、默认 DNS 和分组引用后重试。",
     "iosSessionActive": "系统中已有 Polaris VPN 会话，请先在 iOS 系统设置中停止该会话，再连接。",
     "operationFailed": "操作失败，请稍后重试",
@@ -2187,6 +2218,7 @@
     "onDemandHint": "只有被当前选中的出口或路由规则引用时才连接；未被引用时断开。Tailscale 会交出 tailnet 地址并停用 MagicDNS，登录状态保留。挂起期间收不到 Taildrop 文件。"
   },
   "nodes": {
+    "invalidVisionTransport": "当前内核的 Vision 仅支持原生 TLS/Reality TCP，不支持此附加传输。原参数已保留，请选择兼容节点或修正设置。",
     "previousSubscriptions": "查看前面的订阅",
     "nextSubscriptions": "查看后面的订阅",
     "add": "添加",
@@ -3106,6 +3138,7 @@
     },
     "load": {
       "startupReady": "内核启动已确认加载代。",
+      "runtimeCommitted": "运行时回执已确认加载；持久化状态另行跟踪。",
       "fileWrittenUnacknowledged": "文件已写入，重载未确认。",
       "loadFailed": "加载失败，网段归属未知。",
       "unknown": "没有可用的加载证据。"
@@ -3261,11 +3294,12 @@
     "success": "成功",
     "failed": "失败",
     "unmeasured": "未测",
-    "expired": "过期",
+    "expired": "测速已过期",
+    "expiredHint": "原测速结果已超时，或不再匹配当前连接、配置或网络；不会显示为新结果，可手动重新测速。",
     "paused": "暂停",
     "notIncluded": "未纳入",
     "disconnected": "未连接测量",
-    "systemPath": "系统路径",
+    "systemPath": "按系统路由测量（可能代理或直连）",
     "selectedPath": "当前出口",
     "nodePath": "节点测量",
     "bindingMismatch": "实际承载与请求节点不同",

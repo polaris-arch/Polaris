@@ -1,4 +1,10 @@
 {
+  "feedback": {
+    "connectionFailed": "Connection failed",
+    "stopFailed": "Disconnect failed",
+    "subscriptionSaved": "Subscription saved",
+    "followupIncomplete": "Follow-up processing did not finish. Check the current subscription status before trying again."
+  },
   "helper": {
     "title": "Privileged Helper",
     "statusChecking": "Checking…",
@@ -65,7 +71,7 @@
       "invalid": "Verification failed",
       "unavailable": "Unavailable"
     },
-    "failureNextStep": "Check the Helper installation entries in Logs for the failure details. Recheck does not reinstall the helper.",
+    "failureNextStep": "Recheck only checks the current status; it does not install Helper again.",
     "viewLogsAction": "View logs",
     "installSelectedCoreAction": "Install selected core",
     "stopAndUpgradeAction": "Stop connections and upgrade…",
@@ -87,6 +93,7 @@
     "delete": "Delete",
     "edit": "Edit",
     "save": "Save",
+    "saving": "Saving…",
     "saved": "Saved",
     "copyFail": "Copy failed",
     "retry": "Retry",
@@ -384,6 +391,25 @@
     "pendingDetailTip": "Needs a core restart · click for details",
     "pendingDetailTipStaged": "Click for details",
     "pendingEffectNeedsRestart": "Apply after saving",
+    "restartApplyTitle": "Restart required",
+    "restartApplyDescription": "This change needs a restart and will interrupt the current connection.",
+    "restartApplyConfirm": "Restart and apply",
+    "restartApplyKeepConnection": "Keep current connection",
+    "restartApplyUnsupportedCore": "The installed core cannot apply this change live.",
+    "restartApplyTun": "TUN settings changed.",
+    "restartApplyListener": "Listener port settings changed.",
+    "restartApplyNamespace": "Network namespace changed.",
+    "restartApplyServices": "Service lifecycle settings changed.",
+    "restartApplyCache": "Persistent cache path changed.",
+    "restartApplyStructural": "A structural runtime setting changed.",
+    "pendingHotApplied": "Applied to the running core.",
+    "pendingHotDurabilityPending": "Applied at runtime; persistence is still pending.",
+    "pendingRetryPersistenceBtn": "Retry persistence",
+    "pendingExitPersistenceRecoveryBtn": "Exit recovery",
+    "pendingHotConflict": "The configuration or running state changed. Review and retry.",
+    "pendingHotOwnerSuperseded": "Saved settings changed. Apply the latest settings to finish updating the restart configuration.",
+    "pendingHotRejected": "The change was rejected. Saved changes remain pending.",
+    "pendingHotUnconfirmed": "The apply outcome is unconfirmed. Do not assume it succeeded.",
     "pendingEffectOnSave": "Save only",
     "pendingGroupAdded": "Not yet in the running core",
     "pendingGroupConfig": "Config change — needs a core restart",
@@ -506,7 +532,7 @@
   "settings": {
     "utls": {
       "label": "Global uTLS fingerprint",
-      "description": "New configurations start with Default (Chrome). Follow preserves node fingerprints. Default, Random or a browser overrides eligible nodes unless uTLS is explicitly disabled on the node. Random selects a browser template once per core process.",
+      "description": "New configurations follow node fingerprints. Default (Chrome), Random or a browser overrides eligible nodes unless explicitly disabled. Explicit node disabling takes priority. Random chooses a browser template each time the core starts.",
       "follow": "Follow"
     },
     "coex": {
@@ -804,6 +830,7 @@
       "autoSwitchNode": "Auto-Switch Node on Failure",
       "autoSwitchNodeDesc": "Switches to a working node automatically when the current one is detected as faulty. Intranet-only mesh nodes are excluded: nothing can substitute for them, so they are never switched away.",
       "disableLogFileDescFull": "Turning off disk logs disables live logs and log diagnostics; crash detection remains available. While connected, save and tap Apply Now; otherwise it takes effect on the next connection.",
+      "lanGatewayPrerequisite": "LAN sharing only exposes proxy listeners. Polaris does not change host IP forwarding. Routed LAN MAC filtering requires an already configured gateway and forwarding for the TUN address families; unmet or unreadable prerequisites block Start/Apply. LAN short-name resolution does not require router mode.",
       "lanGateway": "LAN Gateway",
       "neighborDomains": "LAN short-name resolution",
       "neighborDomainsHint": "One suffix per line (leading dot added automatically); dot-less short names under it (e.g. nas.lan) resolve via LAN devices.",
@@ -1086,6 +1113,7 @@
         },
         "load": {
           "startupReady": "Startup load confirmed",
+          "runtimeCommitted": "Runtime load committed",
           "fileWrittenUnacknowledged": "File written; core load unconfirmed",
           "loadFailed": "Load failed",
           "unknown": "Load state unknown"
@@ -1249,6 +1277,7 @@
       "resourceRefServer": "DNS server “{{name}}”",
       "resourceRefDefault": "Default “{{name}}”",
       "fakeIpDesc": "Returns synthetic addresses for A/AAAA queries to avoid DNS poisoning",
+      "fakeIpPolicyLocation": "FakeIP is controlled by rule actions or the default rule in DNS → Resolution rules.",
       "remoteDns": "Remote DNS",
       "remoteDnsDesc": "Upstream used for overseas domains",
       "domesticDns": "Domestic DNS",
@@ -1259,7 +1288,7 @@
       "takeoverSystemDnsDesc": "Restores the original system DNS automatically after a crash or power loss",
       "nodeResolverBlock": "Node domain resolution",
       "raceStrategy": "Resolution strategy",
-      "raceStrategyDesc": "The core races encrypted upstreams first and uses fallback upstreams only if needed. The first clean address answer wins; empty answers are held until the race finishes.",
+      "raceStrategyDesc": "The core races encrypted upstreams first and uses fallback upstreams only if needed. The first clean address answer wins; empty answers are held until the race finishes. Disabling racing still resolves domain-name nodes using one upstream. On cache misses, racing may add queries to multiple upstreams and A/AAAA lookups.",
       "raceMode": "Race",
       "singleMode": "Single upstream",
       "raceUpstreams": "Racing upstreams",
@@ -1713,7 +1742,7 @@
     "previewOk": "Preflight passed: {{n}} node(s) parsed",
     "ua": "Custom User-Agent",
     "uaHint": "The User-Agent sent when fetching this subscription; leave blank to use the default",
-    "uaPh": "Default: Polaris/1.0",
+    "uaPh": "Default: app and core versions",
     "url": "Subscription URL",
     "viaProxy": "Update via proxy",
     "viaProxyHint": "Fetch through the running proxy instead of direct (global policy can override this — see Settings)",
@@ -1736,6 +1765,8 @@
     "createTaskRecoveredHint": "The subscription is added in the background; its progress resumes here after the app restarts."
   },
   "errors": {
+    "lanGatewayForwardingRequired": "LAN gateway forwarding is disabled for a required address family. Configure the gateway outside Polaris, or turn off routed LAN MAC filtering. No host network settings were changed.",
+    "lanGatewayForwardingUnconfirmed": "Cannot confirm the required LAN gateway forwarding state. Start/Apply was rejected; check the gateway configuration. No host network settings were changed.",
     "dnsDependencyInvalid": "This DNS server or group has invalid references or is still in use. Check DNS rules, defaults, and group references before saving.",
     "iosSessionActive": "A Polaris VPN session is already active in the system. Stop that session in iOS Settings before connecting.",
     "operationFailed": "Operation failed, please try again later",
@@ -2187,6 +2218,7 @@
     "onDemandHint": "Connect only while referenced by the selected outbound or a routing rule; disconnect otherwise. Tailscale releases its tailnet address and stops MagicDNS; the login stays. Taildrop files are not received while suspended."
   },
   "nodes": {
+    "invalidVisionTransport": "The current core supports Vision only over native TLS/Reality TCP, not with this extra transport. Original settings are retained; choose a compatible node or correct its settings.",
     "previousSubscriptions": "Show earlier subscriptions",
     "nextSubscriptions": "Show later subscriptions",
     "add": "Add",
@@ -3106,6 +3138,7 @@
     },
     "load": {
       "startupReady": "Core startup confirmed the loaded generation.",
+      "runtimeCommitted": "A runtime receipt confirmed loading; persistence is tracked separately.",
       "fileWrittenUnacknowledged": "File was written; reload is unconfirmed.",
       "loadFailed": "Loading failed; range ownership is unknown.",
       "unknown": "No loading evidence is available."
@@ -3261,11 +3294,12 @@
     "success": "Success",
     "failed": "Failed",
     "unmeasured": "Unmeasured",
-    "expired": "Expired",
+    "expired": "Measurement expired",
+    "expiredHint": "The previous measurement is too old or no longer matches the connection, configuration or network. It is not a fresh result; you can measure again manually.",
     "paused": "Paused",
     "notIncluded": "Not included",
     "disconnected": "Measured while disconnected",
-    "systemPath": "System path",
+    "systemPath": "Measured via system routing (proxy or direct)",
     "selectedPath": "Selected exit",
     "nodePath": "Node measurement",
     "bindingMismatch": "Carrier differs from requested node",

@@ -1,3 +1,4 @@
+// HOT receipts settle directly; only explicit restart scheduling uses the existing attributed lifecycle path.
 /**
  * 移动端的**待应用 / 待保存操作条** —— 落进外壳早就备好的 `.m-pending-slot`。
  *
@@ -41,6 +42,9 @@ import { useEffect, useRef, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { api } from '@/ipc';
+import { useRuntimeApplyReconciliation } from '@/components/layout/use-runtime-apply-reconciliation';
+import { restartReasonKeys, type RestartPrompt } from '@/components/dialogs/restart-apply-reasons';
+import { FormSheet } from './forms/FormSheet';
 import type { ProxyErrorTranslate } from '@/domain/proxy-error-text';
 import type { ProxyLifecycleEvent } from '@/contracts/types';
 import { useConfirmTwice } from '@/lib/confirm-twice';
@@ -49,6 +53,7 @@ import { useStagedConfigStore } from '@/store/staged-config-store';
 import {
   APPLY_CONFIRM_TIMEOUT_MS,
   applyOutcome,
+  runtimePersistenceRecoveryEnded,
   applyStateOnLifecycle,
   composeBarView,
   pendingChangesCount,
@@ -66,10 +71,11 @@ const ACTION_LABEL: Record<BarActionId, string> = {
   retryApply: 'home.pendingRetryBtn',
   dismissApply: 'home.pendingIgnoreBtn',
   retrySave: 'home.pendingRetrySaveBtn',
+  retryPersistence: 'home.pendingRetryPersistenceBtn',
 };
 
 /** 主按钮（实心）：断流的那颗永远是主按钮，与桌面同口径。 */
-const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply', 'retryApply']);
+const PRIMARY_ACTIONS: ReadonlySet<BarActionId> = new Set<BarActionId>(['apply', 'retryApply', 'retryPersistence']);
 
 /** 「重置」的原地二次确认 key（同桌面 `PendingChangesBar` 的 `RESET_KEY`）。 */
 const RESET_KEY = 'mobile-reset-pending';
@@ -77,7 +83,7 @@ const RESET_KEY = 'mobile-reset-pending';
 export function MobilePendingBar(): ReactElement | null {
   const { t } = useTranslation();
   const pending = useAppStore((s) => s.pendingChanges);
-  /** 「立即应用」= 保存 + 强制重启核；核没在跑时后半句无对象，那颗整颗不渲染（见 `BarInput.coreRunning`）。 */
+  /** 「立即应用」保存后请求 HOT；仅确认重启时允许中断连接。核没在跑时没有应用对象，那颗整颗不渲染（见 `BarInput.coreRunning`）。 */
   const coreRunning = useAppStore((s) => s.proxyStatus?.running ?? false);
   const stagedEntries = useStagedConfigStore((s) => s.entries);
   const saveStatus = useStagedConfigStore((s) => s.saveStatus);
@@ -86,8 +92,11 @@ export function MobilePendingBar(): ReactElement | null {
     phase: 'idle',
     reason: null,
   });
+  const [restartPrompt, setRestartPrompt] = useState<RestartPrompt | null>(null);
   const applyRequest = useRef<{
     awaitingReply: boolean;
+    cancelled: boolean;
+    intentGeneration: number | undefined;
     early: ProxyLifecycleEvent[];
     earlyGeneration: number | undefined;
     earlyStopped: boolean;
@@ -100,6 +109,8 @@ export function MobilePendingBar(): ReactElement | null {
   translateRef.current = simpleT;
   const { armed, confirmTwice } = useConfirmTwice();
 
+  useRuntimeApplyReconciliation(apply, setApply, applyRequest, simpleT);
+
   // Await actual listener registration before issuing Apply; plain start/error broadcasts have
   // no action ownership and therefore must not decide this request's outcome.
   useEffect(() => {
@@ -108,6 +119,12 @@ export function MobilePendingBar(): ReactElement | null {
     const ready = api.proxy.onLifecycleReady((data) => {
       const request = applyRequest.current;
       if (!request) return;
+      if (data.kind === 'stop' && data.terminal === true && data.phase === 'stopped'
+          && Number.isSafeInteger(data.mainGeneration)
+          && data.mainGeneration >= (request.earlyGeneration ?? Number.POSITIVE_INFINITY)) {
+        request.cancelled = true;
+        setApply((state) => state.reconciling ? { ...state, reconciling: false } : state);
+      }
       if (request.awaitingReply) {
         // Payload retention is bounded, but generation knowledge must never be evicted.
         // Observe explicit Stop against the floor at arrival, before raising it: replaying
@@ -191,15 +208,22 @@ export function MobilePendingBar(): ReactElement | null {
     pendingCount: pendingChangesCount(pending),
     applyError: apply.reason,
     coreRunning,
+    persistenceRetryAvailable: !!apply.transactionId,
+    persistenceOnly: apply.persistenceOnly,
+    persistenceRecoveryEnded: apply.persistenceRecoveryEnded,
   });
-  if (!view.visible) return null;
+  if (!view.visible && restartPrompt === null) return null;
 
-  const onApply = async (): Promise<void> => {
+  const onApply = async (restartConfirmation?: string, persistenceTransactionId?: string): Promise<void> => {
     if (applyRequest.current?.awaitingReply || apply.phase === 'applying') return;
+    setRestartPrompt(null);
     const generation = useAppStore.getState().proxyStatus?.mainGeneration;
     const initial: ApplyState = { phase: 'applying', reason: null,
+      persistenceOnly: persistenceTransactionId !== undefined, transactionId: persistenceTransactionId,
       ...(Number.isSafeInteger(generation) && (generation ?? 0) > 0 ? { mainGeneration: generation } : {}) };
-    const request = { awaitingReply: true, early: [] as ProxyLifecycleEvent[],
+    const request = { awaitingReply: true, cancelled: false,
+      intentGeneration: undefined as number | undefined,
+      early: [] as ProxyLifecycleEvent[],
       earlyGeneration: initial.mainGeneration, earlyStopped: false };
     applyRequest.current = request;
     setApply(initial);
@@ -207,17 +231,52 @@ export function MobilePendingBar(): ReactElement | null {
       if (!lifecycleReady.current) throw new Error('APPLY_LIFECYCLE_LISTENER_UNAVAILABLE');
       await lifecycleReady.current;
       if (applyRequest.current !== request) return;
-      const result = await useStagedConfigStore.getState().applyNow();
+      const result = persistenceTransactionId === undefined
+        ? await useStagedConfigStore.getState().applyNow(restartConfirmation)
+        : { ...await api.proxy.retryRuntimePersistence(persistenceTransactionId), saved: true };
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       if (!result.saved) {
         setApply({ phase: 'idle', reason: null });
         return;
       }
-      const outcome = applyOutcome(result.status);
-      let next: ApplyState = { ...initial, phase: outcome.phase };
+      if ((result.status === 'hotApplied' || result.status === 'hotDurabilityPending' || result.status === 'unconfirmed')
+          && (request.cancelled || (request.earlyGeneration ?? 0) > (initial.mainGeneration ?? 0))) {
+        request.early = [];
+        setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+        return;
+      }
+      if (persistenceTransactionId !== undefined
+          && (result.transactionId !== persistenceTransactionId
+            || !['hotApplied', 'hotDurabilityPending', 'conflict', 'rejected', 'unconfirmed'].includes(result.status ?? ''))) {
+        request.early = [];
+        setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+        return;
+      }
+      if (result.status === 'restartRequired') {
+        request.early = [];
+        // Missing/empty token must never turn into implicit restart permission.
+        if (!result.restartConfirmation) {
+          setApply({ ...initial, phase: 'failed', reason: t('home.pendingHotUnconfirmed') });
+          return;
+        }
+        setRestartPrompt({ token: result.restartConfirmation, reasons: result.reasons ?? [] });
+        setApply({ phase: 'idle', reason: null });
+        return;
+      }
+      const reconcileOwnerKnown = Number.isSafeInteger(result.runtimeGeneration) && (result.runtimeGeneration ?? 0) > 0
+        && Number.isSafeInteger(result.selectionIntentGeneration) && (result.selectionIntentGeneration ?? -1) >= 0;
+      request.intentGeneration = result.selectionIntentGeneration;
+      const outcome = applyOutcome(result.status, result.reasons);
+      let next: ApplyState = { ...initial, phase: outcome.phase,
+        reason: outcome.phase === 'failed' && outcome.toast ? t(outcome.toast.key) : null,
+        transactionId: result.transactionId,
+        persistenceRecoveryEnded: persistenceTransactionId !== undefined
+          && runtimePersistenceRecoveryEnded(result.status, result.reasons),
+        mainGeneration: result.runtimeGeneration ?? initial.mainGeneration,
+        reconciling: !request.cancelled && reconcileOwnerKnown && !!result.transactionId && (result.status === 'hotDurabilityPending' || result.status === 'unconfirmed') };
       if (outcome.phase === 'applying') {
-        if (!Number.isSafeInteger(result.applyId) || (result.applyId ?? 0) <= 0) {
+        if (typeof result.applyId !== 'number' || !Number.isSafeInteger(result.applyId) || result.applyId <= 0) {
           next = { phase: 'failed', reason: null };
         } else {
           next.applyId = result.applyId;
@@ -239,7 +298,7 @@ export function MobilePendingBar(): ReactElement | null {
       if (applyRequest.current !== request) return;
       request.awaitingReply = false;
       request.early = [];
-      setApply({ phase: 'failed', reason: null });
+      setApply({ ...initial, phase: 'failed', reason: null });
       console.error('[MobilePendingBar] Apply failed:', error);
     }
   };
@@ -262,6 +321,9 @@ export function MobilePendingBar(): ReactElement | null {
       case 'apply':
       case 'retryApply':
         void onApply();
+        return;
+      case 'retryPersistence':
+        if (apply.transactionId) void onApply(undefined, apply.transactionId);
         return;
       case 'dismissApply':
         setApply({ phase: 'idle', reason: null });
@@ -293,11 +355,25 @@ export function MobilePendingBar(): ReactElement | null {
               disabled={a.disabled}
               onClick={() => runAction(a.id)}
             >
-              {arming ? t('common.confirm') : t(ACTION_LABEL[a.id])}
+              {arming ? t('common.confirm') : t(a.id === 'dismissApply' && apply.persistenceRecoveryEnded ? 'home.pendingExitPersistenceRecoveryBtn' : ACTION_LABEL[a.id])}
             </button>
           );
         })}
       </div>
+      {restartPrompt !== null && (
+        <FormSheet
+          compact
+          title={t('home.restartApplyTitle')}
+          onRequestClose={() => setRestartPrompt(null)}
+          closeLabel={t('common.close')}
+          cancelLabel={t('home.restartApplyKeepConnection')}
+          submitLabel={t('home.restartApplyConfirm')}
+          onSubmit={() => void onApply(restartPrompt.token)}
+        >
+          <p className="m-form-msg">{t('home.restartApplyDescription')}</p>
+          <ul>{restartReasonKeys(restartPrompt.reasons).map((key) => <li key={key}>{t(key)}</li>)}</ul>
+        </FormSheet>
+      )}
     </div>
   );
 }

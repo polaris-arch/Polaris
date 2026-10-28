@@ -7,6 +7,8 @@ import test, { after } from 'node:test';
 import { candidateContext, loadCandidate, hasTemporaryDesktop, loadTemporaryDesktopSelection, selectedCandidateContext } from './desktop-core/native-dns-candidate.mjs';
 import { regularPath } from './desktop-core/release-consumer.mjs';
 import { releaseGoVersion } from './desktop-core/source-graph.mjs';
+import { validateRequest as validateLoopbackRequest } from './runtime-config-loopback.mjs';
+import { loopbackInput } from './runtime-config-loopback-formal.mjs';
 import { TARGETS, loadFormalGateSelection, formalGateContext } from './desktop-core/native-dns-gates.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -107,12 +109,160 @@ function reusableContract(caller = workflow, callee = candidateWorkflow) {
   assert.doesNotMatch(callee, /secrets:|secrets\.|contents: write|actions: write|id-token:|cargo (?:build|test) --workspace|run: pnpm/);
 }
 
+test('RuntimeConfig source mocks remain independent of payload admission and use the exact package test', () => {
+  const job = section(workflow, 'runtime_config_source_tests');
+  assert.doesNotMatch(job, /^    needs:/m);
+  assert.doesNotMatch(job, /fetch-core|prepare-core-identity|POLARIS_REQUIRE_KERNEL_GATE|POLARIS_NATIVE_DNS_CANDIDATE|--release|continue-on-error/);
+  const commands = [...job.matchAll(/^        run: (cargo .+)$/gm)].map((match) => match[1]);
+  assert.deepEqual(commands, ['cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
+});
+
+const runtimeSourceDefaults = { runtime_config_loopback_input: 'diagnostic-source', runtime_config_loopback_candidate: '', app_native_compile_candidate: '', runtime_config_source_only: false, windows_launcher_diagnostics: false,
+  native_dns_candidate: '', windows_system_candidate: '', windows_directory_mode: 'formal',
+  windows_directory_candidate_source: '', os: 'all', preserve_run: false };
+const runtimeSourceConflicts = [
+  { windows_launcher_diagnostics: true }, { native_dns_candidate: sha },
+  { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' },
+  { windows_directory_candidate_source: sha }, { os: 'windows-2022' }, { os: 'macos-14' },
+  { windows_launcher_diagnostics: true, windows_system_candidate: sha },
+];
+function ciJobSection(source, name) {
+  const start = source.indexOf('\njobs:\n');
+  assert.notEqual(start, -1, 'Missing jobs map');
+  return section(source.slice(start), name);
+}
+function ciJobCondition(source, name) {
+  const header = ciJobSection(source, name).split('    steps:')[0];
+  const match = /^    if: >-\n((?:      .*\n)+)/m.exec(header)
+    ?? /^    if: (.+)$/m.exec(header);
+  assert.ok(match, `${name} must retain an explicit job condition`);
+  return match[1].trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
+}
+const loopbackRawMode = `(contains(toJSON(inputs), '"runtime_config_loopback_input"') && inputs.runtime_config_loopback_input != 'diagnostic-source')`;
+function evaluateCiExpression(expression, github, inputs, needs = {}) {
+  // Model GitHub's case-insensitive comparison for the new mode predicate,
+  // rather than falsely crediting JS != with rejecting uppercase aliases.
+  const code = expression.replaceAll("inputs.runtime_config_loopback_input != 'diagnostic-source'", '!diagnosticMode(inputs.runtime_config_loopback_input)');
+  return new Function('github', 'inputs', 'needs', 'contains', 'toJSON', 'diagnosticMode', `return (${code});`)(
+    github, inputs, needs, (haystack, needle) => String(haystack).toLowerCase().includes(String(needle).toLowerCase()), JSON.stringify,
+    (mode) => typeof mode === 'string' && mode.toLowerCase() === 'diagnostic-source');
+}
+function ciSchedule(source, names) {
+  const jobs = names.map((name) => ({ name,
+    needs: /^    needs: (\w+)$/m.exec(ciJobSection(source, name))?.[1],
+    allows: (github, inputs, needs) => evaluateCiExpression(ciJobCondition(source, name), github, inputs, needs),
+  }));
+  return (event, inputs, outputs = {}, cheapResult = 'success') => {
+    const github = { event_name: event, repository: 'polaris-arch/Polaris',
+      ref: 'refs/heads/collab/dots-audit-remediation-20261017', workflow_ref: base.GITHUB_WORKFLOW_REF,
+      // Inherited caller event payloads must never activate the dispatch-only typed input.
+      event: { inputs: { os: '', ...inputs, runtime_config_source_only: 'true' } } };
+    const started = new Set();
+    for (const job of jobs)
+      if ((!job.needs || (started.has(job.needs) && cheapResult === 'success')) && job.allows(github, inputs, { cheap_format: { outputs } }))
+        started.add(job.name);
+    return [...started];
+  };
+}
+function runtimeSourceRoutingContract(source = workflow) {
+  const dispatch = section(source, 'workflow_dispatch'), call = section(source, 'workflow_call');
+  assert.match(dispatch, /^      runtime_config_source_only:\n        description: .*\n        type: boolean\n        default: false$/m);
+  assert.doesNotMatch(call, /runtime_config_source_only/);
+  assert.doesNotMatch(source, /github\.event\.inputs\.runtime_config_source_only/);
+  const names = [...source.slice(source.indexOf('\njobs:\n')).matchAll(/^  (\w+):$/gm)].map((m) => m[1]);
+  assert.deepEqual(names, ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback',
+    'runtime_config_source_tests', 'windows_launcher_diagnostics']);
+  for (const name of ['native_dns_candidate_gates', 'lint', 'cross', 'test']) {
+    const header = ciJobSection(source, name).split('    steps:')[0];
+    assert.match(header, /^    needs: cheap_format$/m);
+    assert.doesNotMatch(header, /always\(|cancelled\(|success\(|failure\(|continue-on-error/,
+      'required predecessor must retain implicit success() so a skipped formatter skips native descendants');
+  }
+  const sourceJob = ciJobSection(source, 'runtime_config_source_tests');
+  assert.doesNotMatch(sourceJob, /^    needs:|continue-on-error|fetch-core|prepare-core-identity|sudo|--ignored|--release/m);
+  assert.match(sourceJob, /^    runs-on: ubuntu-22\.04$/m);
+  assert.match(sourceJob, /^    permissions:\n      contents: read$/m);
+  assert.match(sourceJob, /RuntimeConfig source only \(not full CI\/native\/HOT acceptance\)/);
+  assert.match(sourceJob, /This job is not full CI, native or HOT acceptance\./);
+  assert.match(sourceJob, /^        run: node scripts\/fetch-protoc\.mjs$/m);
+  assert.match(sourceJob, /\[ "\$got" = "\$PROTOC_EXPECT" \] \|\| \{/);
+  assert.deepEqual([...sourceJob.matchAll(/^        run: (cargo .+)$/gm)].map((m) => m[1]),
+    ['cargo test --locked -p polaris-singbox-grpc --test runtime_config']);
+  const admission = '      - name: Admit isolated RuntimeConfig source-only selection\n';
+  assert.ok(sourceJob.indexOf(admission) > sourceJob.indexOf('      - name: Setup Node\n'));
+  assert.ok(sourceJob.indexOf(admission) < sourceJob.indexOf('      - name: Install Rust toolchain'));
+  const admissionStep = sourceJob.split(admission)[1].split('\n      - ')[0];
+  assert.match(admissionStep, /^        if: github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true$/m);
+  assert.match(admissionStep, /RUNTIME_CONFIG_SOURCE_INPUTS: \$\{\{ toJSON\(inputs\) \}\}/);
+  assert.doesNotMatch(admissionStep.split('        run: |\n')[1], /\$\{\{/,
+    'input data must not be interpolated into executable shell/JavaScript');
+  const scheduled = ciSchedule(source, names);
+  for (const selection of [{}, { os: 'ubuntu-22.04' }, { preserve_run: true }, ...runtimeSourceConflicts]) {
+    const inputs = { ...runtimeSourceDefaults, ...selection, runtime_config_source_only: true };
+    assert.deepEqual(scheduled('workflow_dispatch', inputs,
+      { native_required: 'true', native_dns_formal: 'true', native_dns_formal_app: sha }),
+    ['runtime_config_source_tests'], JSON.stringify(selection));
+  }
+  // Every job decision must equal the old DAG on default entries, including
+  // a manual caller with a source-only event payload but no declared input.
+  for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call', 'workflow_dispatch'])
+    for (const sourceOnly of [undefined, false, ...(event === 'workflow_dispatch' ? [] : [true])])
+      for (const diagnostic of [undefined, false, true])
+        for (const system of ['', sha]) for (const os of ['', 'all', 'ubuntu-22.04', 'windows-2022', 'macos-14'])
+          for (const nativeRequired of ['', 'true', 'unknown', 'false']) for (const formal of ['', 'true']) {
+            const inputs = { ...runtimeSourceDefaults, runtime_config_source_only: sourceOnly,
+              windows_launcher_diagnostics: diagnostic, windows_system_candidate: system, os };
+            const ordinary = event !== 'workflow_dispatch' || diagnostic !== true || system !== '';
+            const native = ordinary && nativeRequired !== 'false';
+            const expected = [ordinary && 'cheap_format', native && formal === 'true' && 'native_dns_candidate_gates',
+              native && 'lint', native && (event !== 'workflow_dispatch' || ['', 'all', 'ubuntu-22.04'].includes(os)) && 'cross',
+              native && 'test', ordinary && 'runtime_config_source_tests', !ordinary && 'windows_launcher_diagnostics'].filter(Boolean);
+            assert.deepEqual(scheduled(event, inputs, { native_required: nativeRequired, native_dns_formal: formal,
+              native_dns_candidate: '', native_dns_formal_app: sha }), expected);
+          }
+}
+
+test('explicit RuntimeConfig-only dispatch isolates the real source job without changing the default DAG', () => {
+  runtimeSourceRoutingContract();
+  const cheap = ciJobSection(workflow, 'cheap_format'), sourceJob = ciJobSection(workflow, 'runtime_config_source_tests');
+  const diagnostic = ciJobSection(workflow, 'windows_launcher_diagnostics');
+  for (const [before, after] of [
+    [cheap, cheap.replace("(github.event_name != 'workflow_dispatch' || inputs.runtime_config_source_only != true) && ", '')],
+    [sourceJob, sourceJob.replace("(github.event_name == 'workflow_dispatch' && inputs.runtime_config_source_only == true) || ", '')],
+    [diagnostic, diagnostic.replace('inputs.runtime_config_source_only != true && ', '')],
+    [sourceJob, `    needs: cheap_format\n${sourceJob}`],
+    [sourceJob, sourceJob.replace('cargo test --locked -p polaris-singbox-grpc --test runtime_config',
+      'cargo test --locked -p polaris-singbox-grpc --test runtime_config || true')],
+    [sourceJob, sourceJob.replace('node scripts/fetch-protoc.mjs', 'echo omitted')],
+  ]) {
+    assert.notEqual(before, after);
+    assert.throws(() => runtimeSourceRoutingContract(workflow.replace(before, after)));
+  }
+});
+
+test('conflicting RuntimeConfig-only requests fail in the scheduled source job before Rust or protoc setup', () => {
+  const script = nodeScript('Admit isolated RuntimeConfig source-only selection');
+  const admit = (selection = {}, event = 'workflow_dispatch') => new Function('process', script)({ env: {
+    GITHUB_EVENT_NAME: event,
+    RUNTIME_CONFIG_SOURCE_INPUTS: JSON.stringify({ ...runtimeSourceDefaults,
+      runtime_config_source_only: true, ...selection }),
+  } });
+  for (const selection of [{}, { os: 'ubuntu-22.04' }, { preserve_run: true }]) assert.doesNotThrow(() => admit(selection));
+  for (const selection of [...runtimeSourceConflicts, { app_native_compile_candidate: sha }, { runtime_config_loopback_candidate: sha }, { native_dns_candidate: 'malformed' },
+    { windows_directory_candidate_source: ' ' }, { windows_directory_mode: 'unknown' }, { os: 'unknown' }])
+    assert.throws(() => admit(selection), /cannot combine diagnostic, candidate or non-Ubuntu selections/);
+  for (const value of [false, 'true', '', null])
+    assert.throws(() => admit({ runtime_config_source_only: value }), /explicit manual boolean selection/);
+  for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call'])
+    assert.throws(() => admit({}, event), /explicit manual boolean selection/);
+});
+
 test('manual inputs remain opt-in while the committed default preserves the ordinary DAG, matrix and exact workspace commands', () => {
   assert.equal((workflow.match(/^      native_dns_candidate:\n/gm) ?? []).length, 2);
   for (const entry of workflow.matchAll(/^      native_dns_candidate:\n([\s\S]*?)(?=^      \w|^\S)/gm))
     assert.match(entry[1], /type: string\n        default: ''/);
   assert.deepEqual([...workflow.matchAll(/^  (\w+):\n/gm)].filter((m) => m.index > workflow.indexOf('\njobs:\n')).map((m) => m[1]),
-    ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'windows_launcher_diagnostics']);
+    ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics']);
   for (const job of ['lint', 'cross', 'test']) assert.ok(workflow.includes(`  ${job}:\n    needs: cheap_format\n`));
   const testJobHeader = workflow.slice(workflow.indexOf('  test:\n')).split('    strategy:')[0];
   assert.match(testJobHeader, /    permissions:\n      contents: read\n$/);
@@ -123,7 +273,7 @@ test('manual inputs remain opt-in while the committed default preserves the ordi
   for (const command of ['cargo build --workspace --verbose', 'cargo test --workspace --no-fail-fast'])
     assert.equal(workflow.split(`run: ${command}`).length - 1, 1, command);
   assert.ok(step('Test').includes('shell: node scripts/check-coex-runtime-export.mjs capture {0}'));
-  for (const command of ['cargo fmt --all -- --check', 'cargo clippy --workspace --all-targets -- -D warnings',
+  for (const command of ['cargo fmt --all -- --check', 'cargo clippy --workspace --all-targets --keep-going -- -D warnings',
     'cargo doc --no-deps --workspace --bins --lib --document-private-items', 'scripts/fetch-protoc.mjs',
     "NASM_VERSION: '3.02'", 'libwebkit2gtk-4.1-dev']) assert.ok(workflow.includes(command), command);
 });
@@ -577,4 +727,355 @@ test('historical fixture canonicalizes only its owned temp root while release re
       assert.throws(() => regularPath(join(alias, basename(fixture)), true), /Linked release ancestor/);
     } finally { rmSync(fixture, { recursive: true, force: true }); }
   } finally { rmSync(parent, { recursive: true, force: true }); }
+});
+
+
+const compileBranch = 'refs/heads/hot/app-runtime-consumer-20261020';
+const compileInputs = { ...runtimeSourceDefaults, app_native_compile_candidate: sha, os: 'ubuntu-22.04' };
+function compileAdmission(inputs = compileInputs, extra = {}, head = sha, status = '') {
+  const writes = [], calls = [];
+  const source = nodeScript('Admit exact App native compile-only request');
+  new Function('process', 'execFileSync', 'appendFileSync', source)({ env: {
+    ...base, GITHUB_REF: compileBranch, GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/ci.yml@${compileBranch}`,
+    APP_NATIVE_COMPILE_INPUTS: JSON.stringify(inputs), ...extra,
+  } }, (program, args) => {
+    assert.equal(program, 'git'); calls.push(args);
+    assert.ok(['rev-parse', 'status'].includes(args[0]), 'admission cannot execute build/runtime commands');
+    return args[0] === 'rev-parse' ? head : status;
+  }, (path, value) => writes.push({ path, value }));
+  return { writes, calls };
+}
+
+test('exact App compile-only admission is read-only, Ubuntu-only and rejects every conflicting mode', () => {
+  assert.deepEqual(compileAdmission().writes, [{ path: 'output', value: 'compile_only=true\n' }]);
+  for (const candidate of ['', ' ', 'false', false, true, 'A'.repeat(40), 'b'.repeat(40), null])
+    assert.throws(() => compileAdmission({ ...compileInputs, app_native_compile_candidate: candidate }));
+  const conflicts = [{ runtime_config_loopback_candidate: sha }, { runtime_config_loopback_candidate: ' ' }, { os: '' }, { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { os: 'other' },
+    { runtime_config_source_only: true }, { windows_launcher_diagnostics: true }, { native_dns_candidate: sha },
+    { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' }, { windows_directory_candidate_source: sha },
+    { native_dns_candidate: ' ' }, { windows_directory_candidate_source: ' ' }];
+  for (const change of conflicts) assert.throws(() => compileAdmission({ ...compileInputs, ...change }), /requires Ubuntu/);
+  for (const extra of [{ GITHUB_ACTIONS: 'false' }, { GITHUB_REPOSITORY: 'other/Polaris' }, { GITHUB_REPOSITORY_ID: '0' },
+    { GITHUB_REF: 'refs/heads/main' }, { GITHUB_WORKFLOW_REF: base.GITHUB_WORKFLOW_REF }, { GITHUB_SHA: 'b'.repeat(40) },
+    ...['push', 'pull_request', 'merge_group', 'workflow_call'].map((GITHUB_EVENT_NAME) => ({ GITHUB_EVENT_NAME }))])
+    assert.throws(() => compileAdmission(compileInputs, extra), /context required/);
+  for (const key of ['CORE_CANDIDATE', 'CORE_PLATFORM', 'POLARIS_NATIVE_DNS_CANDIDATE', 'POLARIS_NATIVE_DNS_FORMAL',
+    'POLARIS_NATIVE_PAYLOAD_VALIDATION', 'POLARIS_NATIVE_DNS_PLATFORM', 'POLARIS_SINGBOX_PATH', 'POLARIS_TEST_CORE',
+    'POLARIS_CORE_IDENTITY_FILE', 'POLARIS_CORE_CARRIER_DIR', 'POLARIS_REQUIRE_KERNEL_GATE', 'POLARIS_KERNEL_GATE_TARGET',
+    'POLARIS_NO_KERNEL_RUN', 'POLARIS_BUILD_ID', 'POLARIS_RUNTIME_CONFIG_PROTO_SOURCE', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'])
+    for (const value of ['', '0', '1']) assert.throws(() => compileAdmission(compileInputs, { [key]: value }), /must not inherit/);
+  assert.throws(() => compileAdmission(compileInputs, {}, 'b'.repeat(40)), /checkout differs/);
+  assert.throws(() => compileAdmission(compileInputs, {}, sha, ' M Cargo.lock'), /dirty/);
+});
+
+function compileRoutingContract(source = workflow) {
+  const names = ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback',
+    'runtime_config_source_tests', 'windows_launcher_diagnostics'];
+  const scheduled = ciSchedule(source, names);
+  const outputs = { native_required: 'true', app_native_compile_only: 'true', native_dns_formal: 'true', native_dns_formal_app: sha };
+  assert.deepEqual(scheduled('workflow_dispatch', compileInputs, outputs), ['cheap_format', 'test']);
+  // Invalid combinations still schedule admission. It fails before any dependent job can run.
+  for (const selection of [{ runtime_config_source_only: true }, { windows_launcher_diagnostics: true },
+    { native_dns_candidate: sha }, { windows_system_candidate: sha }, { windows_directory_mode: 'candidate' },
+    { windows_directory_candidate_source: sha }, { os: 'all' }, { os: 'windows-2022' }]) {
+    const selected = { ...compileInputs, ...selection };
+    const planned = scheduled('workflow_dispatch', selected, outputs);
+    assert.deepEqual(planned, ['cheap_format', 'test']);
+    assert.throws(() => compileAdmission(selected));
+  }
+  const cheap = ciJobSection(source, 'cheap_format');
+  const contractName = 'Execute native compile routing contracts before native setup';
+  const contract = cheap.split(`      - name: ${contractName}\n`)[1].split('      - name:')[0];
+  assert.match(contract, /if: steps\.app_native_compile_admission\.outputs\.compile_only == 'true'/);
+  assert.match(contract, /run: node --test scripts\/native-dns-ci-routing\.test\.mjs scripts\/windows-token-owner\.test\.mjs scripts\/gate-rust-ci-parity\.test\.mjs/);
+  assert.ok(cheap.indexOf(contractName) > cheap.indexOf('Admit exact App native compile-only request'));
+  assert.ok(cheap.indexOf(contractName) < cheap.indexOf('Install existing Rust formatting toolchain'));
+  const launcherName = 'Execute launcher routing contracts before native setup';
+  const launcher = cheap.split(`      - name: ${launcherName}\n`)[1].split('      - name:')[0];
+  assert.match(launcher, /if: steps\.app_native_compile_admission\.outputs\.compile_only == 'true'/);
+  assert.ok(launcher.includes("node --test --test-reporter=tap --test-name-pattern='^manual (fixed-source )?launcher diagnosis' scripts/ci-workflow-efficiency.test.mjs | tee \"$LAUNCHER_CONTRACT_TAP\""));
+  assert.match(launcher, /set -euo pipefail/);
+  assert.doesNotMatch(launcher, /continue-on-error|\|\| true/);
+  assert.ok(launcher.includes("[['pass', 8], ['fail', 0], ['cancelled', 0]]"));
+  assert.ok(launcher.includes('matches.length !== 1'));
+
+  assert.ok(cheap.indexOf(launcherName) > cheap.indexOf(contractName));
+  assert.ok(cheap.indexOf(launcherName) < cheap.indexOf('Install existing Rust formatting toolchain'));
+
+  for (const name of ['Admit exact final candidate SYSTEM request', 'Admit explicit native DNS ordinary CI selection']) {
+    const block = cheap.split(`      - name: ${name}\n`)[1].split('      - name:')[0];
+    assert.match(block, /if: steps\.runtime_config_loopback_admission\.outputs\.loopback_only != 'true' && steps\.app_native_compile_admission\.outputs\.compile_only != 'true'/);
+  }
+  const job = ciJobSection(source, 'test');
+  assert.match(job, /needs: cheap_format/);
+  assert.match(job, /Native consumer compile only/);
+  assert.match(job, /run: cargo build --workspace --verbose/);
+  const blocks = job.split(/(?=^      - name: )/m);
+  const retained = new Set(['Setup Node', 'Install Rust toolchain (preinstalled rustup)',
+    'Install protoc (pinned URL + sha256)', 'Install NASM (Windows — pinned URL + sha256)',
+    'Assert pinned tools resolve on PATH', 'Install Linux system dependencies (Tauri webkit/gtk)',
+    'Create resource placeholder dirs (tauri build.rs 路径校验)', 'Build']);
+  const compileOnly = new Set(['Verify compile-only resource placeholders', 'Verify admitted App compile checkout', 'Compile native consumer test binaries without execution',
+    'Record native consumer compilation scope']);
+  for (const block of blocks) {
+    const name = /^      - name: (.+)$/m.exec(block)?.[1];
+    if (!name || retained.has(name)) continue;
+    const match = /^        if: >-\n([\s\S]*?)(?=^        [a-z])/m.exec(block) ?? /^        if: (.+)$/m.exec(block);
+    assert.ok(match, `${name} requires an explicit mode boundary`);
+    const expression = match[1].trim().replace(/^\$\{\{\s*|\s*\}\}$/g, '');
+    const value = new Function('needs', 'runner', 'github', 'inputs', 'steps', 'success', 'cancelled', 'always', `return (${expression});`)(
+      { cheap_format: { outputs } }, { os: 'Linux' }, { event_name: 'workflow_dispatch' }, compileInputs, {}, () => true, () => false, () => true);
+    assert.equal(value, compileOnly.has(name), name);
+  }
+  assert.equal((job.match(/run: cargo test --locked --workspace --no-run/g) ?? []).length, 1);
+  assert.doesNotMatch(job, /run:.*POLARIS_NO_KERNEL_RUN=/);
+  assert.doesNotMatch(section(source, 'workflow_call'), /app_native_compile_candidate/);
+}
+
+test('compile-only runs the actual CI route contracts and only current native compiler commands', () => {
+  compileRoutingContract();
+  for (const [before, after] of [
+    ["steps.app_native_compile_admission.outputs.compile_only != 'true'", 'true'],
+    ["needs.cheap_format.outputs.app_native_compile_only != 'true'", 'true'],
+    ['run: cargo test --locked --workspace --no-run', 'run: cargo test --locked --workspace'],
+    ['run: node --test scripts/native-dns-ci-routing.test.mjs scripts/windows-token-owner.test.mjs scripts/gate-rust-ci-parity.test.mjs', 'run: echo omitted'],
+  ]) assert.throws(() => compileRoutingContract(workflow.replaceAll(before, after)), before);
+});
+
+
+test('filtered launcher route execution rejects zero/missing/duplicate/failed TAP completion', () => {
+  const source = nodeScript('Execute launcher routing contracts before native setup');
+  const validate = (text) => new Function('process', 'readFileSync', source)(
+    { env: { LAUNCHER_CONTRACT_TAP: 'owned-output' } }, (path) => { assert.equal(path, 'owned-output'); return text; });
+  const completed = '# pass 8\n# fail 0\n# cancelled 0\n';
+  assert.doesNotThrow(() => validate(completed));
+  for (const invalid of ['', '# pass 8\n', completed.replace('pass 8', 'pass 0'), completed.replace('pass 8', 'pass 7'),
+    completed.replace('fail 0', 'fail 1'), completed.replace('cancelled 0', 'cancelled 1'), completed + '# pass 8\n',
+    completed.replace('pass 8', 'pass unknown')]) assert.throws(() => validate(invalid), /require exactly one/);
+  const block = step('Execute launcher routing contracts before native setup');
+  assert.match(block, /set -euo pipefail/); // runner/tee nonzero exits cannot be replaced by a parser's zero.
+  assert.ok(block.indexOf('| tee "$LAUNCHER_CONTRACT_TAP"') < block.indexOf("node --input-type=module - <<'NODE'"));
+  assert.doesNotMatch(block, /continue-on-error|\|\| true|set \+e/);
+});
+
+const loopbackInputs = { ...runtimeSourceDefaults, runtime_config_loopback_candidate: sha,
+  os: 'ubuntu-22.04', preserve_run: true };
+const loopbackConflicts = [{ app_native_compile_candidate: sha }, { runtime_config_source_only: true },
+  { native_dns_candidate: sha }, { windows_system_candidate: sha }, { windows_launcher_diagnostics: true },
+  { windows_directory_mode: 'candidate' }, { windows_directory_candidate_source: sha },
+  { os: 'all' }, { os: 'windows-2022' }, { os: 'macos-14' }, { preserve_run: false },
+  { app_native_compile_candidate: ' ' }, { native_dns_candidate: ' ' }, { windows_directory_candidate_source: ' ' },
+  { runtime_config_source_only: true, windows_launcher_diagnostics: true, app_native_compile_candidate: sha }];
+function loopbackAdmission(inputs = loopbackInputs, extra = {}) {
+  const ref = 'refs/heads/hot/app-runtime-consumer-20261020';
+  return validateLoopbackRequest({ ...base, GITHUB_REF: ref,
+    GITHUB_WORKFLOW_REF: `polaris-arch/Polaris/.github/workflows/ci.yml@${ref}`,
+    GITHUB_WORKFLOW_SHA: sha, GITHUB_JOB: 'cheap_format', RUNNER_OS: 'Linux', RUNNER_ARCH: 'X64', ...extra },
+  inputs, { ref, repository: { full_name: 'polaris-arch/Polaris', id: 1347028220 },
+    inputs: Object.fromEntries(Object.entries(inputs).map(([key, value]) => [key, String(value)])) });
+}
+function loopbackRoutingContract(source = workflow) {
+  const jobs = [...source.slice(source.indexOf('\njobs:\n')).matchAll(/^  (\w+):$/gm)].map((m) => m[1]);
+  assert.deepEqual(jobs, ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test',
+    'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics']);
+  const dispatch = section(source, 'workflow_dispatch');
+  assert.deepEqual([...dispatch.matchAll(/^      (\w+):$/gm)].map((m) => m[1]), [
+    'runtime_config_loopback_input', 'runtime_config_loopback_candidate', 'app_native_compile_candidate', 'runtime_config_source_only',
+    'native_dns_candidate', 'windows_system_candidate', 'windows_launcher_diagnostics', 'windows_directory_mode',
+    'windows_directory_candidate_source', 'preserve_run', 'os',
+  ]);
+  assert.match(dispatch, /^      runtime_config_loopback_candidate:\n        description: .*\n        type: string\n        default: ''$/m);
+  assert.doesNotMatch(section(source, 'workflow_call'), /runtime_config_loopback_candidate/);
+  assert.doesNotMatch(source, /github\.event\.inputs\.runtime_config_loopback_candidate/);
+  const cheap = ciJobSection(source, 'cheap_format'), job = ciJobSection(source, 'runtime_config_loopback');
+  assert.match(cheap, /^      runtime_config_loopback_only: \$\{\{ steps\.runtime_config_loopback_admission\.outputs\.loopback_only \}\}$/m);
+  const admission = cheap.split('      - name: Admit exact real HOT loopback request\n')[1]?.split('\n      - ')[0];
+  assert.ok(admission);
+  assert.ok(admission.includes(`        if: ${'${{'} ${loopbackRawMode} || (github.event_name == 'workflow_dispatch' && (inputs.runtime_config_loopback_candidate || '') != '') }}`));
+  assert.match(admission, /^        env:\n          RUNTIME_CONFIG_LOOPBACK_INPUTS: \$\{\{ toJSON\(inputs\) \}\}$/m);
+  assert.match(admission, /^        run: node scripts\/runtime-config-loopback\.mjs admit$/m);
+  assert.ok(cheap.indexOf('Admit exact real HOT loopback request') < cheap.indexOf('Admit exact App native compile-only request'));
+  assert.ok(cheap.indexOf('Admit exact real HOT loopback request') < cheap.indexOf('Install existing Rust formatting toolchain'));
+  for (const name of ['native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback']) {
+    const header = ciJobSection(source, name).split('    steps:')[0];
+    assert.match(header, /^    needs: cheap_format$/m);
+    assert.doesNotMatch(header, /always\(|cancelled\(|success\(|failure\(|continue-on-error/);
+  }
+  assert.equal(ciJobCondition(source, 'runtime_config_loopback'), "needs.cheap_format.outputs.runtime_config_loopback_only == 'true'");
+  assert.match(job, /^    runs-on: ubuntu-22\.04$/m);
+  assert.match(job, /^    permissions:\n      contents: read$/m);
+  assert.match(job, /^    timeout-minutes: 60$/m);
+  assert.doesNotMatch(job, /contents: write|actions: write|id-token:|secrets:|secrets\.|continue-on-error|fetch-core|prepare-core-identity|Swatinem\/rust-cache|actions\/cache|self-hosted/);
+  assert.equal((job.match(/persist-credentials: false/g) ?? []).length, 1);
+  assert.ok(job.indexOf('Admit execution runner for real HOT loopback') < job.indexOf('Install Rust toolchain'));
+  assert.ok(job.indexOf('Test real HOT loopback admission and routing contracts') < job.indexOf('Install Rust toolchain'));
+  assert.match(job, /run: node --test scripts\/runtime-config-loopback\.test\.mjs scripts\/runtime-config-loopback-formal\.test\.mjs scripts\/native-dns-ci-routing\.test\.mjs scripts\/gate-rust-ci-parity\.test\.mjs/);
+  assert.deepEqual([...job.matchAll(/^        run: node scripts\/runtime-config-loopback\.mjs (.+)$/gm)].map((m) => m[1]), ['admit', 'run']);
+  const scheduled = ciSchedule(source, jobs);
+  const outputs = { native_required: 'true', native_dns_formal: 'true', native_dns_formal_app: sha,
+    runtime_config_loopback_only: 'true' };
+  assert.deepEqual(scheduled('workflow_dispatch', loopbackInputs, outputs), ['cheap_format', 'runtime_config_loopback']);
+  for (const value of [undefined, '', 'false', 'unknown', 'TRUE']) {
+    const fallback = { ...outputs, runtime_config_loopback_only: value };
+    assert.deepEqual(scheduled('workflow_dispatch', loopbackInputs, fallback),
+      ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test']);
+    assert.deepEqual(scheduled('push', runtimeSourceDefaults, fallback),
+      ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_source_tests']);
+  }
+  for (const request of [loopbackInputs, ...loopbackConflicts.map((selection) => ({ ...loopbackInputs, ...selection })),
+    ...['malformed', ' ', 'A'.repeat(40)].map((runtime_config_loopback_candidate) => ({ ...loopbackInputs, runtime_config_loopback_candidate }))]) {
+    for (const outcome of ['failure', 'cancelled', 'skipped'])
+      assert.deepEqual(scheduled('workflow_dispatch', request, outputs, outcome), ['cheap_format'],
+        'every raw request reaches admission and failed admission blocks every native descendant');
+    for (const name of ['runtime_config_source_tests', 'windows_launcher_diagnostics'])
+      assert.ok(!scheduled('workflow_dispatch', request, outputs).includes(name), `${name} must be independently suppressed`);
+  }
+}
+
+test('real HOT loopback uses exact manual input, admitted output and failing required DAG before native setup', () => {
+  loopbackRoutingContract();
+  for (const [before, after] of [
+    ["((inputs.runtime_config_loopback_candidate || '') != '' || (inputs.app_native_compile_candidate || '') != '')", "(inputs.app_native_compile_candidate || '') != ''"],
+    ["needs.cheap_format.outputs.runtime_config_loopback_only == 'true'", "(inputs.runtime_config_loopback_candidate || '') != ''"],
+    ["needs.cheap_format.outputs.runtime_config_loopback_only != 'true' && ", ''],
+    ["(inputs.runtime_config_loopback_candidate || '') != '' || ", ''],
+    ['runtime_config_loopback:\n    needs: cheap_format', 'runtime_config_loopback:'],
+    ['run: node scripts/runtime-config-loopback.mjs admit', 'run: echo skipped'],
+  ]) {
+    assert.ok(workflow.includes(before), before);
+    assert.throws(() => loopbackRoutingContract(workflow.replaceAll(before, after)), before);
+  }
+});
+
+test('real HOT raw conflicting or malformed requests fail actual read-only admission, never a second lane', () => {
+  assert.equal(loopbackAdmission(), sha);
+  assert.equal(loopbackAdmission(loopbackInputs, { GITHUB_JOB: 'runtime_config_loopback' }), sha);
+  for (const conflict of loopbackConflicts) assert.throws(() => loopbackAdmission({ ...loopbackInputs, ...conflict }), /cannot combine/);
+  for (const candidate of ['', ' ', 'malformed', 'A'.repeat(40), 'b'.repeat(40)])
+    assert.throws(() => loopbackAdmission({ ...loopbackInputs, runtime_config_loopback_candidate: candidate }));
+  for (const event of ['push', 'pull_request', 'merge_group', 'workflow_call'])
+    assert.throws(() => loopbackAdmission(loopbackInputs, { GITHUB_EVENT_NAME: event }), /context required/);
+  assert.throws(() => compileAdmission({ ...compileInputs, runtime_config_loopback_candidate: sha }), /requires Ubuntu/);
+});
+
+test('HOT format repair retains the failed gate and exports only complete known Rust text', () => {
+  const cheap = ciJobSection(workflow, 'cheap_format');
+  const check = cheap.split('      - name: Check workspace formatting before native compilation\n')[1].split('\n      - ')[0];
+  assert.match(check, /id: workspace_format/);
+  assert.match(check, /run: cargo fmt --all -- --check/);
+  assert.doesNotMatch(check, /continue-on-error/);
+  const repair = cheap.split('      - name: Collect exact HOT formatting repair after failed gate\n')[1].split('\n      - ')[0];
+  assert.match(repair, /if: \$\{\{ failure\(\) && steps\.workspace_format\.outcome == 'failure' && steps\.runtime_config_loopback_admission\.outputs\.loopback_only == 'true' \}\}/);
+  const sourcePaths = [...repair.matchAll(/^              '(src-tauri\/[^']+[.]rs)',$/gm)].map(match => match[1]);
+  assert.equal(sourcePaths.length, 13);
+  assert.equal(new Set(sourcePaths).size, 13);
+  assert.ok(sourcePaths.includes('src-tauri/src/runtime/proxy/tests/runtime_config_real_core.rs'));
+  for (const required of ["not set(changed) <= set(paths)", "'--no-ext-diff', '--no-color', '--binary', '--', *paths",
+    "'formatGatePassed': False", "'before': before[path], 'after': digest(path)", "'patchBytes': len(patch)",
+    "['cargo', 'fmt', '--all', '--', '--check']", "'cargoFmt': ['cargo', 'fmt', '--version']"])
+    assert.ok(repair.includes(required), required);
+  assert.doesNotMatch(repair, /sudo|secrets[.]|git.*(?:commit|push)|continue-on-error/);
+  const artifact = cheap.split('      - name: Retain complete HOT format repair for independent replay\n')[1];
+  assert.match(artifact, /always\(\) && steps\.hot_format_patch\.outcome == 'success'/);
+  assert.match(artifact, /path: \$\{\{ steps\.hot_format_patch\.outputs\.directory \}\}/);
+  assert.match(artifact, /retention-days: 3/);
+  assert.match(artifact, /if-no-files-found: error/);
+});
+
+
+test('formal or invalid HOT mode without candidate fails closed and suppresses independent jobs', () => {
+  const names = ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics'];
+  const scheduled = ciSchedule(workflow, names);
+  for (const mode of ['formal-release', '', 'unknown', null, false]) {
+    for (const conflict of [{}, { runtime_config_source_only: true }, { windows_launcher_diagnostics: true }]) {
+      const selected = { ...runtimeSourceDefaults, ...conflict, runtime_config_loopback_input: mode };
+      assert.throws(() => loopbackAdmission(selected));
+      assert.deepEqual(scheduled('workflow_dispatch', selected, {}, 'failure'), ['cheap_format']);
+    }
+    assert.throws(() => compileAdmission({ ...compileInputs, runtime_config_loopback_input: mode }));
+    assert.throws(() => runtimeSourceAdmission({ ...runtimeSourceDefaults, runtime_config_source_only: true, runtime_config_loopback_input: mode }));
+  }
+  assert.equal(loopbackAdmission({ ...loopbackInputs, runtime_config_loopback_input: 'formal-release' }), sha);
+  assert.match(section(workflow, 'workflow_dispatch'), /runtime_config_loopback_input:[\s\S]*?type: choice\n        default: diagnostic-source\n        options: \[diagnostic-source, formal-release\]/);
+});
+
+function exactModeSteps(source = workflow) {
+  const check = (name, before) => {
+    const job = ciJobSection(source, name), label = '      - name: Validate exact loopback input mode\n';
+    assert.equal(job.split(label).length, 2, `${name} has one exact input authority`);
+    const step = job.split(label)[1].split('\n      - ')[0];
+    assert.doesNotMatch(step, /\n        if:|continue-on-error/);
+    assert.match(step, /shell: bash/);
+    assert.match(step, /RUNTIME_CONFIG_LOOPBACK_INPUTS: \$\{\{ toJSON\(inputs\) \}\}/);
+    const code = /^        run: node --input-type=module -e '(.*)'$/m.exec(step)?.[1];
+    const imported = 'import { loopbackInput } from "./scripts/runtime-config-loopback-formal.mjs"; ';
+    assert.ok(code?.startsWith(imported));
+    assert.ok(job.indexOf(label) < job.indexOf(before), `${name} validates before native/setup execution`);
+    return (inputs) => new Function('loopbackInput', 'process', code.slice(imported.length))(
+      loopbackInput, { env: { RUNTIME_CONFIG_LOOPBACK_INPUTS: JSON.stringify(inputs) } });
+  };
+  return [check('cheap_format', '      - name: Admit exact real HOT loopback request'),
+    check('runtime_config_source_tests', '      - name: Admit isolated RuntimeConfig source-only selection'),
+    check('windows_launcher_diagnostics', '      - name: Validate the fixed reviewed candidate')];
+}
+function reusableLoopbackModeContract(source = workflow) {
+  const call = section(source, 'workflow_call');
+  assert.match(call, /^      runtime_config_loopback_input:\n        description: .*\n        type: string\n        default: diagnostic-source$/m);
+  assert.doesNotMatch(call, /runtime_config_loopback_candidate/);
+  const names = ['cheap_format', 'native_dns_candidate_gates', 'lint', 'cross', 'test', 'runtime_config_loopback', 'runtime_config_source_tests', 'windows_launcher_diagnostics'];
+  const scheduled = ciSchedule(source, names);
+  const callDefault = { runtime_config_loopback_input: 'diagnostic-source', windows_system_candidate: '', native_dns_candidate: '', preserve_run: false };
+  const admissionStep = ciJobSection(source, 'cheap_format').split('      - name: Admit exact real HOT loopback request\n')[1].split('\n      - ')[0];
+  const admissionIf = /^        if: \$\{\{ (.*) \}\}$/m.exec(admissionStep)[1];
+  const requested = (event, inputs) => evaluateCiExpression(admissionIf, { event_name: event }, inputs);
+  const checks = exactModeSteps(source);
+  for (const event of ['workflow_dispatch', 'push', 'pull_request', 'workflow_call', 'merge_group']) {
+    assert.equal(requested(event, callDefault), false);
+    for (const check of checks) assert.doesNotThrow(() => check(callDefault));
+    const ordinary = scheduled(event, callDefault);
+    for (const name of ['cheap_format', 'lint', 'cross', 'test', 'runtime_config_source_tests']) assert.ok(ordinary.includes(name), `${event}: ${name}`);
+    assert.ok(!ordinary.includes('runtime_config_loopback'));
+    for (const mode of ['formal-release', '', 'unknown', null, false, 'FORMAL-RELEASE']) {
+      const inputs = { ...callDefault, runtime_config_loopback_input: mode };
+      assert.equal(requested(event, inputs), true, `${event}: explicit ${mode} must reach cheap admission`);
+      assert.deepEqual(scheduled(event, inputs, {}, 'failure'), ['cheap_format']);
+      assert.throws(() => loopbackAdmission(inputs, { GITHUB_EVENT_NAME: event }));
+    }
+    // GitHub folds string comparisons: scheduling is not exact acceptance.
+    const uppercase = { ...callDefault, runtime_config_loopback_input: 'DIAGNOSTIC-SOURCE' };
+    assert.equal(requested(event, uppercase), false);
+    for (const check of checks) assert.throws(() => check(uppercase));
+    assert.throws(() => runtimeSourceAdmission({ ...runtimeSourceDefaults, runtime_config_source_only: true, runtime_config_loopback_input: 'DIAGNOSTIC-SOURCE' }));
+    const failed = scheduled(event, uppercase, {}, 'failure');
+    assert.ok(failed.includes('cheap_format'));
+    assert.ok(!failed.some((name) => ['lint', 'cross', 'test', 'runtime_config_loopback'].includes(name)));
+  }
+  for (const event of ['push', 'pull_request']) {
+    assert.equal(requested(event, {}), false, 'ordinary direct event has no typed inputs');
+    assert.equal(requested(event, { unrelated: '"runtime_config_loopback_input"' }), false, 'escaped value cannot fabricate a JSON key');
+    assert.ok(scheduled(event, {}).includes('test'));
+  }
+  for (const check of checks) {
+    for (const inputs of [{}, callDefault, { runtime_config_loopback_input: 'formal-release' }]) assert.doesNotThrow(() => check(inputs));
+    for (const mode of ['', null, false, 0, {}, [], 'unknown', 'DIAGNOSTIC-SOURCE', 'FORMAL-RELEASE'])
+      assert.throws(() => check({ runtime_config_loopback_input: mode }));
+  }
+  // Each standalone dispatch path must reject aliases before product work,
+  // even when the cheap job is intentionally omitted by its original mode.
+  for (const special of [{ runtime_config_source_only: true }, { windows_launcher_diagnostics: true }]) {
+    const inputs = { ...runtimeSourceDefaults, ...special, runtime_config_loopback_input: 'DIAGNOSTIC-SOURCE' };
+    const started = scheduled('workflow_dispatch', inputs, {}, 'failure');
+    assert.deepEqual(started, special.runtime_config_source_only ? ['runtime_config_source_tests'] : ['windows_launcher_diagnostics']);
+  }
+}
+test('reusable caller defaults preserve full CI, explicit modes fail closed across caller events and exact admission rejects case aliases', () => {
+  reusableLoopbackModeContract();
+  for (const [before, after] of [
+    [loopbackRawMode, 'false'],
+    ['      - name: Validate exact loopback input mode\n', '      - name: OMITTED exact input mode\n'],
+    ["loopbackInput(JSON.parse(process.env.RUNTIME_CONFIG_LOOPBACK_INPUTS));", 'void process.env.RUNTIME_CONFIG_LOOPBACK_INPUTS;'],
+  ]) {
+    assert.ok(workflow.includes(before));
+    assert.throws(() => reusableLoopbackModeContract(workflow.replaceAll(before, after)));
+  }
 });

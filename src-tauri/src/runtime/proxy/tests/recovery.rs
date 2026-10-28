@@ -153,7 +153,7 @@ async fn error_emitter_reenters_readers_before_later_generation_claim() {
 async fn retry_after_owned_restart_failure_reaches_second_attempt() {
     let (rt, _dir) = test_runtime();
     rt.stale_sweep_disabled.store(true, Ordering::SeqCst);
-    *rt.current_config.write().unwrap() = Some(bad_config());
+    *rt.current_config.write().unwrap() = Some(post_admission_failure_config());
     let birth = rt.gate.generation();
     let event = crash_event_for_test(&rt, birth);
     let worker = {
@@ -296,7 +296,7 @@ async fn stopped_superseded_crash_does_not_replay() {
 #[tokio::test(flavor = "multi_thread")]
 async fn admission_failure_returns_recovery_single_flight_token() {
     let (rt, dir) = test_runtime();
-    *rt.current_config.write().unwrap() = Some(bad_config());
+    *rt.current_config.write().unwrap() = Some(post_admission_failure_config());
     std::fs::write(
         dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE),
         b"bad marker",
@@ -329,13 +329,16 @@ async fn recovery_restart_receipt_distinguishes_preclaim_and_owned_errors() {
     let marker = dir.join(polaris_store::mesh_guard::REQUIRED_MARKER_FILE);
     std::fs::write(&marker, b"bad marker").unwrap();
     assert!(matches!(
-        rt.restart_guarded_outcome(bad_config(), Some(birth)).await,
+        rt.restart_guarded_outcome(post_admission_failure_config(), Some(birth))
+            .await,
         RestartLeg::Finished(Err(_), None)
     ));
     assert_eq!(rt.gate.generation(), birth, "preclaim error must not bump");
 
     std::fs::remove_file(marker).unwrap();
-    let receipt = rt.restart_guarded_outcome(bad_config(), Some(birth)).await;
+    let receipt = rt
+        .restart_guarded_outcome(post_admission_failure_config(), Some(birth))
+        .await;
     let owned = match receipt {
         RestartLeg::Finished(Err(_), Some(generation)) => generation,
         _ => panic!("failed restart must return its owned generation"),
@@ -360,7 +363,8 @@ async fn recovery_restart_receipt_distinguishes_preclaim_and_owned_errors() {
     assert!(rt.status().running, "old receipt must not overwrite C");
     assert_eq!(rt.status().pid, 4242);
     assert!(matches!(
-        rt.restart_guarded_outcome(bad_config(), Some(owned)).await,
+        rt.restart_guarded_outcome(post_admission_failure_config(), Some(owned))
+            .await,
         RestartLeg::Superseded
     ));
     assert_eq!(rt.gate.generation(), c_gen);
