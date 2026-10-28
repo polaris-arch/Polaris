@@ -1,5 +1,5 @@
 import { useSubscriptionUserAgent } from '@/hooks/use-subscription-user-agent';
-import { SubscriptionUserAgentHint } from '@/components/dialogs/SubscriptionUserAgentHint';
+import { MobileSubscriptionUserAgentHint } from './SubscriptionUserAgentHint';
 import { isSavedEditProgress, presentSubscriptionRefreshResult, subscriptionEditProgressText } from '@/domain/subscription-refresh';
 import { useSubscriptionProgress } from '@/store/use-subscription-progress-store';
 import { useInputRequest } from '@/hooks/use-input-request';
@@ -408,7 +408,7 @@ export function SubFormPanel({
           }}
         />
         <p className="m-form-hint">{t('sub.uaHint')}</p>
-        <SubscriptionUserAgentHint id="msf-ua-info" model={uaInfo} className="m-form-hint" retryClassName="m-form-btn" />
+        <MobileSubscriptionUserAgentHint id="msf-ua-info" model={uaInfo} />
       </div>
 
       <div className="m-form-row m-form-switch">

@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import type { SubscriptionUserAgentModel } from '@/hooks/use-subscription-user-agent';
 
-/** Shared desktop/mobile read-only hint. Custom input remains optional and untouched. */
+/** Desktop presentation of the shared read model; mobile controls stay in the mobile tree. */
 export function SubscriptionUserAgentHint({ id, model, className = 'fld-hint', retryClassName = 'btn ghost sm' }: {
   id: string;
   model: SubscriptionUserAgentModel;

@@ -11,12 +11,17 @@ import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { useSubscriptionUserAgent } from '/src/hooks/use-subscription-user-agent';
 import { SubscriptionUserAgentHint } from '/src/components/dialogs/SubscriptionUserAgentHint';
+import { MobileSubscriptionUserAgentHint } from '/src/mobile/forms/SubscriptionUserAgentHint';
+import '/src/styles/tokens.resolved.css';
+import '/src/mobile/forms/forms.css';
 import { subscriptionApi } from '/src/ipc/api/subscriptions';
 import { useAppStore } from '/src/store/app-store';
 import i18n, { i18nReady } from '/src/i18n';
 await i18nReady; await i18n.changeLanguage('en-US');
 let view;
-const test = window.__uaTest = { requests: [], mount, unmount,
+const mobile = new URLSearchParams(location.search).get('surface') === 'mobile';
+const Hint = mobile ? MobileSubscriptionUserAgentHint : SubscriptionUserAgentHint;
+const test = window.__uaTest = { requests: [], submits: 0, mount, unmount,
   global(value) { useAppStore.setState({config:{subscriptionUserAgent:value}}); },
   reply(index, value) { test.requests[index].resolve(value); },
   fail(index) { test.requests[index].reject(new Error('synthetic read failure')); },
@@ -25,9 +30,10 @@ subscriptionApi.userAgentInfo = userAgent => new Promise((resolve,reject) => tes
 function Probe() {
   const [ua,setUa] = useState('');
   const model = useSubscriptionUserAgent(ua);
-  return <><input data-testid="ua-input" aria-describedby="ua-info" value={ua} onChange={e=>setUa(e.target.value)}
+  return <form className={mobile ? 'm-form-row' : 'fld'} onSubmit={e=>{e.preventDefault(); test.submits++;}}>
+    <input data-testid="ua-input" aria-describedby="ua-info" value={ua} onChange={e=>setUa(e.target.value)}
     placeholder={model.status==='ready' && model.info.effectiveStatus==='ready' ? model.info.fallbackUserAgent : i18n.t('sub.uaPh')} />
-    <SubscriptionUserAgentHint id="ua-info" model={model} /></>;
+    <Hint id="ua-info" model={model} /></form>;
 }
 function mount() { view=createRoot(document.getElementById('root')); view.render(<Probe/>); }
 function unmount() { view.unmount(); }
@@ -35,6 +41,7 @@ mount();
 `;
 interface TestPort {
   requests: { userAgent: string }[];
+  submits: number;
   mount: () => void;
   unmount: () => void;
   global: (value: string) => void;
@@ -55,7 +62,7 @@ const count = (page: Page, value: number) => page.waitForFunction(n => (window a
 const reply = (page: Page, index: number, info: unknown) => page.evaluate(({ index, info }) => (window as unknown as TestWindow).__uaTest.reply(index, info), { index, info });
 const text = (page: Page) => page.locator('#ua-info').textContent();
 
-describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('backend-owned subscription UA display', () => {
+describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1').each(['desktop', 'mobile'] as const)('%s backend-owned subscription UA display', surface => {
   beforeAll(async () => {
     server = await createServer({ root, server: { host: '127.0.0.1', port: 0 }, plugins: [{
       name: 'subscription-user-agent-fixture',
@@ -74,9 +81,9 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('backend-owned subscri
   }, 30_000);
   afterAll(async () => { await browser?.close(); await server?.close(); });
   async function pageForTest() {
-    const page = await browser.newPage();
+    const page = await browser.newPage({ viewport: { width: surface === 'mobile' ? 390 : 1024, height: 844 } });
     try {
-      await page.goto(`${origin}/__ua`);
+      await page.goto(`${origin}/__ua?surface=${surface}`);
       // The module awaits i18n before installing the port; navigation alone is not readiness.
       await page.waitForFunction(() => '__uaTest' in window, undefined, { timeout: 10_000 });
       await count(page, 1);
@@ -118,6 +125,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('backend-owned subscri
       expect(await text(page)).not.toContain(INFO.defaultUserAgent);
       expect(await page.getByTestId('ua-input').inputValue()).toBe('custom/4');
       await page.getByRole('button', { name: 'Retry', exact: true }).click(); await count(page, 5);
+      expect(await page.evaluate(() => (window as unknown as TestWindow).__uaTest.submits)).toBe(0);
+      expect(await page.getByTestId('ua-input').inputValue()).toBe('custom/4');
       await reply(page, 4, { ...INFO, source: 'subscription', effectiveUserAgent: 'custom/4' }); await ready(page, 'custom/4');
     } finally { await page.close(); }
   }, 30_000);
@@ -135,6 +144,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('backend-owned subscri
       expect(await page.getByTestId('ua-input').getAttribute('placeholder')).not.toBe(INFO.defaultUserAgent);
       expect(await page.getByTestId('ua-input').inputValue()).toBe('');
       await page.getByRole('button', { name: 'Retry', exact: true }).click(); await count(page, 2);
+      expect(await page.evaluate(() => (window as unknown as TestWindow).__uaTest.submits)).toBe(0);
       await reply(page, 1, { ...INFO, source: 'global', effectiveUserAgent: 'real-global/2', fallbackUserAgent: 'real-global/2' });
       await ready(page, 'real-global/2');
       expect(await page.getByTestId('ua-input').getAttribute('placeholder')).toBe('real-global/2');
@@ -170,6 +180,31 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('backend-owned subscri
       await page.getByRole('button', { name: 'Retry', exact: true }).click(); await count(page, 3);
       await reply(page, 2, undefined); await ready(page, 'Could not read versions');
       expect(await text(page)).not.toContain(INFO.appVersion);
+    } finally { await page.close(); }
+  }, 30_000);
+
+  it.runIf(surface === 'mobile')('uses the mobile retry hit target and wraps opaque long UA text within the viewport', async () => {
+    const page = await pageForTest();
+    try {
+      const longUserAgent = 'opaque'.repeat(260);
+      await reply(page, 0, { ...INFO, defaultUserAgent: longUserAgent,
+        effectiveUserAgent: longUserAgent, fallbackUserAgent: longUserAgent });
+      await ready(page, longUserAgent);
+      const hint = page.locator('#ua-info');
+      expect(await hint.getAttribute('class')).toBe('m-form-hint');
+      expect(await hint.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+      expect(await hint.evaluate(node => node.getBoundingClientRect().right <= window.innerWidth)).toBe(true);
+      await page.getByTestId('ua-input').fill('retry-current'); await count(page, 2);
+      await page.evaluate(() => (window as unknown as TestWindow).__uaTest.fail(1));
+      await ready(page, 'Could not read versions');
+      const retry = page.getByRole('button', { name: 'Retry', exact: true });
+      expect(await retry.getAttribute('class')).toBe('m-form-btn');
+      expect(await retry.getAttribute('type')).toBe('button');
+      expect((await retry.boundingBox())?.height).toBeGreaterThanOrEqual(44);
+      await retry.focus();
+      expect(await retry.evaluate(node => document.activeElement === node)).toBe(true);
+      await retry.press('Enter'); await count(page, 3);
+      expect(await page.evaluate(() => (window as unknown as TestWindow).__uaTest.submits)).toBe(0);
     } finally { await page.close(); }
   }, 30_000);
 });

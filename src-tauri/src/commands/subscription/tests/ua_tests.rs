@@ -449,8 +449,9 @@ fn ua_display_rejects_unavailable_versions_even_when_override_exists() {
 
 #[test]
 fn ua_display_command_reads_real_sources_without_fetch_or_write() {
+    let source = crate::test_support::crate_source("commands/subscription.rs");
     let body = crate::commands::guard_scan::top_level_fn_body(
-        include_str!("../../subscription.rs"),
+        &source,
         "pub async fn subscription_user_agent_info(",
     );
     for required in [
