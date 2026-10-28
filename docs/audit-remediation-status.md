@@ -1,5 +1,7 @@
 # Reconstructed audit remediation batch
 
+This is a historical batch-by-batch remediation record, not the current build guide or a release-status dashboard. Commit IDs, failures and pending statements below describe their named batch; do not apply them to later commits or relabel their evidence. For current build inputs and commands, use [Build and Package](build-and-package.en.md), [iOS source builds](ios-source-build.md), and the contracts they reference. Final acceptance must be established for the exact final candidate.
+
 All four implementation review partitions have statically closed their reported findings. The first full GitHub CI batch on App c2226c3c47f0478918b05c2e321f0e221152ab2f reached terminal failure and informed the consolidated fixes below. The amended source snapshot has not yet undergone full product compilation, tests or CI; final integration metadata remains subject to its own review. No historical PASS certifies these reconstructed bytes.
 
 ## Original 45 findings

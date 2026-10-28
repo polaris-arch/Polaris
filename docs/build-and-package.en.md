@@ -20,6 +20,7 @@ Implementation lands in batches per system design §H (B0 scaffolding → B10 re
 | Node.js | 24+ (CI pins 26) | Frontend build + fetch scripts |
 | pnpm | 11.24.0 (pinned by `ui/package.json`) | Frontend package management (`ui/`); the `beforeBuildCommand` of `tauri build` calls `pnpm` directly, so it must be on PATH |
 | Go | `goVersion` in the source manifest for the selected build path | Source builds and binary build-information inspection; desktop and mobile inputs are separate |
+| Python | 3 (full mobile host tests need 3.11+; CI uses 3.12) | Desktop pinned-source archive verification and mobile builders; the command is `python` on Windows and `python3` elsewhere |
 | [Tauri CLI 2](https://v2.tauri.app/) | Pinned by `scripts/tauri-cli.version` | `tauri build` packaging with the global CLI |
 
 Install the global CLI from the repository root. The CLI is no longer a `ui/` devDependency; desktop and Android CI install the same pinned version.
@@ -40,7 +41,9 @@ sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
 ```
 
 **macOS**: 13.0+ (Ventura, required by the three-tier BTM "allow in background" probe), plus Xcode Command Line Tools.
-**Windows**: MSVC build tools (Visual Studio Build Tools 2022 + Windows 10/11 SDK).
+**Windows**: MSVC build tools (Visual Studio Build Tools 2022 + Windows 10/11 SDK), CMake and NASM (CI pins NASM 3.02; source and checksum are in `.github/workflows/ci.yml`).
+
+Native Rust builds also need `protoc` for `crates/singbox-grpc/build.rs`. Run `node scripts/fetch-protoc.mjs` to acquire the script-pinned version and checksum. Locally it only prints the `bin` directory; it does not update the current shell PATH. Add that directory to PATH and check `protoc --version` (currently `libprotoc 35.1`) before running `cargo` / `tauri` builds.
 
 ### Rust workspace (development gates)
 
@@ -72,10 +75,10 @@ create a second compatibility layer.
 
 ### Fetching assets (sing-box core / cronet / dashboard)
 
-The current core development repository is [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). This navigation change does not rewrite frozen build inputs: the desktop Release assets and mobile alpha.12 source below remain subject to their respective manifests. Do not mechanically replace old asset URLs with download URLs under the new repository.
+Current desktop and mobile inputs both select the pinned alpha.12 source from [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris). Desktop release assets and mobile source have separate contracts below. Verify repository, source commit, tag object and digests together; do not mechanically rewrite historical asset URLs or reuse historical receipts.
 
 Current desktop packaging starts from `desktopRelease` in `src-tauri/core-manifest.json` and consumes the pinned
-[polaris-box](https://github.com/polaris-arch/polaris-box) release through `scripts/desktop-core/release-contract.json`.
+[sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris) release through `scripts/desktop-core/release-contract.json`.
 The source commit, tag object, asset index, and digests are pinned. Do not substitute the fork's latest default-branch
 commit, the historical `sourceBuild`, or the mobile `scripts/mobile-core/source-contract.json` for this desktop selection.
 These build inputs do not establish native App acceptance or publication of an App candidate.
@@ -119,17 +122,59 @@ The core ships with the App; this guide does not expose independent user core up
 
 ### Producing installers
 
-The artifact names, asset tables, and three Android APKs described here are the build and release conventions of the current `main` source, for maintainers preparing candidate packages. They are not the current public download list and do not establish that a candidate has been published or passed installation acceptance. For published downloads, use the [README installation guide](../README.en.md#install) and the actual assets on [v1.0.0 Release](https://github.com/polaris-arch/Polaris/releases/tag/v1.0.0).
+The artifact names, asset tables, and three Android APKs described here are the build and release conventions of the current `main` source, for maintainers preparing candidate packages. They are not the current public download list and do not establish that a candidate has been published or passed installation acceptance. Once a release is published, use the [README installation guide](../README.en.md#install) and the actual assets in [Releases](https://github.com/polaris-arch/Polaris/releases).
+
+Run this complete single-platform local sequence at the root of a clean, committed checkout on the matching OS, after satisfying the toolchain and system prerequisites above. Select the intended `platform`; macOS can explicitly target Intel. On Windows, use Git Bash with the MSVC environment available. These are source-build steps, not a formal release command.
 
 ```bash
-# 1) Fetch assets (see above)
-# 2) Frontend build + Rust compile + installer (Tauri CLI orchestrates beforeBuildCommand)
-#    Run from the **repository root** and pass this platform's config explicitly (see "Per-platform core filtering")
-tauri build --config src-tauri/tauri.linux.conf.json          # Linux
-tauri build --config src-tauri/tauri.windows.conf.json        # Windows
-tauri build --config src-tauri/tauri.macos-arm64.conf.json    # macOS Apple Silicon
-tauri build --config src-tauri/tauri.macos-x64.conf.json --target x86_64-apple-darwin  # macOS Intel
+# Bash; on Windows use Git Bash with the MSVC build environment available.
+set -euo pipefail
+platform=linux  # linux | win | mac-arm64 | mac-x64
+case "$platform" in
+  linux) target=x86_64-unknown-linux-gnu; conf=linux; helper=polaris-helper ;;
+  win) target=x86_64-pc-windows-msvc; conf=windows; helper=polaris-helper.exe ;;
+  mac-arm64) target=aarch64-apple-darwin; conf=macos-arm64; helper=polaris-helper ;;
+  mac-x64) target=x86_64-apple-darwin; conf=macos-x64; helper=polaris-helper ;;
+  *) echo "Unsupported platform" >&2; exit 1 ;;
+esac
+npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
+pnpm --dir ui install --frozen-lockfile
+# protoc must already be on PATH as described under system dependencies.
+protoc --version
+export POLARIS_BUILD_ID="$(git rev-parse HEAD)"
+node scripts/fetch-core.mjs --platform="$platform"
+case "$platform" in
+  linux|win) node scripts/fetch-cronet.mjs --platform="$platform" ;;
+esac
+node scripts/fetch-dashboard.mjs
+args=(--target "$target")
+out="target/$target/release"
+case "$platform" in
+  linux|win)
+    test "$(rustc -vV | sed -n 's/^host: //p')" = "$target"
+    args=(); out=target/release ;;
+  mac-*) rustup target add "$target" ;;
+esac
+cargo build --release -p polaris-helper --bin polaris-helper "${args[@]}"
+mkdir -p "resources/$platform"
+cp "$out/$helper" "resources/$platform/$helper"
+case "$platform" in
+  mac-*)
+    if ! codesign --verify --strict "resources/$platform/$helper"; then
+      codesign --force --sign - --timestamp=none "resources/$platform/$helper"
+    fi
+    codesign --verify --strict "resources/$platform/$helper" ;;
+  win)
+    cargo build --release -p polaris-windows-cleaner --bin polaris-cleaner
+    cp "$out/polaris-cleaner.exe" resources/win/polaris-cleaner.exe ;;
+esac
+node scripts/prepare-core-identity.mjs --platform="$platform"
+export POLARIS_CORE_IDENTITY_FILE="$PWD/resources/$platform/core-manifest.json"
+tauri build --config "src-tauri/tauri.$conf.conf.json" "${args[@]}"
+node scripts/prepare-core-identity.mjs --platform="$platform" --mode=verify
 ```
+
+The helper, Windows cleaner and App must share one `POLARIS_BUILD_ID`. Seal the macOS helper ad hoc before freezing its identity; this is not Developer ID signing or notarization. `prepare-core-identity.mjs` freezes the actual bundled bytes, and App compilation consumes that same manifest. If helper/core bytes change later, prepare the identity and rebuild the App rather than replacing files alone. With no identity input, analysis builds may produce an unavailable placeholder; successful compilation alone is not a usable installer. Formal publication additionally requires same-candidate native acceptance bundles, payload/assets/inventory checks, signing and the complete release DAG. These local steps do not replace those gates. `verify-packaging.mjs confs` checks resources for all four platforms and requires all four resource sets; it is not part of this single-platform recipe.
 
 Artifacts land in `target/release/bundle/` at the **repository root** (this repo is a cargo workspace whose root is the repository root, so **not** `src-tauri/target/`). When `--target <triple>` is passed, they go one level deeper: `target/<triple>/release/bundle/`.
 
@@ -152,7 +197,7 @@ Old-name copies and extra files are rejected.
 
 ### Mobile source-build prerequisites
 
-Desktop sidecar downloads do not supply mobile bindings. The current common inputs are defined by [source-contract.json](../scripts/mobile-core/source-contract.json) and the [mobile core build guide](../scripts/mobile-core/README.md): pinned polaris-box source, Go 1.25.5, and gomobile/gobind v0.1.13. Build and verify the component and its original receipt before App consumption.
+Desktop sidecar downloads do not supply mobile bindings. The current common inputs are defined by [source-contract.json](../scripts/mobile-core/source-contract.json) and the [mobile core build guide](../scripts/mobile-core/README.md): pinned sing-box-polaris source, Go 1.27.2, and gomobile/gobind v0.1.13. Build and verify the component and its original receipt before App consumption.
 
 - **Android bindings**: API 24 AAR, Java 17 (CI pins 17.0.20+101), and NDK r30-beta3 (complete source revision 30.0.16138531-beta3). The AAR contains ARM64, ARMv7, x86 and x86_64; this does not widen the two-ARM-ABI signed APK scope.
 - **Android App**: Gradle uses JDK 21 and currently SDK/Build Tools 36 / 36.0.0. Rust uses 27.3.13750724 pinned by [android-rust-ndk.version](../scripts/android-rust-ndk.version), separately from the binding NDK. The App minimum is API 24.
@@ -224,10 +269,11 @@ The main workflows divide the work (`.github/workflows/`):
 
   The local mirror is `scripts/gate-rust.sh` (the cross-target gates need `--with-cross`); `scripts/gate-rust-ci-parity.test.mjs` keeps it in step with `ci.yml`. Setting `fmt + clippy (<os>)` and `build + test (<os>)` for the three platforms, plus `cross-target clippy + android face`, as required checks is recommended.
 - **`ui.yml`** — frontend gate: `pnpm run build` (tsc + vite build), vitest, and Playwright; triggered on PRs and pushes to main.
-- **`release-risk.yml`** — release-risk gate: triggered on PRs, the merge queue, and pushes to main; it classifies the changed paths inside a job and calls `desktop-core.yml`, `package.yml` (without uploading artifacts), and `android.yml` only for the affected faces.
+- **`release-risk.yml`** — release-risk gate: triggered on PRs, the merge queue, and pushes to main; it classifies the changed paths inside a job and calls `desktop-core.yml`, `package.yml`, `android.yml`, and `apple.yml` only for the affected faces. Ordinary desktop and Android risk legs use light builds: installers/APKs are not uploaded or distributable. The separate `native_payload` acceptance path uses the full profile and can upload candidate desktop packages and evidence; these are not public Releases or proof of installation/device acceptance. Check the specific job profile and its actual attachments.
 - **`desktop-core.yml`** — call-only: four native runners verify the pinned release inputs, or build pinned source in source mode, and assemble the candidate bundle.
-- **`package.yml`** — release engineering: four legs (Linux / Windows / macOS arm64 / macOS x64) running fetch + `tauri build` + artifact verification. Triggered by tags (`v*`), manually, or by a call from `release-risk.yml`. Its job is "can we produce a distributable installer". On a tag release it creates the draft release, uploads the desktop assets, then calls `android.yml` to upload the signed APK, and publishes after reconciling the full asset set.
-- **`android.yml`** — call-only or manual: builds a release-profile APK and runs artifact-level checks; when called for a release it produces the signed APK.
+- **`package.yml`** — release engineering: four legs (Linux / Windows / macOS arm64 / macOS x64) running fetch + `tauri build` + artifact verification. Triggered by tags (`v*`), manually, or by a call from `release-risk.yml`. The release profile produces distributable installers; the light risk profile validates only the packaging chain. On a tag release it creates the draft release, uploads the desktop assets, then calls `android.yml` to upload the signed APK, and publishes after reconciling the full asset set.
+- **`android.yml`** — call-only or manual: builds a release-profile APK and runs artifact-level checks; release calls produce three formally signed APKs.
+- **`apple.yml`** — selected by the risk gate or manually dispatched: by default verifies unsigned device-ARM64 App / PacketTunnel compilation and linkage; simulator App compilation is explicit opt-in. It does not publish an IPA or establish device installation, NE authorization or VPN runtime acceptance. See the [mobile core guide](../scripts/mobile-core/README.md) for component and evidence constraints.
 
 ## Windows installer and WebView2
 
@@ -262,7 +308,7 @@ The user then extracts everything in the archive into the program folder, choosi
 
 ## Bundled core and privileged helper
 
-Desktop production packages use the selected polaris-box core for this app version. Linux and Windows include Cronet beside the core; macOS uses static inputs. Packaging freezes the actual helper bytes (and Windows cleaner), generates `core-manifest.json` as an App compile input, and verifies the final payload against it. Production builds accept neither uploaded cores nor environment overrides for the core path.
+Desktop production packages use the selected sing-box-polaris core for this app version. Linux and Windows include Cronet beside the core; macOS uses static inputs. Packaging freezes the actual helper bytes (and Windows cleaner), generates `core-manifest.json` as an App compile input, and verifies the final payload against it. Production builds accept neither uploaded cores nor environment overrides for the core path.
 
 A change to the selected content identity requires an administrator installation transaction before TUN startup. The helper stores immutable versions by CoreID; runtime requests send the ID without uploading files. A newer compatible helper may be retained. Adding another core version does not stop another user's active core. If an old helper retains custody or an empty slot cannot be established, replacement is deferred.
 

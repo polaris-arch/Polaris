@@ -39,6 +39,8 @@ const base = mode === 'node'
       tailscaleSettings: { hostname: 'synthetic-phone', sourceTag: 'imported' } };
 const test = window.__meshPolicyTest = { saved: [], mode };
 api.server.update = async server => { test.saved.push(server); };
+// This fixture models no persisted account, independently of its synthetic peers.
+api.server.tailscaleStateExists = async ids => Object.fromEntries(ids.map(id => [id, false]));
 const peer = (name, ip) => ({ hostName: name, ip, online: true, exitNode: false,
   exitNodeOption: true, active: true });
 api.server.tailscaleGetStatus = async () => ({ connected: true, statuses: [
@@ -80,6 +82,8 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile mesh inbound p
   for (const mode of ['node', 'wg', 'ts'] as const) {
     it(`${mode} retains an explicit allowlist on save`, async () => {
       const page = await browser.newPage({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+      const pageErrors: string[] = [];
+      page.on('pageerror', error => pageErrors.push(error.message));
       try {
         await page.goto(`${origin}/__mesh-policy?mode=${mode}`);
         await page.getByText('授权规则 1').waitFor();
@@ -90,6 +94,7 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile mesh inbound p
           { sourceCidrs: ['10.0.0.2/32'], network: 'tcp', ports: ['443'], target: 'local' },
         ] });
         if (mode === 'ts') expect(saved.tailscaleSettings.sourceTag).toBe('imported');
+        expect(pageErrors).toEqual([]);
       } finally { await page.close(); }
     }, 30_000);
   }

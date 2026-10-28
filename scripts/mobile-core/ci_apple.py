@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import zipfile
+import zlib
 
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
@@ -173,7 +174,7 @@ def prepare():
     print(json.dumps({'phase': 'apple-tool-prepare-capacity-sample', 'capacity': observation}, sort_keys=True), flush=True)
     env, capacity = native_environment(env, observation)
     print('NATIVE_CAPACITY_OBSERVATION=' + json.dumps(capacity, sort_keys=True), flush=True)
-    run([go, 'install', 'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
+    run([go, 'install', '-trimpath', 'github.com/sagernet/gomobile/cmd/gomobile@' + value['gomobileVersion'],
          'github.com/sagernet/gomobile/cmd/gobind@' + value['gobindVersion']], env=env,
         log=root / 'original-generator-prepare.log', capture='none', observation_fd=sys.stdout.fileno(),
         observation_phase='tool-prepare')
@@ -193,6 +194,105 @@ def prepare():
     print('Exact Apple source/tool slots prepared; no compiler, signing or device action')
 
 
+def current_component_binding(root, paths):
+    """Current input admission errors stay fatal and outside cache-miss handling."""
+    from types import SimpleNamespace
+    from fork_input import verify_source
+    from producer import admitted_binding
+    value, identity = load(), producer_code()
+    args = SimpleNamespace(platform='apple', **{name.replace('-', '_'): Path(paths[name]) for name in
+                           ('source', 'go', 'gomobile', 'gobind', 'developer')})
+    initial = verify_source(args.source, value)
+    with lease(Path(paths['component-work']), Path(paths['cache']), value) as (work, cache):
+        return admitted_binding(args, value, work, cache, identity, initial)[5]
+
+
+def component_cache_key():
+    from apple_handoff import component_cache_eligible, component_cache_path
+    from producer import apple_cache_binding, cacheable_native_environment
+    from artifacts import receipt_digest
+    require(component_cache_eligible(), 'component cache key requires trusted ordinary main push')
+    root = location()
+    binding = current_component_binding(root, read_receipt(root / 'tools.json')['paths'])
+    write_json(root / 'component-current-binding.json', binding)
+    with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+        output.write('eligible=' + str(cacheable_native_environment(binding)).lower() + '\n')
+        output.write('identity=' + receipt_digest(apple_cache_binding(binding)) + '\n')
+        output.write('path=' + str(component_cache_path()) + '\n')
+
+
+def restore_component_cache(root, tools):
+    """Only bounded invalid package data is a miss; current admission/I/O is fatal."""
+    from apple_handoff import (component_cache_eligible, component_cache_path, read_component_package,
+                               restore_payload, context)
+    from producer import verify_receipt, apple_cache_binding, cacheable_native_environment
+    from artifacts import receipt_digest
+    if not component_cache_eligible():
+        return False
+    # The key step is mandatory for this branch, and its exact inputs must still
+    # hold after frontend preparation. No cached metadata substitutes for this.
+    binding = current_component_binding(root, tools['paths'])
+    require(binding == read_receipt(root / 'component-current-binding.json'),
+            'current component inputs changed after cache key admission')
+    if not cacheable_native_environment(binding):
+        print('APPLE_COMPONENT_CACHE=miss:custom-native-environment', flush=True)
+        return False
+    folder, package = component_cache_path(), component_cache_path() / 'component.zip'
+    if not package.exists() and not package.is_symlink():
+        print('APPLE_COMPONENT_CACHE=miss:absent', flush=True)
+        return False
+    try:
+        require(all(not parent.is_symlink() for parent in (folder, *folder.parents)) and
+                folder.resolve(strict=True) == folder, 'cache path redirected')
+        pin = file_pin(package)
+        with zipfile.ZipFile(package) as archive:
+            manifest, receipt = read_component_package(archive, root, binding)
+    except (RuntimeError, ValueError, KeyError, TypeError, AttributeError, RecursionError,
+            zipfile.BadZipFile, zlib.error, EOFError):
+        # This block reads only the restored package. It never admits current
+        # source/tools, installs files, or catches permissions/disk/I/O errors.
+        print('APPLE_COMPONENT_CACHE=miss:invalid-or-incompatible-package', flush=True)
+        return False
+    original_root = Path(manifest['root'])
+    require(not original_root.exists() and not original_root.is_symlink(),
+            'original component namespace occupied; explicit recovery required')
+    with lease(private_dir(root / 'component-cache-import'), Path(tools['paths']['cache']), load()):
+        private_dir(original_root)
+        with slot_locks(original_root, original_root):
+            with zipfile.ZipFile(package) as archive:
+                require(file_pin(package) == pin, 'restored cache changed before installation')
+                restore_payload(archive, manifest['files'], original_root, ROOT)
+        component = original_root / 'component'
+        with slot_locks(component, original_root / 'cache'):
+            verify_receipt(component / 'Libbox.xcframework', receipt, load(), receipt['input'], {}, None,
+                           private_dir(root / 'component-cache-check'))
+            from consume import verify_original
+            verify_original(component / 'Libbox.xcframework', component / 'component-receipt.json', 'apple', {},
+                            private_dir(root / 'component-cache-original-check'))
+        # Only after full original byte/API/native admission adopt the component
+        # into the current context. Preserve complete original bytes as evidence.
+        retained = root / 'retained-component.zip'
+        with retained.open('xb') as output:
+            copy_pinned_evidence(package, output, pin)
+        require(file_pin(retained) == pin, 'retained original package changed')
+        observation = {'schema': 'polaris-apple-component-cache-observation-v1', 'context': context(),
+                       'identity': receipt_digest(apple_cache_binding(binding)), 'trust': 'trusted-main-cache',
+                       'inputsRevalidated': True, 'historicalProviderAuthenticated': False,
+                       'currentRunProducedComponent': False, 'currentVerifier': binding['producer'],
+                       'currentBinding': file_pin(root / 'component-current-binding.json'),
+                       'originalRoot': str(original_root), 'originalProducer': receipt['input']['producer'],
+                       'originalBuildID': 'polaris-mobile-' + receipt_digest(receipt['input']),
+                       'originalContextInformational': manifest['originalContext'], 'package': pin,
+                       'devicePassed': False, 'publicationEligible': False}
+        observation['fingerprint'] = receipt_digest(observation)
+        write_json(root / 'component-cache-observation.json', observation)
+        tools['paths']['component-work'] = str(component)
+        tools['fingerprint'] = sha(canonical({k: v for k, v in tools.items() if k != 'fingerprint'}))
+        write_json(root / 'tools.json', tools)
+    print('APPLE_COMPONENT_CACHE=reused:trusted-main-cache; original producer and BuildID retained', flush=True)
+    return True
+
+
 def build():
     root = location()
     tools = read_receipt(root / 'tools.json')
@@ -208,18 +308,20 @@ def build():
             run(['pnpm', '--dir', ROOT / 'ui', 'build'], cwd=ROOT, log=root / 'original-frontend.log', capture='none',
                 observation_fd=sys.stdout.fileno(), observation_phase='frontend-build')
             materialize_apple_resources()
-    command = [sys.executable, ROOT / 'scripts/mobile-core/producer.py', 'apple']
-    for name in ('source', 'go', 'gomobile', 'gobind', 'developer'):
-        command += ['--' + name, paths[name]]
-    command += ['--work', paths['component-work'], '--cache', paths['cache']]
     with phase_timing('shared-component'):
-        progress_fd = os.dup(sys.stdout.fileno())
-        try:
-            command += ['--progress-fd', str(progress_fd)]
-            run(command, cwd=ROOT, log=root / 'original-component-producer.log', capture='none',
-                progress_fd=progress_fd, observation_phase='component-build-or-revalidate')
-        finally:
-            os.close(progress_fd)
+        reused = restore_component_cache(root, tools)
+        if not reused:
+            command = [sys.executable, ROOT / 'scripts/mobile-core/producer.py', 'apple']
+            for name in ('source', 'go', 'gomobile', 'gobind', 'developer'):
+                command += ['--' + name, paths[name]]
+            command += ['--work', paths['component-work'], '--cache', paths['cache']]
+            progress_fd = os.dup(sys.stdout.fileno())
+            try:
+                command += ['--progress-fd', str(progress_fd)]
+                run(command, cwd=ROOT, log=root / 'original-component-producer.log', capture='none',
+                    progress_fd=progress_fd, observation_phase='component-build-or-revalidate')
+            finally:
+                os.close(progress_fd)
     from apple_handoff import freeze
     with phase_timing('component-handoff-freeze'):
         freeze(root)
@@ -386,6 +488,10 @@ def evidence(*, publish_env=False, slot=None):
                   'original-' + scoped_slot + '.log',
                   'original-' + scoped_slot + '.log.stdout.raw',
                   'original-' + scoped_slot + '.log.stderr.raw') if (root / name).is_file()})
+        retained = root / 'retained-component.zip'
+        reused_component = ((root / 'component-cache-observation.json').is_file() and retained.is_file())
+        if reused_component and not scoped_slot:
+            paths.add(retained)  # Complete original namespace, never outside-root raw paths.
         component = root / 'component'
         paths.update(component.glob('*.json'))
         paths.update(component.glob('*.log'))
@@ -416,6 +522,7 @@ def evidence(*, publish_env=False, slot=None):
                     receipt_errors['native-input:' + str(len(receipt_errors))] = 'original input missing in failed partial work'
             if 'generatorOutputRoot' in origins:
                 paths.update(path for path in Path(origins['generatorOutputRoot']).rglob('*') if path.is_file())
+        timing_paths = []
         for current_slot in required_slots():
             if scoped_slot and current_slot != scoped_slot:
                 continue
@@ -435,6 +542,7 @@ def evidence(*, publish_env=False, slot=None):
             from apple_rust import target_for
             target = target_for('iphoneos' if current_slot == 'device-arm64' else 'iphonesimulator',
                                 'arm64', 'release')
+            timing_paths.append(work / ('diagnostic-cargo-timing-' + target + '.html'))
             archive = root / 'cache/rust-target' / target / 'release/libpolaris_lib.a'
             if archive.is_file():
                 paths.add(archive)
@@ -507,10 +615,11 @@ def evidence(*, publish_env=False, slot=None):
                 rows[name] = {'originalPath': str(path), **pin}
             index = {'schema': 'polaris-apple-original-evidence-v2', **scope_fields(), 'files': rows,
                      'completeUnsignedChain': (root / 'apple-chain.json').exists() and not receipt_errors,
-                     'componentAccepted': origins is not None and not receipt_errors and
+                     'componentAccepted': (origins is not None or reused_component) and not receipt_errors and
                                           (not scoped_slot or imported),
                      'componentOriginalsInThisArchive': not bool(scoped_slot),
                      'componentOriginalsReferencedByTransport': bool(scoped_slot),
+                     'retainedOriginalComponentPackage': file_pin(retained) if reused_component else None,
                      'slot': scoped_slot,
                      'sameRunComponentArtifact': 'apple-component-original-' + os.environ.get('GITHUB_RUN_ID', '') +
                                                  '-' + os.environ.get('GITHUB_RUN_ATTEMPT', ''),
@@ -523,6 +632,44 @@ def evidence(*, publish_env=False, slot=None):
             # reads at most this index bound; never emit an unretirable index.
             require(sum(len(raw) for raw in receipt_chunks(index, pretty=True)) <= EVIDENCE_INDEX_BYTES,
                     'original evidence index exceeds bound')
+            # Mandatory originals and their index have already passed unchanged.
+            # Optional diagnostics use only remaining budgets; never enter paths
+            # or receipt_errors, and never read again during ZIP serialization.
+            from apple_rust import CARGO_TIMING_BYTES
+            for timing in timing_paths:
+                try:
+                    name = timing.relative_to(root).as_posix()
+                    require(len(rows) < EVIDENCE_ENTRIES and len(name.encode('utf-8')) <= EVIDENCE_PATH_BYTES and
+                            timing.resolve(strict=True) == timing, 'no safe diagnostic entry budget')
+                    fd = os.open(timing, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(fd, 'rb') as stream:
+                        before = os.fstat(stream.fileno())
+                        require(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= CARGO_TIMING_BYTES,
+                                'bounded diagnostic required')
+                        raw = stream.read(CARGO_TIMING_BYTES + 1)
+                        after = os.fstat(stream.fileno())
+                    require(len(raw) == before.st_size and
+                            (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns) and
+                            total + len(raw) <= EVIDENCE_CONTENT_BYTES, 'no stable diagnostic content budget')
+                    proposed = {**index, 'files': {**rows, name: {'originalPath': str(timing),
+                                'bytes': len(raw), 'sha256': sha(raw), 'diagnosticOnly': True}}}
+                    index_bytes = sum(len(chunk) for chunk in receipt_chunks(proposed, pretty=True))
+                    require(index_bytes <= EVIDENCE_INDEX_BYTES and
+                            (total + len(raw) + index_bytes) * 9 // 8 +
+                            (len(rows) + 2) * (2 * EVIDENCE_PATH_BYTES + 1024) + 1024 <= EVIDENCE_ZIP_BYTES,
+                            'no diagnostic index or ZIP budget')
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFREG | stat.S_IMODE(before.st_mode)) << 16
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                except (OSError, RuntimeError, ValueError):
+                    with contextlib.suppress(OSError):
+                        print('Cargo timing diagnostic omitted; mandatory originals unchanged', flush=True)
+                    continue
+                # Actual output-device/ZIP I/O failure keeps its existing strict
+                # meaning; only optional source reads and validation are skipped.
+                package.writestr(info, raw)
+                index, rows, total = proposed, proposed['files'], total + len(raw)
             with package.open('EVIDENCE-INDEX.json', 'w', force_zip64=True) as member:
                 for raw in receipt_chunks(index, pretty=True):
                     member.write(raw)
@@ -596,7 +743,7 @@ def retire_slot(slot):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['admit', 'prepare', 'build', 'import', 'import-local', 'carrier', 'aggregate', 'evidence', 'retire-slot'])
+    parser.add_argument('action', choices=['admit', 'prepare', 'build', 'import', 'import-local', 'carrier', 'aggregate', 'evidence', 'retire-slot', 'component-cache-key', 'component-cache-export'])
     parser.add_argument('--scope', choices=('device-only', 'device-and-simulator'))
     parser.add_argument('--handoff', type=Path)
     parser.add_argument('--slot', choices=[slot for slot, _ in CARRIERS])
@@ -619,6 +766,11 @@ if __name__ == '__main__':
         aggregate(args.summaries, args.output, scope=args.scope)
     elif args.action == 'evidence':
         evidence(publish_env=True, slot=args.slot)
+    elif args.action == 'component-cache-key':
+        component_cache_key()
+    elif args.action == 'component-cache-export':
+        from apple_handoff import export_component_package
+        export_component_package(location())
     elif args.action == 'retire-slot':
         require(args.slot is not None, 'exact slot required')
         retire_slot(args.slot)

@@ -103,9 +103,10 @@ function matrixOsExpression(job: string, name: string): string {
  * 强转成 `''`，JS 里它是 undefined 且 `undefined != ''` 为真。故调用方对「没有这个输入」
  * 一律显式传 `''`，那正是 Actions 那一侧比较时看到的值。
  */
-function evaluateActions(expression: string, github: { event_name: string; ref: string; os: string }): unknown {
+function evaluateActions(expression: string, github: { event_name: string; ref: string; os: string }, nativeRequired = ''): unknown {
   return runInNewContext(expression, {
     github: { event_name: github.event_name, ref: github.ref, event: { inputs: { os: github.os } } },
+    needs: { cheap_format: { outputs: { native_required: nativeRequired } } },
     fromJSON: (text: string) => JSON.parse(text),
     format: (template: string, value: string) => template.replace('{0}', value),
   });
@@ -222,6 +223,13 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       expect(runInNewContext(candidateIf![1], entry.env), entry.name).toBe(entry.admitted);
       if (entry.admitted) expect(runInNewContext(candidateInput![1], entry.env), entry.name).toBe(entry.app);
     }
+    for (const entry of admissionCases) {
+      for (const nativeRequired of ['', 'true', 'unknown', 'false']) {
+        const env = structuredClone(entry.env);
+        Object.assign(env.needs.cheap_format.outputs, { native_required: nativeRequired });
+        expect(runInNewContext(candidateIf![1], env)).toBe(entry.admitted && nativeRequired !== 'false');
+      }
+    }
     expect(candidate).toMatch(/permissions:\s*\n\s*contents: read/);
     expect(candidate).not.toMatch(/secrets:|continue-on-error:|steps:|runs-on:|actions\/cache|contents: write/);
 
@@ -252,9 +260,13 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       }
     }
 
-    // ② 矩阵 job 没有 job 级 if / continue-on-error；cross 只有那一条 dispatch 单平台条件。
+    // ② Only the classifier's explicit false may omit native jobs. Missing or
+    // malformed output keeps them mandatory; PR/call/manual classification is full.
     for (const [name, block] of [['lint', lint], ['test', test]] as const) {
-      expect(block, `${name} job 出现了 job 级 if —— 它可以被整个关掉而步级判据全绿`).not.toMatch(/^ {4}if:/m);
+      const condition = foldedJobIf(block, name);
+      expect(condition).toBe("needs.cheap_format.outputs.native_required != 'false'");
+      for (const value of ['', 'true', 'unknown', 'false'])
+        expect(evaluateActions(condition, CI_ENTRIES[0], value)).toBe(value !== 'false');
       expect(block).toMatch(/^ {4}runs-on: \$\{\{ matrix\.os \}\}$/m);
     }
     for (const [name, block] of Object.entries(blocks)) {
@@ -283,21 +295,37 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
           }
         }
       }
-      expect(block).not.toMatch(/^ {8}(?:if|continue-on-error):/m);
+      expect(block).not.toMatch(/^ {8}continue-on-error:/m);
+      const stepConditions = [...block.matchAll(/^ {8}if: (.+)$/gm)];
+      expect(stepConditions).toHaveLength(1);
+      expect(stepConditions[0][1]).toBe("steps.native_impact.outputs.native_required != 'false'");
+      for (const value of ['', 'true', 'unknown', 'false'])
+        expect(runInNewContext(stepConditions[0][1], { steps: { native_impact: { outputs: { native_required: value } } } }))
+          .toBe(value !== 'false');
       expect(block).toMatch(/^ {4}runs-on: ubuntu-22\.04$/m);
       expect(block).toMatch(/^ {8}run: cargo fmt --all -- --check$/m);
       expect(block).not.toMatch(/Swatinem\/rust-cache@|actions\/cache@|cargo (?:build|test|clippy)\b/);
     };
-    // The reviewed PR candidate-selection step may be conditional; the formatter may not.
+    // Native formatting shares the same explicit test-only exemption as the
+    // expensive DAG; all other events and unknown outputs keep it mandatory.
     const formatStep = executable(stepBlock(cheapFormat, 'Check workspace formatting before native compilation'));
     const formatGate = cheapFormat.slice(0, cheapFormat.indexOf('    steps:')) + '\n' + formatStep;
     requireCheapFormat(formatGate);
     expect(cheapFormat).not.toMatch(/Swatinem\/rust-cache@|actions\/cache@/);
+    expect(cheapFormat).toContain('native_required: ${{ steps.native_impact.outputs.native_required }}');
+    expect(stepBlock(cheapFormat, 'Classify native CI impact')).toContain('run: node scripts/classify-ci-impact.mjs --native-ci');
+    expect(cheapFormat).toContain('fetch-depth: 2');
+    expect(cheapFormat.indexOf('- name: Classify native CI impact')).toBeLessThan(cheapFormat.indexOf('- name: Install existing Rust formatting toolchain'));
+    const toolchain = stepBlock(cheapFormat, 'Install existing Rust formatting toolchain');
+    expect(toolchain).toContain("if: steps.native_impact.outputs.native_required != 'false'");
+
     for (const block of [lint, cross, test]) expect(block).toMatch(/^ {4}needs: cheap_format$/m);
     for (const mutant of [
       formatGate.replace('    runs-on:', '    if: false\n    runs-on:'),
       formatGate.replace('        run:', '        continue-on-error: true\n        run:'),
       formatGate.replace('cargo fmt --all -- --check', 'cargo fmt --all -- --check || true'),
+      formatGate.replace("steps.native_impact.outputs.native_required != 'false'", 'false'),
+      formatGate.replace("steps.native_impact.outputs.native_required != 'false'", "steps.native_impact.outputs.native_required == 'true'"),
     ]) expect(() => requireCheapFormat(mutant)).toThrow();
 
 
@@ -311,6 +339,9 @@ describe('package 全平台前置 CI 的矩阵输入', () => {
       const runs = evaluateActions(crossIf, entry);
       expect(typeof runs, `${entry.label}: cross 的 if 没有求出布尔值`).toBe('boolean');
       expect(runs, `${entry.label}: cross job 是否运行，必须等于该入口下是否存在 ubuntu 腿`).toBe(hasUbuntuLeg);
+      expect(evaluateActions(crossIf, entry, 'false')).toBe(false);
+      for (const value of ['', 'true', 'unknown'])
+        expect(evaluateActions(crossIf, entry, value)).toBe(hasUbuntuLeg);
       if (runs) ran += 1; else skipped += 1;
     }
     // 反向对照：两种结论都真的出现过（否则「相等」可以被两边同时恒真 / 恒假满足）。

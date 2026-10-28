@@ -694,9 +694,20 @@ mod linux_tests {
         };
         let dir = TestDir::new("polaris-check-source-swap-");
         let source = dir.join("core");
-        fs::hard_link(&binary_path, &source).unwrap_or_else(|_| {
-            fs::copy(&binary_path, &source).unwrap();
-        });
+        let shared_before = FileSnapshot::path(&binary_path).unwrap();
+        // A hard link shares ctime with the real core used by parallel tests.
+        // Creating or replacing it would invalidate their strict snapshots.
+        // This private copy is only read into a memfd, never executed by path.
+        assert_eq!(
+            fs::copy(&binary_path, &source).unwrap(),
+            shared_before.len()
+        );
+        let copied = FileSnapshot::path(&source).unwrap();
+        assert!(
+            !shared_before.same_identity(&copied),
+            "source-swap fixture must own a different inode from the shared core"
+        );
+        assert!(shared_before.same_snapshot(&FileSnapshot::path(&binary_path).unwrap()));
         let (binary, before) = linux::sealed_binary(&source, profile).unwrap();
         let replacement = dir.join("replacement");
         fs::write(&replacement, b"wrong binary").unwrap();
@@ -711,6 +722,9 @@ mod linux_tests {
         let after = FileSnapshot::path(&source).unwrap();
         assert!(!before.same_snapshot(&after));
         assert!(!dir.join("mesh-routes").exists());
+        assert!(shared_before.same_snapshot(&FileSnapshot::path(&binary_path).unwrap()));
+        drop(dir);
+        assert!(shared_before.same_snapshot(&FileSnapshot::path(&binary_path).unwrap()));
     }
 
     #[tokio::test]

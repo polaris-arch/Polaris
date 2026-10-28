@@ -2,13 +2,15 @@
 
 项目保留 iOS 源码与编译入口，不在 GitHub Releases 发布 iOS 安装包。以下步骤说明当前源码的设备 ARM64 无签名编译/链接路径，不表示签名、安装、Network Extension 授权或实际 VPN 流量已验收。
 
-在 Mac 上准备 Rust stable 与 aarch64-apple-ios、Node.js 24+（CI 26）、pnpm 11.24.0、Python 3，以及 Xcode 27.1 build 27A9275；设备与模拟器 SDK 都须 27.1。Go 1.25.5、SagerNet gomobile/gobind v0.1.13 须用明确工具路径提供。本文使用正式 Python 构建入口，不使用历史 `tauri ios build` 流程；通用 Tauri CLI 版本见 `scripts/tauri-cli.version`（当前 2.12.1），不应据此假定 UI 依赖安装会提供本地 CLI。不要运行 `gomobile init` 来替换已固定 gobind。
+在 Mac 上准备 Rust stable 与 aarch64-apple-ios、Node.js 24+（CI 26）、pnpm 11.24.0、Python 3，以及 Xcode 27.1 build 27A9275；设备与模拟器 SDK 都须 27.1。Go 1.27.2（以 `source-contract.json` 的 `goVersion` 为准）、SagerNet gomobile/gobind v0.1.13 须用明确工具路径提供。本文使用正式 Python 构建入口，不使用历史 `tauri ios build` 流程；通用 Tauri CLI 版本见 `scripts/tauri-cli.version`（当前 2.12.1），不应据此假定 UI 依赖安装会提供本地 CLI。不要运行 `gomobile init` 来替换已固定 gobind。
 
 完整主机测试与同树合入复用的执行输入采集要求 Python 3.11+ 及标准库 `tomllib`；CI 显式使用 Python 3.12 并检查实际解释器/模块。缺少该模块时普通构建仍可继续，但证据不具复用资格且不生成 execution sidecar。此要求不追溯改变下文历史构建入口。
 
-当前内核开发仓为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)；下述移动端 alpha.12 固定来源仍以现有 source-contract 为准。新仓导航不表示来源清单已经迁移，也不提供新的已发布移动组件或 IPA 下载。
+当前内核来源为 [sing-box-polaris](https://github.com/polaris-arch/sing-box-polaris)，移动端固定输入由 source-contract 锁定。来源选择不表示 App 运行验收完成，也不提供已发布 IPA 下载；核心仓的原始组件不能替代 App 构建器生成并核验的组件收据。
 
-核心来源以 [source-contract.json](../scripts/mobile-core/source-contract.json) 为准，当前是 polaris-box v1.15.0-alpha.12 的固定 commit 577d4b9a089b71d2f0a4ca334b87264b55c10478。`--source` 指向保存对应 tag/commit/tree 的核心 checkout，不是 Polaris应用目录；不应用历史六片补丁。先准备组件所需现行工具/来源，完整约束见 [移动内核构建说明](../scripts/mobile-core/README.md)。
+核心来源以 [source-contract.json](../scripts/mobile-core/source-contract.json) 为准，当前是 sing-box-polaris `v1.15.0-polaris-alpha.12` 的固定 commit `a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae`（tag 对象 `916d9533ba0a6092e34bc53f63dace63e11fa85e`）。`--source` 指向保存对应 tag/commit/tree 的核心 checkout，不是 Polaris应用目录；不应用历史六片补丁。先准备组件所需现行工具/来源，完整约束见 [移动内核构建说明](../scripts/mobile-core/README.md)。
+
+构建前还须运行 `node scripts/fetch-protoc.mjs`，将输出的 `bin` 目录加入当前 shell 的 PATH，并核对 `protoc --version`（当前 `libprotoc 35.1`）。本地脚本不自动修改 PATH；Rust 的 `singbox-grpc` 构建需要该工具。仅在修改 `project.yml` 后重新生成工程时需要 XcodeGen。
 
 在 Polaris 仓库根目录：
 

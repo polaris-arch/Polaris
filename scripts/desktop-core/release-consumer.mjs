@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { canonical, digest, observeMacCodeSignature, validateMacCodeSignature, verifyMacCodeSignatureReceipt,
   kernelRepositoryIdentity, releaseGoVersion, upstreamSourceGoVersion, requireGraph as demand } from './source-graph.mjs';
 import { isUpstreamRelease, isUpstreamRow, validateUpstreamContract, validateUpstreamRow, validateUpstreamIndex,
-  upstreamMetadata, upstreamPayloadPins, contractPublicAssets, hasCommittedReleaseMaterials, validateUpstreamReadback, readUpstreamPublicEvidence } from './upstream-release.mjs';
+  upstreamMetadata, upstreamPayloadPins, contractPublicAssets, hasCommittedReleaseMaterials, validatePublishedUpstreamReadback, readUpstreamSourceEvidence } from './upstream-release.mjs';
 import { inspectCronetBytes } from '../lib/cronet-payload.mjs';
 
 const REPO = 'polaris-arch/polaris-box';
@@ -565,7 +565,7 @@ async function publicSnapshot(contract, read) {
       && asset.browser_download_url === pin.url && (asset.digest == null || asset.digest === `sha256:${pin.sha256}`), 'Public asset identity differs');
     return { name: asset.name, id: asset.id, bytes: asset.size, url: asset.browser_download_url, digest: asset.digest ?? null };
   });
-  const upstream = isUpstreamRelease(contract) ? await readUpstreamPublicEvidence(contract, request) : undefined;
+  const upstream = isUpstreamRelease(contract) ? await readUpstreamSourceEvidence(contract, request) : undefined;
   return { repositoryId: repo.id, releaseId: release.id, tag: tag.sha, sourceCommit: commit.sha, sourceTree: commit.tree.sha, assets, ...upstream };
 }
 function indexRows(bytes, contract) {
@@ -913,7 +913,7 @@ export function verifyPackagedRelease(root, manifest, key, core, run = execFileS
   same(readback.before, readback.after, 'Saved readback snapshots differ');
   same(readback.before, receipt.publicReadback, 'Consumption public snapshot differs');
   const snapshot = receipt.publicReadback;
-  validateUpstreamReadback(snapshot, contract);
+  validatePublishedUpstreamReadback(snapshot, contract);
   demand(snapshot?.repositoryId === releaseRepositoryId(contract) && snapshot.releaseId === contract.releaseId
     && snapshot.tag === contract.tagObject && snapshot.sourceCommit === contract.sourceCommit
     && snapshot.sourceTree === contract.sourceTree, 'Saved readback identity differs');

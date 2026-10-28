@@ -8,12 +8,127 @@ import {
   ALL_PACKAGE_PLATFORMS,
   NO_PACKAGE_IMPACT_SCOPES,
   classifyImpact,
+  classifyNativeImpact,
+  classifyNativeCiEvent,
 } from './classify-ci-impact.mjs';
 
 function compact(paths, options) {
   const { kernel, platforms, preflight, hasPackage } = classifyImpact(paths, options);
   return { kernel, platforms, preflight, hasPackage };
 }
+
+const oldBlob = '0baa84aa1c73f6e9f147f5f022cbc7039b1abe86';
+const newBlob = 'fba233f4f1e60e26ad0a06de4c0c9e0d0713e09d';
+const nodeTestPath = 'scripts/postprocess-appimage.test.mjs';
+const rawChange = (path = nodeTestPath, status = 'M', beforeMode = '100644', afterMode = '100644',
+  beforeBlob = oldBlob, afterBlob = newBlob) =>
+  `:${beforeMode} ${afterMode} ${beforeBlob} ${afterBlob} ${status}\0${path}\0`;
+
+test('native impact replays the exact e257 fixture-only diff without treating skipped native tests as passes', () => {
+  // GitHub commit e257303805e6686cc96adf31bc6ce30a951447dc, parent 1d62b7a2...
+  // has exactly this one M record, two added fixture copy lines, no other paths.
+  const result = classifyNativeImpact(rawChange());
+  assert.equal(result.nativeRequired, false);
+  assert.match(result.reason, /full Release Risk Node and UI gates still required/);
+  assert.deepEqual(result.paths, [nodeTestPath]);
+  for (const path of ['scripts/fetch-protoc.test.mjs', 'scripts/capture-screenshots.test.mjs',
+    'scripts/macos-memory-sample.test.mjs']) {
+    assert.equal(classifyNativeImpact(rawChange() + rawChange(path)).nativeRequired, false, path);
+  }
+});
+
+test('native impact preserves every existing release classifier axis and does not reinterpret kernel=false', () => {
+  const rust = 'crates/store/src/lib.rs';
+  assert.equal(classifyImpact([rust]).kernel, false);
+  assert.deepEqual(classifyImpact([rust]).platforms, []);
+  for (const path of [rust, 'scripts/postprocess-appimage.mjs', 'scripts/classify-ci-impact.mjs',
+    '.github/workflows/ci.yml', '.github/workflows/ui.yml', 'Cargo.lock', 'Cargo.toml',
+    'ui/package.json', 'ui/pnpm-lock.yaml', 'scripts/desktop-core/release-contract.json',
+    'scripts/desktop-core/native-dns-candidate.json', 'scripts/lib/core-identity.mjs',
+    'ui/src/App.tsx', 'README.md', 'unknown.file',
+    'scripts/build-desktop-core.test.mjs', 'scripts/desktop-core-ci-wiring.test.mjs',
+    'scripts/classify-ci-impact.test.mjs', 'scripts/ci-workflow-efficiency.test.mjs',
+    'scripts/assert-pc-runtime-release.test.mjs', 'scripts/macos-nested-code.test.mjs',
+    'scripts/nsis-core-sweep.test.mjs', 'scripts/verify-apk.test.mjs',
+    'scripts/assert-r8-evidence.test.mjs', 'scripts/mobile-source-unit.test.mjs',
+    'scripts/apple-ci-impact.test.mjs']) {
+    assert.equal(classifyNativeImpact(rawChange(path)).nativeRequired, true, path);
+    assert.equal(classifyNativeImpact(rawChange() + rawChange(path)).nativeRequired, true, `mixed: ${path}`);
+  }
+});
+
+test('native exemption refuses changed file sets, modes, raw path normalization and ambiguous diff records', () => {
+  for (const status of ['A', 'D', 'R100', 'C100', 'T', 'U', 'X', 'M100'])
+    assert.equal(classifyNativeImpact(rawChange(nodeTestPath, status)).nativeRequired, true, status);
+  for (const [before, after] of [['100644', '100755'], ['100755', '100755'], ['120000', '100644'],
+    ['100644', '120000'], ['000000', '100644'], ['100644', '000000']])
+    assert.equal(classifyNativeImpact(rawChange(nodeTestPath, 'M', before, after)).nativeRequired, true);
+  // --no-renames represents a move as D + A; neither side can grant exemption.
+  assert.equal(classifyNativeImpact(rawChange(nodeTestPath, 'D')
+    + rawChange('scripts/renamed.test.mjs', 'A')).nativeRequired, true);
+  for (const path of ['scripts/sub/test.test.mjs', 'scripts/.hidden.test.mjs',
+    'scripts/postprocess-appimage.test.mjs.bak', './scripts/postprocess-appimage.test.mjs',
+    ' scripts/postprocess-appimage.test.mjs', 'scripts/postprocess-appimage.test.mjs ',
+    'scripts\\postprocess-appimage.test.mjs', 'scripts/../postprocess-appimage.test.mjs',
+    'scripts/new\nname.test.mjs', 'scripts/under_score.test.mjs'])
+    assert.equal(classifyNativeImpact(rawChange(path)).nativeRequired, true, path);
+  for (const malformed of [undefined, '', '\0', rawChange().slice(0, -1), rawChange() + 'extra\0',
+    rawChange() + rawChange(), rawChange().replace(oldBlob, '0'.repeat(40)),
+    rawChange().replace(newBlob, oldBlob), rawChange().replace(':100644', '100644')])
+    assert.equal(classifyNativeImpact(malformed).nativeRequired, true);
+});
+
+const nativeEventEnv = {
+  GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/main', GITHUB_WORKFLOW: 'CI',
+  GITHUB_REPOSITORY: 'polaris-arch/Polaris',
+  GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/ci.yml@refs/heads/main',
+  GITHUB_SHA: 'e257303805e6686cc96adf31bc6ce30a951447dc',
+};
+const nativePush = { before: '1d62b7a2a3608b17e6ab9e09495de7228c257029', after: nativeEventEnv.GITHUB_SHA,
+  forced: false, created: false, deleted: false };
+function nativeGit({ failureAt = '', head = nativePush.after, diff = rawChange() } = {}) {
+  const calls = [];
+  const run = (tool, args) => {
+    assert.equal(tool, 'git'); calls.push(args);
+    if (args[0] === failureAt) throw Error('inert git failure');
+    if (args[0] === 'rev-parse') { assert.deepEqual(args, ['rev-parse', 'HEAD']); return head + '\n'; }
+    if (args[0] === 'cat-file') { assert.deepEqual(args, ['cat-file', '-e', nativePush.before + '^{commit}']); return ''; }
+    if (args[0] === 'merge-base') { assert.deepEqual(args, ['merge-base', '--is-ancestor', nativePush.before, nativePush.after]); return ''; }
+    assert.deepEqual(args, ['diff', '--raw', '--abbrev=40', '--no-renames', '-z', nativePush.before, nativePush.after, '--']);
+    return diff;
+  };
+  return { run, calls };
+}
+
+test('native route admits only exact ordinary main push and uses complete raw no-rename diff', () => {
+  const git = nativeGit();
+  assert.equal(classifyNativeCiEvent(nativeEventEnv, nativePush, git.run).nativeRequired, false);
+  assert.equal(git.calls.length, 4);
+  for (const failureAt of ['rev-parse', 'cat-file', 'merge-base', 'diff'])
+    assert.equal(classifyNativeCiEvent(nativeEventEnv, nativePush, nativeGit({ failureAt }).run).nativeRequired, true);
+  assert.equal(classifyNativeCiEvent(nativeEventEnv, nativePush, nativeGit({ head: 'b'.repeat(40) }).run).nativeRequired, true);
+  assert.equal(classifyNativeCiEvent(nativeEventEnv, nativePush, nativeGit({ diff: '' }).run).nativeRequired, true);
+});
+
+test('PR, merge queue, dispatch, reusable callers, tags, force pushes and unknown history remain full native CI', () => {
+  let gitCalls = 0;
+  const noGit = () => { gitCalls++; throw Error('ineligible event must not inspect Git'); };
+  const changes = [
+    ...['pull_request', 'merge_group', 'workflow_dispatch', 'workflow_call', '', 'unknown'].map((GITHUB_EVENT_NAME) => ({ GITHUB_EVENT_NAME })),
+    ...['refs/tags/v1', 'refs/heads/topic', ''].map((GITHUB_REF) => ({ GITHUB_REF })),
+    { GITHUB_WORKFLOW: 'Package' }, { GITHUB_WORKFLOW: 'Release Risk' },
+    // Reusable calls inherit caller push/ref; they are not a workflow_call event.
+    { GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/package.yml@refs/heads/main' },
+    { GITHUB_WORKFLOW_REF: '' }, { GITHUB_SHA: 'b'.repeat(40) },
+  ];
+  for (const change of changes)
+    assert.equal(classifyNativeCiEvent({ ...nativeEventEnv, ...change }, nativePush, noGit).nativeRequired, true, JSON.stringify(change));
+  for (const change of [{ forced: true }, { created: true }, { deleted: true }, { forced: undefined },
+    { before: '0'.repeat(40) }, { before: '' }, { after: '' }, { before: nativePush.after }])
+    assert.equal(classifyNativeCiEvent(nativeEventEnv, { ...nativePush, ...change }, noGit).nativeRequired, true);
+  assert.equal(classifyNativeCiEvent(nativeEventEnv, null, noGit).nativeRequired, true);
+  assert.equal(gitCalls, 0);
+});
 
 test('普通 UI、语言与文档不构建安装包', () => {
   assert.deepEqual(compact(['ui/src/App.tsx', 'ui/src/i18n/locales/zh-CN.json', 'README.md']), {

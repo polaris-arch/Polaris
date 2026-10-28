@@ -62,7 +62,7 @@
 
 ## نصب
 
-بسته مناسب سکوی خود را از [Releases](https://github.com/polaris-arch/Polaris/releases) دانلود کنید.
+پس از انتشار رسمی، بستهٔ سکوی خود را از [Releases](https://github.com/polaris-arch/Polaris/releases) دریافت کنید. موفقیت بررسی کد یا CI به معنی موجود بودن بستهٔ عمومی برای دانلود نیست.
 
 فرایند انتشار فعلی از نام فایل‌های تعریف‌شده در [release-assets.mjs](scripts/release-assets.mjs) استفاده می‌کند؛ `<version>` نسخه برنامه بدون پیشوند `v` است. برای macOS بسته‌های جداگانه Apple Silicon / Intel، برای Windows بسته x64 و برای Linux بسته amd64 در نظر گرفته شده است. بسته‌های Android به‌ترتیب ARM64، ‏ARMv7 و universal آمده‌اند؛ universal فقط همین دو معماری ARM را شامل می‌شود و x86 ندارد. امکان دانلود به فایل‌های واقعی انتشار انتخاب‌شده بستگی دارد. فایل‌ها را با `SHA256SUMS` در همان صفحه بررسی کنید.
 
@@ -101,7 +101,7 @@ xattr -cr /Applications/Polaris.app
 
 ## ساخت
 
-این بخش برای نگه‌دارندگانی است که کد منبع فعلی را می‌سازند؛ مثال برای Linux است. ساخت موفق کد منبع به معنی تأیید عملکرد بسته‌های منتشرشده نیست. وابستگی‌های سکوها، ابزارهای موبایل و قراردادهای بسته‌بندی در راهنماهای زیر آمده است.
+این بخش برای نگه‌دارندگانی است که کد منبع فعلی را می‌سازند. ساخت موفق کد منبع به معنی تأیید عملکرد بسته‌های منتشرشده نیست. وابستگی‌های سکوها، ابزارهای موبایل و قراردادهای بسته‌بندی در راهنماهای زیر آمده است.
 
 راهنمای ساخت از کد: [دسکتاپ و Android](docs/build-and-package.en.md) · [iOS / iPadOS](docs/ios-source-build.md) · [هسته موبایل و ابزارهای با نسخه ثابت](scripts/mobile-core/README.md).
 
@@ -109,20 +109,7 @@ xattr -cr /Applications/Polaris.app
 
 نیازمند Rust stable، Node.js 24+ (در CI اکنون Node 26)، pnpm 11.24.0، Go و [Tauri CLI 2](https://v2.tauri.app/).
 
-</div>
-
-```bash
-npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
-pnpm --dir ui install --frozen-lockfile   # وابستگی‌های رابط کاربری
-# هستهٔ دسکتاپ: انتشار ثابت تعیین‌شده در desktopRelease فایل core-manifest.json
-node scripts/fetch-core.mjs --platform=linux
-# بسته‌های بررسی بومی و آماده‌سازی منابع: docs/build-and-package.en.md
-node scripts/fetch-cronet.mjs --platform=linux  # دریافت libcronet.so در کنار هسته Linux
-node scripts/fetch-dashboard.mjs   # دریافت پنل داخلی
-tauri build --config src-tauri/tauri.linux.conf.json
-```
-
-<div dir="rtl">
+[مراحل کامل ساخت دسکتاپ](docs/build-and-package.en.md#producing-installers) را دنبال کنید: ابتدا ابزارها و protoc/PATH، هستهٔ ثابت، helper (به‌همراه cleaner در Windows) و مانیفست هویت نصب را آماده کنید و سپس برنامه را بسازید. دریافت هسته و اجرای `tauri build` به‌تنهایی برای ساخت بستهٔ نصب کامل و قابل استفاده کافی نیست.
 
 هسته در مخزن نگهداری نمی‌شود و باید پیش از بسته‌بندی دریافت شود. سوئیچ `--config` مخصوص هر سکو اختیاری نیست: نبود آن **بسته‌ای بدون هسته** می‌سازد، آن هم بدون هیچ خطایی در زمان ساخت — خرابی تنها در زمان اجرا آشکار می‌شود. شرح کامل، تقسیم کار در CI و قرارداد انتخاب بسته برای نصب‌کننده ویندوز و به‌روزرسان در [ساخت و بسته‌بندی](docs/build-and-package.en.md) آمده است.
 
@@ -170,7 +157,7 @@ resources/   هسته sing-box + libcronet (در زمان ساخت دریافت 
 
 | پروژه | نقش |
 |---|---|
-| [sing-box-polaris (فورک مورد استفاده)](https://github.com/polaris-arch/sing-box-polaris) | فورک هسته مورد استفاده Polaris؛ کد و نسخه ثابت و فایل‌های polaris-box بر اساس مانیفست ساخت انتخاب‌شده تعیین می‌شوند |
+| [sing-box-polaris (فورک مورد استفاده)](https://github.com/polaris-arch/sing-box-polaris) | فورک هسته مورد استفاده Polaris؛ کد و نسخه ثابت و فایل‌های sing-box-polaris بر اساس مانیفست ساخت انتخاب‌شده تعیین می‌شوند |
 | [sing-box (بالادست اصلی)](https://github.com/SagerNet/sing-box) | پروژه اصلی بالادست و پایه فنی؛ با قدردانی از توسعه‌دهندگان |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | بستر اجرای دسکتاپ |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | libcronet برای NaiveProxy |

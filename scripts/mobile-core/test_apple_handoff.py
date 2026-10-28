@@ -762,5 +762,403 @@ class AppleHandoffControls(unittest.TestCase):
                 handoff.aggregate(folder, folder / 'unused.json', scope='device-and-simulator')
 
 
+
+
+class AppleComponentCacheControls(unittest.TestCase):
+    """Inert complete ZIPs exercise real integrity/closure checks, never native builds."""
+    def setUp(self):
+        import contextlib
+        import io
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+        self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.temp = self.stack.enter_context(tempfile.TemporaryDirectory())
+        self.home = Path(self.temp) / 'home'
+        self.old = self.home / 'Code/polaris-mobile-apple-ci/100-2'
+        self.current = self.home / 'Code/polaris-mobile-apple-ci/200-1'
+        self.current.mkdir(parents=True, mode=0o700)
+        self.stack.enter_context(mock.patch.object(Path, 'home', return_value=self.home))
+        self.env = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'polaris-arch/Polaris',
+                    'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/main',
+                    'GITHUB_WORKFLOW_REF': 'polaris-arch/Polaris/.github/workflows/release-risk.yml@refs/heads/main',
+                    'POLARIS_APP_CANDIDATE': 'c' * 40, 'GITHUB_SHA': 'c' * 40,
+                    'GITHUB_RUN_ID': '200', 'GITHUB_RUN_ATTEMPT': '1', 'POLARIS_APPLE_SCOPE': 'device-only'}
+        self.stack.enter_context(mock.patch.dict(os.environ, self.env, clear=True))
+        self.folder = Path(self.temp) / 'cache'
+        self.folder.mkdir()
+        self.stack.enter_context(mock.patch.object(handoff, 'component_cache_path', return_value=self.folder))
+        import producer
+        self.producer = producer
+        self.binding = self.make_binding(self.old, 'b' * 40)
+        self.current_binding = self.make_binding(self.current, 'c' * 40)
+        self.receipt, self.files, self.manifest = self.fixture()
+
+    def make_binding(self, root, candidate):
+        return {'schema': 'polaris-mobile-producer-input-v1', 'platform': 'apple',
+                'producer': {'candidate': candidate, 'files': {'producer.py': {'bytes': 1, 'sha256': 'a' * 64}}},
+                'sourceContract': {'goModSha256': 'a' * 64, 'apple': {'tags': ['fixed'], 'targets': ['ios/arm64', 'iossimulator/arm64']}},
+                'sourceObservation': {'sourceCommit': 'd' * 40}, 'sourceOverlay': 0,
+                'moduleGraph': [{'Path': 'example.invalid/core', 'Main': True, 'Dir': str(root / 'component/build-view'),
+                                 'GoMod': str(root / 'component/build-view/go.mod')},
+                                {'Path': 'example.invalid/library', 'Version': 'v1.0.0', 'Sum': 'h1:fixed',
+                                 'Dir': str(root / 'cache/go-mod/example.invalid/library@v1.0.0'),
+                                 'GoMod': str(root / 'cache/go-mod/cache/download/example.invalid/library/@v/v1.0.0.mod')}],
+                'tools': {'executables': {name: {'bytes': 1, 'sha256': 'a' * 64} for name in ('go', 'gomobile', 'gobind')},
+                          'mobileBuildInfo': {name: str(root / 'tools' / name) + ': go1.27.2\n\tbuild\t-trimpath=true\n'
+                                              for name in ('gomobile', 'gobind')},
+                          'sdk': {'iphoneos': {'path': '/fixed/SDK', 'version': '27.1'}}},
+                'nativeEnvironment': {'go': {
+                    'CGO_CFLAGS': '-O2 -g', 'CGO_CPPFLAGS': '', 'CGO_CXXFLAGS': '-O2 -g',
+                    'CGO_FFLAGS': '-O2 -g', 'CGO_LDFLAGS': '-O2 -g', 'CC': 'clang', 'CXX': 'clang++',
+                    'AR': 'ar', 'PKG_CONFIG': 'pkg-config', 'CGO_ENABLED': '1', 'GOEXPERIMENT': '',
+                    'GOAMD64': '', 'GOARM': '', 'GOARM64': 'v8.0', 'GO386': '', 'GOMIPS': '',
+                    'GOMIPS64': '', 'GOPPC64': '', 'GORISCV64': '', 'GO_EXTLINK_ENABLED': '',
+                    'GOFIPS140': 'off', 'GOFLAGS': '-mod=readonly', 'GOTOOLCHAIN': 'local'},
+                    'ambient': {}, 'GODEBUG': 'gocacheverify=1'}}
+
+    @staticmethod
+    def signed(row):
+        row = copy.deepcopy(row)
+        row.pop('fingerprint', None)
+        row['fingerprint'] = receipt_digest(row)
+        return row
+
+    def fixture(self):
+        from apple_merge_reuse import pin_bytes
+        obj = 'component/scratch/work/input.o'
+        binary = 'component/Libbox.xcframework/ios-arm64/Libbox.framework/Libbox'
+        generated = 'component/build-view/build/ios/Libbox.objc'
+        files = {obj: b'original-object', binary: b'original-framework', generated: b'original-generated',
+                 'component/original-bind.log': b'original-log'}
+        digest = pin_bytes(files[obj])['sha256']
+        def inventory(prefix):
+            names = {name[len(prefix) + 1:]: raw for name, raw in files.items() if name.startswith(prefix + '/')}
+            dirs = {parent.as_posix() for name in names for parent in Path(name).parents if parent.as_posix() != '.'}
+            return ([{'path': name, 'type': 'directory', 'mode': 0o700} for name in sorted(dirs)] +
+                    [{'path': name, 'type': 'file', 'mode': 0o644, **pin_bytes(raw)} for name, raw in names.items()])
+        output = {'format': 'static-XCFramework', 'slices': {'ios-arm64': {'members': [
+            {'ordinal': 1, 'sha256': digest, 'goCarrier': False}]}},
+            'inventory': inventory('component/Libbox.xcframework')}
+        native = {'schema': 'polaris-mobile-native-inputs-v2', 'scratch': str(self.old / 'component/scratch'),
+                  'cache': str(self.old / 'cache'), 'workRoots': [str(self.old / 'component/scratch/work')],
+                  'originalBindLog': pin_bytes(files['component/original-bind.log']),
+                  'files': {str(self.old / obj): {'kind': 'compiler-object', **pin_bytes(files[obj])}},
+                  'staticMemberOrigins': {'ios-arm64': [{'memberOrdinal': 1, 'sha256': digest}]},
+                  'originsByDigest': {digest: [{'kind': 'compiler-object', 'path': str(self.old / obj), 'sha256': digest}]},
+                  'generatorOutputRoot': str(self.old / 'component/build-view/build'),
+                  'generatorOutputInventory': inventory('component/build-view/build')}
+        receipt = self.signed({'schema': 'polaris-mobile-component-v1', 'platform': 'apple', 'input': self.binding,
+                              'output': output, 'nativeInputs': native, 'sourceOverlay': 0,
+                              'AppAccepted': False, 'devicePassed': False})
+        files['component/component-receipt.json'] = json.dumps(receipt, sort_keys=True).encode()
+        rows = {name: {'mode': 0o644, **pin_bytes(raw)} for name, raw in files.items()}
+        for name in list(rows):
+            for parent in Path(name).parents:
+                if str(parent) != '.': rows[parent.as_posix()] = {'directory': True, 'mode': 0o700}
+        rows['cache'] = {'directory': True, 'mode': 0o700}
+        manifest = self.signed({'schema': handoff.COMPONENT_CACHE_SCHEMA, 'policy': self.producer.APPLE_COMPONENT_CACHE_POLICY,
+                               'identity': receipt_digest(self.producer.apple_cache_binding(self.binding)),
+                               'root': str(self.old), 'originalContext': {'repository': 'polaris-arch/Polaris',
+                               'candidate': 'b' * 40, 'runId': '100', 'attempt': '2'},
+                               'componentReceipt': pin_bytes(files['component/component-receipt.json']),
+                               'componentFingerprint': receipt['fingerprint'], 'files': {'root': rows},
+                               'localReplacementSources': []})
+        return receipt, files, manifest
+
+    def package(self, *, manifest=None, files=None, extra=None):
+        import zipfile
+        import stat
+        path = self.folder / 'component.zip'
+        files, manifest = files or self.files, manifest or self.manifest
+        with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, row in manifest['files']['root'].items():
+                info = zipfile.ZipInfo('root/' + name)
+                info.external_attr = ((stat.S_IFDIR if row.get('directory') else stat.S_IFREG) | row['mode']) << 16
+                archive.writestr(info, b'' if row.get('directory') else files[name])
+            archive.writestr('component-cache.json', json.dumps(manifest).encode())
+            if extra: archive.writestr(extra, b'extra')
+        return path
+
+    def validate(self, path=None, binding=None):
+        import zipfile
+        with zipfile.ZipFile(path or self.package()) as archive:
+            return handoff.read_component_package(archive, self.current, binding or self.current_binding)
+
+    def test_equivalent_different_candidates_keep_original_binding_and_build_id(self):
+        frozen = copy.deepcopy(self.receipt)
+        self.assertTrue(self.producer.equivalent_apple_cache_binding(self.binding, self.current_binding))
+        manifest, receipt = self.validate()
+        self.assertEqual(receipt, frozen)
+        self.assertEqual(receipt['input']['producer']['candidate'], 'b' * 40)
+        self.assertEqual(manifest['identity'], receipt_digest(self.producer.apple_cache_binding(self.current_binding)))
+        self.assertNotEqual(receipt_digest(self.binding), receipt_digest(self.current_binding))
+
+    def test_source_tool_target_tag_module_environment_and_unknown_fields_change_key(self):
+        mutations = [lambda row: row['sourceContract']['apple']['tags'].append('other'),
+                     lambda row: row['sourceContract']['apple']['targets'].append('ios/amd64'),
+                     lambda row: row['sourceObservation'].update(sourceCommit='e' * 40),
+                     lambda row: row['tools']['executables']['go'].update(sha256='f' * 64),
+                     lambda row: row['moduleGraph'][1].update(Sum='h1:changed'),
+                     lambda row: row['moduleGraph'][1].update(Version='v2'),
+                     lambda row: row['nativeEnvironment']['go'].update(CGO_CXXFLAGS='-O3'),
+                     lambda row: row['nativeEnvironment']['go'].update(GOEXPERIMENT='new'),
+                     lambda row: row['tools']['sdk']['iphoneos'].update(version='other'),
+                     lambda row: row['producer']['files'].update({'new.py': {'bytes': 1, 'sha256': 'f' * 64}}),
+                     lambda row: row['moduleGraph'][1].update(UnknownLocation='/different')]
+        for mutate in mutations:
+            changed = copy.deepcopy(self.current_binding); mutate(changed)
+            self.assertFalse(self.producer.equivalent_apple_cache_binding(self.binding, changed))
+            with self.assertRaises(RuntimeError): self.validate(binding=changed)
+        for field in ('Dir', 'GoMod'):
+            changed = copy.deepcopy(self.current_binding); changed['moduleGraph'][1][field] = '/outside/unknown'
+            with self.assertRaisesRegex(RuntimeError, 'escaped'): self.producer.apple_cache_binding(changed)
+
+    def test_eligibility_is_only_trusted_main_exact_current_workflow_candidate(self):
+        self.assertTrue(handoff.component_cache_eligible())
+        for key, value in [('GITHUB_EVENT_NAME', 'pull_request'), ('GITHUB_EVENT_NAME', 'workflow_dispatch'),
+                           ('GITHUB_REF', 'refs/tags/v1'), ('GITHUB_REF', 'refs/pull/3/merge'),
+                           ('GITHUB_REPOSITORY', 'foreign/repository'), ('GITHUB_SHA', 'd' * 40),
+                           ('GITHUB_WORKFLOW_REF', 'polaris-arch/Polaris/.github/workflows/apple.yml@refs/heads/main')]:
+            with mock.patch.dict(os.environ, {key: value}): self.assertFalse(handoff.component_cache_eligible())
+
+    def test_real_zip_tampered_objects_output_logs_and_extra_paths_reject_before_install(self):
+        for name in ('component/scratch/work/input.o', 'component/original-bind.log',
+                     'component/Libbox.xcframework/ios-arm64/Libbox.framework/Libbox'):
+            files = {**self.files, name: b'changed'}
+            with self.subTest(name=name), self.assertRaises(RuntimeError): self.validate(self.package(files=files))
+            self.assertFalse(self.old.exists())
+        for name in ('root/../escaped', '/absolute', 'root/unexpected'):
+            with self.subTest(extra=name), self.assertRaises(RuntimeError): self.validate(self.package(extra=name))
+        changed = copy.deepcopy(self.manifest); changed['root'] = str(self.home / 'arbitrary')
+        with self.assertRaises(RuntimeError): self.validate(self.package(manifest=self.signed(changed)))
+        self.assertFalse(self.old.exists())
+
+    def test_original_native_origin_mapping_missing_or_relabelled_rejects(self):
+        from apple_merge_reuse import pin_bytes
+        for mutation in ('missing', 'relabelled'):
+            receipt = copy.deepcopy(self.receipt)
+            if mutation == 'missing': receipt['nativeInputs']['originsByDigest'] = {}
+            else: receipt['nativeInputs']['scratch'] = str(self.current / 'component/scratch')
+            receipt = self.signed(receipt)
+            raw = json.dumps(receipt, sort_keys=True).encode()
+            manifest = copy.deepcopy(self.manifest)
+            manifest['files']['root']['component/component-receipt.json'].update(pin_bytes(raw))
+            manifest.update(componentReceipt=pin_bytes(raw), componentFingerprint=receipt['fingerprint'])
+            with self.assertRaises(RuntimeError):
+                self.validate(self.package(files={**self.files, 'component/component-receipt.json': raw},
+                                           manifest=self.signed(manifest)))
+            self.assertFalse(self.old.exists())
+
+    def test_restoration_preserves_receipt_and_does_not_call_bind(self):
+        import ci_apple
+        from contextlib import contextmanager
+        package = self.package()
+        (self.current / 'component-current-binding.json').write_text(json.dumps(self.current_binding))
+        paths = {'component-work': str(self.current / 'component'), 'cache': str(self.current / 'cache')}
+        tools = {'paths': paths, 'App': self.current_binding['producer']}
+        @contextmanager
+        def lease(work, cache, value):
+            handoff.private_dir(work); handoff.private_dir(cache)
+            yield work, cache
+        with mock.patch.object(ci_apple, 'current_component_binding', return_value=self.current_binding), \
+                mock.patch.object(ci_apple, 'lease', lease), mock.patch.object(ci_apple, 'load', return_value={}), \
+                mock.patch.object(handoff, 'context', return_value={**self.env, 'candidate': 'c' * 40}), \
+                mock.patch.object(self.producer, 'verify_receipt') as verify, \
+                mock.patch('consume.verify_original') as original, mock.patch.object(ci_apple, 'run') as run:
+            self.assertTrue(ci_apple.restore_component_cache(self.current, tools))
+        run.assert_not_called(); verify.assert_called_once(); original.assert_called_once()
+        self.assertEqual((self.old / 'component/component-receipt.json').read_bytes(), self.files['component/component-receipt.json'])
+        self.assertEqual((self.current / 'retained-component.zip').read_bytes(), package.read_bytes())
+        observation = json.loads((self.current / 'component-cache-observation.json').read_text())
+        self.assertEqual(observation['originalProducer']['candidate'], 'b' * 40)
+        self.assertEqual(observation['currentVerifier']['candidate'], 'c' * 40)
+        self.assertFalse(observation['historicalProviderAuthenticated'] or observation['currentRunProducedComponent'])
+        self.assertEqual(tools['paths']['component-work'], str(self.old / 'component'))
+        self.assertEqual(tools['paths']['cache'], str(self.current / 'cache'))
+
+    def test_invalid_package_falls_back_but_current_admission_and_io_errors_stay_fatal(self):
+        import ci_apple
+        (self.current / 'component-current-binding.json').write_text(json.dumps(self.current_binding))
+        tools = {'paths': {}}
+        with mock.patch.object(ci_apple, 'current_component_binding', return_value=self.current_binding):
+            self.assertFalse(ci_apple.restore_component_cache(self.current, tools))
+            self.package(files={**self.files, 'component/original-bind.log': b'changed'})
+            self.assertFalse(ci_apple.restore_component_cache(self.current, tools))
+            with mock.patch.object(ci_apple, 'file_pin', side_effect=PermissionError('denied')):
+                with self.assertRaises(PermissionError): ci_apple.restore_component_cache(self.current, tools)
+        with mock.patch.object(ci_apple, 'current_component_binding', side_effect=RuntimeError('dirty source')):
+            with self.assertRaisesRegex(RuntimeError, 'dirty source'): ci_apple.restore_component_cache(self.current, tools)
+        self.assertFalse(self.old.exists())
+
+    def test_pure_aggregate_reuse_metadata_rejects_resigned_claims_and_inventory_edges(self):
+        context = {'repository': 'polaris-arch/Polaris', 'candidate': 'c' * 40, 'runId': '200', 'attempt': '1'}
+        pin = {'bytes': 123, 'sha256': 'a' * 64}
+        row = self.signed({'schema': 'polaris-apple-component-cache-observation-v1', 'context': context,
+                          'currentVerifier': self.current_binding['producer'], 'originalProducer': self.binding['producer'],
+                          'originalRoot': str(self.old), 'originalContextInformational': self.manifest['originalContext'],
+                          'identity': self.manifest['identity'], 'trust': 'trusted-main-cache', 'inputsRevalidated': True,
+                          'historicalProviderAuthenticated': False, 'currentRunProducedComponent': False,
+                          'devicePassed': False, 'publicationEligible': False, 'package': pin, 'currentBinding': pin,
+                          'originalBuildID': 'polaris-mobile-' + receipt_digest(self.binding)})
+        manifest = {'componentReuse': row, 'root': str(self.current), 'context': context,
+                    'App': self.current_binding['producer'], 'files': {'root': {
+                        'retained-component.zip': {**pin, 'mode': 0o644},
+                        'component-current-binding.json': {**pin, 'mode': 0o644}}}}
+        self.assertEqual(handoff.component_reuse_record(manifest), row)
+        for field, bad in [('inputsRevalidated', False), ('historicalProviderAuthenticated', True),
+                           ('currentRunProducedComponent', True), ('devicePassed', True), ('publicationEligible', True),
+                           ('trust', 'api-authenticated'), ('context', self.manifest['originalContext']),
+                           ('currentVerifier', self.binding['producer']), ('originalRoot', str(self.current)),
+                           ('originalBuildID', 'fabricated'), ('package', {'bytes': 124, 'sha256': 'a' * 64})]:
+            changed = copy.deepcopy(manifest); changed['componentReuse'][field] = bad
+            changed['componentReuse'] = self.signed(changed['componentReuse'])
+            with self.subTest(field=field), self.assertRaises(RuntimeError): handoff.component_reuse_record(changed)
+        changed = copy.deepcopy(manifest); del changed['files']['root']['retained-component.zip']
+        with self.assertRaises(RuntimeError): handoff.component_reuse_record(changed)
+
+    def test_invalid_overlay_and_huge_historical_path_are_cache_misses_before_installation(self):
+        from apple_merge_reuse import pin_bytes
+        for overlay in (False, True, 1, None):
+            receipt = self.signed({**self.receipt, 'sourceOverlay': overlay})
+            raw = json.dumps(receipt, sort_keys=True).encode()
+            manifest = copy.deepcopy(self.manifest)
+            manifest['files']['root']['component/component-receipt.json'].update(pin_bytes(raw))
+            manifest.update(componentReceipt=pin_bytes(raw), componentFingerprint=receipt['fingerprint'])
+            with self.assertRaises(RuntimeError):
+                self.validate(self.package(files={**self.files, 'component/component-receipt.json': raw},
+                                           manifest=self.signed(manifest)))
+        changed = copy.deepcopy(self.manifest); changed['root'] = str(self.old.parent / ('1' * 256 + '-1'))
+        with self.assertRaises(RuntimeError): self.validate(self.package(manifest=self.signed(changed)))
+        self.assertFalse(self.old.exists())
+
+    def test_malformed_json_shape_and_corrupt_deflate_are_invalid_cache_misses(self):
+        import ci_apple
+        import zipfile
+        (self.current / 'component-current-binding.json').write_text(json.dumps(self.current_binding))
+        path = self.folder / 'component.zip'
+        for raw in (b'[]', b'{"schema":"polaris-apple-complete-component-cache-v1","files":[]}', b'{}'):
+            with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr('component-cache.json', raw)
+            if raw == b'{}':
+                data = bytearray(path.read_bytes())
+                name_length = int.from_bytes(data[26:28], 'little')
+                extra_length = int.from_bytes(data[28:30], 'little')
+                data[30 + name_length + extra_length] = 0xff
+                path.write_bytes(data)
+            with mock.patch.object(ci_apple, 'current_component_binding', return_value=self.current_binding):
+                self.assertFalse(ci_apple.restore_component_cache(self.current, {'paths': {}}))
+            self.assertFalse(self.old.exists())
+
+    def test_current_app_keeps_current_cache_and_also_locks_original_native_cache(self):
+        import ast
+        source = (Path(handoff.__file__).parent / 'build_apple_app.py').read_text()
+        tree = ast.parse(source)
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
+        self.assertFalse(any(isinstance(node, ast.ImportFrom) and node.module == 'artifacts' and
+                             any(alias.name == 'read_receipt' for alias in node.names) for node in ast.walk(main)))
+        self.assertIn("['nativeInputs']['cache']", source)
+        self.assertIn("'--cache', component_cache, '--output', link", source)
+        self.assertIn('slot_locks(component_work, component_cache) if component_cache != cache', source)
+        self.assertIn('with lease(root, cache, value),', source)
+
+    def test_private_modes_missing_parents_and_link_topology_reject_before_restore(self):
+        import stat
+        import zipfile
+        for name in ('component', 'cache', 'component/scratch'):
+            changed = copy.deepcopy(self.manifest); changed['files']['root'][name]['mode'] = 0o755
+            with self.subTest(mode=name), self.assertRaisesRegex(RuntimeError, 'private slot'):
+                self.validate(self.package(manifest=self.signed(changed)))
+        changed = copy.deepcopy(self.manifest); del changed['files']['root']['component/scratch/work']
+        with self.assertRaisesRegex(RuntimeError, 'parent directory'):
+            self.validate(self.package(manifest=self.signed(changed)))
+        for target in ('missing', 'loop'):
+            changed = copy.deepcopy(self.manifest)
+            changed['files']['root']['component/loop'] = {'link': target, 'mode': 0o777}
+            changed = self.signed(changed)
+            path = self.package()
+            with zipfile.ZipFile(path, 'a') as archive:
+                # Build a fresh central directory without a duplicate manifest.
+                retained = {row.filename: (row, archive.read(row)) for row in archive.infolist()
+                            if row.filename != 'component-cache.json'}
+            with zipfile.ZipFile(path, 'w') as archive:
+                for info, raw in retained.values(): archive.writestr(info, raw)
+                info = zipfile.ZipInfo('root/component/loop'); info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(info, target.encode())
+                archive.writestr('component-cache.json', json.dumps(changed).encode())
+            with self.subTest(link=target), self.assertRaisesRegex(RuntimeError, 'link target missing|dependency cyclic'):
+                self.validate(path)
+        self.assertFalse(self.old.exists())
+
+    def test_export_revalidates_complete_package_and_skips_any_occupied_or_redirected_restore(self):
+        import zipfile
+        from contextlib import contextmanager
+        package = self.package()
+        handoff.private_dir(self.old)
+        with zipfile.ZipFile(package) as archive:
+            handoff.restore_payload(archive, self.manifest['files'], self.old, Path(self.temp))
+        (self.old / 'import-observation.json').write_text(json.dumps({'completed': True}))
+        (self.old / 'component-current-binding.json').write_text(json.dumps(self.binding))
+        out = Path(self.temp) / 'output'
+        @contextmanager
+        def lease(work, cache, value):
+            handoff.private_dir(work); handoff.private_dir(cache)
+            yield work, cache
+        def invoke():
+            with mock.patch.object(handoff, 'lease', lease), mock.patch.object(handoff, 'load', return_value={}), \
+                    mock.patch.object(handoff, 'producer_code', return_value=self.binding['producer']), \
+                    mock.patch.object(handoff, 'context', return_value=self.manifest['originalContext']), \
+                    mock.patch.dict(os.environ, {'GITHUB_OUTPUT': str(out)}):
+                handoff.export_component_package(self.old)
+        invoke()
+        self.assertEqual(out.read_text(), 'exported=false\n')
+        self.assertEqual(package.read_bytes(), (self.folder / 'component.zip').read_bytes())
+        package.unlink()
+        (self.folder / 'unexpected-restored-file').write_bytes(b'unrelated')
+        out.unlink(); invoke(); self.assertEqual(out.read_text(), 'exported=false\n')
+        redirected = Path(self.temp) / 'redirected'; redirected.symlink_to(self.folder, target_is_directory=True)
+        with mock.patch.object(handoff, 'component_cache_path', return_value=redirected):
+            out.unlink(); invoke(); self.assertEqual(out.read_text(), 'exported=false\n')
+        (self.folder / 'unexpected-restored-file').unlink(); out.unlink()
+        invoke()
+        self.assertEqual(out.read_text(), 'exported=true\n')
+        manifest, receipt = self.validate(self.folder / 'component.zip')
+        self.assertEqual(receipt, self.receipt)
+        self.assertEqual(manifest['componentFingerprint'], self.receipt['fingerprint'])
+
+
+    def test_same_external_path_with_changed_contents_never_reuses_or_exports(self):
+        import ci_apple
+        path = Path(self.temp) / 'mutable-header.h'
+        path.write_bytes(b'first contents')
+        self.assertTrue(self.producer.cacheable_native_environment(self.current_binding))
+        for field, value in [('CGO_CFLAGS', '-I' + str(path.parent)), ('CGO_CXXFLAGS', '-include ' + str(path)),
+                             ('CGO_LDFLAGS', '-L' + str(path.parent)), ('CC', str(path)),
+                             ('GOFLAGS', '-mod=readonly -overlay=' + str(path)), ('GOEXPERIMENT', 'unknown')]:
+            current = copy.deepcopy(self.current_binding)
+            current['nativeEnvironment']['go'][field] = value
+            self.assertFalse(self.producer.cacheable_native_environment(current))
+        for field in ('CPATH', 'LIBRARY_PATH', 'CGO_CFLAGS_ALLOW', 'CLANG_CONFIG_FILE_USER_DIR',
+                      'PKG_CONFIG_PATH', 'GCC_EXEC_PREFIX'):
+            current = copy.deepcopy(self.current_binding)
+            current['nativeEnvironment']['ambient'][field] = str(path)
+            (self.current / 'component-current-binding.json').write_text(json.dumps(current))
+            for raw in (b'first contents', b'changed contents'):
+                path.write_bytes(raw)
+                with mock.patch.object(ci_apple, 'current_component_binding', return_value=current), \
+                        mock.patch.object(handoff, 'read_component_package') as read:
+                    self.assertFalse(ci_apple.restore_component_cache(self.current, {'paths': {}}))
+                read.assert_not_called()
+            (self.current / 'import-observation.json').write_text(json.dumps({'completed': True}))
+            output = Path(self.temp) / 'custom-export-output'
+            output.unlink(missing_ok=True)
+            with mock.patch.object(handoff, 'producer_code', return_value=current['producer']), \
+                    mock.patch.dict(os.environ, {'GITHUB_OUTPUT': str(output)}), \
+                    mock.patch.object(handoff, 'component_members') as selected:
+                handoff.export_component_package(self.current)
+            selected.assert_not_called()
+            self.assertEqual(output.read_text(), 'exported=false\n')
+
+
 if __name__ == '__main__':
     unittest.main()

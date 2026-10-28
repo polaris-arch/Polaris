@@ -1045,7 +1045,7 @@ def read_evidence(api, artifacts, ctx, source, work):
                 rust_receipt['iosConfig'] == file_pin(ROOT / 'src-tauri/tauri.ios.conf.json'),
                 'Rust input contract differs')
         require(rust_receipt['command'] == [rust_tools['cargo']['path'], 'rustc', '--locked', '--release',
-                '--lib', '--package', 'polaris', '--target', 'aarch64-apple-ios', '--features',
+                '--timings', '--lib', '--package', 'polaris', '--target', 'aarch64-apple-ios', '--features',
                 'tauri/custom-protocol', '--crate-type', 'staticlib'], 'Rust command contract differs')
         execution = rust_receipt['executionInputs']
         execution_supported = execution != {'unavailable': UNAVAILABLE_REASON}

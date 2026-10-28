@@ -36,9 +36,11 @@
  * `run:` 的每个仓库脚本、以及 verify-packaging 当判据读的每个源文件，都必须触发打包腿。
  */
 
-import { readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { appleRequired, mobileUnitTestsOnlyForReleaseRisk } from './apple-ci-impact.mjs';
 
 export const ALL_PACKAGE_PLATFORMS = Object.freeze([
   'linux',
@@ -513,6 +515,15 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'scripts/apple-ci-impact.mjs': {
+    why: 'Shared Release Risk Python-test proof now controls Android selection; changing its rules requires the real APK leg.',
+  },
+  'scripts/apple-ci-impact.test.mjs': {
+    why: 'Negative controls for the shared mobile routing proof; rule tests retain both mobile build legs.',
+  },
+  'scripts/classify-ci-impact.mjs': {
+    why: 'Release Risk Android selection and its conservative fallback are owned by this classifier.',
+  },
   'src-tauri/src/runtime/tls_fingerprints.rs': {
     why: 'The shared capability parser now explicitly compiles from_native for Android/iOS and host tests. '
       + 'Its loaded-container identity and schema handling enter the Android Rust cdylib and must be compiled in the APK leg. '
@@ -1319,6 +1330,15 @@ export function classifyImpact(rawPaths, { forceFull = false } = {}) {
   };
 }
 
+// Only the direct Release Risk main push can omit mobile builds. Keep the
+// path-only API, --full, native CI, PR/manual and other callers conservative.
+export function classifyReleaseRiskImpact(paths, env, event, run = execFileSync) {
+  const result = classifyImpact(paths);
+  if (result.android && mobileUnitTestsOnlyForReleaseRisk(paths, env, event, run))
+    result.android = false;
+  return result;
+}
+
 function stdinPaths() {
   const input = readFileSync(0);
   if (input.length === 0) return [];
@@ -1326,9 +1346,90 @@ function stdinPaths() {
   return input.toString('utf8').split(separator);
 }
 
+// Separate from kernel/package impact: pure Rust logic often has no package
+// impact but still requires native CI. Only existing Node-test content changes
+// on the ordinary main push may reuse the full Linux Node/UI gates instead.
+// Rust test_source_anchors enumerates scripts/ names, so A/D/R/T and mode changes
+// must retain native CI even when the new name looks like a Node test.
+export function classifyNativeImpact(rawDiff) {
+  const full = (reason) => ({ nativeRequired: true, reason });
+  if (typeof rawDiff !== 'string' || !rawDiff || !rawDiff.endsWith('\0')) return full('missing-or-empty-diff');
+  const fields = rawDiff.slice(0, -1).split('\0');
+  if (fields.length % 2 !== 0) return full('malformed-raw-diff');
+  const paths = [];
+  for (let i = 0; i < fields.length; i += 2) {
+    const row = /^:100644 100644 ([0-9a-f]{40}) ([0-9a-f]{40}) M$/.exec(fields[i]);
+    const path = fields[i + 1];
+    if (!row || row[1] === row[2] || [row[1], row[2]].some((oid) => /^0+$/.test(oid)))
+      return full('not-existing-regular-file-content-only');
+    // Match the visible, first-level gate-node-test.sh glob without normalizing
+    // a malformed raw Git path into a different, apparently safe path.
+    if (!/^scripts\/[a-z0-9][a-z0-9.-]*\.test\.mjs$/.test(path)) return full('not-node-test-only');
+    paths.push(path);
+  }
+  if (new Set(paths).size !== paths.length) return full('duplicate-raw-path');
+  const impact = classifyImpact(paths);
+  if (impact.kernel || impact.preflight || impact.hasPackage || impact.platforms.length
+      || impact.android || impact.unregisteredScopes.length || appleRequired(paths))
+    return full('existing-release-impact-requires-native');
+  return { nativeRequired: false, reason: 'existing-node-test-content-only; full Release Risk Node and UI gates still required', paths };
+}
+
+// github context belongs to the caller in a reusable workflow. Checking the
+// exact direct CI workflow_ref keeps Package/release calls full even if they
+// inherit a push event. PR/merge queue retain their real three-host Node tests.
+export function classifyNativeCiEvent(env, event, run = execFileSync) {
+  const full = (reason) => ({ nativeRequired: true, reason });
+  if (env.GITHUB_EVENT_NAME !== 'push' || env.GITHUB_REF !== 'refs/heads/main'
+      || env.GITHUB_WORKFLOW !== 'CI'
+      || env.GITHUB_WORKFLOW_REF !== `${env.GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/main`)
+    return full('not-ordinary-direct-main-push');
+  if (!event || event.forced !== false || event.created !== false || event.deleted !== false)
+    return full('forced-created-deleted-or-unknown-push');
+  const sha = /^[0-9a-f]{40}$/;
+  if (!sha.test(event.before) || !sha.test(event.after) || /^0+$/.test(event.before)
+      || event.after !== env.GITHUB_SHA || event.before === event.after)
+    return full('unreliable-push-endpoints');
+  try {
+    const options = { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 };
+    if (run('git', ['rev-parse', 'HEAD'], options).trim() !== event.after)
+      return full('checkout-head-differs');
+    run('git', ['cat-file', '-e', `${event.before}^{commit}`], options);
+    run('git', ['merge-base', '--is-ancestor', event.before, event.after], options);
+    const diff = run('git', ['diff', '--raw', '--abbrev=40', '--no-renames', '-z', event.before, event.after, '--'], options);
+    return classifyNativeImpact(diff);
+  } catch {
+    // A shallow/missing base, history rewrite, failed command, oversized diff,
+    // or unavailable objects never grants the exemption. No remote fetch/retry.
+    return full('unreliable-history-or-diff');
+  }
+}
+
 function main() {
+  if (process.argv.includes('--native-ci')) {
+    let result;
+    try {
+      result = classifyNativeCiEvent(process.env, JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')));
+    } catch {
+      result = { nativeRequired: true, reason: 'missing-or-invalid-event' };
+    }
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (process.env.GITHUB_OUTPUT)
+      appendFileSync(process.env.GITHUB_OUTPUT, `native_required=${result.nativeRequired}\n`);
+    if (process.env.GITHUB_STEP_SUMMARY)
+      appendFileSync(process.env.GITHUB_STEP_SUMMARY, `Native CI required: ${result.nativeRequired}. ${result.reason}\n`
+        + (result.paths ? `Changed Node tests: ${result.paths.join(', ')}\nNative checks are not executed for this test-only change; this is not a native test pass.\n` : ''));
+    return;
+  }
   const forceFull = process.argv.includes('--full');
-  const result = classifyImpact(forceFull ? [] : stdinPaths(), { forceFull });
+  const paths = forceFull ? [] : stdinPaths().filter(Boolean);
+  let result = classifyImpact(paths, { forceFull });
+  if (!forceFull && result.android) {
+    try {
+      result = classifyReleaseRiskImpact(paths, process.env,
+        JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')));
+    } catch { /* Missing/invalid context retains the conservative path result. */ }
+  }
   // 自曝：未登记 scope 已经按内核门 + 四平台处理，但「为什么这次全量」必须能在日志里读出来。
   for (const scope of result.unregisteredScopes) {
     process.stderr.write(

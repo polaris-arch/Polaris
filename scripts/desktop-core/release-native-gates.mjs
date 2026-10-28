@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, digest, requireGraph as demand } from './source-graph.mjs';
-import { contractPublicAssets, validateUpstreamReadback } from './upstream-release.mjs';
+import { contractPublicAssets, validatePublishedUpstreamReadback } from './upstream-release.mjs';
 import { ADAPTER_FILES, consumeRelease, loadReleaseContract, portableCanonical,
   regularPath, releaseRepositoryId, RELEASE_TARGETS, verifyPackagedRelease } from './release-consumer.mjs';
 import { hasTemporaryDesktop, loadTemporaryDesktopSelection, loadCandidate, selectedCandidateContext,
@@ -52,7 +52,7 @@ export function verifyNativeReleaseGate(gate, contract, selection, expectedAdapt
     && gate.readback.contractSha256 === selection.contractSha256, 'Native readback contract differs');
   same(receipt.publicReadback, gate.readback.before, 'Native readback snapshot differs');
   const snapshot = receipt.publicReadback;
-  validateUpstreamReadback(snapshot, contract);
+  validatePublishedUpstreamReadback(snapshot, contract);
   demand(snapshot.repositoryId === releaseRepositoryId(contract) && snapshot.releaseId === contract.releaseId
     && snapshot.tag === contract.tagObject && snapshot.sourceCommit === contract.sourceCommit
     && snapshot.sourceTree === contract.sourceTree, 'Native public source identity differs');

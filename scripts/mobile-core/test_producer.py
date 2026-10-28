@@ -321,7 +321,7 @@ class ProducerCalls(unittest.TestCase):
         observed = producer.component_revalidation_observation(receipt, current, pin, True)
         self.assertEqual(observed['comparisonPolicy'], producer.ANDROID_BUILD_CODE_POLICY)
         self.assertEqual(observed['currentVerifier'], current['producer'])
-        self.assertEqual(len(observed['currentVerifier']['files']), 24)
+        self.assertEqual(len(observed['currentVerifier']['files']), len(producer.PRODUCER_FILES))
         self.assertEqual(set(observed['currentVerifier']['files']), set(producer.PRODUCER_FILES))
         for helper in ('scripts/mobile-core/apple_admission.py', 'scripts/mobile-core/apple_handoff.py',
                        'scripts/mobile-core/apple-cache.py', 'scripts/mobile-core/apple_tls_fingerprint.py',
@@ -391,6 +391,8 @@ class ProducerCalls(unittest.TestCase):
                     bindings.append((Path(cwd), out))
                     bind_caps.append((env['GOMAXPROCS'], env['CARGO_BUILD_JOBS']))
                     Path(log).write_text('inert original bind log')
+                elif command[1:3] == ['env', '-json']:
+                    return json.dumps({key: '' for key in command[3:]})
                 elif command[1:4] == ['list', '-m', '-json']:
                     return '{"Path":"github.com/sagernet/sing-box","Main":true}'
                 return None if capture == 'none' else ''

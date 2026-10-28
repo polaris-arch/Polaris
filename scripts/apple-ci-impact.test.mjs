@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { runInNewContext } from 'node:vm';
-import { appleRequired } from './apple-ci-impact.mjs';
+import { APPLE_TEST_LEAF, MOBILE_UNIT_TEST_FILES, appleRequired, appleRequiredForReleaseRisk } from './apple-ci-impact.mjs';
+import { classifyImpact, classifyNativeImpact, classifyReleaseRiskImpact } from './classify-ci-impact.mjs';
 
 function aggregateScript() {
   const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
@@ -375,7 +377,11 @@ test('resolver failures and partial uploads select a full component build withou
   }
   assert.match(resolver, /id: resolve\n\s+continue-on-error: true/);
   assert.match(resolver, /id: receipt\n\s+if: \$\{\{ steps.resolve.outcome == 'success' && steps.resolve.outputs.reused == 'true' \}\}\n\s+continue-on-error: true/);
-  assert.equal((workflow.match(/continue-on-error: true/g) || []).length, 2);
+  assert.equal((workflow.match(/continue-on-error: true/g) || []).length, 4);
+  for (const name of ['Restore exact trusted-main complete Go component package',
+    'Save exact trusted-main component package']) {
+    assert.match(workflowStep(workflow, name), /continue-on-error: true/);
+  }
   assert.match(resolver, /receipt_sha256: \$\{\{ steps.resolve.outputs.receipt_sha256 \}\}/);
   const verification = workflowStep(workflow, 'Verify same-tree evidence receipt against the current candidate and context');
   assert.match(verification, /RECEIPT_SHA256: \$\{\{ needs.resolve.outputs.receipt_sha256 \}\}/);
@@ -548,4 +554,279 @@ test('Release Risk reports rebuilt versus reused Apple evidence and rejects miss
   assert.equal(invoke({ APPLE_EVIDENCE_MODE: 'reused', APPLE_INCLUDE_SIMULATOR: 'true' }).status, 1);
   assert.equal(invoke({ APPLE_EVIDENCE_MODE: 'rebuilt', APPLE_INCLUDE_SIMULATOR: 'true' }).status, 0);
   assert.equal(invoke({ APPLE_REQUIRED: 'false', APPLE_RESULT: 'skipped', APPLE_EVIDENCE_MODE: '' }).status, 0);
+});
+
+
+const reviewedOwner = 'src-tauri/src/runtime/proxy/mesh_apply/candidate/check.rs';
+const ownerBlob = '5c38100fa91a246ed00606832af675b4684c14ea';
+const linuxBoundary = '#[cfg(all(target_os = "linux", target_arch = "x86_64"))]\nmod linux_tests {\n';
+function leafContext() {
+  const before = 'a'.repeat(40), after = 'b'.repeat(40);
+  return { env: { GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/main',
+    GITHUB_REPOSITORY: 'polaris-arch/Polaris', GITHUB_WORKFLOW: 'Release Risk',
+    GITHUB_WORKFLOW_REF: 'polaris-arch/Polaris/.github/workflows/release-risk.yml@refs/heads/main',
+    GITHUB_SHA: after }, event: { before, after, forced: false, created: false, deleted: false } };
+}
+function leafGit(context, overrides = {}) {
+  return (command, args) => {
+    assert.equal(command, 'git');
+    if (args[0] === 'rev-parse' && args[1] === 'HEAD') return overrides.head ?? context.event.after;
+    if (args[0] === 'cat-file' && args[1] === '-e') {
+      if (overrides.missingBase) throw new Error('missing base');
+      return '';
+    }
+    if (args[0] === 'merge-base') {
+      if (overrides.nonAncestor) throw new Error('not ancestor');
+      return '';
+    }
+    if (args[0] === 'diff') return overrides.diff ?? `:100755 100755 ${'c'.repeat(40)} ${'d'.repeat(40)} M\0${APPLE_TEST_LEAF}\0`;
+    if (args[0] === 'ls-tree') return `${overrides.ownerMode ?? '100755'} blob ${overrides.owner ?? ownerBlob}\t${reviewedOwner}\0`;
+    if (args[0] === 'cat-file' && args[1] === 'blob') return overrides.content ?? linuxBoundary + '}\n';
+    throw new Error('unexpected git call: ' + args.join(' '));
+  };
+}
+
+test('one audited existing Linux test leaf can omit Apple, never native Rust', async () => {
+  const context = leafContext();
+  assert.equal(appleRequired([APPLE_TEST_LEAF]), true); // Legacy path-only API stays conservative.
+  assert.equal(appleRequiredForReleaseRisk([APPLE_TEST_LEAF], context.env, context.event, leafGit(context)), false);
+  const { classifyNativeImpact } = await import('./classify-ci-impact.mjs');
+  assert.equal(classifyNativeImpact(leafGit(context)('git', ['diff'])).nativeRequired, true);
+  const owner = readFileSync(new URL('../' + reviewedOwner, import.meta.url));
+  // Ordinary owner edits merely disable the runtime exemption; no exact-blob
+  // assertion blocks unrelated production development.
+  assert.match(owner.toString(), /#\[cfg\(test\)\]\nmod tests;/);
+  assert.ok(readFileSync(new URL('../' + APPLE_TEST_LEAF, import.meta.url), 'utf8').startsWith(linuxBoundary));
+  // Reviewed source-input contract: build.rs must not acquire this test leaf as
+  // an input. A future production include/build dependency needs routing review.
+  const build = readFileSync(new URL('../src-tauri/build.rs', import.meta.url), 'utf8');
+  assert.doesNotMatch(build, /candidate\/check\/tests|check\/tests\/mod\.rs/);
+  const risk = readFileSync(new URL('../.github/workflows/release-risk.yml', import.meta.url), 'utf8');
+  assert.match(risk, /git diff --name-only -z "\$base" "\$head" \| node scripts\/apple-ci-impact\.mjs --release-risk/);
+});
+
+test('test-leaf routing rejects unsafe or unregistered diff and source boundaries', () => {
+  const c = leafContext(), valid = leafGit(c)('git', ['diff']);
+  const check = overrides => appleRequiredForReleaseRisk([APPLE_TEST_LEAF], c.env, c.event, leafGit(c, overrides));
+  for (const diff of ['', valid.slice(0, -1), valid + valid,
+    valid.replace(' M\0', ' A\0'), valid.replace(' M\0', ' D\0'), valid.replace(' M\0', ' R100\0'),
+    valid.replace(' M\0', ' C100\0'), valid.replace(' M\0', ' T\0'),
+    valid.replace(':100755 100755', ':100644 100755'), valid.replace(':100755 100755', ':100755 100644'),
+    valid.replace(':100755 100755', ':120000 120000'), valid.replace(':100755 100755', ':160000 160000'),
+    valid.replace('c'.repeat(40), '0'.repeat(40)), valid.replace('d'.repeat(40), 'c'.repeat(40)),
+    valid.replace(APPLE_TEST_LEAF, 'src-tauri/src/lib.rs'), valid.replace(APPLE_TEST_LEAF, '../' + APPLE_TEST_LEAF),
+    valid + `:100644 100644 ${'c'.repeat(40)} ${'d'.repeat(40)} M\0src-tauri/build.rs\0`]) {
+    assert.equal(check({ diff }), true, JSON.stringify(diff));
+  }
+  for (const overrides of [{ owner: 'e'.repeat(40) }, { ownerMode: '120000' }, { content: '// cfg removed\n' },
+    { content: linuxBoundary.replace('linux', 'macos') }, { missingBase: true }, { nonAncestor: true },
+    { head: 'e'.repeat(40) }]) assert.equal(check(overrides), true);
+  for (const extra of [reviewedOwner, 'src-tauri/build.rs', 'src-tauri/src/lib.rs', 'Cargo.toml',
+    '.github/workflows/apple.yml', 'src-tauri/src/another/tests/mod.rs']) {
+    assert.equal(appleRequiredForReleaseRisk([APPLE_TEST_LEAF, extra], c.env, c.event, leafGit(c)), true);
+  }
+});
+
+test('only reliable direct ordinary main push can use the leaf contract', () => {
+  const c = leafContext();
+  for (const env of [{ GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_EVENT_NAME: 'merge_group' },
+    { GITHUB_EVENT_NAME: 'workflow_dispatch' }, { GITHUB_REF: 'refs/heads/topic' },
+    { GITHUB_WORKFLOW: 'CI' }, { GITHUB_WORKFLOW_REF: '' }, { GITHUB_SHA: 'e'.repeat(40) },
+    { GITHUB_WORKFLOW_REF: c.env.GITHUB_WORKFLOW_REF.replace('release-risk.yml@', 'apple.yml@') }]) {
+    assert.equal(appleRequiredForReleaseRisk([APPLE_TEST_LEAF], { ...c.env, ...env }, c.event, leafGit(c)), true);
+  }
+  for (const event of [null, {}, { ...c.event, forced: true }, { ...c.event, created: true },
+    { ...c.event, deleted: true }, { ...c.event, forced: undefined },
+    { ...c.event, before: '0'.repeat(40) }, { ...c.event, before: c.event.after },
+    { ...c.event, after: 'unknown' }]) {
+    assert.equal(appleRequiredForReleaseRisk([APPLE_TEST_LEAF], c.env, event, leafGit(c)), true);
+  }
+});
+
+test('actual Git/CLI leaf exception, full override and legacy invocation stay compatible', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'apple-leaf-route-'));
+  const script = fileURLToPath(new URL('./apple-ci-impact.mjs', import.meta.url));
+  const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+  try {
+    git('init', '-q'); git('config', 'user.name', 'fixture'); git('config', 'user.email', 'fixture@example.invalid');
+    mkdirSync(dirname(join(dir, APPLE_TEST_LEAF)), { recursive: true });
+    writeFileSync(join(dir, reviewedOwner), readFileSync(new URL('../' + reviewedOwner, import.meta.url)));
+    chmodSync(join(dir, reviewedOwner), 0o755);
+    writeFileSync(join(dir, APPLE_TEST_LEAF), linuxBoundary + '}\n'); chmodSync(join(dir, APPLE_TEST_LEAF), 0o755);
+    git('add', '.'); git('commit', '-qm', 'fixture base');
+    const before = git('rev-parse', 'HEAD');
+    writeFileSync(join(dir, APPLE_TEST_LEAF), linuxBoundary + '    // test fixture only\n}\n');
+    git('add', '.'); git('commit', '-qm', 'fixture edit');
+    const after = git('rev-parse', 'HEAD'), c = leafContext();
+    const ownerCurrent = git('rev-parse', `${after}:${reviewedOwner}`) === ownerBlob;
+    const eventPath = join(dir, 'event.json');
+    writeFileSync(eventPath, JSON.stringify({ ...c.event, before, after }));
+    const invoke = (args, env = {}) => spawnSync(process.execPath, [script, ...args], { cwd: dir,
+      input: APPLE_TEST_LEAF + '\0', encoding: 'utf8',
+      env: { ...process.env, ...c.env, GITHUB_SHA: after, GITHUB_EVENT_PATH: eventPath, ...env } });
+    for (const [args, expected] of [[[], 'true'], [['--release-risk'], ownerCurrent ? 'false' : 'true'],
+      [['--release-risk', '--full'], 'true'], [['--full'], 'true']]) {
+      const result = invoke(args); assert.equal(result.status, 0, result.stderr); assert.equal(result.stdout.trim(), expected);
+    }
+    assert.equal(invoke(['--release-risk'], { GITHUB_EVENT_PATH: join(dir, 'missing') }).stdout.trim(), 'true');
+    writeFileSync(eventPath, '{broken');
+    assert.equal(invoke(['--release-risk']).stdout.trim(), 'true');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// Frozen fixtures model the reviewed owner versions. Current owner edits are
+// allowed and simply disable optimization, including in the real CLI test below.
+const mobileOwners = [
+  ['scripts/mobile-core/producer.py', '100644', '56074f0294450f26ba6ef3934df52fa81d6b4105'],
+  ['scripts/mobile-source-unit.test.mjs', '100644', '8cc09d5f633f4f3c2eb6a4246f79644773b5681e'],
+  ['scripts/gate-node-test.sh', '100755', '52e873e5cc95361c6723318d398caeb4db442664'],
+  ['.github/workflows/release-risk.yml', '100644', '8424964ac3edd11cfe182b852dabae405b7b70ad'],
+  ['.github/workflows/ci.yml', '100644', '9407e92d0fbc36897b7915e45511ade217bc39fa'],
+  ['src-tauri/tests/test_source_anchors.rs', '100644', '18667d599e46b5fb5cc354642a4bd86528419524'],
+];
+const mobilePath = 'scripts/mobile-core/test_apple_merge_reuse.py';
+const mobileRaw = paths => paths.map(path => `:100644 100644 ${'c'.repeat(40)} ${'d'.repeat(40)} M\0${path}\0`).join('');
+function mobileGit(c, paths = [mobilePath], overrides = {}) {
+  const fallback = leafGit(c, { ...overrides, diff: overrides.diff ?? mobileRaw(paths) });
+  return (command, args, options) => {
+    if (args[0] === 'ls-tree') {
+      const owner = mobileOwners.find(([path]) => path === args[4]);
+      assert.ok(owner, 'only the six reviewed owners are read');
+      if (overrides.owner === owner[0] && (!overrides.ref || overrides.ref === args[2])) return '';
+      return `${owner[1]} blob ${owner[2]}\t${owner[0]}\0`;
+    }
+    if (overrides.fail === args[0]) throw new Error('unavailable history/output budget');
+    return fallback(command, args, options);
+  };
+}
+function mobileDecision(paths, c = leafContext(), run = mobileGit(c, paths)) {
+  return [appleRequiredForReleaseRisk(paths, c.env, c.event, run),
+    classifyReleaseRiskImpact(paths, c.env, c.event, run).android];
+}
+
+test('reviewed existing Python unittest content omits both mobile builds but retains native CI', () => {
+  const c = leafContext();
+  assert.equal(MOBILE_UNIT_TEST_FILES.length, 14);
+  for (const paths of [...MOBILE_UNIT_TEST_FILES.map(path => [path]), [...MOBILE_UNIT_TEST_FILES].reverse()]) {
+    assert.deepEqual(mobileDecision(paths), [false, false]);
+    assert.equal(classifyNativeImpact(mobileRaw(paths)).nativeRequired, true);
+    assert.equal(appleRequired(paths), true);
+    assert.equal(classifyImpact(paths).android, true);
+    assert.deepEqual({ ...classifyReleaseRiskImpact(paths, c.env, c.event, mobileGit(c, paths)), android: true },
+      classifyImpact(paths));
+  }
+});
+
+test('Python routing rejects source modes, added/deleted/renamed/unknown files and mixed changes', () => {
+  const c = leafContext(), valid = mobileRaw([mobilePath]);
+  for (const diff of ['', valid.slice(0, -1), valid + valid,
+    ...['A', 'D', 'R100', 'C100', 'T', 'U', 'M100'].map(status => valid.replace(' M\0', ` ${status}\0`)),
+    ...['100644 100755', '100755 100644', '100755 100755', '120000 120000', '160000 160000', '000000 100644']
+      .map(modes => valid.replace('100644 100644', modes)),
+    valid.replace('c'.repeat(40), '0'.repeat(40)), valid.replace('d'.repeat(40), 'c'.repeat(40)),
+    valid.replace(mobilePath, '../' + mobilePath), valid.replace(mobilePath, mobilePath + '\n'),
+    valid + mobileRaw(['scripts/mobile-core/producer.py'])]) {
+    assert.deepEqual(mobileDecision([mobilePath], c, mobileGit(c, [mobilePath], { diff })), [true, true], JSON.stringify(diff));
+  }
+  for (const extra of ['scripts/mobile-core/test_unknown.py', 'scripts/mobile-core/nested/test_inputs.py',
+    'scripts/mobile-core/test_apple_cargo_timing.py', 'scripts/mobile-core/ci_apple.py',
+    'scripts/mobile-core/producer.py', 'src-tauri/src/lib.rs', 'Cargo.toml', '.cargo/config.toml',
+    '.github/workflows/release-risk.yml', 'scripts/apple-ci-impact.mjs', 'scripts/classify-ci-impact.mjs',
+    'scripts/apple-ci-impact.test.mjs', 'scripts/gate-node-test.sh', 'scripts/mobile-source-unit.test.mjs']) {
+    assert.deepEqual(mobileDecision([mobilePath, extra]), [true, true], extra);
+  }
+  assert.deepEqual(mobileDecision([mobilePath, mobilePath]), [true, true]);
+  for (const rule of ['scripts/apple-ci-impact.mjs', 'scripts/classify-ci-impact.mjs', 'scripts/apple-ci-impact.test.mjs']) {
+    assert.deepEqual(mobileDecision([rule]), [true, true], 'routing contract edits retain both builds');
+  }
+  assert.deepEqual(mobileDecision([]), [false, false]); // Preserve an already-unselected result.
+  assert.deepEqual(mobileDecision(['docs/README.md']), [false, false]);
+});
+
+test('mobile routing requires reliable ordinary direct Release Risk main push and unchanged owners', () => {
+  const c = leafContext();
+  for (const env of [{ GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_EVENT_NAME: 'merge_group' },
+    { GITHUB_EVENT_NAME: 'workflow_dispatch' }, { GITHUB_EVENT_NAME: 'workflow_call' },
+    { GITHUB_REF: 'refs/heads/topic' }, { GITHUB_REF: 'refs/tags/v1' }, { GITHUB_WORKFLOW: 'CI' },
+    { GITHUB_WORKFLOW_REF: '' }, { GITHUB_REPOSITORY: 'other/repo' }, { GITHUB_SHA: 'e'.repeat(40) },
+    { GITHUB_WORKFLOW_REF: c.env.GITHUB_WORKFLOW_REF.replace('release-risk.yml@', 'apple.yml@') }]) {
+    assert.deepEqual(mobileDecision([mobilePath], { ...c, env: { ...c.env, ...env } }), [true, true]);
+  }
+  for (const event of [null, {}, { ...c.event, forced: true }, { ...c.event, created: true },
+    { ...c.event, deleted: true }, { ...c.event, forced: undefined },
+    { ...c.event, before: '0'.repeat(40) }, { ...c.event, before: c.event.after },
+    { ...c.event, after: 'unknown' }]) {
+    assert.deepEqual(mobileDecision([mobilePath], { ...c, event }, mobileGit(c)), [true, true]);
+  }
+  for (const [owner] of mobileOwners) {
+    for (const ref of [c.event.before, c.event.after]) {
+      assert.deepEqual(mobileDecision([mobilePath], c, mobileGit(c, [mobilePath], { owner, ref })), [true, true]);
+    }
+  }
+  for (const overrides of [{ missingBase: true }, { nonAncestor: true }, { head: 'e'.repeat(40) },
+    ...['rev-parse', 'cat-file', 'merge-base', 'diff'].map(fail => ({ fail }))]) {
+    assert.deepEqual(mobileDecision([mobilePath], c, mobileGit(c, [mobilePath], overrides)), [true, true]);
+  }
+});
+
+test('Python discovery and naming remain existing gates, separate from producer input inventory', () => {
+  const source = path => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
+  const producer = source('scripts/mobile-core/producer.py');
+  const inventory = producer.slice(producer.indexOf('PRODUCER_FILES ='), producer.indexOf('ANDROID_BUILD_CODE_POLICY ='));
+  const naming = source('src-tauri/tests/test_source_anchors.rs');
+  const registry = naming.slice(naming.indexOf('const PYTHON_MODULE_FILES:'), naming.indexOf('fn registered_python_module'));
+  for (const path of MOBILE_UNIT_TEST_FILES) {
+    assert.doesNotMatch(inventory, new RegExp(path.replaceAll('.', '\\.')));
+    assert.ok(registry.includes(`"${path}"`));
+  }
+  assert.match(source('scripts/mobile-source-unit.test.mjs'), /'unittest', 'discover', '-s', 'scripts\/mobile-core', '-p', 'test_\*\.py'/);
+  assert.match(source('scripts/gate-node-test.sh'), /scripts\/mobile-source-unit\.test\.mjs/);
+  const risk = source('.github/workflows/release-risk.yml');
+  assert.ok(risk.indexOf('run: bash scripts/gate-node-test.sh') < risk.indexOf('- name: Classify changed paths'));
+  assert.match(source('scripts/classify-ci-impact.mjs'), /classifyNativeImpact/);
+});
+
+test('actual Git and both CLIs agree; force-full, invalid context and owner evolution retain original decisions', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mobile-unit-route-'));
+  const script = name => fileURLToPath(new URL('./' + name, import.meta.url));
+  const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' }).trim();
+  const c = leafContext();
+  try {
+    git('init', '-q'); git('config', 'user.name', 'fixture'); git('config', 'user.email', 'fixture@example.invalid');
+    for (const [path, mode] of mobileOwners) {
+      mkdirSync(dirname(join(dir, path)), { recursive: true });
+      writeFileSync(join(dir, path), readFileSync(new URL('../' + path, import.meta.url)));
+      chmodSync(join(dir, path), mode === '100755' ? 0o755 : 0o644);
+    }
+    writeFileSync(join(dir, mobilePath), '# existing unittest fixture\n');
+    git('add', '.'); git('commit', '-qm', 'base');
+    const before = git('rev-parse', 'HEAD');
+    writeFileSync(join(dir, mobilePath), '# modified unittest fixture\n');
+    git('add', '.'); git('commit', '-qm', 'edit');
+    let after = git('rev-parse', 'HEAD');
+    const ownersCurrent = mobileOwners.every(([path, , blob]) => git('rev-parse', `${after}:${path}`) === blob);
+    const eventPath = join(dir, 'event.json');
+    const invoke = (name, args, env = {}, input = mobilePath + '\0') => spawnSync(process.execPath,
+      [script(name), ...args], { cwd: dir, input, encoding: 'utf8', env: {
+        ...process.env, ...c.env, GITHUB_SHA: after, GITHUB_EVENT_PATH: eventPath, ...env } });
+    const check = (required, args = [], env = {}) => {
+      const apple = invoke('apple-ci-impact.mjs', ['--release-risk', ...args], env);
+      const android = invoke('classify-ci-impact.mjs', args, env);
+      assert.equal(apple.status, 0, apple.stderr); assert.equal(android.status, 0, android.stderr);
+      assert.equal(apple.stdout.trim(), String(required)); assert.equal(JSON.parse(android.stdout).android, required);
+    };
+    writeFileSync(eventPath, JSON.stringify({ ...c.event, before, after }));
+    check(!ownersCurrent); check(true, ['--full']);
+    check(true, [], { GITHUB_EVENT_NAME: 'pull_request' });
+    check(true, [], { GITHUB_EVENT_PATH: join(dir, 'missing') });
+    assert.equal(invoke('apple-ci-impact.mjs', []).stdout.trim(), 'true');
+    writeFileSync(eventPath, '{broken'); check(true);
+    // An earlier owner-only change must disable a later test-only optimization.
+    writeFileSync(join(dir, mobileOwners[0][0]), '# changed producer owner\n');
+    git('add', '.'); git('commit', '-qm', 'owner evolution');
+    const evolvedBase = git('rev-parse', 'HEAD');
+    writeFileSync(join(dir, mobilePath), '# another test-only edit\n');
+    git('add', '.'); git('commit', '-qm', 'later edit'); after = git('rev-parse', 'HEAD');
+    writeFileSync(eventPath, JSON.stringify({ ...c.event, before: evolvedBase, after })); check(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

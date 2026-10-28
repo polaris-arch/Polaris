@@ -1652,6 +1652,9 @@ jobs:
         run: |
           printf '%s\n' 'Desktop artifacts use the reviewed source-first release policy. Native/device acceptance is NotObserved; Exact/NoOwner remain Unknown and managed status is NotGranted. Publication still requires the complete signed Release DAG.' >> "$GITHUB_STEP_SUMMARY"
 
+      # Release transport and manual package recovery share the same seven-day window.
+      # Both release_desktop and release consume these bytes; evidence has separate uploads.
+      # Release assets are durable distribution copies. Do not auto-delete transport on upload.
       - name: Upload artifacts
         if: env.POLARIS_UPLOAD_ARTIFACTS == '1'
         uses: actions/upload-artifact@v7
@@ -1891,6 +1894,12 @@ jobs:
       - name: Require reviewed source-first release policy
         run: node scripts/assert-pc-runtime-release.mjs
 
+      # Validate before using the tag in an artifact glob; never admit glob metacharacters.
+      - name: Require literal release artifact tag
+        run: |
+          node --input-type=module -e 'import assert from "node:assert/strict"; import { assetNames } from "./scripts/release-assets.mjs"; const tag = process.env.GITHUB_REF_NAME; assert.match(tag, /^v/); assetNames(tag.slice(1), "release");'
+
+      # Only this tag’s four desktop transport artifacts, never evidence artifacts.
       # 四个 artifact 合并落进 dist-release/。
       # upload-artifact v7 的基准是**实际命中文件**的最近公共祖先（不是所列 path 的公共祖先，
       # 也不是仓库根）：mac 两条腿各自只命中一个 dmg ⇒ 那个 artifact 里是**平铺的裸 dmg**；
@@ -1902,7 +1911,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: dist-release
-          pattern: polaris-*
+          pattern: polaris-{linux,windows,macos-arm64,macos-x64}-${{ github.ref_name }}
           merge-multiple: true
 
       - name: List collected assets
@@ -2230,6 +2239,11 @@ jobs:
       - name: Require reviewed source-first release policy
         run: node scripts/assert-pc-runtime-release.mjs
 
+      # Validate before using the tag in an artifact glob; never admit glob metacharacters.
+      - name: Require literal release artifact tag
+        run: |
+          node --input-type=module -e 'import assert from "node:assert/strict"; import { assetNames } from "./scripts/release-assets.mjs"; const tag = process.env.GITHUB_REF_NAME; assert.match(tag, /^v/); assetNames(tag.slice(1), "release");'
+
       - name: Verify release identity is still the same draft
         id: release_identity
         shell: bash
@@ -2259,11 +2273,12 @@ jobs:
           echo "::notice::release targetCommitish=$target_commitish（仅诊断；SHA 由远端 peeled tag 对拍）"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+      # The second consumer needs the original bytes to recompute the combined manifest.
       - name: Download desktop artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist-release
-          pattern: polaris-*
+          pattern: polaris-{linux,windows,macos-arm64,macos-x64}-${{ github.ref_name }}
           merge-multiple: true
 
       # APK 来自上一段已验签名/开箱/远端 digest 的 job。再从 draft 下载一次，确保最终清单按

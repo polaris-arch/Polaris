@@ -28,6 +28,10 @@ name: CI
 #   · 全矩阵事件下 windows / macos 各起两个 job（lint、test），两边都要冷编同一批 C 依赖。
 #
 # ── 反馈架构（2026-08-26 按公开仓实况更新）──
+# 2026-10-18: direct non-force main pushes containing only existing regular
+# first-level Node-test content changes may omit native work after the existing
+# release classifiers agree. Node/UI gates still run; PR/merge/call/manual stay full.
+# Missing history or ambiguous output never omits native checks.
 #    标准 GitHub-hosted runner 对公开仓不计分钟额度；仍需控制等待、并发与无信息量重跑。
 #    此前每次 push main = 3-OS CI + 4 平台 Package 并行，反馈噪声与 artifact 体积都过高。
 #   · push main（调试热路径）：矩阵 job 只跑 ubuntu-22.04 一条腿 —— 最便宜、最快反馈；
@@ -139,6 +143,7 @@ jobs:
     permissions:
       contents: read
     outputs:
+      native_required: ${{ steps.native_impact.outputs.native_required }}
       native_dns_candidate: ${{ steps.native_dns_admission.outputs.candidate }}
       native_dns_default: ${{ steps.native_dns_admission.outputs.temporary_default }}
       native_dns_formal: ${{ steps.native_dns_admission.outputs.formal_default }}
@@ -149,10 +154,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # The previous tip is normally a direct parent. Missing/multi-push
+          # history falls back to full native CI instead of fetching more history.
+          fetch-depth: 2
       - name: Setup candidate admission Node
         uses: actions/setup-node@v7
         with:
           node-version: '26'
+      - name: Classify native CI impact
+        id: native_impact
+        run: node scripts/classify-ci-impact.mjs --native-ci
       - name: Admit exact final candidate SYSTEM request
         shell: bash
         env:
@@ -233,6 +244,7 @@ jobs:
               out.write('mode=candidate\nsource=' + data['sourceCommit'] + '\n')
           PYCANDIDATE
       - name: Install existing Rust formatting toolchain
+        if: steps.native_impact.outputs.native_required != 'false'
         shell: bash
         run: |
           set -euo pipefail
@@ -241,6 +253,7 @@ jobs:
           rustc -Vv
           cargo fmt --version
       - name: Check workspace formatting before native compilation
+        if: steps.native_impact.outputs.native_required != 'false'
         run: cargo fmt --all -- --check
 
   native_dns_candidate_gates:
@@ -249,11 +262,12 @@ jobs:
     # Manual diagnostics retain their fixed context. Committed formal defaults use
     # the same caller/App SHA and four-host gate plan without a second dispatch.
     if: >-
-      ${{ github.event_name == 'workflow_dispatch'
+      ${{ needs.cheap_format.outputs.native_required != 'false'
+          && (github.event_name == 'workflow_dispatch'
           && github.workflow_ref == 'polaris-arch/Polaris/.github/workflows/ci.yml@refs/heads/collab/native-node-dns-20261018'
           && inputs.native_dns_candidate != ''
           && needs.cheap_format.outputs.native_dns_candidate == inputs.native_dns_candidate
-          || needs.cheap_format.outputs.native_dns_formal == 'true' }}
+          || needs.cheap_format.outputs.native_dns_formal == 'true') }}
     permissions:
       contents: read
     uses: ./.github/workflows/native-dns-candidate.yml
@@ -264,6 +278,8 @@ jobs:
   # ══ 检查类之一：fmt + clippy（矩阵）；Linux 腿另跑 rustdoc 与 Cronet 来源解析 ══
   lint:
     needs: cheap_format
+    if: >-
+      needs.cheap_format.outputs.native_required != 'false'
     name: fmt + clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -507,7 +523,8 @@ jobs:
     needs: cheap_format
     name: cross-target clippy + android face
     if: >-
-      !(github.event_name == 'workflow_dispatch'
+      needs.cheap_format.outputs.native_required != 'false'
+      && !(github.event_name == 'workflow_dispatch'
         && github.event.inputs.os != ''
         && github.event.inputs.os != 'all'
         && github.event.inputs.os != 'ubuntu-22.04')
@@ -805,6 +822,8 @@ jobs:
   # Build 与 Test 留在同一个 job：`cargo test` 复用 `cargo build` 出的依赖 rlib，拆开就是编两遍。
   test:
     needs: cheap_format
+    if: >-
+      needs.cheap_format.outputs.native_required != 'false'
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120

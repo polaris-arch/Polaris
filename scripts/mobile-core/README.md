@@ -62,7 +62,9 @@ Formal binding plans are explicit:
   selected compiler/SDK identities are checked without version fallback.
 - Tags are copied from the actual source-owned libbox declaration, including
   gvisor, Naive, Tailscale and Apple-only DHCP/low-memory flags. The Go module
-  remains `github.com/sagernet/sing-box`; only outer assets use `polaris-box-*`.
+  remains `github.com/sagernet/sing-box`; the pinned source repository is
+  `polaris-arch/sing-box-polaris` at `v1.15.0-polaris-alpha.12`. Published core
+  assets use `sing-box-polaris-*`; formal mobile output remains Libbox.
 - Version is passed through fixed ldflags. `ReadTag`/`git describe`, an upstream
   cache tag, or a reused CLI BuildID cannot provide formal mobile identity.
 
@@ -130,9 +132,47 @@ bytes remain original; formal consumption requires the exact current two-target
 inventory, including rejection of an extra Intel simulator entry or member.
 Device arm64 and simulator arm64 are separate platform identities even though
 the CPU is the same.
+Hosted Apple complete-component reuse is an optional optimization for ordinary
+Release Risk main pushes only. `component-cache-key` recomputes source, module,
+actual tool/SDK, producer-code and effective native compilation inputs. The
+exact `apple-go-component-v1` Actions key has no prefix fallback. PR/manual/tag
+executions neither restore nor save this package. Generator tools are installed
+with `-trimpath`; only admitted module-root locations and the generator filename
+header are normalized for comparison. Original receipt paths and BuildIDs are
+never rewritten. Native compilation overrides remain identity inputs; custom or
+unrecognized effective compiler/CGO settings and ambient include/library/config
+paths disable both restore and export, leaving the normal fresh build available.
+
+The package contains the original receipt, two-slice output, bind log, compiler
+objects, external archives, generated-source and local-replacement closure. It
+is validated before restoring a previously unused historical private-root
+namespace, then all original native/API/output predicates run again. A current
+consumer observation identifies `trusted-main-cache`, retains the original
+producer, and explicitly does not claim historical provider authentication or
+current-run component production. Current evidence retains the complete package,
+so old Actions runs/artifacts are not required for later validation.
+
+The trust boundary is all repository executions allowed to write main-scoped
+Actions caches, as with compiled Rust dependency caches; self-reported hashes
+are integrity checks, not independent producer authentication. Missing, invalid
+or incompatible restored packages rebuild. Current source/tool admission,
+filesystem failures and failures after original installation are fatal. An
+occupied/corrupt immutable cache entry is not overwritten or promoted; until it
+is evicted, consumers may continue rebuilding safely. Export occurs only after
+complete local verification and only for a newly produced component.
+
+Rust download and compiled-dependency keys are independent. Download identity
+retains exact Cargo format/tool bytes and lock/manifests/source configuration.
+Compiled identity conservatively excludes only `android_sdk.py` and the two NDK
+installer/archive files; shared `ci_android.py` and `android-source.py`, unknown
+producer files, Apple workflow, tools, SDK/configuration and flags remain
+relevant. Full producer provenance and final App-product exclusion are unchanged.
+New key versions initially miss. These cache changes do not measure or promise
+a speedup for a genuinely cold build or the final App crate.
+
 Before that input is frozen, exact remote module versions already covered by
 the source `go.sum` are admitted into the same module cache if their directories
-are missing. Go1.25.5's `go list -m -json` reports those directories according to
+are missing. The pinned Go1.27.2's `go list -m -json` reports those directories according to
 cache availability; a cold graph must not be frozen and then change merely
 because the original bind populated the cache. Download admission uses one
 fixed `module-cache-admission/admission.mod` plus `.sum` copy (each at most 1MiB,

@@ -56,7 +56,7 @@
 
 ## 安装
 
-从 [Releases](https://github.com/polaris-arch/Polaris/releases) 下载对应平台安装包。
+正式包发布后，可从 [Releases](https://github.com/polaris-arch/Polaris/releases) 下载对应平台安装包；源码或 CI 验证通过不表示已有公开下载。
 
 当前发布流程按 [release-assets.mjs](scripts/release-assets.mjs) 使用以下文件名，`<version>` 为应用版本（不含 `v` 前缀）。macOS 按 Apple Silicon / Intel 分包，Windows 为 x64，Linux 为 amd64；Android 依次为 ARM64、ARMv7 和 universal，universal 仅含这两种 ARM 架构，不含 x86。下载时以所选 Release 的实际附件为准，并用同页 `SHA256SUMS` 核对文件。
 
@@ -94,7 +94,7 @@ SmartScreen 提示时选择「更多信息」→「仍要运行」。
 
 ## 构建
 
-以下供维护者构建当前源码，示例为 Linux；源码构建成功不等于已发布安装包通过运行验收。平台依赖、移动端工具链与打包约定见下方构建文档。
+以下供维护者构建当前源码；源码构建成功不等于已发布安装包通过运行验收。平台依赖、移动端工具链与打包约定见下方构建文档。
 
 源码构建入口：[桌面与 Android](docs/build-and-package.md) · [iOS / iPadOS](docs/ios-source-build.md) · [移动内核与固定工具链](scripts/mobile-core/README.md)。
 
@@ -102,16 +102,7 @@ iOS 目前不提供 IPA 或越狱包，越狱兼容性未验证。非越狱设�
 
 需要 Rust stable、Node.js 24+（CI 当前使用 Node 26）、pnpm 11.24.0、Go、[Tauri CLI 2](https://v2.tauri.app/)。
 
-```bash
-npm install -g "@tauri-apps/cli@$(cat scripts/tauri-cli.version)"
-pnpm --dir ui install --frozen-lockfile   # 前端依赖
-# 桌面核：按当前 core-manifest.json 的 desktopRelease 消费固定发布资产
-node scripts/fetch-core.mjs --platform=linux
-# 发布打包的原生验收包与本地资源准备，见 docs/build-and-package.md
-node scripts/fetch-cronet.mjs --platform=linux  # 拉与 Linux 核同目录的 libcronet.so
-node scripts/fetch-dashboard.mjs   # 拉内置面板
-tauri build --config src-tauri/tauri.linux.conf.json
-```
+请按[完整桌面构建步骤](docs/build-and-package.md#打包出安装包)依次准备工具链与 protoc/PATH、固定内核、helper（Windows 另含 cleaner）及安装身份清单，再编译 App。仅拉内核后运行 `tauri build` 不足以生成可用的完整安装包。
 
 内核不入库，打包前必须拉。平台 `--config` 不可省：缺了会打出**没有内核的包**，且构建期零报错，
 直到运行期才暴露。完整说明、CI 分工、Windows 安装器与更新器选包契约见
@@ -155,7 +146,7 @@ Android 将 libbox 载入应用进程，采用移动端 VPN 集成，不使用�
 
 | 项目 | 用途 |
 |---|---|
-| [sing-box-polaris（实际使用的 fork）](https://github.com/polaris-arch/sing-box-polaris) | 实际使用的内核 fork；冻结源码、版本及 polaris-box 资产以所选构建清单为准 |
+| [sing-box-polaris（实际使用的 fork）](https://github.com/polaris-arch/sing-box-polaris) | 实际使用的内核 fork；冻结源码、版本及 sing-box-polaris 资产以所选构建清单为准 |
 | [sing-box（原始上游）](https://github.com/SagerNet/sing-box) | 原始上游项目与技术来源；保留致谢 |
 | [Tauri 2](https://github.com/tauri-apps/tauri) | 桌面运行时 |
 | [cronet-go](https://github.com/SagerNet/cronet-go) | NaiveProxy 的 libcronet |

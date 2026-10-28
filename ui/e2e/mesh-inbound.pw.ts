@@ -22,9 +22,27 @@ const save = async (page: import('@playwright/test').Page) => {
 };
 
 test('real Tailscale form saves, reopens, edits and removes ingress policy', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
   await page.addInitScript(({ key }) => window.localStorage.setItem(key, 'en-US'), { key: LANGUAGE_STORAGE_KEY });
   await page.goto(url);
   await routing(page);
+  const presence = await page.evaluate(async () => {
+    const internals = (window as unknown as {
+      __TAURI_INTERNALS__: {
+        invoke: (command: string, args: Record<string, unknown>) => Promise<unknown>;
+      };
+    }).__TAURI_INTERNALS__;
+    const serverIds = ['mesh-ingress-ts', 'mesh-no-state', 'mesh-ingress-ts'];
+    return Promise.all([
+      internals.invoke('tailscale_state_exists', { serverIds }),
+      internals.invoke('tailscale_state_exists', { serverIds, cachedSessionOnly: false }),
+      internals.invoke('tailscale_state_exists', { serverIds, cachedSessionOnly: true }),
+      internals.invoke('tailscale_state_exists', { serverIds: [], cachedSessionOnly: true }),
+    ]);
+  });
+  const absent = { 'mesh-ingress-ts': false, 'mesh-no-state': false };
+  expect(presence).toEqual([absent, absent, absent, {}]);
   await mode(page, 'allowlist');
   await page.getByRole('button', { name: enUS.meshInbound.add, exact: true }).click();
   await page.locator('#ts-mesh-source-0').fill('10.77.0.2/32');
@@ -48,4 +66,5 @@ test('real Tailscale form saves, reopens, edits and removes ingress policy', asy
   await mode(page, 'legacy'); // remove the field rather than writing a permissive object
   await save(page);
   await expect.poll(() => savedPolicy(page)).toBeNull();
+  expect(pageErrors).toEqual([]);
 });

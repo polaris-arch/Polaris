@@ -122,6 +122,9 @@ function fixture(options = {}) {
     const files = { [t.core]: coreBytes, LICENSE: Buffer.from('synthetic license'), NOTICE: Buffer.from('synthetic notice'),
       'licenses/NOTICE': Buffer.from('synthetic notice'), 'provenance.json': encode({ ...provenance, archive: originalArchive }),
       'source/SOURCE-INDEX.json': encode({ fixtureOnly: true }) };
+    for (let n = 0; n < (options.legalMembers ?? 0); n++) {
+      files[`licenses/dependency-${n}/LICENSE`] = Buffer.from(`synthetic dependency license ${n}`);
+    }
     files.SHA256SUMS = Buffer.from(Object.keys(files).sort().map((n) => `${digest(files[n])}  ${n}\n`).join(''));
     if (t.sidecar) { files[t.sidecar] = sidecarBytes; files.SHA256SUMS = Buffer.from(Object.keys(files).filter((n) => n !== 'SHA256SUMS').sort().map((n) => `${digest(files[n])}  ${n}\n`).join('')); }
     const archiveFile = join(root, 'inputs', rootName + t.suffix);
@@ -1019,6 +1022,19 @@ test('actual tar transport preserves executable modes despite artifact outer-fil
   importCoreWireHandoff(f.root, f.manifest, payload, candidate, h.name, h.options);
   assert.deepEqual(resources(f), h.before);
   const metadata = join(packed, 'archive.json'), frozenMetadata = readFileSync(metadata);
+  for (const field of ['profile', 'sourceArchive', 'wireTransport', 'target', 'memberBytes']) {
+    write(metadata, encode({ ...pin, [field]: 'untrusted domain selection' }));
+    const rejected = join(f.root, `wire-field-${field}`);
+    assert.throws(() => unpackCoreWireHandoff(packed, rejected), /Unexpected wire archive fields/);
+    assert.equal(existsSync(rejected), false);
+  }
+  for (const field of ['profile', 'memberBytes']) {
+    write(metadata, encode({ ...pin, archive: { ...pin.archive, [field]: 'untrusted' } }));
+    const rejected = join(f.root, `wire-record-${field}`);
+    assert.throws(() => unpackCoreWireHandoff(packed, rejected), /Unexpected wire archive record fields/);
+    assert.equal(existsSync(rejected), false);
+  }
+  write(metadata, frozenMetadata);
   const changedMode = structuredClone(pin); changedMode.archive.memberModes['core-wire-inputs/resources/linux/sing-box'] = 0o644;
   write(metadata, encode(changedMode));
   const badMode = join(f.root, 'wire-mode-extracted');
@@ -1029,6 +1045,40 @@ test('actual tar transport preserves executable modes despite artifact outer-fil
   const rejected = join(f.root, 'wire-corrupt-extracted');
   assert.throws(() => unpackCoreWireHandoff(packed, rejected)); assert.equal(existsSync(rejected), false);
 }));
+test('four bounded native inputs with full legal trees survive aggregate transport and complete import verification',
+  async () => withFixture(async (f) => {
+    const h = await handoffFixture(f), packed = join(f.root, 'wire-large-archive');
+    const pin = packCoreWireHandoff(h.bundle, packed);
+    assert(Object.keys(pin.archive.members).length > 3000);
+    for (const key of Object.keys(RELEASE_TARGETS)) {
+      const prefix = `core-wire-inputs/resources/${key}/`;
+      const count = Object.keys(pin.archive.members).filter((name) => name.startsWith(prefix)).length;
+      assert(count > 762 && count <= 1024);
+    }
+    const payload = unpackCoreWireHandoff(packed, join(f.root, 'wire-large-extracted'));
+    importCoreWireHandoff(f.root, f.manifest, payload, candidate, h.name, h.options);
+    assert.deepEqual(resources(f), h.before);
+  }, { legalMembers: 762 }));
+test('wire producer rejects real empty directories and one oversized platform before creating transport',
+  async () => withFixture(async (f) => {
+    const h = await handoffFixture(f), packed = join(f.root, 'wire-invalid-archive');
+    const unknown = join(h.bundle, 'unexpected-control'); write(unknown, 'inert');
+    assert.throws(() => packCoreWireHandoff(h.bundle, packed), /Unexpected wire handoff payload/);
+    assert.equal(existsSync(packed), false); rmSync(unknown);
+    const empty = join(h.bundle, 'resources/linux/unrecorded-empty'); mkdirSync(empty);
+    assert.throws(() => packCoreWireHandoff(h.bundle, packed), /wire directory inventory differs/);
+    assert.equal(existsSync(packed), false); rmSync(empty, { recursive: true });
+    const proofPath = join(h.bundle, 'handoff.json'), proof = JSON.parse(readFileSync(proofPath));
+    for (let n = 0; n < 1025; n++) {
+      const name = `linux/overflow-${n}`, raw = Buffer.from('inert legal fixture');
+      const path = join(h.bundle, 'resources', name); write(path, raw); fs.chmodSync(path, 0o644);
+      proof.files.push({ name, bytes: raw.length, sha256: digest(raw), mode: 0o644 });
+    }
+    proof.files.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    write(proofPath, encode(proof));
+    assert.throws(() => packCoreWireHandoff(h.bundle, packed), /wire platform member inventory limit/);
+    assert.equal(existsSync(packed), false);
+  }));
 test('handoff closes changed bytes, unsafe modes, links, extra members and changed manifest without writes', async () => withFixture(async (f) => {
   const h = await handoffFixture(f), core = join(h.bundle, 'resources/linux/sing-box'), original = readFileSync(core);
   const failed = () => { assert.throws(() => importCoreWireHandoff(f.root, f.manifest, h.bundle, candidate, h.name, h.options)); assert.deepEqual(resources(f), {}); };
