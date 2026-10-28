@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { TsLoginModeSwitch } from './TsLoginModeSwitch';
 import type { ServerConfig } from '@/contracts/types';
-import { executeTsLogin, planTsLoginSubmit, type TsLoginExecution } from './ts-login-server';
+import { executeTsLogin, planTsLoginSubmit, tsLoginErrorReason, type TsLoginExecution } from './ts-login-server';
 
 function execution(overrides: Partial<TsLoginExecution> = {}): TsLoginExecution {
   return { isActive: () => true, prepare: vi.fn(async () => {}), logout: vi.fn(async () => {}),
@@ -11,6 +11,58 @@ function execution(overrides: Partial<TsLoginExecution> = {}): TsLoginExecution 
 }
 
 describe('save followed by authorization', () => {
+  it('backend replacement prepares and invokes once, then refreshes without renderer identity or configuration writes', async () => {
+    const order: string[] = [];
+    const input = execution({ backendReplacement: true, verifyState: vi.fn(async () => true),
+      prepare: vi.fn(async () => { order.push('prepare'); }),
+      start: vi.fn(async () => { order.push('start'); return { started: false, reason: 'inMainCore' }; }),
+      refresh: vi.fn(async () => { order.push('refresh'); }) });
+    expect(await executeTsLogin(input)).toEqual({ phase: 'handedOff' });
+    expect(order).toEqual(['prepare', 'start', 'refresh']);
+    for (const fn of [input.verifyState, input.logout, input.save, input.onSaved, input.cancel]) expect(fn).not.toHaveBeenCalled();
+    expect(input.start).toHaveBeenCalledOnce();
+    expect(input.refresh).toHaveBeenCalledOnce();
+  });
+
+  it.each(['mainCoreChanged', 'cancelled', 'nativeRetirementUnknown', 'profileBindingUnknown', 'stateRevisionChanged', 'candidateConfigurationChanged', 'retainedAuthKeyUnavailable', 'retainedAuthKeyAuthorityChanged', 'credentialRevisionChanged', 'invalidCredentialIntent', 'credentialCommitUnknown'])(
+    'refreshes the possibly committed backend candidate after %s without exposing raw diagnostics', async reason => {
+      const input = execution({ backendReplacement: true, start: vi.fn(async () => { throw { code: 'TAILSCALE_LOGIN_FAILED', message: reason }; }) });
+      expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason });
+      expect(input.refresh).toHaveBeenCalledOnce();
+      expect(input.cancel).toHaveBeenCalledOnce();
+      expect(input.save).not.toHaveBeenCalled();
+      expect(tsLoginErrorReason({ code: 'OTHER', message: reason })).toBeUndefined();
+      expect(tsLoginErrorReason({ code: 'TAILSCALE_LOGIN_FAILED', message: reason + ' PRIVATE_KEY' })).toBeUndefined();
+    });
+
+  it('refreshes after a cancelled replacement settles and retains its exact cancellation', async () => {
+    let active = true;
+    let finish!: (value: { started: boolean; reason: string }) => void;
+    const input = execution({ backendReplacement: true, isActive: () => active,
+      start: vi.fn(() => new Promise<{ started: boolean; reason: string }>(resolve => { finish = resolve; })) });
+    const pending = executeTsLogin(input);
+    await vi.waitFor(() => expect(input.start).toHaveBeenCalledOnce());
+    active = false;
+    expect(input.refresh).not.toHaveBeenCalled();
+    finish({ started: false, reason: 'cancelled' });
+    expect(await pending).toEqual({ phase: 'cancelled' });
+    expect(input.refresh).toHaveBeenCalledOnce();
+    expect(input.cancel).toHaveBeenCalledOnce();
+  });
+
+  it('a refresh failure preserves a specific backend failure and reports stale configuration separately', async () => {
+    const input = execution({ backendReplacement: true,
+      start: async () => { throw { code: 'IOS_VPN_PERMISSION_DENIED', message: 'private' }; },
+      refresh: vi.fn(async () => { throw new Error('private'); }) });
+    expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: 'IOS_VPN_PERMISSION_DENIED', refreshFailed: true });
+    expect(input.refresh).toHaveBeenCalledOnce();
+  });
+
+  it('a handed-off replacement whose mirror cannot refresh does not cancel the connected main producer', async () => {
+    const input = execution({ backendReplacement: true, refresh: async () => { throw new Error('private'); } });
+    expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: 'configurationRefreshFailed', refreshFailed: true });
+    expect(input.cancel).not.toHaveBeenCalled();
+  });
   it('explicit capacity code survives the authorization flow and still cancels the original attempt', async () => {
     const input = execution({ start: async () => { throw { code: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', message: 'private' }; } });
     expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED' });
@@ -63,6 +115,26 @@ describe('save followed by authorization', () => {
     expect(input.cancel).toHaveBeenCalledOnce();
   });
 
+  it('authorization can detach the panel while invoke awaits the main observer without a late cancel', async () => {
+    let active = true;
+    let finish!: (value: { started: boolean; reason: string }) => void;
+    const input = execution({ isActive: () => active, start: () => new Promise(resolve => { finish = resolve; }) });
+    const pending = executeTsLogin(input);
+    await vi.waitFor(() => expect(input.onSaved).toHaveBeenCalledOnce());
+    active = false;
+    finish({ started: false, reason: 'inMainCore' });
+    expect(await pending).toEqual({ phase: 'cancelled' });
+    expect(input.cancel).not.toHaveBeenCalled();
+  });
+
+  it.each(['IOS_FOREGROUND_REQUIRED', 'IOS_VPN_PERMISSION_DENIED', 'TAILSCALE_IDENTITY_RETIREMENT_REQUIRED'])('preserves %s without disclosing diagnostics or retrying', async code => {
+    const input = execution({ start: vi.fn(async () => { throw { code, message: 'private token/path' }; }) });
+    expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: code });
+    expect(input.start).toHaveBeenCalledOnce();
+    expect(input.logout).not.toHaveBeenCalled();
+    expect(input.cancel).toHaveBeenCalledOnce();
+  });
+
   it('fresh state-query failure blocks logout/save/start and cannot claim save success', async () => {
     const input = execution({ verifyState: async () => { throw new Error('unavailable'); } });
     expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: 'stateQueryFailed' });
@@ -106,4 +178,25 @@ it('switching mode is blocked while prepare/save is pending, so the current subm
   expect(input.save).toHaveBeenCalledOnce();
   expect(input.start).toHaveBeenCalledOnce();
   expect(submitting).toBe(false);
+});
+
+
+it('backend credential login skips renderer writes and refreshes once even if the explicit activation later fails', async () => {
+  const input = execution({ backendCredentials: true, verifyState: vi.fn(async () => true),
+    start: vi.fn(async () => { throw { code: 'TAILSCALE_LOGIN_FAILED', message: 'credentialCommitUnknown' }; }) });
+  expect(await executeTsLogin(input)).toEqual({ phase: 'failed', reason: 'credentialCommitUnknown' });
+  for (const fn of [input.verifyState, input.logout, input.save, input.onSaved]) expect(fn).not.toHaveBeenCalled();
+  expect(input.prepare).toHaveBeenCalledOnce();
+  expect(input.start).toHaveBeenCalledOnce();
+  expect(input.refresh).toHaveBeenCalledOnce();
+  expect(input.cancel).toHaveBeenCalledOnce();
+});
+
+it('cancel before prepare completes cannot activate retained credentials or refresh an uninvoked transaction', async () => {
+  let active = true;
+  const input = execution({ backendCredentials: true, isActive: () => active, prepare: async () => { active = false; } });
+  expect(await executeTsLogin(input)).toEqual({ phase: 'cancelled' });
+  expect(input.start).not.toHaveBeenCalled();
+  expect(input.refresh).not.toHaveBeenCalled();
+  expect(input.cancel).toHaveBeenCalledOnce();
 });

@@ -47,8 +47,10 @@ import {
   expandDecl,
   explain,
   resolve,
+  selectorKey,
   shorthandComponent,
   type Decl,
+  type Dir,
   type Edge,
 } from '@/styles/css-cascade.test-support';
 
@@ -83,15 +85,16 @@ const edgeValueOf = (d: Decl, family: Family, edge: Edge): string | null =>
  * 该选择器该条边的层叠结果。
  *
  * `where: ALL` —— 条件块里的覆写**要看**：某个断点下把安全区悄悄丢掉，正是本门要抓的形状之一。
- * `env` 用默认 `ltr`：登记表里的边都是物理边，且 corpus 里这批消费点全是物理长写/简写，
- * 一条逻辑属性都没有（实测），所以 dir 在这里不改变任何一格；哪天有人改成 `padding-inline`，
- * `:root[dir=` 那两条规则会让解析器当场要求显式给 env。
+ * 边仍是物理边；现在 iOS rail 有真实 `[dir]` 覆写，显式度量 ltr/rtl，不能让默认环境隐去它。
  */
-const edgeResolution = (selector: string, family: Family, edge: Edge) =>
-  resolve({ sel: selector, prop: `${family}-${edge}`, ctx: 'mobile', where: ALL });
+const edgeResolution = (selector: string, family: Family, edge: Edge, dir: Dir = 'ltr') =>
+  resolve({ sel: selector, prop: `${family}-${edge}`, ctx: 'mobile', where: ALL, env: { dir } });
 
 const readsVar = (value: string, name: string) =>
   new RegExp(`var\\(\\s*${name}\\b`).test(value);
+
+const ios = (selector: string, attributes = '') => selectorKey(`:root[data-mobile-os="ios"]${attributes} ${selector}`);
+const iosBar = selectorKey(':root[data-mobile-os="ios"]:is([data-ios-vertical-bar-side="left"], [data-ios-vertical-bar-side="right"]) .m-nav');
 
 // ════════════════════════════════════════════════════════════════════════════
 // ② 登记表：(贴边容器, 边, 盒属性族, 必须消费的变量)
@@ -159,9 +162,88 @@ const REGISTRY: ReadonlyArray<readonly [string, Edge, Family, string]> = [
   ['.m-lock-content', 'right', 'padding', '--safe-r'],
   ['.m-lock-content', 'bottom', 'padding', '--safe-b'],
   ['.m-lock-content', 'left', 'padding', '--safe-l'],
+  // iOS-specific consumers: the shell owns bottom, panels own side insets.
+  [ios('.mn-sheet'), 'left', 'padding', '--safe-l'],
+  [ios('.mn-sheet'), 'right', 'padding', '--safe-r'],
+  [ios('.m-form-panel'), 'left', 'padding', '--safe-l'],
+  [ios('.m-form-panel'), 'right', 'padding', '--safe-r'],
+  [ios('.m-shell'), 'bottom', 'padding', '--safe-b'],
+  [ios('.m-pending-slot'), 'left', 'padding', '--safe-l'],
+  [ios('.m-pending-slot'), 'right', 'padding', '--safe-r'],
+  [ios('.m-nav'), 'left', 'padding', '--safe-l'],
+  [ios('.m-nav'), 'right', 'padding', '--safe-r'],
+  [iosBar, 'right', 'padding', '--safe-r'],
+  [ios('.m-nav', '[data-ios-vertical-bar-side="left"]'), 'left', 'padding', '--safe-l'],
+  [ios('.m-nav', '[data-ios-vertical-bar-side="left"][dir]'), 'left', 'padding', '--safe-l'],
+  [ios('.m-nav', '[data-ios-vertical-bar-side="right"][dir]'), 'right', 'padding', '--safe-r'],
 ];
 
 const key = (s: string, e: Edge, f: Family) => `${s}|${f}-${e}`;
+
+// A narrower iOS rule may transfer an inset to a specific containing block or
+// to the rail's physical outer edge. Pin both the exact replacement value and
+// the receiving owner. Unlisted overrides (including Android) still fail.
+type Transfer = readonly [selector: string, prop: string, value: string, owner: string, ownerProp: string, variable: string];
+const TRANSFERS: Transfer[] = [];
+const transfer = (sel: string, prop: string, value: string, owner: string, ownerProp: string, variable: string) =>
+  TRANSFERS.push([sel, prop, value, owner, ownerProp, variable]);
+const railTraits = ['[data-ios-horizontal-size-class="regular"]', '[data-ios-vertical-size-class="compact"]'];
+const leftRail = ios('.m-nav', '[data-ios-vertical-bar-side="left"]');
+const leftRailDir = ios('.m-nav', '[data-ios-vertical-bar-side="left"][dir]');
+const rightRailDir = ios('.m-nav', '[data-ios-vertical-bar-side="right"][dir]');
+for (const sel of [...railTraits.map((a) => ios('.m-nav', a)), iosBar, leftRail, leftRailDir, rightRailDir]) {
+  transfer(sel, 'padding-top', 'var(--sp-3)', '.m-shell', 'padding-top', '--safe-t');
+}
+transfer(ios('.m-nav'), 'padding-top', '0', '.m-shell', 'padding-top', '--safe-t');
+for (const attr of railTraits) {
+  const rail = ios('.m-nav', attr);
+  transfer(rail, 'padding-left', '0', rail, 'padding-right', '--rail-edge-safe');
+  transfer(rail, 'padding-right', 'var(--rail-edge-safe)', ios('.m-shell'), '--rail-edge-safe', '--safe-r');
+  const rtl = ios('.m-nav', attr + '[dir="rtl"]');
+  transfer(rtl, 'padding-left', 'var(--rail-edge-safe)', ios('.m-shell', '[dir="rtl"]'), '--rail-edge-safe', '--safe-l');
+  transfer(rtl, 'padding-right', '0', rtl, 'padding-left', '--rail-edge-safe');
+}
+transfer(iosBar, 'padding-left', '0', iosBar, 'padding-right', '--safe-r');
+for (const sel of [leftRail, leftRailDir]) {
+  transfer(sel, 'padding-right', '0', sel, 'padding-left', '--safe-l');
+}
+transfer(rightRailDir, 'padding-left', '0', rightRailDir, 'padding-right', '--safe-r');
+transfer(ios('.mn-sheet'), 'padding-bottom', 'var(--card-padding)', ios('.m-shell'), 'padding-bottom', '--safe-b');
+transfer(ios('.m-form-layer'), 'padding-top', 'var(--ios-form-safe-top)', ios('.m-form-layer'), '--ios-form-safe-top', '--safe-t');
+for (const [edge, variable] of [['left', '--safe-l'], ['right', '--safe-r']] as const) {
+  transfer(ios('.m-form-layer'), `padding-${edge}`, '0', ios('.m-form-panel'), `padding-${edge}`, variable);
+}
+transfer(ios('.m-form-foot'), 'padding-bottom', 'var(--sp-2)', ios('.m-form-layer'), '--ios-form-safe-bottom', '--safe-b');
+transfer(ios('.m-form-foot'), 'padding-bottom', '0', ios('.m-form-layer'), '--ios-form-safe-bottom', '--safe-b');
+transfer(ios('.m-form-panel[data-ios-reserved-short] .m-form-foot'), 'padding-bottom', '0', ios('.m-form-layer'), '--ios-form-safe-bottom', '--safe-b');
+
+const assertNarrowConsumption = (decl: Decl, value: string, family: Family, edge: Edge, variable: string) => {
+  const prop = `${family}-${edge}`;
+  for (const sel of decl.sels) {
+    expect(sel, `较窄覆盖必须明确只匹配 iOS：${decl.file}:${decl.line}`).toContain('[data-mobile-os="ios"]');
+    if (readsVar(value, variable)) continue;
+    const known = TRANSFERS.find(([s, p, v]) => s === sel && p === prop && v === value);
+    expect(known, `未裁定的较窄覆盖：${sel} ${prop}: ${value}`).toBeDefined();
+    if (!known) throw new Error('Missing safe-area ownership transfer');
+    if (sel === ios('.m-form-foot') && value === '0') {
+      expect(decl.conds, 'footer 的零 inset 只属于 ios-form 短高容器，不能扩成常规档').toEqual(['@container ios-form (max-height: 15em)']);
+    }
+    const [, , , owner, ownerProp, ownerVariable] = known;
+    const r = resolve({ sel: owner, prop: ownerProp, ctx: 'mobile', where: ALL,
+      env: { dir: owner.includes('[dir="rtl"]') ? 'rtl' : 'ltr' } });
+    expect(r.winner && readsVar(r.winner.value, ownerVariable),
+      `${sel} 把 ${prop} 转给 ${owner}，但接收方没有消费 ${ownerVariable}:\n${explain(r)}`).toBe(true);
+    for (const c of r.narrower) {
+      for (const receivingSel of c.decl.sels) {
+        const physicalRtlRail = ownerProp === '--rail-edge-safe'
+          && receivingSel === ios('.m-shell', '[dir="rtl"]') && c.value === 'var(--safe-l)';
+        const provedTransfer = TRANSFERS.some(([s, p, v]) => s === receivingSel && p === ownerProp && v === c.value);
+        expect(readsVar(c.value, ownerVariable) || physicalRtlRail || provedTransfer,
+          `接收安全区的 owner 又被未裁定覆盖：${receivingSel} ${ownerProp}: ${c.value}`).toBe(true);
+      }
+    }
+  }
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -233,10 +315,10 @@ describe('① 正向：登记的每个贴边容器，胜出声明里确实读到
     expect(ghosts, `登记表里这些选择器在移动端 CSS 链上不存在：${ghosts.join(', ')}`).toEqual([]);
   });
 
-  it.each(REGISTRY.map((e) => [`${e[0]} ${e[2]}-${e[1]} ← ${e[3]}`, e] as const))(
+  it.each(REGISTRY.flatMap((e) => (['ltr', 'rtl'] as const).map((dir) => [`${e[0]} ${e[2]}-${e[1]} ← ${e[3]} (${dir})`, e, dir] as const)))(
     '%s',
-    (_name, [selector, edge, family, variable]) => {
-      const r = edgeResolution(selector, family, edge);
+    (_name, [selector, edge, family, variable], dir) => {
+      const r = edgeResolution(selector, family, edge, dir);
       // 正面断言之一：这条边**有**声明。全没有 ⇒ 被整条删掉了。
       expect(
         r.chain.length,
@@ -257,13 +339,21 @@ describe('① 正向：登记的每个贴边容器，胜出声明里确实读到
             `\`${c.value}\`，丢掉了 ${variable} —— 某些断点/媒体条件下安全区会静默失效\n${explain(r)}`,
         ).toBe(true);
       }
-      // 正面断言之三：没有更窄的选择器从旁边压掉这条边（旧读法对这一族完全没有概念）。
-      expect(
-        r.narrower.map((x) => `${x.decl.file}:${x.decl.line} ${x.decl.rawSels.join(', ')}`),
-        `有更窄的选择器覆写了 ${selector} 的 ${family}-${edge}：\n${explain(r)}`,
-      ).toEqual([]);
+      // Android/unlisted overrides still fail. iOS must keep this physical
+      // variable or match an exact, proved ownership transfer above.
+      for (const c of r.narrower) assertNarrowConsumption(c.decl, c.value, family, edge, variable);
     },
   );
+
+  it('较窄覆盖不能扩成 Android、未知 iOS 分支或把短高 footer 的零 inset 扩成常规档', () => {
+    const original = DECLS.find((d) => d.sels.includes(ios('.m-form-foot')) && d.conds.length > 0 && d.prop === 'padding-bottom');
+    expect(original).toBeDefined();
+    if (!original) throw new Error('Missing real short-height footer override');
+    for (const sels of [['.m-form-foot'], [ios('.m-form-foot[data-unreviewed]')]]) {
+      expect(() => assertNarrowConsumption({ ...original, sels }, '0', 'padding', 'bottom', '--safe-b')).toThrow();
+    }
+    expect(() => assertNarrowConsumption({ ...original, conds: [] }, '0', 'padding', 'bottom', '--safe-b')).toThrow();
+  });
 });
 
 describe('② 反向僵尸自检：树上每一处安全区消费点都必须在登记表里', () => {

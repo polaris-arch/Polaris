@@ -10,8 +10,8 @@ import type { PopupPhase } from '@/contracts/types/update';
 
 /** 后端白名单快照（`crates/updater/src/popup.rs::is_valid_for`）。改了那边，本表必须同步。 */
 const BACKEND_WHITELIST: Record<PopupPhase, readonly string[]> = {
-  remind: ['update', 'later', 'skip', 'viewLog'],
-  progress: ['cancel'],
+  remind: ['update', 'later', 'skip', 'viewLog', 'close'],
+  progress: ['cancel', 'close'],
   error: ['retry', 'manualDownload', 'close'],
   done: ['close'],
   noupdate: ['close'],
@@ -20,13 +20,14 @@ const BACKEND_WHITELIST: Record<PopupPhase, readonly string[]> = {
 describe('exitActionFor：退出动作必须在后端该 phase 的白名单里', () => {
   for (const phase of Object.keys(BACKEND_WHITELIST) as PopupPhase[]) {
     it(`${phase} 态的退出动作被后端接受`, () => {
-      // 变异对照：把实现改回「恒返回 'close'」→ remind / progress 两条转红（正是修复前的形态）。
+      // 例如把退出误接为 'update'：progress/error/done/noupdate 会拒收，本条必须失败。
       expect(BACKEND_WHITELIST[phase]).toContain(exitActionFor(phase));
     });
   }
 
-  it('progress 态发 cancel 而不是 close（close 会被静默忽略 = 死键）', () => {
-    expect(exitActionFor('progress')).toBe('cancel');
+  it('阶段变化时仍发可接受的 close，不把收起界面误称为取消下载', () => {
+    expect(exitActionFor('progress')).toBe('close');
+    expect(exitActionFor('remind')).toBe('close');
   });
 
   it('phase 未知时仍给出一个动作（逃生优先，绝不返回空）', () => {

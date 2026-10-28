@@ -52,7 +52,7 @@ use std::pin::Pin;
 #[cfg(not(target_os = "android"))]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    LazyLock,
+    LazyLock, OnceLock,
 };
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -96,6 +96,10 @@ use polaris_core_supervisor::Signal;
 use crate::runtime::tailscale_login_core::{
     ConfigCheckFailure, ConfigChecker, LoginCoreChild, LoginCoreSpawner, SingBoxConfigChecker,
     TokioLoginCoreSpawner,
+};
+#[cfg(not(target_os = "android"))]
+use crate::runtime::tailscale_login_core::{
+    LocalTempNativeTerminal, NativeTransientExit, PreparedTempNativeBirth, TempNativeBirthRef,
 };
 
 #[cfg(target_os = "android")]
@@ -812,17 +816,43 @@ struct PcTempCoreCustody {
     admission: tokio::sync::Mutex<()>,
     birth: Mutex<Option<Arc<PcTempCoreBirth>>>,
     closing: AtomicBool,
+    identity: Arc<()>,
 }
 
 #[cfg(not(target_os = "android"))]
 struct PcTempCoreBirth {
-    child: tokio::sync::Mutex<Box<dyn LoginCoreChild>>,
-    pid: Option<u32>,
-    pid_guard: Mutex<Option<TempCorePidGuard>>,
+    child: tokio::sync::Mutex<Option<Box<dyn LoginCoreChild>>>,
+    pid: OnceLock<Option<u32>>,
+    pid_guard: Mutex<PcTempRegistration>,
     config_path: PathBuf,
     keep_config: bool,
     close_requested: tokio::sync::watch::Sender<bool>,
     retired: AtomicBool,
+    identity: Arc<()>,
+    native: Option<TempNativeBirthRef>,
+}
+
+#[cfg(not(target_os = "android"))]
+struct PcTempRegistration {
+    pid_guard: Option<TempCorePidGuard>,
+    native_terminal: Option<LocalTempNativeTerminal>,
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+impl PcTempCoreBirth {
+    fn has_native_terminal(&self) -> bool {
+        self.pid_guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .native_terminal
+            .is_some()
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+enum PcTempRetirement {
+    Close(Option<NativeTransientExit>),
+    NoChild,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -869,13 +899,18 @@ impl PcTempCoreCustody {
         let pid = child.pid();
         let (close_requested, _) = tokio::sync::watch::channel(false);
         let birth = Arc::new(PcTempCoreBirth {
-            child: tokio::sync::Mutex::new(child),
-            pid,
-            pid_guard: Mutex::new(TempCorePidGuard::register(pid.unwrap_or(0))),
+            child: tokio::sync::Mutex::new(Some(child)),
+            pid: OnceLock::from(pid),
+            pid_guard: Mutex::new(PcTempRegistration {
+                pid_guard: TempCorePidGuard::register(pid.unwrap_or(0)),
+                native_terminal: None,
+            }),
             config_path,
             keep_config,
             close_requested,
             retired: AtomicBool::new(false),
+            identity: Arc::new(()),
+            native: None,
         });
         // Admission remains held from the initial empty-slot check through publication.
         // No other path can install a successor before this synchronous assignment.
@@ -891,6 +926,40 @@ impl PcTempCoreCustody {
         }
     }
 
+    fn book_native(
+        self: &Arc<Self>,
+        prepared: &PreparedTempNativeBirth,
+        config_path: PathBuf,
+        keep_config: bool,
+    ) -> Result<PcCustodiedChild, String> {
+        let mut current = self.birth.lock().map_err(|_| "测速临时核占用状态不可用")?;
+        if current.is_some() {
+            return Err("测速临时核已有未退休实例".into());
+        }
+        let identity = Arc::new(());
+        let native = prepared.bind(&self.identity, &identity)?;
+        let (close_requested, _) = tokio::sync::watch::channel(self.closing.load(Ordering::SeqCst));
+        let birth = Arc::new(PcTempCoreBirth {
+            child: tokio::sync::Mutex::new(None),
+            pid: OnceLock::new(),
+            pid_guard: Mutex::new(PcTempRegistration {
+                pid_guard: None,
+                native_terminal: None,
+            }),
+            config_path,
+            keep_config,
+            close_requested,
+            retired: AtomicBool::new(false),
+            identity,
+            native: Some(native),
+        });
+        *current = Some(birth.clone());
+        Ok(PcCustodiedChild {
+            custody: self.clone(),
+            birth,
+        })
+    }
+
     async fn retry_close(self: &Arc<Self>) -> Result<(), String> {
         let Some(birth) = self.current()? else {
             return Ok(());
@@ -903,7 +972,11 @@ impl PcTempCoreCustody {
         .await
     }
 
-    fn retire(&self, birth: &Arc<PcTempCoreBirth>) -> Result<(), String> {
+    fn retire(
+        &self,
+        birth: &Arc<PcTempCoreBirth>,
+        evidence: PcTempRetirement,
+    ) -> Result<(), String> {
         let mut current = self.birth.lock().map_err(|_| "测速临时核占用状态不可用")?;
         if !current
             .as_ref()
@@ -911,15 +984,33 @@ impl PcTempCoreCustody {
         {
             return Err("测速临时核关闭回执不属于当前实例".into());
         }
-        // Native close already succeeded. Keep these rights in one synchronous commit so
-        // cancellation or a delayed old completion cannot delete a successor's fixed config.
-        retire_temp_config(&birth.config_path, birth.keep_config);
-        birth
+        let mut pid_guard = birth
             .pid_guard
             .lock()
-            .map_err(|_| "测速临时核进程登记不可用")?
-            .take();
+            .map_err(|_| "测速临时核进程登记不可用")?;
+        let validated = match (&birth.native, evidence) {
+            (Some(native), PcTempRetirement::Close(fact)) => {
+                Some(native.validate_exit(fact, &self.identity, &birth.identity)?)
+            }
+            (Some(native), PcTempRetirement::NoChild) => {
+                native.validate_no_child(&self.identity, &birth.identity)?;
+                None
+            }
+            (None, PcTempRetirement::Close(_)) => None,
+            (None, PcTempRetirement::NoChild) => {
+                return Err("测速临时核没有 native factory 返回事实".into());
+            }
+        };
+        // Every fallible lock/validation and sealed-reference clone precedes this commit.
+        // File cleanup retains its ordinary best-effort diagnostic policy, outside native scope.
+        retire_temp_config(&birth.config_path, birth.keep_config);
+        pid_guard.pid_guard.take();
         current.take();
+        if let Some(validated) = validated {
+            pid_guard.native_terminal = Some(validated.retire());
+        } else if let Some(native) = &birth.native {
+            native.retire_no_child();
+        }
         birth.retired.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -932,10 +1023,56 @@ struct PcCustodiedChild {
 }
 
 #[cfg(not(target_os = "android"))]
+impl PcCustodiedChild {
+    async fn dispatch_native(
+        self,
+        spawner: &dyn LoginCoreSpawner,
+        req: SpawnRequest,
+        prepared: PreparedTempNativeBirth,
+    ) -> Result<Self, SpawnError> {
+        let bin = req.binary.clone();
+        // This is the original birth's exclusive physical Child lock, held before dispatch.
+        let mut owned = self.birth.child.lock().await;
+        match spawner
+            .spawn_with_temp_native_birth(req, Some(prepared))
+            .await
+        {
+            Ok(child) => {
+                // Returned physical custody is published before any metadata/signals/await.
+                *owned = Some(child);
+                let pid = owned.as_ref().and_then(|child| child.pid());
+                let _ = self.birth.pid.set(pid);
+                self.birth
+                    .pid_guard
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pid_guard = TempCorePidGuard::register(pid.unwrap_or(0));
+                if self.custody.closing.load(Ordering::SeqCst) {
+                    self.birth.close_requested.send_replace(true);
+                }
+                drop(owned);
+                Ok(self)
+            }
+            Err(error) => {
+                // Generic dyn Err, observer Drop and Drain panic have no narrow native return.
+                // They leave this same pending slot/config occupied and block the next batch.
+                if let Err(detail) = self.custody.retire(&self.birth, PcTempRetirement::NoChild) {
+                    return Err(SpawnError::Spawn {
+                        bin,
+                        source: std::io::Error::other(TempCoreCleanupUnknown(detail)),
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 #[async_trait::async_trait]
 impl LoginCoreChild for PcCustodiedChild {
     fn pid(&self) -> Option<u32> {
-        self.birth.pid
+        self.birth.pid.get().copied().flatten()
     }
     async fn wait(&mut self) {
         if let Err(error) = self.wait_result().await {
@@ -943,10 +1080,24 @@ impl LoginCoreChild for PcCustodiedChild {
         }
     }
     async fn wait_result(&mut self) -> Result<(), String> {
-        self.birth.child.lock().await.wait_result().await
+        self.birth
+            .child
+            .lock()
+            .await
+            .as_mut()
+            .ok_or("测速临时核 native Child 尚未返回")?
+            .wait_result()
+            .await
     }
     async fn after_exit(&mut self) -> Result<(), String> {
-        self.birth.child.lock().await.after_exit().await
+        self.birth
+            .child
+            .lock()
+            .await
+            .as_mut()
+            .ok_or("测速临时核 native Child 尚未返回")?
+            .after_exit()
+            .await
     }
     async fn terminate(&mut self) {
         if let Err(error) = self.close_confirmed().await {
@@ -958,8 +1109,12 @@ impl LoginCoreChild for PcCustodiedChild {
         if self.birth.retired.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let child = child
+            .as_mut()
+            .ok_or("测速临时核 native factory 责任尚未确认")?;
         child.close_confirmed().await?;
-        self.custody.retire(&self.birth)
+        self.custody
+            .retire(&self.birth, PcTempRetirement::Close(child.native_exit()))
     }
 }
 
@@ -2677,9 +2832,40 @@ impl TempCoreSession {
         if deps.pc_custody.closing.load(Ordering::SeqCst) {
             return BatchOutcome::CleanupUnknown("应用退出中，测速临时核禁止重新启动".into());
         }
-        let child = match deps.spawner.spawn(req).await {
+        #[cfg(not(target_os = "android"))]
+        let prepared = deps.spawner.prepare_temp_native_birth();
+        #[cfg(not(target_os = "android"))]
+        let native_bound = prepared.is_some();
+        #[cfg(not(target_os = "android"))]
+        let spawned = match prepared {
+            Some(prepared) => {
+                let booked =
+                    match deps
+                        .pc_custody
+                        .book_native(&prepared, config_path.clone(), keep_config)
+                    {
+                        Ok(booked) => booked,
+                        Err(detail) => return BatchOutcome::CleanupUnknown(detail),
+                    };
+                // The original slot takes config responsibility before any factory await/effect.
+                config_guard.armed = false;
+                booked
+                    .dispatch_native(deps.spawner.as_ref(), req, prepared)
+                    .await
+                    .map(|child| Box::new(child) as Box<dyn LoginCoreChild>)
+            }
+            None => deps.spawner.spawn(req).await,
+        };
+        #[cfg(target_os = "android")]
+        let spawned = deps.spawner.spawn(req).await;
+        let child = match spawned {
             Ok(c) => c,
             Err(e) => {
+                #[cfg(not(target_os = "android"))]
+                if !native_bound {
+                    retire_temp_config(&config_path, keep_config);
+                }
+                #[cfg(target_os = "android")]
                 retire_temp_config(&config_path, keep_config);
                 if let Some(detail) = spawn_cleanup_unknown(&e) {
                     return BatchOutcome::CleanupUnknown(detail);
@@ -2697,7 +2883,9 @@ impl TempCoreSession {
         };
 
         #[cfg(not(target_os = "android"))]
-        let child: Box<dyn LoginCoreChild> = {
+        let child: Box<dyn LoginCoreChild> = if native_bound {
+            child
+        } else {
             // No await between returned Child and custody publication.
             let retained = deps
                 .pc_custody

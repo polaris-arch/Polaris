@@ -23,7 +23,7 @@ fn next_instance_id() -> Result<String, String> {
         .as_ref()
         .map_err(Clone::clone)?;
     let seq = NEXT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
             seq.checked_add(1)
         })
         .map_err(|_| "Android 测速实例序号已耗尽".to_owned())?;

@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""Test pure final admission, or explicitly test a real historical framework."""
+import argparse
+import copy
+from contextlib import ExitStack, redirect_stdout
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import sys
+import tempfile
+from types import SimpleNamespace
+from unittest import mock
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location('ios_libbox', Path(__file__).with_name('ios-libbox.py'))
+builder = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(builder)
+spec = importlib.util.spec_from_file_location('ios_archive', Path(__file__).with_name('verify-ios-archive.py'))
+archive_checker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(archive_checker)
+archive_checker.libbox = builder
+
+
+def rejected(action, expected):
+    try:
+        action()
+    except (RuntimeError, KeyError, ValueError) as error:
+        if expected not in str(error):
+            raise AssertionError(f'Wrong rejection: {error}; expected {expected}') from error
+    else:
+        raise AssertionError(f'Counterexample was accepted: {expected}')
+
+
+def monitor_source_wiring(project, declaration):
+    """Resolve file -> build file -> target Sources, plus the generated folder source."""
+    project = re.sub(r'/\*.*?\*/', '', project, flags=re.S)
+    entries = re.findall(r'^\t\t([0-9A-F]{24})\s*=\s*\{(.*?)\};(?=\n)', project, re.M | re.S)
+    objects = dict(entries)
+    builder.require(len(objects) == len(entries), 'monitor source wiring duplicate object')
+
+    def of_type(kind):
+        return {key: body for key, body in objects.items() if re.search(r'\bisa\s*=\s*' + kind + ';', body)}
+
+    def field(body, name):
+        found = re.search(r'\b' + name + r'\s*=\s*([^;]+);', body)
+        return found.group(1).strip() if found else None
+
+    def members(body, name):
+        found = re.search(r'\b' + name + r'\s*=\s*\((.*?)\);', body, re.S)
+        return re.findall(r'\b[0-9A-F]{24}\b', found.group(1)) if found else []
+
+    refs = {key: body for key, body in of_type('PBXFileReference').items()
+            if field(body, 'path') == 'TunnelMonitorSession.swift'}
+    builder.require(len(refs) == 1, 'monitor source wiring file reference')
+    reference, body = next(iter(refs.items()))
+    builder.require(field(body, 'lastKnownFileType') == 'sourcecode.swift'
+                    and field(body, 'sourceTree') == '"<group>"', 'monitor source wiring Swift file type')
+    builds = [key for key, body in of_type('PBXBuildFile').items() if field(body, 'fileRef') == reference]
+    builder.require(len(builds) == 1, 'monitor source wiring build reference')
+    groups = [body for body in of_type('PBXGroup').values() if field(body, 'path') == 'PacketTunnel']
+    builder.require(len(groups) == 1 and members(groups[0], 'children').count(reference) == 1,
+                    'monitor source wiring folder membership')
+    targets = [body for body in of_type('PBXNativeTarget').values() if field(body, 'name') == 'polaris_PacketTunnel']
+    builder.require(len(targets) == 1, 'monitor source wiring target')
+    sources = [objects[key] for key in members(targets[0], 'buildPhases')
+               if key in of_type('PBXSourcesBuildPhase')]
+    builder.require(len(sources) == 1 and members(sources[0], 'files').count(builds[0]) == 1,
+                    'monitor source wiring target Sources membership')
+    target = re.search(r'^  polaris_PacketTunnel:\n(.*?)(?=^  \S|\Z)', declaration, re.M | re.S)
+    builder.require(target is not None, 'monitor source wiring generated target')
+    sources = re.search(r'^    sources:\n(.*?)(?=^    \S|\Z)', target.group(1), re.M | re.S)
+    builder.require(sources is not None and re.search(r'^      - path: PacketTunnel\s*$', sources.group(1), re.M)
+                    and 'TunnelMonitorSession.swift' not in sources.group(1), 'monitor source wiring generated folder source')
+
+
+def component_source_wiring(project, declaration):
+    """Trace the fixed Framework reference and verifier through the actual target."""
+    clean = re.sub(r'/\*.*?\*/', '', project, flags=re.S)
+    entries = re.findall(r'^\t\t([0-9A-F]{24})\s*=\s*\{(.*?)\};(?=\n)', clean, re.M | re.S)
+    objects = dict(entries)
+    builder.require(len(objects) == len(entries), 'component source wiring duplicate object')
+    def field(body, name):
+        value = re.search(r'\b' + name + r'\s*=\s*([^;]+);', body)
+        return value[1].strip() if value else None
+    def members(body, name):
+        value = re.search(r'\b' + name + r'\s*=\s*\((.*?)\);', body, re.S)
+        return re.findall(r'\b[0-9A-F]{24}\b', value[1]) if value else []
+    def kind(name):
+        return {key: body for key, body in objects.items() if field(body, 'isa') == name}
+    refs = {key: body for key, body in kind('PBXFileReference').items() if field(body, 'name') == 'Libbox.xcframework'}
+    builder.require(len(refs) == 1, 'component source wiring reference')
+    reference, body = next(iter(refs.items()))
+    builder.require(field(body, 'path') == '"$(POLARIS_LIBBOX_GENERATION_ROOT)/Libbox.xcframework"'
+                    and field(body, 'sourceTree') == '"<absolute>"', 'component source wiring fixed path')
+    builds = [key for key, body in kind('PBXBuildFile').items() if field(body, 'fileRef') == reference]
+    targets = [body for body in kind('PBXNativeTarget').values() if field(body, 'name') == 'polaris_PacketTunnel']
+    builder.require(len(builds) == 1 and len(targets) == 1, 'component source wiring target/build reference')
+    phases = members(targets[0], 'buildPhases')
+    linked = [key for key in phases if key in kind('PBXFrameworksBuildPhase') and builds[0] in members(objects[key], 'files')]
+    verified = [key for key in phases if key in kind('PBXShellScriptBuildPhase') and field(objects[key], 'name') == '"Verify iOS Core"']
+    builder.require(len(linked) == len(verified) == 1 and phases.index(verified[0]) < phases.index(linked[0]),
+                    'component source wiring verifier/link phase')
+    hook = json.loads(field(objects[verified[0]], 'shellScript'))
+    target = re.search(r'^  polaris_PacketTunnel:\n(.*?)(?=^  \S|\Z)', declaration, re.M | re.S)
+    builder.require(target is not None and re.search(r'^      - framework: \$\(POLARIS_LIBBOX_GENERATION_ROOT\)/Libbox\.xcframework\n        embed: false$', target[1], re.M),
+                    'component source wiring generated fixed dependency')
+    script = re.search(r'^        script: \|\n(.*?)(?=^        \S|\Z)', target[1], re.M | re.S)
+    builder.require(script is not None and hook == ''.join(line[10:] + '\n' for line in script[1].splitlines()),
+                    'component source wiring hooks differ')
+    builder.require('scripts/ios-libbox.py" verify --component-for-link' in hook
+                    and all(token not in hook for token in ('--historical', '.libbox-current', 'Frameworks/Libbox')),
+                    'component source wiring verifier scope')
+    for flag, setting in [('generation-root', 'GENERATION_ROOT'), ('output-fingerprint', 'OUTPUT_FINGERPRINT'),
+                          ('receipt-sha256', 'RECEIPT_SHA256'), ('build-policy', 'BUILD_POLICY'),
+                          ('build-policy-sha256', 'BUILD_POLICY_SHA256'), ('tools', 'TOOLS'), ('tools-sha256', 'TOOLS_SHA256')]:
+        builder.require('--' + flag + ' "${POLARIS_LIBBOX_' + setting + ':?' in hook,
+                        'component source wiring approved argument: ' + flag)
+    configs = objects[field(targets[0], 'buildConfigurationList')]
+    configurations = members(configs, 'buildConfigurations')
+    builder.require(len(configurations) == 2, 'component source wiring configurations')
+    for key in configurations:
+        builder.require('"$(POLARIS_LIBBOX_GENERATION_ROOT)"' in objects[key]
+                        and '"\\\"Frameworks\\\""' not in objects[key], 'component source wiring fixed search path')
+
+
+def preflight_tests():
+    """No Mac, source checkout, Framework or IPA is needed for these tests."""
+    count = 0
+    missing = Path('/nonexistent/polaris-ios-preflight-artifact')
+
+    # C1 uses real adapter bytes for both fresh and cached inspection. The
+    # deliberately synthetic graph/contracts never become a checked-in policy.
+    spec = importlib.util.spec_from_file_location('apple_carrier_fixtures', Path(__file__).with_name('apple-carrier.test.py'))
+    fixtures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixtures)
+    fixture = fixtures.fixture()
+    target = 'ios-arm64'
+    carrier_bytes = fixture['archives'][target]
+    with mock.patch.object(builder, 'final_preflight', return_value=(fixture['source'], fixture['core'], {})), \
+            mock.patch.object(builder, 'run', side_effect=AssertionError('Carrier inspection executed a tool')):
+        with tempfile.TemporaryDirectory(prefix='polaris-ios-carrier-cache-test-') as temp:
+            cached = Path(temp) / 'carrier.a'
+            cached.write_bytes(carrier_bytes)
+            produced = builder.inspect_source_carrier(carrier_bytes, [target], fixture['receipt'],
+                                                       fixture['policy'], fixture['tools'])
+            consumed = builder.inspect_source_carrier(cached, [target], fixture['receipt'],
+                                                       fixture['policy'], fixture['tools'])
+            assert produced == consumed and produced['evidenceScope'] == 'carrier-inspection-only'
+            count += 1
+            cached.write_bytes(carrier_bytes.replace(fixture['id'].encode(), b'0' * len(fixture['id']), 1))
+            for binary in (cached, cached.read_bytes()):
+                rejected(lambda: builder.inspect_source_carrier(binary, [target], fixture['receipt'],
+                                                                 fixture['policy'], fixture['tools']), 'source BuildID differs')
+                count += 1
+            rejected(lambda: builder.inspect_source_carrier(carrier_bytes, [target], fixture['receipt'], None),
+                     'complete observed carrier contract required (C2 pending)')
+            count += 1
+
+    def no_side_effects(actions, expected):
+        nonlocal count
+        with ExitStack() as stack:
+            for owner, name in [(builder, 'run'), (builder, 'source_check'),
+                                (builder, 'framework_evidence'), (builder.platform, 'system'),
+                                (builder.platform, 'machine'), (builder.shutil, 'which'),
+                                (builder.shutil, 'copyfile'), (builder.tempfile, 'TemporaryDirectory'),
+                                (Path, 'mkdir'), (Path, 'write_text'), (Path, 'write_bytes'),
+                                (archive_checker.zipfile, 'ZipFile')]:
+                stack.enter_context(mock.patch.object(owner, name,
+                    side_effect=AssertionError('Final admission reached ' + name)))
+            read_text, read_bytes = Path.read_text, Path.read_bytes
+
+            def guarded_read(method):
+                def read(path, *args, **kwargs):
+                    if path == missing or missing in path.parents:
+                        raise AssertionError('Final admission consumed an artifact')
+                    return method(path, *args, **kwargs)
+                return read
+
+            stack.enter_context(mock.patch.object(Path, 'read_text', guarded_read(read_text)))
+            stack.enter_context(mock.patch.object(Path, 'read_bytes', guarded_read(read_bytes)))
+            for action in actions:
+                rejected(action, expected)
+                count += 1
+
+    actions = [lambda: builder.build(None), lambda: builder.verify(missing, missing, native=None),
+               builder.inputs, lambda: archive_checker.verify_archive(missing),
+               lambda: builder.main(['build']), lambda: builder.main(['verify', '--framework', str(missing), '--receipt', str(missing)]),
+               lambda: archive_checker.main([str(missing)])]
+    no_side_effects(actions, 'Apple final artifact evidence not implemented')
+    manifest, version = builder.inputs(historical=True)
+    shared, core, policy = builder.final_preflight()
+    assert len(shared['patches']) == 9 and len(shared['dependencyPatches']) == 2
+    assert policy['evidenceScope'] == 'source-inputs-only'
+    assert policy['binding']['gomobileVersion'] == 'v0.1.12' != shared['gomobileVersion']
+    with ExitStack() as stack:
+        for owner, name in [(builder, 'run'), (builder, 'source_check'), (builder, 'framework_evidence'),
+                            (builder.platform, 'system'), (builder.platform, 'machine'), (builder.shutil, 'which'),
+                            (Path, 'mkdir'), (Path, 'write_text'), (Path, 'write_bytes'),
+                            (builder.tempfile, 'TemporaryDirectory'), (archive_checker.zipfile, 'ZipFile')]:
+            stack.enter_context(mock.patch.object(owner, name, side_effect=AssertionError('Source admission reached ' + name)))
+        assert builder.final_preflight() == (shared, core, policy)
+        with redirect_stdout(io.StringIO()) as output:
+            builder.main(['check-inputs'])
+        assert 'source-inputs-only' in output.getvalue() and 'remain unverified' in output.getvalue()
+    count += 2
+    with tempfile.TemporaryDirectory(prefix='polaris-ios-preflight-test-') as temp:
+        root = Path(temp)
+        declaration = root / 'apple-source-policy.json'
+        cases = []
+        for field in builder.COMMON_FIELDS:
+            bad = copy.deepcopy(policy)
+            bad['commonSource'][field] = 'wrong'
+            cases.append((bad, 'Apple common source pins differ'))
+        for field in policy['binding']:
+            bad = copy.deepcopy(policy)
+            bad['binding'][field] = 'wrong'
+            cases.append((bad, 'binding/tags/deployment'))
+        for field, value in [('trimpath', 1), ('buildVCS', 0)]:
+            bad = copy.deepcopy(policy)
+            bad['binding'][field] = value
+            cases.append((bad, 'binding/tags/deployment'))
+        for name, target in policy['targets'].items():
+            for field in target:
+                bad = copy.deepcopy(policy)
+                bad['targets'][name][field] = 'wrong'
+                cases.append((bad, 'target policy'))
+        for field, value, expected in [('schema', 'unknown', 'policy scope'),
+                                       ('evidenceScope', 'final', 'policy scope'),
+                                       ('sourceHelperSha256', '0' * 64, 'helper hash'),
+                                       ('moduleInventory', {'patched': [], 'transport': []}, 'module inventory'),
+                                       ('unresolvedArtifactEvidence', [], 'artifact evidence requirements')]:
+            bad = copy.deepcopy(policy)
+            bad[field] = value
+            cases.append((bad, expected))
+        for field in ('constructedBoxCleanup', 'exactCleanupEnabled', 'noOwnerCleanupEnabled'):
+            bad = copy.deepcopy(policy)
+            bad['validationCleanupContract'][field] = True
+            cases.append((bad, 'cleanup contract'))
+        for field in ('exactCleanupEnabled', 'noOwnerCleanupEnabled'):
+            bad = copy.deepcopy(policy)
+            bad['validationCleanupContract'][field] = 0
+            cases.append((bad, 'cleanup contract'))
+        bad = copy.deepcopy(policy)
+        bad['carrierVerified'] = True
+        cases.append((bad, 'policy fields'))
+        with mock.patch.object(builder, 'APPLE_POLICY', declaration):
+            for bad, expected in cases:
+                declaration.write_text(json.dumps(bad))
+                no_side_effects([builder.final_preflight, *actions], expected)
+            declaration.write_text(json.dumps(policy))
+            assert builder.final_preflight() == (shared, core, policy)
+            no_side_effects(actions, 'Apple final artifact evidence not implemented')
+        # A valid source policy never substitutes for the frozen common bytes.
+        common = root / 'common'
+        shutil.copytree(builder.SHARED_MANIFEST.parent, common)
+        shared_path = common / 'source-manifest.json'
+        with mock.patch.object(builder, 'SHARED_MANIFEST', shared_path):
+            for field, value in [('patches', shared['patches'][:-1]),
+                                 ('patches', list(reversed(shared['patches']))),
+                                 ('dependencyPatches', []), ('sourceCommit', '0' * 40)]:
+                changed = copy.deepcopy(shared)
+                changed[field] = value
+                shared_path.write_text(json.dumps(changed))
+                no_side_effects([builder.final_preflight, *actions], 'shared manifest/provider hash differs')
+            shared_path.write_bytes(builder.ROOT.joinpath('scripts/libbox-patches/source-manifest.json').read_bytes())
+            patch = common / 'default-monitor-isolation.patch'
+            patch.write_bytes(patch.read_bytes() + b'\n')
+            no_side_effects([builder.final_preflight, *actions], 'ordered common patch hash differs')
+        # The production preparation entry calls the real shared-provider API.
+        # Stub execution proves dispatch/arguments and receipt checks, never real source replay.
+        helper = builder.source_helpers()
+        receipt = {'schema': 'polaris-core-source-v1', 'sourceGraphState': 'dependencies-patched',
+                   'graphScope': 'declared-patched-modules', 'moduleGraphQueries': sorted(core['sourceBuild']['dependencyModules']),
+                   'sourceCommit': shared['sourceCommit'], 'sourceURL': 'https://github.com/SagerNet/sing-box',
+                   'upstreamTree': '1' * 40, 'patches': shared['patches'],
+                   'dependencies': [{**dep, 'upstreamTree': '1' * 40, 'replacement': './polaris-dependencies/' + dep['name']}
+                                    for dep in shared['dependencyPatches']],
+                   'moduleGraph': [{'Path': dep['module'], 'Version': dep['upstreamVersion'],
+                                    'Replace': {'Path': './polaris-dependencies/' + dep['name']}}
+                                   for dep in shared['dependencyPatches']]}
+        for field in ('sourceManifestSha256', 'provisionerSha256', 'patchedSourceTree', 'buildTree', 'mainGoModSha256', 'mainGoSumSha256'):
+            receipt[field] = core['sourceBuild'][field]
+        receipt['moduleGraphSha256'] = helper.digest(helper.canonical(receipt['moduleGraph']))
+        receipt['fingerprint'] = helper.digest(helper.canonical(receipt))
+        synthetic_core = copy.deepcopy(core)
+        for field in ('sourceReceiptFingerprint', 'moduleGraphSha256'):
+            synthetic_core['sourceBuild'][field] = receipt['fingerprint' if field == 'sourceReceiptFingerprint' else field]
+        helper.validate_source_receipt(receipt, shared, synthetic_core)
+        repositories, arguments = {}, []
+        for dep in shared['dependencyPatches']:
+            repo = root / ('objects-' + dep['name'])
+            (repo / '.git').mkdir(parents=True)
+            repositories[dep['module']] = repo.resolve()
+            arguments.append(dep['module'] + '=' + str(repo))
+        go = root / 'fixture-go-never-executed'
+        go.write_bytes(b'fixture only')
+        source_repo, checkout = root / 'source-objects', root / 'fresh-checkout'
+        provider = SimpleNamespace(provision=mock.Mock(return_value=receipt))
+        verify_checkout = mock.Mock()
+        reused = SimpleNamespace(module_sources=helper.module_sources, provider=lambda: provider,
+                                 validate_source_receipt=helper.validate_source_receipt, verify_checkout=verify_checkout)
+        with mock.patch.object(builder, 'source_helpers', return_value=reused), \
+                mock.patch.object(builder, 'final_preflight', return_value=(shared, synthetic_core, policy)), \
+                mock.patch.object(builder, 'run', side_effect=AssertionError('Fixture executed a tool')):
+            produced = builder.provision_source(source_repo, checkout, arguments, go)
+            assert produced == receipt
+            provider.provision.assert_called_once_with(builder.SHARED_MANIFEST, source_repo, checkout, repositories, go)
+            verify_checkout.assert_called_once_with(checkout, receipt, provider)
+            count += 1
+            for bad_map in [[], arguments[:-1], arguments + arguments[:1], ['foreign/module=' + str(source_repo)]]:
+                before = provider.provision.call_count
+                rejected(lambda: builder.provision_source(source_repo, checkout, bad_map, go), 'module')
+                assert provider.provision.call_count == before
+                count += 1
+            before = provider.provision.call_count
+            rejected(lambda: builder.provision_source(source_repo, checkout, arguments, None), 'pinned Go executable')
+            assert provider.provision.call_count == before
+            count += 1
+            forged = copy.deepcopy(receipt)
+            forged['fingerprint'] = '0' * 64
+            provider.provision.return_value = forged
+            rejected(lambda: builder.provision_source(source_repo, checkout, arguments, go), 'fingerprint')
+            assert verify_checkout.call_count == 1
+            count += 1
+        patch_copy = root / 'patches'
+        shutil.copytree(builder.PATCH_DIR, patch_copy)
+        patch = patch_copy / 'construction-validation.patch'
+        patch.write_bytes(patch.read_bytes() + b'\n')
+        with mock.patch.object(builder, 'PATCH_DIR', patch_copy):
+            rejected(lambda: builder.inputs(historical=True), 'Pinned patch hash mismatch')
+            count += 1
+
+        # Unit-test producer provenance without creating or claiming a real
+        # Framework. Actual framework evidence remains the separate Mac test.
+        receipt = {key: copy.deepcopy(manifest[key]) for key in (
+            'sourceCommit', 'frozenPatchCommit', 'sharedGoCommit', 'replacementReviewCommit',
+            'patchedSourceTree', 'patches', 'buildTags', 'nonMacOSTags', 'validationCleanupContract',
+            'unresolvedRuntimeEvidence', 'bindTarget', 'iosMinimumVersion')}
+        receipt.update(schemaVersion=1, evidenceScope='build-only', officialTag=f'v{version}',
+                       sourceManifestSha256=builder.digest(builder.MANIFEST.read_bytes()),
+                       buildScriptSha256=builder.HISTORICAL_SCRIPT_SHA256,
+                       buildEntrySha256=builder.HISTORICAL_ENTRY_SHA256,
+                       linkerFlags=builder.LINKER_FLAGS.format(version=version),
+                       sourceTests=[{'passed': True} for _ in range(5)], framework={})
+        receipt['toolchain'] = {key: manifest[key] for key in (
+            'goVersion', 'xcodeVersion', 'xcodeBuild', 'iosSDKVersion', 'simulatorSDKVersion')}
+        for name in ('gomobile', 'gobind'):
+            receipt['toolchain'][name] = dict(version=manifest['gomobileVersion'], sha256='1' * 64,
+                buildInfo=f'github.com/sagernet/gomobile\t{manifest["gomobileVersion"]}\t')
+        receipt_path = root / 'receipt.json'
+        with mock.patch.object(builder, 'framework_evidence', return_value={}):
+            receipt_path.write_text(json.dumps(receipt))
+            before = receipt_path.read_bytes()
+            assert builder.verify(missing, receipt_path, historical=True) == receipt
+            assert receipt_path.read_bytes() == before
+            count += 1
+            for key in ('buildScriptSha256', 'buildEntrySha256'):
+                bad = copy.deepcopy(receipt)
+                bad[key] = '0' * 64
+                receipt_path.write_text(json.dumps(bad))
+                rejected(lambda: builder.verify(missing, receipt_path, historical=True), key)
+                count += 1
+            new = copy.deepcopy(receipt)
+            new['evidenceScope'] = 'historical-only'
+            new['buildScriptSha256'] = builder.digest(builder.SCRIPT.read_bytes())
+            new['buildEntrySha256'] = builder.digest((builder.ROOT / 'scripts/build-libbox-ios.sh').read_bytes())
+            receipt_path.write_text(json.dumps(new))
+            assert builder.verify(missing, receipt_path, historical=True) == new
+            count += 1
+            new['evidenceScope'] = 'build-only'
+            receipt_path.write_text(json.dumps(new))
+            rejected(lambda: builder.verify(missing, receipt_path, historical=True), 'buildScriptSha256')
+            count += 1
+            new['evidenceScope'] = 'final'
+            receipt_path.write_text(json.dumps(new))
+            rejected(lambda: builder.verify(missing, receipt_path, historical=True), 'evidence scope')
+            count += 1
+
+    # Both checked-in hooks explicitly verify the component prerequisite. The
+    # unqualified final artifact gate remains closed and is tested above.
+    for file in ('src-tauri/gen/apple/project.yml', 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj'):
+        hook = (builder.ROOT / file).read_text()
+        assert 'scripts/ios-libbox.py' in hook and ' verify' in hook and '--historical' not in hook
+        count += 1
+
+    project = (builder.ROOT / 'src-tauri/gen/apple/polaris.xcodeproj/project.pbxproj').read_text()
+    declaration = (builder.ROOT / 'src-tauri/gen/apple/project.yml').read_text()
+    monitor_source_wiring(project, declaration)
+    count += 1
+    component_source_wiring(project, declaration)
+    count += 1
+    for old, new in [('path = "$(POLARIS_LIBBOX_GENERATION_ROOT)/Libbox.xcframework"', 'path = Frameworks/Libbox.xcframework'),
+                     ('sourceTree = "<absolute>"', 'sourceTree = "<group>"'),
+                     ('--component-for-link', ''), ('--receipt-sha256', '--ignored-receipt'),
+                     ('"$(POLARIS_LIBBOX_GENERATION_ROOT)"', '"\\\"Frameworks\\\""')]:
+        rejected(lambda: component_source_wiring(project.replace(old, new), declaration), 'component source wiring')
+        count += 1
+    rejected(lambda: component_source_wiring(project, declaration.replace('framework: $(POLARIS_LIBBOX_GENERATION_ROOT)/Libbox.xcframework',
+                                                                         'framework: Frameworks/Libbox.xcframework')), 'component source wiring')
+    count += 1
+    # Counterexamples disconnect each of the four required source relationships.
+    for marker in ('PBXBuildFile;', 'PBXFileReference;', '/* TunnelMonitorSession.swift */,',
+                   '/* TunnelMonitorSession.swift in Sources */,'):
+        line = next(line for line in project.splitlines(keepends=True)
+                    if 'TunnelMonitorSession.swift' in line and marker in line)
+        rejected(lambda: monitor_source_wiring(project.replace(line, '', 1), declaration), 'monitor source wiring')
+        count += 1
+    rejected(lambda: monitor_source_wiring(project, declaration.replace('- path: PacketTunnel', '- path: MissingFolder')),
+             'monitor source wiring')
+    count += 1
+
+    # In-memory layout fixture tests the historical checker and its evidence
+    # label; no IPA, signing, core linkage or device acceptance is produced.
+    app_path = 'Payload/Polaris.app/'
+    extension_path = app_path + 'PlugIns/PacketTunnel.appex/'
+    app = dict(CFBundleIdentifier='com.example.polaris', PolarisAppGroup='group.com.example.polaris',
+               UIDeviceFamily=[1, 2], CFBundleSupportedPlatforms=['iPhoneOS'], MinimumOSVersion='17.0',
+               CFBundleExecutable='Polaris')
+    extension = dict(app, CFBundleIdentifier=app['CFBundleIdentifier'] + '.PacketTunnel',
+                     CFBundleExecutable='PacketTunnel',
+                     NSExtension=dict(NSExtensionPointIdentifier='com.apple.networkextension.packet-tunnel'))
+    files = {app_path + 'Info.plist': plistlib.dumps(app), extension_path + 'Info.plist': plistlib.dumps(extension),
+             app_path + 'Polaris': b'\xcf\xfa\xed\xfe\x0c\x00\x00\x01',
+             extension_path + 'PacketTunnel': b'\xcf\xfa\xed\xfe\x0c\x00\x00\x01'}
+    files.update({app_path + p.name: b'' for p in (builder.ROOT / 'resources/data').glob('*.srs')})
+    fake_archive = mock.MagicMock()
+    fake_archive.__enter__.return_value = fake_archive
+    fake_archive.namelist.return_value = list(files)
+    fake_archive.read.side_effect = files.__getitem__
+    fake_archive.open.side_effect = lambda name: io.BytesIO(files[name])
+    with mock.patch.object(archive_checker.zipfile, 'ZipFile', return_value=fake_archive), redirect_stdout(io.StringIO()) as output:
+        archive_checker.verify_archive(missing, historical=True)
+    assert 'Historical structure-only' in output.getvalue() and 'final source/linkage' in output.getvalue()
+    count += 1
+    # Only the explicit observer action dispatches C2; normal admission never probes tools.
+    with mock.patch.object(builder, 'observe_source', return_value={
+            'evidenceScope': 'C2-source-observations-only', 'status': 'mock-only', 'C3Required': ['actual source carrier']}) as observed, \
+            mock.patch.object(builder.subprocess, 'run', side_effect=AssertionError('unexpected tool')), redirect_stdout(io.StringIO()) as output:
+        builder.main(['observe-source', '/prepared', '--source-receipt', '/receipt', '--go', '/go',
+                      '--mobile-bin', '/mobile', '--developer-dir', '/developer', '--evidence-dir', '/evidence'])
+        assert observed.call_count == 1 and json.loads(output.getvalue())['carrierAdmission'] is False
+    count += 1
+    with mock.patch.object(builder, 'observe_source', side_effect=AssertionError('observer reached')), \
+            mock.patch.object(builder.subprocess, 'run', side_effect=AssertionError('unexpected tool')), redirect_stdout(io.StringIO()) as output:
+        builder.main(['check-inputs'])
+        assert 'source-inputs-only' in output.getvalue()
+    count += 1
+    with mock.patch.object(builder, 'observe_component', return_value={
+            'evidenceScope': 'C3-source-compiler-observations-only', 'status': 'mock-only', 'pending': ['actual contract']}) as observed, \
+            mock.patch.object(builder.subprocess, 'run', side_effect=AssertionError('unexpected tool')), redirect_stdout(io.StringIO()) as output:
+        builder.main(['observe-component', '/prepared', '--source-receipt', '/receipt', '--go', '/go',
+                      '--mobile-bin', '/mobile', '--developer-dir', '/developer', '--evidence-dir', '/evidence'])
+        assert observed.call_count == 1 and json.loads(output.getvalue())['carrierAdmission'] is False
+    count += 1
+    with mock.patch.object(builder, 'observe_component', side_effect=AssertionError('component observer reached')), \
+            mock.patch.object(builder.subprocess, 'run', side_effect=AssertionError('unexpected tool')):
+        rejected(lambda: builder.main(['build']), 'artifact evidence not implemented')
+        rejected(lambda: builder.main(['verify']), 'artifact evidence not implemented')
+    count += 2
+    print(f'{count} source-admission/producer/structure unit cases passed; no Framework or App built.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--framework', type=Path, default=builder.OUTPUT / 'Libbox.xcframework')
+    parser.add_argument('--receipt', type=Path, default=builder.RECEIPT)
+    parser.add_argument('--source', type=Path)
+    parser.add_argument('--historical', action='store_true', help='Explicitly test the real frozen six-patch framework')
+    parser.add_argument('--preflight-only', action='store_true', help='Run pure admission and mocked provenance tests')
+    args = parser.parse_args()
+    if args.preflight_only:
+        preflight_tests()
+        return
+    manifest, version = builder.inputs(historical=args.historical)
+    source = args.source or Path.home() / f'Code/sing-box-ios-v{version}'
+    builder.source_check(source, manifest, version)
+    original = builder.verify(args.framework.resolve(), args.receipt.resolve(), historical=args.historical)
+    count = 0
+    with tempfile.TemporaryDirectory(prefix='polaris-ios-receipt-test-', dir=Path.home() / 'Code') as temp:
+        root = Path(temp)
+        receipt = root / 'receipt.json'
+        cases = [
+            ('sourceCommit', '0' * 40), ('patchedSourceTree', '0' * 40),
+            ('frozenPatchCommit', '0' * 40), ('sharedGoCommit', '0' * 40),
+            ('replacementReviewCommit', '0' * 40),
+            ('officialTag', 'v0.0.0'), ('sourceManifestSha256', '0' * 64),
+            ('buildScriptSha256', '0' * 64), ('buildEntrySha256', '0' * 64),
+            ('patches', original['patches'][:-1]), ('buildTags', original['buildTags'][:-1]),
+            ('nonMacOSTags', []), ('bindTarget', 'ios,macos'),
+            ('iosMinimumVersion', '17.0'), ('unresolvedRuntimeEvidence', []),
+            ('linkerFlags', '-X github.com/sagernet/sing-box/constant.Version=0.0.0')]
+        for key, value in cases:
+            bad = copy.deepcopy(original)
+            bad[key] = value
+            receipt.write_text(json.dumps(bad))
+            rejected(lambda: builder.verify(args.framework, receipt, historical=True), key)
+            count += 1
+        for cleanup in ['DisposedExact', 'NoOwner']:
+            bad = copy.deepcopy(original)
+            bad['validationCleanupContract']['constructedBoxCleanup'] = cleanup
+            receipt.write_text(json.dumps(bad))
+            rejected(lambda: builder.verify(args.framework, receipt, historical=True), 'validationCleanupContract')
+            count += 1
+        for key in ['goVersion', 'xcodeBuild', 'iosSDKVersion', 'simulatorSDKVersion']:
+            bad = copy.deepcopy(original)
+            bad['toolchain'][key] = 'incorrect'
+            receipt.write_text(json.dumps(bad))
+            rejected(lambda: builder.verify(args.framework, receipt, historical=True), 'mismatch')
+            count += 1
+        bad = copy.deepcopy(original)
+        bad['toolchain']['gomobile']['version'] = 'v0.1.13'
+        receipt.write_text(json.dumps(bad))
+        rejected(lambda: builder.verify(args.framework, receipt, historical=True), 'gomobile toolchain mismatch')
+        count += 1
+        bad = copy.deepcopy(original)
+        bad['sourceTests'][0]['passed'] = False
+        receipt.write_text(json.dumps(bad))
+        rejected(lambda: builder.verify(args.framework, receipt, historical=True), 'test groups did not pass')
+        count += 1
+        bad = copy.deepcopy(manifest)
+        bad['sourceCommit'] = '0' * 40
+        rejected(lambda: builder.source_check(source, bad, version), 'Official source tag differs')
+        count += 1
+        # Copy only patch files to exercise hash corruption without changing
+        # repository files or the framework receipt used by the main build.
+        patch_copy = root / 'patches'
+        shutil.copytree(builder.PATCH_DIR, patch_copy)
+        patch = patch_copy / 'construction-validation.patch'
+        patch.write_bytes(patch.read_bytes() + b'\n')
+        saved_dir = builder.PATCH_DIR
+        builder.PATCH_DIR = patch_copy
+        try:
+            rejected(lambda: builder.inputs(historical=True), 'Pinned patch hash mismatch')
+            count += 1
+        finally:
+            builder.PATCH_DIR = saved_dir
+        # Hard link a private copy of the real artifact. Break the specific link
+        # before modifying its bytes, so the build artifact stays untouched.
+        framework = root / 'Libbox.xcframework'
+        shutil.copytree(args.framework, framework, symlinks=True, copy_function=os.link)
+        info_path = framework / 'Info.plist'
+        info = plistlib.loads(info_path.read_bytes())
+        info['AvailableLibraries'][0]['SupportedPlatform'] = 'android'
+        info_path.unlink()
+        info_path.write_bytes(plistlib.dumps(info))
+        rejected(lambda: builder.verify(framework, args.receipt, historical=True), 'Non-iOS platform')
+        count += 1
+        info_path.write_bytes((args.framework / 'Info.plist').read_bytes())
+        header = next(framework.glob('ios-arm64/Libbox.framework/Versions/A/Headers/Libbox.objc.h'))
+        text = header.read_text().replace('LibboxNewStrictCommandServer(', 'UntrustedFactory(')
+        header.unlink()
+        header.write_text(text)
+        rejected(lambda: builder.verify(framework, args.receipt, historical=True), 'Patched Objective-C API missing')
+        count += 1
+    print(f'Positive historical-only real framework receipt and {count} rejection counterexamples passed.')
+
+
+if __name__ == '__main__':
+    main()

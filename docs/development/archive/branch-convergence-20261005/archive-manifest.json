@@ -1,0 +1,117 @@
+{
+  "schema": "polaris-branch-source-archive-v1",
+  "date": "2026-10-05",
+  "source_main": "0713990a2cda8cbf476709adabbdefe7e2171034",
+  "entries": [
+    {
+      "source_branch": "c4-mac-masque-ci-20260929",
+      "source_sha": "a0e5eebced9dc4e9f555f028518cc1484f892616",
+      "source_path": ".github/c4-mac-masque/ci_bundle.py",
+      "source_blob": "be9c060dbce4da518cdec3110035c9e769759f17",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/c4-mac-masque-ci-20260929/.github/c4-mac-masque/ci_bundle.py",
+      "sha256": "aecc583db4c83a0b1642b68b2a41cd90ada18fa53ea742f169d00d441cd131de",
+      "bytes": 24080,
+      "status": "historical_source_archive",
+      "active_ci": false
+    },
+    {
+      "source_branch": "c4-mac-masque-ci-20260929",
+      "source_sha": "a0e5eebced9dc4e9f555f028518cc1484f892616",
+      "source_path": ".github/c4-mac-masque/polaris_socket_state_darwin_cgo.go",
+      "source_blob": "a5ed38a594540bac0c14501d36650286452be1c0",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/c4-mac-masque-ci-20260929/.github/c4-mac-masque/polaris_socket_state_darwin_cgo.go",
+      "sha256": "b915d7d8562133bd05ea00642d73facaad9c732d248748fab8c2d8b6d7a1e5fa",
+      "bytes": 1665,
+      "status": "historical_source_archive",
+      "active_ci": false
+    },
+    {
+      "source_branch": "c4-mac-masque-ci-20260929",
+      "source_sha": "a0e5eebced9dc4e9f555f028518cc1484f892616",
+      "source_path": ".github/c4-mac-masque/polaris_socket_state_stub.go",
+      "source_blob": "0fad066f3be09d083ee30ad43563e92574510ec3",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/c4-mac-masque-ci-20260929/.github/c4-mac-masque/polaris_socket_state_stub.go",
+      "sha256": "22c602865d24bed850a5eefc92788a63cf302d1d9ad2723e496019dd7e5757ea",
+      "bytes": 267,
+      "status": "historical_source_archive",
+      "active_ci": false
+    },
+    {
+      "source_branch": "c4-mac-masque-ci-20260929",
+      "source_sha": "a0e5eebced9dc4e9f555f028518cc1484f892616",
+      "source_path": ".github/c4-mac-masque/polaris_trace_darwin.go",
+      "source_blob": "1ad04e3536ecb79b5eb85c9774d3cc9edc16cdef",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/c4-mac-masque-ci-20260929/.github/c4-mac-masque/polaris_trace_darwin.go",
+      "sha256": "867850c2108e558f5086190a0b43d03bea65f015afe37803ff655c7ca2f052d8",
+      "bytes": 17262,
+      "status": "historical_source_archive",
+      "active_ci": false
+    },
+    {
+      "source_branch": "c4-mac-masque-ci-20260929",
+      "source_sha": "a0e5eebced9dc4e9f555f028518cc1484f892616",
+      "source_path": ".github/c4-mac-masque/prepare.py",
+      "source_blob": "9ac69e39023b69f1d12eca65e25792178ee0ed3e",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/c4-mac-masque-ci-20260929/.github/c4-mac-masque/prepare.py",
+      "sha256": "e31164da1174ee378ee662ed21d213fedb16e1e434b9fda6f8b69bb283393751",
+      "bytes": 33991,
+      "status": "historical_source_archive",
+      "active_ci": false
+    },
+    {
+      "source_branch": "c4-mac-masque-ci-20260929",
+      "source_sha": "a0e5eebced9dc4e9f555f028518cc1484f892616",
+      "source_path": ".github/c4-mac-masque/runner.py",
+      "source_blob": "83affd6c3f2771dc494706de1d518b881f9ccfe4",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/c4-mac-masque-ci-20260929/.github/c4-mac-masque/runner.py",
+      "sha256": "fa4c3aa2eb2f771d8784812574027a51935c67c807b3e162d386d23db9ffc49d",
+      "bytes": 47472,
+      "status": "historical_source_archive",
+      "active_ci": false
+    },
+    {
+      "source_branch": "c4-mac-masque-ci-20260929",
+      "source_sha": "a0e5eebced9dc4e9f555f028518cc1484f892616",
+      "source_path": ".github/workflows/c4-mac-masque-candidate.yml",
+      "source_blob": "40b28e848c4b32e4c55ee52959bced64bd16f6e7",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/c4-mac-masque-ci-20260929/.github/workflows/c4-mac-masque-candidate.yml",
+      "sha256": "1f61d81a907f85dd6fb94e3cbc3f230973dd18f71cea022fbf44e249f588e6f3",
+      "bytes": 4041,
+      "status": "historical_source_archive",
+      "active_ci": false
+    },
+    {
+      "source_branch": "codex/diag-windows-source-5924-20261001",
+      "source_sha": "c568183459d1427cd1b12f3787f89b857761a14a",
+      "source_path": ".github/workflows/package.yml",
+      "source_blob": "0a56dd38fc19df3b009c71e01e2b2347e6b12de3",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/windows-source-diagnostic-20261001/.github/workflows/package.yml",
+      "sha256": "a7027667d6480933fd0ffcd8902bbbe1419fc1439ea83d2989cf99dc2efb8fac",
+      "bytes": 8194,
+      "status": "historical_source_archive",
+      "active_ci": false
+    },
+    {
+      "source_branch": "g-source-native-sol61-20260930",
+      "source_sha": "9929a38f19e31ce4374acbb5940bd2985df4a8c0",
+      "source_path": "scripts/core-source-provision.test.py",
+      "source_blob": "d4621d7f7f2d4f4c4a1449c2e075409ba4f5fc52",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/g-source-native-sol61-20260930/scripts/core-source-provision.test.py",
+      "sha256": "8e831ebd92b06cbe4ccc2a8556e0aa19a57864921851d44d4c8e116a98db23b1",
+      "bytes": 5749,
+      "status": "historical_source_archive",
+      "active_ci": false
+    },
+    {
+      "source_branch": "g-source-native-sol61-20260930",
+      "source_sha": "9929a38f19e31ce4374acbb5940bd2985df4a8c0",
+      "source_path": "docs/polaris/design/linux-native-source-harness-2026-09-30.md",
+      "source_blob": "567b331d57d7d21284a487988cb35f2b15b8321b",
+      "archive_path": "docs/development/archive/branch-convergence-20261005/g-source-native-sol61-20260930/docs/polaris/design/linux-native-source-harness-2026-09-30.md",
+      "sha256": "9b8ba0c73bcc495839bd93e1221b0e1670c644334771e28b041ccc1f078d605a",
+      "bytes": 11428,
+      "status": "historical_source_archive",
+      "active_ci": false
+    }
+  ]
+}

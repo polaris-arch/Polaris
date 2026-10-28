@@ -1,3 +1,5 @@
+import com.android.build.gradle.internal.tasks.StripDebugSymbolsTask
+import org.gradle.api.tasks.PathSensitivity
 import java.util.Properties
 
 plugins {
@@ -135,6 +137,8 @@ val allowUnsignedRelease: Boolean =
 
 android {
     compileSdk = 36
+    // Use the same pinned NDK for AGP's native processing and Tauri's Rust build.
+    ndkVersion = File(project.rootDir, "../../../scripts/android-rust-ndk.version").readText().trim()
     namespace = "com.polaris2.app"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
@@ -193,6 +197,9 @@ android {
     buildFeatures {
         buildConfig = true
     }
+    packaging {
+        jniLibs.useLegacyPackaging = true
+    }
     // ── Tauri 的 `_up_` 资源树必须进 APK ────────────────────────────────────────
     // AGP 传给 aapt2 的 --ignore-assets 默认串含 `<dir>_*`（= 忽略任何以 `_` 开头的 assets 子目录）。
     // Tauri 把 `bundle.resources` 里每个 `../x` 条目铺成 `assets/_up_/x`，于是**所有以 `../` 写的资源
@@ -206,6 +213,35 @@ android {
                 "!CVS", "!thumbs.db", "!picasa.ini", "!*~",
             )
         )
+    }
+}
+
+androidComponents.onVariants(androidComponents.selector().withBuildType("release")) { variant ->
+    // AGP 8.11's producer uses --strip-unneeded and retains C++ global static symbols.
+    // MERGED_NATIVE_LIBS is read-only in this AGP API; attach to the actual strip producer,
+    // whose declared output is an independent copy consumed by APK packaging.
+    val producer = "strip${variant.name.replaceFirstChar { it.uppercaseChar() }}DebugSymbols"
+    val stripScript = File(project.rootDir, "../../../scripts/strip-android-release-native.mjs")
+    val verificationScript = File(project.rootDir, "../../../scripts/verify-apk.mjs")
+    val stripTool = androidComponents.sdkComponents.ndkDirectory.map { ndk ->
+        val host = File(ndk.asFile, "toolchains/llvm/prebuilt").listFiles()
+            ?.filter { it.isDirectory }?.singleOrNull()
+            ?: throw GradleException("Pinned Android NDK must contain one host toolchain")
+        val executable = if (System.getProperty("os.name").startsWith("Windows")) "llvm-strip.exe" else "llvm-strip"
+        File(host, "bin/$executable")
+    }
+    tasks.withType<StripDebugSymbolsTask>().configureEach {
+        if (name == producer) {
+            inputs.files(stripScript, verificationScript).withPropertyName("releaseNativeStripScripts")
+                .withPathSensitivity(PathSensitivity.RELATIVE)
+            inputs.file(stripTool).withPropertyName("releaseNativeStripTool")
+                .withPathSensitivity(PathSensitivity.NONE)
+            doLast {
+                execOperations.exec {
+                    commandLine("node", stripScript, stripTool.get(), outputDir.get().asFile)
+                }
+            }
+        }
     }
 }
 

@@ -35,6 +35,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { useDismissableLayer } from '../../back-stack';
 import { setPushedPage, usePushedPage } from '../../MobileShell';
+import { navigateMobile } from '../../navigate';
+import { ruleResourceUpdatePolicyText } from '../../settings/rule-resource-update-policy';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
 import type {
@@ -1847,6 +1849,13 @@ export function MobileRulesScreen(): ReactElement {
           onOpenSheet={setSheetResId}
           onCatalog={() => openMobileForm({ kind: 'res-catalog' })}
           onUrlDownload={() => openMobileForm({ kind: 'res-url' })}
+          autoUpdatePolicy={config ? ruleResourceUpdatePolicyText(config, tr) : tr('common.loading')}
+          onAutoUpdateSettings={() => {
+            clearWriteError('res:settings');
+            if (!navigateMobile('settings', 'update')) {
+              reportWriteError('res:settings', tr('resources.autoUpdateUnavailable'));
+            }
+          }}
         />
       )}
 

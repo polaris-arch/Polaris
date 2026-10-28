@@ -45,7 +45,7 @@ async fn logout_rejects_path_escape_without_touching_sibling_directory() {
 }
 
 #[tokio::test]
-async fn logout_removes_only_the_valid_managed_state_directory() {
+async fn explicit_node_deletion_removes_only_the_valid_managed_state_directory() {
     let root = temp_dir("logout-valid");
     let config = root.join("config");
     let mesh = MeshRuntime::new(config.clone());
@@ -53,8 +53,8 @@ async fn logout_removes_only_the_valid_managed_state_directory() {
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("tailscaled.state"), b"state").unwrap();
 
-    mesh.logout_tailscale_safely("srv-1", &|| false, None)
-        .await
+    let gate = mesh.tailscale_state_gate().await;
+    mesh.tailscale_logout_under_gate("srv-1", &gate, false)
         .unwrap();
     assert!(!state.exists());
     assert!(config.exists());
@@ -164,4 +164,193 @@ fn selected_exit_backend_state_expired_maps_to_needs_login() {
         Some("NeedsLogin"),
         "过期 key 须投影为 NeedsLogin，即便帧仍报 Running"
     );
+}
+
+fn auth_sealed() -> Vec<u8> {
+    polaris_source_probe::repo_bytes_in(
+        env!("CARGO_MANIFEST_DIR"),
+        "crates/mesh/src/tailscale_state/auth_projection/tests/synthetic-sealed-state.json",
+    )
+}
+
+fn auth_expected() -> Vec<u8> {
+    polaris_source_probe::repo_bytes_in(
+        env!("CARGO_MANIFEST_DIR"),
+        "crates/mesh/src/tailscale_state/auth_projection/tests/synthetic-sealed-state.expected.json",
+    )
+}
+
+#[tokio::test]
+async fn logout_projects_only_active_auth_and_repeat_preserves_exact_bytes() {
+    let root = temp_dir("logout-auth-only");
+    let mesh = MeshRuntime::new(root.join("config"));
+    let state = mesh.tailscale_state_dir("srv-1").unwrap();
+    std::fs::create_dir_all(state.join("taildrop")).unwrap();
+    let file = state.join("tailscaled.state");
+    std::fs::write(&file, auth_sealed()).unwrap();
+    std::fs::write(
+        state.join("taildrop/user-file"),
+        b"user-owned synthetic file",
+    )
+    .unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&auth_sealed()).unwrap();
+    mesh.logout_tailscale_safely("srv-1", &|| false, None)
+        .await
+        .unwrap();
+    assert!(state.exists());
+    let retired = std::fs::read(&file).unwrap();
+    let actual: serde_json::Value = serde_json::from_slice(&retired).unwrap();
+    assert_eq!(
+        std::fs::read(state.join("taildrop/user-file")).unwrap(),
+        b"user-owned synthetic file"
+    );
+    for key in [
+        "_machinekey",
+        "_taildrop-received",
+        "profile-b456",
+        "_serve/a123",
+        "ipn-go-bridge",
+        "unknown-user-value",
+        "_current-profile",
+    ] {
+        assert_eq!(actual[key], original[key], "preserve {key}");
+    }
+    assert!(actual.get("profile-a123").is_none());
+    assert_eq!(
+        polaris_updater::sha256_hex(&retired),
+        "28851585b59661040db39387c91e6a5a9b633ec341c6c4a6dc99f526eb370799"
+    );
+    assert_eq!(
+        polaris_mesh::tailscale_state::cached_session_exists_for_presentation(&retired),
+        Ok(false)
+    );
+    assert!(polaris_mesh::tailscale_state::cached_session_exists(&retired).is_err());
+    mesh.logout_tailscale_safely("srv-1", &|| false, None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), retired);
+}
+
+#[tokio::test]
+async fn bound_auth_projection_rejects_changed_revision_without_mutation() {
+    let root = temp_dir("logout-auth-revision");
+    let mesh = MeshRuntime::new(root.join("config"));
+    let state = mesh.tailscale_state_dir("srv-1").unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let file = state.join("tailscaled.state");
+    std::fs::write(&file, auth_sealed()).unwrap();
+    let expected: serde_json::Value = serde_json::from_slice(&auth_expected()).unwrap();
+    let gate = mesh.tailscale_state_gate().await;
+    assert!(mesh
+        .tailscale_retire_auth_under_gate(
+            "srv-1",
+            &gate,
+            None,
+            polaris_mesh::tailscale_state::AuthProjectionProvenance::BoundFingerprint(
+                expected["profileFingerprint"].as_str().unwrap()
+            ),
+            Some(&"0".repeat(64))
+        )
+        .is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), auth_sealed());
+    mesh.tailscale_retire_auth_under_gate(
+        "srv-1",
+        &gate,
+        None,
+        polaris_mesh::tailscale_state::AuthProjectionProvenance::BoundFingerprint(
+            expected["profileFingerprint"].as_str().unwrap(),
+        ),
+        Some(expected["stateFileRevision"].as_str().unwrap()),
+    )
+    .unwrap();
+    let retired = std::fs::read(&file).unwrap();
+    assert!(mesh
+        .tailscale_retire_auth_under_gate(
+            "srv-1",
+            &gate,
+            None,
+            polaris_mesh::tailscale_state::AuthProjectionProvenance::BoundFingerprint(
+                expected["profileFingerprint"].as_str().unwrap()
+            ),
+            Some(&polaris_updater::sha256_hex(&retired))
+        )
+        .is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), retired);
+}
+
+#[tokio::test]
+async fn sealed_unbound_auth_allows_only_retired_exact_bytes_and_revision() {
+    use polaris_mesh::tailscale_state::AuthProjectionProvenance::CurrentFileReferences;
+    let root = temp_dir("logout-auth-unbound");
+    let mesh = MeshRuntime::new(root.join("config"));
+    let state = mesh.tailscale_state_dir("srv-1").unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let file = state.join("tailscaled.state");
+    std::fs::write(&file, auth_sealed()).unwrap();
+    let gate = mesh.tailscale_state_gate().await;
+    // A complete sealed file is insufficient to delete an active unbound identity.
+    assert!(mesh
+        .tailscale_retire_auth_under_gate(
+            "srv-1",
+            &gate,
+            None,
+            CurrentFileReferences,
+            Some(&polaris_updater::sha256_hex(&auth_sealed()))
+        )
+        .is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), auth_sealed());
+    mesh.tailscale_retire_auth_under_gate("srv-1", &gate, None, CurrentFileReferences, None)
+        .unwrap();
+    let retired = std::fs::read(&file).unwrap();
+    let revision = polaris_updater::sha256_hex(&retired);
+    let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+    mesh.tailscale_retire_auth_under_gate(
+        "srv-1",
+        &gate,
+        None,
+        CurrentFileReferences,
+        Some(&revision),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), retired);
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().modified().unwrap(),
+        before
+    );
+    let mut changed = retired.clone();
+    changed.push(b'\n');
+    std::fs::write(&file, &changed).unwrap();
+    assert!(mesh
+        .tailscale_retire_auth_under_gate(
+            "srv-1",
+            &gate,
+            None,
+            CurrentFileReferences,
+            Some(&revision)
+        )
+        .is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), changed);
+    // Read-only absence does not confer admission when an original Main claim remains.
+    assert_eq!(
+        polaris_mesh::tailscale_state::cached_session_exists_for_presentation(&changed),
+        Ok(false)
+    );
+    let token = mesh.mint_tailscale_main_birth();
+    let generated = serde_json::json!({"endpoints":[{"type":"tailscale","tag":"ts-srv-1", "state_directory":state}]});
+    let mut reservation = mesh
+        .reserve_tailscale_main_states(&generated, &gate, token)
+        .await
+        .unwrap();
+    reservation.arm_external_start();
+    drop(reservation);
+    assert!(mesh
+        .tailscale_retire_auth_under_gate(
+            "srv-1",
+            &gate,
+            None,
+            CurrentFileReferences,
+            Some(&polaris_updater::sha256_hex(&changed))
+        )
+        .is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), changed);
 }

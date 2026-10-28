@@ -394,6 +394,15 @@ const IMPL_ONLY: readonly ImplOnlyRow[] = [
       '主机名 / 出口节点截然不同。它与旁边的「退出登录」也不是同一件事：那条清 state 目录（当前身份），' +
       '这条清配置（下次拿什么认证），两者各有各的确认。',
   },
+  {
+    key: 'ts-authkey-clear',
+    file: 'mobile/forms/TsSettingsPanel.tsx',
+    why:
+      '同一清密钥动作的移动端第二客户端：当前原型 HTML 仅覆盖桌面，且没有这处确认调用，故按既有 IMPL_ONLY 合同具名登记。' +
+      '用户明确清除该节点 active 与 retained 两份长期凭据，误点丢失原值且无撤销腿；退出登录只是停用并留存，不能替代此清除。' +
+      '移动端沿同一 useConfirmTwice 两次点击、原 captured credential revision 与 stage/update CAS；原确认负门继续守第一次零写、' +
+      '第二次仅提交显式 clear intent，缺 revision/继任变更不授删除，host UI 测试不签 native 身份退休。',
+  },
 ];
 
 const PARITY: readonly ParityRow[] = [

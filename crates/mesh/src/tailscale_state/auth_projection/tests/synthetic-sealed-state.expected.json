@@ -1,0 +1,23 @@
+{
+  "schema": "polaris-ts-synthetic-state-fixture-v1",
+  "synthetic": true,
+  "profileId": "a123",
+  "profileKey": "profile-a123",
+  "profileFingerprint": "bf1ff23b84deae9d2dc78f5241586709dbff294a1f8a8c76d61ccac3bf76224d",
+  "stateFileRevision": "cb330f842c694336d53e225db936e7bc0ebc85763c71cbfa1fef8da824c47e03",
+  "projectionRemovesOnly": [
+    "profile-a123",
+    "_profiles.a123"
+  ],
+  "preserveKeys": [
+    "_current-profile",
+    "_profiles",
+    "profile-b456",
+    "_machinekey",
+    "_taildrop-received",
+    "_serve/a123",
+    "ipn-go-bridge",
+    "unknown-user-value"
+  ],
+  "currentPointerPreserved": "profile-a123"
+}

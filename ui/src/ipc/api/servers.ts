@@ -4,7 +4,7 @@ import type { ServerConfig } from '../../contracts/types';
 import type { WarpWireGuardDraft } from '../../domain/warp';
 import type { TailscaleStatusSnapshot } from '../../contracts/tailscale-status';
 import type { TaildropInbox, TaildropSaveResult, TaildropSendResult, TaildropTaskSnapshot } from '../../contracts/taildrop';
-import type { SpeedTestDonePayload, SpeedTestInvokeResult } from '../../contracts/speed-test';
+import type { SpeedTestDonePayload, SpeedTestInvokeResult, SpeedTestProgressPayload, SpeedTestResultPayload } from '../../contracts/speed-test';
 import type { ServerSwitchReceipt } from '../../contracts/server-switch';
 
 // ============================================================================
@@ -57,7 +57,7 @@ export const serverApi = {
     });
   },
 
-  /** Phase 2 按需登录：拉起瞬态登录核取交互登录 URL。 */
+  /** Reserve an exact login attempt before saving or preparing the normal main connection. */
   async tailscaleLoginPrepare(serverId: string, attemptId: string): Promise<void> {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PREPARE, { serverId, attemptId });
   },
@@ -67,27 +67,29 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_PROGRESS, { serverId, attemptId });
   },
 
-  async tailscaleLogin(server: ServerConfig, request: { attemptId: string; mode: 'browser' | 'authkey' }): Promise<{
+  async tailscaleLogin(server: ServerConfig, request: { attemptId: string; mode: 'browser' | 'authkey'; replaceIdentity?: boolean;
+    reuseRetainedAuthKey?: boolean; expectedCredentialRevision?: string }): Promise<{
     started: boolean;
     reason?: 'inMainCore' | 'cancelled';
     configurationPending?: boolean;
   }> {
-    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN, { server, request });
+    return invoke(IPC_CHANNELS.TAILSCALE_LOGIN, { server, request: { ...request, replaceIdentity: request.replaceIdentity ?? false,
+      reuseRetainedAuthKey: request.reuseRetainedAuthKey ?? false } });
   },
 
-  /** Resolves only after the cancelled request no longer owns a process/state writer. */
+  /** Cancels this exact login request; it does not certify retirement of the main proxy. */
   async tailscaleLoginCancel(serverId: string, attemptId: string): Promise<void> {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGIN_CANCEL, { serverId, attemptId });
   },
 
-  /** 退出登录：清该节点 Tailscale 持久登录会话（state 目录）。 */
+  /** 退出登录：只清目标认证记录，保留 Taildrop；iOS 的正常连接/停止由后端负责。 */
   async tailscaleLogout(serverId: string, keepAttemptId?: string): Promise<{ runningNeedsRestart: boolean }> {
     return invoke(IPC_CHANNELS.TAILSCALE_LOGOUT, { serverId, keepAttemptId });
   },
 
-  /** 批量查 TS 节点 state 目录存在性（不起核判「登录过没」）。 */
-  async tailscaleStateExists(serverIds: string[]): Promise<Record<string, boolean>> {
-    return invoke(IPC_CHANNELS.TAILSCALE_STATE_EXISTS, { serverIds });
+  /** Default: directory presence. Opt-in: cached identity presence; neither is writer retirement proof. */
+  async tailscaleStateExists(serverIds: string[], cachedSessionOnly = false): Promise<Record<string, boolean>> {
+    return invoke(IPC_CHANNELS.TAILSCALE_STATE_EXISTS, { serverIds, cachedSessionOnly });
   },
 
   /** L2：主动拉各 TS 节点状态末帧(self IP/peers) + 新鲜度(connected)。 */
@@ -175,14 +177,14 @@ export const serverApi = {
 
   /** 订阅测速单个节点完成事件（流式增量显示，不等队列）。 */
   onSpeedTestResult(
-    listener: (data: { serverId: string; latency: number; runId?: string }) => void
+    listener: (data: SpeedTestResultPayload) => void
   ): () => void {
     return listen(IPC_CHANNELS.EVENT_SPEED_TEST_RESULT, listener);
   },
 
   /** 订阅测速进度事件（已测/成功/总数）。 */
   onSpeedTestProgress(
-    listener: (data: { tested: number; ok: number; total: number; runId?: string }) => void
+    listener: (data: SpeedTestProgressPayload) => void
   ): () => void {
     return listen(IPC_CHANNELS.EVENT_SPEED_TEST_PROGRESS, listener);
   },

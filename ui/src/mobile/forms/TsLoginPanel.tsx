@@ -1,27 +1,30 @@
 import { MobileInfo } from '../MobileInfo';
 /**
- * 移动 Tailscale 接入：先保存配置，再发起授权。保存成功后的重试复用同一节点。
+ * 移动 Tailscale 接入：空凭据登录先保存；明确凭据动作与 iOS 切换由同一后端请求处理后刷新。
  * URL 自动打开归 app-wiring；本面板保留复制/重开入口。瞬态进度按 attempt 接受后端
- * 授权结局，主核授权态仅来自本次新鲜 STATUS，不读取历史登录缓存。
+ * 授权结局与 URL；全局 STATUS 只展示账号状态，不证明本次请求成功。
  */
 import { useEffect, useRef, useState, type ReactElement } from 'react';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
 import {
   TS_LOGIN_TIMEOUT_MS,
+  supportsTsAccountActions,
   executeTsLogin,
   nextTsNodeName,
   planTsLoginSubmit,
-  tsLoginMainCoreView,
+  supportsTsLoginActions,
+  tsLoginUsesBackendReplacement,
+  tsLoginUsesBackendCredentials,
   type TsLoginMode,
 } from '@/components/dialogs/ts-login-server';
 import type { ServerConfig } from '@/contracts/types';
-import type { TailscaleStatusSnapshot } from '@/contracts/tailscale-status';
 import { controlUrlReject } from '@/domain/control-url';
 import { groupServersBySubscription } from '@/domain/server-grouping';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
+import { canReuseTsAuthKey, hasTsRetainedAuthKey } from '@/domain/tailscale-conn-state';
 import { validatedTailscaleAuthUrl } from '@/domain/tailscale-auth-url';
-import { authorizeFromMainFrame, copyLoginUrl, loginAttemptActive, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
+import { copyLoginUrl, loginAttemptActive, loginConnectionProgressKey, loginFailureReasonKey, openLoginUrl, progressForLoginRequest } from '@/domain/tailscale-login-progress';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
@@ -31,11 +34,17 @@ import { useMobileFormStore } from './form-store';
 export function TsLoginPanel({
   instanceId,
   serverId,
+  replaceIdentity = false,
 }: {
   instanceId: string;
   serverId?: string;
+  replaceIdentity?: boolean;
 }): ReactElement {
   const { t } = useTranslation();
+  const accountActionsSupported = supportsTsAccountActions();
+  const loginActionsSupported = supportsTsLoginActions();
+  const backendReplacement = tsLoginUsesBackendReplacement(replaceIdentity);
+  const isIOS = tsLoginUsesBackendReplacement(true);
   const open = useMobileFormStore((s) => s.open);
   const closeInstance = useMobileFormStore((s) => s.closeInstance);
   const hasInstance = useMobileFormStore((s) => s.hasInstance);
@@ -63,6 +72,9 @@ export function TsLoginPanel({
   const [errName, setErrName] = useState(false);
   const [mode, setMode] = useState<TsLoginMode>('browser');
   const [authKey, setAuthKey] = useState('');
+  const [reuseCredentialRevision, setReuseCredentialRevision] = useState<string>();
+  const reuseRetainedAuthKey = !!reuseCredentialRevision;
+  const credentialNode = savedServer ?? existingTs;
   const [errKey, setErrKey] = useState(false);
   /* 自建控制面地址。**登录表必须有这一格**：登录核确实透传它
      （`crates/mesh/src/tailscale_login.rs`），但此前只有「TS 设置」表有控件，而那张表要求节点
@@ -71,18 +83,17 @@ export function TsLoginPanel({
   const [errControl, setErrControl] = useState<string | null>(null);
   /* 该节点是否已有登录 state。切 auth_key 时必须先清掉它 —— tsnet 手上只要有有效 node key
      就不会去用 `auth_key`，于是「填了新 key、提交成功、身份一动不动」。 */
-  const [hasState, setHasState] = useState<boolean | null>(existingTs ? null : false);
+  const [hasState, setHasState] = useState<boolean | null>(accountActionsSupported && existingTs ? null : false);
   const [submitting, setSubmitting] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'info' | 'err'; text: string } | undefined>();
   const [progressReadFailedAttempt, setProgressReadFailedAttempt] = useState<string | null>(null);
-  type PendingLogin = { serverId: string; attemptId: string; source: 'transient' | 'main'; persisted: boolean };
+  type PendingLogin = { serverId: string; attemptId: string; source: 'pending' | 'transient' | 'main'; persisted: boolean };
   const [pending, setPending] = useState<PendingLogin | null>(null);
   const pendingRef = useRef<PendingLogin | null>(null);
+  const submissionRef = useRef(0);
   const editedAfterSaveRef = useRef(false);
   const editRevisionRef = useRef(0);
-  const pendingServerId = pending?.serverId ?? null;
-  const [mainSnapshot, setMainSnapshot] = useState<TailscaleStatusSnapshot | null>(null);
   const progress = useTailscaleLoginProgressStore((s) => progressForLoginRequest(
     pending ? s.attempts[pending.serverId] : undefined,
     pending,
@@ -104,7 +115,7 @@ export function TsLoginPanel({
     let cancelled = false;
     setHasState(null);
     api.server
-      .tailscaleStateExists([id])
+      .tailscaleStateExists([id], true)
       .then((map) => {
         if (!cancelled) setHasState(typeof map[id] === 'boolean' ? map[id] : null);
       })
@@ -116,21 +127,14 @@ export function TsLoginPanel({
     };
   }, [savedServer?.id, existingTs?.id]);
 
-  // 每次提交先清该 id 的 URL；此处只消费提交后到达的 URL，不读历史登录态。
-  const receivedUrl = useAppStore((s) =>
-    pendingServerId === null ? null : (s.tailscaleAuthUrls[pendingServerId] ?? null),
-  );
-  const mainView = pending?.source === 'main' && progress?.phase === 'mainCore' && !progress.reason
-    ? tsLoginMainCoreView(pending.serverId, mainSnapshot, receivedUrl)
-    : null;
-  const authUrl = validatedTailscaleAuthUrl(mainView?.authUrl ?? (
-    progress?.phase === 'awaitingAuth' ? progress.url : null
-  ));
+  const authUrl = validatedTailscaleAuthUrl(progress &&
+    (progress.phase === 'awaitingAuth' || progress.phase === 'mainCore') ? progress.url : null);
 
   // Native progress can fail after start has handed off; that path has no pending submit
   // promise left to report it. The save claim belongs to this attempt, not an older node.
   useEffect(() => {
-    if (!pending || progress?.phase !== 'failed') return;
+    if (!pending || !progress || !['failed', 'timedOut', 'cancelled'].includes(progress.phase)) return;
+    setSubmitting(false);
     const reason = t(loginFailureReasonKey(progress.reason));
     setNotice({ tone: 'err', text: pending.persisted
       ? `${t('ts.loginSavedAttemptIncomplete')} ${reason}` : reason });
@@ -151,12 +155,12 @@ export function TsLoginPanel({
         if (disposed || request !== revision || pendingRef.current?.attemptId !== attemptId
           || !hasInstance(instanceId)) return;
         setProgressReadFailedAttempt(null);
-        if (!receipt || !['authorized', 'failed', 'timedOut'].includes(receipt.phase)) return;
+        if (!receipt || (receipt.url && !validatedTailscaleAuthUrl(receipt.url))) return;
         const current = useTailscaleLoginProgressStore.getState().attempts[serverId];
         if (current?.attemptId !== attemptId) return;
         if (!useTailscaleLoginProgressStore.getState().apply(receipt)) return;
-        setTailscaleAuthUrl(serverId, null);
-        setTailscaleLoginInitiated(serverId, false);
+        setTailscaleAuthUrl(serverId, loginAttemptActive(receipt.phase) ? receipt.url ?? null : null);
+        setTailscaleLoginInitiated(serverId, loginAttemptActive(receipt.phase));
         if (receipt.phase === 'authorized') setTailscaleLoginState(serverId, true);
       } catch {
         // A failed read proves nothing about authorization. Keep the event path live and
@@ -179,50 +183,6 @@ export function TsLoginPanel({
   }, [pending?.serverId, pending?.attemptId, hasInstance, instanceId,
     setTailscaleAuthUrl, setTailscaleLoginInitiated, setTailscaleLoginState]);
 
-  // 主核分支独立读取同 server 的活态。push 优先于较早开始的 pull；停止后立即丢弃快照。
-  useEffect(() => {
-    setMainSnapshot(null);
-    if (pending?.source !== 'main') return;
-    let disposed = false;
-    let revision = 0;
-    const refresh = async (): Promise<void> => {
-      const request = ++revision;
-      try {
-        const snapshot = await api.server.tailscaleGetStatus();
-        if (!disposed && request === revision) setMainSnapshot(snapshot);
-      } catch {
-        if (!disposed && request === revision) setMainSnapshot(null);
-      }
-    };
-    const offStatus = api.proxy.onTailscaleStatus((frame) => {
-      if (frame.serverId !== pending.serverId) return;
-      ++revision;
-      setMainSnapshot({ connected: true, statuses: [frame] });
-    });
-    const offStopped = api.proxy.onStopped(() => { ++revision; setMainSnapshot(null); });
-    const offStarted = api.proxy.onStarted(() => { setMainSnapshot(null); void refresh(); });
-    window.addEventListener('focus', refresh);
-    void refresh();
-    return () => {
-      disposed = true;
-      offStatus(); offStopped(); offStarted();
-      window.removeEventListener('focus', refresh);
-    };
-  }, [pending]);
-
-  // A main-core STATUS pull may be the only fresh Running frame after returning from the
-  // browser. It belongs to this prepared request only when the live core owns its configuration.
-  useEffect(() => {
-    if (pending?.source !== 'main' || !pending.persisted || progress?.phase !== 'mainCore'
-      || progress.reason || !mainSnapshot?.connected) return;
-    const frame = mainSnapshot.statuses.find((status) => status.serverId === pending.serverId);
-    if (!frame) return;
-    const authorized = authorizeFromMainFrame(progress, frame);
-    if (authorized && useTailscaleLoginProgressStore.getState().apply(authorized)) {
-      setTailscaleLoginState(pending.serverId, true);
-    }
-  }, [pending, progress, mainSnapshot, setTailscaleLoginState]);
-
   // Authorization is a terminal receipt for this exact attempt. Detach before closing so the
   // unmount cleanup cannot send a late native cancel for an already authorized session.
   useEffect(() => {
@@ -233,6 +193,7 @@ export function TsLoginPanel({
       || current?.attemptId !== pending.attemptId || current.phase !== 'authorized') return;
     pendingRef.current = null;
     setPending(null);
+    setSubmitting(false);
     setTailscaleAuthUrl(pending.serverId, null);
     setTailscaleLoginInitiated(pending.serverId, false);
     setNotice(undefined);
@@ -350,7 +311,7 @@ export function TsLoginPanel({
       return;
     }
     setName(submittedName);
-    if (mode === 'authkey' && authKey.trim() === '') {
+    if (mode === 'authkey' && authKey.trim() === '' && !reuseRetainedAuthKey) {
       setErrKey(true);
       return;
     }
@@ -363,19 +324,23 @@ export function TsLoginPanel({
     }
     setErrControl(null);
     const submissionRevision = editRevisionRef.current;
+    const backendCredentials = tsLoginUsesBackendCredentials(submissionBase, reuseRetainedAuthKey);
+    const backendOwned = backendReplacement || backendCredentials;
+    const expectedCredentialRevision = reuseCredentialRevision ?? submissionBase?.tailscaleSettings?.tailscaleCredentialRevision;
+    const submission = ++submissionRef.current;
     setSubmitting(true);
     setNotice(undefined);
     let persisted = false;
     try {
       if (!await discardPendingLogin()) return;
       const { server, persist } = planTsLoginSubmit({
-        // The fresh state query occurs after prepare and before save. This preview flag does
-        // not decide logout; executeTsLogin consumes only the fresh result below.
-        existing: submissionBase, name: submittedName, mode, authKey, controlUrl, hasState: false,
+        // Presence is presentation metadata. Only an explicit switch selects replacement;
+        // the backend owns the writer/identity gates in both platform flows.
+        existing: submissionBase, name: submittedName, mode, authKey, reuseRetainedAuthKey, controlUrl, hasState: false,
         mintId: () => crypto.randomUUID(),
       });
-      persisted = persist === 'none';
-      const request: PendingLogin = { serverId: server.id, attemptId: crypto.randomUUID(), source: 'transient', persisted };
+      persisted = !backendOwned && persist === 'none';
+      const request: PendingLogin = { serverId: server.id, attemptId: crypto.randomUUID(), source: 'pending', persisted };
       pendingRef.current = request;
       setPending(request);
       useTailscaleLoginProgressStore.getState().begin(server.id, request.attemptId);
@@ -388,11 +353,23 @@ export function TsLoginPanel({
           && phase.phase !== 'timedOut' && phase.phase !== 'failed' && phase.phase !== 'cancelled';
       };
       let startResult: Awaited<ReturnType<typeof api.server.tailscaleLogin>> | undefined;
+      const recordSaved = (actual: ServerConfig, matchesCandidate = true): void => {
+        persisted = true;
+        if (pendingRef.current?.attemptId !== request.attemptId || !hasInstance(instanceId)) return;
+        setSavedServer(actual);
+        const savedRequest = { ...pendingRef.current, persisted: true };
+        pendingRef.current = savedRequest;
+        setPending(savedRequest);
+        editedAfterSaveRef.current = editRevisionRef.current !== submissionRevision;
+        if (matchesCandidate && stillActive() && !editedAfterSaveRef.current) setDirty(false);
+      };
       const outcome = await executeTsLogin({
+        backendReplacement,
+        backendCredentials,
         isActive: stillActive,
         prepare: () => api.server.tailscaleLoginPrepare(server.id, request.attemptId),
-        verifyState: mode === 'authkey' ? async () => {
-          const states = await api.server.tailscaleStateExists([server.id]);
+        verifyState: !isIOS && (mode === 'authkey' || replaceIdentity) ? async () => {
+          const states = await api.server.tailscaleStateExists([server.id], true);
           if (typeof states[server.id] !== 'boolean') throw new Error('STATE_QUERY_UNAVAILABLE');
           if (stillActive()) setHasState(states[server.id]);
           return states[server.id];
@@ -402,23 +379,21 @@ export function TsLoginPanel({
           if (persist === 'add') await api.server.add(server);
           else if (persist === 'update') await api.server.update(server);
         },
-        onSaved: () => {
-          // A successful write is retained across a later refresh or login failure.
-          persisted = true;
-          setSavedServer(server);
-          if (pendingRef.current?.attemptId === request.attemptId) {
-            const savedRequest = { ...pendingRef.current, persisted: true };
-            pendingRef.current = savedRequest;
-            setPending(savedRequest);
-          }
-          editedAfterSaveRef.current = editRevisionRef.current !== submissionRevision;
-          if (stillActive() && !editedAfterSaveRef.current) setDirty(false);
-        },
+        onSaved: () => recordSaved(server),
         refresh: async () => {
-          if (persist === 'none') return;
+          if (!backendOwned && persist === 'none') return;
           await loadConfig(true);
           const mirrored = useAppStore.getState().servers.find((s) => s.id === server.id);
-          if (!mirrored || mirrored.name !== server.name
+          const matches = mirrored && mirrored.name === server.name
+            && mirrored.tailscaleSettings?.controlUrl === server.tailscaleSettings?.controlUrl
+            && (backendOwned || mirrored.tailscaleSettings?.authKey === server.tailscaleSettings?.authKey)
+            && mirrored.tailscaleSettings?.sourceTag === server.tailscaleSettings?.sourceTag;
+          if (backendOwned) {
+            // A failed/cancelled backend request may have committed its candidate already.
+            // Read the saved mirror even after close; only this live request may update the panel.
+            if (mirrored) recordSaved(mirrored, !!matches && !!(startResult?.started || startResult?.reason === 'inMainCore'));
+            if (!matches && (startResult?.started || startResult?.reason === 'inMainCore')) throw new Error('TS_CONFIG_REFRESH_FAILED');
+          } else if (!mirrored || mirrored.name !== server.name
             || mirrored.tailscaleSettings?.controlUrl !== server.tailscaleSettings?.controlUrl
             || mirrored.tailscaleSettings?.authKey !== server.tailscaleSettings?.authKey
             || mirrored.tailscaleSettings?.sourceTag !== server.tailscaleSettings?.sourceTag) {
@@ -426,7 +401,7 @@ export function TsLoginPanel({
           }
         },
         start: async () => {
-          startResult = await api.server.tailscaleLogin(server, { attemptId: request.attemptId, mode });
+          startResult = await api.server.tailscaleLogin(server, { attemptId: request.attemptId, mode, replaceIdentity, reuseRetainedAuthKey, expectedCredentialRevision });
           return startResult;
         },
         cancel: async () => {
@@ -435,6 +410,7 @@ export function TsLoginPanel({
           await api.server.tailscaleLoginCancel(server.id, request.attemptId);
         },
       });
+      if (outcome.refreshFailed) toast.error(t('ts.loginRefreshFailed'));
       if (!stillActive()) return;
       const current = useTailscaleLoginProgressStore.getState().attempts[server.id];
       if (outcome.phase === 'failed') {
@@ -457,18 +433,11 @@ export function TsLoginPanel({
         if (persisted) setNotice({ tone: 'info', text: t('ts.loginSavedAttemptIncomplete') });
         return;
       }
-      if (!startResult.started && startResult.reason === 'inMainCore') {
-        const next = { ...(pendingRef.current ?? request), source: 'main' as const };
-        pendingRef.current = next;
-        setPending(next);
-        if (current?.attemptId === request.attemptId && loginAttemptActive(current.phase)) {
-          useTailscaleLoginProgressStore.getState().apply({ ...current, phase: 'mainCore',
-            reason: startResult.configurationPending ? 'configurationPending' : null, url: null });
-        }
-        setNotice({ tone: 'info', text: startResult.configurationPending
-          ? t('ts.loginInMainCoreNeedsRestart') : t('ts.loginMainCoreStatus') });
-      } else {
-        // Started is submission, never proof of an authorized account.
+      const next = { ...(pendingRef.current ?? request), source: startResult.reason === 'inMainCore' ? 'main' as const : 'transient' as const };
+      pendingRef.current = next;
+      setPending(next);
+      // Producer progress can be ahead of this invocation receipt; never downgrade it.
+      if (current?.attemptId === request.attemptId && current.phase === 'starting') {
         setNotice({ tone: 'info', text: t('ts.loginSubmitted') });
       }
     } catch {
@@ -477,7 +446,7 @@ export function TsLoginPanel({
       console.error('[mobile-ts-login] unexpected UI failure');
       setNotice({ tone: 'err', text: t('ts.loginAttemptFailed') });
     } finally {
-      if (hasInstance(instanceId)) setSubmitting(false);
+      if (hasInstance(instanceId) && submissionRef.current === submission) setSubmitting(false);
     }
   };
 
@@ -488,7 +457,7 @@ export function TsLoginPanel({
       closeLabel={t('common.close')}
       cancelLabel={t('common.cancel')}
       submitLabel={mode === 'browser' ? t('ts.openLogin') : t('ts.signIn')}
-      submitDisabled={submitting}
+      submitDisabled={submitting || !loginActionsSupported}
       onSubmit={() => void submit()}
       notice={progressReadFailedAttempt === pending?.attemptId && progress
         && loginAttemptActive(progress.phase)
@@ -526,6 +495,7 @@ export function TsLoginPanel({
           placeholder="https://controlplane.tailscale.com"
           onChange={(e) => {
             setControlUrl(e.target.value);
+            setReuseCredentialRevision(undefined);
             setErrControl(null);
             setDirty(true);
             editedAfterSaveRef.current = true;
@@ -552,7 +522,7 @@ export function TsLoginPanel({
             aria-pressed={mode === 'browser'}
             disabled={submitting}
             onClick={() => {
-              void discardPendingLogin().then((ok) => { if (ok) { setMode('browser'); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
+              void discardPendingLogin().then((ok) => { if (ok) { setMode('browser'); setReuseCredentialRevision(undefined); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
             }}
           >
             {t('ts.browserLogin')}
@@ -563,7 +533,7 @@ export function TsLoginPanel({
             aria-pressed={mode === 'authkey'}
             disabled={submitting}
             onClick={() => {
-              void discardPendingLogin().then((ok) => { if (ok) { setMode('authkey'); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
+              void discardPendingLogin().then((ok) => { if (ok) { setMode('authkey'); setReuseCredentialRevision(undefined); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++; } });
             }}
           >
             {t('ts.authKey')}
@@ -589,20 +559,33 @@ export function TsLoginPanel({
             placeholder="YOUR_TAILSCALE_AUTH_KEY"
             onChange={(e) => {
               setAuthKey(e.target.value);
+              setReuseCredentialRevision(undefined);
               setErrKey(false);
               setDirty(true);
               editedAfterSaveRef.current = true;
               editRevisionRef.current++;
             }}
           />
+          {canReuseTsAuthKey(credentialNode) && controlUrl === (credentialNode?.tailscaleSettings?.controlUrl ?? '') && (
+            <button type="button" className={`m-form-btn${reuseRetainedAuthKey ? ' primary' : ''}`} disabled={submitting}
+              aria-pressed={reuseRetainedAuthKey} onClick={() => {
+                setReuseCredentialRevision(reuseRetainedAuthKey ? undefined : credentialNode?.tailscaleSettings?.tailscaleCredentialRevision);
+                setAuthKey(''); setErrKey(false); setDirty(true); editedAfterSaveRef.current = true; editRevisionRef.current++;
+              }}>{t('ts.reuseSavedAuthKey')}</button>
+          )}
+          {hasTsRetainedAuthKey(credentialNode) && <p className="m-form-hint" role="status">
+            {t(credentialNode?.tailscaleSettings?.retainedAuthKeyAvailable && controlUrl === (credentialNode.tailscaleSettings.controlUrl ?? '')
+              ? 'ts.retainedAuthKeyHint' : 'ts.retainedAuthKeyAuthorityHint')}
+          </p>}
           <p className="m-form-hint">{t('ts.authkeyHint')}</p>
           {errKey && <p className="m-form-err">{t('ts.errKey')}</p>}
-          {hasState === true && <div className="m-form-hint"><MobileInfo title={t('ts.authKeyLabel')} summary={t('mobileHelp.tsAuthKeySwitch')} details={t('ts.authKeySwitchLogoutNote')} /></div>}
+          {hasState === true && <div className="m-form-hint"><MobileInfo title={t('ts.authKeyLabel')} summary={t('mobileHelp.tsAuthKeySwitch')} details={t(accountActionsSupported ? 'ts.authKeySwitchLogoutNote' : 'ts.identityRetirementRequired')} /></div>}
           {hasState === null && <p className="m-form-hint">{t('ts.loginStateUnknown')}</p>}
         </div>
       )}
 
-      {(mode === 'browser' || mainView !== null || progress?.phase === 'authorized') && (progress?.phase === 'authorized' || mainView?.state === 'authorized' ? (
+      {backendReplacement && <p className="m-form-hint">{t('ts.switchAccountNote')}</p>}
+      {(mode === 'browser' || progress !== undefined) && (progress?.phase === 'authorized' ? (
         <p className="m-form-hint">{t('ts.loginMainCoreAuthorized')}</p>
       ) : authUrl !== null ? (
         <div className="m-form-row">
@@ -639,12 +622,12 @@ export function TsLoginPanel({
             {t('ts.retryLogin')}
           </button>
         </div>
+      ) : loginConnectionProgressKey(progress?.phase) ? (
+        <p className="m-form-hint" role="status">{t(loginConnectionProgressKey(progress?.phase)!)}</p>
       ) : progress?.phase === 'starting' ? (
         <p className="m-form-hint">{t('ts.awaitingUrl')}</p>
       ) : progress?.phase === 'mainCore' && !progress.reason ? (
-        <p className="m-form-hint">{t(mainView
-          ? mainView.state === 'needs-login' ? 'ts.loginMainCoreAwaiting' : 'ts.loginMainCoreUnknown'
-          : 'ts.loginMainCoreUnknown')}</p>
+        <p className="m-form-hint">{t('ts.loginMainCoreAwaiting')}</p>
       ) : (
         <p className="m-form-hint">{t('ts.browserHint')}</p>
       ))}

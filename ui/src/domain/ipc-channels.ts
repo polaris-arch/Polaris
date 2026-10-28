@@ -192,6 +192,8 @@ export const IPC_CHANNELS = {
   // 解锁检测（AI/流媒体，经当前代理出口）：run 触发一轮检测（force 绕 TTL）；get 纯读最近快照（水合）
   UNLOCK_RUN: 'unlock_run',
   UNLOCK_GET: 'unlock_get',
+  MANUAL_NETWORK_CHECK: 'manual_network_check',
+  MANUAL_NETWORK_CHECK_CANCEL: 'manual_network_check_cancel',
 
   // 系统进程枚举（路由规则的进程快速选择器）
   SYSTEM_LIST_PROCESSES: 'system_list_processes',
@@ -215,6 +217,7 @@ export const IPC_CHANNELS = {
   // 下载一无所知（下完了的那一帧永不再来）⇒ 挂载时补一次回读。
   UPDATE_GET_PROGRESS: 'update_get_progress',
   UPDATE_INSTALL: 'update_install',
+  UPDATE_REQUEST_INSTALL_PERMISSION: 'update_request_install_permission',
   UPDATE_SKIP: 'update_skip',
   // App 更新弹窗（独立 mini 更新窗）：主进程 → 弹窗推状态载荷；弹窗 → 主进程回传按钮/关闭动作。
   UPDATE_POPUP_ACTION: 'update_popup_action',

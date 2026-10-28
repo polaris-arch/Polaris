@@ -738,6 +738,10 @@
       "noTelemetry": "零遙測 — 不自動上傳當機報告或分析資料"
     },
     "update": {
+      "hideProgress": "收起進度",
+      "showProgress": "查看進度",
+      "backgroundProgress": "更新工作仍在繼續",
+      "hideProgressHint": "收起進度後，工作會繼續進行",
       "ruleResourceAutoStatusOn": "依排程更新",
       "ruleResourceAutoStatusManual": "僅手動",
       "formMismatch": "更新包形態與目前安裝形態不符，已交由系統處理",
@@ -768,7 +772,7 @@
       "autoDownloadOffToast": "僅檢查提醒，不自動下載",
       "pageSub": "應用程式、核心、規則資源更新與下載加速",
       "intervalCard": "背景檢查間隔",
-      "intervalCardSub": "訂閱與規則資源依此週期在背景重新整理；應用程式更新在每次啟動時檢查一次",
+      "intervalCardSub": "訂閱依此週期在背景重新整理；規則資源有獨立週期，應用更新在啟動時檢查。",
       "intervalManualOnly": "僅手動",
       "intervalHours": "每 {{n}} 小時",
       "intervalDays": "每 {{n}} 天",
@@ -831,7 +835,7 @@
       "subFollow": "跟隨訂閱",
       "subViaProxy": "走代理",
       "subDirect": "直連",
-      "ruleResourceAutoDesc": "依「背景檢查間隔」自動重新下載規則資源"
+      "ruleResourceAutoDesc": "依規則資源的獨立週期自動重新下載資源。"
     },
     "core": {
       "applied": "內核已更新",
@@ -1573,6 +1577,7 @@
     "createTaskRecoveredHint": "訂閱新增在背景執行，應用程式重新啟動後會在這裡繼續顯示進度。"
   },
   "errors": {
+    "iosSessionActive": "系統中已有 Polaris VPN 工作階段，請先在 iOS 系統設定中停止該工作階段，再連線。",
     "operationFailed": "操作失敗，請稍後重試",
     "systemDnsTakeoverFailed": "Linux 系統 DNS 未能接入 Polaris。代理仍在執行，但網域解析可能失敗或繞過 DNS 規則；請檢查 Helper 與 systemd-resolved 後重新連線。",
     "outboundInterfaceUnavailable": "指定的出口網卡不存在或尚未啟用。為避免改走其他網卡，本次連線未套用；請重新選擇出口網卡。",
@@ -2224,6 +2229,10 @@
     "downloadAllFailed": "下載失敗"
   },
   "resources": {
+    "updateInterval": "規則資源更新週期",
+    "updateIntervalDesc": "只變更規則資源週期，不變更訂閱設定；0 代表僅手動。",
+    "autoUpdateSettings": "自動更新設定",
+    "autoUpdateUnavailable": "暫時無法開啟設定，請在設定 → 應用與更新中調整規則資源自動更新。",
     "cancel": "取消",
     "cancelAlreadyDone": "下載已結束，無需取消",
     "cancelFailed": "取消失敗",
@@ -2342,6 +2351,15 @@
     "errUnknown": "操作失敗。"
   },
   "ts": {
+    "identityRetirementRequired": "更換帳號前需要安全登出舊帳號。請使用「切換帳號」。",
+    "switchAccountNote": "切換帳號會中斷代理、登出該節點舊帳號，再重新連線並發起登入。",
+    "stoppingConnection": "正在中斷代理連線…",
+    "retiringIdentity": "正在登出舊帳號…",
+    "savingCandidate": "正在儲存節點設定…",
+    "startingConnection": "正在重新連線代理…",
+    "reasonIdentityRetirement": "無法安全登出舊帳號。請重試。",
+    "reasonSessionChanged": "登入狀態已變更，請重新嘗試。",
+    "reasonConfigurationChanged": "節點設定已變更，請重新開啟登入頁面。",
     "acceptDefaultResolvers": "接受 tailnet 預設解析器",
     "acceptDefaultResolversHint": "額外接受 tailnet 下發的預設 DNS 解析器（split-DNS）。可選。",
     "acceptRoutes": "接受子網路由",
@@ -2380,6 +2398,10 @@
     "exitNotAdvertised": "未廣告出口",
     "exitOffline": "離線",
     "hostname": "主機名稱",
+    "hostnamePlaceholder": "留空自動命名",
+    "hostnameHint": "留空使用本機核心預設名稱；填寫後將作為這台裝置在組網中的主機名稱。",
+    "accountActions": "帳號操作",
+    "fileTransfer": "檔案傳輸",
     "loginDiscard": "放棄",
     "loginDiscardMsg": "已填寫的內容將不會儲存。",
     "loginDiscardTitle": "放棄登入？",
@@ -2440,7 +2462,15 @@
     "authKeyClearPending": "待清除（儲存後生效）",
     "authKeyClear": "清除",
     "authKeyClearAgain": "再點一次以清除",
-    "authKeyClearHint": "此處只顯示這台節點有沒有存過 Auth Key，不顯示金鑰本身。清除只刪設定裡的金鑰，不影響目前的登入狀態（登入狀態在 state 目錄裡，要清它用「登出」）；清除後該節點在需要重新認證時就沒有可用的靜態憑證，必須重新登入。儲存後生效。",
+    "authKeyRetained": "已保留 · 自動驗證已停用",
+    "reuseSavedAuthKey": "使用已儲存金鑰",
+    "retainedAuthKeyHint": "請明確選擇金鑰登入來重用。控制面仍會驗證；金鑰失效時需填入新值。",
+    "retainedAuthKeyAuthorityHint": "已儲存金鑰屬於另一控制面。請還原原地址，或填入新金鑰。",
+    "reasonRetainedKeyUnavailable": "已儲存金鑰無法使用，請填入新金鑰。",
+    "reasonCredentialChanged": "憑證已變更，請重新開啟此節點後重試。",
+    "reasonCredentialIntent": "清除請求已失效，請重新開啟此節點並確認。",
+    "reasonCredentialCommit": "無法確認已儲存憑證，請重新整理此節點後重試。",
+    "authKeyClearHint": "套用變更時清除目前與保留金鑰；這不會登出目前工作階段。",
     "browserOpenFailed": "無法開啟瀏覽器，請複製登入連結。",
     "reasonMainCoreChanged": "主連線已變更，請重新嘗試授權。",
     "loginSavedAttemptIncomplete": "節點已儲存；本次授權尚未完成。",
@@ -2451,10 +2481,8 @@
     "loginAttemptFailed": "本次登入請求失敗。請重試。",
     "loginCancelFailed": "取消登入失敗，請重試。",
     "loginSubmitted": "已提交登入請求。請等待授權完成。",
-    "loginMainCoreStatus": "正在讀取主連線中該節點的授權狀態。",
     "loginMainCoreAuthorized": "主連線中的該節點已授權；這不代表新儲存的認證設定已生效。",
     "loginMainCoreAwaiting": "該節點需要授權。正在取得登入頁位址…",
-    "loginMainCoreUnknown": "尚無法確認主連線中該節點的授權狀態，可重試讀取。",
     "loginUrlTimeout": "取得登入頁位址逾時。請重試。",
     "loginSessionReadFailed": "無法讀取舊登入工作階段，未發起新的授權。請重試。",
     "loginProgressReadFailed": "暫時無法核對這次授權結果。授權可能仍在進行；返回應用程式時會重試。",
@@ -2708,6 +2736,14 @@
       "appTitle": "應用程式更新",
       "appDesc": "Android 版經 GitHub Releases 分發。在這裡檢查、下載簽章 APK 並交給系統安裝器；某個版本沒有發 APK 時，仍可開啟發布頁。",
       "ghScopeNote": "這裡的加速與自訂網域服務的是規則資源下載，與核心更新無關。",
+      "ruleResourceAutoDesc": "獨立控制內建分流資料與外部規則資源，不變更訂閱設定。",
+      "ruleResourceInterval": "規則資源更新週期",
+      "ruleResourceIntervalDesc": "從上次成功下載計算；選「僅手動」時，啟動或返回前景都不會自動下載。",
+      "ruleResourceOff": "自動更新已關閉。",
+      "ruleResourceManual": "目前僅手動更新。",
+      "ruleResourceActive": "已啟用，依 {{hours}} 小時週期更新到期資源。",
+      "ruleResourceScopeNote": "啟動或返回前景時補查到期資源；應用執行期間定期檢查。下載失敗會退避重試，背景暫停時不保證準時更新。「更新於」表示上次成功下載。",
+      "subscriptionIntervalDesc": "只控制訂閱的背景重新整理週期，不變更規則資源的獨立週期。",
       "checkAction": "檢查更新",
       "checking": "正在檢查…",
       "openReleases": "開啟發佈頁",
@@ -2947,5 +2983,17 @@
       "other": "其他證據暫不可用。"
     },
     "legacy": "目前版本無法提供可核實的路由歸屬報告。"
+  },
+  "prerequisite": {
+    "preparingConnection": "正在準備代理連線，請完成系統授權。",
+    "waitingForReady": "等待代理就緒…",
+    "foregroundRequired": "請返回應用程式前景後重試。",
+    "permissionDenied": "VPN 授權未獲允許，請重試並允許系統請求。",
+    "readyUnknown": "無法確認連線已就緒，請檢查連線後重試。",
+    "cancelled": "本次操作已取消，可重試。",
+    "cancelFailed": "未能取消這次操作，請重試。",
+    "saveConfiguration": "請先儲存設定，再重試。",
+    "ipInfoFailed": "IP 資訊未能重新整理，請重試網路檢測。",
+    "unlockFailed": "服務可用性未能檢測，請重試網路檢測。"
   }
 }

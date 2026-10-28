@@ -515,7 +515,7 @@ describe('③ Tailscale：原始帧整帧落 store，折叠登录态过判决门
     off();
   });
 
-  it('无效 URL 拒绝打开并取消对应 attempt；主核仅新鲜 Running STATUS 能确认本次成功', async () => {
+  it('无效 URL 拒绝打开；全局 Running 和 AUTH 均不能升级请求，只接受绑定 producer 结果', async () => {
     const off = startMobileAppWiring(t);
     await settle();
     const progress = useTailscaleLoginProgressStore.getState();
@@ -526,11 +526,16 @@ describe('③ Tailscale：原始帧整帧落 store，折叠登录态过判决门
     expect(cancelLoginMock).toHaveBeenCalledWith('ts-1', 'bad-url');
 
     progress.begin('ts-1', 'main-core');
-    emit('tsLoginProgress', { serverId: 'ts-1', attemptId: 'main-core', phase: 'mainCore', url: null });
+    const binding = { serverId: 'ts-1', attemptId: 'main-core', mainGeneration: 8, identityEpoch: 'epoch-A' };
+    emit('tsLoginProgress', { ...binding, phase: 'mainCore', url: null });
     emit('tsStatus', tsFrame({ backendState: 'Starting', loggedIn: true, authURL: 'https://login.example/main' }));
     expect(useTailscaleLoginProgressStore.getState().attempts['ts-1']?.phase).toBe('mainCore');
-    expect(openExternalMock).toHaveBeenCalledTimes(1);
+    expect(openExternalMock).not.toHaveBeenCalled();
     emit('tsStatus', tsFrame({ backendState: 'Running', loggedIn: true, authURL: '' }));
+    expect(useTailscaleLoginProgressStore.getState().attempts['ts-1']?.phase).toBe('mainCore');
+    emit('tsLoginProgress', { ...binding, phase: 'awaitingAuth', url: 'https://login.example/bound' });
+    expect(openExternalMock).toHaveBeenCalledTimes(1);
+    emit('tsLoginProgress', { ...binding, phase: 'authorized', url: null });
     expect(useTailscaleLoginProgressStore.getState().attempts['ts-1']?.phase).toBe('authorized');
     emit('tsAuth', { url: 'https://login.example/late', serverId: 'ts-1', nodeName: 'n' });
     expect(openExternalMock).toHaveBeenCalledTimes(1);

@@ -615,3 +615,4 @@ async fn via_local_proxy_presents_the_loopback_credential() {
         "无凭据时不许发该头：{request}"
     );
 }
+mod manual_guard;

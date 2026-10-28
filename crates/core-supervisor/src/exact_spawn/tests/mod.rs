@@ -379,21 +379,124 @@ async fn failure_spawn_and_synthetic_wait_error_never_report_success() {
     assert!(observed.await.unwrap().unwrap().cleanup_uncertain);
 }
 
+/// Separate, ordinary executable: it never opens or closes protected images.
+#[test]
+#[ignore = "private child fixture for an unrelated executable, executed by exact_spawn tests"]
+fn unrelated_no_network_fixture() {
+    use std::io::Write;
+    std::io::stdout()
+        .write_all(b"\nPOLARIS_UNRELATED_USERLAND_READY\n")
+        .unwrap();
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+struct UnrelatedObservation {
+    pid: u32,
+    executable: std::path::PathBuf,
+    targets: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+async fn observe_unrelated_child(
+    stdin: std::process::Stdio,
+) -> Result<UnrelatedObservation, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let mut child =
+        tokio::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+            .args([
+                "--exact",
+                "exact_spawn::tests::unrelated_no_network_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(stdin)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+    let observation = async {
+        let pid = child.id().ok_or("missing unrelated child pid")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("missing unrelated child stdout")?;
+        let ready = async {
+            let mut reader = BufReader::new(stdout.take(4096));
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                if reader.read_until(b'\n', &mut line).await? == 0 {
+                    return Err(std::io::Error::other("missing userland READY"));
+                }
+                if line == b"POLARIS_UNRELATED_USERLAND_READY\n" {
+                    return Ok(());
+                }
+            }
+        };
+        // spawn() can return during exec's CLOEXEC sweep on some hosts. The
+        // child's own marker proves this scan is after entering userland.
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let executable =
+            std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|error| error.to_string())?;
+        let mut targets = Vec::new();
+        for entry in
+            std::fs::read_dir(format!("/proc/{pid}/fd")).map_err(|error| error.to_string())?
+        {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            let target = std::fs::read_link(&path).map_err(|error| error.to_string())?;
+            targets.push((path, target));
+        }
+        Ok(UnrelatedObservation {
+            pid,
+            executable,
+            targets,
+        })
+    }
+    .await;
+    // Finish physical cleanup before any observation or assertion can fail.
+    let killed = child.start_kill();
+    let waited = child.wait().await;
+    killed.map_err(|error| format!("unrelated child kill: {error}; wait={waited:?}"))?;
+    waited.map_err(|error| format!("unrelated child wait: {error}"))?;
+    observation
+}
+
 #[tokio::test]
 async fn unrelated_child_does_not_inherit_protected_images() {
     let _images = fixture_inputs(b"original");
-    let mut child = tokio::process::Command::new("sleep")
-        .arg("5")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
+    let observation = observe_unrelated_child(std::process::Stdio::null())
+        .await
         .unwrap();
-    let pid = child.id().unwrap();
-    for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
-        let target = std::fs::read_link(entry.unwrap().path()).unwrap();
-        assert!(!target.to_string_lossy().contains("polaris-s4-"));
+    for (fd, target) in &observation.targets {
+        assert!(
+            !target.to_string_lossy().contains("polaris-s4-"),
+            "pid={} exe={} fd={} target={}",
+            observation.pid,
+            observation.executable.display(),
+            fd.display(),
+            target.display()
+        );
     }
-    child.kill().await.unwrap();
-    child.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn deliberately_passed_protected_stdin_is_detected_after_userland_ready() {
+    let images = fixture_inputs(b"deliberately inherited");
+    let stdin = File::from(rustix::io::fcntl_dupfd_cloexec(&images.config, 3).unwrap());
+    let observation = observe_unrelated_child(std::process::Stdio::from(stdin))
+        .await
+        .unwrap();
+    // Command deliberately maps this CLOEXEC copy to inheritable fd0 only in
+    // this child. No parent descriptor becomes inheritable during parallel tests.
+    assert!(observation.targets.iter().any(|(fd, target)| {
+        fd.file_name().is_some_and(|name| name == "0")
+            && target.to_string_lossy().contains("polaris-s4-config")
+    }));
 }

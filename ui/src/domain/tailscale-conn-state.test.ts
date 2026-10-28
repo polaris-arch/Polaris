@@ -15,6 +15,8 @@ import {
   deriveTsCardState,
   tsAccountLabel,
   hasTsAuthKey,
+  hasTsRetainedAuthKey,
+  canReuseTsAuthKey,
 } from './tailscale-conn-state';
 import type { TailscaleStatusDetails, TailscaleUserGroupStatus } from '../contracts/tailscale-status';
 
@@ -214,4 +216,17 @@ describe('tsAccountLabel —— 账号标识文案，登录名只在无歧义时
     const d = details({ userGroups: [group('owner@example.com'), group('shared-by@other.com')] });
     expect(tsAccountLabel(d)).toBeUndefined();
   });
+});
+
+
+it('retained metadata never means an active key or a logged-in account, including issuer mismatch', () => {
+  for (const available of [true, false]) {
+    const node = { id: 'ts-1', protocol: 'tailscale', tailscaleSettings: { retainedAuthKeyAvailable: available, tailscaleCredentialRevision: 'opaque' } } as import('../contracts/types').ServerConfig;
+    expect(hasTsAuthKey(node)).toBe(false);
+    expect(hasTsRetainedAuthKey(node)).toBe(true);
+    expect(canReuseTsAuthKey(node)).toBe(available);
+    expect(deriveTsCardState(node, false, false)).toBe('needs-login');
+  }
+  expect(canReuseTsAuthKey({ tailscaleSettings: { retainedAuthKeyAvailable: true } } as import('../contracts/types').ServerConfig)).toBe(false);
+  expect(hasTsRetainedAuthKey(undefined)).toBe(false);
 });

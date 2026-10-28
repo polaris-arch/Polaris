@@ -35,7 +35,7 @@ internal object DebugPcEchoSender {
     internal fun approved(target: DebugPcEchoTarget, tuple: Tuple): Boolean = tuple.protocol in setOf("tcp", "udp") &&
         tuple.address == target.address && tuple.port == target.port(tuple.protocol)
 
-    private class Ledger(val target: DebugPcEchoTarget, val caseId: String, val kind: String,
+    internal class Ledger(val target: DebugPcEchoTarget, val caseId: String, val kind: String,
                          val sequence: Int, val tuple: Tuple) {
         var sent: ByteArray? = null
         var returned: ByteArray? = null
@@ -53,6 +53,20 @@ internal object DebugPcEchoSender {
                 .put("outcome", outcome).put("rootNativeWitness", JSONObject().put("kind", "Unknown"))
         }
         fun erase() { sent?.fill(0); returned?.fill(0) }
+    }
+    /** The actual per-attempt admission and public witness precede all outbound work. */
+    internal fun attempt(target: DebugPcEchoTarget, protocol: String, caseId: String, kind: String,
+                         sequence: Int, outbound: (Tuple, Ledger) -> Unit, append: (JSONObject) -> Unit) {
+        require(protocol in setOf("tcp", "udp"))
+        val approved = Tuple(target.address, target.port(protocol), protocol)
+        val tuple = if (kind == "WrongPortAdmission") approved.copy(port = target.port(if (protocol == "tcp") "udp" else "tcp")) else approved
+        val report = Ledger(target, caseId, kind, sequence, tuple)
+        try {
+            if (!approved(target, tuple)) report.outcome = "RejectedBeforeOutbound"
+            else outbound(tuple, report)
+            append(report.publicJson())
+            if (report.outcome in setOf("Canceled", "StaleScope", "TransportFailure")) error("Batch input unavailable")
+        } finally { report.erase() }
     }
     private fun <T : Closeable> acquire(lease: DebugBatchLease, construct: () -> T): T {
         check(lease.beginAcquire())
@@ -199,12 +213,8 @@ internal object DebugPcEchoSender {
                     }, "after" to "Positive")) {
                         current(loan, ready, allowed)
                         snapshots.put(JSONObject(DebugPcEchoCodec.canonical(channel.snapshot("$caseId-$position")).toString(Charsets.UTF_8)))
-                        val approved = Tuple(ready.target.address, ready.target.port(protocol), protocol)
-                        val tuple = if (kind == "WrongPortAdmission") approved.copy(port = if (approved.port == 65535) 65534 else approved.port + 1) else approved
-                        val report = Ledger(ready.target, caseId, kind, ++sequence, tuple)
-                        try {
-                            if (!approved(ready.target, tuple)) report.outcome = "RejectedBeforeOutbound"
-                            else if (kind == "ForeignPeer" || protocol == "udp" && !loan.supportsUdp) {
+                        attempt(ready.target, protocol, caseId, kind, ++sequence, { tuple, report ->
+                            if (kind == "ForeignPeer" || protocol == "udp" && !loan.supportsUdp) {
                                 report.outcome = "Unsupported"; complete = false
                             } else {
                                 val nonce = ready.target.nonce.copyOf()
@@ -222,9 +232,7 @@ internal object DebugPcEchoSender {
                                 if (!allowed() || !ready.current(SystemClock.elapsedRealtime())) report.outcome = "Canceled"
                                 else if (!loan.isCurrent(SystemClock.elapsedRealtime(), DebugCoreProbeLoan.currentInput())) report.outcome = "StaleScope"
                             }
-                            witnesses.put(report.publicJson())
-                            if (report.outcome in setOf("Canceled", "StaleScope", "TransportFailure")) error("Batch input unavailable")
-                        } finally { report.erase() }
+                        }, { witnesses.put(it) })
                     }
                     snapshots.put(JSONObject(DebugPcEchoCodec.canonical(channel.snapshot("$caseId-final")).toString(Charsets.UTF_8)))
                 }

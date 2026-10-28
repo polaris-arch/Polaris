@@ -7,29 +7,18 @@
     "mac-arm64": "e3fb5d7e8586b92e3eab06fca80a09239ec0c9e7c8a04f6f16e483a034c78581"
   },
   "cronetLibrarySha256": {
-    "linux": "23109c55b08829bb1a68682a61a64852b1bbf243753b153cbd8f6e4ea2c05294",
-    "win": "3217c6260fbca5f16072e0b79735742f40109a63bb0ff88fd6b96dd6b54a2928"
-  },
-  "windowsBuild": {
-    "version": "1.15.0-alpha.8.polaris.2",
-    "sourceCommit": "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
-    "sourceSha256": "77aabf518a4464832f6f4792196a8ab9aadadcc616dbbd82327137ce664a5862",
-    "patchSha256": "69ae099ae06710bdb46c47448909e1bda11cb63dd944e85208c29a19b10bb7c9",
-    "goVersion": "1.25.5",
-    "binarySha256": "3fe6ab3911d3600ad1d949e071ae01d70d25075597269bacd37ce9904f290f81"
+    "linux": "99eb98eb47102c7418c7fed1e666d27e2bfb67c6b5517f7ae6b033748d657ed4",
+    "win": "8b005a933ac0d0899c047617a9cd18418810d9426d0919c824520094a2c893f5"
   },
   "sourceBuild": {
-    "sourceManifestSha256": "1570f165723b9763fc23b1e5870f4e5b4a02b45f562542ce9d75b67a5637512a",
-    "provisionerSha256": "5ad89596ee5b4e320c6bfec710933af6219318fff6c66fb4d911475240deaa5b",
-    "sourceReceiptFingerprint": "b0eb6c10e5883b70016d22c0f5aa1f5e95700df1a194fcebba10d1928b06b257",
-    "moduleGraphSha256": "c4f92118f017f76bfe0bed59ffd5517123e9da6e27318e9968f3abb1c0f62512",
-    "patchedSourceTree": "1f6bf34b1e12d6bcef7750453c4eeff7040ca533",
-    "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
-    "version": "1.15.0-alpha.8.polaris.2",
-    "dependencyModules": [
-      "github.com/sagernet/sing-tun",
-      "github.com/sagernet/nftables"
-    ],
+    "sourceManifestSha256": "d7d8441334f1b2c3a42b15312e26fb40af453b2bb1755c289b5bd4827afaadec",
+    "provisionerSha256": "a2d1379d13b6c1efe28bb07d9f470111d0f5e83eb17439c76da180cac546f63d",
+    "sourceReceiptFingerprint": "151aa5ab53084a25a80f571bf6281b7cd18eb429a1548ad9cafaeba044eecafe",
+    "moduleGraphSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "patchedSourceTree": "208f43bb64c3be80ffb10228a426186a7c2cba58",
+    "buildTree": "208f43bb64c3be80ffb10228a426186a7c2cba58",
+    "version": "1.15.0-alpha.8.polaris.4",
+    "dependencyModules": [],
     "transportPins": {
       "github.com/mdlayher/netlink": "v1.11.2",
       "github.com/mdlayher/socket": "v0.6.0",
@@ -40,12 +29,9 @@
     },
     "platforms": {
       "linux": {
-        "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
+        "buildTree": "208f43bb64c3be80ffb10228a426186a7c2cba58",
         "patchedModules": {
-          "requiredLinked": [
-            "github.com/sagernet/sing-tun",
-            "github.com/sagernet/nftables"
-          ],
+          "requiredLinked": [],
           "allowedAbsent": []
         },
         "transportModules": {
@@ -59,17 +45,13 @@
           ],
           "confirmedAbsent": []
         },
-        "binarySha256": "27e5d7e30dd7cfc8313710341d798296a06840157a5811723e45ba4b12291686"
+        "binarySha256": null
       },
       "win": {
-        "buildTree": "484135e0d95edd95d7c8890a3f0b8ce0dcbe8fed",
+        "buildTree": "f418d5bae6bf691ac5807d6cf1c41fa543e7c349",
         "patchedModules": {
-          "requiredLinked": [
-            "github.com/sagernet/sing-tun"
-          ],
-          "allowedAbsent": [
-            "github.com/sagernet/nftables"
-          ]
+          "requiredLinked": [],
+          "allowedAbsent": []
         },
         "transportModules": {
           "requiredLinked": [
@@ -83,17 +65,13 @@
             "github.com/sagernet/netlink"
           ]
         },
-        "binarySha256": "3fe6ab3911d3600ad1d949e071ae01d70d25075597269bacd37ce9904f290f81"
+        "binarySha256": null
       },
       "mac-x64": {
-        "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
+        "buildTree": "208f43bb64c3be80ffb10228a426186a7c2cba58",
         "patchedModules": {
-          "requiredLinked": [
-            "github.com/sagernet/sing-tun"
-          ],
-          "allowedAbsent": [
-            "github.com/sagernet/nftables"
-          ]
+          "requiredLinked": [],
+          "allowedAbsent": []
         },
         "transportModules": {
           "requiredLinked": [
@@ -107,17 +85,13 @@
             "github.com/sagernet/netlink"
           ]
         },
-        "binarySha256": "fb83ce82ec89bf56c821e623ccf8cbb9a3f36f9e72d66f867381964fe6819d06"
+        "binarySha256": null
       },
       "mac-arm64": {
-        "buildTree": "3b09e1a80e761bbabe7f5d147b994af1cddb68f9",
+        "buildTree": "208f43bb64c3be80ffb10228a426186a7c2cba58",
         "patchedModules": {
-          "requiredLinked": [
-            "github.com/sagernet/sing-tun"
-          ],
-          "allowedAbsent": [
-            "github.com/sagernet/nftables"
-          ]
+          "requiredLinked": [],
+          "allowedAbsent": []
         },
         "transportModules": {
           "requiredLinked": [
@@ -131,11 +105,217 @@
             "github.com/sagernet/netlink"
           ]
         },
-        "binarySha256": "febe21529e48911e43c078039a0a296ef785ca38b3170e888e939e53248e954d"
+        "binarySha256": null
       }
     },
-    "graphScope": "declared-patched-modules",
-    "mainGoModSha256": "b46717b2476acfc3f497d48f466993f644e29f32213a27932a956241b9f68f5f",
+    "graphScope": "core-source-only",
+    "mainGoModSha256": "44f8313894387dd4576ec8839ab2bb74307748e378d79863be778f05abdeaa5c",
     "mainGoSumSha256": "b0b62e1b51d268a1c569bf0ec39b72debb9683036d4913edfd8dee073db3a64f"
+  },
+  "desktopSourceBuild": {
+    "sourceManifestSha256": "3f633d5927bb5bfe7c0751678c44357bac97f5183fbc13a394c8e5568267886a",
+    "provisionerSha256": "a2d1379d13b6c1efe28bb07d9f470111d0f5e83eb17439c76da180cac546f63d",
+    "sourceReceiptFingerprint": "4449e20bba538b404559a5b901f73e0a67df3efc7594deddd3eab51e89996c59",
+    "moduleGraphSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "patchedSourceTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
+    "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
+    "version": "1.15.0-alpha.11.polaris.2",
+    "dependencyModules": [],
+    "transportPins": {
+      "github.com/mdlayher/netlink": "v1.11.2",
+      "github.com/mdlayher/socket": "v0.6.0",
+      "github.com/sagernet/netlink": "v0.0.0-20260814022025-64455d367bbf",
+      "golang.org/x/sys": "v0.47.0",
+      "golang.org/x/net": "v0.57.0",
+      "golang.org/x/sync": "v0.22.0"
+    },
+    "platforms": {
+      "linux": {
+        "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
+        "patchedModules": {
+          "requiredLinked": [],
+          "allowedAbsent": []
+        },
+        "transportModules": {
+          "requiredLinked": [
+            "github.com/mdlayher/netlink",
+            "github.com/mdlayher/socket",
+            "github.com/sagernet/netlink",
+            "golang.org/x/sys",
+            "golang.org/x/net",
+            "golang.org/x/sync"
+          ],
+          "confirmedAbsent": []
+        },
+        "binarySha256": null
+      },
+      "win": {
+        "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
+        "patchedModules": {
+          "requiredLinked": [],
+          "allowedAbsent": []
+        },
+        "transportModules": {
+          "requiredLinked": [
+            "golang.org/x/sys",
+            "golang.org/x/net",
+            "golang.org/x/sync"
+          ],
+          "confirmedAbsent": [
+            "github.com/mdlayher/netlink",
+            "github.com/mdlayher/socket",
+            "github.com/sagernet/netlink"
+          ]
+        },
+        "binarySha256": null
+      },
+      "mac-x64": {
+        "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
+        "patchedModules": {
+          "requiredLinked": [],
+          "allowedAbsent": []
+        },
+        "transportModules": {
+          "requiredLinked": [
+            "golang.org/x/sys",
+            "golang.org/x/net",
+            "golang.org/x/sync"
+          ],
+          "confirmedAbsent": [
+            "github.com/mdlayher/netlink",
+            "github.com/mdlayher/socket",
+            "github.com/sagernet/netlink"
+          ]
+        },
+        "binarySha256": null
+      },
+      "mac-arm64": {
+        "buildTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
+        "patchedModules": {
+          "requiredLinked": [],
+          "allowedAbsent": []
+        },
+        "transportModules": {
+          "requiredLinked": [
+            "golang.org/x/sys",
+            "golang.org/x/net",
+            "golang.org/x/sync"
+          ],
+          "confirmedAbsent": [
+            "github.com/mdlayher/netlink",
+            "github.com/mdlayher/socket",
+            "github.com/sagernet/netlink"
+          ]
+        },
+        "binarySha256": null
+      }
+    },
+    "graphScope": "core-source-only",
+    "mainGoModSha256": "a2d3d373d50a5d1d8a98fac6c3a0393885eeabc8404dfd3435eab41d6426324b",
+    "mainGoSumSha256": "6904f2adc151e575c3751e7bc0734ac40f3ac039b2640b6ceff4293825f68edb",
+    "sourceMode": "fork-commit-v1",
+    "upstreamVersion": "1.15.0-alpha.11",
+    "sourceOwnedReplacements": [
+      {
+        "schemaVersion": 1,
+        "module": "github.com/sagernet/sing-tun",
+        "version": "v0.9.7-0.20261009022811-5c2edb183cc9",
+        "replacementPath": "./third_party/sing-tun",
+        "replacementTree": "18492017863a3bf41df92fe528c2bbe38fe97ab2",
+        "replacementFileCount": 256,
+        "baselineOriginCommit": "5c2edb183cc92eb190d41c04dedfa5519ca3e78c",
+        "baselineZipSha256": "d30c485149d53a88d3d31dd2312b5e4ca97649169ac4d0ed81a918fa80c9bcaf",
+        "baselineModuleSum": "h1:VBWPwC1CM/9ULXCtl120Nh64tmjFsybhBvB3IWzF+Mc=",
+        "baselineFiles": 253,
+        "changedBaselineFiles": [
+          "tun_windows.go"
+        ],
+        "addedFiles": [
+          "windows_dns_configuration.go",
+          "windows_dns_configuration_test.go",
+          "windows_lifecycle_guard_windows_test.go"
+        ],
+        "other252BaselineFilesByteExact": true,
+        "windowsAfterDNSSuffixUnchanged": true,
+        "patchSha256": "812956b42cfbb5d302343998b898b9c6489a93f633b1f446c367c5c24681ecd1",
+        "fingerprintSchema": "fork-source-fingerprint-v1",
+        "fourKernelPolicy": "Collect same schema from each actual new kernel source/build input; existing a01 and mobilealpha8 fingerprints remain historical and unchanged.",
+        "bindingSha256": "fff7ce2035d71e37fc02d06ef22f1e643c147f6adfbde34f69b69d6d9351773b",
+        "bindingPath": "release/dependency-sources/sing-tun-replacement.json",
+        "patchPath": "release/dependency-sources/sing-tun-windows-auto-route.patch"
+      }
+    ]
+  },
+  "historicalDesktopRelease": {
+    "schema": "polaris-app-release-selection-v1",
+    "contractPath": "scripts/desktop-core/release-contract.json",
+    "contractSha256": "0268c8ebfaf41f6b5976de7dec18deda6b5790eedc5c5c84a94704e36a8b4e9d",
+    "version": "1.15.0-alpha.12",
+    "tag": "v1.15.0-alpha.12",
+    "tagObject": "5cedbe7a54594756da544af90ebfd1f403f2e091",
+    "sourceCommit": "577d4b9a089b71d2f0a4ca334b87264b55c10478",
+    "sourceTree": "072dacb999c07c7948816f10efaaaf371da45eb9",
+    "releaseId": 410852499,
+    "librarySha256": {
+      "linux": "99eb98eb47102c7418c7fed1e666d27e2bfb67c6b5517f7ae6b033748d657ed4",
+      "win": "8b005a933ac0d0899c047617a9cd18418810d9426d0919c824520094a2c893f5"
+    }
+  },
+  "historicalDesktopTemporary": {
+    "schema": "polaris-app-temporary-desktop-selection-v1",
+    "contractPath": "scripts/desktop-core/native-dns-candidate.json",
+    "contractSha256": "62ab483f37da5a7cb44c213722e0b92736da3bd232986641dc7e65d87dc7ce8d",
+    "version": "1.15.0-polaris-alpha.12",
+    "tag": "polaris-staging-fe1824314957-run39075665574",
+    "tagObject": "127ee419f28a88e207f61f04e011b440176cbf43",
+    "sourceCommit": "fe182431495711c09bdb3b074ed6aa6309c00cf8",
+    "sourceTree": "9b2fe41af73c5768dccff079ded1e4a489cfa9e1",
+    "releaseId": 416260275,
+    "producer": {
+      "repository": "polaris-arch/sing-box-polaris",
+      "repositoryId": 1421657509,
+      "workflow": ".github/workflows/build.yml",
+      "workflowCommit": "fe182431495711c09bdb3b074ed6aa6309c00cf8",
+      "runId": 39075665574,
+      "runAttempt": 1,
+      "nativeJobs": {
+        "linux": {
+          "id": 117524786053,
+          "name": "Native final-package Cronet and gVisor smoke (linux-amd64-purego)"
+        },
+        "win": {
+          "id": 117524786039,
+          "name": "Native final-package Cronet and gVisor smoke (windows-amd64)"
+        },
+        "mac-x64": {
+          "id": 117524786011,
+          "name": "Native final-package Cronet and gVisor smoke (darwin-amd64)"
+        },
+        "mac-arm64": {
+          "id": 117524786071,
+          "name": "Native final-package Cronet and gVisor smoke (darwin-arm64)"
+        }
+      }
+    },
+    "librarySha256": {
+      "linux": "99eb98eb47102c7418c7fed1e666d27e2bfb67c6b5517f7ae6b033748d657ed4",
+      "win": "8b005a933ac0d0899c047617a9cd18418810d9426d0919c824520094a2c893f5"
+    }
+  },
+  "historicalDesktopReleaseContractPath": "scripts/desktop-core/historical-release-contract-577d4b9.json",
+  "desktopRelease": {
+    "schema": "polaris-app-release-selection-v1",
+    "contractPath": "scripts/desktop-core/release-contract.json",
+    "contractSha256": "f99daa91345df468b18e9c61451cc6465ffdce137fb1adc33829053ab2b194f3",
+    "version": "1.15.0-polaris-alpha.12",
+    "tag": "v1.15.0-polaris-alpha.12",
+    "tagObject": "916d9533ba0a6092e34bc53f63dace63e11fa85e",
+    "sourceCommit": "a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae",
+    "sourceTree": "830f7256af499e5ad3e7da9a79f0a377ca38fc77",
+    "releaseId": 416392475,
+    "librarySha256": {
+      "linux": "99eb98eb47102c7418c7fed1e666d27e2bfb67c6b5517f7ae6b033748d657ed4",
+      "win": "8b005a933ac0d0899c047617a9cd18418810d9426d0919c824520094a2c893f5"
+    }
   }
 }

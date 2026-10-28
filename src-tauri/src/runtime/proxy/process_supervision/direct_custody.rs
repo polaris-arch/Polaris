@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::runtime::helper::HelperStopTarget;
+use crate::runtime::proxy::mesh_apply::owner_proof::{
+    LocalNativeTerminal, NativeExited, ProducerCell, SealedNativeMembers,
+};
 use crate::runtime::proxy::process_supervision::{DirectCoreRun, DirectRunOrigin, RunIdentity};
 use polaris_core_supervisor::ChildObservation;
 use polaris_helper_proto::{HelperBirthTarget, StartNotAdmitted};
@@ -30,7 +33,7 @@ impl Default for DirectCoreSlot {
     }
 }
 
-pub(super) struct SlotInstance;
+pub(in crate::runtime::proxy) struct SlotInstance;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BackendFence {
@@ -105,6 +108,11 @@ impl WorkerNonce {
     pub(super) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn fixture_for_test() -> Self {
+        Self::new()
+    }
 }
 
 /// Holds an exclusive borrow of a proven Empty slot through synchronous spawn.
@@ -114,8 +122,38 @@ pub(in crate::runtime::proxy) struct EmptyDirectSlot<'a> {
 }
 
 impl EmptyDirectSlot<'_> {
-    pub(in crate::runtime::proxy) fn install_running(self, run: DirectCoreRun) {
+    /// Only this actual returned-Child path can attach the one-member native seal.
+    pub(in crate::runtime::proxy) fn spawn_native(
+        self,
+        producer: &Arc<ProducerCell>,
+        birth_generation: u64,
+        factory_call: impl FnOnce() -> Result<Child, polaris_core_supervisor::SpawnError>,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+        before_factory: impl FnOnce(),
+    ) -> Result<(u32, RunIdentity), crate::runtime::proxy::StartError> {
+        let identity = RunIdentity::new();
+        // TokioSpawner invokes Drain after cmd.spawn and before returning. Entered
+        // is retained even if that synchronous callback panics with a Child born.
+        let factory = producer.enter_factory(identity.clone(), birth_generation)?;
+        before_factory();
+        let child = match factory_call() {
+            Ok(child) => child,
+            Err(error) => {
+                // Only a returned native spawn Err proves this invocation born no Child.
+                factory.returned_no_child();
+                return Err(crate::runtime::proxy::StartError::from(error.to_string()));
+            }
+        };
+        let pid = child.id().unwrap_or(0);
+        let mut run = DirectCoreRun::with_identity(child, identity.clone());
+        run.native_members = Some(SealedNativeMembers::attached(
+            factory,
+            Arc::clone(&self.slot.instance),
+            main_token.clone(),
+        ));
+        run.main_token = main_token;
         self.slot.state = SlotState::Running(run);
+        Ok((pid, identity))
     }
 }
 
@@ -139,6 +177,7 @@ enum StopPhase {
         nonce: WorkerNonce,
         inflight: bool,
         exit: Option<ExitStatus>,
+        native_exit: Option<NativeExited>,
     },
     Armed {
         nonce: WorkerNonce,
@@ -820,6 +859,7 @@ impl DirectCoreSlot {
                 nonce: nonce.clone(),
                 inflight: true,
                 exit: None,
+                native_exit: None,
             },
         });
         Ok(Some((identity, nonce)))
@@ -856,7 +896,10 @@ impl DirectCoreSlot {
             Ok(custody) => custody,
             Err(error) => return Poll::Ready(Err(error)),
         };
-        let StopPhase::NativeWait { exit, .. } = &mut custody.phase else {
+        let StopPhase::NativeWait {
+            exit, native_exit, ..
+        } = &mut custody.phase
+        else {
             unreachable!("native booking was just checked");
         };
         if let Some(status) = *exit {
@@ -864,6 +907,11 @@ impl DirectCoreSlot {
         }
         match custody.run.poll_wait_with(cx, poll) {
             Poll::Ready(Ok(status)) => {
+                *native_exit = custody
+                    .run
+                    .native_members
+                    .as_ref()
+                    .map(|members| members.observe_exit(status, nonce.clone()));
                 *exit = Some(status);
                 Poll::Ready(Ok(status))
             }
@@ -900,16 +948,53 @@ impl DirectCoreSlot {
         release_main: impl FnOnce(
             &crate::runtime::tailscale_login_core::MainBirthToken,
         ) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<LocalNativeTerminal>, String> {
+        let instance = Arc::clone(&self.instance);
         let custody = self.native_stop_custody(expected, nonce)?;
-        if !matches!(&custody.phase, StopPhase::NativeWait { exit: Some(_), .. }) {
+        let StopPhase::NativeWait {
+            exit: Some(status),
+            native_exit,
+            ..
+        } = &custody.phase
+        else {
             return Err("direct Child exit is not confirmed by native wait".into());
-        }
+        };
+        let validation = match (&custody.run.native_members, native_exit) {
+            (Some(members), Some(fact)) if fact.status() == *status => {
+                Some(members.consume_native_exit(
+                    fact,
+                    &instance,
+                    &custody.run.identity,
+                    custody.run.main_token.as_ref(),
+                )?)
+            }
+            // Existing unbound synthetic fixtures retain ordinary behavior only;
+            // they issue neither a NativeExited nor a LocalNativeTerminal.
+            #[cfg(test)]
+            (None, None) => None,
+            _ => return Err("direct Child native birth binding is missing or inconsistent".into()),
+        };
         if let Some(token) = &custody.run.main_token {
             release_main(token)?;
         }
+        // Last fallible step succeeded. No lock/allocation/Err follows this mark.
+        let terminal = validation.map(|validation| validation.retire());
         self.state = SlotState::Empty;
-        Ok(())
+        Ok(terminal)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::proxy) fn native_exit_for_test(&self) -> bool {
+        matches!(
+            &self.state,
+            SlotState::Stopping(DirectStoppingCustody {
+                phase: StopPhase::NativeWait {
+                    native_exit: Some(_),
+                    ..
+                },
+                ..
+            })
+        )
     }
 
     /// Cancellation/error relinquishes only this waiter. The Child, main

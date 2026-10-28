@@ -243,21 +243,80 @@ fn exemption_entries_are_well_formed() {
     assert!(bad.is_empty(), "\n豁免表结构有问题：\n{}\n", bad.join("\n"));
 }
 
-/// 🔴 豁免面反哨兵：条目数必须落在 `[1, 3]`。
+/// 原有豁免最多 3 条；iOS bridge 只有精确的 iOS target 可占独立增量名额。
+fn exemption_surface_fits_budget(table: &serde_json::Map<String, Value>) -> bool {
+    let ios_bridge = table.get("tauri-plugin-polaris-ios");
+    if ios_bridge.is_some_and(|entry| {
+        entry.get("targets") != Some(&serde_json::json!(["aarch64-apple-ios"]))
+    }) {
+        return false;
+    }
+    !table.is_empty() && table.len() - usize::from(ios_bridge.is_some()) <= 3
+}
+
+/// 🔴 豁免面反哨兵：保留原 3 条预算，只给 iOS bridge 一个受限增量名额。
 ///
 /// 0 条 = 有人清空了豁免表却没有在本机说明原因 —— CI 上一批依赖 host 没有的 C 工具链的包
-/// 会同时炸；超过 3 条 = 豁免面在扩大，交叉检查实际覆盖的东西越来越少，必须先说清为什么
-/// 又多豁免了一个包，而不是让门自己适应放行。
+/// 会同时炸。新增 bridge 在 iOS 上因缺 xcrun 而无法通过 objc2 的 build script；它只能豁免
+/// aarch64-apple-ios，Windows / Darwin / Android 仍覆盖，反腐烂步骤仍检查豁免是否必要。
+/// 其它包仍共享原来的 3 条预算，不能借这个增量名额继续扩大豁免面。
 #[test]
 fn exemption_surface_is_bounded() {
     let table = exempt_table();
-    let n = table.len();
     assert!(
-        n >= 1,
-        "豁免表是空的 —— 清空豁免表须先在本机说明原因，否则 CI 上一堆包会同时炸"
+        exemption_surface_fits_budget(&table),
+        "豁免表须非空，原有预算最多 3 条；仅 tauri-plugin-polaris-ios 可占独立增量名额，\
+         且 targets 必须恰为 [aarch64-apple-ios]。当前表：{table:?}"
     );
-    assert!(
-        n <= 3,
-        "豁免表有 {n} 条 —— 豁免面在扩大，先说清为什么，而不是顺手再加一条"
+}
+
+#[test]
+fn exemption_budget_rejects_unrelated_fourth_and_fifth_entries() {
+    // 这里只验证预算；条目的完整结构仍由 exemption_entries_are_well_formed 把关。
+    let mut table = serde_json::json!({
+        "polaris": {},
+        "polaris-unlock-transport": {},
+        "polaris-helper": {}
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    assert!(exemption_surface_fits_budget(&table));
+
+    table.insert("unrelated-package".into(), serde_json::json!({}));
+    assert!(!exemption_surface_fits_budget(&table));
+    table.insert(
+        "tauri-plugin-polaris-ios".into(),
+        serde_json::json!({"targets": ["aarch64-apple-ios"]}),
     );
+    assert!(!exemption_surface_fits_budget(&table));
+
+    table.remove("unrelated-package");
+    assert!(exemption_surface_fits_budget(&table));
+    let bridge = table.remove("tauri-plugin-polaris-ios").unwrap();
+    table.insert("tauri-plugin-polaris-ios-renamed".into(), bridge);
+    assert!(!exemption_surface_fits_budget(&table));
+
+    table.clear();
+    assert!(!exemption_surface_fits_budget(&table));
+}
+
+#[test]
+fn ios_bridge_exemption_cannot_expand_targets_even_below_budget() {
+    for targets in [
+        serde_json::json!(["x86_64-pc-windows-msvc"]),
+        serde_json::json!(["aarch64-apple-ios", "x86_64-pc-windows-msvc"]),
+        serde_json::json!(["aarch64-apple-ios", "x86_64-apple-darwin"]),
+        serde_json::json!(["aarch64-apple-ios", "aarch64-linux-android"]),
+        serde_json::json!(["aarch64-apple-ios", "aarch64-apple-ios"]),
+        serde_json::json!([]),
+        serde_json::json!("aarch64-apple-ios"),
+        Value::Null,
+    ] {
+        let table = serde_json::json!({"tauri-plugin-polaris-ios": {"targets": targets}});
+        assert!(
+            !exemption_surface_fits_budget(table.as_object().unwrap()),
+            "iOS bridge 不得扩大 targets：{targets:?}"
+        );
+    }
 }

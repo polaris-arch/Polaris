@@ -1295,3 +1295,31 @@ fn import_rule_with_missing_profile_keeps_reference_and_fails_closed() {
         RuleEnv::Skip(PRUNE_PROFILE_REF_INVALID)
     );
 }
+
+#[test]
+fn explicit_backup_retains_node_owned_inactive_credential_and_replace_drops_old_node() {
+    let current = json!({"servers":[{"id":"old", "name":"Old", "protocol":"tailscale",
+        "tailscaleSettings":{"authKey":"removed-node-active-sentinel",
+        "retainedAuthKey":{"authKey":"removed-node-retained-sentinel", "controlAuthority":"https://issuer.invalid"}}}]});
+    let exported = json!({"servers":[{"id":"new-id", "name":"New", "protocol":"tailscale",
+        "tailscaleSettings":{"retainedAuthKey":{"authKey":"legal-backup-sentinel", "controlAuthority":"https://issuer.invalid"},
+        "unknown":"keep"}}]});
+    let picked = pick_categories(&exported, &[C::MeshNodes]);
+    assert_eq!(picked["servers"], exported["servers"]);
+    let parsed = parse_backup_content(&picked.to_string()).unwrap();
+    let merged = merge_categories(&current, &parsed.config, &[C::MeshNodes]);
+    assert_eq!(merged.config["servers"], exported["servers"]);
+    assert!(!merged
+        .config
+        .to_string()
+        .contains("removed-node-active-sentinel"));
+    assert!(!merged
+        .config
+        .to_string()
+        .contains("removed-node-retained-sentinel"));
+    assert!(merged.config.get("retainedAuthKey").is_none());
+    assert_eq!(count_category(&parsed.config, C::MeshNodes), 1);
+    let summary = serde_json::to_string(&build_backup_info(&parsed.config, 0)).unwrap();
+    assert!(!summary.contains("legal-backup-sentinel"));
+    assert!(!summary.contains("retainedAuthKey"));
+}

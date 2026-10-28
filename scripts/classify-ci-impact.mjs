@@ -52,7 +52,7 @@ const MACOS = Object.freeze(['macos-arm64', 'macos-x64']);
 const NO_LEG = Object.freeze([]);
 
 /**
- * fail-closed 的作用域根。这三棵树的内容全部编译进安装包、随包分发或参与打包契约，
+ * fail-closed 的作用域根。这些树的内容全部编译进安装包、随包分发或参与打包契约，
  * 且 scope 数量有限可枚举 —— 所以「没登记」在这里是错误，不是默认放行。
  *
  * `resources/` 是 2026-08-30 补上的第三条姊妹腿：`resources/data/` 的 28 个 `.srs` **入库**
@@ -61,7 +61,7 @@ const NO_LEG = Object.freeze([]);
  * 而此前分类器对 `resources/**` 输出 `kernel=false platforms=[] hasPackage=false`（实测），
  * 与改 `crates/`、改 `src-tauri/` 是同一个 fail-open。
  */
-export const REGISTRY_ROOTS = Object.freeze(['crates/', 'src-tauri/', 'resources/']);
+export const REGISTRY_ROOTS = Object.freeze(['crates/', 'src-tauri/', 'resources/', 'vendor/']);
 
 /**
  * scope 粒度：`crates/<name>/`、`src-tauri/<entry>`、`src-tauri/src/<entry>`。
@@ -74,6 +74,7 @@ const SCOPE_DEPTH = Object.freeze([
   // `resources/<子树>/`：data/ dashboard/ 与四个平台目录各自一个 scope；
   // 根下的散文件（.gitkeep / .fetch-stamp.json）按单文件 scope 归一。
   ['resources/', 2],
+  ['vendor/', 2],
 ]);
 
 /**
@@ -103,6 +104,11 @@ export function scopeOf(rawPath) {
  * 用来把「整棵树四平台」收窄成单腿。
  */
 export const PACKAGE_IMPACT_SCOPES = Object.freeze({
+  'vendor/swift-rs/': {
+    kernel: false,
+    platforms: ALL,
+    why: 'Cargo crates.io patch 使用的本地 Swift/Rust 桥源码；库及构建脚本可能改变桌面 Tauri 产物，须保留四平台打包门。',
+  },
   'crates/config-engine/': {
     kernel: true,
     platforms: NO_LEG,
@@ -321,6 +327,11 @@ const APP_LOGIC = (what) =>
  * value 是理由。在这里 = 「有人看过、判过」，不是「没人管过」。
  */
 export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
+  'crates/tauri-plugin-polaris-ios/':
+    'iOS 原生 VPN/viewport bridge；runtime 依赖及 Swift 构建均限 target_os=ios。当前桌面/Android包不链接它，'
+    + '无 iOS CI 发布腿；共享纯 Rust lifecycle 测试由 workspace test 覆盖，Apple目标另以实际Xcode构建验证。',
+  'src-tauri/Info.ios.plist':
+    'iOS scene/bundle 配置，Tauri 仅在 iOS 构建消费；当前桌面与 Android 包不读取。无 iOS CI 发布腿，实际Xcode归档另验。',
   'crates/core-supervisor/': APP_LOGIC('sing-box 进程 spawn / readiness / 崩溃自愈；核路径由调用方传入'),
   'crates/dns-race/': APP_LOGIC('节点域名解析竞速 sidecar（UDP server + DNS wire 编解码）'),
   'crates/helper-client/': APP_LOGIC(
@@ -371,9 +382,10 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
     + '（release-risk.yml 的条件是 has_package==true），判据由本机全量门承担。',
 
   'src-tauri/gen/':
-    '两棵子树、同一条结论「不影响桌面安装包」：`gen/schemas` 是 tauri-build 构建期重生成的 ACL/schema 产物，'
+    '平台生成子树不影响桌面安装包：`gen/schemas` 是 tauri-build 构建期重生成的 ACL/schema 产物，'
     + '不是包内资产（生成源 capabilities/ 与 permissions/ 已在影响表）；`gen/android` 是**入库的** Gradle 工程'
-    + '（49 个文件，.gitignore :41 起有承重注释），四条桌面腿一个字节都不读它。'
+    + '（入库工程），四条桌面腿一个字节都不读它；`gen/apple` 是 iOS 源码自编译的 Xcode 工程，'
+    + '同样不被桌面/Android腿读取，当前无 iOS CI 发布腿。'
     + '🔴 但 `gen/android/` **不是没人管**：它是 Android APK 腿的主要触发面，登记在 [`ANDROID_IMPACT_SCOPES`]，'
     + '改它会点亮 `android=true`。本条只说「不加桌面腿」，别据此推断「改它没有门」。',
   'src-tauri/tests/':
@@ -477,6 +489,13 @@ export const NO_PACKAGE_IMPACT_SCOPES = Object.freeze({
  * `--full` 亦然。默认后果是多跑一条腿，不是静默放行。
  */
 export const ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/proxy/android_bridge/tailscale_store.rs': {
+    why: '原 android_bridge.rs 的 scoped store 模块外移后，父声明 cfg(any(android,test)) 使本文件在 '
+      + 'production 中只参与 Android 编译；原实际 dep-info 的 Android − host 差集已确认该精确文件。'
+      + '同父模块、同 public API、原 decoder/body 与 Android 调用保持，文件字节进入 APK 的 Rust cdylib，'
+      + '必须点亮 Android 编译/链接与打包腿。whole Android crossClippy/check 覆盖目标编译，host decoder '
+      + 'tests 与 check-android-bridge.mjs 覆盖原 37 个命令；这些门不签实际 JNI 调用、设备或 NoOwner 语义。',
+  },
   'scripts/core-source-provision.py': {
     why: '共同 core/dependency source provider 须点亮 Android AAR/APK 来源腿，避免共同来源变更静默沿用桌面豁免。'
       + 'Android builder 直接消费原 provider checkout，prelookup 与 cached/fresh 共享完整来源和实际工具/SDK 谓词。'
@@ -534,6 +553,21 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   'src-tauri/src/runtime/tailscale_login_core.rs': {
     why: 'Android-only production adapter starts and closes an independent libbox login instance through the native bridge; APK compilation verifies this cfg branch and Java factory ABI.',
   },
+  'src-tauri/src/runtime/mesh.rs': {
+    why: 'Android Logout dispatch and strict auth-state retirement consume the original native store custody and held target reservation. '
+      + 'These Android production branches enter the linked Rust cdylib and require fresh APK cfg/bridge compilation; '
+      + 'host FileStore tests cannot verify packaged JNI behavior or actual writer retirement.',
+  },
+  'src-tauri/src/runtime/proxy/prerequisite.rs': {
+    why: 'Android credential actions bind the original Main raw-config digest, complete claim scope, selected current runtime run and exact Stop. '
+      + 'These cfg branches enter the APK Rust cdylib and must compile against the packaged native bridge; '
+      + 'host selection negatives do not attest Android SDK execution or native cleanup.',
+  },
+  'src-tauri/src/runtime/tailscale_login_core/attempts.rs': {
+    why: 'The original Android Attempt retains private Main/Login custody or an exact Warm tuple and same-Entry action reservation across cancellation and unknown completion. '
+      + 'These production cfg fields and consumers enter the APK Rust cdylib; fresh APK compilation covers their native adapter types, '
+      + 'while host bookkeeping tests cannot prove on-device terminal or reservation release.',
+  },
   'src-tauri/src/android_tls.rs': {
     why:
       '平台证书校验器的初始化本体，也是**全仓唯一的 JNI 导出点**（本文件 `#[jni::jni_mangle(...)]`）。'
@@ -567,6 +601,12 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
   },
   'scripts/android-rust-ndk.version': {
     why: 'Rust Android 构建默认使用的已验稳定 NDK 版本；改版本须重跑 APK 腿验证交叉编译与 Gradle。',
+  },
+  'scripts/strip-android-release-native.mjs': {
+    why: 'Release native producer strips copied libraries before APK packaging; changes require the actual Android APK and source-receipt checks.',
+  },
+  'scripts/strip-android-release-native.test.mjs': {
+    why: 'Mutation checks preserve runtime/JNI/Go metadata and source AAR bytes during release stripping; changes must retain actual Android package validation.',
   },
   'scripts/verify-apk.mjs': {
     why:
@@ -736,11 +776,18 @@ export const ANDROID_IMPACT_SCOPES = Object.freeze({
  * 在剥掉字符串的面上也还在，否则那是内联夹具的字符串在喂判据），加上声明了 JNI 导出的文件。
  * 「只在 android 上编译、而文件自己不含 `target_os` 字样」的那一类**不在本表的取材面上** ——
  * 那是 dep-info 对差门的射程，两者互补。
- * 只在注释里提过 android 的文件（今天是 `src-tauri/src/runtime/mesh.rs`、
- * `src-tauri/src/runtime/route_binding.rs`）**不进表** —— 把它们登记进来等于承认判据被自己的注释喂饱，
- * 那正是完备性门 C 组断言要证伪的形态。
+ * 只在注释里提过 android 的文件**不进表** —— 把它们登记进来等于承认判据被自己的注释喂饱，
+ * 那正是完备性门 C 组固定 comment-only 合成负例要证伪的形态；原 mesh.rs 已有真实 Android 分支。
  */
 export const NO_ANDROID_IMPACT_SCOPES = Object.freeze({
+  'src-tauri/src/runtime/tailscale_login_core/tests/attempt_lifecycle.rs':
+    '原 cfg(test) 登录动作回归，只由 ci.yml 的 host cargo test --workspace 执行纯 Attempt/CAS 与源码绑定负门，测试代码不进入 APK。'
+    + 'Android cargo check -p polaris 不带 --all-targets，APK 构建也不构建 test target，因此其中 Android test cfg 编译/运行没有被 APK 腿保证；'
+    + '点亮 APK 腿不能补成这些测试的实际 Android 覆盖或 scoped writer 证明。',
+  'src-tauri/src/runtime/tailscale_login_core/tests/process_exit.rs':
+    '原 cfg(test) Child/supervisor 回归在 ci.yml 的 host cargo test --workspace 核真实 mock close/retry 与保留 Entry/config 的负门，不随 APK 发布。'
+    + 'Android cargo check -p polaris 未包含测试目标，APK 构建同样不编 test target；Android test cfg 的编译/运行缺口仍如实保留，'
+    + 'host close fixture 不能签 JNI terminal、实际 native retirement 或设备验收。',
   'src-tauri/src/commands/android_batch_qa.rs':
     '单一 Debug Android 批次入口；android+debug_assertions 分支走已有预算 plugin 桥，其他构型零资源 disabled stub。'
     + 'Android cargo check 守 cfg 类型，check-android-bridge A15 守 release guard/实际 BoxService 观察接线；'

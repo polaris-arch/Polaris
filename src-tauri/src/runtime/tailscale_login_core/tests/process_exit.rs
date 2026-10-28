@@ -21,6 +21,10 @@ async fn legacy_void_methods_and_missing_pid_cannot_attest_cleanup() {
     let mut child = UnprovenChild(terminations.clone());
     assert!(child.wait_result().await.is_err());
     assert!(child.after_exit().await.is_err());
+    assert!(
+        child.native_exit().is_none(),
+        "unbound login cannot issue a temp native fact"
+    );
     assert!(child.close_confirmed().await.is_err());
     assert_eq!(terminations.load(Ordering::SeqCst), 1);
     assert!(child.close_confirmed().await.is_err());
@@ -90,6 +94,145 @@ impl Drop for ScriptedChild {
 }
 
 struct ScriptedSpawner(Mutex<Option<Box<dyn LoginCoreChild>>>);
+
+struct NoWarmSubscription;
+
+#[async_trait]
+impl LoginStatusSubscriber for NoWarmSubscription {
+    async fn subscribe(
+        &self,
+        _port: u16,
+        _secret: &str,
+    ) -> Result<Box<dyn LoginStatusStream>, String> {
+        panic!("a warm observation must not subscribe or authorize a login")
+    }
+}
+
+#[tokio::test]
+async fn warm_uses_original_close_supervisor_without_status_or_completing_account_action() {
+    for cancelled in [false, true] {
+        let registry = LoginCoreRegistry::with_deps(
+            Arc::new(ScriptedSpawner(Mutex::new(None))),
+            Arc::new(FakeChecker { ok: true }),
+            Arc::new(NoWarmSubscription),
+            Arc::new(|| Ok(PathBuf::from("/fake/sing-box"))),
+            Duration::from_secs(60),
+        );
+        let attempt = registry.attempts.prepare("ts1", "warm-action").unwrap();
+        let dir = temp_ud();
+        let config_path = dir.join("tailscale-login-ts1-71.json");
+        std::fs::write(&config_path, "{}").unwrap();
+        let (wait_tx, wait_rx) = mpsc::unbounded_channel();
+        let (close_tx, close_rx) = mpsc::unbounded_channel();
+        let close_entered = Arc::new(Semaphore::new(0));
+        let reaped = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let child: LoginChildCustody = Arc::new(tokio::sync::Mutex::new(Box::new(ScriptedChild {
+            wait_rx,
+            close_rx,
+            wait_entered: Arc::new(Semaphore::new(0)),
+            close_entered: close_entered.clone(),
+            reaped: reaped.clone(),
+            dropped: dropped.clone(),
+        })));
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+        let (closed_tx, mut closed_rx) = watch::channel(None);
+        registry.shared.insert(
+            "ts1".into(),
+            LoginEntry {
+                epoch: 71,
+                attempt_id: "warm-action".into(),
+                pid: None,
+                cancel_tx: cancel_tx.clone(),
+                closed_rx: closed_rx.clone(),
+                _child: Some(child.clone()),
+                #[cfg(target_os = "android")]
+                android_instance: None,
+                #[cfg(target_os = "android")]
+                android_authority: None,
+            },
+        );
+        attempt.process_owned.store(true, Ordering::SeqCst);
+        let emitter = Arc::new(FakeEmitter::default());
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(subscribe_and_supervise(
+            SuperviseCtx {
+                shared: registry.shared.clone(),
+                attempt: attempt.clone(),
+                attempt_id: "warm-action".into(),
+                server_id: "ts1".into(),
+                node_name: "warm".into(),
+                tag_to_id: BTreeMap::from([(TAILSCALE_LOGIN_ENDPOINT_TAG.into(), "ts1".into())]),
+                config_path: config_path.clone(),
+                epoch: 71,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+                emitter: emitter.clone(),
+                closed_tx,
+                warm: true,
+                #[cfg(target_os = "android")]
+                android_instance: None,
+            },
+            child.clone(),
+            Arc::new(NoWarmSubscription),
+            TailscaleLoginApiService {
+                port: 1,
+                secret: "unused".into(),
+            },
+            cancel_rx,
+            ready_tx,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), close_entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        close_tx.send(Err("fixture close failed".into())).unwrap();
+        closed_rx.changed().await.unwrap();
+        assert_eq!(
+            *closed_rx.borrow(),
+            Some(Err("fixture close failed".into()))
+        );
+        assert!(registry.shared.contains("ts1"));
+        assert!(config_path.exists());
+        assert!(!reaped.load(Ordering::SeqCst));
+        assert!(!attempt.is_finished());
+        assert!(attempt.process_owned.load(Ordering::SeqCst));
+        assert!(emitter.progress.lock().unwrap().is_empty());
+        assert!(emitter.captured.lock().unwrap().is_empty());
+        if cancelled {
+            attempt.cancel();
+        }
+        // The original cancellation channel retries the original Child; no replacement birth.
+        cancel_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), close_entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        close_tx.send(Ok(())).unwrap();
+        assert!(matches!(
+            ready_rx.await.unwrap(),
+            StartLoginOutcome::Started
+        ));
+        task.await.unwrap();
+        assert!(reaped.load(Ordering::SeqCst));
+        assert!(!registry.shared.contains("ts1"));
+        assert!(!config_path.exists());
+        assert_eq!(
+            attempt.is_finished(),
+            cancelled,
+            "only a cancelled request completes; warm is not authorization"
+        );
+        assert!(!attempt.process_owned.load(Ordering::SeqCst));
+        assert!(emitter.progress.lock().unwrap().is_empty());
+        assert!(emitter.captured.lock().unwrap().is_empty());
+        assert_eq!(attempt.while_active(|| ()).is_some(), !cancelled);
+        drop(wait_tx);
+        drop(child);
+        assert!(dropped.load(Ordering::SeqCst));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
 
 #[async_trait]
 impl LoginCoreSpawner for ScriptedSpawner {
@@ -376,6 +519,9 @@ async fn shutdown_in_spawn_window_cancels_exact_published_birth_before_ready() {
                     LoginRequest {
                         attempt_id: "exit-spawn".into(),
                         mode: LoginMode::Browser,
+                        replace_identity: false,
+                        reuse_retained_auth_key: false,
+                        expected_credential_revision: None,
                     },
                     &MainLoginSnapshot::default,
                     Arc::new(FakeEmitter::default()),
@@ -419,6 +565,8 @@ async fn pc_child_requires_native_wait_even_when_pid_is_absent_and_repeated_clos
         child: Some(child),
         reaped: false,
         wait_identity_lost: false,
+        native_attachment: None,
+        native_exit: None,
     };
     assert!(child.after_exit().await.is_err());
     // Simulate a prior caller of native Child::wait without this wrapper's receipt.
@@ -434,6 +582,7 @@ async fn pc_child_requires_native_wait_even_when_pid_is_absent_and_repeated_clos
     child.after_exit().await.unwrap();
     child.close_confirmed().await.unwrap();
     child.wait_result().await.unwrap();
+    assert!(child.native_exit().is_none());
 }
 
 #[cfg(unix)]
@@ -455,6 +604,8 @@ async fn dropping_native_close_future_keeps_the_child_and_never_mints_an_exit_re
         child: Some(process),
         reaped: false,
         wait_identity_lost: false,
+        native_attachment: None,
+        native_exit: None,
     };
     let mut close = child.close_confirmed();
     assert!(
@@ -464,11 +615,13 @@ async fn dropping_native_close_future_keeps_the_child_and_never_mints_an_exit_re
     );
     drop(close);
     assert!(!child.reaped);
+    assert!(child.native_exit().is_none());
     assert!(child.after_exit().await.is_err());
     assert!(child.child.as_mut().unwrap().try_wait().unwrap().is_none());
     child.child.as_mut().unwrap().start_kill().unwrap();
     child.wait_result().await.unwrap();
     child.after_exit().await.unwrap();
+    assert!(child.native_exit().is_none());
 }
 
 #[cfg(unix)]
@@ -483,6 +636,8 @@ async fn native_echild_is_an_error_and_permanently_quarantines_the_numeric_wait_
         child: Some(process),
         reaped: false,
         wait_identity_lost: false,
+        native_attachment: None,
+        native_exit: None,
     };
     // Existing nix safely reaps this exact stand-in outside Tokio. Its own native wait must
     // now return ECHILD; no mock can make a swallowed OS error turn this regression green.
@@ -498,6 +653,7 @@ async fn native_echild_is_an_error_and_permanently_quarantines_the_numeric_wait_
     assert!(child.wait_result().await.is_err());
     assert!(!child.reaped);
     assert!(child.wait_identity_lost);
+    assert!(child.native_exit().is_none());
     assert!(child.after_exit().await.is_err());
     assert!(child.close_confirmed().await.is_err());
     assert!(
@@ -507,4 +663,72 @@ async fn native_echild_is_an_error_and_permanently_quarantines_the_numeric_wait_
     // Drop quarantines this invalid native wait handle; it may neither signal the old PID
     // nor hand it to Tokio's orphan queue for another waitpid after PID reuse.
     drop(child);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ordinary_tokio_factory_drains_both_streams_without_a_temp_native_fact() {
+    use tokio::io::AsyncReadExt;
+
+    let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("crates/core-supervisor/src/config_gate/check_custody/tests/fixtures/exit-seven.sh");
+    let (drained, drainage) = tokio::sync::oneshot::channel();
+    let req = SpawnRequest::new(
+        binary,
+        PathBuf::from("owned-stand-in-unused-config.json"),
+        StdioPolicy::drain(move |mut stdout, mut stderr| {
+            tokio::spawn(async move {
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let result =
+                    tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err),);
+                drained.send(result).unwrap();
+            });
+        }),
+    );
+    let mut child = TokioLoginCoreSpawner.spawn(req).await.unwrap();
+    assert!(child.native_exit().is_none());
+    child.wait_result().await.unwrap();
+    child.after_exit().await.unwrap();
+    child.close_confirmed().await.unwrap();
+    assert!(child.native_exit().is_none());
+    let (stdout, stderr) = tokio::time::timeout(LOGIN_REAP_TIMEOUT, drainage)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stdout.unwrap(), 0);
+    assert_eq!(stderr.unwrap(), 0);
+}
+
+#[test]
+fn lazy_tailscale_claim_directory_matches_constructor_without_creating_state() {
+    let root = crate::test_support::TestDir::new("polaris-lazy-ts-claim-");
+    let directory = root.join("config/tailscale/srv-1");
+    let actual = canonical_tailscale_claim_directory(&directory).unwrap();
+    assert_eq!(
+        actual,
+        root.canonicalize().unwrap().join("config/tailscale/srv-1")
+    );
+    assert!(!directory.exists());
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    assert_eq!(
+        canonical_tailscale_claim_directory(&directory).unwrap(),
+        actual
+    );
+    assert!(canonical_tailscale_claim_directory(&root.join("config/not-tailscale/srv-1")).is_err());
+    assert!(
+        canonical_tailscale_claim_directory(&root.join("config/tailscale/../outside")).is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lazy_tailscale_claim_rejects_symlink_root_escape() {
+    let root = crate::test_support::TestDir::new("polaris-lazy-ts-escape-");
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::create_dir_all(root.join("outside")).unwrap();
+    std::os::unix::fs::symlink(root.join("outside"), root.join("config/tailscale")).unwrap();
+    assert!(canonical_tailscale_claim_directory(&root.join("config/tailscale/srv-1")).is_err());
 }

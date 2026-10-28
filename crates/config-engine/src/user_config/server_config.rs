@@ -209,7 +209,66 @@ pub struct WireGuardSettings {
     pub warp_device: Option<crate::user_config::protocol_settings::WarpDevice>,
 }
 
+/// One inactive credential in the original node configuration. This is never core input.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedTailscaleAuthKey {
+    pub auth_key: String,
+    pub control_authority: String,
+}
+
+impl<'de> Deserialize<'de> for RetainedTailscaleAuthKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Record {
+            auth_key: String,
+            control_authority: String,
+        }
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let record: Record = serde_json::from_value(value)
+            .map_err(|_| serde::de::Error::custom("Invalid retained Tailscale credential"))?;
+        Ok(Self {
+            auth_key: record.auth_key,
+            control_authority: record.control_authority,
+        })
+    }
+}
+
+impl std::fmt::Debug for RetainedTailscaleAuthKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RetainedTailscaleAuthKey([REDACTED])")
+    }
+}
+
 /// Tailscale 设置（上游 `TailscaleSettings`）。账号制 mesh，sing-box endpoint。
+/// Fields deliberately replaceable by an explicit candidate; sourceTag still belongs to
+/// the saved node. Both existing runtime merge legs preserve unmodeled source data.
+pub const TAILSCALE_CANDIDATE_SETTINGS_FIELDS: &[&str] = &[
+    "sourceTag",
+    "authKey",
+    "retainedAuthKey",
+    "retainedAuthKeyAvailable",
+    "tailscaleCredentialRevision",
+    "allowInternet",
+    "alwaysRouteSubnets",
+    "exitNode",
+    "exitNodeAllowLanAccess",
+    "acceptRoutes",
+    "routes",
+    "controlUrl",
+    "hostname",
+    "ephemeral",
+    "advertiseRoutes",
+    "reverseMesh",
+    "advertiseTags",
+    "sshServer",
+    "relayServerPort",
+    "listenPort",
+    "resolveByName",
+    "acceptDefaultResolvers",
+];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailscaleSettings {
     /// Imported source tag, independent of the locally editable display name. Never sent to core.
@@ -217,6 +276,8 @@ pub struct TailscaleSettings {
     pub source_tag: Option<String>,
     #[serde(rename = "authKey", skip_serializing_if = "Option::is_none")]
     pub auth_key: Option<String>,
+    #[serde(rename = "retainedAuthKey", skip_serializing_if = "Option::is_none")]
+    pub retained_auth_key: Option<Box<RetainedTailscaleAuthKey>>,
     #[serde(rename = "allowInternet", skip_serializing_if = "Option::is_none")]
     pub allow_internet: Option<bool>,
     #[serde(rename = "alwaysRouteSubnets", skip_serializing_if = "Option::is_none")]

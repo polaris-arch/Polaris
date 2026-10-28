@@ -178,6 +178,14 @@ const html = () => renderToStaticMarkup(<MeshJoinDialogView {...viewProps()} />)
 // ════════════════════════════════════════════════════════════════════════════
 
 describe('判据 1 —— 单个 Tailscale 节点：既有动作和新增入口分离', () => {
+  it('unverified state offers Login, without claiming an account that can be switched or logged out', () => {
+    h.servers = [tsNode('ts-a', '家里')];
+    const markup = renderToStaticMarkup(<MeshJoinDialogView {...props} servers={h.servers as ServerConfig[]} tsStates={{}} />);
+    expect(markup).toContain('ts.signIn');
+    expect(markup).not.toContain('meshJoin.switchAccount');
+    expect(markup).not.toContain('meshJoin.logout');
+    expect(markup).toContain('meshJoin.taildrop');
+  });
   it('原节点 tile 标题恒为 `Tailscale`，新增 tile 独立出现', () => {
     h.servers = [tsNode('ts-a', '家里')];
     const all = tiles(tree());
@@ -220,7 +228,7 @@ describe('判据 1 —— 单个 Tailscale 节点：既有动作和新增入口�
     expect(h.opened).toEqual([
       { kind: 'ts-settings', serverId: 'ts-a' },
       { kind: 'taildrop', serverId: 'ts-a' },
-      { kind: 'ts-login', serverId: 'ts-a' },
+      { kind: 'ts-login', serverId: 'ts-a', replaceIdentity: true },
     ]);
     buttons(ts.props.actions)[2].click();
     expect(logouts.map((n) => n.id)).toEqual(['ts-a']);
@@ -319,7 +327,7 @@ describe('判据 2 —— 多个 Tailscale 节点：逐行各自寻址', () => {
     (rows[1].props.onClick as () => void)();
     expect(h.opened).toEqual([
       { kind: 'taildrop', serverId: 'ts-b' },
-      { kind: 'ts-login', serverId: 'ts-b' },
+      { kind: 'ts-login', serverId: 'ts-b', replaceIdentity: true },
       { kind: 'ts-settings', serverId: 'ts-b' },
     ]);
     second[2].click();

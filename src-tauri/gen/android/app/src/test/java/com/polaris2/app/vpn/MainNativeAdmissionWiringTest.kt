@@ -286,4 +286,29 @@ class MainNativeAdmissionWiringTest {
         AndroidNativeMain.settleAfterExactRelease(ledger, attempt)
         assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
     }
+
+    @Test fun productionScopedSnapshotsUseTheSameServerBeforeHandleLossAndAreIndependentOfDebugWitness() {
+        val observer = service.substringAfter("private fun observeNativeInput(").substringBefore("private fun isReloadCurrent(")
+        assertTrue(observer.contains("checkNotNull(attempt.tailscaleStore).invoke(config, { AndroidTailscaleStoreCustody.export(server) }, nativeCall)"))
+        val close = service.substringAfter("private fun stopService(").substringBefore("private fun onAttemptClosed(")
+        assertTrue(close.contains("synchronized(attempt.operationLock)"))
+        assertTrue(close.indexOf("server?.closeService()") < close.indexOf("attempt.tailscaleStore?.closed"))
+        assertTrue(close.indexOf("attempt.tailscaleStore?.closed") < close.indexOf("server?.close()"))
+        val directory = File("src/main/java/com/polaris2/app/vpn")
+        val login = File(directory, "TransientLoginHost.kt").readText()
+        assertTrue(login.indexOf("server.closeService()") < login.indexOf("store?.closed"))
+        assertTrue(login.indexOf("store?.closed") < login.indexOf("closeServer ="))
+        assertTrue(login.contains("invoke(checkNotNull(config), { AndroidTailscaleStoreCustody.export(original) })"))
+        val speed = File(directory, "TransientSpeedtestHost.kt").readText()
+        val finish = speed.substringAfter("override fun finishClose()").substringBefore("override fun cleanupConfirmed()")
+        assertTrue(finish.indexOf("store?.closed") < finish.indexOf("original.close()"))
+        assertTrue(speed.contains("closeServer = {}"))
+        val sessions = File(directory, "TransientSpeedtestSessions.kt").readText()
+        assertTrue(sessions.indexOf("entry.operationFinished.get()") < sessions.indexOf("entry.engine.finishClose()"))
+        val typed = plugin.substringAfter("fun tailscaleStoreCustody(invoke: Invoke)").substringBefore("fun startTransientLogin(")
+        assertTrue(typed.contains("Thread("))
+        assertTrue(typed.contains("beginTailscaleClose("))
+        assertFalse(typed.contains("closedExact("))
+    }
+
 }

@@ -738,6 +738,10 @@
       "noTelemetry": "Zero telemetry — no automatic upload of crash reports or analytics"
     },
     "update": {
+      "hideProgress": "Hide progress",
+      "showProgress": "Show progress",
+      "backgroundProgress": "The update is still running",
+      "hideProgressHint": "Hiding progress keeps the task running",
       "ruleResourceAutoStatusOn": "Scheduled refresh",
       "ruleResourceAutoStatusManual": "Manual only",
       "formMismatch": "The update package does not match the current install form; handed to the system",
@@ -768,7 +772,7 @@
       "autoDownloadOffToast": "Check & notify only",
       "pageSub": "Updates for the app, the core and rule resources, plus download acceleration",
       "intervalCard": "Background check interval",
-      "intervalCardSub": "Subscriptions and rule resources refresh in the background on this cycle; app updates are checked once at every startup",
+      "intervalCardSub": "Subscriptions refresh in the background on this cycle. Rule resources have their own interval; app updates are checked at startup.",
       "intervalManualOnly": "Manual only",
       "intervalHours": "Every {{n}} hours",
       "intervalDays": "Every {{n}} days",
@@ -831,7 +835,7 @@
       "subFollow": "Per subscription",
       "subViaProxy": "Via proxy",
       "subDirect": "Direct",
-      "ruleResourceAutoDesc": "Re-downloads rule resources on the background check interval"
+      "ruleResourceAutoDesc": "Re-downloads rule resources on their independent update interval."
     },
     "core": {
       "applied": "Core updated",
@@ -1573,6 +1577,7 @@
     "createTaskRecoveredHint": "The subscription is added in the background; its progress resumes here after the app restarts."
   },
   "errors": {
+    "iosSessionActive": "A Polaris VPN session is already active in the system. Stop that session in iOS Settings before connecting.",
     "operationFailed": "Operation failed, please try again later",
     "systemDnsTakeoverFailed": "Linux system DNS could not be connected to Polaris. The proxy is still running, but DNS may fail or bypass DNS rules. Check Helper and systemd-resolved, then reconnect.",
     "outboundInterfaceUnavailable": "The selected outbound interface is missing or inactive. This connection was not applied to prevent traffic from switching to another interface; choose an available interface.",
@@ -2224,6 +2229,10 @@
     "downloadAllFailed": "Download failed"
   },
   "resources": {
+    "updateInterval": "Rule-resource update interval",
+    "updateIntervalDesc": "Changes only the rule-resource interval, leaving subscriptions unchanged. 0 means manual only.",
+    "autoUpdateSettings": "Auto-update settings",
+    "autoUpdateUnavailable": "Settings are unavailable. Open Settings → App & Updates to configure rule-resource updates.",
     "cancel": "Cancel",
     "cancelAlreadyDone": "Download already finished — nothing to cancel",
     "cancelFailed": "Cancel failed",
@@ -2342,6 +2351,15 @@
     "errUnknown": "The operation failed."
   },
   "ts": {
+    "identityRetirementRequired": "Sign out of the previous account safely before replacing it. Use Switch account.",
+    "switchAccountNote": "Switching accounts disconnects the proxy, signs out this node, then reconnects and starts a new login.",
+    "stoppingConnection": "Disconnecting the proxy…",
+    "retiringIdentity": "Signing out the previous account…",
+    "savingCandidate": "Saving the node configuration…",
+    "startingConnection": "Reconnecting the proxy…",
+    "reasonIdentityRetirement": "Could not safely sign out the previous account. Try again.",
+    "reasonSessionChanged": "The login state changed. Try again.",
+    "reasonConfigurationChanged": "The node configuration changed. Reopen the login form.",
     "acceptDefaultResolvers": "Accept tailnet default resolvers",
     "acceptDefaultResolversHint": "Also accept the default DNS resolvers pushed by the tailnet (split-DNS). Optional.",
     "acceptRoutes": "Accept subnet routes",
@@ -2380,6 +2398,10 @@
     "exitNotAdvertised": "not an exit node",
     "exitOffline": "offline",
     "hostname": "Hostname",
+    "hostnamePlaceholder": "Leave blank for automatic naming",
+    "hostnameHint": "Leave blank to use the local engine’s default name. A custom name identifies this device in the mesh network.",
+    "accountActions": "Account actions",
+    "fileTransfer": "File transfer",
     "loginDiscard": "Discard",
     "loginDiscardMsg": "What you've entered won't be saved.",
     "loginDiscardTitle": "Discard login?",
@@ -2440,7 +2462,15 @@
     "authKeyClearPending": "Pending removal (applies on save)",
     "authKeyClear": "Clear",
     "authKeyClearAgain": "Click again to clear",
-    "authKeyClearHint": "Shows only whether this node has an auth key stored — never the key itself. Clearing removes the key from the configuration and does not touch the current login (that lives in the state directory — use Log out for it). Afterwards the node has no static credential left to re-authenticate with and must sign in again. Applies on save.",
+    "authKeyRetained": "Saved · automatic sign-in disabled",
+    "reuseSavedAuthKey": "Use saved key",
+    "retainedAuthKeyHint": "Choose key login to use the saved key. The control plane still verifies it; an expired key needs a new value.",
+    "retainedAuthKeyAuthorityHint": "The saved key belongs to another control plane. Restore that address or enter a new key.",
+    "reasonRetainedKeyUnavailable": "The saved key is unavailable. Enter a new key.",
+    "reasonCredentialChanged": "Credentials changed. Reopen this node and try again.",
+    "reasonCredentialIntent": "The clear request is no longer valid. Reopen this node and confirm again.",
+    "reasonCredentialCommit": "Could not confirm the saved credentials. Refresh this node before trying again.",
+    "authKeyClearHint": "Clear the active and saved keys when changes are applied. This does not log out the current session.",
     "browserOpenFailed": "Unable to open the browser. Copy the login link to continue.",
     "reasonMainCoreChanged": "The main connection changed. Retry authorization.",
     "loginSavedAttemptIncomplete": "Node saved; this authorization attempt is not complete.",
@@ -2451,10 +2481,8 @@
     "loginAttemptFailed": "This login request failed. Try again.",
     "loginCancelFailed": "Could not cancel login. Try again.",
     "loginSubmitted": "Login request submitted. Please wait for authorization to complete.",
-    "loginMainCoreStatus": "Reading this node’s authorization status in the main connection.",
     "loginMainCoreAuthorized": "This node is authorized in the main connection; newly saved authentication settings may still need to be applied.",
     "loginMainCoreAwaiting": "This node needs authorization. Getting the login URL…",
-    "loginMainCoreUnknown": "This node’s authorization status in the main connection is not yet confirmed. Retry to read it.",
     "loginUrlTimeout": "Timed out getting the login URL. Try again.",
     "loginSessionReadFailed": "Could not read the previous login session. New authorization was not started. Try again.",
     "loginProgressReadFailed": "Could not check this authorization result yet. Authorization may still be in progress; returning to the app will retry.",
@@ -2708,6 +2736,14 @@
       "appTitle": "App update",
       "appDesc": "The Android build ships through GitHub Releases. Check here, download the signed APK and hand it to the system installer; when a release ships no APK, the release page is still there.",
       "ghScopeNote": "This mirror and custom domain serve rule-resource downloads, not the core.",
+      "ruleResourceAutoDesc": "Controls built-in routing data and external rule resources independently of subscription settings.",
+      "ruleResourceInterval": "Rule-resource update interval",
+      "ruleResourceIntervalDesc": "Measured from the last successful download. Manual only disables automatic downloads at startup and when returning to the app.",
+      "ruleResourceOff": "Automatic updates are off.",
+      "ruleResourceManual": "Updates are manual only.",
+      "ruleResourceActive": "Enabled: update due resources on a {{hours}}-hour cycle.",
+      "ruleResourceScopeNote": "Checks due resources at startup, when returning to the app, and periodically while the app runs. Failed downloads retry with backoff; background suspension can delay updates. Updated means the last successful download.",
+      "subscriptionIntervalDesc": "Controls background subscription refresh only; the rule-resource interval stays independent.",
       "checkAction": "Check for updates",
       "checking": "Checking…",
       "openReleases": "Open the release page",
@@ -2947,5 +2983,17 @@
       "other": "Further evidence is unavailable."
     },
     "legacy": "This version cannot provide a verifiable route ownership report."
+  },
+  "prerequisite": {
+    "preparingConnection": "Preparing the proxy connection. Complete any system permission request.",
+    "waitingForReady": "Waiting for the proxy to be ready…",
+    "foregroundRequired": "Return to the app in the foreground and retry.",
+    "permissionDenied": "VPN permission was denied. Retry and allow the system request.",
+    "readyUnknown": "Connection readiness could not be confirmed. Check the connection and retry.",
+    "cancelled": "This action was cancelled. You can retry.",
+    "cancelFailed": "Could not cancel this action. Please try again.",
+    "saveConfiguration": "Save the configuration first, then retry.",
+    "ipInfoFailed": "IP information could not be refreshed. Retry the network check.",
+    "unlockFailed": "Service availability could not be checked. Retry the network check."
   }
 }

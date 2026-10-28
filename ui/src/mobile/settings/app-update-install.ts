@@ -17,7 +17,7 @@
  *
  * 用户视角的三档是「来源被禁」「包损坏」「签名不符」。前两档有确定的观测点：
  *  · **来源被禁** —— `installApk` 在 `startActivity` **之前**显式问过
- *    `canRequestPackageInstalls()`，答案随回包带上来（`unknown-sources-*` 两个码）；
+ *    `canRequestPackageInstalls()`；独立授权请求从设置返回时也重新查询，未授权与设置不可用分码；
  *  · **包损坏 / 被篡改** —— 在**下载**那一步就判掉了（`update_download` 的 sha256 强校验与
  *    「清单声明体积」等值判据），码是 `digestMismatch` / `sizeMismatch` / `digestHexInvalid`，
  *    走 `appUpdateErrText` 取文，根本走不到交付这一步。
@@ -30,7 +30,23 @@
  * 已装的那份签名不一致 —— 去发布页拿官方包重装」。预告写在
  * `mobileSettings.update.handedOffNote` 上，与「已交给系统安装器」同一行。
  */
-import type { AndroidInstallReason, UpdateInstallResult } from '@/ipc/api-client';
+import type {
+  AndroidInstallPermissionResult,
+  AndroidInstallReason,
+  UpdateInstallResult,
+} from '@/ipc/api-client';
+
+/** Permission is not installation: only an explicit granted receipt may continue this click. */
+export type InstallPermission =
+  | { readonly kind: 'granted' }
+  | { readonly kind: 'refused'; readonly reason: string };
+
+export function classifyInstallPermission(
+  result: AndroidInstallPermissionResult,
+): InstallPermission {
+  if (result.granted === true && result.reason === undefined) return { kind: 'granted' };
+  return { kind: 'refused', reason: result.reason ?? '' };
+}
 
 /**
  * 交付结局。`handed-off` 是**成功**（包出去了，本进程还活着在等），不是终态 ——
@@ -43,22 +59,24 @@ export type InstallHandoff =
 /**
  * 把 `updateApi.install` 的回包折成交付结局。
  *
- * 🔴 判据是 `awaitingSystemInstaller === true`，**不是** `ok`：那个字段是这条腿独有的键
+ * 🔴 必须同时有 `ok:true`、`awaitingSystemInstaller:true` 且无失败原因，不能只按 `ok`：后一个字段是这条腿独有的键
  * （后端刻意没有复用 `handedToSystem`，因为那个键在本仓的唯一语义是「形态错配、放弃安装」）。
  * 按 `ok` 判会让「字段整个不存在」的回包（桌面那条脚本腿、或后端改了形状）静默落进成功侧。
  */
 export function classifyInstallHandoff(result: UpdateInstallResult): InstallHandoff {
-  if (result.awaitingSystemInstaller === true) return { kind: 'handed-off' };
+  if (result.ok === true && result.awaitingSystemInstaller === true && !result.reason) {
+    return { kind: 'handed-off' };
+  }
   return { kind: 'refused', reason: result.reason ?? '' };
 }
 
 /**
  * 五个 `REASON_*` 码各自的文案键。表外的码（含空串）落一句**不编原因**的兜底。
  *
- * 🔴 **一个码一句话**：前两个是「按一下开关就能继续，而且应用已经把你送到那一页了」，
+ * 🔴 **一个码一句话**：前两个分别是「尚未授权，需要重试」与「系统授权设置页不可用」，
  * 第三个是「本机装不了」，后两个是接线错误 / 包不见了 —— 折成一句「安装失败」，
  * 等于对前两种情形的用户说一句做不到的话。这正是 Kotlin 侧那五个常量分开的全部理由
- * （`PolarisVpnPlugin.kt` 的 `openUnknownSourcesSettings` 头注写着同一条）。
+ * （授权与安装两条 Kotlin 命令共用同一组原因码）。
  */
 const REASON_KEYS: Readonly<Record<AndroidInstallReason, string>> = {
   'unknown-sources-denied': 'mobileSettings.update.installUnknownSourcesDenied',

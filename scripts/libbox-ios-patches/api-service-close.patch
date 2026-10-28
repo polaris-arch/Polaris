@@ -1,0 +1,199 @@
+diff --git a/service/api/server.go b/service/api/server.go
+index 658e656..ddc63ba 100644
+--- a/service/api/server.go
++++ b/service/api/server.go
+@@ -2,6 +2,7 @@ package api
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"net"
+ 	"net/http"
+ 
+@@ -33,7 +34,7 @@ type Service struct {
+ 	cancel         context.CancelFunc
+ 	logger         log.ContextLogger
+ 	options        option.APIServiceOptions
+-	listener       *listener.Listener
++	listener       apiListener
+ 	tlsConfig      tls.ServerConfig
+ 	startedService *daemon.StartedService
+ 	grpcServer     *grpc.Server
+@@ -41,6 +42,11 @@ type Service struct {
+ 	dashboard      *dashboard
+ }
+ 
++type apiListener interface {
++	ListenTCP() (net.Listener, error)
++	Close() error
++}
++
+ func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.APIServiceOptions) (adapter.Service, error) {
+ 	ctx, cancel := context.WithCancel(ctx)
+ 	s := &Service{
+@@ -122,8 +128,9 @@ func (s *Service) Close() error {
+ 	if s.dashboard != nil {
+ 		s.dashboard.close()
+ 	}
++	var httpErr error
+ 	if s.httpServer != nil {
+-		s.httpServer.Close()
++		httpErr = s.httpServer.Close()
+ 	}
+ 	if s.grpcServer != nil {
+ 		s.grpcServer.Stop()
+@@ -131,8 +138,11 @@ func (s *Service) Close() error {
+ 	if s.startedService != nil {
+ 		s.startedService.Close()
+ 	}
+-	return common.Close(
+-		common.PtrOrNil(s.listener),
+-		s.tlsConfig,
+-	)
++	listenerErr := common.Close(s.listener)
++	// http.Server.Close owns the Serve listener too. Keep Listener.Close for a
++	// Start/Close race, but its second TCP close confirms the socket is gone.
++	if s.httpServer != nil && errors.Is(listenerErr, net.ErrClosed) {
++		listenerErr = nil
++	}
++	return E.Errors(httpErr, listenerErr, common.Close(s.tlsConfig))
+ }
+diff --git a/service/api/server_close_test.go b/service/api/server_close_test.go
+new file mode 100644
+index 0000000..6db3d4a
+--- /dev/null
++++ b/service/api/server_close_test.go
+@@ -0,0 +1,133 @@
++package api
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/http"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/common/listener"
++	"github.com/sagernet/sing-box/common/tls"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++)
++
++func TestCloseAfterHTTPServerServesClosesListenerOnce(t *testing.T) {
++	wrapped := listener.New(listener.Options{
++		Context: context.Background(),
++		Logger:  log.NewNOPFactory().Logger(),
++		Network: []string{"tcp"},
++		Listen:  option.ListenOptions{},
++	})
++	tcpListener, err := wrapped.ListenTCP()
++	if err != nil {
++		t.Fatal(err)
++	}
++	served := make(chan struct{})
++	httpServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		close(served)
++		w.WriteHeader(http.StatusNoContent)
++	})}
++	go httpServer.Serve(tcpListener)
++	client := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: time.Second}
++	response, err := client.Get("http://" + tcpListener.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	<-served
++	service := &Service{cancel: func() {}, listener: wrapped, httpServer: httpServer}
++	if err := service.Close(); err != nil {
++		t.Fatalf("Close() = %v; want nil", err)
++	}
++	if _, err := net.DialTimeout("tcp", tcpListener.Addr().String(), 100*time.Millisecond); err == nil {
++		t.Fatal("API listener still accepts after Close")
++	}
++}
++
++type failingHTTPListener struct {
++	entered   chan struct{}
++	closed    chan struct{}
++	closeOnce sync.Once
++	failure   error
++}
++
++func (l *failingHTTPListener) Accept() (net.Conn, error) {
++	close(l.entered)
++	<-l.closed
++	return nil, net.ErrClosed
++}
++
++func (l *failingHTTPListener) Close() error {
++	l.closeOnce.Do(func() { close(l.closed) })
++	return l.failure
++}
++
++func (l *failingHTTPListener) Addr() net.Addr { return &net.TCPAddr{} }
++
++func TestClosePreservesHTTPListenerFailure(t *testing.T) {
++	failure := errors.New("HTTP listener close failed")
++	httpListener := &failingHTTPListener{entered: make(chan struct{}), closed: make(chan struct{}), failure: failure}
++	httpServer := &http.Server{}
++	go httpServer.Serve(httpListener)
++	<-httpListener.entered
++	service := &Service{cancel: func() {}, httpServer: httpServer}
++	if err := service.Close(); !errors.Is(err, failure) {
++		t.Fatalf("Close() = %v; want original HTTP close failure", err)
++	}
++}
++
++type failingTLSConfig struct {
++	tls.ServerConfig
++	failure error
++}
++
++func (c failingTLSConfig) Close() error { return c.failure }
++
++func TestClosePreservesTLSFailure(t *testing.T) {
++	failure := errors.New("TLS config close failed")
++	service := &Service{cancel: func() {}, tlsConfig: failingTLSConfig{failure: failure}}
++	if err := service.Close(); !errors.Is(err, failure) {
++		t.Fatalf("Close() = %v; want original TLS close failure", err)
++	}
++}
++
++func TestCloseBeforeHTTPServeStillClosesListener(t *testing.T) {
++	wrapped := listener.New(listener.Options{
++		Context: context.Background(),
++		Logger:  log.NewNOPFactory().Logger(),
++		Network: []string{"tcp"},
++		Listen:  option.ListenOptions{},
++	})
++	tcpListener, err := wrapped.ListenTCP()
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Start can reach ListenTCP before the Serve goroutine registers the socket.
++	service := &Service{cancel: func() {}, listener: wrapped, httpServer: &http.Server{}}
++	if err := service.Close(); err != nil {
++		t.Fatalf("Close() before Serve = %v; want nil", err)
++	}
++	if _, err := net.DialTimeout("tcp", tcpListener.Addr().String(), 100*time.Millisecond); err == nil {
++		t.Fatal("API listener still accepts after Close before Serve")
++	}
++}
++
++type failingAPIListener struct{ failure error }
++
++func (l failingAPIListener) ListenTCP() (net.Listener, error) {
++	return nil, errors.New("unexpected ListenTCP call")
++}
++
++func (l failingAPIListener) Close() error { return l.failure }
++
++func TestClosePreservesListenerFailure(t *testing.T) {
++	failure := errors.New("API listener close failed")
++	service := &Service{cancel: func() {}, listener: failingAPIListener{failure: failure}, httpServer: &http.Server{}}
++	if err := service.Close(); !errors.Is(err, failure) {
++		t.Fatalf("Close() = %v; want original listener close failure", err)
++	}
++}

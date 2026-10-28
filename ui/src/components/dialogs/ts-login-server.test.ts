@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
-import { nextTsNodeName, planTsLoginSubmit, tsLoginMainCoreView, tsLoginFailureKey } from './ts-login-server';
+import { supportsTsLoginActions, supportsTsAccountActions, nextTsNodeName, planTsLoginSubmit, tsLoginFailureKey, tsLoginUsesBackendCredentials } from './ts-login-server';
 
 const MINTED = 'minted-id-1';
 const mint = () => MINTED;
@@ -190,29 +190,55 @@ describe('移动登录：保存后的重试与安全授权状态', () => {
     expect(official.server.tailscaleSettings?.controlUrl).toBeUndefined();
     expect(first.server.tailscaleSettings?.controlUrl).toBe('https://control.example.test');
   });
-  const frame = (serverId: string, backendState = 'Running', loggedIn = true, expired = false, authURL?: string) => ({
-    serverId, backendState, loggedIn, expired, authURL, tailscaleIPs: [], peers: [], canShareFiles: false,
-    waitingFileCount: 0, receivingFileCount: 0, unreadFileCount: 0,
-  });
-  it('陈旧 STATUS、其它节点、启动过渡不能宣称授权；当前 Running 才可确认主核身份', () => {
-    expect(tsLoginMainCoreView('a', { connected: false, statuses: [frame('a')] }, null).state).toBe('unknown');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('b')] }, null).state).toBe('unknown');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'NoState', false)] }, null).state).toBe('unknown');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'Starting')] }, null).state).toBe('unknown');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a')] }, null).state).toBe('authorized');
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'Running', true, true)] }, null).state).toBe('needs-login');
-  });
-  it('主核 NeedsLogin 的 URL 可显示；授权后的新鲜帧压过旧 URL', () => {
-    const url = 'https://login.example.test/authorize';
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a', 'NeedsLogin', false, false, url)] }, null)).toEqual({ state: 'url', authUrl: url });
-    expect(tsLoginMainCoreView('a', null, url)).toEqual({ state: 'url', authUrl: url });
-    expect(tsLoginMainCoreView('a', { connected: true, statuses: [frame('a')] }, url)).toEqual({ state: 'authorized', authUrl: null });
-  });
   it('只按稳定错误码分类，秘密/URL/path 的原始错误不进入展示键', () => {
     expect(tsLoginFailureKey({ code: 'TAILSCALE_LOGIN_FAILED', message: 'tskey-secret https://private /data/user' })).toBe('ts.loginStartFailed');
     expect(tsLoginFailureKey({ code: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED', message: 'private' })).toBe('errors.androidNativeCapacityClosed');
     expect(tsLoginFailureKey({ message: 'ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED' })).toBe('ts.loginAttemptFailed');
     expect(tsLoginFailureKey(new Error('tskey-secret https://private /data/user'))).toBe('ts.loginAttemptFailed');
     expect(tsLoginFailureKey({ code: 'https://private' })).toBe('ts.loginAttemptFailed');
+  });
+});
+
+// iOS owns only the main VPN; Android and desktop retain their account sessions.
+it.each(['android', 'windows', 'macos', undefined])('keeps account actions on %s', (os) => {
+  expect(supportsTsAccountActions(os)).toBe(true);
+});
+it('supports iOS account actions through backend retirement', () => {
+  expect(supportsTsAccountActions('ios')).toBe(true);
+  expect(supportsTsLoginActions()).toBe(true);
+});
+
+
+describe('explicit retained credential routing and editable candidates', () => {
+  it.each([true, false])('retained record availability=%s uses backend routing without implying authorization', available => {
+    const existing = tsNode({ tailscaleSettings: { retainedAuthKeyAvailable: available, tailscaleCredentialRevision: 'revision-A' } });
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    const plan = planTsLoginSubmit(base({ existing, mode: 'authkey', reuseRetainedAuthKey: true }));
+    expect(plan.server.id).toBe(existing.id);
+    expect(plan.server.tailscaleSettings).toEqual({});
+    expect(existing.tailscaleSettings?.tailscaleCredentialRevision).toBe('revision-A');
+  });
+
+  it('any explicit login with an active-only credential scope uses backend routing, while empty credentials preserve ordinary routing', () => {
+    const existing = tsNode({ tailscaleSettings: { authKey: 'synthetic-active', tailscaleCredentialRevision: 'revision-A' } });
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    expect(tsLoginUsesBackendCredentials(existing)).toBe(true);
+    expect(tsLoginUsesBackendCredentials(tsNode())).toBe(false);
+    expect(tsLoginUsesBackendCredentials(undefined, true)).toBe(true);
+  });
+
+  it('removes a raw retained record and computed metadata from both login modes, without changing the saved record', () => {
+    const raw = { authKey: 'synthetic-active', sourceTag: 'source', retainedAuthKey: { authKey: 'synthetic-retained', controlAuthority: 'https://issuer.example' },
+      retainedAuthKeyAvailable: true, tailscaleCredentialRevision: 'revision-A' };
+    const existing = tsNode({ tailscaleSettings: raw as unknown as ServerConfig['tailscaleSettings'] });
+    for (const mode of ['browser', 'authkey'] as const) {
+      const plan = planTsLoginSubmit(base({ existing, mode, authKey: 'synthetic-new' }));
+      expect(plan.server.tailscaleSettings).toEqual(mode === 'browser' ? { sourceTag: 'source' } : { sourceTag: 'source', authKey: 'synthetic-new' });
+      expect(JSON.stringify(plan.server)).not.toContain('synthetic-retained');
+      expect(JSON.stringify(plan.server)).not.toContain('revision-A');
+    }
+    expect(raw.retainedAuthKey.authKey).toBe('synthetic-retained');
   });
 });

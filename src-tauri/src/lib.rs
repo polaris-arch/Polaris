@@ -641,6 +641,8 @@ pub fn run() {
     // Tauri setup 之后才有；ProxyRuntime 在 `AppRuntime::new` 里就造好了，够不着。
     #[cfg(target_os = "android")]
     let builder = builder.plugin(runtime::proxy::android_bridge::init());
+    #[cfg(target_os = "ios")]
+    let builder = builder.plugin(tauri_plugin_polaris_ios::init());
     let builder = builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -711,6 +713,12 @@ pub fn run() {
                 .unwrap_or_else(|e| {
                     log::warn!("app_config_dir 解析失败 {e}，回落 cwd/polaris");
                     std::path::PathBuf::from("./polaris")
+                });
+            #[cfg(target_os = "ios")]
+            let config_dir =
+                tauri_plugin_polaris_ios::shared_directory().unwrap_or_else(|error| {
+                    eprintln!("iOS shared container unavailable: {error}");
+                    config_dir
                 });
             // 确保目录存在（首次启动）。
             let _ = std::fs::create_dir_all(&config_dir);
@@ -789,6 +797,13 @@ pub fn run() {
             // 装配 18 crate 运行时（注入 tokio / std::fs / 真 socket / 真 HTTP client）。
             // 传输层 client 建不起来 = 网络栈残缺 → 报错退出（? 冒泡给 setup），不带病硬跑。
             let app_runtime = AppRuntime::new(config_dir)?;
+            #[cfg(target_os = "ios")]
+            {
+                let proxy = Arc::clone(&app_runtime.proxy);
+                tauri::async_runtime::spawn(async move {
+                    proxy.reconcile_ios_session_on_startup().await;
+                });
+            }
 
             // ── 版本感知 reseed：随包核 → 可写现役核（幂等；**失败不 fatal**）──
             // 失败即回落随包种子照常起核（`resolve_core_binary` 第 3 级）⇒ 首启/迁移永不 brick。
@@ -1242,6 +1257,8 @@ pub fn run() {
             // ── 解锁检测（unlock:run/get）──
             unlock_run,
             unlock_get,
+            manual_network_check,
+            manual_network_check_cancel,
             // ── 测速（server:speedTest）──
             server_speed_test,
             // ── 更新（version + app update + core update）──
@@ -1251,6 +1268,7 @@ pub fn run() {
             // 更新卡重挂载后回读最后一帧进度（切页/窗口重建后不再退回 idle）。
             update_get_progress,
             update_install,
+            update_request_install_permission,
             update_skip,
             // D14：IPC 通道 update:openReleases 已随 D12 从前端退役，但本命令仍被
             // updater/app_update.rs 的 PopupAction::ViewLog / ManualDownload 分支直接 Rust 内部
@@ -1333,6 +1351,19 @@ pub fn run() {
     // RunEvent 循环：① macOS dock 图标重开 ② C1 退出清理（停核 + 清系统代理）。关窗语义仍由
     // on_window_event + QuitState 决定，未改动；本回调只在**进程级真实退出**时兜安全清理。
     app.run(|app_handle, event| match event {
+        // Android onResume / iOS willEnterForeground；首启仍由调度器的 12s 补更覆盖。
+        #[cfg(mobile)]
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Resumed,
+            ..
+        } if label == "main" => {
+            if let Some(scheduler) = app_handle
+                .try_state::<Arc<runtime::rule_resource_scheduler::RuleResourceScheduler>>()
+            {
+                scheduler.on_resume(app_handle.clone());
+            }
+        }
         // macOS：点 dock 图标（NSApplicationDelegate applicationShouldHandleReopen）→ RunEvent::Reopen。
         // 主窗关闭进入轻量驻留后，Dock 重开是 macOS 上召回/重建窗口的路径；Windows 靠任务栏
         // 或托盘浮层的明确入口，Linux 靠原生菜单「显示」。show_main_window 会按存在性选择呈现或重建。
@@ -1350,7 +1381,7 @@ pub fn run() {
                 api.prevent_exit();
                 return;
             }
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if !exit_lifecycle::exit_is_committed(app_handle) {
                 api.prevent_exit();
                 exit_lifecycle::queue_quit(app_handle);

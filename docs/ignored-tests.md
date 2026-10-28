@@ -76,7 +76,7 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 
 ---
 
-## 完整清单（34 条）
+## 完整清单（35 条）
 
 `src-tauri/tests/ignored_tests_registry.rs` 的 `REGISTRY` 是真值源；本表由它逐条对应，
 **每个测试名都必须在本文档里逐字出现**（那道门会逐条核对，前缀兜底已被去掉——它会让 2/3 的条目失守）。
@@ -102,6 +102,7 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 | `production_macos_native_proxy_recovers_across_process_sessions` | 同上 | LiveHostState（**写宿主机**，macOS-only） |
 | `inventory` | `src-tauri/tests/release_escape_hatches.rs` | NotAGate |
 | `no_network_fixture` | `crates/core-supervisor/src/exact_spawn/tests/mod.rs` | PrivateChildFixture |
+| `unrelated_no_network_fixture` | `crates/core-supervisor/src/exact_spawn/tests/mod.rs` | PrivateChildFixture |
 | `root_provision_publishes_exact_v2_without_rewriting_existing_claims` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
 | `root_old_private_or_partial_layout_is_never_repaired` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
 | `root_concurrent_initializers_only_accept_the_completed_layout` | `crates/helper/src/platform/linux/claims/tests/mod.rs` | PrivilegedPrivateFs |
@@ -128,6 +129,9 @@ cargo test -p polaris --test release_escape_hatches -- --ignored --nocapture inv
 POLARIS_NO_KERNEL_RUN=1 cargo test -p polaris-core-supervisor exact_spawn::tests -- --test-threads=1
 ```
 
+`unrelated_no_network_fixture` 是普通 `Command` 启动的独立子可执行夹具，不打开或关闭受保护 FD。父门以 `--exact --ignored --nocapture exact_spawn::tests::unrelated_no_network_fixture` 调用它，在两秒内收到真实用户态 READY 后扫描其 FD，并在观察或断言失败前 kill/wait。
+默认运行的 `unrelated_child_does_not_inherit_protected_images` 保留 FD 隔离断言；`deliberately_passed_protected_stdin_is_detected_after_userland_ready` 保留真实继承 FD 的反向对照。不要独立调用这个会等待父门收尾的子夹具，也不要把它的 ignored 数当成安全门退出默认覆盖。
+
 Linux claims 的 13 条 `root_*` 门需要 root，创建 `/var/tmp/polaris-claims-h-*` 独占目录；不写 `/run/polaris-sing-tun-claims`，不改网络。只在隔离 Linux 验证环境中用 root 身份执行父门：
 
 ```bash
@@ -144,4 +148,4 @@ POLARIS_SINGBOX_PATH=/绝对路径/sing-box cargo test -p polaris-singbox-grpc -
 
 ## 平台差异：`ignored` 的数字是平台相关的
 
-源码登记共 34 条。Linux claims 与 exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。
+源码登记共 35 条。Linux claims 与 exact-spawn 私有夹具、Windows 路由和 macOS 系统代理门各有平台 cfg；运行时 `ignored` 数量按编译目标与过滤器变化。源码登记数是平台无关的事实，不用某个平台的运行时报告数充当其它平台的验收收据。

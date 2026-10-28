@@ -23,6 +23,13 @@ function environment(withViewport = true) {
 }
 
 describe('mobile visible viewport', () => {
+  it('leaves iOS viewport CSS to the UIKit consumer', () => {
+    const { style, win } = environment();
+    const root = { style, dataset: { mobileOs: 'ios' } } as unknown as HTMLElement;
+    const stop = installMobileVisibleViewport(win as unknown as Window, root);
+    expect(style.getPropertyValue('--m-vv-height')).toBe('');
+    stop();
+  });
   it('follows an IME visual resize while the layout viewport and focused input remain unchanged', () => {
     const { style, viewport, input, win, start } = environment();
     const stop = start();

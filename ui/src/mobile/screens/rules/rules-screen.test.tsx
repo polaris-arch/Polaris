@@ -42,6 +42,7 @@ import { ALL, UNCONDITIONAL, winners, winnersText } from '@/styles/css-cascade.t
 import { closeOracle, measure } from '@/styles/css-oracle.test-support';
 import { inMobileShell } from '@/styles/mount.test-support';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { isValidElement, type ReactElement, type ReactNode } from 'react';
 
 /**
  * ⑤ 组要渲染**容器**（它是唯一碰 i18next 的文件）。恒等 `t` 让断言比的是 key 而不是译文；
@@ -429,8 +430,44 @@ const resourcesMarkup = (
       onOpenSheet={() => {}}
       onCatalog={() => {}}
       onUrlDownload={() => {}}
+      autoUpdatePolicy="mobileSettings.update.ruleResourceActive"
+      onAutoUpdateSettings={() => {}}
     />,
   );
+
+describe('资源自动更新设置入口', () => {
+  it.each([
+    { loading: false, error: false },
+    { loading: true, error: false },
+    { loading: false, error: true },
+  ])('资源为空、加载或失败时仍能查看策略并进入设置 %j', (state) => {
+    const onSettings = vi.fn();
+    const onUpdate = vi.fn();
+    const tree = ResourcesSegment({
+      t, source: 'all', onSourceChange: () => {}, ...state, groups: [],
+      updatingAll: false, updatingIds: new Set(), onUpdateAll: onUpdate,
+      onResetBuiltin: () => {}, resetConfirming: false, onUpdateOne: onUpdate,
+      onCancel: () => {}, onDelete: () => {}, errorOf: noErrors,
+      deleteConfirmingId: null, sheetId: null, onOpenSheet: () => {},
+      onCatalog: () => {}, onUrlDownload: () => {},
+      autoUpdatePolicy: 'mobileSettings.update.ruleResourceManual',
+      onAutoUpdateSettings: onSettings,
+    });
+    type Props = { children?: ReactNode; onClick?: () => void };
+    function nodes(node: ReactNode): ReactElement<Props>[] {
+      if (Array.isArray(node)) return node.flatMap(nodes);
+      if (!isValidElement<Props>(node)) return [];
+      return [node, ...nodes(node.props.children)];
+    }
+    const button = nodes(tree).find((node) => node.props.children === 'resources.autoUpdateSettings');
+    expect(button).toBeDefined();
+    expect(renderToStaticMarkup(tree)).toContain('mobileSettings.update.ruleResourceManual');
+    expect(onUpdate).not.toHaveBeenCalled();
+    button!.props.onClick!();
+    expect(onSettings).toHaveBeenCalledTimes(1);
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+});
 
 const dnsMarkup = (errorOf: (key: string) => string | undefined = noErrors): string =>
   renderToStaticMarkup(
@@ -1303,6 +1340,8 @@ describe('⑥ 写操作失败必须有**可见**回显（行内，贴着那颗�
         onOpenSheet={() => {}}
           onCatalog={() => {}}
       onUrlDownload={() => {}}
+      autoUpdatePolicy="mobileSettings.update.ruleResourceActive"
+      onAutoUpdateSettings={() => {}}
       />,
     );
     expect(textNodesOf(html)).toContain('resources.loadError');

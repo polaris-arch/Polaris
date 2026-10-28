@@ -75,3 +75,112 @@ fn invalid_id_never_reaches_the_filesystem_boundary() {
     };
     assert!(!state_exists(&fs, Path::new("/ud"), "../victim"));
 }
+
+fn observed_retirement_fixture() -> (
+    super::retirement::TailscaleStoreExport,
+    Vec<super::retirement::ObservedTailscaleStoreRun>,
+) {
+    use super::retirement::{ObservedTailscaleStoreRun, ObservedTailscaleStoreScope};
+    let observed: Vec<_> = [("a", "b", "first"), ("c", "d", "second")]
+        .into_iter()
+        .map(|(nonce, digest, tag)| ObservedTailscaleStoreRun {
+            run_nonce: nonce.repeat(64),
+            config_digest: digest.repeat(64),
+            scopes: vec![ObservedTailscaleStoreScope {
+                tag: tag.into(),
+                state_directory: format!("/private/{tag}"),
+                state_file: format!("/private/{tag}/tailscaled.state"),
+            }],
+        })
+        .collect();
+    let instances: Vec<_> = observed
+        .iter()
+        .map(|run| {
+            let scope = &run.scopes[0];
+            serde_json::json!({
+                "runNonce": run.run_nonce, "configDigest": run.config_digest,
+                "terminal": "NoStoreConstruction", "censusComplete": true,
+                "nodes": [{"tag": scope.tag, "stateDirectory": scope.state_directory,
+                    "stateFile": scope.state_file, "writerState": "NoStoreConstruction",
+                    "stateFileState": "Missing", "stateFileRevision": "",
+                    "profileState": "None", "profileFingerprint": ""}]
+            })
+        })
+        .collect();
+    let export = serde_json::from_value(serde_json::json!({
+        "contractVersion": "polaris-ts-auth-writer-retirement-v1",
+        "globalCleanupEvidence": "CleanupUnknown", "instances": instances
+    }))
+    .unwrap();
+    (export, observed)
+}
+
+#[test]
+fn observed_runs_bind_mixed_reload_digests_without_weakening_single_digest() {
+    let (export, mut observed) = observed_retirement_fixture();
+    assert!(export.validate(&"b".repeat(64), true).is_err());
+    assert!(export.validate(&"d".repeat(64), true).is_err());
+    export.validate_observed_runs(&observed, true).unwrap();
+    observed.reverse();
+    export.validate_observed_runs(&observed, true).unwrap();
+}
+
+#[test]
+fn observed_runs_reject_missing_rebound_duplicate_and_extra_original_scopes() {
+    let (export, observed) = observed_retirement_fixture();
+    assert!(export.validate_observed_runs(&[], true).is_err());
+    assert!(export.validate_observed_runs(&observed[..1], true).is_err());
+    for mutation in [
+        "nonce",
+        "digest",
+        "duplicate-run",
+        "missing-scope",
+        "extra-scope",
+        "duplicate-scope",
+        "path",
+    ] {
+        let mut changed = observed.clone();
+        match mutation {
+            "nonce" => changed[0].run_nonce = "e".repeat(64),
+            "digest" => changed[0].config_digest = "e".repeat(64),
+            "duplicate-run" => changed[1] = changed[0].clone(),
+            "missing-scope" => changed[0].scopes.clear(),
+            "extra-scope" => {
+                let scope = changed[1].scopes[0].clone();
+                changed[0].scopes.push(scope);
+            }
+            "duplicate-scope" => {
+                let scope = changed[0].scopes[0].clone();
+                changed[0].scopes.push(scope);
+            }
+            "path" => changed[0].scopes[0].state_directory.push_str("/other"),
+            _ => unreachable!(),
+        }
+        assert!(
+            export.validate_observed_runs(&changed, true).is_err(),
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
+fn observed_runs_do_not_turn_active_or_empty_export_into_terminal_fact() {
+    let (export, observed) = observed_retirement_fixture();
+    let mut value = serde_json::json!({
+        "contractVersion": "polaris-ts-auth-writer-retirement-v1",
+        "globalCleanupEvidence": "CleanupUnknown", "instances": []
+    });
+    let empty: super::retirement::TailscaleStoreExport =
+        serde_json::from_value(value.clone()).unwrap();
+    assert!(empty.validate_observed_runs(&observed, true).is_err());
+    value["instances"] = serde_json::json!([{
+        "runNonce": observed[0].run_nonce, "configDigest": observed[0].config_digest,
+        "terminal": "Unknown", "censusComplete": false, "nodes": []
+    }]);
+    let active: super::retirement::TailscaleStoreExport = serde_json::from_value(value).unwrap();
+    let mut actual = observed[..1].to_vec();
+    actual[0].scopes.clear();
+    active.validate_observed_runs(&actual, false).unwrap();
+    assert!(active.validate_observed_runs(&actual, true).is_err());
+    export.validate_observed_runs(&observed, true).unwrap();
+}

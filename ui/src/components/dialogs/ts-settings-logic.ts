@@ -38,6 +38,7 @@ import { splitCsv } from './wg-logic';
 import { detourDraftValue } from './detour-options';
 import { isValidIpCidr } from '@/domain/rules';
 import { controlUrlReject, type ControlUrlReject } from '@/domain/control-url';
+import { stripTsCredentialMetadata } from './ts-login-server';
 
 /** 「自定义…」哨兵（与 `TsSettingsDialog` 的 `when` 谓词、`buildTsSettings` 的分支同一常量）。 */
 export const EXIT_CUSTOM = '__custom__';
@@ -107,6 +108,28 @@ export function invalidControlUrl(draft: FormValues): ControlUrlReject | null {
   return controlUrlReject(str(draft.controlUrl));
 }
 
+/** Capture once when the user confirms clear; a failed save must not re-sign a newer revision. */
+export function tsCredentialClearIntent(node: ServerConfig | undefined): ServerConfig['tailscaleCredentialIntent'] {
+  const revision = node?.tailscaleSettings?.tailscaleCredentialRevision;
+  return typeof revision === 'string' && revision.length > 0
+    ? { action: 'clear', expectedCredentialRevision: revision } : undefined;
+}
+
+/** Staged editable values omit computed metadata; status still belongs to this exact saved target. */
+export function tsCredentialSource(node: ServerConfig | undefined, saved: readonly ServerConfig[]): ServerConfig | undefined {
+  if (!node || node.tailscaleSettings?.tailscaleCredentialRevision) return node;
+  return saved.find((item) => item.id === node.id && item.protocol === 'tailscale'
+    && item.tailscaleSettings?.sourceTag === node.tailscaleSettings?.sourceTag) ?? node;
+}
+
+export function tsCredentialSaveErrorKey(error: unknown): string {
+  if (error && typeof error === 'object' && 'message' in error) {
+    if (error.message === 'credentialRevisionChanged') return 'ts.reasonCredentialChanged';
+    if (error.message === 'invalidCredentialIntent') return 'ts.reasonCredentialIntent';
+  }
+  return 'common.saveFailed';
+}
+
 /**
  * 草稿 → `TailscaleSettings`（提交路径）。
  *
@@ -129,6 +152,7 @@ export function buildTsSettings(
   clearAuthKey = false
 ): TailscaleSettings {
   const next: TailscaleSettings = { ...(base ?? {}) };
+  stripTsCredentialMetadata(next);
   // 删键而不是写空串：空串同样会被 `hasTsAuthKey` 判成「没有」，但它会在磁盘上留下一个
   // `"authKey": ""`——日后任何一次「这个键在不在」的判断都得多带一层空串语义。
   if (clearAuthKey) delete next.authKey;

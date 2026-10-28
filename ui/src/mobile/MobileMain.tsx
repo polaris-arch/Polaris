@@ -40,12 +40,15 @@
 
 import { StrictMode } from 'react';
 import ReactDOM from 'react-dom/client';
+import { isTauri } from '@tauri-apps/api/core';
+import { platform } from '@tauri-apps/plugin-os';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { i18nReady } from '@/i18n';
 import { disableNativeContextMenu } from '@/lib/native-context-menu';
 import { injectStaticFailureDom, installErrorForwarding } from '@/lib/renderer-recovery';
 import { reportRendererReady } from '@/lib/renderer-ready';
 import { MobileApp } from './MobileApp';
+import { installIosLayout, refreshNativeViewportCss } from './ios-layout';
 import { DebugReportButton } from './DebugReportButton';
 import '../styles/tokens.resolved.css';
 import './theme.css';
@@ -57,6 +60,91 @@ import './connections/connections-redesign.css';
 
 installErrorForwarding();
 disableNativeContextMenu();
+
+// Keep the iOS layout switch out of desktop and Android. Tauri's OS plugin
+// reports the target at build time, so this is ready before the first render.
+if (isTauri() && platform() === 'ios') {
+  document.documentElement.dataset.mobileOs = 'ios';
+  // Keyboard geometry changes the visible viewport, not the React tree. Keep
+  // the focused field visible by scrolling its form body only after layout.
+  const viewport = window.visualViewport;
+  if (viewport) {
+    let frame = 0;
+    const update = (): void => {
+      frame = 0;
+      const style = document.documentElement.style;
+      const nativeViewport = refreshNativeViewportCss();
+      const nativeBottom = Number.parseFloat(
+        window.getComputedStyle(document.documentElement).getPropertyValue('--ios-keyboard-visible-bottom'),
+      );
+      const scale = viewport.scale || 1;
+      // Native reports a height from the physical WebView top. offsetTop only
+      // locates that visible region within the layout viewport; don't subtract it.
+      const height = Math.max(0, Math.min(
+        viewport.height,
+        Number.isFinite(nativeBottom) ? nativeBottom / scale : Infinity,
+      ));
+      style.setProperty('--ios-form-viewport-height', `${height}px`);
+      style.setProperty('--ios-form-viewport-top', `${viewport.offsetTop}px`);
+      style.setProperty('--ios-form-visual-scale', String(scale));
+      style.setProperty(
+        '--ios-form-viewport-bottom-gap',
+        `${Math.max(0, (nativeViewport?.height ?? document.documentElement.clientHeight) / scale - height)}px`,
+      );
+      const focused = document.activeElement;
+      if (!(focused instanceof HTMLElement)) return;
+      const body = focused.closest<HTMLElement>('.m-form-body');
+      if (!body) return;
+      const panel = focused.closest<HTMLElement>('.m-form-panel');
+      const scroller = window.getComputedStyle(body).overflowY === 'visible' ? panel : body;
+      if (!scroller) return;
+      const field = focused.getBoundingClientRect();
+      const fieldStyle = window.getComputedStyle(focused);
+      // Outlines paint outside the border box returned by getBoundingClientRect.
+      const outline = fieldStyle.outlineStyle === 'none' ? 0 : Math.max(0,
+        (Number.parseFloat(fieldStyle.outlineWidth) || 0) +
+        (Number.parseFloat(fieldStyle.outlineOffset) || 0),
+      );
+      const fieldTop = field.top - outline;
+      const fieldBottom = field.bottom + outline;
+      const bounds = scroller.getBoundingClientRect();
+      const scrollerStyle = window.getComputedStyle(scroller);
+      // The scrollport excludes its border, when present.
+      const top = bounds.top + (Number.parseFloat(scrollerStyle.borderTopWidth) || 0);
+      const innerBottom = bounds.bottom - (Number.parseFloat(scrollerStyle.borderBottomWidth) || 0);
+      const footer = panel?.querySelector<HTMLElement>('.m-form-foot');
+      const bottom = scroller === panel && footer && window.getComputedStyle(footer).position === 'sticky'
+        ? Math.min(innerBottom, footer.getBoundingClientRect().top)
+        : innerBottom;
+      if (fieldTop < top) scroller.scrollTop += fieldTop - top;
+      else if (fieldBottom > bottom) {
+        scroller.scrollTop += Math.min(fieldBottom - bottom, fieldTop - top);
+      }
+    };
+    const schedule = (): void => {
+      if (!frame) frame = window.requestAnimationFrame(update);
+    };
+    viewport.addEventListener('resize', schedule);
+    viewport.addEventListener('scroll', schedule);
+    window.addEventListener('resize', schedule);
+    window.addEventListener('polaris-ios-viewport-change', schedule);
+    document.addEventListener('focusin', schedule);
+    const disposeLayout = installIosLayout(schedule);
+    schedule();
+    import.meta.hot?.dispose(() => {
+      window.cancelAnimationFrame(frame);
+      viewport.removeEventListener('resize', schedule);
+      viewport.removeEventListener('scroll', schedule);
+      window.removeEventListener('resize', schedule);
+      window.removeEventListener('polaris-ios-viewport-change', schedule);
+      document.removeEventListener('focusin', schedule);
+      disposeLayout();
+    });
+  } else {
+    const disposeLayout = installIosLayout();
+    import.meta.hot?.dispose(disposeLayout);
+  }
+}
 
 const rootEl = document.getElementById('root');
 if (rootEl) {

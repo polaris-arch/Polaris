@@ -142,7 +142,9 @@ test('only reviewed source inputs are eligible, without native or ownership clea
     (manifest) => { delete manifest.sourceBuild.platforms['mac-arm64']; },
     (manifest) => { manifest.sourceBuild.platforms.linux.patchedModules.allowedAbsent.push('github.com/sagernet/sing-tun'); },
     (manifest) => { manifest.windowsBuild.patchSha256 = 'a'.repeat(64); },
-    (manifest) => { manifest.sourceBuild.version = '1.15.0-alpha.8.polaris.3'; },
+    (manifest) => {
+      manifest.sourceBuild.version = manifest.sourceBuild.version.replace(/\d+$/, (suffix) => String(Number(suffix) + 1));
+    },
     (manifest) => { manifest.clearance = 'approved'; },
   ]) assert.throws(() => assertSourceFirstRelease(manifestRead(mutate)));
 

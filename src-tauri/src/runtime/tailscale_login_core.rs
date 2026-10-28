@@ -7,6 +7,9 @@
 //! 与 `ProxyRuntime` 的常驻代理核**隔离**（独立注册表、独立 child 句柄；瞬态核绝不写进 proxy 的
 //! pid 槽，故不会被误当作代理核）。
 //!
+//! iOS 首次登录消费正常主核 producer 的 ready ticket，再观察同一主核的 fresh STATUS。
+//! 主核观察的完成、取消和超时只收订阅，不停止正常连接；已有平台的瞬态 custody 保留。
+//!
 //! ## 为什么 URL 只认 gRPC，不再扫 stdout（含「gRPC 腿失败要不要回退 stdout」的结论）
 //!
 //! 曾经的实现从核 stdout 正则抓 `Waiting for authentication: <url>`。改掉它有两条独立理由：
@@ -68,7 +71,8 @@ use tauri::AppHandle;
 use tokio::sync::{mpsc, oneshot, watch};
 
 mod attempts;
-use attempts::{Attempt, AttemptGuard, Attempts};
+pub(crate) use attempts::Attempt;
+use attempts::{AttemptGuard, Attempts};
 pub use attempts::{LoginMode, LoginProgressReceipt, LoginRequest};
 
 #[cfg(test)]
@@ -91,7 +95,138 @@ use crate::runtime::proxy::core_log::pipe_to_log_with_secrets;
 use crate::runtime::proxy::resolve_core_binary;
 #[cfg(unix)]
 use crate::runtime::proxy::send_signal;
+use crate::runtime::proxy::{
+    ActionBinding, MainPrerequisiteError, NormalMainAction, ProxyRuntime, ReadyMainTicket,
+};
 use crate::runtime::tailscale_status::decode_tailscale_status;
+
+/// Resolve an explicit credential action from this one current raw node. Renderer metadata
+/// and omitted secrets never supply a key or authorize retirement. This is pure preflight.
+pub(crate) fn resolve_tailscale_credential_candidate(
+    saved: &serde_json::Value,
+    candidate: &serde_json::Value,
+    request: &LoginRequest,
+) -> Result<(serde_json::Value, bool), String> {
+    use polaris_config_engine::user_config::effective_view::{
+        park_tailscale_auth_key, retained_tailscale_auth_key, tailscale_control_authority,
+        tailscale_credential_revision,
+    };
+    let id = candidate
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("candidateConfigurationChanged")?;
+    let nodes: Vec<_> = saved
+        .get("servers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|node| node.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        .collect();
+    let [current] = nodes.as_slice() else {
+        return Err("candidateConfigurationChanged".into());
+    };
+    let record = retained_tailscale_auth_key(current)?;
+    let current_authority = tailscale_control_authority(current)?;
+    let candidate_authority = tailscale_control_authority(candidate)?;
+    let revision = tailscale_credential_revision(current);
+    let backend_owned = request.reuse_retained_auth_key
+        || record.is_some()
+        || request.expected_credential_revision.is_some()
+        || revision.is_some() && current_authority != candidate_authority;
+    if !backend_owned {
+        return Ok((candidate.clone(), false));
+    }
+    if request.expected_credential_revision.as_deref() != revision.as_deref() || revision.is_none()
+    {
+        return Err("credentialRevisionChanged".into());
+    }
+    let supplied_key = candidate
+        .get("tailscaleSettings")
+        .and_then(|settings| settings.get("authKey"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|key| !key.trim().is_empty());
+    if request.reuse_retained_auth_key
+        && (request.mode != LoginMode::Authkey || supplied_key.is_some())
+    {
+        return Err("invalidCredentialIntent".into());
+    }
+    let mut candidate = candidate.clone();
+    let settings = candidate
+        .get_mut("tailscaleSettings")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("candidateConfigurationChanged")?;
+    settings.remove("retainedAuthKey");
+    settings.remove("retainedAuthKeyAvailable");
+    settings.remove("tailscaleCredentialRevision");
+    if request.mode == LoginMode::Authkey {
+        let key = if request.reuse_retained_auth_key {
+            let record = record.ok_or("retainedAuthKeyUnavailable")?;
+            if record.control_authority != current_authority
+                || record.control_authority != candidate_authority
+            {
+                return Err("retainedAuthKeyAuthorityChanged".into());
+            }
+            record.auth_key
+        } else {
+            supplied_key.ok_or("authKeyRequired")?.to_owned()
+        };
+        settings.insert("authKey".into(), serde_json::Value::String(key.clone()));
+        settings.insert(
+            "retainedAuthKey".into(),
+            json!({
+                "authKey":key,"controlAuthority":candidate_authority
+            }),
+        );
+    } else {
+        if supplied_key.is_some() {
+            return Err("invalidCredentialIntent".into());
+        }
+        let mut parked = (*current).clone();
+        park_tailscale_auth_key(&mut parked)?;
+        settings.remove("authKey");
+        if let Some(record) = parked
+            .get("tailscaleSettings")
+            .and_then(|s| s.get("retainedAuthKey"))
+        {
+            settings.insert("retainedAuthKey".into(), record.clone());
+        }
+    }
+    if let Some(object) = candidate.as_object_mut() {
+        object.remove("tailscaleCredentialIntent");
+    }
+    Ok((
+        ProxyRuntime::merged_tailscale_candidate(saved, &candidate)?,
+        true,
+    ))
+}
+
+pub(crate) fn park_saved_tailscale_key(
+    saved: &mut serde_json::Value,
+    id: &str,
+) -> Result<(), String> {
+    let nodes = saved
+        .get_mut("servers")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("candidateConfigurationChanged")?;
+    let matches: Vec<_> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            (node.get("id").and_then(serde_json::Value::as_str) == Some(id)).then_some(index)
+        })
+        .collect();
+    let [index] = matches.as_slice() else {
+        return Err("candidateConfigurationChanged".into());
+    };
+    if nodes[*index]
+        .get("protocol")
+        .and_then(serde_json::Value::as_str)
+        != Some("tailscale")
+    {
+        return Err("candidateConfigurationChanged".into());
+    }
+    polaris_config_engine::user_config::effective_view::park_tailscale_auth_key(&mut nodes[*index])
+}
 
 /// 瞬态登录核的最大挂起时长：登录不完成（用户不去浏览器认证）时到点自动杀核，避免核无限挂着。
 /// 交互登录需人去浏览器完成，故给宽松窗口（5 分钟）。
@@ -123,6 +258,69 @@ pub struct MainLoginSnapshot {
     pub mixed_port: Option<u16>,
 }
 
+/// Only the normal lifecycle producer supplies this ticket. The observer can read and
+/// revalidate it, but cannot promote a running cache or a TCP connection to readiness.
+struct ReadyMainLogin<'a> {
+    proxy: &'a ProxyRuntime,
+    ticket: ReadyMainTicket,
+}
+
+#[async_trait]
+trait MainLoginBinding: Send + Sync {
+    async fn validate(&self) -> Result<(), String>;
+    fn target_tag(&self, _server_id: &str) -> Option<&str> {
+        None
+    }
+}
+
+#[async_trait]
+impl MainLoginBinding for ReadyMainLogin<'_> {
+    fn target_tag(&self, server_id: &str) -> Option<&str> {
+        self.ticket.target_tag(server_id)
+    }
+    async fn validate(&self) -> Result<(), String> {
+        self.proxy
+            .validate_ready_main(&self.ticket)
+            .await
+            .map_err(|error| error.code().to_owned())
+    }
+}
+
+struct NormalMainLoginInput<'a> {
+    proxy: &'a Arc<ProxyRuntime>,
+    saved: &'a serde_json::Value,
+    identity_epoch: Option<String>,
+    candidate: &'a serde_json::Value,
+    action_generation: u64,
+}
+
+pub(crate) fn saved_tailscale_identity_epoch(
+    saved: &serde_json::Value,
+    server_id: &str,
+) -> Result<Option<String>, String> {
+    use polaris_config_engine::user_config::mesh_route_state::{MeshBindingState, MeshRouteState};
+    let Some(raw) = saved.get("meshRouteState") else {
+        return Ok(None);
+    };
+    let state: MeshRouteState = serde_json::from_value(raw.clone())
+        .map_err(|_| "Saved mesh identity ledger is invalid".to_owned())?;
+    let active: Vec<_> = state
+        .identities
+        .iter()
+        .filter(|identity| {
+            identity.server_id == server_id
+                && matches!(
+                    identity.binding_state,
+                    MeshBindingState::Bound | MeshBindingState::Unbound
+                )
+        })
+        .collect();
+    let [identity] = active.as_slice() else {
+        return Err("Saved Tailscale identity epoch is unavailable".into());
+    };
+    Ok(Some(identity.identity_epoch.clone()))
+}
+
 /// Production resolves the bundled binary; tests inject a path without running a real core.
 type BinaryResolver = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
 
@@ -142,6 +340,16 @@ pub trait LoginCoreChild: Send {
     /// [`LoginCoreRegistry::inflight_login_pids`] 据此喂 `ProxyRuntime::cleanup_stale_cores`
     /// 的排除表 —— 返错 pid 会让清扫放过一个真孤儿，返 `None` 只会让本核在飞时失去保护。
     fn pid(&self) -> Option<u32>;
+    /// An opaque fact from this exact native-bound temporary Child, never ordinary Close Ok.
+    fn native_exit(&self) -> Option<NativeTransientExit> {
+        None
+    }
+    /// Original native input correlation only. The actual scoped bridge, rather
+    /// than these strings or an ordinary close ACK, supplies Store custody.
+    #[cfg(target_os = "android")]
+    fn android_tailscale_instance(&self) -> Option<(&str, &str)> {
+        None
+    }
     /// 等子进程自然退出并收割（cancel-safe：可在 `select!` 中反复创建/丢弃）。
     async fn wait(&mut self);
     /// Only an explicit implementation may attest that its owned child exited. The legacy
@@ -170,6 +378,272 @@ pub trait LoginCoreSpawner: Send + Sync {
     /// **按值收请求**（与 [`SingBoxSpawner`] 同）：请求里的排空回调是 `FnOnce`，spawner 必须能
     /// 消费掉它。假 spawner 也一样要把自己那两条内存流喂给同一个回调，测试才走的是生产接线。
     async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError>;
+    /// Preparation has no OS effect and supplies no exit/no-child evidence.
+    fn prepare_temp_native_birth(&self) -> Option<PreparedTempNativeBirth> {
+        None
+    }
+    /// Some booking stays strict even if an injected implementation uses legacy spawn.
+    /// None lets the concrete adapter reuse this factory for ordinary unbound login.
+    async fn spawn_with_temp_native_birth(
+        &self,
+        req: SpawnRequest,
+        _prepared: Option<PreparedTempNativeBirth>,
+    ) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        self.spawn(req).await
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) use temp_native::{LocalTempNativeTerminal, TempNativeBirthRef};
+pub use temp_native::{NativeTransientExit, PreparedTempNativeBirth};
+
+/// Private issuer data lives in the existing transient adapter, not a second registry.
+mod temp_native {
+    use std::process::ExitStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NativeRole {
+        Temp,
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        Foreign,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NativeScope {
+        SingleTempNativeChildV1,
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        Foreign,
+    }
+    struct Binding {
+        #[cfg(not(target_os = "android"))]
+        custody: Arc<()>,
+        #[cfg(not(target_os = "android"))]
+        birth: Arc<()>,
+    }
+    enum NoChildReturn {
+        FactoryReturned,
+        AdmissionRejected,
+    }
+    #[derive(Default)]
+    struct NativeCell {
+        binding: OnceLock<Binding>,
+        factory_entered: AtomicBool,
+        no_child: OnceLock<NoChildReturn>,
+        member: OnceLock<Arc<()>>,
+        status: OnceLock<ExitStatus>,
+        retired: AtomicBool,
+    }
+    /// Dispatch authority is move-only. Its constructors and native issuer are private.
+    pub struct PreparedTempNativeBirth(Arc<NativeCell>);
+    #[derive(Clone)]
+    pub(crate) struct TempNativeBirthRef(Arc<NativeCell>);
+    pub(super) struct NativeAttachment {
+        birth: TempNativeBirthRef,
+        member: Arc<()>,
+    }
+    #[derive(Clone)]
+    pub struct NativeTransientExit {
+        birth: TempNativeBirthRef,
+        member: Arc<()>,
+        role: NativeRole,
+        scope: NativeScope,
+        status: ExitStatus,
+    }
+    #[cfg(not(target_os = "android"))]
+    pub(crate) struct ValidatedTempNativeExit(NativeTransientExit);
+    #[cfg(not(target_os = "android"))]
+    pub(crate) struct LocalTempNativeTerminal {
+        _exit: NativeTransientExit,
+    }
+
+    impl PreparedTempNativeBirth {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(NativeCell::default()))
+        }
+        #[cfg(not(target_os = "android"))]
+        pub(crate) fn bind(
+            &self,
+            custody: &Arc<()>,
+            birth: &Arc<()>,
+        ) -> Result<TempNativeBirthRef, String> {
+            if self.0.factory_entered.load(Ordering::SeqCst)
+                || self.0.no_child.get().is_some()
+                || self.0.member.get().is_some()
+                || self.0.retired.load(Ordering::SeqCst)
+            {
+                return Err("测速临时核 native birth 已进入或退休".into());
+            }
+            self.0
+                .binding
+                .set(Binding {
+                    custody: custody.clone(),
+                    birth: birth.clone(),
+                })
+                .map_err(|_| "测速临时核 native birth 禁止重复绑定")?;
+            Ok(TempNativeBirthRef(self.0.clone()))
+        }
+        pub(super) fn enter_factory(&self) -> Result<(), String> {
+            if self.0.binding.get().is_none()
+                || self.0.retired.load(Ordering::SeqCst)
+                || self.0.no_child.get().is_some()
+                || self
+                    .0
+                    .factory_entered
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                return Err("测速临时核 native factory 未绑定或重复进入".into());
+            }
+            Ok(())
+        }
+        pub(super) fn factory_returned_no_child(&self) {
+            let _ = self.0.no_child.set(NoChildReturn::FactoryReturned);
+        }
+        pub(super) fn admission_rejected(&self) {
+            let _ = self.0.no_child.set(NoChildReturn::AdmissionRejected);
+        }
+        pub(super) fn attach(&self) -> NativeAttachment {
+            // Only the concrete factory's returned physical Child reaches this issuer.
+            let member = Arc::new(());
+            let _ = self.0.member.set(member.clone());
+            NativeAttachment {
+                birth: TempNativeBirthRef(self.0.clone()),
+                member,
+            }
+        }
+    }
+    impl NativeAttachment {
+        pub(super) fn observe(&self, status: ExitStatus) -> NativeTransientExit {
+            let status = *self.birth.0.status.get_or_init(|| status);
+            NativeTransientExit {
+                birth: self.birth.clone(),
+                member: self.member.clone(),
+                role: NativeRole::Temp,
+                scope: NativeScope::SingleTempNativeChildV1,
+                status,
+            }
+        }
+    }
+    impl NativeTransientExit {
+        pub(super) fn matches_cell(&self) -> bool {
+            self.birth.0.factory_entered.load(Ordering::SeqCst)
+                && self.birth.0.no_child.get().is_none()
+                && self
+                    .birth
+                    .0
+                    .member
+                    .get()
+                    .is_some_and(|member| Arc::ptr_eq(member, &self.member))
+                && self.role == NativeRole::Temp
+                && self.scope == NativeScope::SingleTempNativeChildV1
+                && self.birth.0.status.get() == Some(&self.status)
+        }
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        pub(crate) fn status_for_test(&self) -> ExitStatus {
+            self.status
+        }
+        /// Negative consumer input only: never used to create a native acceptance positive.
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        pub(crate) fn corrupted_for_test(&self, fault: &str, foreign: &Self) -> Self {
+            let mut fact = self.clone();
+            match fault {
+                "member" => fact.member = foreign.member.clone(),
+                "role" => fact.role = NativeRole::Foreign,
+                "scope" => fact.scope = NativeScope::Foreign,
+                "status" => fact.status = foreign.status,
+                _ => panic!("unknown negative native fact fault"),
+            }
+            fact
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    impl TempNativeBirthRef {
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        pub(crate) fn replayed_preparation_for_test(&self) -> PreparedTempNativeBirth {
+            PreparedTempNativeBirth(self.0.clone())
+        }
+        #[cfg(all(test, not(target_os = "android")))]
+        #[cfg(unix)]
+        pub(crate) fn factory_entered_for_test(&self) -> bool {
+            self.0.factory_entered.load(Ordering::SeqCst)
+        }
+        fn validate_binding(&self, custody: &Arc<()>, birth: &Arc<()>) -> Result<(), String> {
+            let binding = self
+                .0
+                .binding
+                .get()
+                .ok_or("测速临时核 native birth 未绑定")?;
+            if !Arc::ptr_eq(&binding.custody, custody)
+                || !Arc::ptr_eq(&binding.birth, birth)
+                || self.0.retired.load(Ordering::SeqCst)
+            {
+                return Err("测速临时核 native 回执不属于原 custody/birth".into());
+            }
+            Ok(())
+        }
+        pub(crate) fn validate_exit(
+            &self,
+            fact: Option<NativeTransientExit>,
+            custody: &Arc<()>,
+            birth: &Arc<()>,
+        ) -> Result<ValidatedTempNativeExit, String> {
+            self.validate_binding(custody, birth)?;
+            let fact = fact.ok_or("测速临时核 native 退出事实缺失")?;
+            if !self.0.factory_entered.load(Ordering::SeqCst)
+                || self.0.no_child.get().is_some()
+                || !Arc::ptr_eq(&self.0, &fact.birth.0)
+                || !self
+                    .0
+                    .member
+                    .get()
+                    .is_some_and(|member| Arc::ptr_eq(member, &fact.member))
+                || fact.role != NativeRole::Temp
+                || fact.scope != NativeScope::SingleTempNativeChildV1
+                || self.0.status.get() != Some(&fact.status)
+            {
+                return Err("测速临时核 native 成员或退出状态不匹配".into());
+            }
+            // Clone/move every sealed reference before the original custody commit.
+            Ok(ValidatedTempNativeExit(fact))
+        }
+        pub(crate) fn validate_no_child(
+            &self,
+            custody: &Arc<()>,
+            birth: &Arc<()>,
+        ) -> Result<(), String> {
+            self.validate_binding(custody, birth)?;
+            let entered = self.0.factory_entered.load(Ordering::SeqCst);
+            let returned =
+                matches!(self.0.no_child.get(), Some(NoChildReturn::FactoryReturned)) && entered;
+            let rejected = matches!(
+                self.0.no_child.get(),
+                Some(NoChildReturn::AdmissionRejected)
+            ) && !entered;
+            if (!returned && !rejected)
+                || self.0.member.get().is_some()
+                || self.0.status.get().is_some()
+            {
+                return Err("测速临时核 native factory 责任尚未确认".into());
+            }
+            Ok(())
+        }
+        pub(crate) fn retire_no_child(&self) {
+            self.0.retired.store(true, Ordering::SeqCst);
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    impl ValidatedTempNativeExit {
+        pub(crate) fn retire(self) -> LocalTempNativeTerminal {
+            self.0.birth.0.retired.store(true, Ordering::SeqCst);
+            LocalTempNativeTerminal { _exit: self.0 }
+        }
+    }
 }
 
 /// `sing-box check` 抽象：spawn 前先验配置形状（fail-fast）。生产真跑 `sing-box check -c <file>`，测试 mock。
@@ -237,6 +711,23 @@ pub trait AuthUrlEmitter: Send + Sync {
         _url: Option<&str>,
     ) {
     }
+    fn progress_receipt(&self, receipt: &LoginProgressReceipt) {
+        self.progress(
+            &receipt.server_id,
+            &receipt.attempt_id,
+            &receipt.phase,
+            receipt.reason.as_deref(),
+            receipt.url.as_deref(),
+        );
+    }
+}
+
+#[cfg(target_os = "android")]
+struct WarmEmitter;
+
+#[cfg(target_os = "android")]
+impl AuthUrlEmitter for WarmEmitter {
+    fn emit_auth_url(&self, _server_id: &str, _node_name: &str, _url: &str) {}
 }
 
 /// Save the receipt before broadcasting. Android may suspend the WebView while Chrome owns the
@@ -260,42 +751,61 @@ impl AuthUrlEmitter for AttemptReceiptEmitter {
         reason: Option<&str>,
         url: Option<&str>,
     ) {
-        if server_id == self.attempt.server_id && attempt_id == self.attempt_id {
-            self.attempt.record_progress(LoginProgressReceipt {
-                server_id: server_id.to_owned(),
-                attempt_id: attempt_id.to_owned(),
-                phase: phase.to_owned(),
-                // Only stable UI reason codes cross this read API. Native error text could
-                // contain a URL or secret and the UI already maps unknown codes to a generic
-                // authorization error.
-                reason: reason
-                    .filter(|reason| {
-                        matches!(
-                            *reason,
-                            "coreUnavailable"
-                                | "ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED"
-                                | "configurationCheckFailed"
-                                | "configWriteFailed"
-                                | "processStartFailed"
-                                | "statusSubscriptionFailed"
-                                | "statusStreamEnded"
-                                | "processExited"
-                                | "processWaitFailed"
-                                | "authorizationTimedOut"
-                                | "mainCoreChanged"
-                                | "mainCoreInUse"
-                                | "stateQueryFailed"
-                                | "saveFailed"
-                                | "configurationRefreshFailed"
-                                | "tooManyLogins"
-                                | "invalidAuthUrl"
-                        )
-                    })
-                    .map(str::to_owned),
-            });
+        if server_id != self.attempt.server_id || attempt_id != self.attempt_id {
+            return;
         }
-        self.inner
-            .progress(server_id, attempt_id, phase, reason, url);
+        let context = self.attempt.main_context();
+        let receipt = LoginProgressReceipt {
+            server_id: server_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            phase: phase.to_owned(),
+            // Only stable UI reason codes cross this read API. Native error text could
+            // contain a URL or secret and the UI already maps unknown codes to a generic
+            // authorization error.
+            reason: reason
+                .filter(|reason| {
+                    matches!(
+                        *reason,
+                        "coreUnavailable"
+                            | "ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED"
+                            | "configurationCheckFailed"
+                            | "configWriteFailed"
+                            | "processStartFailed"
+                            | "statusSubscriptionFailed"
+                            | "statusStreamEnded"
+                            | "processExited"
+                            | "processWaitFailed"
+                            | "authorizationTimedOut"
+                            | "mainCoreChanged"
+                            | "mainCoreInUse"
+                            | "stateQueryFailed"
+                            | "saveFailed"
+                            | "configurationRefreshFailed"
+                            | "tooManyLogins"
+                            | "invalidAuthUrl"
+                            | "savedTailscaleIdentityChanged"
+                            | "configurationPending"
+                            | "superseded"
+                            | "readyUnknown"
+                            | "targetNotInMain"
+                            | "unsavedConfiguration"
+                    )
+                })
+                .map(str::to_owned),
+            // An active attempt can recover only a URL validated from its own fresh stream.
+            // Terminal receipts discard it so browser return cannot revive an old URL.
+            url: if matches!(phase, "awaitingAuth" | "mainCore") {
+                url.and_then(crate::runtime::tailscale_status::validated_tailscale_auth_url)
+            } else {
+                None
+            },
+            main_generation: context.as_ref().map(|(generation, _)| *generation),
+            identity_epoch: context.and_then(|(_, epoch)| epoch),
+        };
+        if !self.attempt.record_progress(receipt.clone()) {
+            return;
+        }
+        self.inner.progress_receipt(&receipt);
     }
 }
 
@@ -343,6 +853,8 @@ pub struct TokioLoginCoreChild {
     reaped: bool,
     /// ECHILD loses the Unix wait identity. A reused numeric PID can never repair this birth.
     wait_identity_lost: bool,
+    native_attachment: Option<temp_native::NativeAttachment>,
+    native_exit: Option<NativeTransientExit>,
 }
 
 impl Drop for TokioLoginCoreChild {
@@ -369,6 +881,12 @@ impl LoginCoreChild for TokioLoginCoreChild {
     fn pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(tokio::process::Child::id)
     }
+    fn native_exit(&self) -> Option<NativeTransientExit> {
+        self.native_exit
+            .as_ref()
+            .filter(|fact| fact.matches_cell())
+            .cloned()
+    }
     async fn wait(&mut self) {
         if let Err(error) = self.wait_result().await {
             log::error!("{error}");
@@ -382,13 +900,20 @@ impl LoginCoreChild for TokioLoginCoreChild {
             return Err("瞬态登录核等待身份已丢失，退出未确认".into());
         }
         let child = self.child.as_mut().ok_or("瞬态登录核句柄不可用")?;
-        if let Err(error) = child.wait().await {
-            #[cfg(unix)]
-            if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32) {
-                self.wait_identity_lost = true;
+        let status = match child.wait().await {
+            Ok(status) => status,
+            Err(error) => {
+                #[cfg(unix)]
+                if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32) {
+                    self.wait_identity_lost = true;
+                }
+                return Err(format!("等待瞬态登录核退出失败: {error}"));
             }
-            return Err(format!("等待瞬态登录核退出失败: {error}"));
-        }
+        };
+        self.native_exit = self
+            .native_attachment
+            .as_ref()
+            .map(|native| native.observe(status));
         self.reaped = true;
         Ok(())
     }
@@ -413,13 +938,13 @@ impl LoginCoreChild for TokioLoginCoreChild {
         }
         // The registry's exclusive Child lock covers this whole close. Probe before a
         // synchronous SIGTERM; a native wait error must never schedule a later PID signal.
-        let exited = match self
+        let status = match self
             .child
             .as_mut()
             .ok_or("瞬态登录核句柄不可用")?
             .try_wait()
         {
-            Ok(status) => status.is_some(),
+            Ok(status) => status,
             Err(error) => {
                 #[cfg(unix)]
                 if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32) {
@@ -428,8 +953,13 @@ impl LoginCoreChild for TokioLoginCoreChild {
                 return Err(format!("查询瞬态登录核退出失败: {error}"));
             }
         };
-        if exited {
-            return self.wait_result().await;
+        if let Some(status) = status {
+            self.native_exit = self
+                .native_attachment
+                .as_ref()
+                .map(|native| native.observe(status));
+            self.reaped = true;
+            return Ok(());
         }
         #[cfg(unix)]
         if let Some(pid) = self.pid().filter(|pid| *pid != 0) {
@@ -458,24 +988,61 @@ pub struct TokioLoginCoreSpawner;
 #[async_trait]
 impl LoginCoreSpawner for TokioLoginCoreSpawner {
     async fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
-        // 装箱适配：把 `SpawnedChild` 换成 `LoginCoreChild`。请求原样透传 —— 排空回调在
-        // `TokioSpawner::spawn` 内部就被调用完了，到这里 child 已经不带管道。
+        self.spawn_with_temp_native_birth(req, None).await
+    }
+    fn prepare_temp_native_birth(&self) -> Option<PreparedTempNativeBirth> {
+        Some(PreparedTempNativeBirth::new())
+    }
+    async fn spawn_with_temp_native_birth(
+        &self,
+        req: SpawnRequest,
+        prepared: Option<PreparedTempNativeBirth>,
+    ) -> Result<Box<dyn LoginCoreChild>, SpawnError> {
+        let bin = req.binary.clone();
         // This central guard linearizes OS spawn admission, not the outer registry publication.
         // Login/speedtest keep their own admission gate across this ready return and synchronously
         // publish the owned Child without another await or fallible branch before shutdown can drain.
-        let bin = req.binary.clone();
-        polaris_core_supervisor::with_check_admission(|| {
-            let spawned = TokioSpawner::new().spawn(req)?;
+        let admitted = polaris_core_supervisor::with_check_admission(|| {
+            if let Some(prepared) = &prepared {
+                prepared
+                    .enter_factory()
+                    .map_err(|error| SpawnError::Spawn {
+                        bin: bin.clone(),
+                        source: std::io::Error::other(error),
+                    })?;
+            }
+            // Drain executes after OS birth, before this call returns. A panic leaves entered
+            // responsibility booked; only this concrete call's actual Err issues no-child.
+            let spawned = match TokioSpawner::new().spawn(req) {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    if let Some(prepared) = &prepared {
+                        prepared.factory_returned_no_child();
+                    }
+                    return Err(error);
+                }
+            };
             Ok(Box::new(TokioLoginCoreChild {
                 child: Some(spawned.child),
                 reaped: false,
                 wait_identity_lost: false,
+                native_attachment: prepared.as_ref().map(PreparedTempNativeBirth::attach),
+                native_exit: None,
             }) as Box<dyn LoginCoreChild>)
-        })
-        .map_err(|error| SpawnError::Spawn {
-            bin,
-            source: std::io::Error::other(error),
-        })?
+        });
+        match admitted {
+            Ok(result) => result,
+            Err(error) => {
+                // Central admission rejected without invoking the factory closure.
+                if let Some(prepared) = &prepared {
+                    prepared.admission_rejected();
+                }
+                Err(SpawnError::Spawn {
+                    bin,
+                    source: std::io::Error::other(error),
+                })
+            }
+        }
     }
 }
 
@@ -484,6 +1051,7 @@ struct AndroidLoginCoreSpawner;
 #[cfg(target_os = "android")]
 struct AndroidLoginCoreChild {
     instance_id: String,
+    config_digest: String,
     closed: bool,
 }
 
@@ -505,6 +1073,7 @@ impl LoginCoreSpawner for AndroidLoginCoreSpawner {
             std::fs::read_to_string(&req.config).map_err(|error| failure(error.to_string()))?;
         let mut child = AndroidLoginCoreChild {
             instance_id,
+            config_digest: polaris_updater::sha256_hex(config.as_bytes()),
             closed: false,
         };
         crate::runtime::proxy::android_bridge::start_transient_login(&child.instance_id, &config)
@@ -538,6 +1107,9 @@ impl Drop for AndroidLoginCoreChild {
 #[cfg(target_os = "android")]
 #[async_trait]
 impl LoginCoreChild for AndroidLoginCoreChild {
+    fn android_tailscale_instance(&self) -> Option<(&str, &str)> {
+        Some((&self.instance_id, &self.config_digest))
+    }
     fn pid(&self) -> Option<u32> {
         None
     } // A libbox instance has no independent process PID.
@@ -709,6 +1281,23 @@ pub struct AppHandleEmitter {
 }
 
 impl AuthUrlEmitter for AppHandleEmitter {
+    fn progress_receipt(&self, receipt: &LoginProgressReceipt) {
+        broadcast(
+            &self.app,
+            crate::events::channel::EVENT_TAILSCALE_LOGIN_PROGRESS,
+            json!({"serverId": receipt.server_id, "attemptId": receipt.attempt_id,
+                "phase": receipt.phase, "reason": receipt.reason, "url": receipt.url,
+                "mainGeneration": receipt.main_generation, "identityEpoch": receipt.identity_epoch}),
+        );
+        if receipt.phase == "awaitingAuth" {
+            broadcast(
+                &self.app,
+                crate::events::channel::EVENT_TAILSCALE_AUTH_URL,
+                json!({"serverId": receipt.server_id, "attemptId": receipt.attempt_id,
+                    "nodeName": "", "url": receipt.url, "transient": true}),
+            );
+        }
+    }
     fn progress(
         &self,
         server_id: &str,
@@ -741,6 +1330,38 @@ impl AuthUrlEmitter for AppHandleEmitter {
 
 type LoginChildCustody = Arc<tokio::sync::Mutex<Box<dyn LoginCoreChild>>>;
 
+#[cfg(target_os = "android")]
+fn canonical_login_authority(server: &ServerConfig) -> Result<String, String> {
+    let authority = server
+        .tailscale_settings
+        .as_ref()
+        .and_then(|settings| settings.control_url.as_deref())
+        .filter(|url| !url.is_empty())
+        .unwrap_or("https://controlplane.tailscale.com");
+    polaris_config_engine::user_config::mesh_identity_reconcile::canonical_control_authority(
+        authority,
+    )
+    .map_err(|_| "profileBindingUnknown".into())
+}
+
+/// Begin's reply is not a release receipt. Every observed error must still run
+/// the exact finish; an unknown finish overrides a commit result and keeps custody.
+#[cfg(any(target_os = "android", test))]
+async fn complete_scoped_action<T, B, F, G, E>(
+    begin: B,
+    commit: impl FnOnce() -> Result<T, String>,
+    finish: F,
+) -> Result<T, String>
+where
+    B: std::future::Future<Output = Result<G, String>>,
+    F: FnOnce() -> E,
+    E: std::future::Future<Output = Result<(), String>>,
+{
+    let result = begin.await.and_then(|_reservation| commit());
+    finish().await?;
+    result
+}
+
 /// The registry retains the exact child even if its detached supervisor panics or is aborted.
 struct LoginEntry {
     /// 单调 epoch：区分同一 serverId 的不同代次登录（kill-on-relogin 后旧 supervisor 不得误删新表项）。
@@ -758,6 +1379,10 @@ struct LoginEntry {
     closed_rx: watch::Receiver<Option<Result<(), String>>>,
     /// Synthetic registry-only test entries have no physical child.
     _child: Option<LoginChildCustody>,
+    #[cfg(target_os = "android")]
+    android_instance: Option<(String, String)>,
+    #[cfg(target_os = "android")]
+    android_authority: Option<String>,
 }
 
 /// 注册表共享状态（supervisor 任务与命令层共享）。
@@ -892,6 +1517,10 @@ impl Shared {
 /// [`LoginCoreRegistry::start_attempt_with_saved`] 的结果；Started 表示仍待授权。
 pub enum StartLoginOutcome {
     AndroidCapacityClosed(crate::runtime::proxy::android_capacity::CapacityClosed),
+    PrerequisiteFailed {
+        reason: String,
+        code: String,
+    },
     /// 已起瞬态登录核（登录 URL 稍后经事件到达，非「已登录」）。
     Started,
     /// 双写守卫命中：该 TS endpoint 已在运行主核里，无需瞬态核（前端 `reason: 'inMainCore'`）。
@@ -901,6 +1530,68 @@ pub enum StartLoginOutcome {
     Failed(String),
     /// The request was cancelled before its process was started.
     Cancelled,
+}
+
+/// Match the Go Store constructor's lazy-directory canonicalization, while
+/// retaining the original one-component config/tailscale containment.
+#[cfg(any(target_os = "ios", target_os = "android", test))]
+pub(crate) fn canonical_tailscale_claim_directory(directory: &Path) -> Result<PathBuf, String> {
+    fn nearest_existing(path: &Path) -> std::io::Result<PathBuf> {
+        if !path.is_absolute()
+            || path.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid scoped path",
+            ));
+        }
+        let mut parent = path;
+        let mut remaining = Vec::new();
+        loop {
+            match parent.canonicalize() {
+                Ok(mut canonical) => {
+                    for name in remaining.into_iter().rev() {
+                        canonical.push(name);
+                    }
+                    return Ok(canonical);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    remaining.push(parent.file_name().ok_or(error)?);
+                    parent = parent
+                        .parent()
+                        .ok_or_else(|| std::io::Error::other("No scoped ancestor"))?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let unknown = |_| "nativeRetirementUnknown".to_owned();
+    let root = directory
+        .parent()
+        .filter(|root| root.file_name() == Some(std::ffi::OsStr::new("tailscale")))
+        .ok_or("nativeRetirementUnknown")?;
+    let config = root.parent().ok_or("nativeRetirementUnknown")?;
+    let canonical = nearest_existing(directory).map_err(unknown)?;
+    let canonical_root = nearest_existing(root).map_err(unknown)?;
+    let canonical_config = nearest_existing(config).map_err(unknown)?;
+    if canonical_root.parent() != Some(canonical_config.as_path())
+        || canonical.parent() != Some(canonical_root.as_path())
+    {
+        return Err("nativeRetirementUnknown".into());
+    }
+    Ok(canonical)
+}
+
+fn prerequisite_failure(error: MainPrerequisiteError) -> StartLoginOutcome {
+    StartLoginOutcome::PrerequisiteFailed {
+        reason: error.to_string(),
+        code: error.code().to_owned(),
+    }
 }
 
 /// Facts from this process's Tailscale login registry only. `Vacant` says nothing about an OS,
@@ -1015,6 +1706,10 @@ impl LoginCoreRegistry {
                 cancel_tx,
                 closed_rx,
                 _child: None,
+                #[cfg(target_os = "android")]
+                android_instance: None,
+                #[cfg(target_os = "android")]
+                android_authority: None,
             },
         );
     }
@@ -1134,6 +1829,95 @@ impl LoginCoreRegistry {
         self.attempts.prepare(server_id, attempt_id).map(|_| ())
     }
 
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn logout_with_normal_main(
+        &self,
+        server_id: &str,
+        proxy: &Arc<ProxyRuntime>,
+        saved: &serde_json::Value,
+        generation: u64,
+    ) -> Result<(), (String, String)> {
+        let failure = |reason: String| (reason, "TAILSCALE_LOGOUT_FAILED".to_owned());
+        let _lease = proxy.tailscale_action_lease().map_err(failure)?;
+        let request_id = format!("logout-{}", self.epoch.fetch_add(1, Ordering::SeqCst));
+        self.prepare(server_id, &request_id)
+            .await
+            .map_err(failure)?;
+        let attempt = self.attempts.get(server_id, &request_id).map_err(failure)?;
+        if attempt.claimed.swap(true, Ordering::SeqCst) {
+            return Err(failure("attemptAlreadyUsed".into()));
+        }
+        let mut guard = AttemptGuard(Arc::clone(&attempt), false);
+        let mut saved = saved.clone();
+        let binding = ActionBinding::new(
+            NormalMainAction::TailscaleLogin,
+            request_id.clone(),
+            &saved,
+            vec![server_id.to_owned()],
+            saved_tailscale_identity_epoch(&saved, server_id).map_err(failure)?,
+        )
+        .map_err(|error| (error.to_string(), error.code().to_owned()))?
+        .for_attempt(generation, Arc::clone(&attempt));
+        let ready = match proxy.live_tailscale_main(binding.clone()).await {
+            Ok(Some(ready)) => ready,
+            Err(error) => return Err((error.to_string(), error.code().to_owned())),
+            Ok(None) => {
+                // Classify the captured entry before Stop can change its live status.
+                // Only the genuine cold leg may clean original custody and start normally.
+                let generation = proxy
+                    .prepare_tailscale_action_origin(generation, &attempt)
+                    .await
+                    .map_err(failure)?;
+                // Original cold custody cleanup completed before this commit. Hold
+                // its real TS gate and action generation while publishing the no-key doc.
+                let gate = self.state_gate().await;
+                self.retire_other_attempts_under_state_gate(server_id, &gate, &attempt)
+                    .await
+                    .map_err(failure)?;
+                self.assert_auth_state_available(server_id, &gate, Some(&attempt))
+                    .map_err(failure)?;
+                saved = proxy
+                    .commit_tailscale_credential(
+                        &saved,
+                        server_id,
+                        generation,
+                        Some(&attempt),
+                        |current| park_saved_tailscale_key(current, server_id),
+                    )
+                    .map_err(failure)?;
+                drop(gate);
+                let binding = ActionBinding::new(
+                    NormalMainAction::TailscaleLogin,
+                    request_id.clone(),
+                    &saved,
+                    vec![server_id.to_owned()],
+                    saved_tailscale_identity_epoch(&saved, server_id).map_err(failure)?,
+                )
+                .map_err(|error| (error.to_string(), error.code().to_owned()))?
+                .for_attempt(generation, Arc::clone(&attempt));
+                match tokio::time::timeout(self.timeout, proxy.await_normal_main(binding)).await {
+                    Ok(Ok(ready)) => ready,
+                    Ok(Err(error)) => return Err((error.to_string(), error.code().to_owned())),
+                    Err(_) => {
+                        attempt.cancel();
+                        return Err(failure("authorizationTimedOut".into()));
+                    }
+                }
+            }
+        };
+        attempt.bind_main(
+            ready.generation(),
+            ready.identity_epoch().map(str::to_owned),
+        );
+        proxy
+            .retire_tailscale_account(&ready, server_id, &attempt, &saved, None)
+            .await
+            .map_err(failure)?;
+        attempt.finish();
+        guard.1 = true;
+        Ok(())
+    }
+
     /// Read-only, attempt-scoped recovery of a missed renderer event. Native running status and
     /// state-directory existence cannot establish a successful authorization for this request.
     pub fn login_progress(
@@ -1142,6 +1926,17 @@ impl LoginCoreRegistry {
         attempt_id: &str,
     ) -> Option<LoginProgressReceipt> {
         self.attempts.progress(server_id, attempt_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_attempt_for_test(
+        &self,
+        server_id: &str,
+        attempt_id: &str,
+    ) -> Arc<Attempt> {
+        self.attempts
+            .get(server_id, attempt_id)
+            .expect("original prepared request")
     }
 
     /// Fence every request already prepared for this state directory. The caller keeps the
@@ -1163,12 +1958,99 @@ impl LoginCoreRegistry {
         Ok(())
     }
 
+    #[cfg(any(target_os = "ios", target_os = "android", test))]
+    pub(crate) async fn retire_other_attempts_under_state_gate(
+        &self,
+        server_id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        keep: &Arc<Attempt>,
+    ) -> Result<(), String> {
+        if !self.valid_main_gate(gate) {
+            return Err("Login state gate changed".into());
+        }
+        let cancelled = self.attempts.retire_node_except_claimed(server_id, keep)?;
+        self.cancel_and_wait(server_id).await?;
+        for attempt in cancelled {
+            attempt.finished().await;
+        }
+        self.assert_auth_state_available(server_id, gate, Some(keep))
+    }
+
+    pub(crate) fn assert_auth_state_available(
+        &self,
+        server_id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        keep: Option<&Arc<Attempt>>,
+    ) -> Result<(), String> {
+        if !self.valid_main_gate(gate)
+            || self.main_claims(server_id)
+            || self.shared.contains(server_id)
+            || self.attempts.owns_state_except(server_id, keep)?
+        {
+            return Err("Tailscale state is in use".into());
+        }
+        Ok(())
+    }
+
     pub async fn cancel_attempt(&self, server_id: &str, attempt_id: &str) -> Result<(), String> {
         let attempt = self.attempts.cancel(server_id, attempt_id)?;
-        self.cancel_matching_login(server_id, Some(attempt_id))
+        let closed = self
+            .cancel_matching_login(server_id, Some(attempt_id))
             .await?;
+        #[cfg(target_os = "android")]
+        if let Some(original) = &attempt {
+            if let Some(action) = original.android_action()? {
+                if !action.active.load(Ordering::SeqCst) {
+                    self.finish_android_action(original, &action).await?;
+                }
+            }
+        }
+        #[cfg(target_os = "android")]
+        if let Some(original) = &attempt {
+            if original.credential_activation().is_some()
+                && (closed
+                    || !original
+                        .progress_receipt()
+                        .is_some_and(|receipt| receipt.phase == "authorized"))
+            {
+                // An unpublished/absent child is not NoConstruction. The exact
+                // selected native origin and whole family still have to close.
+                self.compensate_android_credential(server_id, attempt_id, original)
+                    .await?;
+            }
+        }
+        if let Some(original) = attempt.as_ref().filter(|_| closed) {
+            // Only the original registered child's real close/reap result admits this
+            // compensation. Attempt done/cancelled/process_owned flags are not terminal.
+            #[cfg(not(target_os = "android"))]
+            let gate = self.state_gate().await;
+            #[cfg(not(target_os = "android"))]
+            if self.attempts.original_credential_row(attempt_id, original)
+                && self
+                    .assert_auth_state_available(server_id, &gate, Some(original))
+                    .is_ok()
+            {
+                if let Some(activation) = original.credential_activation() {
+                    if let Some(proxy) = activation.proxy.upgrade() {
+                        proxy.commit_tailscale_credential(
+                            &activation.saved,
+                            server_id,
+                            activation.generation,
+                            None,
+                            |current| park_saved_tailscale_key(current, server_id),
+                        )?;
+                    }
+                }
+            }
+        }
         if let Some(attempt) = attempt {
             attempt.finished().await;
+            #[cfg(target_os = "android")]
+            if attempt.android_action()?.is_some() {
+                // A concurrent pipeline may still be handing back its exact
+                // reservation. Request completion never releases native custody.
+                return Err("nativeRetirementUnknown".into());
+            }
         }
         Ok(())
     }
@@ -1176,6 +2058,447 @@ impl LoginCoreRegistry {
     /// Lock order: proxy lifecycle -> this gate. Login never waits for proxy lifecycle.
     pub async fn state_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.start_gate.lock().await
+    }
+
+    #[cfg(target_os = "android")]
+    async fn finish_android_action(
+        &self,
+        attempt: &Arc<Attempt>,
+        action: &Arc<attempts::AndroidTargetAction>,
+    ) -> Result<(), String> {
+        use crate::runtime::proxy::android_bridge::tailscale_store;
+        match &action.original {
+            attempts::AndroidActionOrigin::Runtime(original) => {
+                tailscale_store::finish_action(original, &action.state_file, &action.action_id)
+                    .await?;
+            }
+            attempts::AndroidActionOrigin::Warm(tuple) => {
+                // A failed create/response can have born an Entry without any
+                // Store payload. Only this original tuple can close it.
+                if tailscale_store::finish_warm(tuple).await.is_err() {
+                    let reservation = tailscale_store::read_warm(tuple).await?;
+                    if reservation.held_retirement().is_err() {
+                        tailscale_store::close_warm(tuple, &format!("{}-close", action.action_id))
+                            .await?;
+                    }
+                    tailscale_store::finish_warm(tuple).await?;
+                }
+            }
+        }
+        attempt.release_android_action(action)
+    }
+
+    #[cfg(target_os = "android")]
+    async fn with_android_target_action<T>(
+        &self,
+        attempt: &Arc<Attempt>,
+        original: &crate::runtime::proxy::android_bridge::tailscale_store::AndroidStoreCustody,
+        state_file: &str,
+        commit: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        if let Some(action) = attempt.android_action()? {
+            let attempts::AndroidActionOrigin::Warm(tuple) = &action.original else {
+                return Err("nativeRetirementUnknown".into());
+            };
+            if action.state_file != state_file {
+                return Err("nativeRetirementUnknown".into());
+            }
+            // The warm reservation already fences the entire native family.
+            // It cannot acquire a second target permit while that fence is held.
+            let held = async {
+                let reservation =
+                    crate::runtime::proxy::android_bridge::tailscale_store::read_warm(tuple)
+                        .await?;
+                let (retired, snapshot) = reservation.held_retirement()?;
+                if retired.original() != original.original() {
+                    return Err("nativeRetirementUnknown".into());
+                }
+                Ok(snapshot)
+            };
+            return complete_scoped_action(held, commit, || {
+                self.finish_android_action(attempt, &action)
+            })
+            .await;
+        }
+        let action = Arc::new(attempts::AndroidTargetAction {
+            state_file: state_file.to_owned(),
+            action_id: format!("ts-action-{}", self.epoch.fetch_add(1, Ordering::SeqCst)),
+            active: AtomicBool::new(true),
+            original: attempts::AndroidActionOrigin::Runtime(original.clone()),
+        });
+        attempt.reserve_android_action(action.clone())?;
+        let _activity = attempts::AndroidActionActivity(action.clone());
+        // Native begin can install the reservation before Rust rejects its reply.
+        // Always finish the same original token, including that decode/error path.
+        // Dropping this IPC future retains the token in its original Attempt.
+        complete_scoped_action(
+            crate::runtime::proxy::android_bridge::tailscale_store::target_action(
+                original,
+                state_file,
+                &action.action_id,
+                true,
+            ),
+            commit,
+            || self.finish_android_action(attempt, &action),
+        )
+        .await
+    }
+
+    #[cfg(target_os = "android")]
+    async fn close_android_tailscale_origin(
+        &self,
+        id: &str,
+        proxy: &Arc<ProxyRuntime>,
+        saved: &serde_json::Value,
+        generation: u64,
+        request_id: &str,
+        attempt: &Arc<Attempt>,
+    ) -> Result<
+        (
+            crate::runtime::proxy::android_bridge::tailscale_store::AndroidStoreCustody,
+            u64,
+            String,
+            Option<attempts::AndroidActionActivity>,
+        ),
+        String,
+    > {
+        use crate::runtime::proxy::android_bridge::tailscale_store;
+        if let Some(main) = proxy
+            .stop_android_tailscale_main_origin(id, saved, generation, request_id, attempt)
+            .await?
+        {
+            return Ok((main.0, main.1, main.2, None));
+        }
+        let old: ServerConfig = serde_json::from_value(
+            saved
+                .get("servers")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|nodes| {
+                    nodes
+                        .iter()
+                        .find(|node| node.get("id").and_then(serde_json::Value::as_str) == Some(id))
+                })
+                .ok_or("candidateConfigurationChanged")?
+                .clone(),
+        )
+        .map_err(|_| "candidateConfigurationChanged")?;
+        let authority = canonical_login_authority(&old)?;
+        let gate = self.state_gate().await;
+        let selected = self
+            .shared
+            .guard()
+            .get(id)
+            .map(|entry| {
+                if entry.android_authority.as_deref() != Some(authority.as_str()) {
+                    return Err("nativeRetirementUnknown".to_owned());
+                }
+                let metadata = entry
+                    .android_instance
+                    .clone()
+                    .ok_or("nativeRetirementUnknown")?;
+                Ok((entry.epoch, metadata, entry.attempt_id.clone()))
+            })
+            .transpose()?;
+        let Some((epoch, metadata, old_request)) = selected else {
+            // No Rust entry only chooses preparation. The original native
+            // validation and whole-family reservation must authorize its birth.
+            drop(gate);
+            let saved_server =
+                || proxy.saved_android_credential_target(saved, id, generation, attempt);
+            let main_core = || MainLoginSnapshot {
+                alive: proxy.tailscale_writer_alive(),
+                generation: proxy.core_generation(),
+                api_port: proxy.status().clash_api_port,
+                ..Default::default()
+            };
+            let request = LoginRequest {
+                attempt_id: request_id.to_owned(),
+                mode: LoginMode::Browser,
+                replace_identity: false,
+                reuse_retained_auth_key: false,
+                expected_credential_revision: None,
+            };
+            let mut activity = None;
+            let outcome = self
+                .launch_attempt(
+                    &old,
+                    proxy.android_tailscale_user_data(),
+                    &request,
+                    attempt,
+                    &saved_server,
+                    &main_core,
+                    Arc::new(WarmEmitter),
+                    Some((proxy, generation)),
+                    Some(&mut activity),
+                )
+                .await;
+            if !matches!(&outcome, StartLoginOutcome::Started) {
+                return Err(match outcome {
+                    StartLoginOutcome::Failed(error) => error,
+                    StartLoginOutcome::Cancelled => "cancelled".into(),
+                    _ => "nativeRetirementUnknown".into(),
+                });
+            }
+            let action = attempt.android_action()?.ok_or("nativeRetirementUnknown")?;
+            let attempts::AndroidActionOrigin::Warm(tuple) = &action.original else {
+                return Err("nativeRetirementUnknown".into());
+            };
+            let reservation = tailscale_store::read_warm(tuple).await?;
+            let (held_retired, _held_family) = reservation.held_retirement()?;
+            // The supervisor observed the current original run before close.
+            // The validation's cached metadata cannot substitute for that run.
+            let original = attempt.android_store()?;
+            if original.original().producer_kind != "Login"
+                || original.original().logical_instance_id != tuple.logical_instance_id()
+                || original.original().actual_config_digest != tuple.config_digest()
+            {
+                return Err("nativeRetirementUnknown".into());
+            }
+            let retired = tailscale_store::read_login_retirement(&original).await?;
+            if retired.original() != held_retired.original() {
+                return Err("nativeRetirementUnknown".into());
+            }
+            if proxy.core_generation() != generation || attempt.cancelled() {
+                return Err("mainCoreChanged".into());
+            }
+            attempt.record_android_store(retired.clone())?;
+            return Ok((
+                retired,
+                generation,
+                TAILSCALE_LOGIN_ENDPOINT_TAG.to_owned(),
+                activity,
+            ));
+        };
+        let original = tailscale_store::observe_login(&metadata.0, &metadata.1).await?;
+        if proxy.core_generation() != generation
+            || attempt.cancelled()
+            || !self
+                .shared
+                .guard()
+                .get(id)
+                .is_some_and(|entry| entry.epoch == epoch)
+        {
+            return Err("mainCoreChanged".into());
+        }
+        attempt.record_android_store(original.clone())?;
+        // Capture first, then signal the original supervisor exactly once. Its
+        // ordinary ACK remains distinct from this original native writer export.
+        if !self.cancel_matching_login(id, Some(&old_request)).await? {
+            return Err("nativeRetirementUnknown".into());
+        }
+        let retired = tailscale_store::read_login_retirement(&original).await?;
+        drop(gate);
+        Ok((
+            retired,
+            generation,
+            TAILSCALE_LOGIN_ENDPOINT_TAG.to_owned(),
+            None,
+        ))
+    }
+
+    #[cfg(target_os = "android")]
+    async fn activate_android_credential(
+        &self,
+        requested: &ServerConfig,
+        request: &LoginRequest,
+        attempt: &Arc<Attempt>,
+        normal: &NormalMainLoginInput<'_>,
+    ) -> Result<(), String> {
+        normal
+            .proxy
+            .tailscale_candidate_preflight(normal.saved, normal.candidate)?;
+        let mut guard = AttemptGuard(attempt.clone(), false);
+        let (retired, generation, tag, _warm_activity) = self
+            .close_android_tailscale_origin(
+                &requested.id,
+                normal.proxy,
+                normal.saved,
+                normal.action_generation,
+                &request.attempt_id,
+                attempt,
+            )
+            .await?;
+        let gate = self.state_gate().await;
+        let cancelled = self
+            .attempts
+            .retire_node_except(&requested.id, Some(&request.attempt_id))?;
+        self.cancel_and_wait(&requested.id).await?;
+        for original in cancelled {
+            original.finished().await;
+        }
+        self.assert_auth_state_available(&requested.id, &gate, Some(attempt))?;
+        let directory = normal
+            .proxy
+            .android_tailscale_auth_directory(&requested.id)?;
+        let export = retired.retired_export()?;
+        let node = ProxyRuntime::selected_android_auth_node(
+            &retired.original().original_observed_runs,
+            &retired.original().actual_config_digest,
+            &tag,
+            directory.to_str().ok_or("profileBindingUnknown")?,
+            &export,
+        )?;
+        self.with_android_target_action(attempt, &retired, &node.state_file, || {
+            self.assert_auth_state_available(&requested.id, &gate, Some(attempt))?;
+            let saved = normal.proxy.commit_tailscale_credential(
+                normal.saved,
+                &requested.id,
+                generation,
+                Some(attempt),
+                |current| {
+                    if request.replace_identity {
+                        normal.proxy.retire_android_tailscale_auth(
+                            &requested.id,
+                            &gate,
+                            attempt,
+                            &node,
+                        )?;
+                    }
+                    let replacement =
+                        ProxyRuntime::merged_tailscale_candidate(current, normal.candidate)?;
+                    let node = current
+                        .get_mut("servers")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|nodes| {
+                            nodes.iter_mut().find(|node| {
+                                node.get("id").and_then(serde_json::Value::as_str)
+                                    == Some(&requested.id)
+                            })
+                        })
+                        .ok_or("candidateConfigurationChanged")?;
+                    *node = replacement;
+                    Ok(())
+                },
+            )?;
+            // Bind the actual committed CAS before awaiting finish. A lost
+            // finish must not discard the only compensation snapshot.
+            attempt.record_credential_activation(normal.proxy, saved, generation);
+            Ok(())
+        })
+        .await?;
+        guard.1 = true;
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    async fn compensate_android_credential(
+        &self,
+        id: &str,
+        request_id: &str,
+        attempt: &Arc<Attempt>,
+    ) -> Result<(), String> {
+        let original = attempt.android_store()?;
+        use crate::runtime::proxy::android_bridge::tailscale_store;
+        let retired = match original.original().producer_kind.as_str() {
+            "Main" => tailscale_store::read_main_retirement(&original).await?,
+            "Login" => tailscale_store::read_login_retirement(&original).await?,
+            _ => return Err("nativeRetirementUnknown".into()),
+        };
+        let activation = attempt
+            .credential_activation()
+            .ok_or("nativeRetirementUnknown")?;
+        let proxy = activation
+            .proxy
+            .upgrade()
+            .ok_or("nativeRetirementUnknown")?;
+        let gate = self.state_gate().await;
+        if !self.attempts.original_credential_row(request_id, attempt) {
+            return Err("credentialRevisionChanged".into());
+        }
+        self.assert_auth_state_available(id, &gate, Some(attempt))?;
+        let directory = proxy.android_tailscale_auth_directory(id)?;
+        let state_file = directory.join("tailscaled.state");
+        let scopes: Vec<_> = original
+            .original()
+            .original_observed_runs
+            .last()
+            .ok_or("profileBindingUnknown")?
+            .scopes
+            .iter()
+            .filter(|scope| {
+                Some(scope.state_directory.as_str()) == directory.to_str()
+                    && Some(scope.state_file.as_str()) == state_file.to_str()
+            })
+            .collect();
+        let [scope] = scopes.as_slice() else {
+            return Err("profileBindingUnknown".into());
+        };
+        if original.original().producer_kind == "Login" && scope.tag != TAILSCALE_LOGIN_ENDPOINT_TAG
+        {
+            return Err("profileBindingUnknown".into());
+        }
+        let node = ProxyRuntime::selected_android_auth_node(
+            &retired.original().original_observed_runs,
+            &retired.original().actual_config_digest,
+            &scope.tag,
+            directory.to_str().ok_or("profileBindingUnknown")?,
+            &retired.retired_export()?,
+        )?;
+        self.with_android_target_action(attempt, &retired, &node.state_file, || {
+            // Cancellation is intended here. The same original row, actual child
+            // close, native writer family and exact promoted target CAS remain mandatory.
+            if !self.attempts.original_credential_row(request_id, attempt) {
+                return Err("credentialRevisionChanged".into());
+            }
+            self.assert_auth_state_available(id, &gate, Some(attempt))?;
+            let saved = proxy.commit_tailscale_credential(
+                &activation.saved,
+                id,
+                activation.generation,
+                None,
+                |current| park_saved_tailscale_key(current, id),
+            )?;
+            // A successful park with unknown finish keeps its own latest exact
+            // CAS, so a same-request retry does not borrow the pre-park revision.
+            attempt.record_credential_activation(&proxy, saved, activation.generation);
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) async fn logout_with_android_store(
+        &self,
+        id: &str,
+        proxy: &Arc<ProxyRuntime>,
+        saved: &serde_json::Value,
+        generation: u64,
+    ) -> Result<(), String> {
+        let _lease = proxy.tailscale_action_lease()?;
+        let request_id = format!("logout-{}", self.epoch.fetch_add(1, Ordering::SeqCst));
+        self.prepare(id, &request_id).await?;
+        let attempt = self.attempts.get(id, &request_id)?;
+        if attempt.claimed.swap(true, Ordering::SeqCst) {
+            return Err("attemptAlreadyUsed".into());
+        }
+        let mut guard = AttemptGuard(attempt.clone(), false);
+        let (retired, generation, tag, _warm_activity) = self
+            .close_android_tailscale_origin(id, proxy, saved, generation, &request_id, &attempt)
+            .await?;
+        let gate = self.state_gate().await;
+        self.retire_other_attempts_under_state_gate(id, &gate, &attempt)
+            .await?;
+        let directory = proxy.android_tailscale_auth_directory(id)?;
+        let node = ProxyRuntime::selected_android_auth_node(
+            &retired.original().original_observed_runs,
+            &retired.original().actual_config_digest,
+            &tag,
+            directory.to_str().ok_or("profileBindingUnknown")?,
+            &retired.retired_export()?,
+        )?;
+        self.with_android_target_action(&attempt, &retired, &node.state_file, || {
+            self.assert_auth_state_available(id, &gate, Some(&attempt))?;
+            proxy
+                .commit_tailscale_credential(saved, id, generation, Some(&attempt), |current| {
+                    proxy.retire_android_tailscale_auth(id, &gate, &attempt, &node)?;
+                    park_saved_tailscale_key(current, id)
+                })
+                .map(|_| ())
+        })
+        .await?;
+        attempt.finish();
+        guard.1 = true;
+        Ok(())
     }
 
     /// A registry-local fact while the caller continuously holds this exact registry's gate.
@@ -1319,6 +2642,52 @@ impl LoginCoreRegistry {
             return Err("Tailscale main ownership remains unconfirmed".into());
         }
         Ok(())
+    }
+
+    /// The original birth owns the full endpoint census, including nodes other
+    /// than the account being retired. This is registry scope, not a Stop proof.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    pub(crate) fn main_scope_if_token(
+        &self,
+        token: &MainBirthToken,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        if !self.valid_main_gate(gate) || !Arc::ptr_eq(&token.registry, &self.identity) {
+            return Err("nativeRetirementUnknown".into());
+        }
+        let main = self
+            .shared
+            .main
+            .lock()
+            .map_err(|_| "nativeRetirementUnknown")?;
+        let claim = main
+            .as_ref()
+            .filter(|claim| claim.token.same(token))
+            .ok_or("nativeRetirementUnknown")?;
+        claim
+            .directories
+            .iter()
+            .map(|(id, directory)| {
+                let tag = claim
+                    .endpoints
+                    .get(id)
+                    .and_then(|ep| ep.get("tag"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|tag| !tag.is_empty())
+                    .ok_or("nativeRetirementUnknown")?;
+                let directory = canonical_tailscale_claim_directory(directory)?;
+                let directory = directory.to_str().ok_or("nativeRetirementUnknown")?;
+                Ok((
+                    tag.to_owned(),
+                    directory.to_owned(),
+                    Path::new(directory)
+                        .join("tailscaled.state")
+                        .to_str()
+                        .ok_or("nativeRetirementUnknown")?
+                        .to_owned(),
+                ))
+            })
+            .collect()
     }
 
     /// Reserve the entire final peeled TS set under this registry's real gate.
@@ -1508,6 +2877,9 @@ impl LoginCoreRegistry {
         let request = LoginRequest {
             attempt_id: format!("test-{}", self.epoch.fetch_add(1, Ordering::SeqCst)),
             mode: LoginMode::Browser,
+            replace_identity: false,
+            reuse_retained_auth_key: false,
+            expected_credential_revision: None,
         };
         self.prepare(&server.id, &request.attempt_id).await.unwrap();
         self.start_attempt(
@@ -1559,12 +2931,151 @@ impl LoginCoreRegistry {
         main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
+        self.start_attempt_inner(
+            requested,
+            user_data,
+            request,
+            saved_server,
+            main_core,
+            emitter,
+            None,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "normal prerequisite retains the saved action binding"
+    )]
+    pub async fn start_attempt_with_normal_main(
+        &self,
+        requested: &ServerConfig,
+        user_data: &Path,
+        request: LoginRequest,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+        proxy: &Arc<ProxyRuntime>,
+        saved: &serde_json::Value,
+        identity_epoch: Option<String>,
+        candidate: &serde_json::Value,
+        action_generation: u64,
+    ) -> StartLoginOutcome {
+        self.start_attempt_inner(
+            requested,
+            user_data,
+            request,
+            saved_server,
+            main_core,
+            emitter,
+            Some(NormalMainLoginInput {
+                proxy,
+                saved,
+                identity_epoch,
+                candidate,
+                action_generation,
+            }),
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "existing and normal-main paths share the same attempt custody"
+    )]
+    async fn start_attempt_inner(
+        &self,
+        requested: &ServerConfig,
+        user_data: &Path,
+        request: LoginRequest,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+        normal_main: Option<NormalMainLoginInput<'_>>,
+    ) -> StartLoginOutcome {
         if self.closing.load(Ordering::SeqCst) {
             return StartLoginOutcome::Failed("Polaris is shutting down".into());
         }
         let attempt = match self.attempts.get(&requested.id, &request.attempt_id) {
             Ok(attempt) => attempt,
             Err(reason) => return StartLoginOutcome::Failed(reason),
+        };
+        let producer_origin = normal_main
+            .as_ref()
+            .map(|normal| (normal.proxy, normal.action_generation));
+        #[cfg(not(target_os = "ios"))]
+        let credential_transaction = normal_main.as_ref().is_some_and(|normal| {
+            normal
+                .candidate
+                .get("tailscaleSettings")
+                .is_some_and(|settings| settings.get("retainedAuthKey").is_some())
+                || request.reuse_retained_auth_key
+                || request.mode == LoginMode::Authkey
+                    && request.expected_credential_revision.is_some()
+        });
+        #[cfg(not(target_os = "ios"))]
+        let _credential_lease = if credential_transaction {
+            let normal = normal_main.as_ref().expect("credential input is present");
+            let lease = match normal.proxy.tailscale_action_lease() {
+                Ok(lease) => lease,
+                Err(error) => return StartLoginOutcome::Failed(error),
+            };
+            #[cfg(not(target_os = "android"))]
+            let activation = self
+                .activate_pc_credential(requested, &request, &attempt, main_core, normal)
+                .await;
+            #[cfg(target_os = "android")]
+            let activation = self
+                .activate_android_credential(requested, &request, &attempt, normal)
+                .await;
+            if let Err(error) = activation {
+                return if attempt.cancelled() {
+                    StartLoginOutcome::Cancelled
+                } else {
+                    StartLoginOutcome::Failed(error)
+                };
+            }
+            Some(lease)
+        } else {
+            None
+        };
+        #[cfg(target_os = "android")]
+        let producer_origin = if credential_transaction {
+            let Some(activation) = attempt.credential_activation() else {
+                return StartLoginOutcome::Failed("nativeRetirementUnknown".into());
+            };
+            producer_origin.map(|(proxy, _)| (proxy, activation.generation))
+        } else {
+            producer_origin
+        };
+        #[cfg(target_os = "android")]
+        let saved_after_activation = || -> Result<ServerConfig, String> {
+            let activation = attempt
+                .credential_activation()
+                .ok_or("nativeRetirementUnknown")?;
+            let proxy = activation
+                .proxy
+                .upgrade()
+                .ok_or("nativeRetirementUnknown")?;
+            proxy.saved_android_credential_target(
+                &activation.saved,
+                &requested.id,
+                activation.generation,
+                &attempt,
+            )
+        };
+        #[cfg(target_os = "android")]
+        let saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync) =
+            if credential_transaction {
+                &saved_after_activation
+            } else {
+                saved_server
+            };
+        #[cfg(not(target_os = "ios"))]
+        let normal_main = if credential_transaction {
+            None
+        } else {
+            normal_main
         };
         if attempt.claimed.swap(true, Ordering::SeqCst) {
             return StartLoginOutcome::Failed("attemptAlreadyUsed".into());
@@ -1576,8 +3087,19 @@ impl LoginCoreRegistry {
             attempt_id: request.attempt_id.clone(),
         });
         emitter.progress(&requested.id, &request.attempt_id, "starting", None, None);
-        let outcome = self
-            .launch_attempt(
+        let outcome = if let Some(normal_main) = normal_main {
+            self.launch_normal_main_attempt(
+                requested,
+                &request,
+                &attempt,
+                saved_server,
+                main_core,
+                emitter.clone(),
+                normal_main,
+            )
+            .await
+        } else {
+            self.launch_attempt(
                 requested,
                 user_data,
                 &request,
@@ -1585,8 +3107,12 @@ impl LoginCoreRegistry {
                 saved_server,
                 main_core,
                 emitter.clone(),
+                producer_origin,
+                #[cfg(target_os = "android")]
+                None,
             )
-            .await;
+            .await
+        };
         if !attempt.is_finished() {
             match &outcome {
                 StartLoginOutcome::Started => {}
@@ -1618,6 +3144,16 @@ impl LoginCoreRegistry {
                     );
                     attempt.finish();
                 }
+                StartLoginOutcome::PrerequisiteFailed { code, .. } => {
+                    emitter.progress(
+                        &requested.id,
+                        &request.attempt_id,
+                        "failed",
+                        Some(code),
+                        None,
+                    );
+                    attempt.finish();
+                }
                 StartLoginOutcome::Failed(reason) => {
                     emitter.progress(
                         &requested.id,
@@ -1634,8 +3170,487 @@ impl LoginCoreRegistry {
         outcome
     }
 
-    /// A steady Running core need not send another global frame. Subscribe once for a fresh
-    /// initial snapshot; this query never starts/stops the primary core or keeps its stream alive.
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    async fn activate_pc_credential(
+        &self,
+        requested: &ServerConfig,
+        request: &LoginRequest,
+        attempt: &Arc<Attempt>,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        normal: &NormalMainLoginInput<'_>,
+    ) -> Result<(), String> {
+        normal
+            .proxy
+            .tailscale_candidate_preflight(normal.saved, normal.candidate)?;
+        // Preserve only the original unclaimed prepared request. The ordinary logout
+        // admission closes other transient owners and rejects the real main claim.
+        let retired = self
+            .logout(
+                &requested.id,
+                &|| main_core().alive,
+                Some(&request.attempt_id),
+                |gate| {
+                    let saved = normal
+                        .proxy
+                        .commit_tailscale_credential(
+                            normal.saved,
+                            &requested.id,
+                            normal.action_generation,
+                            Some(attempt),
+                            |current| {
+                                if request.replace_identity {
+                                    normal.proxy.retire_pc_tailscale_auth(
+                                        &requested.id,
+                                        gate,
+                                        Some(attempt),
+                                    )?;
+                                }
+                                let replacement = ProxyRuntime::merged_tailscale_candidate(
+                                    current,
+                                    normal.candidate,
+                                )?;
+                                let nodes = current
+                                    .get_mut("servers")
+                                    .and_then(serde_json::Value::as_array_mut)
+                                    .ok_or("candidateConfigurationChanged")?;
+                                let node = nodes
+                                    .iter_mut()
+                                    .find(|node| {
+                                        node.get("id").and_then(serde_json::Value::as_str)
+                                            == Some(&requested.id)
+                                    })
+                                    .ok_or("candidateConfigurationChanged")?;
+                                *node = replacement;
+                                Ok(())
+                            },
+                        )
+                        .map_err(std::io::Error::other)?;
+                    attempt.record_credential_activation(
+                        normal.proxy,
+                        saved,
+                        normal.action_generation,
+                    );
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(|_| "credentialCommitUnknown".to_owned())?;
+        if !retired {
+            return Err("mainCoreInUse".into());
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the ticket and saved identity are distinct authorities"
+    )]
+    async fn launch_normal_main_attempt(
+        &self,
+        requested: &ServerConfig,
+        request: &LoginRequest,
+        attempt: &Arc<Attempt>,
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+        normal: NormalMainLoginInput<'_>,
+    ) -> StartLoginOutcome {
+        if normal
+            .candidate
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            != Some(&requested.id)
+        {
+            return StartLoginOutcome::Failed("candidateConfigurationChanged".into());
+        }
+        #[cfg(target_os = "ios")]
+        if request.replace_identity {
+            return self
+                .launch_normal_main_replacement(
+                    requested, request, attempt, main_core, emitter, normal,
+                )
+                .await;
+        }
+        #[cfg(target_os = "ios")]
+        let _credential_lease = if request.expected_credential_revision.is_some() {
+            match normal.proxy.tailscale_action_lease() {
+                Ok(lease) => Some(lease),
+                Err(error) => return StartLoginOutcome::Failed(error),
+            }
+        } else {
+            None
+        };
+        #[cfg(target_os = "ios")]
+        let committed = if request.expected_credential_revision.is_some() {
+            let generation = match normal
+                .proxy
+                .prepare_tailscale_action_origin(normal.action_generation, attempt)
+                .await
+            {
+                Ok(generation) => generation,
+                Err(error) => return StartLoginOutcome::Failed(error),
+            };
+            if normal.proxy.tailscale_writer_alive() {
+                return StartLoginOutcome::InMainCorePending;
+            }
+            let gate = self.state_gate().await;
+            if let Err(error) = self
+                .retire_other_attempts_under_state_gate(&requested.id, &gate, attempt)
+                .await
+            {
+                return StartLoginOutcome::Failed(error);
+            }
+            if let Err(error) =
+                self.assert_auth_state_available(&requested.id, &gate, Some(attempt))
+            {
+                return StartLoginOutcome::Failed(error);
+            }
+            match normal.proxy.commit_tailscale_credential(
+                normal.saved,
+                &requested.id,
+                generation,
+                Some(attempt),
+                |current| {
+                    let replacement =
+                        ProxyRuntime::merged_tailscale_candidate(current, normal.candidate)?;
+                    let nodes = current
+                        .get_mut("servers")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .ok_or("candidateConfigurationChanged")?;
+                    let node = nodes
+                        .iter_mut()
+                        .find(|node| {
+                            node.get("id").and_then(serde_json::Value::as_str)
+                                == Some(&requested.id)
+                        })
+                        .ok_or("candidateConfigurationChanged")?;
+                    *node = replacement;
+                    Ok(())
+                },
+            ) {
+                Ok(saved) => Some((generation, saved)),
+                Err(error) => return StartLoginOutcome::Failed(error),
+            }
+        } else {
+            None
+        };
+        #[cfg(target_os = "ios")]
+        let normal = NormalMainLoginInput {
+            saved: committed.as_ref().map_or(normal.saved, |(_, saved)| saved),
+            action_generation: committed
+                .as_ref()
+                .map_or(normal.action_generation, |(generation, _)| *generation),
+            ..normal
+        };
+        if attempt.cancelled() {
+            return StartLoginOutcome::Cancelled;
+        }
+        let server = match saved_server() {
+            Ok(server)
+                if server.id == requested.id
+                    && server.protocol
+                        == polaris_config_engine::user_config::server_config::Protocol::Tailscale
+                    && server.tailscale_settings == requested.tailscale_settings =>
+            {
+                server
+            }
+            _ => return StartLoginOutcome::Failed("savedTailscaleIdentityChanged".into()),
+        };
+        let key = server
+            .tailscale_settings
+            .as_ref()
+            .and_then(|ts| ts.auth_key.as_deref())
+            .filter(|key| !key.trim().is_empty());
+        if request.mode == LoginMode::Browser && key.is_some() {
+            return StartLoginOutcome::InMainCorePending;
+        }
+        if request.mode == LoginMode::Authkey && key.is_none() {
+            return StartLoginOutcome::Failed("authKeyRequired".into());
+        }
+        #[cfg(target_os = "ios")]
+        let action_generation = match normal
+            .proxy
+            .prepare_tailscale_action_origin(normal.action_generation, attempt)
+            .await
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                return if attempt.cancelled() {
+                    StartLoginOutcome::Cancelled
+                } else {
+                    StartLoginOutcome::Failed(error)
+                }
+            }
+        };
+        #[cfg(not(target_os = "ios"))]
+        let action_generation = normal.action_generation;
+        let binding = match ActionBinding::new(
+            NormalMainAction::TailscaleLogin,
+            request.attempt_id.clone(),
+            normal.saved,
+            vec![server.id.clone()],
+            normal.identity_epoch,
+        ) {
+            Ok(binding) => binding.for_attempt(action_generation, Arc::clone(attempt)),
+            Err(error) => return prerequisite_failure(error),
+        };
+        emitter.progress(
+            &server.id,
+            &request.attempt_id,
+            "preparingConnection",
+            None,
+            None,
+        );
+        // No TS state gate is held while the normal Start producer acquires its lifecycle gate.
+        emitter.progress(
+            &server.id,
+            &request.attempt_id,
+            "waitingForReady",
+            None,
+            None,
+        );
+        let ticket = tokio::select! {
+            biased;
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            result = tokio::time::timeout(self.timeout, normal.proxy.await_normal_main(binding)) => match result {
+                Ok(Ok(ticket)) => ticket,
+                Ok(Err(error)) => return prerequisite_failure(error),
+                Err(_) => {
+                    emitter.progress(&server.id, &request.attempt_id, "timedOut", Some("authorizationTimedOut"), None);
+                    attempt.cancel();
+                    attempt.finish();
+                    return StartLoginOutcome::Failed("authorizationTimedOut".into());
+                },
+            },
+        };
+        attempt.bind_main(
+            ticket.generation(),
+            ticket.identity_epoch().map(str::to_owned),
+        );
+        let bound = ReadyMainLogin {
+            proxy: normal.proxy,
+            ticket,
+        };
+        let main = main_core();
+        if main.generation != bound.ticket.generation()
+            || main.api_port != bound.ticket.api_port()
+            || main.api_secret != bound.ticket.api_secret()
+        {
+            return StartLoginOutcome::Failed("mainCoreChanged".into());
+        }
+        let gate = tokio::select! {
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            gate = self.start_gate.lock() => gate,
+        };
+        let current = saved_server();
+        if !current.is_ok_and(|current| {
+            current.id == server.id && current.tailscale_settings == server.tailscale_settings
+        }) || !self.main_matches_request(&server, request.mode)
+            || bound.ticket.target_tag(&server.id).is_none()
+        {
+            return StartLoginOutcome::InMainCorePending;
+        }
+        drop(gate);
+        self.confirm_main_request(
+            &server,
+            request,
+            attempt,
+            &main,
+            main_core,
+            saved_server,
+            Some(&bound),
+            emitter,
+        )
+        .await
+    }
+
+    #[cfg(target_os = "ios")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the same claimed request retains original and candidate bindings"
+    )]
+    async fn launch_normal_main_replacement(
+        &self,
+        requested: &ServerConfig,
+        request: &LoginRequest,
+        attempt: &Arc<Attempt>,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        emitter: Arc<dyn AuthUrlEmitter>,
+        normal: NormalMainLoginInput<'_>,
+    ) -> StartLoginOutcome {
+        let key = requested
+            .tailscale_settings
+            .as_ref()
+            .and_then(|settings| settings.auth_key.as_deref())
+            .filter(|key| !key.trim().is_empty());
+        if request.mode == LoginMode::Authkey && key.is_none() {
+            return StartLoginOutcome::Failed("authKeyRequired".into());
+        }
+        if request.mode == LoginMode::Browser && key.is_some() {
+            return StartLoginOutcome::Failed("candidateConfigurationChanged".into());
+        }
+        if let Err(error) = normal
+            .proxy
+            .tailscale_candidate_preflight(normal.saved, normal.candidate)
+        {
+            return StartLoginOutcome::Failed(error);
+        }
+        let _lease = match normal.proxy.tailscale_action_lease() {
+            Ok(lease) => lease,
+            Err(error) => return StartLoginOutcome::Failed(error),
+        };
+        #[cfg(target_os = "ios")]
+        let action_generation = match normal
+            .proxy
+            .prepare_tailscale_action_origin(normal.action_generation, attempt)
+            .await
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                return if attempt.cancelled() {
+                    StartLoginOutcome::Cancelled
+                } else {
+                    StartLoginOutcome::Failed(error)
+                }
+            }
+        };
+        #[cfg(not(target_os = "ios"))]
+        let action_generation = normal.action_generation;
+        let binding = match ActionBinding::new(
+            NormalMainAction::TailscaleLogin,
+            request.attempt_id.clone(),
+            normal.saved,
+            vec![requested.id.clone()],
+            normal.identity_epoch,
+        ) {
+            Ok(binding) => binding.for_attempt(action_generation, Arc::clone(attempt)),
+            Err(error) => return prerequisite_failure(error),
+        };
+        emitter.progress(
+            &requested.id,
+            &request.attempt_id,
+            "preparingConnection",
+            None,
+            None,
+        );
+        let old = tokio::select! {
+            biased;
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            ready = tokio::time::timeout(self.timeout, normal.proxy.await_normal_main(binding)) => match ready {
+                Ok(Ok(ticket)) => ticket,
+                Ok(Err(error)) => return prerequisite_failure(error),
+                Err(_) => { attempt.cancel(); return StartLoginOutcome::Failed("authorizationTimedOut".into()); }
+            }
+        };
+        // Keep old ownership in the immutable ticket. Presentation binds only
+        // the fresh Ready generation, so existing once-bound observers stay exact.
+        emitter.progress(
+            &requested.id,
+            &request.attempt_id,
+            "stoppingConnection",
+            None,
+            None,
+        );
+        // Stop is awaited to completion even if cancellation arrives. Its scoped
+        // owner remains booked; the synchronous commit and next Start check cancel.
+        emitter.progress(
+            &requested.id,
+            &request.attempt_id,
+            "retiringIdentity",
+            None,
+            None,
+        );
+        let (generation, saved) = match normal
+            .proxy
+            .retire_tailscale_account(
+                &old,
+                &requested.id,
+                attempt,
+                normal.saved,
+                Some(normal.candidate),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return if attempt.cancelled() {
+                    StartLoginOutcome::Cancelled
+                } else {
+                    StartLoginOutcome::Failed(error)
+                }
+            }
+        };
+        let Some(saved) = saved else {
+            return StartLoginOutcome::Failed("candidateConfigurationChanged".into());
+        };
+        emitter.progress(
+            &requested.id,
+            &request.attempt_id,
+            "savingCandidate",
+            None,
+            None,
+        );
+        let epoch = match saved_tailscale_identity_epoch(&saved, &requested.id) {
+            Ok(epoch) => epoch,
+            Err(error) => return StartLoginOutcome::Failed(error),
+        };
+        let saved_server = || {
+            let current = normal.proxy.tailscale_action_saved_config()?;
+            if current != saved {
+                return Err("candidateConfigurationChanged".into());
+            }
+            let nodes: Vec<_> = current
+                .get("servers")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|node| {
+                    node.get("id").and_then(serde_json::Value::as_str) == Some(&requested.id)
+                })
+                .collect();
+            let [node] = nodes.as_slice() else {
+                return Err("candidateConfigurationChanged".into());
+            };
+            serde_json::from_value::<ServerConfig>((*node).clone())
+                .map_err(|_| "candidateConfigurationChanged".into())
+        };
+        let candidate = match saved_server() {
+            Ok(candidate) => candidate,
+            Err(error) => return StartLoginOutcome::Failed(error),
+        };
+        let mut fresh = request.clone();
+        fresh.replace_identity = false;
+        emitter.progress(
+            &requested.id,
+            &request.attempt_id,
+            "startingConnection",
+            None,
+            None,
+        );
+        Box::pin(self.launch_normal_main_attempt(
+            &candidate,
+            &fresh,
+            attempt,
+            &saved_server,
+            main_core,
+            emitter,
+            NormalMainLoginInput {
+                proxy: normal.proxy,
+                saved: &saved,
+                identity_epoch: epoch,
+                candidate: normal.candidate,
+                action_generation: generation,
+            },
+        ))
+        .await
+    }
+
+    /// Observe a fresh target stream until authorization or an exact request terminal. Its
+    /// cancellation and deadline close only this subscription; the normal connection persists.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "observer retains independent request and main authorities"
+    )]
     async fn confirm_main_request(
         &self,
         server: &ServerConfig,
@@ -1643,6 +3658,8 @@ impl LoginCoreRegistry {
         attempt: &Arc<Attempt>,
         main: &MainLoginSnapshot,
         main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        binding: Option<&dyn MainLoginBinding>,
         emitter: Arc<dyn AuthUrlEmitter>,
     ) -> StartLoginOutcome {
         let tag = self
@@ -1658,6 +3675,12 @@ impl LoginCoreRegistry {
         let Some(tag) = tag.filter(|_| main.api_port != 0) else {
             return StartLoginOutcome::Failed("statusSubscriptionFailed".into());
         };
+        if binding.is_some_and(|binding| binding.target_tag(&server.id) != Some(tag.as_str())) {
+            return StartLoginOutcome::Failed("mainCoreChanged".into());
+        }
+        if attempt.main_context().is_none() {
+            attempt.bind_main(main.generation, None);
+        }
         emitter.progress(
             &server.id,
             &request.attempt_id,
@@ -1666,48 +3689,65 @@ impl LoginCoreRegistry {
             None,
         );
         let query = async {
+            self.check_main_observer(server, request.mode, main, main_core, saved_server, binding)
+                .await?;
             let mut stream = self
                 .subscriber
                 .subscribe(main.api_port, &main.api_secret)
                 .await
-                .map_err(|_| "statusSubscriptionFailed")?;
-            let frame = stream.recv().await.ok_or("statusStreamEnded")?;
-            let current = main_core();
-            if !current.alive
-                || current.generation != main.generation
-                || current.api_port != main.api_port
-            {
-                return Err("mainCoreChanged");
-            }
-            let endpoint = frame
-                .endpoints
-                .iter()
-                .find(|ep| ep.endpoint_tag == tag)
-                .ok_or("statusSubscriptionFailed")?;
-            let authorized = endpoint.backend_state == "Running"
-                && !endpoint.self_.as_ref().is_some_and(|peer| peer.expired);
-            let url = if authorized || endpoint.auth_url.is_empty() {
-                None
-            } else {
-                Some(
-                    crate::runtime::tailscale_status::validated_tailscale_auth_url(
-                        &endpoint.auth_url,
-                    )
-                    .ok_or("invalidAuthUrl")?,
+                .map_err(|_| "statusSubscriptionFailed".to_owned())?;
+            let mut check = tokio::time::interval(Duration::from_millis(250));
+            check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    () = attempt.cancellation() => return Err("cancelled".to_owned()),
+                    frame = stream.recv() => frame.ok_or_else(|| "statusStreamEnded".to_owned())?,
+                    _ = check.tick() => {
+                        self.check_main_observer(server, request.mode, main, main_core, saved_server, binding).await?;
+                        continue;
+                    },
+                };
+                self.check_main_observer(
+                    server,
+                    request.mode,
+                    main,
+                    main_core,
+                    saved_server,
+                    binding,
                 )
-            };
-            Ok((authorized, url))
-        };
-        let result = tokio::select! {
-            biased;
-            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
-            result = tokio::time::timeout(self.timeout.min(CONFIG_CHECK_TIMEOUT), query) => result,
-        };
-        if attempt.cancelled() {
-            return StartLoginOutcome::Cancelled;
-        }
-        match result {
-            Ok(Ok((authorized, url))) => {
+                .await?;
+                let endpoint = frame
+                    .endpoints
+                    .iter()
+                    .find(|ep| ep.endpoint_tag == tag)
+                    .ok_or_else(|| "statusSubscriptionFailed".to_owned())?;
+                let expired = endpoint.self_.as_ref().is_some_and(|peer| peer.expired);
+                let authorized = endpoint.backend_state == "Running" && !expired;
+                let url = if authorized
+                    || endpoint.auth_url.is_empty()
+                    || (endpoint.backend_state != "NeedsLogin" && !expired)
+                {
+                    None
+                } else {
+                    Some(
+                        crate::runtime::tailscale_status::validated_tailscale_auth_url(
+                            &endpoint.auth_url,
+                        )
+                        .ok_or_else(|| "invalidAuthUrl".to_owned())?,
+                    )
+                };
+                // The final synchronous checks and receipt emission have no await between them.
+                self.check_main_observer_snapshot(
+                    server,
+                    request.mode,
+                    main,
+                    main_core,
+                    saved_server,
+                )?;
+                if attempt.cancelled() {
+                    return Err("cancelled".into());
+                }
                 emitter.progress(
                     &server.id,
                     &request.attempt_id,
@@ -1715,10 +3755,25 @@ impl LoginCoreRegistry {
                     None,
                     if authorized { None } else { url.as_deref() },
                 );
+                if authorized {
+                    return Ok(());
+                }
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+            result = tokio::time::timeout(self.timeout, query) => result,
+        };
+        if attempt.cancelled() {
+            return StartLoginOutcome::Cancelled;
+        }
+        match result {
+            Ok(Ok(())) => {
                 attempt.finish();
                 StartLoginOutcome::InMainCore
             }
-            Ok(Err(reason)) => StartLoginOutcome::Failed(reason.into()),
+            Ok(Err(reason)) => StartLoginOutcome::Failed(reason),
             Err(_) => {
                 emitter.progress(
                     &server.id,
@@ -1731,6 +3786,53 @@ impl LoginCoreRegistry {
                 StartLoginOutcome::Failed("authorizationTimedOut".into())
             }
         }
+    }
+
+    fn check_main_observer_snapshot(
+        &self,
+        server: &ServerConfig,
+        mode: LoginMode,
+        main: &MainLoginSnapshot,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+    ) -> Result<(), String> {
+        let current = main_core();
+        if !current.alive
+            || current.generation != main.generation
+            || current.api_port != main.api_port
+            || current.api_secret != main.api_secret
+            || !self.main_matches_request(server, mode)
+        {
+            return Err("mainCoreChanged".into());
+        }
+        if !saved_server().is_ok_and(|saved| {
+            saved.id == server.id
+                && saved.protocol == server.protocol
+                && saved.tailscale_settings == server.tailscale_settings
+        }) {
+            return Err("savedTailscaleIdentityChanged".into());
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fresh native binding supplements the saved request checks"
+    )]
+    async fn check_main_observer(
+        &self,
+        server: &ServerConfig,
+        mode: LoginMode,
+        main: &MainLoginSnapshot,
+        main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
+        saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
+        binding: Option<&dyn MainLoginBinding>,
+    ) -> Result<(), String> {
+        self.check_main_observer_snapshot(server, mode, main, main_core, saved_server)?;
+        if let Some(binding) = binding {
+            binding.validate().await?;
+        }
+        self.check_main_observer_snapshot(server, mode, main, main_core, saved_server)
     }
 
     #[allow(
@@ -1746,7 +3848,15 @@ impl LoginCoreRegistry {
         saved_server: &(dyn Fn() -> Result<ServerConfig, String> + Send + Sync),
         main_core: &(dyn Fn() -> MainLoginSnapshot + Send + Sync),
         emitter: Arc<dyn AuthUrlEmitter>,
+        producer_origin: Option<(&Arc<ProxyRuntime>, u64)>,
+        #[cfg(target_os = "android")] mut warm_activity: Option<
+            &mut Option<attempts::AndroidActionActivity>,
+        >,
     ) -> StartLoginOutcome {
+        #[cfg(target_os = "android")]
+        let warm = warm_activity.is_some();
+        #[cfg(not(target_os = "android"))]
+        let warm = false;
         let _start_guard = tokio::select! {
             () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
             guard = self.start_gate.lock() => guard,
@@ -1776,15 +3886,29 @@ impl LoginCoreRegistry {
         // is still false. The persistent claim, not that probe, fences a
         // transient writer of the same state directory under this gate.
         if self.main_claims(&server.id) {
+            if warm {
+                return StartLoginOutcome::Failed("nativeRetirementUnknown".into());
+            }
             if !main.alive {
                 return StartLoginOutcome::InMainCorePending;
             }
-            return if self.main_matches_request(&server, request.mode) {
-                self.confirm_main_request(&server, request, attempt, &main, main_core, emitter)
-                    .await
-            } else {
-                StartLoginOutcome::InMainCorePending
-            };
+            if !self.main_matches_request(&server, request.mode) {
+                return StartLoginOutcome::InMainCorePending;
+            }
+            // Keeping this gate through a browser login would block normal Stop/retirement.
+            drop(_start_guard);
+            return self
+                .confirm_main_request(
+                    &server,
+                    request,
+                    attempt,
+                    &main,
+                    main_core,
+                    saved_server,
+                    None,
+                    emitter,
+                )
+                .await;
         }
         if !self.shared.can_start(&server.id) {
             return StartLoginOutcome::Failed("tooManyLogins".into());
@@ -1869,13 +3993,87 @@ impl LoginCoreRegistry {
         let mut config_guard = LoginConfigGuard::new(&config_path);
 
         // (e) sing-box check 先验配置形状（失败快退、不 spawn —— 这一段可单测）。
-        tokio::select! {
-            () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
-            result = self.checker.check_for_spawn(&binary, &config_path) => match result {
-                Ok(()) => {},
-                Err(ConfigCheckFailure::AndroidCapacityClosed(error)) => return StartLoginOutcome::AndroidCapacityClosed(error),
+        #[cfg(target_os = "android")]
+        if warm {
+            use crate::runtime::proxy::android_bridge::tailscale_store;
+            use polaris_core_supervisor::config_gate::ConfigCheckVerdict;
+            // A single original native validation captures the exact bytes that
+            // the unchanged spawner subsequently reads. Cancellation does not
+            // drop an invocation that may already be disposing SDK state.
+            let config = match std::str::from_utf8(&bytes) {
+                Ok(config) => config,
                 Err(_) => return StartLoginOutcome::Failed("configurationCheckFailed".into()),
-            },
+            };
+            let check = match tailscale_store::check_config_for_tailscale(config).await {
+                Ok(check) => check,
+                Err(error) => return StartLoginOutcome::AndroidCapacityClosed(error),
+            };
+            if check.verdict() != &ConfigCheckVerdict::Accepted {
+                return StartLoginOutcome::Failed("configurationCheckFailed".into());
+            }
+            let Some(validation) = check.custody() else {
+                return StartLoginOutcome::Failed("nativeRetirementUnknown".into());
+            };
+            let Some(logical_id) = config_path.file_stem().and_then(|stem| stem.to_str()) else {
+                return StartLoginOutcome::Failed("nativeRetirementUnknown".into());
+            };
+            let Some((proxy, generation)) = producer_origin else {
+                return StartLoginOutcome::Failed("nativeRetirementUnknown".into());
+            };
+            let state_file = match proxy.android_tailscale_auth_directory(&server.id) {
+                Ok(directory) => directory.join("tailscaled.state"),
+                Err(error) => return StartLoginOutcome::Failed(error),
+            };
+            let Some(state_file) = state_file.to_str() else {
+                return StartLoginOutcome::Failed("nativeRetirementUnknown".into());
+            };
+            let action_id = format!("ts-warm-{epoch}");
+            let tuple = match tailscale_store::make_warm_tuple(
+                validation, state_file, &action_id, logical_id,
+            ) {
+                Ok(tuple)
+                    if tuple.config_digest() == polaris_updater::sha256_hex(&bytes)
+                        && tuple.logical_instance_id() == logical_id =>
+                {
+                    tuple
+                }
+                _ => return StartLoginOutcome::Failed("nativeRetirementUnknown".into()),
+            };
+            let action = Arc::new(attempts::AndroidTargetAction {
+                state_file: state_file.to_owned(),
+                action_id,
+                active: AtomicBool::new(true),
+                original: attempts::AndroidActionOrigin::Warm(tuple.clone()),
+            });
+            let admitted = proxy.with_tailscale_credential_birth(generation, attempt, || {
+                attempt.reserve_android_action(action.clone())?;
+                // The caller retains activity through close and FS/CAS, including
+                // all await/error paths. Dropping it leaves the original tuple reachable.
+                if let Some(activity) = warm_activity.as_mut() {
+                    **activity = Some(attempts::AndroidActionActivity(action));
+                }
+                Ok::<(), String>(())
+            });
+            match admitted {
+                Some(Ok(())) => {}
+                Some(Err(error)) => return StartLoginOutcome::Failed(error),
+                None => return StartLoginOutcome::Cancelled,
+            }
+            // No cancellation early-return between booking and this original
+            // begin: even a lost reply remains recoverable through that tuple.
+            if let Err(error) = tailscale_store::begin_warm(&tuple).await {
+                return StartLoginOutcome::Failed(error);
+            }
+        }
+        if !warm {
+            tokio::select! {
+                () = attempt.cancellation() => return StartLoginOutcome::Cancelled,
+                result = self.checker.check_for_spawn(&binary, &config_path) => match result {
+                    Ok(()) => {},
+                    Err(ConfigCheckFailure::AndroidCapacityClosed(error)) => return StartLoginOutcome::AndroidCapacityClosed(error),
+                    Err(_) => return StartLoginOutcome::Failed("configurationCheckFailed".into()),
+                },
+            }
         }
 
         // (f) kill-on-relogin：先杀该 server 在飞的旧瞬态核（若有），再起新核。
@@ -1920,7 +4118,43 @@ impl LoginCoreRegistry {
         if self.closing.load(Ordering::SeqCst) {
             return StartLoginOutcome::Cancelled;
         }
-        let child = match self.spawner.spawn(req).await {
+        let spawned = match producer_origin {
+            None => self.spawner.spawn(req).await,
+            Some((proxy, generation)) => {
+                let mut pending = self.spawner.spawn(req);
+                let mut admitted = false;
+                let result = std::future::poll_fn(|context| {
+                    if !admitted {
+                        let Some(result) =
+                            proxy.with_tailscale_credential_birth(generation, attempt, || {
+                                pending.as_mut().poll(context)
+                            })
+                        else {
+                            return std::task::Poll::Ready(None);
+                        };
+                        admitted = true;
+                        return result.map(Some);
+                    }
+                    // Pending may already own a desktop/native resource. Join this exact
+                    // future; cancellation does not turn dropping it into terminal evidence.
+                    if proxy.core_generation() != generation {
+                        attempt.cancel();
+                    }
+                    pending.as_mut().poll(context).map(Some)
+                })
+                .await;
+                let Some(result) = result else {
+                    attempt.cancel();
+                    return StartLoginOutcome::Cancelled;
+                };
+                // Even a late Child must be published without an intervening await below.
+                if proxy.core_generation() != generation {
+                    attempt.cancel();
+                }
+                result
+            }
+        };
+        let child = match spawned {
             Ok(c) => c,
             Err(error) => {
                 if let Some(capacity) =
@@ -1937,6 +4171,12 @@ impl LoginCoreRegistry {
         let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
         let (closed_tx, closed_rx) = watch::channel(None);
         let pid = child.pid();
+        #[cfg(target_os = "android")]
+        let android_instance = child
+            .android_tailscale_instance()
+            .map(|(id, digest)| (id.to_owned(), digest.to_owned()));
+        #[cfg(target_os = "android")]
+        let android_authority = canonical_login_authority(&server).ok();
         // No await between a successful spawn and custody publication. The supervisor only
         // borrows this child; dropping its task cannot erase the registry's physical owner.
         let child = Arc::new(tokio::sync::Mutex::new(child));
@@ -1949,6 +4189,10 @@ impl LoginCoreRegistry {
                 cancel_tx,
                 closed_rx,
                 _child: Some(child.clone()),
+                #[cfg(target_os = "android")]
+                android_instance: android_instance.clone(),
+                #[cfg(target_os = "android")]
+                android_authority,
             },
         );
         // Shutdown may have observed an empty table while spawn was pending. Publication
@@ -1980,6 +4224,9 @@ impl LoginCoreRegistry {
             deadline: tokio::time::Instant::now() + self.timeout,
             emitter,
             closed_tx,
+            warm,
+            #[cfg(target_os = "android")]
+            android_instance,
         };
         config_guard.disarm();
         attempt.process_owned.store(true, Ordering::SeqCst);
@@ -2027,6 +4274,17 @@ fn generate_login_api_secret() -> Result<String, String> {
         .map_err(|e| format!("生成瞬态登录核管理 API secret 失败: {e}"))
 }
 
+#[cfg(target_os = "android")]
+async fn capture_android_login_store(
+    attempt: &Arc<Attempt>,
+    instance: Option<&(String, String)>,
+) -> Result<(), String> {
+    let (id, digest) = instance.ok_or("nativeRetirementUnknown")?;
+    let original =
+        crate::runtime::proxy::android_bridge::tailscale_store::observe_login(id, digest).await?;
+    attempt.record_android_store(original)
+}
+
 /// supervisor 任务的入参束（避免 `too_many_arguments`）。
 struct SuperviseCtx {
     shared: Arc<Shared>,
@@ -2046,6 +4304,11 @@ struct SuperviseCtx {
     deadline: tokio::time::Instant,
     emitter: Arc<dyn AuthUrlEmitter>,
     closed_tx: watch::Sender<Option<Result<(), String>>>,
+    /// A reserved cold observation uses the same Child supervisor to close,
+    /// without subscribing or completing the account action as a login.
+    warm: bool,
+    #[cfg(target_os = "android")]
+    android_instance: Option<(String, String)>,
 }
 
 /// 瞬态登录核退出原因。
@@ -2073,11 +4336,22 @@ async fn subscribe_and_supervise(
     mut cancel_rx: mpsc::UnboundedReceiver<()>,
     ready: oneshot::Sender<StartLoginOutcome>,
 ) {
-    let result = tokio::select! {
-        () = ctx.attempt.cancellation() => Err(("cancelled", "cancelled")),
-        _ = cancel_rx.recv() => Err(("cancelled", "cancelled")),
-        () = tokio::time::sleep_until(ctx.deadline) => Err(("timedOut", "authorizationTimedOut")),
-        result = subscriber.subscribe(api.port, &api.secret) => result.map_err(|_| ("failed", "statusSubscriptionFailed")),
+    #[cfg(target_os = "android")]
+    if ctx.warm || ctx.attempt.credential_activation().is_some() {
+        // Publication already owns this exact Child. A failed observation keeps
+        // its scoped state Unknown without dropping the child or signing NoCtor.
+        let _ = capture_android_login_store(&ctx.attempt, ctx.android_instance.as_ref()).await;
+    }
+    let result = if ctx.warm {
+        Err(("warm", "nativeRetirementUnknown"))
+    } else {
+        tokio::select! {
+            biased;
+            () = ctx.attempt.cancellation() => Err(("cancelled", "cancelled")),
+            _ = cancel_rx.recv() => Err(("cancelled", "cancelled")),
+            () = tokio::time::sleep_until(ctx.deadline) => Err(("timedOut", "authorizationTimedOut")),
+            result = subscriber.subscribe(api.port, &api.secret) => result.map_err(|_| ("failed", "statusSubscriptionFailed")),
+        }
     };
     match result {
         Ok(status) => {
@@ -2102,10 +4376,23 @@ async fn subscribe_and_supervise(
             remove_login_config(&ctx.config_path);
             ctx.shared.remove_if_epoch(&ctx.server_id, ctx.epoch);
             let _ = ctx.closed_tx.send(Some(Ok(())));
-            ctx.emitter
-                .progress(&ctx.server_id, &ctx.attempt_id, phase, Some(reason), None);
-            ctx.attempt.finish();
-            let outcome = if phase == "cancelled" {
+            if !ctx.warm {
+                ctx.emitter
+                    .progress(&ctx.server_id, &ctx.attempt_id, phase, Some(reason), None);
+                ctx.attempt.finish();
+            } else {
+                ctx.attempt.process_owned.store(false, Ordering::SeqCst);
+                if ctx.attempt.cancelled() {
+                    // Only request completion. The original action token still
+                    // keeps any unconfirmed native reservation occupied.
+                    ctx.attempt.finish();
+                }
+            }
+            let outcome = if ctx.warm {
+                // This only joins the original Child close. The caller must
+                // still consume held_retirement before touching FS or CAS.
+                StartLoginOutcome::Started
+            } else if phase == "cancelled" {
                 StartLoginOutcome::Cancelled
             } else {
                 StartLoginOutcome::Failed(reason.into())

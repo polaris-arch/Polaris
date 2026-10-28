@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "b609f959f57ce34416c51c7b87ce4a76f2e1df56",
+  "frozenPatchCommit": "18202c520f614d3560bf0d4bff27f3e3e0f4a92a",
+  "goVersion": "1.25.5",
+  "gomobileVersion": "v0.1.12",
+  "xcodeVersion": "27.0",
+  "xcodeBuild": "27A266a",
+  "iosSDKVersion": "27.0",
+  "simulatorSDKVersion": "27.0",
+  "bindTarget": "ios,iossimulator",
+  "iosMinimumVersion": "15.0",
+  "buildTags": [
+    "with_quic",
+    "with_wireguard",
+    "with_utls",
+    "with_naive_outbound",
+    "with_clash_api",
+    "with_usbip",
+    "with_openvpn",
+    "with_openconnect",
+    "badlinkname",
+    "tfogo_checklinkname0",
+    "with_tailscale",
+    "ts_omit_logtail",
+    "ts_omit_ssh",
+    "ts_omit_drive",
+    "ts_omit_taildrop",
+    "ts_omit_webclient",
+    "ts_omit_doctor",
+    "ts_omit_capture",
+    "ts_omit_kube",
+    "ts_omit_aws",
+    "ts_omit_synology",
+    "ts_omit_bird",
+    "with_dhcp",
+    "grpcnotrace"
+  ],
+  "nonMacOSTags": [
+    "with_low_memory"
+  ],
+  "patches": [
+    {
+      "file": "transient-command-server.patch",
+      "sha256": "4e946ad8c9ef5925849103c519f358da860eaf2c162631aa6f2c70cb6e49101b"
+    },
+    {
+      "file": "android-interface-binding.patch",
+      "sha256": "ca12eef0f94fb4592b4653dabf903711c52bdb8d14658ab6163534eb5098b879"
+    },
+    {
+      "file": "stopped-speed-strict-cleanup.patch",
+      "sha256": "af5a0dc89dbcd0c7cd9e4d055b8565cd39c1a9cef51a7b89e45896150755e474"
+    },
+    {
+      "file": "api-service-close.patch",
+      "sha256": "3995ffaaa387ade7058826387733b6a7bd5252c5640810f7e65b15bebbf6e9cc"
+    },
+    {
+      "file": "clashmode-hot-switch.patch",
+      "sha256": "e65b52666212ab142f310decde3369258827d9b36520922acf03a74313a82994"
+    },
+    {
+      "file": "construction-validation.patch",
+      "sha256": "f699001b797fdc473f20ad8738ee674f7244371ed34e383367b3cfa33bad7ec5"
+    }
+  ],
+  "validationCleanupContract": {
+    "version": "polaris-validation-v1",
+    "constructedBoxCleanup": "CleanupUnknown",
+    "exactCleanupEnabled": false,
+    "noOwnerCleanupEnabled": false
+  },
+  "unresolvedRuntimeEvidence": [
+    "sing-tun runtime cleanup (P1)"
+  ],
+  "patchedSourceTree": "553461561f628a8875c637d6f248226d8b05fadc",
+  "sharedGoCommit": "f63543e77f6af4ca6ef9a756732b43b95d5ddc72",
+  "replacementReviewCommit": "fbdb20c082712c24635ada65bb947a7f8032e931"
+}

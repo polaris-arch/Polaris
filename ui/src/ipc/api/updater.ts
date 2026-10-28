@@ -93,7 +93,7 @@ export type InstallAdvisory = 'macosGatekeeper' | 'windowsSmartScreen' | 'debEle
  * Android 交系统安装器那条腿的失败原因码（后端原样转述 Kotlin 侧的 `REASON_*` 常量）。
  *
  * 🔴 **一个码一句话，不许折成「安装失败」**：这五个的「用户下一步」完全不同 ——
- * 前两个是「按一下开关就能继续」（而且应用已经把用户送到那一页了），第三个是「本机装不了」，
+ * 前两个分别是「尚未授权，需要重试」与「系统授权设置页不可用」，第三个是「本机装不了」，
  * 后两个是接线错误 / 包不见了。折叠等于对前两种情形的用户说一句做不到的话。
  * 取文在 `mobile/settings/app-update-install.ts`，逐码对拍在它的测试里。
  */
@@ -103,6 +103,12 @@ export type AndroidInstallReason =
   | 'no-installer-activity'
   | 'package-not-app-private'
   | 'package-missing';
+
+/** Android permission alone. Opening settings is never an installer handoff. */
+export interface AndroidInstallPermissionResult {
+  granted: boolean;
+  reason?: AndroidInstallReason;
+}
 
 /** `updateApi.install` 的返回：需确认 / 已交系统 / 已起安装脚本。 */
 export interface UpdateInstallResult {
@@ -222,6 +228,11 @@ export const updateApi = {
    */
   async install(filePath: string, confirmed = false): Promise<UpdateInstallResult> {
     return invoke(IPC_CHANNELS.UPDATE_INSTALL, { filePath, confirmed });
+  },
+
+  /** Only the current foreground install click may request this system setting. */
+  async requestInstallPermission(): Promise<AndroidInstallPermissionResult> {
+    return invoke(IPC_CHANNELS.UPDATE_REQUEST_INSTALL_PERMISSION);
   },
 
   async skip(version: string): Promise<{ success: boolean }> {

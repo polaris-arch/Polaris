@@ -857,7 +857,7 @@ pub async fn tailscale_login_progress(
 
 /// Authorize the persisted node with an explicit browser/AuthKey mode and prepared attempt identity.
 /// `started` denotes process startup only; request-scoped STATUS progress confirms Running after reap.
-/// A matching primary owner is queried once for fresh STATUS; a changed configuration remains pending.
+/// A matching primary owner is observed until fresh authorization; iOS uses normal main readiness.
 /// Real control-plane authorization is outside the mock/check-only test boundary.
 #[tauri::command]
 pub async fn tailscale_login(
@@ -866,7 +866,8 @@ pub async fn tailscale_login(
     server: Value,
     request: crate::runtime::tailscale_login_core::LoginRequest,
 ) -> Result<ApiResponse<Value>, ()> {
-    let Ok(requested) = serde_json::from_value::<ServerConfig>(server) else {
+    let action_generation = state.proxy().core_generation();
+    let Ok(mut requested) = serde_json::from_value::<ServerConfig>(server.clone()) else {
         return Ok(ApiResponse::err_with_code(
             "Invalid Tailscale node",
             "TAILSCALE_LOGIN_BAD_SERVER",
@@ -881,13 +882,67 @@ pub async fn tailscale_login(
             "TAILSCALE_LOGIN_BAD_SERVER",
         ));
     }
-    // Resolve only after the registry takes the TS state gate. A renderer request may have
+    let saved = match state.config().current() {
+        Ok(saved) => saved,
+        Err(_) => {
+            return Ok(ApiResponse::err_with_code(
+                "Cannot read the saved Tailscale node",
+                "TAILSCALE_LOGIN_FAILED",
+            ))
+        }
+    };
+    let (server, credential_transaction) =
+        match crate::runtime::tailscale_login_core::resolve_tailscale_credential_candidate(
+            &saved, &server, &request,
+        ) {
+            Ok(result) => result,
+            Err(reason) => return Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED")),
+        };
+    requested = match serde_json::from_value(server.clone()) {
+        Ok(server) => server,
+        Err(_) => {
+            return Ok(ApiResponse::err_with_code(
+                "invalidCredentialIntent",
+                "TAILSCALE_LOGIN_FAILED",
+            ))
+        }
+    };
+    let identity_epoch = match saved_tailscale_identity_epoch(&saved, &requested.id) {
+        Ok(epoch) => epoch,
+        Err(reason) => return Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED")),
+    };
+    if (cfg!(target_os = "ios") || credential_transaction)
+        && request.mode == crate::runtime::tailscale_login_core::LoginMode::Authkey
+        && !request.replace_identity
+    {
+        let existing_identity = state
+            .mesh()
+            .tailscale_state_dir(&requested.id)
+            .and_then(|path| tailscale_state_exists_at(&path, true));
+        match existing_identity {
+            Ok(false) => {}
+            Ok(true) => return Ok(ApiResponse::err_with_code(
+                "Retire the existing Tailscale identity before replacing its authentication key",
+                "TAILSCALE_IDENTITY_RETIREMENT_REQUIRED",
+            )),
+            Err(_) => {
+                return Ok(ApiResponse::err_with_code(
+                    "Cannot verify the existing Tailscale identity",
+                    "TAILSCALE_STATE_QUERY_FAILED",
+                ))
+            }
+        }
+    }
+    // Resolve again after the registry takes the TS state gate. A renderer request may have
     // waited through an identity retirement after this command was dispatched.
     let saved_server = || -> Result<ServerConfig, String> {
         let saved = state
             .config()
             .current()
             .map_err(|_| "Cannot read the saved Tailscale node".to_string())?;
+        if saved_tailscale_identity_epoch(&saved, &requested.id)? != identity_epoch {
+            return Err("Saved Tailscale identity epoch changed".into());
+        }
         let nodes = saved
             .get("servers")
             .and_then(Value::as_array)
@@ -957,11 +1012,29 @@ pub async fn tailscale_login(
             mixed_port: cfg.as_ref().and_then(|c| c.mixed_port),
         }
     };
-    match state
-        .mesh()
-        .start_tailscale_login(app, &requested, request, &saved_server, &main_core)
-        .await
-    {
+    let outcome = if cfg!(target_os = "ios") || credential_transaction {
+        state
+            .mesh()
+            .start_tailscale_login_with_normal_main(
+                app,
+                &requested,
+                request,
+                &saved_server,
+                &main_core,
+                &state.proxy,
+                &saved,
+                identity_epoch.clone(),
+                &server,
+                action_generation,
+            )
+            .await
+    } else {
+        state
+            .mesh()
+            .start_tailscale_login(app, &requested, request, &saved_server, &main_core)
+            .await
+    };
+    match outcome {
         StartLoginOutcome::Started => Ok(ApiResponse::ok(json!({"started": true}))),
         StartLoginOutcome::InMainCore => Ok(ApiResponse::ok(
             json!({"started": false, "reason": "inMainCore"}),
@@ -976,13 +1049,23 @@ pub async fn tailscale_login(
             error.to_string(),
             crate::runtime::proxy::code::ANDROID_NATIVE_LEDGER_CAPACITY_CLOSED,
         )),
+        StartLoginOutcome::PrerequisiteFailed { reason, code } => {
+            Ok(ApiResponse::err_with_code(reason, code))
+        }
         StartLoginOutcome::Failed(reason) => {
             Ok(ApiResponse::err_with_code(reason, "TAILSCALE_LOGIN_FAILED"))
         }
     }
 }
 
-/// 上游 `TAILSCALE_LOGIN_CANCEL`：取消一个请求，等待其核收割后注销。
+fn saved_tailscale_identity_epoch(
+    saved: &Value,
+    server_id: &str,
+) -> Result<Option<String>, String> {
+    crate::runtime::tailscale_login_core::saved_tailscale_identity_epoch(saved, server_id)
+}
+
+/// 取消精确登录请求：瞬态核等待收割；正常主核仅撤销本次观察，连接继续由用户控制。
 /// 幂等：取消一个不存在的登录不算错（对齐 Polaris handler 的静默 ok）。
 #[allow(
     clippy::needless_pass_by_value,
@@ -1018,11 +1101,71 @@ pub async fn tailscale_logout(
     server_id: String,
     keep_attempt_id: Option<String>,
 ) -> Result<ApiResponse<Value>, ()> {
+    #[cfg(target_os = "ios")]
+    {
+        let generation = state.proxy().core_generation();
+        if keep_attempt_id.is_some() {
+            return Ok(ApiResponse::err_with_code(
+                "A standalone iOS logout cannot consume another login request",
+                "TAILSCALE_LOGOUT_FAILED",
+            ));
+        }
+        let saved = match state.config().current() {
+            Ok(saved) => saved,
+            Err(_) => {
+                return Ok(ApiResponse::err_with_code(
+                    "Cannot read the saved Tailscale node",
+                    "TAILSCALE_LOGOUT_FAILED",
+                ))
+            }
+        };
+        let id_valid = saved
+            .get("servers")
+            .and_then(Value::as_array)
+            .is_some_and(|nodes| {
+                nodes
+                    .iter()
+                    .filter(|node| {
+                        node.get("id").and_then(Value::as_str) == Some(&server_id)
+                            && node.get("protocol").and_then(Value::as_str) == Some("tailscale")
+                    })
+                    .count()
+                    == 1
+            });
+        if !id_valid {
+            return Ok(ApiResponse::err_with_code(
+                "Invalid Tailscale node",
+                "TAILSCALE_LOGOUT_INVALID_SERVER_ID",
+            ));
+        }
+        return Ok(
+            match state
+                .mesh()
+                .logout_tailscale_with_normal_main(&server_id, &state.proxy, &saved, generation)
+                .await
+            {
+                Ok(()) => ApiResponse::ok(json!({ "runningNeedsRestart": false })),
+                Err((reason, code)) => ApiResponse::err_with_code(reason, code),
+            },
+        );
+    }
+    let generation = state.proxy().core_generation();
+    let saved = match state.config().current() {
+        Ok(saved) => saved,
+        Err(_) => {
+            return Ok(ApiResponse::err_with_code(
+                "Cannot read the saved Tailscale node",
+                "TAILSCALE_LOGOUT_FAILED",
+            ))
+        }
+    };
     match state
         .mesh()
-        .logout_tailscale_safely(
+        .logout_tailscale_with_credentials(
             &server_id,
-            &|| state.proxy().tailscale_writer_alive(),
+            &state.proxy,
+            &saved,
+            generation,
             keep_attempt_id.as_deref(),
         )
         .await
@@ -1050,7 +1193,8 @@ pub async fn tailscale_logout(
     Ok(ApiResponse::ok(json!({ "runningNeedsRestart": false })))
 }
 
-/// 上游 `TAILSCALE_STATE_EXISTS`：批量查 TS 节点 state 目录存在性。
+/// 默认查物理 state 目录，供认证密钥替换前清理；`cached_session_only` 仅供 UI 展示
+/// 持久化的当前会话，不证明 live authentication、NoOwner 或可以跳过停核/清理。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
@@ -1059,6 +1203,7 @@ pub async fn tailscale_logout(
 pub fn tailscale_state_exists(
     state: State<'_, AppRuntime>,
     server_ids: Vec<String>,
+    cached_session_only: Option<bool>,
 ) -> ApiResponse<Value> {
     let mut map = serde_json::Map::new();
     for id in server_ids {
@@ -1068,9 +1213,8 @@ pub fn tailscale_state_exists(
                 "TAILSCALE_STATE_QUERY_FAILED",
             );
         };
-        let exists = match std::fs::metadata(path) {
-            Ok(metadata) => metadata.is_dir(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        let exists = match tailscale_state_exists_at(&path, cached_session_only.unwrap_or(false)) {
+            Ok(exists) => exists,
             Err(_) => {
                 return ApiResponse::err_with_code(
                     "Cannot verify Tailscale state",
@@ -1081,6 +1225,69 @@ pub fn tailscale_state_exists(
         map.insert(id, Value::Bool(exists));
     }
     ApiResponse::ok(Value::Object(map))
+}
+
+/// The default physical-directory query protects auth-key replacement cleanup. Only UI
+/// presentation opts into cached account evidence; neither query establishes writer ownership.
+fn tailscale_state_exists_at(
+    path: &std::path::Path,
+    cached_session_only: bool,
+) -> std::io::Result<bool> {
+    if !cached_session_only {
+        return match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        };
+    }
+    use std::io::Read;
+    const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
+    let unknown = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Cannot verify Tailscale state",
+        )
+    };
+    let directory = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !directory.is_dir() || directory.file_type().is_symlink() {
+        return Err(unknown());
+    }
+    let state_root = path.parent().ok_or_else(unknown)?;
+    let config_root = state_root.parent().ok_or_else(unknown)?.canonicalize()?;
+    let state_root = state_root.canonicalize()?;
+    let target = path.canonicalize()?;
+    if !state_root.starts_with(&config_root)
+        || !target.starts_with(&state_root)
+        || target == state_root
+    {
+        return Err(unknown());
+    }
+    let file_path = path.join("tailscaled.state");
+    let metadata = match std::fs::symlink_metadata(&file_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_STATE_BYTES
+    {
+        return Err(unknown());
+    }
+    let file = std::fs::File::open(file_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_STATE_BYTES {
+        return Err(unknown());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(unknown());
+    }
+    polaris_mesh::tailscale_state::cached_session_exists_for_presentation(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// 上游 `TAILSCALE_GET_STATUS`：拉各 TS 节点状态末帧（sing-box 管理 API STATUS 流缓存）。

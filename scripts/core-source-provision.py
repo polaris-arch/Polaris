@@ -147,6 +147,8 @@ def provision(manifest_path, source_repo, checkout, module_repos=None, go_binary
         run(["git", "add", "-f", "go.mod"], cwd=checkout)
         receipt["dependencies"].append({**dependency, "upstreamTree": tree,
                                          "replacement": "./" + relative.as_posix()})
+    # An empty declaration records an empty graph; receipt fields keep one shape.
+    portable = []
     if dependencies:
         # Query exactly the manifest's patched modules. Optional unrelated module
         # metadata is outside this receipt's declared scope; the complete main
@@ -160,12 +162,11 @@ def provision(manifest_path, source_repo, checkout, module_repos=None, go_binary
             require(replacement.get("Path") == dependency["replacement"] and Path(replacement.get("Dir", "")).resolve() == (checkout / dependency["replacement"]).resolve(), "compiled dependency replacement differs")
         # Paths are build-directory dependent; the portable graph records module
         # versions/checksums and the explicit manifest replacement instead.
-        portable = []
         for item in graph:
             portable.append({key: item[key] for key in ("Path", "Version", "Sum", "GoModSum") if key in item} |
                             ({"Replace": {key: item["Replace"][key] for key in ("Path", "Version", "Sum", "GoModSum") if key in item["Replace"]}} if "Replace" in item else {}))
-        receipt["moduleGraph"] = portable
-        receipt["moduleGraphSha256"] = digest(json.dumps(portable, sort_keys=True, separators=(",", ":")).encode())
+    receipt["moduleGraph"] = portable
+    receipt["moduleGraphSha256"] = digest(json.dumps(portable, sort_keys=True, separators=(",", ":")).encode())
     receipt["mainGoModSha256"] = digest((checkout / "go.mod").read_bytes())
     receipt["mainGoSumSha256"] = digest((checkout / "go.sum").read_bytes())
     run(["git", "add", "-f", "go.mod", "go.sum"], cwd=checkout)
@@ -191,7 +192,7 @@ def verify_checkout(checkout, receipt):
     require(not any(path.endswith(inputs) or Path(path).name in {"go.mod", "go.sum", "go.work", "go.work.sum"} or path.startswith("vendor/") for path in extra), "untracked compiler input present")
 
 
-def verify_binary(go_binary, binary, receipt, required_modules=("github.com/sagernet/sing-tun",)):
+def verify_binary(go_binary, binary, receipt, required_modules=()):
     info = run([str(go_binary), "version", "-m", str(binary)])
     build_id = run([str(go_binary), "tool", "buildid", str(binary)]).strip()
     require(build_id == source_linker_flag(receipt).removeprefix("-buildid="), "binary source fingerprint differs")

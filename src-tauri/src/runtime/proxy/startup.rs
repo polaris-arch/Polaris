@@ -31,9 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-#[cfg(target_os = "android")]
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use polaris_config_engine::builder::custom_rule_files::{
@@ -73,9 +71,9 @@ use polaris_config_engine::user_config::proxy_ports::{control_api_port, local_pr
 use polaris_config_engine::user_config::server_config::ServerConfig;
 use polaris_config_engine::user_config::tun_config::resolve_win_tun_interface_name;
 use polaris_config_engine::user_config::ProxyModeType;
-#[cfg(target_os = "android")]
-use polaris_core_supervisor::port_bookkeeping::PrimaryApiPortLedger;
-use polaris_core_supervisor::port_bookkeeping::{FreePortProvider, TokioPortProvider};
+use polaris_core_supervisor::port_bookkeeping::{
+    FreePortProvider, PrimaryApiPortLedger, ResolvedPort, TokioPortProvider,
+};
 use polaris_core_supervisor::{
     core_ready_budget_ms, core_startup_estimate_ms, decide_peel, run_config_check,
     wait_for_core_ready, CoreReadyDeps, CoreReadyOutcome, KernelRejection, PeelStep, PortAllocator,
@@ -191,7 +189,7 @@ impl Drop for HelperStartCompletion {
 /// 核是进程内 `.so`（libbox），Android 上根本没有核可执行文件，而起核腿的 `binary` 是一个
 /// `PathBuf`。占位串只出现在两处：起核日志的 `bin=` 字段（写明「核在进程内」比写一个假路径诚实），
 /// 以及被带出重试循环的那个元组。**真正会拿它去碰盘的内核自证在 Android 上整条不挂**（见调用点）。
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 pub(super) const IN_PROCESS_CORE_PLACEHOLDER: &str = "<in-process libbox>";
 
 /// 回环探针/更新入站凭据的用户名。**不是秘密**：sing-box 在连接日志里会打出认证用户名，
@@ -404,6 +402,18 @@ pub(super) struct StartPorts {
     pub(super) subscription_update_in: u16,
     pub(super) probe_proxy: Option<u16>,
     pub(super) probe_pool: Vec<u16>,
+}
+
+/// Primary endpoints stay retired until this app process exits. No failure or
+/// cancellation may return a port to a later main's lazy controller transport.
+pub(super) fn allocate_primary_api_port<P: FreePortProvider>(
+    ledger: &PrimaryApiPortLedger,
+    allocator: &PortAllocator<P>,
+    exclusions: &PortExclusions,
+) -> Result<ResolvedPort, String> {
+    ledger
+        .allocate(allocator, exclusions)
+        .map_err(|_| "管理 API 端口已耗尽；请完全退出应用后重试".to_string())
 }
 
 /// Adds one exclusion to the fixed-size core-supervisor port book without
@@ -733,13 +743,14 @@ tokio::task_local! {
     ///    退场会提前解除外层。
     ///
     /// task-local 天然随调用链传递、随作用域嵌套、且**不跨任务泄漏** —— 别的任务里的 `start` 读不到，
-    /// 上面两条缺陷从物理上不再存在。`tokio::spawn` 出去的任务不继承（正确：那已是另一次调用）。
+    /// 上面两条缺陷从物理上不再存在。任意 `tokio::spawn` 不自动继承；normal Start producer
+    /// 延续当前起核请求，因此注册时捕获交互性，并在其任务内显式恢复非交互作用域。
     static HELPER_GATE_INTERACTIVE: bool;
 }
 
 /// 当前调用链是否为交互式起核。**未设置 = 交互式**（默认放行弹框）：绝大多数入口（IPC / 托盘 /
 /// 启动自动连接 / switchMode 去抖重启）都不显式声明，它们全是用户驱动的，默认必须能弹框。
-fn helper_gate_interactive() -> bool {
+pub(super) fn helper_gate_interactive() -> bool {
     HELPER_GATE_INTERACTIVE.try_with(|v| *v).unwrap_or(true)
 }
 
@@ -1105,6 +1116,58 @@ impl ProxyRuntime {
     }
 
     /// start 主体（错误路径统一由 [`Self::start`] 收口 `end`）。
+    /// Production startup and harmless local fixtures share this exact protected
+    /// synchronous factory/attachment seam. The captured opaque producer is never
+    /// rediscovered through current while Child/check/desktop locks are held.
+    pub(super) fn spawn_direct_native(
+        &self,
+        producer: Option<&Arc<super::mesh_apply::owner_proof::ProducerCell>>,
+        birth_generation: u64,
+        factory_call: impl FnOnce()
+            -> Result<tokio::process::Child, polaris_core_supervisor::SpawnError>,
+        main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+        before_factory: impl FnOnce(),
+    ) -> Result<Option<(u32, super::process_supervision::RunIdentity)>, StartError> {
+        let closing = self
+            .desktop_shutdown
+            .lock()
+            .map_err(|_| StartError::from("proxy shutdown admission poisoned".to_owned()))?;
+        if *closing {
+            return Err(StartError::from("proxy is shutting down".to_owned()));
+        }
+        polaris_core_supervisor::with_check_admission(|| {
+            let mut slot = self
+                .child
+                .lock()
+                .map_err(StartError::direct_slot_poisoned)?;
+            if self.gate.generation() != birth_generation {
+                return Ok(None);
+            }
+            if slot.has_helper_start() || self.core_via_helper.load(Ordering::SeqCst) {
+                return Err(StartError::direct_slot_occupied());
+            }
+            let empty = slot
+                .empty_for_install()
+                .ok_or_else(StartError::direct_slot_occupied)?;
+            let producer = producer
+                .filter(|producer| producer.belongs_to(&self.stop_domain, birth_generation))
+                .ok_or_else(|| {
+                    StartError::from("direct native producer binding is missing".to_owned())
+                })?;
+            self.core_via_helper.store(false, Ordering::SeqCst);
+            empty
+                .spawn_native(
+                    producer,
+                    birth_generation,
+                    factory_call,
+                    main_token,
+                    before_factory,
+                )
+                .map(Some)
+        })
+        .map_err(|error| StartError::from(error.to_string()))?
+    }
+
     pub(super) async fn start_inner(
         self: &Arc<Self>,
         config: Value,
@@ -1116,6 +1179,16 @@ impl ProxyRuntime {
         if self.gate.generation() != my_gen {
             log::info!("起核入口即被接管（世代 {my_gen}）→ 让位");
             return Ok(self.status());
+        }
+        // Snapshot under normal_start before any desktop/check/Child/live lock.
+        // This is the recorded final admission, not the watch's requested generation.
+        let native_producer = self.admitted_native_producer(my_gen)?;
+        let request_attempt = self.normal_start_attempt(my_gen)?;
+        if request_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.cancelled())
+        {
+            return Err(StartError::from("cancelled".to_owned()));
         }
         if let Ok(mut route) = self.mesh_route_run.write() {
             *route = None;
@@ -1566,9 +1639,9 @@ impl ProxyRuntime {
             // Android 上 `core_binary_for_start()` **恒 Err**：核是进程内 `.so`，盘上根本没有可执行
             // 文件（`resolve_core_binary` 按平台目录找 `sing-box`，Android 不在那张表里）。桌面三平台
             // 解析不到核仍是终态 Err —— 这里的分叉是**平台事实**，不是把桌面那条判据放宽。
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             let binary = std::path::PathBuf::from(IN_PROCESS_CORE_PLACEHOLDER);
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let binary = binary_res?;
             // C5：起核前快照 utun 基线（每尝试；macOS 时序 diff 锚点）——须在核创建 TS 内核接口**前**。
             let t_mesh_baseline = std::time::Instant::now();
@@ -1669,6 +1742,88 @@ impl ProxyRuntime {
                         return Err(StartError::coded(msg, error_code));
                     }
                 }
+            } else if cfg!(target_os = "ios") {
+                #[cfg(target_os = "ios")]
+                {
+                    let prepare = || {
+                        self.gate.with_current_generation(my_gen, |_live| {
+                            let mut slot = self.ios_ready_session.write().map_err(|_| {
+                                StartError::from("iOS main custody poisoned".to_owned())
+                            })?;
+                            if slot.as_ref().is_some_and(|owner| !owner.allows_successor()) {
+                                return Err(StartError::from("nativeRetirementUnknown".to_owned()));
+                            }
+                            let start =
+                                tauri_plugin_polaris_ios::prepare_start(&gate_config_json, my_gen)
+                                    .map_err(StartError::from)?;
+                            *slot = Some(super::IosMainCustody {
+                                generation: my_gen,
+                                origin: super::IosMainOrigin::LocalStart(start.clone()),
+                                config_digest: polaris_updater::sha256_hex(
+                                    gate_config_json.as_bytes(),
+                                ),
+                                main_token: main_claim_token.clone(),
+                                ready: None,
+                                stopped: None,
+                            });
+                            Ok(start)
+                        })
+                    };
+                    let prepared = match &request_attempt {
+                        Some(attempt) => attempt.while_active(prepare).flatten(),
+                        None => prepare(),
+                    };
+                    let Some(start) = prepared else {
+                        return Ok(self.status());
+                    };
+                    let start = start?;
+                    // Original native request, full main token/config and callback cell
+                    // are retained before the single native dispatcher can submit.
+                    main_reservation.arm_external_start();
+                    match tauri_plugin_polaris_ios::start_prepared(&start).await {
+                        Ok(receipt) => {
+                            self.gate.with_current_generation(my_gen, |_live| {
+                                if let Ok(mut ready) = self.ios_ready_session.write() {
+                                    if let Some(owner) = ready
+                                        .as_mut()
+                                        .filter(|owner| owner.request_id() == start.request_id())
+                                    {
+                                        owner.ready = Some(receipt);
+                                    }
+                                }
+                            });
+                        }
+                        Err(msg) => {
+                            if start
+                                .no_store_terminal()
+                                .is_some_and(|receipt| receipt.belongs_to(&start))
+                            {
+                                main_reservation.confirmed_no_external_writer();
+                                if let Ok(mut slot) = self.ios_ready_session.write() {
+                                    if let Some(owner) = slot
+                                        .as_mut()
+                                        .filter(|owner| owner.request_id() == start.request_id())
+                                    {
+                                        owner.main_token = None;
+                                    }
+                                }
+                            }
+                            if self.gate.generation() != my_gen {
+                                return Ok(self.status());
+                            }
+                            // These exact prefixes are emitted by the native NSError adapter.
+                            // Unknown failures remain StartupFailed; no timeout is permission denial.
+                            let error_code = match msg.split_once(':').map(|(code, _)| code) {
+                                Some("ForegroundRequired") => code::IOS_FOREGROUND_REQUIRED,
+                                Some("PermissionDenied") => code::IOS_VPN_PERMISSION_DENIED,
+                                _ => code::STARTUP_FAILED,
+                            };
+                            self.set_error(&msg, error_code);
+                            return Err(StartError::coded(msg, error_code));
+                        }
+                    }
+                }
+                0
             } else if via_helper {
                 // 经 helper 起（阻塞 IPC 挪 spawn_blocking；helper 核无本地 child 句柄）。
                 // 让位 → Ok(None) → 静默返回（接管方拥有已提交 pid + core_via_helper 标记，负责收口）。
@@ -1695,102 +1850,54 @@ impl ProxyRuntime {
                 // 竞态不变式：stop() 先 bump 世代、再取 child 锁；本处在**持锁期间**判世代。
                 //   · 本判定先于 stop 的 bump → 本腿 spawn 并存 child；stop 随后取到 child 并杀 → 无孤儿。
                 //   · stop 的 bump 先于本判定 → 本腿直接让位、**根本不 spawn** → 无孤儿。
-                let direct_spawn = {
-                    let closing = self
-                        .desktop_shutdown
-                        .lock()
-                        .map_err(|_| "proxy shutdown admission poisoned".to_owned())?;
-                    if *closing {
-                        return Err(StartError::from("proxy is shutting down".to_owned()));
-                    }
-                    polaris_core_supervisor::with_check_admission(|| {
-                        let mut guard = self
-                            .child
-                            .lock()
-                            .map_err(|e| format!("child lock poisoned: {e}"))?;
-                        if self.gate.generation() != my_gen {
-                            log::info!(
-                                "起核在 spawn 前被接管（世代 {my_gen} → {}）→ 让位",
-                                self.gate.generation()
-                            );
-                            return Ok(None);
-                        }
-                        if guard.has_helper_start() || self.core_via_helper.load(Ordering::SeqCst) {
-                            return Err(StartError::direct_slot_occupied());
-                        }
-                        let empty_slot = guard
-                            .empty_for_install()
-                            .ok_or_else(StartError::direct_slot_occupied)?;
-                        self.core_via_helper.store(false, Ordering::SeqCst);
-                        // stdout/stderr → 日志 sink（logging.rs 已装 log::Log 实现）。**排空接线写在请求里**：
-                        // spawner 在返回之前就把两个读端交给这个闭包，核从起来的第一毫秒起就有人读它，
-                        // 「起了核却忘记排空」在类型上写不出来（见 `StdioPolicy`）。
-                        // stdout 不接真因收集：sing-box 的 `log.Fatal` 走包级 `std` logger，其 writer 恒是
-                        // **os.Stderr**（`log/export.go` 的 `init()`；`--disable-color` 分支 `cmd/sing-box/cmd.go:55`
-                        // 换的也仍是 os.Stderr）。给 stdout 也接一份 = 白扫每一行。
-                        // 两条腿共用同一个交接闸：核就绪后日志改由 `SubscribeLog` 流承担，本腿只剩起核期与
-                        // FATAL 分类（见 `pipe_to_log` 文档）。
-                        let handoff: CoreLogHandoff = Arc::new(AtomicBool::new(false));
-                        let sink_handoff = Arc::clone(&handoff);
-                        let sink_fatal = Arc::clone(&fatal_slot);
-                        let mut req = SpawnRequest::new(
-                            &binary,
-                            &config_path,
-                            StdioPolicy::drain(move |stdout, stderr| {
-                                pipe_to_log(
-                                    stdout,
-                                    SING_BOX_TARGET,
-                                    None,
-                                    Some(Arc::clone(&sink_handoff)),
-                                );
-                                pipe_to_log(
-                                    stderr,
-                                    SING_BOX_TARGET,
-                                    Some(sink_fatal),
-                                    Some(sink_handoff),
-                                );
-                            }),
+                // stdout/stderr → 日志 sink（logging.rs 已装 log::Log 实现）。**排空接线写在请求里**：
+                // spawner 在返回之前就把两个读端交给这个闭包，核从起来的第一毫秒起就有人读它，
+                // 「起了核却忘记排空」在类型上写不出来（见 `StdioPolicy`）。
+                // stdout 不接真因收集：sing-box 的 `log.Fatal` 走包级 `std` logger，其 writer 恒是
+                // **os.Stderr**（`log/export.go` 的 `init()`；`--disable-color` 分支 `cmd/sing-box/cmd.go:55`
+                // 换的也仍是 os.Stderr）。给 stdout 也接一份 = 白扫每一行。
+                // 两条腿共用同一个交接闸：核就绪后日志改由 `SubscribeLog` 流承担，本腿只剩起核期与
+                // FATAL 分类（见 `pipe_to_log` 文档）。
+                let handoff: CoreLogHandoff = Arc::new(AtomicBool::new(false));
+                let sink_handoff = Arc::clone(&handoff);
+                let sink_fatal = Arc::clone(&fatal_slot);
+                let mut req = SpawnRequest::new(
+                    &binary,
+                    &config_path,
+                    StdioPolicy::drain(move |stdout, stderr| {
+                        pipe_to_log(
+                            stdout,
+                            SING_BOX_TARGET,
+                            None,
+                            Some(Arc::clone(&sink_handoff)),
                         );
-                        // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
-                        req.extra_args = vec!["--disable-color".to_string()];
-                        // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
-                        // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
-                        req.working_dir = Some(self.config.dir().to_path_buf());
-                        // Mint before spawn: even a failed OS random source must not
-                        // leave a successfully spawned Child without its run token.
-                        let run_identity = super::process_supervision::RunIdentity::new();
-                        main_reservation.arm_external_start();
-                        match TokioSpawner::new().spawn(req) {
-                            Ok(spawned) => {
-                                let pid = spawned.pid().unwrap_or(0);
-                                let run = if let Some(token) = main_claim_token.clone() {
-                                    super::process_supervision::DirectCoreRun::with_main_token(
-                                        spawned.child,
-                                        run_identity,
-                                        token,
-                                    )
-                                } else {
-                                    super::process_supervision::DirectCoreRun::with_identity(
-                                        spawned.child,
-                                        run_identity,
-                                    )
-                                };
-                                let identity = run.identity.clone();
-                                // The empty-slot permit retains this mutex guard
-                                // through spawn, so this cannot discard a Child.
-                                empty_slot.install_running(run);
-                                Ok(Some((pid, handoff, identity)))
-                            }
-                            Err(e) => {
-                                main_reservation.confirmed_no_external_writer();
-                                Err(StartError::from(format!("{e}")))
-                            }
-                        }
-                    })
-                    .map_err(|error| StartError::from(error.to_string()))?
-                };
+                        pipe_to_log(
+                            stderr,
+                            SING_BOX_TARGET,
+                            Some(sink_fatal),
+                            Some(sink_handoff),
+                        );
+                    }),
+                );
+                // 核输出恒进日志 sink（非 TTY）；sing-box 不自行关色，不加 flag 会混入 ANSI 转义。
+                req.extra_args = vec!["--disable-color".to_string()];
+                // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
+                // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
+                req.working_dir = Some(self.config.dir().to_path_buf());
+                let direct_spawn = self.spawn_direct_native(
+                    native_producer.as_ref(),
+                    my_gen,
+                    || TokioSpawner::new().spawn(req).map(|spawned| spawned.child),
+                    main_claim_token.clone(),
+                    || main_reservation.arm_external_start(),
+                );
+                if direct_spawn.is_err() {
+                    // Returned Err means this invocation never returned a live Child;
+                    // the protected factory marks its definite spawn Err separately.
+                    main_reservation.confirmed_no_external_writer();
+                }
                 match direct_spawn {
-                    Ok(Some((pid, handoff, identity))) => {
+                    Ok(Some((pid, identity))) => {
                         log_pipe_handoff = Some(handoff);
                         direct_run_identity = Some(identity);
                         pid
@@ -1828,7 +1935,7 @@ impl ProxyRuntime {
             // Android 腿**不提交 pid**：核在本进程内，没有号码可记。写 `Some(0)` 会被
             // `status()`、诊断以及 stale 清扫的「受管 pid 排除表」当成一个真实号码引用
             // ——那等于给 0 号发一张免死金牌。
-            if !via_helper && !cfg!(target_os = "android") {
+            if !via_helper && !cfg!(any(target_os = "android", target_os = "ios")) {
                 let pid_commit_started = std::time::Instant::now();
                 if let Ok(mut g) = self.pid.lock() {
                     *g = Some(pid);
@@ -2085,6 +2192,7 @@ impl ProxyRuntime {
         let user_config = effective_user_config;
 
         let new_status = ProxyStatus {
+            main_generation: my_gen,
             running: true,
             // 读时投影字段，存储态恒 false（真值 = `start_inflight` 计数，见字段文档）。
             starting: false,
@@ -2129,7 +2237,7 @@ impl ProxyRuntime {
         // The final endpoint set was claimed before native/libbox startup. Keep that claim
         // continuously through readiness; releasing and re-reserving here opens a takeover gap.
         if let Ok(mut snap) = self.startup_snapshot.write() {
-            *snap = Some(config);
+            *snap = Some(config.clone());
         }
         // 核刚按磁盘配置生成并起来 ⇒ 一切「保存但没进核」的欠账在这一刻结清。
         // 清点必须与 `startup_snapshot` 同刻：这两者一起定义了「运行核吃进去的是什么」。
@@ -2262,9 +2370,9 @@ impl ProxyRuntime {
         // Android 上没有核二进制可对账（`binary` 是 `IN_PROCESS_CORE_PLACEHOLDER` 占位串，
         // 不指向任何文件）⇒ 整条自证不挂。挂了只会得到一条恒 `Unobservable` 的噪音，而
         // 「换核没生效」在 Android 上是换 aar 的事，不由这条链回答。
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         self.spawn_running_core_binary_attestation(pid, binary.clone(), my_gen);
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         let _ = &binary;
         // TUN 起来了 → 后台查一次「别人设的系统代理」并提示（只读不动手，见下方方法文档）。
         // 这只是 advisory、不是起核成立条件；Windows 真机首次 `reg query` 曾因系统冷态/安全软件扫描
@@ -2433,6 +2541,14 @@ impl ProxyRuntime {
              TUN路由校验={tun_route_ms}ms 系统代理设置={system_proxy_ms}ms \
              mesh路由接线={mesh_route_ms}ms DNS接管={dns_ms}ms）"
         );
+        self.capture_ready_main(
+            my_gen,
+            &config,
+            &user_config,
+            &serde_json::to_value(&singbox_config)
+                .map_err(|error| StartError::from(error.to_string()))?,
+            &new_status,
+        )?;
         Ok(new_status)
     }
 
@@ -2920,6 +3036,15 @@ impl ProxyRuntime {
                     // 异步的，塞进来只能 `block_on`，而它本就跑在 async 上下文里 ⇒ 必 panic。
                     let alive = if cfg!(target_os = "android") {
                         super::android_bridge::core_started()
+                    } else if cfg!(target_os = "ios") {
+                        #[cfg(target_os = "ios")]
+                        {
+                            tauri_plugin_polaris_ios::started()
+                        }
+                        #[cfg(not(target_os = "ios"))]
+                        {
+                            false
+                        }
                     } else if via_helper {
                         helper_pid.is_some_and(pid_alive)
                     } else if let Ok(mut g) = child.lock() {
@@ -3141,19 +3266,18 @@ impl ProxyRuntime {
             user_config.mixed_port,
         );
         let allocator = PortAllocator::new(TokioPortProvider);
-        #[cfg(target_os = "android")]
-        let resolved = {
-            static USED_PRIMARY_API_PORTS: OnceLock<PrimaryApiPortLedger> = OnceLock::new();
-            USED_PRIMARY_API_PORTS
-                .get_or_init(PrimaryApiPortLedger::default)
-                .allocate(&allocator, &exclusions)
-                .map_err(|_| "Android 管理 API 端口已耗尽；请完全退出应用后重试".to_string())?
-        };
-        #[cfg(not(target_os = "android"))]
-        let resolved = allocator.resolve_tailscale_api_port(&exclusions);
+        // h2c channels dial lazily and may reconnect. Every platform must retire a
+        // proposed primary endpoint, including cancelled/failed starts, so a ticket's
+        // port and saved secret cannot address a later main in this process.
+        static USED_PRIMARY_API_PORTS: OnceLock<PrimaryApiPortLedger> = OnceLock::new();
+        let resolved = allocate_primary_api_port(
+            USED_PRIMARY_API_PORTS.get_or_init(PrimaryApiPortLedger::default),
+            &allocator,
+            &exclusions,
+        )?;
         let api_port = resolved.port;
         if resolved.used_fallback {
-            log::warn!("管理 API 端口 5 次解析均撞排除集 → 回落 {api_port}");
+            log::warn!("管理 API 端口 5 次解析无可用新端口 → 回落 {api_port}");
         }
         // C19 update-in 端口：额外排除已占的 api_port，fallback = control_api+3（避与 api/login 的 +1/+2 撞）。
         let update_in_excl = PortExclusions::for_login_api(
@@ -3613,7 +3737,7 @@ impl ProxyRuntime {
         peeled: &mut BTreeMap<String, InvalidNode>,
         runtime_bind_interfaces: &BTreeMap<String, String>,
     ) -> Result<GateOutcome, String> {
-        if !cfg!(target_os = "android") {
+        if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             self.settle_kernel_validation_admission(binary).await?;
         }
         let started = std::time::Instant::now();
@@ -3639,7 +3763,11 @@ impl ProxyRuntime {
             // **Android 例外**：核是**进程内 `.so`**（libbox），压根没有二进制可解析 ⇒ `binary`
             // 恒 `None`。照旧早退的话闸门在 Android 上**永不运行**（不是「运行了但归因不到」），
             // 「坏节点被剥掉」这项能力就静默消失了。那条腿改问桥要 `Libbox.checkConfig`。
-            if binary.is_none() && !cfg!(target_os = "android") {
+            if cfg!(target_os = "ios") || (binary.is_none() && !cfg!(target_os = "android")) {
+                #[cfg(target_os = "ios")]
+                log::warn!(
+                    "iOS 配置预检查未执行：Libbox 只在 PacketTunnel 扩展中；构造检查的目录隔离与 CleanupUnknown 尚未满足独立检查后启动主核的条件。配置将在扩展实际启动时由内核检查。"
+                );
                 return Ok(GateOutcome::assemble(
                     gen_out, effective, json, peeled, checks_run, None,
                 ));
@@ -4049,31 +4177,10 @@ pub(super) fn is_valid_srs_file(path: &str) -> bool {
 /// 形态与 cronet 编不编进去**没有因果关系** —— linux 的核也是独立可执行文件却走动态库，macOS
 /// 同样是独立可执行文件却静态编入。用形态推是伪相关，第一个反例就静默判错。
 ///
-/// # `ios` 是**具名的 false**，不是兜底落进去的 false（2026-09-06）
-///
-/// 加 `Platform::Ios` 变体时逐处答题走到这里。答案是 `false`，与不写它时求值的结果相同 ——
-/// 所以必须写出来，否则没有人知道这个 false 是答过的还是漏掉的。
-///
-/// 依据：**本仓今天构不出任何 iOS 产物**，所以「那个核里有没有 cronet」今天没有事实可查；
-/// 而将来有了也不是白送的 —— iOS 的 cronet 是一份预编译静态库，链接面要另外接十几个 Apple
-/// framework，与 Android 那份「`build_libbox` 默认 sharedTags 就含 `with_naive_outbound`」
-/// 完全不同形。故在那件事真的做完并取到证之前，这里只能答 `false`。
-///
-/// ⚠️ **这个诚实的 false 带着一个已知的坏形态**：`cronet_available` 随之为 false ⇒
-/// `generate.rs` 的 `is_node_usable` 丢弃**全部** naive/H3 节点，而用户看到的是「节点无效」
-/// 而不是「本构建不含 naive」（下方 `cronet_available` 注释里记着的那两个真机 bug 是同一根因）。
-/// iOS 腿真正接上核之后，这一格必须连同归因提示一起重答；在那之前它由
-/// `runtime/proxy/tests/platform_contracts.rs` 的 `cronet_available_across_core_forms` 钉住
-/// （翻成 `true` 即红），确保它不会被当成「随便填的」而悄悄改掉。
-///
-/// **未验证**：上述 iOS 链接面结论来自上游构建脚本与 cronet 发布物的形态，本仓未实际构建过。
+/// iOS: the pinned six-patch source build verifies naive/cronet in device and simulator slices.
+/// Its static framework is linked only into the Packet Tunnel extension.
 pub(super) fn core_has_builtin_cronet(platform: &str) -> bool {
-    match platform {
-        "darwin" | "android" => true,
-        // 见上方 §`ios` 是具名的 false。
-        "ios" => false,
-        _ => false,
-    }
+    matches!(platform, "darwin" | "android" | "ios")
 }
 
 /// NaiveProxy 可用性判定（抽纯函数便于单测 + 变异验证）。`generate_deps` 的 `has_cronet` 经此。

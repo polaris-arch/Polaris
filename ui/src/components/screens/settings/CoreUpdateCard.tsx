@@ -17,6 +17,7 @@ import {
 } from './Primitives';
 import CoreVersionBanner from './CoreVersionBanner';
 import { CORE_ROLLBACK_KEY, useCoreUpdate } from './use-core-update';
+import { useProgressDisclosure } from '@/lib/use-progress-disclosure';
 
 export interface CoreUpdateCardProps {
   config: UserConfig;
@@ -44,6 +45,8 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
     checkCoreUpdate,
     runCoreUpdate,
   } = useCoreUpdate();
+  const coreInProgress = coreBusy || onlineState === 'checking' || onlineState === 'updating';
+  const progressView = useProgressDisclosure(coreInProgress);
 
   const blockedNote = t(coreVer?.build === 'polaris'
     ? 'settings.core.managedByApp' : 'settings.core.forkBlocked');
@@ -95,7 +98,7 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
             <Button
               variant="flow"
               size="sm"
-              disabled={coreBusy}
+              disabled={coreInProgress}
               onClick={() => void applyStaged()}
             >
               <span>{t('settings.coreManagement.applyNow')}</span>
@@ -117,7 +120,7 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
             <Button
               variant="ghost"
               size="sm"
-              disabled={coreForkBlocked || coreBusy}
+              disabled={coreForkBlocked || coreInProgress}
               data-tip={coreForkBlocked ? blockedNote : undefined}
               onClick={() => void checkCoreUpdate()}
             >
@@ -126,7 +129,7 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
           </div>
         )}
 
-        {onlineState === 'checking' && (
+        {onlineState === 'checking' && !progressView.hidden && (
           <div className="core-ver" style={{ marginTop: 12 }}>
             <Spinner />
             <div style={{ flex: 1 }}>
@@ -149,13 +152,13 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
               <span className="cv-tag">{latest.version}</span>
               {latest.crossBand && <CardSub>{t('settings.coreManagement.crossBandRisk')}</CardSub>}
             </div>
-            <Button variant="flow" size="sm" disabled={coreBusy} onClick={() => void runCoreUpdate()}>
+            <Button variant="flow" size="sm" disabled={coreInProgress} onClick={() => void runCoreUpdate()}>
               <span>{t('settings.coreManagement.updateNow')}</span>
             </Button>
           </div>
         )}
 
-        {onlineState === 'updating' && (
+        {(onlineState === 'updating' || coreBusy) && !progressView.hidden && (
           <div className="core-ver" style={{ marginTop: 12 }}>
             <Spinner />
             <div style={{ flex: 1 }}>
@@ -167,11 +170,22 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
         {onlineMessage && <CardSub style={{ marginTop: 8 }}>{onlineMessage}</CardSub>}
         {onlineError && <CardSub style={{ marginTop: 8, color: 'hsl(var(--err))' }}>{onlineError}</CardSub>}
 
+        {coreInProgress && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+            <CardSub style={{ flex: 1 }}>
+              {t(progressView.hidden ? 'settings.update.backgroundProgress' : 'settings.update.hideProgressHint')}
+            </CardSub>
+            <Button variant="ghost" size="sm" onClick={progressView.hidden ? progressView.show : progressView.hide}>
+              {t(progressView.hidden ? 'settings.update.showProgress' : 'settings.update.hideProgress')}
+            </Button>
+          </div>
+        )}
+
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginTop: 12, flexWrap: 'wrap' }}>
           <Button
             variant="ghost"
             size="sm"
-            disabled={coreBusy}
+            disabled={coreInProgress}
             onClick={() => void replaceManual()}
           >
             <span>{t('settings.coreManagement.manualSwap')}</span>
@@ -180,7 +194,7 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
             variant="ghost"
             size="sm"
             className={cn(armed === CORE_ROLLBACK_KEY && 'confirming')}
-            disabled={coreBusy || !coreVer?.hasBackup}
+            disabled={coreInProgress || !coreVer?.hasBackup}
             data-tip={coreVer?.hasBackup ? undefined : t('settings.core.noBackup')}
             onClick={rollback}
           >
@@ -193,7 +207,7 @@ export default function CoreUpdateCard({ config, update }: CoreUpdateCardProps) 
           <Button
             variant="ghost"
             size="sm"
-            disabled={coreBusy}
+            disabled={coreInProgress}
             onClick={resetFactory}
           >
             <span>{t('settings.coreManagement.resetFactory')}</span>

@@ -199,6 +199,11 @@ const REGISTRY: &[Entry] = &[
         class: Class::PrivateChildFixture,
     },
     Entry {
+        file: "crates/core-supervisor/src/exact_spawn/tests/mod.rs",
+        test: "unrelated_no_network_fixture",
+        class: Class::PrivateChildFixture,
+    },
+    Entry {
         file: "crates/helper/src/platform/linux/claims/tests/mod.rs",
         test: "root_provision_publishes_exact_v2_without_rewriting_existing_claims",
         class: Class::PrivilegedPrivateFs,
@@ -554,8 +559,8 @@ fn registry_and_source_agree_exactly() {
     );
     assert_eq!(
         sites.len(),
-        34,
-        "默认不跑的测试数从 34 变成了 {} —— 这不是自动放行的事：\
+        35,
+        "默认不跑的测试数从 35 变成了 {} —— 这不是自动放行的事：\
          增加意味着又有一块行为退出了默认覆盖，减少意味着有测试被接回默认门（好事，但要同步改这个数）。",
         sites.len()
     );

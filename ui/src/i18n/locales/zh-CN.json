@@ -738,6 +738,10 @@
       "noTelemetry": "零遥测 — 不自动上传崩溃报告或分析数据"
     },
     "update": {
+      "hideProgress": "收起进度",
+      "showProgress": "查看进度",
+      "backgroundProgress": "更新任务仍在继续",
+      "hideProgressHint": "收起进度后，任务会继续进行",
       "ruleResourceAutoStatusOn": "按间隔刷新",
       "ruleResourceAutoStatusManual": "仅手动",
       "formMismatch": "更新包形态与当前安装形态不匹配，已交由系统处理",
@@ -768,7 +772,7 @@
       "autoDownloadOffToast": "仅检查提醒，不自动下载",
       "pageSub": "应用、内核、规则资源更新与下载加速",
       "intervalCard": "后台检查间隔",
-      "intervalCardSub": "订阅与规则资源按此周期在后台刷新；应用更新在每次启动时检查一次",
+      "intervalCardSub": "订阅按此周期在后台刷新；规则资源有独立周期，应用更新在启动时检查。",
       "intervalManualOnly": "仅手动",
       "intervalHours": "每 {{n}} 小时",
       "intervalDays": "每 {{n}} 天",
@@ -831,7 +835,7 @@
       "subFollow": "跟随订阅",
       "subViaProxy": "走代理",
       "subDirect": "直连",
-      "ruleResourceAutoDesc": "按「后台检查间隔」自动重新下载规则资源"
+      "ruleResourceAutoDesc": "按规则资源的独立周期自动重新下载资源。"
     },
     "core": {
       "applied": "内核已更新",
@@ -1573,6 +1577,7 @@
     "createTaskRecoveredHint": "订阅添加在后台执行，应用重启后会在这里继续显示进度。"
   },
   "errors": {
+    "iosSessionActive": "系统中已有 Polaris VPN 会话，请先在 iOS 系统设置中停止该会话，再连接。",
     "operationFailed": "操作失败，请稍后重试",
     "systemDnsTakeoverFailed": "Linux 系统 DNS 未能接入 Polaris。代理仍在运行，但域名解析可能失败或绕过 DNS 规则；请检查 Helper 与 systemd-resolved 后重连。",
     "outboundInterfaceUnavailable": "指定的出口网卡不存在或尚未启用。为避免改走其他网卡，本次连接未应用；请重新选择出口网卡。",
@@ -2224,6 +2229,10 @@
     "downloadAllFailed": "下载失败"
   },
   "resources": {
+    "updateInterval": "规则资源更新周期",
+    "updateIntervalDesc": "仅改变规则资源周期，不改变订阅设置；0 表示仅手动。",
+    "autoUpdateSettings": "自动更新设置",
+    "autoUpdateUnavailable": "暂时无法打开设置，请在设置 → 应用与更新中调整规则资源自动更新。",
     "cancel": "取消",
     "cancelAlreadyDone": "下载已结束，无需取消",
     "cancelFailed": "取消失败",
@@ -2342,6 +2351,15 @@
     "errUnknown": "操作失败。"
   },
   "ts": {
+    "identityRetirementRequired": "更换账号前需要安全退出旧账号。请使用“切换账号”。",
+    "switchAccountNote": "切换账号会断开代理、退出该节点旧账号，再重新连接并发起登录。",
+    "stoppingConnection": "正在断开代理连接…",
+    "retiringIdentity": "正在退出旧账号…",
+    "savingCandidate": "正在保存节点配置…",
+    "startingConnection": "正在重新连接代理…",
+    "reasonIdentityRetirement": "无法安全退出旧账号。请重试。",
+    "reasonSessionChanged": "登录状态已变更，请重新尝试。",
+    "reasonConfigurationChanged": "节点配置已变更，请重新打开登录页面。",
     "acceptDefaultResolvers": "接受 tailnet 默认解析器",
     "acceptDefaultResolversHint": "额外接受 tailnet 下发的默认 DNS 解析器（split-DNS）。可选。",
     "acceptRoutes": "接受子网路由",
@@ -2380,6 +2398,10 @@
     "exitNotAdvertised": "未广告出口",
     "exitOffline": "离线",
     "hostname": "主机名",
+    "hostnamePlaceholder": "留空自动命名",
+    "hostnameHint": "留空使用本机内核默认名称；填写后将作为这台设备在组网中的主机名。",
+    "accountActions": "账号操作",
+    "fileTransfer": "文件传输",
     "loginDiscard": "放弃",
     "loginDiscardMsg": "已填写的内容将不会保存。",
     "loginDiscardTitle": "放弃登录？",
@@ -2440,7 +2462,15 @@
     "authKeyClearPending": "待清除（保存后生效）",
     "authKeyClear": "清除",
     "authKeyClearAgain": "再点一次以清除",
-    "authKeyClearHint": "此处只显示这台节点有没有存过 Auth Key，不显示密钥本身。清除只删配置里的密钥，不影响当前登录状态（登录状态在 state 目录里，要清它用「退出登录」）；清除后该节点在需要重新认证时就没有可用的静态凭据，必须重新登录。保存后生效。",
+    "authKeyRetained": "已留存 · 自动认证已停用",
+    "reuseSavedAuthKey": "使用已保存密钥",
+    "retainedAuthKeyHint": "请明确选择密钥登录来复用。控制面仍会验证；密钥失效时需填写新值。",
+    "retainedAuthKeyAuthorityHint": "已保存密钥属于另一控制面。请恢复原地址，或填写新密钥。",
+    "reasonRetainedKeyUnavailable": "已保存密钥不可用，请填写新密钥。",
+    "reasonCredentialChanged": "凭据已变化，请重新打开此节点后重试。",
+    "reasonCredentialIntent": "清除请求已失效，请重新打开此节点并确认。",
+    "reasonCredentialCommit": "无法确认已保存凭据，请刷新此节点后重试。",
+    "authKeyClearHint": "应用更改时清除当前与留存密钥；这不会退出当前会话。",
     "browserOpenFailed": "无法打开浏览器，请复制登录链接。",
     "reasonMainCoreChanged": "主连接已变更，请重新尝试授权。",
     "loginSavedAttemptIncomplete": "节点已保存；本次授权尚未完成。",
@@ -2451,10 +2481,8 @@
     "loginAttemptFailed": "本次登录请求失败。请重试。",
     "loginCancelFailed": "取消登录失败，请重试。",
     "loginSubmitted": "已提交登录请求。请等待授权完成。",
-    "loginMainCoreStatus": "正在读取主连接中该节点的授权状态。",
     "loginMainCoreAuthorized": "主连接中的该节点已授权；这不代表新保存的认证设置已生效。",
     "loginMainCoreAwaiting": "该节点需要授权。正在获取登录页地址…",
-    "loginMainCoreUnknown": "尚无法确认主连接中该节点的授权状态，可重试读取。",
     "loginUrlTimeout": "获取登录页地址超时。请重试。",
     "loginSessionReadFailed": "无法读取旧登录会话，未发起新的授权。请重试。",
     "loginProgressReadFailed": "暂时无法核对本次授权结果。授权可能仍在进行；返回应用时会重试。",
@@ -2708,6 +2736,14 @@
       "appTitle": "应用更新",
       "appDesc": "Android 版经 GitHub Releases 分发。在这里检查、下载签名 APK 并交给系统安装器；某个版本没有发 APK 时，仍可打开发布页。",
       "ghScopeNote": "这里的加速与自定义域名服务的是规则资源下载，与内核更新无关。",
+      "ruleResourceAutoDesc": "独立控制内置分流数据与外部规则资源，不改变订阅设置。",
+      "ruleResourceInterval": "规则资源更新周期",
+      "ruleResourceIntervalDesc": "从上次成功下载计算；选「仅手动」时，启动或返回前台都不会自动下载。",
+      "ruleResourceOff": "自动更新已关闭。",
+      "ruleResourceManual": "当前仅手动更新。",
+      "ruleResourceActive": "已开启，按 {{hours}} 小时周期更新到期资源。",
+      "ruleResourceScopeNote": "启动或返回前台时补查到期资源；应用运行期间定期检查。下载失败会退避重试，后台暂停时不保证按时更新。「更新于」表示上次成功下载。",
+      "subscriptionIntervalDesc": "只控制订阅的后台刷新周期，不改变规则资源的独立周期。",
       "checkAction": "检查更新",
       "checking": "正在检查…",
       "openReleases": "打开发布页",
@@ -2947,5 +2983,17 @@
       "other": "其他证据暂不可用。"
     },
     "legacy": "当前版本无法提供可核实的路由归属报告。"
+  },
+  "prerequisite": {
+    "preparingConnection": "正在准备代理连接，请完成系统授权。",
+    "waitingForReady": "等待代理就绪…",
+    "foregroundRequired": "请返回应用前台后重试。",
+    "permissionDenied": "VPN 授权未获允许，请重试并允许系统请求。",
+    "readyUnknown": "无法确认连接已就绪，请检查连接后重试。",
+    "cancelled": "本次操作已取消，可重试。",
+    "cancelFailed": "未能取消这次操作，请重试。",
+    "saveConfiguration": "请先保存配置，再重试。",
+    "ipInfoFailed": "IP 信息未能刷新，请重试网络检测。",
+    "unlockFailed": "服务可用性未能检测，请重试网络检测。"
   }
 }

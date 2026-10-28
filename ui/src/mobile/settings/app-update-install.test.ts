@@ -18,6 +18,7 @@ import {
   ANDROID_INSTALL_REASONS,
   androidInstallFailureKey,
   classifyInstallHandoff,
+  classifyInstallPermission,
 } from './app-update-install';
 import { appUpdateDownloadTarget, reinstallTarget } from './app-update-check';
 import zhCN from '@/i18n/locales/zh-CN.json';
@@ -33,6 +34,30 @@ const PLUGIN = join(
 );
 
 const LOCALES = { 'zh-CN': zhCN, 'en-US': enUS, 'zh-TW': zhTW, ru, fa } as const;
+
+describe('安装授权只允许当前按钮流程继续，不宣称已打开安装器或已安装', () => {
+  it('明确的 granted:true 才能继续；打开设置本身不算授权', () => {
+    expect(classifyInstallPermission({ granted: true })).toEqual({ kind: 'granted' });
+    expect(classifyInstallPermission({ granted: false, reason: 'unknown-sources-denied' })).toEqual({
+      kind: 'refused',
+      reason: 'unknown-sources-denied',
+    });
+    expect(classifyInstallPermission({ granted: false })).toEqual({ kind: 'refused', reason: '' });
+    expect(classifyInstallPermission({ settingsOpened: true } as never).kind).toBe('refused');
+    expect(classifyInstallPermission({ launched: true } as never).kind).toBe('refused');
+    expect(classifyInstallPermission({ granted: 'true' } as never).kind).toBe('refused');
+  });
+
+  it('拒绝原因和许可互相矛盾时保守停止，可显示现有失败文案', () => {
+    expect(classifyInstallPermission({ granted: true, reason: 'unknown-sources-denied' })).toEqual({
+      kind: 'refused',
+      reason: 'unknown-sources-denied',
+    });
+    expect(
+      classifyInstallPermission({ granted: false, reason: 'unknown-sources-settings-unavailable' }),
+    ).toEqual({ kind: 'refused', reason: 'unknown-sources-settings-unavailable' });
+  });
+});
 
 /** 按 `a.b.c` 取一条文案；取不到返 `undefined`（缺键与空串必须可分辨）。 */
 function lookup(bundle: unknown, key: string): string | undefined {
@@ -72,6 +97,19 @@ describe('① 交付结局：成功的判据是那个只属于本条腿的键', 
     expect(classifyInstallHandoff({ ok: true, handedToSystem: true, reason: 'form-mismatch' })).toEqual(
       { kind: 'refused', reason: 'form-mismatch' },
     );
+  });
+
+  it('授权或打开设置的回包不能被误算成交付成功；矛盾回包拒绝', () => {
+    expect(classifyInstallHandoff({ ok: true, granted: true } as never).kind).toBe('refused');
+    expect(classifyInstallHandoff({ ok: true, settingsOpened: true } as never).kind).toBe('refused');
+    expect(classifyInstallHandoff({ ok: false, awaitingSystemInstaller: true }).kind).toBe('refused');
+    expect(
+      classifyInstallHandoff({
+        ok: true,
+        awaitingSystemInstaller: true,
+        reason: 'unknown-sources-denied',
+      }),
+    ).toEqual({ kind: 'refused', reason: 'unknown-sources-denied' });
   });
 });
 

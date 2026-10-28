@@ -592,7 +592,7 @@ describe('Android 影响面的完备性（APK 腿的触发面 fail-open 根治�
       '针把 `target_os = "linux"` 也算进来了 —— 合取只该要求 `target_os` 是真代码，不该丢掉 "android" 这半边',
     ).toBe(false);
 
-    // ④ 仓内真实文件的正反对照（本仓记过的「判据被自己污染」的两个实例）
+    // ④ 仓内真实 JNI 负例与固定 comment-only cfg 负例（判据不被自己的注释/字符串喂饱）
     const wiring = 'src-tauri/tests/android_platform_verifier_wiring.rs';
     const wiringRaw = readFileSync(join(REPO_ROOT, wiring), 'utf8');
     expect(
@@ -605,16 +605,22 @@ describe('Android 影响面的完备性（APK 腿的触发面 fail-open 根治�
         '一条真代码行上的字符串 `let attr = "#[jni::jni_mangle(";`）。这是判据被自己污染。',
     ).not.toContain(wiring);
 
-    const mesh = 'src-tauri/src/runtime/mesh.rs';
-    const meshRaw = readFileSync(join(REPO_ROOT, mesh), 'utf8');
+    // mesh.rs now has real Android consumers. Keep this negative independent of
+    // future production cfg additions instead of treating real code as a comment.
+    const commentOnly = 'fixture-comment-only.rs';
+    const commentOnlyRaw =
+      '// #[cfg(target_os = "android")]\n' +
+      '/* #[cfg(target_os = r"android")] */\n' +
+      'fn ordinary() {}\n';
+    const commentOnlyFace = [commentOnly].filter(() => hasRealAndroidCfg(commentOnlyRaw));
     expect(
-      ANDROID_CFG.test(meshRaw),
-      `${mesh} 原文里已经没有 target_os = "android" —— 本对照失去意义，该换一个注释假阳性样本`,
+      ANDROID_CFG.test(commentOnlyRaw),
+      `${commentOnly} 原文里已经没有 target_os = "android" —— 本对照失去意义，该换一个注释假阳性样本`,
     ).toBe(true);
     expect(
-      androidCfgFace,
-      `${mesh} 被判成含 Android 专属代码 —— 它那处 target_os = "android" 只在行注释里，注释剥离失效了`,
-    ).not.toContain(mesh);
+      commentOnlyFace,
+      `${commentOnly} 被判成含 Android 专属代码 —— target_os = "android" 只在行/块注释里，注释剥离失效了`,
+    ).not.toContain(commentOnly);
   });
 
   it('D：NO_ANDROID_IMPACT_SCOPES 不是装饰，且它依赖的替补覆盖今天还在', () => {

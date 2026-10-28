@@ -193,13 +193,13 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         kind: 'ported',
         mobile: {
           file: 'ui/src/mobile/settings/UpdatePage.tsx',
-          mustContain: "disabled={check.phase === 'checking'}",
+          mustContain: "disabled={check.phase === 'checking' || installing}",
         },
       },
       note:
         '检查更新的第二个渲染位（桌面在失败态下重新出现的那一颗）。移动端不按状态换按钮：同一颗 ' +
-        '`app-update` 按钮恒在，只在 `checking` 时禁用 ⇒ 失败之后它照样点得动，桌面那两个渲染位在 ' +
-        '移动端是同一颗。锚指的是那条「只有正在查时才禁用」的判据 —— 它要是变成恒禁用，本条当场失配。',
+        '`app-update` 按钮恒在，在 `checking` 或安装授权在途时禁用 ⇒ 失败之后它照样点得动，桌面那两个渲染位在 ' +
+        '移动端是同一颗。锚指向检查与安装授权的互斥判据，防止安装在途重复检查。',
     },
     {
       id: 'AppUpdateCard.tsx|k:settings.update.download',
@@ -320,6 +320,23 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         mobile: { file: 'ui/src/mobile/settings/TunReports.tsx', mustContain: "t('settings.tun.forceRouteLoading')" },
       },
       note: '旧桌面报告块的加载文案，移动报告块仍在加载时显示状态。',
+    },
+
+    {
+      id: 'AppUpdateCard.tsx|f:progressView',
+      disposition: {
+        kind: 'ported',
+        mobile: {
+          file: 'ui/src/mobile/settings/UpdatePage.tsx',
+          mustContain: 'onClick={progressView.hidden ? progressView.show : progressView.hide}',
+        },
+      },
+      note: '收起或重新查看应用检查、下载及重装进度；只改变展示，后台任务与重复操作保护保持。',
+    },
+    {
+      id: 'CoreUpdateCard.tsx|f:progressView',
+      disposition: { kind: 'platform-absent', evidence: CORE_IS_BUNDLED },
+      note: 'Android 内核随应用更新，进度由同页应用更新的收起/查看入口承接，不存在独立换核任务。',
     },
 
     /* ── 内核更新卡 / 版本横幅（核随 APK 打包，整族没有对象）────────────────── */

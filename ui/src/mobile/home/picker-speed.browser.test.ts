@@ -154,18 +154,65 @@ useAppStore.setState({config,servers:config.servers,selectedServerId:'node-a',sw
 }});
 createRoot(document.getElementById('root')).render(<MobileHomeScreen/>);
 `;
+const networkEntry = sentinelEntry.replace("import { api } from '/src/ipc';", "import { api, unlockApi } from '/src/ipc';\nimport { MobileToaster } from '/src/mobile/MobileToaster';").replace(
+  "createRoot(document.getElementById('root')).render(<MobileHomeScreen/>);",
+  `
+document.documentElement.dataset.mobileOs = new URLSearchParams(location.search).get('os') || 'ios';
+const net=window.__networkTest={manual:[],raw:[],speeds:[],cancels:[],mainStarts:0,mainStops:0,
+ status:{running:false,mainGeneration:6},requestId:null,finish:null,
+ state:()=>useAppStore.getState(),setSelection(id){useAppStore.setState({selectedServerId:id});},cancelReject:null,leave:null,
+ setStatus(status){net.status=status;useAppStore.getState().setProxyStatus(status);}};
+const ip={revision:5,direct:null,proxy:null,updatedAt:123};
+const unlock={results:{},checkedAt:123,egress:null};
+useAppStore.setState({proxyStatus:net.status,ipInfo:{revision:0,direct:null,proxy:null,updatedAt:0}});
+api.proxy.getStatus=async()=>net.status;
+api.proxy.start=async()=>{net.mainStarts++;};api.proxy.stop=async()=>{net.mainStops++;};
+api.ipInfo.get=async()=>{net.raw.push('ip');return ip;};
+unlockApi.run=async()=>{net.raw.push('unlock');return unlock;};
+unlockApi.cancelManualCheck=id=>{net.cancels.push(id);return new Promise((_resolve,reject)=>{net.cancelReject=reject;});};
+unlockApi.manualCheck=(requestId,force)=>new Promise(resolve=>{
+ net.manual.push({requestId,force});net.requestId=requestId;
+ net.finish=(ipError,unlockError)=>resolve({context:{requestId,mainGeneration:7,startTime:123},
+  ipInfo:ipError?{error:{code:ipError}}:{data:ip},unlock:unlockError?{error:{code:unlockError}}:{data:unlock}});
+});
+api.server.speedTest=async ids=>{net.speeds.push(ids);return {runId:'1',results:{'node-a':24},outcome:'completed',notInPool:[],tsNotReady:[],
+ measurementContext:{runId:'1',requestId:'speed-1',mainGeneration:7,startTime:123}};};
+function Host(){const [home,setHome]=React.useState(true);net.leave=()=>setHome(false);return <>{home?<MobileHomeScreen/>:<p>Other screen</p>}<MobileToaster/></>;}
+createRoot(document.getElementById('root')).render(<Host/>);
+`,
+);
+const authWarningEntry = sentinelEntry.replace("import { api } from '/src/ipc';", `
+import { api } from '/src/ipc';
+import { MobileNodesScreen } from '/src/mobile/nodes/MobileNodesScreen';
+import { useMobileFormStore } from '/src/mobile/forms/form-store';
+import { useTailscaleLoginProgressStore } from '/src/store/use-tailscale-login-progress-store';
+`).replace("createRoot(document.getElementById('root')).render(<MobileHomeScreen/>);", `
+const params=new URLSearchParams(location.search);document.documentElement.dataset.mobileOs=params.get('os')||'ios';
+const ts={...config.servers[0],protocol:'tailscale',tailscaleSettings:{exitNode:'fixture-exit'}};
+const auth=window.__authWarning={opens:[],panels:()=>useMobileFormStore.getState().stack,
+ reset(){auth.opens=[];useMobileFormStore.setState({stack:[]});},
+ attempt(phase,url){useTailscaleLoginProgressStore.getState().begin('node-a','B');useTailscaleLoginProgressStore.getState().apply({serverId:'node-a',attemptId:'B',phase,url,mainGeneration:7,identityEpoch:'epoch-B'});}};
+useAppStore.setState({config:{...config,servers:[ts]},servers:[ts],proxyStatus:{running:true,mainGeneration:7,startTime:123},
+ tailscaleStatuses:{'node-a':{serverId:'node-a',nodeName:'fixture',backendState:'NeedsLogin',loggedIn:false,expired:false,peers:[],tailscaleIPs:[],authURL:'https://login.example/status-A'}},
+ tailscaleAuthUrls:{'node-a':'https://login.example/store-A'}});
+api.config.meshRouteReport=async()=>null;api.system.openExternal=async url=>{auth.opens.push(url);};
+createRoot(document.getElementById('root')).render(params.get('screen')==='nodes'?<MobileNodesScreen/>:<MobileHomeScreen/>);
+`);
 let server: ViteDevServer; let browser: Browser; let origin: string;
 describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and measured task consumers', () => {
   beforeAll(async () => {
     server=await createServer({root,cacheDir:path.join(tmpdir(),'polaris-picker-speed-vite-'+process.pid),server:{host:'127.0.0.1',port:0,watch:null},plugins:[{
-      name:'picker-speed-fixture',resolveId(id){if(id==='/picker-speed-fixture.tsx'||id==='/full-home-fixture.tsx'||id==='/speed-feedback-fixture.tsx'||id==='/sentinel-fixture.tsx')return id;},load(id){if(id==='/picker-speed-fixture.tsx')return entry;if(id==='/full-home-fixture.tsx')return fullHomeEntry;if(id==='/speed-feedback-fixture.tsx')return speedFeedbackEntry;if(id==='/sentinel-fixture.tsx')return sentinelEntry;},
+      name:'picker-speed-fixture',resolveId(id){if(id==='/picker-speed-fixture.tsx'||id==='/full-home-fixture.tsx'||id==='/speed-feedback-fixture.tsx'||id==='/sentinel-fixture.tsx'||id==='/network-fixture.tsx'||id==='/auth-warning-fixture.tsx')return id;},load(id){if(id==='/picker-speed-fixture.tsx')return entry;if(id==='/full-home-fixture.tsx')return fullHomeEntry;if(id==='/speed-feedback-fixture.tsx')return speedFeedbackEntry;if(id==='/sentinel-fixture.tsx')return sentinelEntry;if(id==='/network-fixture.tsx')return networkEntry;if(id==='/auth-warning-fixture.tsx')return authWarningEntry;},
       configureServer(vite){vite.middlewares.use(async(req,res,next)=>{
-        if(req.url!=='/__picker-speed'&&req.url!=='/__full-home'&&req.url!=='/__speed-feedback'&&req.url!=='/__sentinel')return next();
+        const route=req.url?.split('?')[0];
+        if(route!=='/__picker-speed'&&route!=='/__full-home'&&route!=='/__speed-feedback'&&route!=='/__sentinel'&&route!=='/__network'&&route!=='/__auth-warning')return next();
         const full=req.url?.includes('full-home');
         const sentinel=req.url?.includes('sentinel');
         const speed=req.url?.includes('speed-feedback');
-        const html=await vite.transformIndexHtml(full?'/__full-home':sentinel?'/__sentinel':speed?'/__speed-feedback':'/__picker-speed',
-          '<html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script type="module" src="/'+(full?'full-home-fixture':sentinel?'sentinel-fixture':speed?'speed-feedback-fixture':'picker-speed-fixture')+'.tsx"></script></html>');
+        const network=route==='/__network';
+        const authWarning=route==='/__auth-warning';
+        const html=await vite.transformIndexHtml(full?'/__full-home':sentinel?'/__sentinel':speed?'/__speed-feedback':network?'/__network':authWarning?'/__auth-warning':'/__picker-speed',
+          '<html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><div id="root"></div><script type="module" src="/'+(full?'full-home-fixture':sentinel?'sentinel-fixture':speed?'speed-feedback-fixture':network?'network-fixture':authWarning?'auth-warning-fixture':'picker-speed-fixture')+'.tsx"></script></html>');
         res.setHeader('Content-Type','text/html');res.end(html);
       });},
     }]});await server.listen();const address=server.httpServer!.address();if(!address||typeof address!=='object')throw new Error('Vite did not bind');origin='http://127.0.0.1:'+address.port;
@@ -365,5 +412,93 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('mobile picker and mea
     expect(await block.innerText()).toContain('当前为直连模式：全部流量都不经过代理出口，阻断不会生效');
     expect(await page.evaluate(()=>(window as any).__sentinelTest.calls)).toHaveLength(2);
     await page.close();
+  },30_000);
+  it('iOS explicit network entry holds one request through preparation, preserves partial success and measures only after ready',async()=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});
+    try {
+      await page.goto(origin+'/__network');
+      const button=page.locator('[data-write-control="network-check"]');await button.waitFor();
+      expect(await page.evaluate(()=>(window as any).__networkTest.manual)).toEqual([]);
+      await button.click();
+      await page.waitForFunction(()=>(window as any).__networkTest.manual.length===1);
+      expect(await button.isDisabled()).toBe(true);
+      expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.raw,n.speeds,n.mainStarts,n.mainStops];})).toEqual([[],[],0,0]);
+      await page.evaluate(()=>{const n=(window as any).__networkTest;n.setStatus({running:true,mainGeneration:7,startTime:123});n.finish(null,'targetTimedOut');});
+      await page.locator('[data-write-error="network-check"]').waitFor();
+      expect(await page.locator('[data-write-error="network-check"]').innerText()).toContain('服务可用性未能检测');
+      expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.state().ipInfo.revision,n.speeds,n.cancels,n.mainStops];})).toEqual([5,[['node-a']],[],0]);
+      expect(await button.isDisabled()).toBe(false);
+    } finally {await page.close();}
+  },30_000);
+  it('iOS network results from a stopped/replaced main or changed selection do not overwrite the current view',async()=>{
+    for(const mutation of ['stop','generation','selection']) {
+      const page=await browser.newPage({viewport:{width:390,height:844}});
+      try {
+        await page.goto(origin+'/__network');
+        const button=page.locator('[data-write-control="network-check"]');await button.click();
+        await page.waitForFunction(()=>(window as any).__networkTest.manual.length===1);
+        await page.evaluate(kind=>{const n=(window as any).__networkTest;
+          n.setStatus({running:kind!=='stop',mainGeneration:kind==='generation'?8:7,startTime:123});
+          if(kind==='selection')n.setSelection('other-node');
+          n.finish(null,null);
+        },mutation);
+        await page.waitForFunction(()=>document.querySelector('[data-write-control="network-check"]')?.getAttribute('aria-busy')!=='true');
+        expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.state().ipInfo.revision,n.speeds,n.mainStarts,n.mainStops];})).toEqual([0,[],0,0]);
+        if(mutation==='selection')expect(await page.evaluate(()=>(window as any).__networkTest.cancels)).toHaveLength(1);
+      } finally {await page.close();}
+    }
+  },30_000);
+  it('Android disconnected manual network entry keeps the existing independent IP/unlock behavior',async()=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});
+    try {
+      await page.goto(origin+'/__network?os=android');
+      await page.locator('[data-write-control="network-check"]').click();
+      await page.waitForFunction(()=>(window as any).__networkTest.raw.length===2);
+      expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.manual,n.raw,n.speeds,n.mainStarts,n.mainStops];})).toEqual([[],['ip','unlock'],[],0,0]);
+    } finally {await page.close();}
+  },30_000);
+  it('a rejected exact network cancellation remains visible globally after Home has left',async()=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});
+    try {
+      await page.goto(origin+'/__network');
+      await page.locator('[data-write-control="network-check"]').click();
+      await page.waitForFunction(()=>(window as any).__networkTest.manual.length===1);
+      await page.evaluate(()=>(window as any).__networkTest.leave());
+      await page.getByText('Other screen',{exact:true}).waitFor();
+      await page.waitForFunction(()=>!!(window as any).__networkTest.cancelReject);
+      await page.evaluate(()=>(window as any).__networkTest.cancelReject(new Error('private cancellation diagnostic')));
+      await page.locator('.m-toast').filter({hasText:'未能取消这次操作，请重试。'}).waitFor();
+      const requestId=await page.evaluate(()=>(window as any).__networkTest.requestId as string);
+      expect(await page.evaluate(()=>{const n=(window as any).__networkTest;return [n.cancels,n.mainStops];})).toEqual([[requestId],0]);
+      expect(await page.locator('[data-write-control="network-check"]').count()).toBe(0);
+    } finally {await page.close();}
+  },30_000);
+  it.each(['home','nodes'])('%s auth warning only opens the active bound request URL on iOS; terminal and legacy STATUS open fresh panels',async screen=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});
+    try {
+      await page.goto(origin+'/__auth-warning?screen='+screen);
+      const button=page.locator(screen==='home'?'.h-noticeact':'.mn-notice-act');await button.waitFor();
+      await button.click();
+      expect(await page.evaluate(()=>(window as any).__authWarning.opens)).toEqual([]);
+      expect(await page.evaluate(()=>(window as any).__authWarning.panels().at(-1))).toMatchObject({kind:'ts-login',serverId:'node-a'});
+      await page.evaluate(()=>{const a=(window as any).__authWarning;a.reset();a.attempt('awaitingAuth','https://login.example/bound-B');});
+      await button.click();
+      expect(await page.evaluate(()=>(window as any).__authWarning.opens)).toEqual(['https://login.example/bound-B']);
+      for(const phase of ['cancelled','timedOut','failed']) {
+        await page.evaluate(p=>{const a=(window as any).__authWarning;a.reset();a.attempt(p,'https://login.example/bound-B');},phase);
+        await button.click();
+        expect(await page.evaluate(()=>(window as any).__authWarning.opens)).toEqual([]);
+        expect(await page.evaluate(()=>(window as any).__authWarning.panels().at(-1))).toMatchObject({kind:'ts-login',serverId:'node-a'});
+      }
+    } finally {await page.close();}
+  },30_000);
+  it.each(['home','nodes'])('%s auth warning preserves Android legacy STATUS URL with no attempt',async screen=>{
+    const page=await browser.newPage({viewport:{width:390,height:844}});
+    try {
+      await page.goto(origin+'/__auth-warning?os=android&screen='+screen);
+      await page.locator(screen==='home'?'.h-noticeact':'.mn-notice-act').click();
+      expect(await page.evaluate(()=>(window as any).__authWarning.opens)).toEqual(['https://login.example/status-A']);
+      expect(await page.evaluate(()=>(window as any).__authWarning.panels())).toEqual([]);
+    } finally {await page.close();}
   },30_000);
 });

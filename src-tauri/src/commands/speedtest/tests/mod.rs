@@ -8,6 +8,126 @@ fn ids(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
+#[test]
+fn speed_action_requirement_keeps_other_platforms_independent() {
+    use polaris_helper_proto::Platform;
+    assert_eq!(
+        NormalMainAction::ManualSpeedTest.requirement(Platform::Ios),
+        ActionRequirement::NormalMainRequired
+    );
+    for platform in [
+        Platform::Mac,
+        Platform::Win,
+        Platform::Linux,
+        Platform::Android,
+    ] {
+        assert_eq!(
+            NormalMainAction::ManualSpeedTest.requirement(platform),
+            ActionRequirement::IndependentExistingPath
+        );
+    }
+}
+
+#[test]
+fn normal_main_speed_holds_real_run_identity_before_permission_and_rereads_after_ready() {
+    let body = crate::commands::guard_scan::top_level_fn_body(
+        &crate_code("commands/speedtest.rs"),
+        "pub async fn server_speed_test(",
+    );
+    let ready = body.find("proxy.await_normal_main(binding).await").unwrap();
+    assert!(body.find("SpeedTestGuard::acquire()").unwrap() < ready);
+    assert!(body.find("next_speed_test_run_id(").unwrap() < ready);
+    let measurement = &body[ready..];
+    assert!(
+        measurement.find("state.config().current()").unwrap()
+            < measurement.find("let status = proxy.status()").unwrap()
+    );
+    assert!(body.contains("if ticket.is_some() || cfg!(target_os = \"ios\")"));
+    assert!(body.find("run_temp_core_speed_test(").unwrap() > ready);
+    assert!(!body.contains("proxy.stop("));
+}
+
+#[tokio::test]
+async fn prerequisite_speed_failed_binding_has_no_actual_io_or_fake_timeout() {
+    let invalid = AtomicBool::new(false);
+    let calls = AtomicU64::new(0);
+    let result = bound_speed_io(
+        || async { false },
+        &invalid,
+        || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(12u32)
+        },
+    )
+    .await;
+    assert_eq!(result, None);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(invalid.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn prerequisite_speed_binding_change_after_actual_io_discards_result() {
+    let invalid = AtomicBool::new(false);
+    let checks = AtomicU64::new(0);
+    let calls = AtomicU64::new(0);
+    let result = bound_speed_io(
+        || async { checks.fetch_add(1, Ordering::SeqCst) == 0 },
+        &invalid,
+        || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(12u32)
+        },
+    )
+    .await;
+    assert_eq!(result, None);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(invalid.load(Ordering::SeqCst));
+}
+
+#[test]
+fn pool_selector_uses_ticket_transport_and_keeps_legacy_path_without_ticket() {
+    let body = crate::commands::guard_scan::top_level_fn_body(
+        &crate_code("commands/speedtest.rs"),
+        "async fn run_pool_speed_test(",
+    );
+    assert!(
+        body.contains("Some(ticket) => proxy.probe_select_slot_bound(ticket, slot, &tag).await")
+    );
+    assert!(body.contains("None => proxy.probe_select_slot(slot, &tag).await"));
+    assert!(body.contains("proxy.validate_ready_main(ticket).await.is_ok()"));
+    assert!(body.contains("bound_speed_io("));
+    let bound = crate::commands::guard_scan::impl_method_body(
+        &crate_code("runtime/proxy.rs"),
+        "    pub(crate) async fn probe_select_slot_bound(",
+    );
+    assert!(bound.contains("prerequisite::select_ticket_probe("));
+    assert!(bound.contains("Self::management_api_at"));
+    assert!(!bound.contains("self.management_api()"));
+    let transport = crate::commands::guard_scan::impl_method_body(
+        &crate_code("runtime/proxy/management_api.rs"),
+        "    pub(super) async fn management_api_at(",
+    );
+    assert!(transport.contains("Endpoint::new(\"127.0.0.1\", port), secret"));
+    assert!(!transport.contains("self.status()"));
+    assert!(!transport.contains("clash_api_secret()"));
+}
+
+#[test]
+fn prerequisite_speed_preparation_has_no_counts_and_measurement_context_survives_receipt() {
+    let preparation = speed_test_run_payload(json!({"phase":"waitingForReady"}), "7");
+    assert_eq!(preparation, json!({"phase":"waitingForReady","runId":"7"}));
+    let context = json!({"runId":"7","requestId":"7","mainGeneration":9,"startTime":100});
+    for payload in [
+        json!({"tested":1,"ok":1,"total":1}),
+        json!({"serverId":"node","latency":12}),
+        json!({"outcome":"completed","results":{"node":12}}),
+    ] {
+        let payload = speed_test_measurement_payload(payload, "7", Some(&context));
+        assert_eq!(payload["measurementContext"], context);
+        assert_eq!(payload["runId"], "7");
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // plan_speed_test：本波裁定。每条测都盯住「静默返回 + 前端卡死」这个根因的一个面。
 // ══════════════════════════════════════════════════════════════════════════

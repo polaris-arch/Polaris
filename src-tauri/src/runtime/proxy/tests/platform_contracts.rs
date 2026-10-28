@@ -291,27 +291,20 @@ fn cronet_available_across_core_forms() {
             false,
             "Windows 无 libcronet → false",
         ),
-        // iOS：本仓今天构不出 iOS 产物 ⇒ 核里有没有 cronet 没有事实可查 ⇒ 谓词答 false。
-        // 这两条钉的是**「这个 false 是答过的」**：把 `core_has_builtin_cronet` 的 `"ios"` 臂
-        // 翻成 true（或并进 darwin/android 那条），两条同时红。
-        //
-        // 第二条（lib_exists=true）不是凑数：它证明 `cronet_available` 的**并集语义**在 iOS 上
-        // 仍然成立 —— 将来若 iOS 改走动态库形态，探测到库就该 true，那时该改的是探测腿而不是
-        // 本谓词。少了它，「把 cronet_available 写成 `core_has_builtin_cronet(platform)` 单条」
-        // 这种退化在 iOS 这一格上不会被抓到。
+        // The pinned iOS framework contains static cronet in both Apple slices.
         (
             false,
             "ios",
             "aarch64",
-            false,
-            "iOS 无核产物 + 无落盘动态库 → false（具名的 false，见 core_has_builtin_cronet §ios）",
+            true,
+            "iOS static framework contains cronet",
         ),
         (
             true,
             "ios",
             "aarch64",
             true,
-            "iOS 若探测到落盘 cronet 动态库 → true（并集语义不因平台而失效）",
+            "iOS cronet remains available with a dynamic library",
         ),
     ];
     let mut fails = Vec::new();

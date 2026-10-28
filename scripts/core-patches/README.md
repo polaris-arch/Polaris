@@ -8,12 +8,16 @@ That provider is owned outside this desktop slice. Existing eight Go patches
 and the shared source manifest are unchanged here. Unfrozen consumer patches
 and dependency pins are not imported.
 
-`sourceBuild` in `src-tauri/core-manifest.json` deliberately has null pins.
-`fetch-core.mjs` rejects this state before any clone/build/resource write,
-including with `--force`. Old official archive hashes, old Windows output hashes,
-fetch stamps and existing binaries cannot substitute for the new graph. The
-historical `coreArchiveSha256` keys and `windowsBuild` are retained for current
-platform/runtime contracts; they are not proof of a new patched build.
+`sourceBuild` in `src-tauri/core-manifest.json` pins the source manifest, the
+provisioner, the patched source tree, the build tree, the module graph and each
+platform's build tree. `fetch-core.mjs` rejects an incomplete set of pins before
+any clone/build/resource write, including with `--force`. Old official archive
+hashes, old Windows output hashes, fetch stamps and existing binaries cannot
+substitute for the graph. The per-platform `binarySha256` fields and
+`windowsBuild.binarySha256` are null: output digests are only required where the
+caller asks for them, and the consumed binaries are bound through the producer
+receipts instead. The historical `coreArchiveSha256` keys are retained only as
+the list of bundled platforms; they are not proof of a patched build.
 
 `windows-dns-refresh.patch` changes only Windows system DNS cache invalidation:
 configuration reads recheck adapter DNS at most once per second, even when the
@@ -82,10 +86,13 @@ Git, Python compatible with the frozen provider, and the pinned Go toolchain are
 required. Provider module-cache/toolchain prerequisites remain part of its
 separate contract; failure is propagated and cannot fall back to stock sources.
 
-The source receipt must explicitly declare `graphScope = declared-patched-modules`
-and `sourceGraphState = dependencies-patched`, with the exact sorted declared
-paths in `moduleGraphQueries`. Its `moduleGraph` and `moduleGraphSha256` cover
-those patched modules, not the full linked graph. The provider separately binds
+The source receipt must explicitly declare its scope. With dependency patches it
+is `graphScope = declared-patched-modules` and `sourceGraphState =
+dependencies-patched`; with none (the current manifest) it is `graphScope =
+core-source-only` and `sourceGraphState = source-only`, and either mismatch
+rejects. `moduleGraphQueries` holds the exact sorted declared paths. Its
+`moduleGraph` and `moduleGraphSha256` cover those patched modules (an empty list
+and its digest when none are declared), not the full linked graph. The provider separately binds
 the full generated main files as `mainGoModSha256` and `mainGoSumSha256`.
 It does not query or emit transport pins. Desktop `sourceBuild.transportPins`
 is a separate inventory map from module path to exact MVS version. Every
@@ -95,24 +102,24 @@ is a separate inventory map from module path to exact MVS version. Every
 `transportModules.confirmedAbsent` cover exactly the transport inventory.
 Missing fields, duplicates, overlaps, omitted inventory entries, unknown entries
 or extra policy fields reject the input freeze in both JS and the Rust updater.
-Every patched module must link by default, including sing-tun on all four
-platforms and nftables on Linux. Only the reviewed Windows/macOS NFT omission
-may be explicitly frozen in `allowedAbsent`; this records permission for the
-confirmed platform nonparticipation, not proof of a particular binary's absence.
-If NFT actually links there, its exact upstream version and local patched
-replacement are still required. A transport module in `requiredLinked` must be
-present with its exact MVS version; one in `confirmedAbsent` must be absent.
-Present non-patched transports cannot use replacements.
+Every declared patched module must link on every platform with its exact upstream
+version and local patched replacement: `allowedAbsent` must be empty. A linked
+module carrying any replacement row must be a declared patched module. The
+current manifest declares none, so `dependencyModules` and both `patchedModules`
+arrays are empty and a binary with any replacement is refused. A transport
+module in `requiredLinked` must be present with its exact MVS version; one in
+`confirmedAbsent` must be absent. Present non-patched transports cannot use
+replacements.
 
-For example, with a common patched inventory containing sing-tun and nftables,
+For example, with a common patched inventory containing `example.com/patched`,
 and a transport inventory containing `example.com/transport` and
 `example.com/linux-transport`, the Windows policy is:
 
 ```json
 {
   "patchedModules": {
-    "requiredLinked": ["github.com/sagernet/sing-tun"],
-    "allowedAbsent": ["github.com/sagernet/nftables"]
+    "requiredLinked": ["example.com/patched"],
+    "allowedAbsent": []
   },
   "transportModules": {
     "requiredLinked": ["example.com/transport"],
@@ -121,25 +128,23 @@ and a transport inventory containing `example.com/transport` and
 }
 ```
 
-The Linux policy puts both patched and both transport modules in `requiredLinked`
-with empty absence arrays. macOS freezes its own actual transport participation
-and may use the same reviewed NFT omission. These example paths are synthetic,
+The Linux policy puts the patched and both transport modules in `requiredLinked`
+with empty absence arrays. macOS freezes its own actual transport participation.
+These example paths are synthetic,
 not production transport pins. The selected platform policy is bound in
 `platformInputFingerprint` and its BuildID; changing it rejects older platform
 receipts while preserving the provider's common fingerprint and complete graph.
-Final dependency/transport input pins remain null pending joint
-freeze. The final binary receipt records all linked module rows, preserves the
+The final binary receipt records all linked module rows, preserves the
 common receipt fingerprint as `sourceFingerprint`, and adds the final platform
 inputs as `platformInputFingerprint`. Its platform BuildID is checked separately from the
 provider's common BuildID contract, so the Windows overlay cannot be mistaken
 for the common pre-overlay build tree.
 
-The current workflows still call `fetch-core.mjs` without a candidate bundle and
-are intentionally blocked by missing graph pins. Their existing four-binary wire,
-dependency and build-face gates are unchanged. Coordinated native four-producer
-jobs and exact-candidate artifact transport are pending; no CI topology, source
-provenance authentication, real desktop source binary or package execution is
-claimed by these fixtures. The runtime baseline uses a common source version
+`desktop-core.yml` runs one native producer per platform, assembles the four
+outputs into a candidate bundle and uploads it; `package.yml` and
+`release-risk.yml` download that exact bundle and call `fetch-core.mjs` with
+`--bundle-dir` and `--candidate`. The fixtures in this directory claim no source
+provenance authentication. The runtime baseline uses a common source version
 only when all frozen input fields are complete; null/partial input keeps the
 existing baseline and Android version behavior. Packaging uses actual consumed
 source receipts/digests for frozen inputs, retaining the old Windows hash check
@@ -153,6 +158,10 @@ and must not disable a check. Receipt/inventory transport is not source
 authentication by itself.
 
 Light verification (no sing-box build or execution):
+
+The complete gate includes Apple execution-input tests and requires Python 3.11+
+with standard-library `tomllib` (Release Risk selects and verifies Python 3.12).
+This does not change the historical producer requirements above.
 
 ```sh
 bash scripts/gate-node-test.sh
@@ -174,9 +183,70 @@ freeze remains in force.
 
 The `.polaris.N` suffix follows the upstream prerelease number so normal
 version ordering remains correct: alpha.8 < alpha.8.polaris.1 < alpha.9.
-Polaris builds update with the app. Official online core updates (including
-already staged downloads) cannot replace them. Explicit manual imports stay
-available and retain the existing manual-core protection.
+Polaris builds update with the app: the app executes the core that ships inside
+its installation package and has no in-app entry for updating, importing,
+uploading or rolling back a core. Core directories left in the user
+configuration directory by earlier versions are removed at startup and are
+never executed.
+
+To run a self-built core in the app:
+
+- Place it in `resources/<platform>/` (`linux`, `win`, `mac-arm64` or
+  `mac-x64`) and build the package with that platform's `--config`. The
+  packaged app resolves the core only from its bundled resources. This is
+  for local packaging: the CI packaging gates compare the packaged core with
+  the pinned source build.
+- In a debug build only, point `POLARIS_SINGBOX_PATH` at the binary. Release
+  builds do not read this variable at all.
+
+The app resolves the core by path. It does not verify at runtime that the file
+found there is the build that matches the app version, so replacing files
+inside an installed package is unsupported and unchecked.
+
+## macOS code signature of the bundled core
+
+Packaging never signs or otherwise rewrites the core. On the macOS legs
+`scripts/macos-nested-code.sh` only checks the `sing-box` inside the app
+bundle, before the bundle seal and again in the final dmg:
+
+- it must be byte-identical to `resources/mac-<arch>/sing-box`, the file whose
+  hash the source receipt records;
+- its own code signature must pass `codesign --verify --strict`. One exception:
+  a thin x86_64 core that `codesign` reports as not signed at all is accepted
+  and logged as a notice, because Intel macOS does not require a signature to
+  execute a Mach-O. A signature that is present but invalid fails on every
+  architecture, and an unsigned arm64 (or universal) core fails.
+
+A core that fails these checks fails packaging. The fix belongs to the step
+that produces the core, not to packaging.
+
+The native producer reads `go version -m` and checks the BuildID first,
+then observes the actual macOS code signature before computing `binarySha256`.
+It runs `codesign --verify --strict`; arm64 requires success. Thin Intel output
+may remain explicitly unsigned, but an invalid signature is rejected on both
+architectures. A signed core must yield exactly one actual `CDHash` from
+`codesign --display --verbose=4`. The producer does not sign or rewrite the core;
+it validates the Apple linker's output and fails if it does not meet this policy.
+
+The platform output receipt binds `macCodeSignature = {state, cdHash}` in its
+fingerprint: `signed` carries a lower-case 40-hex CDHash, while the thin Intel
+`unsigned` exception carries `null`. These output facts do not enter the
+pre-link platform BuildID, avoiding a CDHash/BuildID cycle. Non-Mac receipts
+cannot carry this field. Assembly validates the state/platform policy,
+fingerprint and actual bytes; native Mac consumption re-observes the signature
+and compares it to the receipt. Staged copies must still match the final hash.
+
+Before bundle sealing and again in the final dmg, the read-only core check
+retains byte-for-byte `cmp` and strict signature validation, and also compares
+the actual state/CDHash and byte hash with the adjacent same-source receipt in
+`resources/.source-receipts`. Only the helper may be re-signed by packaging.
+Native Go pins select the desktop manifest through the App's source mode;
+an active desktop fork cannot accidentally select the separate mobile manifest.
+
+These code/fixture checks do not activate a production fork manifest or certify
+native output bytes. That requires real annotated consumption/upstream tags,
+frozen input pins, four native producers, and final post-signature output hashes.
+No guessed tag objects or empty output pins stand in for that acceptance.
 
 Any future pin must follow the combined L/N/R/I/C source freeze and native
 four-platform builds. Do not reuse an old output hash or remove the Windows

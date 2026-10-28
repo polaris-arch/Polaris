@@ -67,7 +67,7 @@ export function MeshJoinDialog(props: MeshJoinDialogProps) {
     const readStates = (): void => {
       const request = ++revision;
       setTsStates({});
-      void api.server.tailscaleStateExists(tsNodeIds).then(
+      void api.server.tailscaleStateExists(tsNodeIds, true).then(
         (states) => { if (alive && request === revision) setTsStates(states); },
         () => { if (alive && request === revision) setTsStates({}); },
       );
@@ -120,7 +120,6 @@ export function MeshJoinDialogView({ onTsLogout, onWarpReregister, onWarpDeregis
    */
   const tsActions = (node: ServerConfig) => {
     const unread = taildropBadgeCount(tailscaleStatuses[node.id]);
-    const accountActionLabel = tsStates[node.id] === false ? t('ts.signIn') : t('meshJoin.switchAccount');
     return (
       <>
         <button
@@ -131,13 +130,14 @@ export function MeshJoinDialogView({ onTsLogout, onWarpReregister, onWarpDeregis
           {t('meshJoin.taildrop')}
           {unread > 0 && <span className="tdrop-badge">{unread}</span>}
         </button>
-        <button
+        {tsStates[node.id] === true ? <button
           type="button"
           className="btn ghost sm"
-          onClick={() => go({ kind: 'ts-login', serverId: node.id })}
+          onClick={() => go({ kind: 'ts-login', serverId: node.id, replaceIdentity: true })}
         >
-          {accountActionLabel}
-        </button>
+          {t('meshJoin.switchAccount')}
+        </button> : <button type="button" className="btn ghost sm"
+          onClick={() => go({ kind: 'ts-login', serverId: node.id })}>{t('ts.signIn')}</button>}
         {tsStates[node.id] === true && <button type="button" className="btn ghost sm danger-text" onClick={() => action(() => onTsLogout(node))}>
           {t('meshJoin.logout')}
         </button>}

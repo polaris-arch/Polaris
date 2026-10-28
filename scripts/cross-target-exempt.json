@@ -1,4 +1,8 @@
 {
+  "tauri-plugin-polaris-ios": {
+    "targets": ["aarch64-apple-ios"],
+    "why": "新增iOS bridge只在target_os=ios启用tauri/wry；Linux实际cargo clippy --offline --locked --target aarch64-apple-ios --all-targets -p tauri-plugin-polaris-ios -- -D warnings在objc2-exception-helper v0.1.1的cc-rs build script失败：缺Apple SDK工具xcrun（exit101），cargo check同样不能绕过。仅此iOS目标整包豁免；非iOS runtime依赖及Swift build已门控，Darwin/Windows/Android交叉覆盖保留，现有floor及反腐烂检查不变。实际iOS编译另由Mac/Xcode验证；此项不代表NE运行通过。"
+  },
   "polaris": {
     "targets": [
       "x86_64-pc-windows-msvc",

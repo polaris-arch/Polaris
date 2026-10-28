@@ -56,7 +56,7 @@
     "update": "Update",
     "downloading": "Downloading update",
     "mirror": "Mirror",
-    "cancel": "Cancel",
+    "continueInBackground": "Continue in background",
     "downloaded": "Download complete",
     "noUpdate": "No update to download",
     "noUpdateSubject": "This check found no package for {{version}}",

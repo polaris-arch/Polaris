@@ -146,4 +146,123 @@ class DebugPcEchoTest {
                 { if (++fences == 2) throw canceled }, {})
         }.exceptionOrNull())
     }
+
+    private fun wrongPortWitness(tcpPort: Int, udpPort: Int) {
+        assumeTrue(BuildConfig.DEBUG)
+        val target = DebugPcEchoTarget.decode(target() + mapOf("tcpPort" to tcpPort.toLong(), "udpPort" to udpPort.toLong()))
+        val lease = DebugBatchLease(); val initialLease = lease.snapshot()
+        try {
+            for ((index, protocol) in listOf("tcp", "udp").withIndex()) {
+                val caseId = "$protocol-wrong-port-admission"; val sequence = index + 1
+                var outboundCalls = 0
+                var witness: org.json.JSONObject? = null
+                DebugPcEchoSender.attempt(target, protocol, caseId, "WrongPortAdmission", sequence,
+                    { _, _ -> outboundCalls++; fail("WrongPort reached outbound resource acquisition or send") },
+                    { assertNull(witness); witness = it })
+                assertEquals(0, outboundCalls); assertEquals(initialLease, lease.snapshot())
+                val expected = mapOf(
+                    "schema" to "polaris-pc-echo-public-witness-v1", "pcRunId" to "1".repeat(32),
+                    "pcPlanSha256" to "2".repeat(64), "readyReceiptSha256" to "3".repeat(64),
+                    "receiverInstanceId" to "8".repeat(32), "socketInstanceId" to target.socketId(protocol),
+                    "protocol" to protocol, "caseId" to caseId, "caseKind" to "WrongPortAdmission", "attemptSeq" to sequence,
+                    "requestedTuple" to mapOf("address" to target.address, "port" to target.port(if (protocol == "tcp") "udp" else "tcp"), "protocol" to protocol),
+                    "approvedTuple" to mapOf("address" to target.address, "port" to target.port(protocol), "protocol" to protocol),
+                    "sent" to mapOf("kind" to "NotSent"), "returned" to mapOf("kind" to "NotReceived"),
+                    "outcome" to "RejectedBeforeOutbound", "rootNativeWitness" to mapOf("kind" to "Unknown"))
+                assertEquals("actual production witness for $protocol/$tcpPort/$udpPort", expected, witness!!.toMap())
+            }
+        } finally { target.erase() }
+    }
+    @Test fun actualWrongPortAdmissionUsesNonAdjacentOtherApprovedPortInBothDirections() {
+        wrongPortWitness(50001, 51017)
+    }
+    @Test fun actualWrongPortAdmissionUsesReversedOtherApprovedPortInBothDirections() {
+        wrongPortWitness(61000, 50003)
+    }
+    @Test fun actualWrongPortAdmissionUsesBothRangeBoundariesWithoutArithmetic() {
+        wrongPortWitness(49152, 65535); wrongPortWitness(65535, 49152)
+    }
+    @Test fun actualWrongPortAdmissionDoesNotHideUdpBehindAdjacentTcpFixture() {
+        wrongPortWitness(50001, 50002)
+    }
+    @Test fun actualAdmissionRejectsUnknownProtocolBeforeEitherCallbackAndStrictTargetKeepsPortBounds() {
+        assumeTrue(BuildConfig.DEBUG)
+        val target = DebugPcEchoTarget.decode(target())
+        try {
+            for (kind in listOf("Positive", "WrongPortAdmission")) {
+                var outboundCalls = 0; var appendCalls = 0
+                val failure = runCatching {
+                    DebugPcEchoSender.attempt(target, "sctp", "sctp-wrong-port-admission", kind, 1,
+                        { _, _ -> outboundCalls++ }, { appendCalls++ })
+                }.exceptionOrNull()
+                assertTrue(failure is IllegalArgumentException)
+                assertEquals(0, outboundCalls); assertEquals(0, appendCalls)
+            }
+            for (ports in listOf(50001L to 50001L, 49151L to 50002L, 50001L to 65536L))
+                assertTrue(runCatching { DebugPcEchoTarget.decode(target() + mapOf("tcpPort" to ports.first, "udpPort" to ports.second)) }.isFailure)
+        } finally { target.erase() }
+    }
+    @Test fun actualAdmissionKeepsOrdinaryTupleAndErasesProgressAfterPublicWitness() {
+        assumeTrue(BuildConfig.DEBUG)
+        val target = DebugPcEchoTarget.decode(target())
+        try {
+            for (protocol in listOf("tcp", "udp")) for (kind in listOf("Positive", "WrongNonce", "ForeignPeer")) {
+                var calls = 0; var appended = 0
+                val sent = byteArrayOf(1, 2, 3); val returned = byteArrayOf(4, 5)
+                val sentSha = DebugPcEchoCodec.sha(sent); val returnedSha = DebugPcEchoCodec.sha(returned)
+                DebugPcEchoSender.attempt(target, protocol, "$protocol-$kind", kind, 1, { tuple, report ->
+                    calls++; assertEquals(DebugPcEchoSender.Tuple(target.address, target.port(protocol), protocol), tuple)
+                    report.sent = sent; report.returned = returned; report.outcome = "ExactEcho"
+                }, { witness ->
+                    appended++; assertEquals(kind, witness.getString("caseKind")); assertEquals("ExactEcho", witness.getString("outcome"))
+                    assertEquals(witness.getJSONObject("approvedTuple").toMap(), witness.getJSONObject("requestedTuple").toMap())
+                    assertEquals(mapOf("kind" to "Bytes", "count" to 3, "sha256" to sentSha), witness.getJSONObject("sent").toMap())
+                    assertEquals(mapOf("kind" to "Bytes", "count" to 2, "sha256" to returnedSha), witness.getJSONObject("returned").toMap())
+                    assertArrayEquals(byteArrayOf(1, 2, 3), sent); assertArrayEquals(byteArrayOf(4, 5), returned)
+                })
+                assertEquals(1, calls); assertEquals(1, appended)
+                assertArrayEquals(ByteArray(3), sent); assertArrayEquals(ByteArray(2), returned)
+            }
+        } finally { target.erase() }
+    }
+    @Test fun actualAdmissionAppendsTerminalProgressBeforeErrorAndAlwaysErasesIt() {
+        assumeTrue(BuildConfig.DEBUG)
+        val target = DebugPcEchoTarget.decode(target())
+        try {
+            for (outcome in listOf("Canceled", "StaleScope", "TransportFailure")) {
+                val sent = byteArrayOf(1, 2, 3); val returned = byteArrayOf(4)
+                val sentSha = DebugPcEchoCodec.sha(sent); var appended = 0
+                val failure = runCatching {
+                    DebugPcEchoSender.attempt(target, "tcp", "tcp-wrong-nonce", "WrongNonce", 2,
+                        { _, report -> report.sent = sent; report.returned = returned; report.outcome = outcome },
+                        { witness ->
+                            appended++; assertEquals(outcome, witness.getString("outcome"))
+                            assertEquals(sentSha, witness.getJSONObject("sent").getString("sha256"))
+                            assertArrayEquals(byteArrayOf(1, 2, 3), sent); assertArrayEquals(byteArrayOf(4), returned)
+                        })
+                }.exceptionOrNull()
+                assertTrue(failure is IllegalStateException); assertEquals("Batch input unavailable", failure!!.message)
+                assertEquals(1, appended); assertArrayEquals(ByteArray(3), sent); assertArrayEquals(ByteArray(1), returned)
+            }
+        } finally { target.erase() }
+    }
+    @Test fun actualAdmissionDoesNotSwallowOrRetryOutboundOrAppendCallbackFailure() {
+        assumeTrue(BuildConfig.DEBUG)
+        val target = DebugPcEchoTarget.decode(target())
+        try {
+            for (failOnAppend in listOf(false, true)) {
+                val failure = IOException("synthetic callback failure")
+                val sent = byteArrayOf(1, 2); val returned = byteArrayOf(3)
+                var calls = 0; var appended = 0
+                assertSame(failure, runCatching {
+                    DebugPcEchoSender.attempt(target, "udp", "udp-wrong-nonce", "WrongNonce", 2, { _, report ->
+                        calls++; report.sent = sent; report.returned = returned
+                        if (!failOnAppend) throw failure
+                    }, { appended++; throw failure })
+                }.exceptionOrNull())
+                assertEquals(1, calls); assertEquals(if (failOnAppend) 1 else 0, appended)
+                assertArrayEquals(ByteArray(2), sent); assertArrayEquals(ByteArray(1), returned)
+            }
+        } finally { target.erase() }
+    }
 }

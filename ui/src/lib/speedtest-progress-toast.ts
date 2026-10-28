@@ -81,14 +81,10 @@
  * 换句话说，把 `toast`/`i18n` 直接 import 进来 = 本模块的门整个消失。注入是让门存在的前提。
  */
 import type { ToastImpl } from './error-handler';
-import type { SpeedTestDonePayload, SpeedTestInterruptReason } from '../contracts/speed-test';
+import { isSpeedTestCountProgress, type SpeedTestCountProgress, type SpeedTestDonePayload, type SpeedTestInterruptReason, type SpeedTestProgressPayload } from '../contracts/speed-test';
 
 /** 后端 `EVENT_SPEED_TEST_PROGRESS` 载荷。 */
-export interface SpeedTestProgress {
-  tested: number;
-  ok: number;
-  total: number;
-}
+export type SpeedTestProgress = SpeedTestCountProgress;
 
 export type { SpeedTestDonePayload };
 
@@ -183,8 +179,9 @@ export interface SpeedTestToastIntent {
 /** 收到一个进度事件：更新态并给出该弹的 toast（`null` = 什么都不做）。 */
 export function reduceSpeedTestProgress(
   state: SpeedTestToastState,
-  ev: SpeedTestProgress
+  ev: SpeedTestProgressPayload
 ): { next: SpeedTestToastState; intent: SpeedTestToastIntent | null } {
+  if (!isSpeedTestCountProgress(ev)) return { next: state, intent: null };
   // total<=0：后端不会这么发（`plan_speed_test` 的零可测走的是失败信封，根本不 emit 进度）。
   // 真收到就说明契约破了 —— 此时起一条永不终止的 sticky toast 比不起更糟，故忽略。
   //
@@ -316,7 +313,7 @@ export function planSpeedTestRun(serverIds: string[], currentIds: string[]): str
 
 /** 可注入的外部面（生产由 `App.tsx` 装配；单测注入假的，故本模块整条链路在 node 环境可跑）。 */
 export interface SpeedTestToastDeps {
-  subscribe: (listener: (p: SpeedTestProgress) => void) => () => void;
+  subscribe: (listener: (p: SpeedTestProgressPayload) => void) => () => void;
   /** 终态事件流（`EVENT_SPEED_TEST_DONE`）—— 中断/完成的主路径。 */
   subscribeDone: (listener: (p: SpeedTestDonePayload) => void) => () => void;
   toast: Pick<ToastImpl, 'info' | 'success' | 'warning'>;
@@ -405,6 +402,7 @@ export function subscribeSpeedTestProgressToast(deps: SpeedTestToastDeps): () =>
   };
 
   const unsubscribe = deps.subscribe((ev) => {
+    if (!isSpeedTestCountProgress(ev)) return;
     const r = reduceSpeedTestProgress(state, ev);
     state = r.next;
     dispatch(r.intent);

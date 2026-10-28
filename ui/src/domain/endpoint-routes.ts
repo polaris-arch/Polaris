@@ -408,6 +408,13 @@ export function meshSystemSupportedOnPlatform(
 /** 测速可行性能力位（path-aware）：主核 probe 池是否可用（=代理运行且池就绪）。 */
 export interface SpeedTestCaps {
   mainCorePool?: boolean;
+  /** This explicit user action is prepared by the backend normal-main producer. */
+  normalMainRequired?: boolean;
+}
+
+export function manualSpeedTestCaps(mainCorePool: boolean, mobileOs = typeof document === 'undefined'
+  ? undefined : document.documentElement.dataset.mobileOs): SpeedTestCaps {
+  return { mainCorePool, normalMainRequired: mobileOs === 'ios' };
 }
 
 /**
@@ -429,7 +436,7 @@ export function isSpeedTestable(server: ServerConfig, caps?: SpeedTestCaps): boo
   if (meshUsesSystemInterface(server)) return false; // reverseMesh 排除（直连假好值）
   // ⟺ TS 的 !!exitNode / WG·WARP 的 allowInternet !== false（本文件 meshAllowsInternet）。
   if (isMeshNode(server) && !meshAllowsInternet(server)) return false;
-  if (p === 'tailscale') return caps?.mainCorePool === true;
+  if (p === 'tailscale') return caps?.mainCorePool === true || caps?.normalMainRequired === true;
   if (p === 'custom' && server.customSettings?.isEndpoint) return false;
   return true;
 }

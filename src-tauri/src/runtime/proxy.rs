@@ -55,6 +55,10 @@ mod network_canary;
 mod network_monitor;
 mod network_settle;
 mod pending_changes;
+mod prerequisite;
+pub(crate) use prerequisite::{
+    ActionBinding, ActionRequirement, MainPrerequisiteError, NormalMainAction, ReadyMainTicket,
+};
 // `pub(crate)`：`commands::config` 的排除面预览要用同一份 `platform_tag` /
 // `enumerate_own_lan_cidrs` —— 预览若自己另探一次平台或网卡，就成了第二真值源。
 pub(crate) mod platform_contracts;
@@ -272,6 +276,9 @@ const PROBE_POOL_SIZE: usize = 16;
 pub struct ProxyStatus {
     /// 是否运行中。
     pub running: bool,
+    /// Read-time projection of the shared lifecycle generation for action attribution.
+    #[serde(rename = "mainGeneration", default)]
+    pub main_generation: u64,
     /// **是否有起核腿在飞**（`running:false` 期间也可能正在起核——重试预算内一轮可达数十秒）。
     ///
     /// **读时投影**（同 `uptime`）：存储态恒 `false`，真值是 [`ProxyRuntime::start_inflight`] 计数，
@@ -348,6 +355,12 @@ pub mod code {
     pub const SYSTEM_INTERFACE_UNSUPPORTED: &str = "SYSTEM_INTERFACE_UNSUPPORTED";
     /// 起核腿失败（就绪门判定核已死 / 就绪超时）——「启动失败」轴。
     pub const STARTUP_FAILED: &str = "STARTUP_FAILED";
+    #[cfg(target_os = "ios")]
+    pub const IOS_SESSION_ACTIVE: &str = "IOS_SESSION_ACTIVE";
+    #[cfg(target_os = "ios")]
+    pub const IOS_FOREGROUND_REQUIRED: &str = "IOS_FOREGROUND_REQUIRED";
+    #[cfg(target_os = "ios")]
+    pub const IOS_VPN_PERMISSION_DENIED: &str = "IOS_VPN_PERMISSION_DENIED";
     /// 核**意外**退出且无法自愈（无可用配置重启）——「运行中崩了」轴。
     pub const PROCESS_EXITED: &str = "PROCESS_EXITED";
     /// 崩溃自愈达上限放弃（反复崩溃 / 自愈重启反复失败）——「运行中崩了」轴的终态。
@@ -976,6 +989,14 @@ impl ProxyErrorEmitter for AppHandleProxyErrorEmitter {
             crate::events::channel::EVENT_PROXY_LIFECYCLE,
             event,
         );
+        // All normal Start consumers receive the same complete-transaction notification.
+        if event.phase == "ready" {
+            crate::events::broadcast(
+                &self.app,
+                crate::events::channel::EVENT_PROXY_STARTED,
+                serde_json::json!({}),
+            );
+        }
     }
 
     fn emit_network_profile_match_changed(&self) {
@@ -1234,6 +1255,56 @@ enum ForceRestartSource {
     Selected { intent_generation: u64 },
 }
 
+#[cfg(target_os = "ios")]
+#[derive(Clone)]
+enum IosMainOrigin {
+    LocalStart(tauri_plugin_polaris_ios::StartSessionCustody),
+    Observed(tauri_plugin_polaris_ios::ObservedSessionReceipt),
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Clone)]
+struct IosMainCustody {
+    generation: u64,
+    origin: IosMainOrigin,
+    config_digest: String,
+    main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    ready: Option<tauri_plugin_polaris_ios::ReadySessionReceipt>,
+    stopped: Option<Arc<tauri_plugin_polaris_ios::StoppedSessionReceipt>>,
+}
+
+#[cfg(target_os = "ios")]
+impl IosMainCustody {
+    fn request_id(&self) -> &str {
+        match &self.origin {
+            IosMainOrigin::LocalStart(start) => start.request_id(),
+            IosMainOrigin::Observed(observed) => observed.request_id(),
+        }
+    }
+    fn allows_successor(&self) -> bool {
+        self.main_token.is_none()
+            && (self.stopped.is_some()
+                || matches!(&self.origin, IosMainOrigin::LocalStart(start)
+                if start.no_store_terminal().is_some_and(|receipt| receipt.belongs_to(start))))
+    }
+    fn same_origin(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.config_digest == other.config_digest
+            && match (&self.origin, &other.origin) {
+                (IosMainOrigin::LocalStart(a), IosMainOrigin::LocalStart(b)) => {
+                    a.request_id() == b.request_id()
+                        && a.native_generation() == b.native_generation()
+                }
+                (IosMainOrigin::Observed(a), IosMainOrigin::Observed(b)) => {
+                    a.request_id() == b.request_id()
+                        && a.session_id() == b.session_id()
+                        && a.extension_generation() == b.extension_generation()
+                }
+                _ => false,
+            }
+    }
+}
+
 pub struct ProxyRuntime {
     config: Arc<ConfigManager>,
     /// 提权 helper（C6-5 接线）：TUN 模式经它起停 root/SYSTEM 受管核（见 [`should_start_via_helper`](startup::should_start_via_helper)）。
@@ -1246,6 +1317,11 @@ pub struct ProxyRuntime {
     status: RwLock<ProxyStatus>,
     /// 运行核启动时的配置快照（待应用差集基准，上游 ProxyManager.startupSnapshot）。
     startup_snapshot: RwLock<Option<Value>>,
+    /// Only the current normal Start completion and its committed evidence. LifecycleGate owns generations.
+    normal_start: Mutex<prerequisite::NormalStarts>,
+    ready_main: RwLock<Option<Arc<prerequisite::ReadyMainCore>>>,
+    #[cfg(target_os = "ios")]
+    ios_ready_session: RwLock<Option<IosMainCustody>>,
     /// 生命周期单飞守卫（core-supervisor 既有状态机；起停竞态/世代/pending 全在其中）。
     gate: Arc<LifecycleGate>,
     /// Nonrecoverable authority for this runtime's reserved direct stops.
@@ -1631,6 +1707,10 @@ impl ProxyRuntime {
             mesh,
             status: RwLock::new(ProxyStatus::default()),
             startup_snapshot: RwLock::new(None),
+            normal_start: Mutex::new(prerequisite::NormalStarts::default()),
+            ready_main: RwLock::new(None),
+            #[cfg(target_os = "ios")]
+            ios_ready_session: RwLock::new(None),
             debounced: DebouncedRestart::new(gate.clone()),
             gate,
             stop_domain,
@@ -1801,6 +1881,24 @@ impl ProxyRuntime {
     pub async fn probe_select_slot(&self, k: usize, member_tag: &str) -> bool {
         self.hot_switch_selector(&format!("probe-selector-{k}"), member_tag)
             .await
+    }
+
+    /// A prerequisite action writes only to its ticket's management endpoint. Current
+    /// generation changes can reject this write, but cannot select a successor's transport.
+    pub(crate) async fn probe_select_slot_bound(
+        &self,
+        ticket: &ReadyMainTicket,
+        k: usize,
+        member_tag: &str,
+    ) -> bool {
+        prerequisite::select_ticket_probe(
+            ticket,
+            k,
+            member_tag,
+            || self.check_ready_main(ticket).is_ok(),
+            Self::management_api_at,
+        )
+        .await
     }
 }
 

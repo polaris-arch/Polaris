@@ -50,7 +50,8 @@
  * 不是内核，两个平台都照常保留。订阅与规则资源的自动更新档同理。
  */
 
-import { useEffect, useState, useSyncExternalStore, type ReactElement } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactElement } from 'react';
+import { useProgressDisclosure } from '@/lib/use-progress-disclosure';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { GH_PROXY_PRESETS } from '@/domain/gh-proxy';
@@ -69,6 +70,8 @@ import {
   appUpdateErrText,
   backgroundIntervalSelectValue,
   ruleResourceAutoUpdateChecked,
+  ruleResourceAutoUpdatePatch,
+  ruleResourceIntervalSelectValue,
   wireUpdateProgress,
   type AppDownloadIntegrity,
   type ProgressDrivenState,
@@ -96,9 +99,10 @@ import {
   subscribeAppUpdateCheck,
   type AppUpdateCheckState,
 } from './app-update-check';
-import { androidInstallFailureKey, classifyInstallHandoff } from './app-update-install';
+import { androidInstallFailureKey, classifyInstallHandoff, classifyInstallPermission } from './app-update-install';
 import { failureText } from './write-feedback';
 import type { MobileSettingsPageProps } from './settings-pages';
+import { ruleResourceUpdatePolicyText } from './rule-resource-update-policy';
 
 type SubProxyPolicy = 'follow' | 'proxy' | 'direct';
 
@@ -270,6 +274,11 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
    * 故这一行说的是「交出去了」+ 一句签名一致性的预告，不是「装好了」。
    */
   const [handedOff, setHandedOff] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const installAttempt = useRef<{ active: boolean } | null>(null);
+  useEffect(() => () => {
+    if (installAttempt.current) installAttempt.current.active = false;
+  }, []);
 
   /* 查到的新版本号。`hasUpdate` 为真却拿不到版本号是后端契约破损：那一档不画「跳过此版本」
      （跳过一个叫不出名字的版本落到后端就是一条空串），但「打开发布页」照旧 —— 发布页不需要版本号。 */
@@ -283,6 +292,7 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
   /* 已落位的包（本页下的，或后台自动下载腿下的）。安装那颗按钮的对象就是它。 */
   const staged = dl.phase === 'downloaded' ? dl.path : null;
   const busy = dl.phase === 'downloading';
+  const progressView = useProgressDisclosure(busy || check.phase === 'checking');
 
   /**
    * 交付失败的取文：把 Kotlin 侧那五个 `REASON_*` 码各翻成一句话，**不把码贴进界面**。
@@ -311,6 +321,44 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
 
   return (
     <>
+      <SettingsGroup header={t('settings.update.ruleResourceAutoCard')}>
+        <SettingsRow
+          first
+          id="rule-resource-auto"
+          label={t('settings.update.ruleResourceAutoCard')}
+          desc={t('mobileSettings.update.ruleResourceAutoDesc')}
+          control={
+            <MobileSwitch
+              checked={ruleResourceAutoUpdateChecked(config)}
+              ariaLabel={t('settings.update.ruleResourceAutoCard')}
+              onChange={(v) => commit('rule-resource-auto', update(ruleResourceAutoUpdatePatch(v)))}
+            />
+          }
+        />
+        <SettingsRow
+          stacked
+          id="rule-resource-interval"
+          label={t('mobileSettings.update.ruleResourceInterval')}
+          desc={t('mobileSettings.update.ruleResourceIntervalDesc')}
+          control={
+            <MobileSelect
+              value={ruleResourceIntervalSelectValue(config)}
+              ariaLabel={t('mobileSettings.update.ruleResourceInterval')}
+              onChange={(v) => commit('rule-resource-interval', update({ ruleResourceUpdateIntervalHours: Number(v) }))}
+            >
+              <option value="0">{t('settings.update.intervalManualOnly')}</option>
+              <option value="6">{t('settings.update.intervalHours', { n: 6 })}</option>
+              <option value="12">{t('settings.update.intervalHours', { n: 12 })}</option>
+              <option value="24">{t('settings.update.intervalHours', { n: 24 })}</option>
+              <option value="72">{t('settings.update.intervalDays', { n: 3 })}</option>
+              <option value="168">{t('settings.update.intervalDays', { n: 7 })}</option>
+            </MobileSelect>
+          }
+        />
+        <SettingsNote id="rule-resource-policy">{ruleResourceUpdatePolicyText(config, t)}</SettingsNote>
+        <SettingsNote id="rule-resource-scope">{t('mobileSettings.update.ruleResourceScopeNote')}</SettingsNote>
+      </SettingsGroup>
+
       <SettingsGroup header={t('mobileSettings.update.channelBlock')}>
         {/* 版本号是真值（`about-info`），拿不到就显示 `—` —— 不编一个「最新」，也不说成「待接线」
             （那是一条腿的状态，不是一个读不到的值；见头注那条 🔴）。
@@ -326,7 +374,9 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
           hint={
             handedOff
               ? t('mobileSettings.update.handedOffNote')
-              : (downloadLine(t, dl) ?? hintText(t, check))
+              : progressView.hidden
+                ? t('settings.update.backgroundProgress')
+                : (downloadLine(t, dl) ?? hintText(t, check))
           }
           problem={downloadProblem}
           control={
@@ -345,7 +395,7 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
                 {info?.appVersion ? `v${info.appVersion}` : '—'}
               </span>
               <MobileButton
-                disabled={check.phase === 'checking'}
+                disabled={check.phase === 'checking' || installing}
                 onClick={() => {
                   commit(
                     'app-update',
@@ -372,17 +422,32 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
               {staged !== null && (
                 <MobileButton
                   tone="primary"
+                  disabled={installing}
                   onClick={() => {
+                    if (installAttempt.current?.active) return;
+                    const attempt = { active: true };
+                    installAttempt.current = attempt;
+                    setInstalling(true);
+                    setHandedOff(false);
                     /* IPC 调用**内联在 `commit` 的实参里**（裁定 #14 的辖区判据按词法算）。
                        `awaitingSystemInstaller` 为真 = 包交出去了、系统安装器已在前台，而本进程
                        还活着 —— 它**不是**「装好了」。交不出去时后端把 Kotlin 的原因码原样带回来，
                        这里逐码翻成一句话（`androidInstallFailureKey`）。 */
                     commit(
                       'app-update',
-                      updateApi.install(staged).then((result) => {
-                        const outcome = classifyInstallHandoff(result);
-                        if (outcome.kind === 'refused') throw new Error(outcome.reason);
-                        setHandedOff(true);
+                      updateApi.requestInstallPermission().then((permission) => {
+                        // Leaving this page withdraws this click's installation intent.
+                        if (!attempt.active) return;
+                        const authorization = classifyInstallPermission(permission);
+                        if (authorization.kind === 'refused') throw new Error(authorization.reason);
+                        return updateApi.install(staged).then((result) => {
+                          const outcome = classifyInstallHandoff(result);
+                          if (outcome.kind === 'refused') throw new Error(outcome.reason);
+                          if (attempt.active) setHandedOff(true);
+                        });
+                      }).finally(() => {
+                        if (installAttempt.current === attempt) installAttempt.current = null;
+                        if (attempt.active) setInstalling(false);
                       }),
                       handoffText,
                     );
@@ -394,7 +459,7 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
               {staged === null && target !== null && (
                 <MobileButton
                   tone={dl.phase === 'error' ? 'plain' : 'primary'}
-                  disabled={busy}
+                  disabled={busy || installing}
                   onClick={() => {
                     setHandedOff(false);
                     commit(
@@ -472,6 +537,18 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
             </div>
           }
         />
+        {(busy || check.phase === 'checking') && (
+          <SettingsRow
+            id="app-update-progress"
+            label={t('settings.update.backgroundProgress')}
+            desc={t('settings.update.hideProgressHint')}
+            control={
+              <MobileButton onClick={progressView.hidden ? progressView.show : progressView.hide}>
+                {t(progressView.hidden ? 'settings.update.showProgress' : 'settings.update.hideProgress')}
+              </MobileButton>
+            }
+          />
+        )}
         {/*
           「重装当前版本」（桌面 `AppUpdateCard.tsx:74` 那一颗 + 它的 `data-tip`）。
           它修的是**损坏的安装**，不是升级：走 `update_check(includeCurrent:true)` → 选**当前版本**
@@ -489,7 +566,7 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
           desc={t('settings.update.reinstallCurrentTip')}
           control={
             <MobileButton
-              disabled={busy}
+              disabled={busy || installing}
               onClick={() => {
                 commit(
                   'app-reinstall',
@@ -579,7 +656,7 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
           stacked
           id="update-interval"
           label={t('settings.update.intervalCard')}
-          desc={t('settings.update.intervalCardSub')}
+          desc={t('mobileSettings.update.subscriptionIntervalDesc')}
           control={
             <MobileSelect
               value={interval}
@@ -589,7 +666,6 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
                   'update-interval',
                   update({
                     subscriptionUpdateIntervalHours: Number(v),
-                    ruleResourceUpdateIntervalHours: Number(v),
                   }),
                 )
               }
@@ -630,26 +706,6 @@ export function UpdatePage({ config, update, commit }: MobileSettingsPageProps):
               <option value="proxy">{t('settings.update.subViaProxy')}</option>
               <option value="direct">{t('settings.update.subDirect')}</option>
             </MobileSelect>
-          }
-        />
-        <SettingsRow
-          id="rule-resource-auto"
-          label={t('settings.update.ruleResourceAutoCard')}
-          desc={t('settings.update.ruleResourceAutoDesc')}
-          control={
-            <MobileSwitch
-              checked={ruleResourceAutoUpdateChecked(config)}
-              ariaLabel={t('settings.update.ruleResourceAutoCard')}
-              onChange={(v) =>
-                commit(
-                  'rule-resource-auto',
-                  update({
-                    ruleResourceAutoUpdate: v,
-                    ruleResourceUpdateIntervalHours: config.subscriptionUpdateIntervalHours,
-                  }),
-                )
-              }
-            />
           }
         />
       </SettingsGroup>

@@ -27,6 +27,8 @@ required_tests=(
   # Android APK 腿的产物级判据本体（scripts/verify-apk.mjs）的变异测试：它被删/改名时
   # `node --test scripts/*.test.mjs` 只会少 pass 几条，下面的下限未必抓得到，故显式列出。
   scripts/verify-apk.test.mjs
+  # Release native stripping must retain runtime metadata and exact AAR source bytes.
+  scripts/strip-android-release-native.test.mjs
   # release 冒烟腿的产物级判据本体（scripts/assert-r8-evidence.mjs）的变异测试：它守的是
   # 「针被本仓自己的注释喂绿」与「configuration.txt 证明不了 keep 命中没命中」这两条真缺陷。
   scripts/assert-r8-evidence.test.mjs
@@ -95,7 +97,8 @@ fi
 #   212 → 217（2026-09-30）G1 的 5 条逐平台 patched/transport presence 与 fingerprint 合同。
 #   217 → 223（2026-10-01）6 条 native source workflow/candidate/bundle/reuse/impact 纯接线合同。
 #   真实 tiny Go buildInfo 用显式 opt-in 单独执行，不借其 skip 数满足下限。
-if [ "$pass" -lt 223 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 223）—— 必需合同测试是否被误删/改名/漏跑？" >&2
+#   223 → 231（2026-10-05）8 条 ZIP 压缩／静态符号／运行元数据与 libbox 来源原字节合同。
+if [ "$pass" -lt 231 ]; then
+  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 231）—— 必需合同测试是否被误删/改名/漏跑？" >&2
   exit 1
 fi

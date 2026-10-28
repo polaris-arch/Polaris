@@ -398,3 +398,6 @@ async fn non_android_system_backup_toggle_fails_honestly() {
         .expect_err("非 Android 读必须失败，不许折成 false");
     assert!(!err.trim().is_empty(), "失败必须带原因");
 }
+
+#[cfg(test)]
+mod scoped_store_tests;

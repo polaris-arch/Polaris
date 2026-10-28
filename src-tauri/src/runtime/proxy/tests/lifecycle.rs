@@ -128,7 +128,10 @@ fn lifecycle_push_is_paired_with_the_diff_push() {
     let src = module_code("runtime/proxy");
     const DIFF: &str = "self.push_pending_changes();";
 
-    let started = method_body(&src, "    pub(super) async fn start_guarded(");
+    let started = method_body(
+        &src,
+        "    pub(super) async fn start_guarded_with_completion(",
+    );
     assert!(
         line_immediately_followed_by(
             &started,
@@ -148,7 +151,10 @@ fn lifecycle_push_is_paired_with_the_diff_push() {
         "停核拆除腿：`stopped` 必须紧跟差集 PUSH（与起核腿严格对偶）"
     );
 
-    let start_wrap = method_body(&src, "    pub(super) async fn start_guarded(");
+    let start_wrap = method_body(
+        &src,
+        "    pub(super) async fn start_guarded_with_completion(",
+    );
     assert!(
         start_wrap.contains("if let Err(e) = &r {")
             && start_wrap.contains("self.push_lifecycle(&ProxyLifecycleEvent::failed(e));"),
@@ -177,7 +183,10 @@ fn system_proxy_enable_settles_before_ready_lifecycle_push() {
         !inner.contains("self.push_lifecycle(&ProxyLifecycleEvent::ready());"),
         "start_inner 尚未归还 starting 计数，不得提前发布 ready"
     );
-    let started = method_body(&src, "    pub(super) async fn start_guarded(");
+    let started = method_body(
+        &src,
+        "    pub(super) async fn start_guarded_with_completion(",
+    );
     let inner_return = started
         .find("let r = self.start_inner(config, my_gen, &_tailscale_gate).await;")
         .expect("start 包装必须等待 start_inner 完整事务");
@@ -1263,6 +1272,7 @@ fn proxy_status_serializes_camel_case_contract() {
     // 前端契约：running / pid / startTime / uptime / error / errorCode / mixedPort / clashApiPort / startedViaHelper。
     let s = ProxyStatus {
         running: true,
+        main_generation: 7,
         pid: 42,
         start_time: Some(1_700_000_000_000),
         uptime: Some(90),
@@ -1278,6 +1288,7 @@ fn proxy_status_serializes_camel_case_contract() {
     };
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(v["running"], true);
+    assert_eq!(v["mainGeneration"], 7);
     assert_eq!(v["pid"], 42);
     assert_eq!(v["mixedPort"], 7890);
     assert_eq!(v["clashApiPort"], 19090);
@@ -2030,7 +2041,10 @@ fn tailscale_state_remains_owned_during_helper_start_before_pid_publication() {
 #[test]
 fn tailscale_ownership_wiring_covers_main_start_cleanup_spawn_and_snapshot() {
     let src = module_code("runtime/proxy");
-    let start = method_body(&src, "    pub(super) async fn start_guarded(");
+    let start = method_body(
+        &src,
+        "    pub(super) async fn start_guarded_with_completion(",
+    );
     let compact: String = start.chars().filter(|ch| !ch.is_whitespace()).collect();
     let gate = compact
         .find("self.mesh.tailscale_state_gate().await")
@@ -2066,7 +2080,7 @@ fn android_global_custody_is_checked_before_claim_and_stale_sweep() {
     let src = module_code("runtime/proxy");
     let claim_body = method_body(
         &src,
-        "    pub(super) fn claim_android_global_start_generation(",
+        "    fn claim_android_global_start_generation_expected(",
     );
     let claim_compact: String = claim_body
         .chars()
@@ -2076,13 +2090,16 @@ fn android_global_custody_is_checked_before_claim_and_stale_sweep() {
         .find("self.android_main_token.lock()")
         .expect("claim must hold Android custody");
     let claim_generation = claim_compact
-        .find("self.claim_generation(None,LifecycleKind::Start)")
+        .find("self.claim_generation(expected,LifecycleKind::Start)")
         .expect("claim must publish generation under custody");
     assert!(custody_lock < claim_generation);
-    let started = method_body(&src, "    pub(super) async fn start_guarded(");
+    let started = method_body(
+        &src,
+        "    pub(super) async fn start_guarded_with_completion(",
+    );
     let compact: String = started.chars().filter(|ch| !ch.is_whitespace()).collect();
     let custody = compact
-        .find("self.claim_android_global_start_generation()")
+        .find("self.claim_android_global_start_generation_expected(completion.map(|claim|claim.expected),)")
         .expect("explicit Android Start must claim under global custody");
     let sweep = compact
         .find("self.cleanup_stale_cores().await")

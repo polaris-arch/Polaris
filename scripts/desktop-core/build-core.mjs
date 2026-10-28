@@ -1,23 +1,32 @@
 // Four desktop consumers of the shared provisioner. No target kernel is run.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync,
   rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { buildInfoFingerprint, canonical, DESKTOP_TARGETS, digest, expectedTags, platformSourceIdentity, requireGraph, validateBuildInfo,
-  validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
+  sourceOwnedReplacements, producerContext, verifySourceOwnedCheckout, desktopSourceManifestPath, desktopOverlays, isForkSource, observeMacCodeSignature, validateSourceManifest, validateSourcePins, validateSourceReceipt, verifyHash } from './source-graph.mjs';
 
-const SOURCE_MANIFEST = 'scripts/libbox-patches/source-manifest.json';
 const PROVISIONER = 'scripts/core-source-provision.py';
 const sourceText = (value) => String(value).trim();
+const nativeRun = (command, args, options = {}) => command === 'codesign'
+  ? spawnSync(command, args, options) : execFileSync(command, args, { stdio: 'inherit', ...options });
+
+export function withProviderMetadataOutside(checkout, work, operation) {
+  const metadata = join(checkout, '.polaris-source-receipt.json');
+  const savedMetadata = join(work, 'source-receipt.staging.json');
+  renameSync(metadata, savedMetadata);
+  try { return operation(); }
+  finally { renameSync(savedMetadata, metadata); }
+}
 
 export function buildDesktopCore(root, manifest, key, dest, _force = false,
-  run = (command, args, options = {}) => execFileSync(command, args, { stdio: 'inherit', ...options }),
+  run = nativeRun,
   production = {}) {
   // Incomplete pins fail before mkdir, network, cache inspection or execution.
   const spec = validateSourcePins(manifest, key, !production.producer);
   requireGraph(/^[a-f0-9]{40}$/.test(production.candidate ?? ''), 'Explicit candidate source SHA required');
-  const sourceManifest = join(root, SOURCE_MANIFEST);
+  const sourceManifest = join(root, desktopSourceManifestPath(spec));
   const provisioner = join(root, PROVISIONER);
   verifyHash(sourceManifest, spec.sourceManifestSha256);
   verifyHash(provisioner, spec.provisionerSha256);
@@ -25,7 +34,10 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
   const dependencies = validateSourceManifest(source, spec);
   for (const patch of source.patches) verifyHash(join(dirname(sourceManifest), patch.file), patch.sha256);
   for (const dep of dependencies) verifyHash(join(dirname(sourceManifest), dep.patchFile), dep.patchSha256);
-  const overlay = key === 'win' ? join(root, 'scripts/core-patches/windows-dns-refresh.patch') : undefined;
+  const fork = isForkSource(spec);
+  const owned = sourceOwnedReplacements(spec);
+  const context = owned ? producerContext(production.candidate) : undefined;
+  const overlay = !fork && key === 'win' ? join(root, 'scripts/core-patches/windows-dns-refresh.patch') : undefined;
   if (overlay) {
     requireGraph(manifest.windowsBuild?.sourceCommit === source.sourceCommit
       && manifest.windowsBuild.goVersion === source.goVersion && manifest.windowsBuild.version === spec.version
@@ -39,6 +51,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     // Always replay fresh sources. Darwin CGO requires a real SDK/compiler.
     const environment = { ...process.env, GOWORK: 'off', GOFLAGS: '', GOEXPERIMENT: '',
       GOOS: target.goos, GOARCH: target.goarch, CGO_ENABLED: target.cgo };
+    if (owned) environment.GOENV = 'off';
     for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GOAMD64', 'GOARM', 'GOARM64']) delete environment[name];
     if (target.goarch === 'amd64') environment.GOAMD64 = 'v1';
     const options = { env: { ...environment, GOTOOLCHAIN: `go${source.goVersion}` } };
@@ -62,7 +75,33 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
       requireGraph(capture('git', ['-C', repository, 'rev-parse', 'refs/heads/polaris-source']) === commit, 'Fetched upstream source ref differs');
       return repository;
     };
-    const repository = fetch('https://github.com/SagerNet/sing-box.git', source.sourceCommit, 'upstream');
+    const repository = fetch(fork ? source.sourceURL + '.git' : 'https://github.com/SagerNet/sing-box.git', source.sourceCommit, 'upstream');
+    if (fork) {
+      // Resolve the consumption tag from the fork and the baseline tag from its
+      // upstream. The fork need not mirror upstream tags; both identities are
+      // still checked against the frozen manifest below, never a moving branch.
+      for (const [tag, url] of [[source.sourceTag, source.sourceURL + '.git'],
+        [source.upstreamTag, 'https://github.com/SagerNet/sing-box.git']]) {
+        run('git', ['-C', repository, 'fetch', '--depth=1', '--no-tags', url,
+          `refs/tags/${tag}:refs/tags/${tag}`], options);
+      }
+      requireGraph(capture('git', ['-C', repository, 'rev-parse', `refs/tags/${source.sourceTag}`]) === source.sourceTagObject
+        && capture('git', ['-C', repository, 'cat-file', '-t', `refs/tags/${source.sourceTag}`]) === 'tag',
+      'Fork consumption tag object differs or is not annotated');
+      // These annotation fields bind the selected role to the pinned tag object.
+      // The remaining annotation carries the reviewed queue; no segment is inferred from HEAD.
+      const annotation = capture('git', ['-C', repository, 'for-each-ref', '--format=%(contents)', `refs/tags/${source.sourceTag}`]).split(/\r?\n/);
+      for (const [field, expected] of [['Role', source.role], ['Upstream-Tag', source.upstreamTag], ['Upstream-Commit', source.upstreamCommit]]) {
+        const values = annotation.filter((line) => line.startsWith(`${field}:`));
+        requireGraph(values.length === 1 && values[0] === `${field}: ${expected}`, 'Fork consumption tag annotation role/baseline differs');
+      }
+      requireGraph(capture('git', ['-C', repository, 'rev-parse', `refs/tags/${source.sourceTag}^{commit}`]) === source.sourceCommit,
+        'Fork consumption tag/commit differs');
+      requireGraph(capture('git', ['-C', repository, 'rev-parse', `refs/tags/${source.upstreamTag}^{commit}`]) === source.upstreamCommit,
+        'Fork upstream baseline tag/commit differs');
+      requireGraph(capture('git', ['-C', repository, 'rev-parse', `${source.sourceCommit}^{tree}`]) === source.sourceTree,
+        'Fork source commit/tree differs');
+    }
     const args = [provisioner, '--manifest', sourceManifest, '--source', repository,
       '--checkout', join(work, 'checkout'), '--go', go];
     for (const dep of dependencies) {
@@ -78,14 +117,9 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
       // Git 2.53 rejects an excluded path when upstream also ignores it. Move
       // only receipt metadata outside the checkout during staging, regardless
       // of ignore policy, and restore its original bytes even when add fails.
-      const metadata = join(checkout, '.polaris-source-receipt.json');
-      const savedMetadata = join(work, 'source-receipt.staging.json');
-      renameSync(metadata, savedMetadata);
-      try {
+      withProviderMetadataOutside(checkout, work, () => {
         run('git', ['add', '-A', '--', '.', ':(exclude).polaris-source-receipt.json'], { ...options, cwd: checkout });
-      } finally {
-        renameSync(savedMetadata, metadata);
-      }
+      });
     };
     const buildOptions = { ...options, cwd: checkout };
     if (overlay) {
@@ -107,36 +141,53 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
       'Untracked compiler input differs from reviewed source tree');
     };
     verifyCompilerInputs();
+    verifySourceOwnedCheckout(checkout, source, spec, capture);
     const preset = readFileSync(join(checkout, 'release', key === 'win' ? 'DEFAULT_BUILD_TAGS_WINDOWS' : 'DEFAULT_BUILD_TAGS'), 'utf8').trim();
-    const tags = [...new Set([...preset.split(','), ...(target.cgo === '0' ? ['with_purego'] : [])])].sort();
+    // alpha.11 moved gvisor out of the default preset. Keep the explicit
+    // Linux/Mac capability and CGO-free additions, then reject any other drift.
+    const tags = [...new Set([...preset.split(','), ...target.extras])].sort();
     requireGraph(canonical(tags) === canonical(expectedTags(key)), 'Upstream feature tag preset differs; review required, do not drop features');
     const flags = readFileSync(join(checkout, 'release/LDFLAGS'), 'utf8').trim();
-    if (overlay) {
+    if (key === 'win') {
       run(go, process.platform === 'win32'
         ? ['test', '-mod=readonly', '-count=20', './dns/transport/local/systemconfig']
         : ['test', '-mod=readonly', '-c', '-o', join(work, 'systemconfig.test.exe'), './dns/transport/local/systemconfig'], buildOptions);
     }
     const binary = join(work, key === 'win' ? 'sing-box.exe' : 'sing-box');
     const identity = platformSourceIdentity(receipt, source, spec, key, manifest.windowsBuild?.patchSha256);
-    run(go, ['build', '-mod=readonly', '-trimpath', '-buildvcs=false', '-tags', tags.join(','), '-ldflags',
-      `${flags} -X github.com/sagernet/sing-box/constant.Version=${spec.version} -s -w -buildid=${identity.buildID}`,
-      '-o', binary, './cmd/sing-box'], buildOptions);
+    const compile = () => {
+      if (owned) requireGraph(capture('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: checkout }) === '',
+        'Source-owned VCS must be clean during build');
+      run(go, ['build', '-mod=readonly', '-trimpath', owned ? '-buildvcs=true' : '-buildvcs=false', '-tags', tags.join(','), '-ldflags',
+        `${flags} -X github.com/sagernet/sing-box/constant.Version=${spec.version} -s -w -buildid=${identity.buildID}`,
+        '-o', binary, './cmd/sing-box'], buildOptions);
+      if (owned) {
+        verifySourceOwnedCheckout(checkout, source, spec, capture);
+        requireGraph(capture('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: checkout }) === '',
+          'Source-owned build changed clean VCS');
+      }
+    };
+    if (owned) withProviderMetadataOutside(checkout, work, compile);
+    else compile();
     // Read actual embedded metadata without executing the target binary.
     const buildInfo = capture(go, ['version', '-m', binary], { cwd: checkout });
     const linked = validateBuildInfo(buildInfo, source, key, spec);
     requireGraph(capture(go, ['tool', 'buildid', binary], { cwd: checkout }) === identity.buildID,
       'Actual binary source buildID differs');
+    const macCodeSignature = observeMacCodeSignature(binary, key, run);
     const binarySha256 = digest(readFileSync(binary));
     if (!production.producer) verifyHash(binary, spec.platforms[key].binarySha256);
     stageCompilerInputs();
     requireGraph(capture('git', ['write-tree'], { cwd: checkout }) === buildTree, 'Build changed reviewed source graph');
     verifyCompilerInputs();
+    verifySourceOwnedCheckout(checkout, source, spec, capture);
     const platformReceipt = { schema: 'polaris-desktop-core-v1', candidate: production.candidate, platform: key,
-      ...identity, linkedModules: Object.fromEntries(linked.modules),
-      sourceReceipt: receipt, buildTree, overlays: overlay ? [{ file: 'windows-dns-refresh.patch', sha256: manifest.windowsBuild.patchSha256 }] : [],
+      ...identity, ...(owned ? { sourceOwnedReplacements: owned, producerContext: context } : {}), linkedModules: Object.fromEntries(linked.modules),
+      sourceReceipt: receipt, buildTree, overlays: desktopOverlays(spec, key, manifest.windowsBuild?.patchSha256),
       mainGoModSha256: receipt.mainGoModSha256,
       mainGoSumSha256: receipt.mainGoSumSha256,
       version: spec.version, binarySha256,
+      ...(macCodeSignature ? { macCodeSignature } : {}),
       buildInfoSha256: buildInfoFingerprint(buildInfo), goos: target.goos, goarch: target.goarch,
       cgo: target.cgo, tags };
     platformReceipt.fingerprint = digest(canonical(platformReceipt));
@@ -145,6 +196,7 @@ export function buildDesktopCore(root, manifest, key, dest, _force = false,
     const stagedBinary = join(staging, 'binary');
     const stagedReceipt = join(staging, 'receipt.json');
     copyFileSync(binary, stagedBinary);
+    verifyHash(stagedBinary, binarySha256);
     if (key !== 'win') chmodSync(stagedBinary, 0o755);
     writeFileSync(stagedReceipt, `${JSON.stringify(platformReceipt, null, 2)}\n`);
     renameSync(stagedReceipt, `${dest}.source-receipt.json`);

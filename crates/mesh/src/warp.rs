@@ -415,7 +415,7 @@ pub fn plan_deregister_drain(
 
 /// 宽容的标准 base64 解码：接受 +/ 与 URL-safe -_；忽略非字母表字符不报错（与 Polaris 的容忍度对齐：
 /// Polaris 用 Node `Buffer.from(id,'base64')`，对合法字母表解码、忽略填充异常）。失败返回 None。
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
     // 收集字母表字符（兼容 URL-safe 变体）。
     let mut bits: u32 = 0;
     let mut nbits: u32 = 0;

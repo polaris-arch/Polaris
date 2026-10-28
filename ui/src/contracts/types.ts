@@ -11,6 +11,7 @@ import type {
   TuicSettings,
   WireGuardSettings,
   TailscaleSettings,
+  TailscaleCredentialMetadata,
   CustomSettings,
   AnyTlsSettings,
   MultiplexSettings,
@@ -62,6 +63,7 @@ export type {
   ShadowTlsSettings,
   WireGuardSettings,
   TailscaleSettings,
+  TailscaleCredentialMetadata,
   CustomSettings,
 } from './types/protocol-settings';
 
@@ -322,7 +324,9 @@ export interface ServerConfig {
   wireguardSettings?: WireGuardSettings;
 
   // Tailscale 特定（sing-box endpoint，账号制 mesh）
-  tailscaleSettings?: TailscaleSettings;
+  tailscaleSettings?: TailscaleSettings & TailscaleCredentialMetadata;
+  /** One-shot credential clear intent, consumed by the original configuration write lock. */
+  tailscaleCredentialIntent?: { action: 'clear'; expectedCredentialRevision: string };
 
   // 自定义协议（raw-JSON 透传，第三方内核用）
   customSettings?: CustomSettings;

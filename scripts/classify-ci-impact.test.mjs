@@ -297,6 +297,8 @@ test('Android 面点亮 android 腿，且不误伤桌面腿', () => {
     'scripts/build-android-apk.sh',
     'scripts/android-rust-ndk.version',
     'scripts/verify-apk.mjs',
+    'scripts/strip-android-release-native.mjs',
+    'scripts/strip-android-release-native.test.mjs',
     '.github/workflows/android.yml',
   ]) {
     const result = classifyImpact([path]);

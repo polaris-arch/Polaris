@@ -5,8 +5,8 @@ use crate::test_support::module_files;
 /// （即 `use super::<域>::<项>;`，多段路径，天然放行；本门只抓**单段**叶子导入）。
 ///
 /// 白名单是 façade **定义**的公共契约面：`ProxyRuntime` / `ProxyStatus` / `StartError` / `code`
-/// / `ProxyErrorEmitter` 不动（§C 例外①②），`PendingChangesSummary` / `ProxyLifecycleEvent`
-/// 搬出后由 façade `pub use` 再导出（§A.3）。除这 7 个之外的任何 `use super::{叶子项};`
+/// / `ProxyErrorEmitter` / `LocalHttpProxy` 不动（§C 例外①②），`PendingChangesSummary` /
+/// `ProxyLifecycleEvent` 搬出后由 façade `pub use` 再导出（§A.3）。除这 8 个之外的任何 `use super::{叶子项};`
 /// 都意味着有一个私有工具函数被回头掏走。
 ///
 /// 判据只看 `module_files("runtime/proxy")`（排除 `tests/`，见 `module_files_in` 文档）里
@@ -27,6 +27,9 @@ fn proxy_submodules_only_reach_back_for_whitelisted_facade_items() {
         "ProxyErrorEmitter",
         "PendingChangesSummary",
         "ProxyLifecycleEvent",
+        // Permanent public facade contract: ready-main tickets capture the same local
+        // HTTP proxy descriptor exposed by ProxyRuntime::local_http_proxy.
+        "LocalHttpProxy",
         // **永久面项**（非过渡）：`TUN_ADDRESS_UNAVAILABLE_MSG` 是 §C 例外① 钉死在 façade 的五条
         // `*_MSG` 兜底文案之一（与 `pub mod code` 同锚，四条跨语言门以它们为判据），永不外移；
         // 其消费者 `core_log::settle_start_failure` 只能回掏。删除条件同 `TUN_ROUTE_NOT_CAPTURED_MSG`。

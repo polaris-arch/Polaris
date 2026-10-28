@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import type { ServerConfig } from '@/contracts/types';
 import { getEffectiveConfig, useAppStore } from '@/store/app-store';
 import { isSentinelSelection } from '@/domain/direct-selection';
+import { manualSpeedTestCaps } from '@/domain/endpoint-routes';
 import { stagedOnlyIds } from '@/lib/staged-config';
 import { speedTestBlockReason } from '@/components/screens/nodes/nodes-logic';
 import {
@@ -37,7 +38,8 @@ export function useHomeSpeedTest(args: {
   const selected = args.servers.find((s) => s.id === args.selectedId);
   const direct = args.routing === 'direct' || isSentinelSelection(args.selectedId);
   const stagedOnly = stagedOnlyIds(args.servers, args.diskServers);
-  const blocked = !args.running
+  const caps = manualSpeedTestCaps(args.running);
+  const blocked = !args.running && !caps.normalMainRequired
     ? t('mobileHome.connectToTest')
     : direct
       ? t('nodes.speedTestSentinelExit')
@@ -45,7 +47,7 @@ export function useHomeSpeedTest(args: {
         ? (() => {
             const reason = speedTestBlockReason(
               selected,
-              { mainCorePool: args.running },
+              caps,
               stagedOnly.has(selected.id),
             );
             return reason ? speedTestBlockedMessage(reason, t) : null;
@@ -57,7 +59,7 @@ export function useHomeSpeedTest(args: {
   );
   const currentKey = useCallback(() => {
     const state = useAppStore.getState();
-    return `${state.proxyStatus?.running === true}|${state.proxyStatus?.startTime ?? 0}|${state.selectedServerId ?? ''}|${getEffectiveConfig()?.proxyMode ?? 'smart'}`;
+    return `${state.selectedServerId ?? ''}|${getEffectiveConfig()?.proxyMode ?? 'smart'}`;
   }, []);
 
   const runCurrent = useCallback(async (): Promise<void> => {

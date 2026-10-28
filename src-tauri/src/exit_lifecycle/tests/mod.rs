@@ -268,6 +268,66 @@ fn restart_and_all_quit_entrypoints_consume_the_shared_prepare_gate() {
 }
 
 #[test]
+fn ios_host_quit_and_restart_preserve_ne_without_desktop_owner_receipts() {
+    fn cfg_body<'a>(source: &'a str, predicate: &str) -> &'a str {
+        let at = source.find(predicate).unwrap();
+        let open = at + source[at..].find('{').unwrap();
+        let mut depth = 0;
+        for (index, byte) in source.as_bytes().iter().enumerate().skip(open) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open + 1..index];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced cfg block");
+    }
+    let exit = crate_code("exit_lifecycle.rs");
+    for signature in [
+        "pub(crate) async fn request_quit(",
+        "pub(crate) fn final_exit_best_effort(",
+    ] {
+        let body = top_level_fn_body(&exit, signature);
+        let ios = cfg_body(&body, "#[cfg(target_os = \"ios\")]");
+        for forbidden in [
+            "prepare_desktop_exit",
+            "commit_desktop_exit",
+            "run_android_exit_once",
+            "mark_clean_exit",
+            "shutdown_for_exit",
+            "proxy.stop",
+        ] {
+            assert!(
+                !ios.contains(forbidden),
+                "iOS host exit reached {forbidden}"
+            );
+        }
+    }
+    let restart = top_level_fn_body(
+        &crate_code("commands/window.rs"),
+        "pub async fn app_restart(",
+    );
+    let ios = cfg_body(&restart, "#[cfg(target_os = \"ios\")]");
+    assert!(ios.contains("app.request_restart()"));
+    assert!(!ios.contains("prepare_desktop_exit") && !ios.contains("commit_desktop_exit"));
+    let desktop = cfg_body(
+        &restart,
+        "#[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]",
+    );
+    assert!(
+        desktop.find("prepare_desktop_exit").unwrap()
+            < desktop.find("commit_desktop_exit").unwrap()
+    );
+    let run = crate_root_code();
+    assert!(run.contains("#[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n            if !exit_lifecycle::exit_is_committed"));
+}
+
+#[test]
 fn updater_must_prepare_before_detached_spawn_with_no_running_shortcut() {
     let body = top_level_fn_body(
         &crate_code("commands/updater/app_update.rs"),

@@ -1503,6 +1503,17 @@ pub async fn update_download(
     })))
 }
 
+/// Android foreground installation permission. This command neither installs nor stops a core.
+#[tauri::command]
+pub async fn update_request_install_permission() -> Result<ApiResponse<Value>, ()> {
+    Ok(
+        match crate::runtime::proxy::android_bridge::request_apk_install_permission().await {
+            Ok(permission) => ApiResponse::ok(json!(permission)),
+            Err(reason) => ApiResponse::err(reason),
+        },
+    )
+}
+
 /// 上游 `UPDATE_INSTALL`：安装已下载的更新包（生成平台脚本 → 停代理 → detached 起脚本 → 退出应用）。
 ///
 /// ✅ **已接线**。决策全在纯函数 [`update_install::decide_install_plan`] /
@@ -1825,9 +1836,10 @@ pub(super) fn reconcile_recheck(advertised: Option<&str>, rechecked: &str) -> Re
 ///
 /// # 已知边界（如实登记）
 ///
-/// `PopupAction::Cancel` 现在可达了（progress 态真会出现），但它只关窗、**不中断在飞的下载**——
-/// `CoreDownloader` 无取消令牌。关窗后下载继续跑完并落盘，不会留半截文件（原子写），
-/// 用户的下一次「更新」会直接复用。真正的下载取消需给下载器加 cancel token，单列。
+/// `Close` 在每个阶段均合法，陈旧的渲染阶段也不能阻止用户关窗。
+/// 旧 `Cancel` 动作保留兼容，但仅收起界面；渲染端明确显示「后台继续」。
+/// `CoreDownloader` 无取消令牌。关窗后下载继续原子落盘，设置页订阅与快照照常可查看；
+/// 本命令不表示下载已取消，也不会打断安装或换核。
 #[tauri::command]
 pub async fn update_popup_action(
     app: AppHandle,

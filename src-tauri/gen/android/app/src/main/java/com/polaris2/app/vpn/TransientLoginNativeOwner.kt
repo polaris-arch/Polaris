@@ -9,6 +9,8 @@ internal class TransientLoginNativeOwner private constructor(
     @Volatile private var revoked = false
     val cancelled: Boolean get() = revoked || ledger.state(ticket) == AndroidNativeAdmission.State.CancelledBeforeBirth
 
+    fun bindTailscaleStore(): AndroidTailscaleStoreCustody = ledger.bindTailscaleStore(ticket)
+
     /** Both owner and independent validation reservations exist before dispatch. */
     fun enqueue(queue: (() -> Unit) -> Unit, action: (AndroidNativeAdmission.Ticket) -> Unit) {
         try { AndroidNativeValidation.enqueue(ledger, queue, action) }

@@ -362,7 +362,7 @@ pub enum PopupAction {
     Skip,
     /// 查看发布说明（开浏览器；**不 resolve 等待**，弹窗停在 remind）。
     ViewLog,
-    /// 取消下载（progress 态）。
+    /// 兼容旧动作：收起进度窗，后台下载继续（不表示下载已取消）。
     Cancel,
     /// 重试（error → progress）。
     Retry,
@@ -390,10 +390,10 @@ impl PopupAction {
             // remind：update / later / skip（+ viewLog 非 resolving）
             PopupPhase::Remind => matches!(
                 self,
-                Self::Update | Self::Later | Self::Skip | Self::ViewLog
+                Self::Update | Self::Later | Self::Skip | Self::ViewLog | Self::Close
             ),
-            // progress：仅 cancel
-            PopupPhase::Progress => matches!(self, Self::Cancel),
+            // 关闭始终可用：阶段可能已在渲染与动作投递之间变化。
+            PopupPhase::Progress => matches!(self, Self::Cancel | Self::Close),
             // error：retry / manualDownload / close
             PopupPhase::Error => matches!(self, Self::Retry | Self::ManualDownload | Self::Close),
             // done：800ms 后自动关窗，用户无按钮可点（仅容 close 兜底）

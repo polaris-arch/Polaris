@@ -1,8 +1,9 @@
 # Polaris — Cargo workspace
-# crate 边界 / 职责见 ~/docs/polaris/design/polaris-system-design.md §B.2
+# crate 边界与职责见 docs/architecture.md
 [workspace]
 resolver = "2"
 members = ["src-tauri", "crates/*"]
+exclude = ["vendor/swift-rs"]
 
 [workspace.package]
 version = "1.0.0"
@@ -23,12 +24,18 @@ async-trait = "0.1"
 # futures = async 工具：unlock 并发齐射 6 checker（join_all），无依赖则需手搓 VecFuture。
 futures = "0.3"
 
+# SwiftPM in Xcode 27 needs the package target triple in addition to swiftc's
+# target. The local swift-rs change is gated to iOS; macOS builds keep the
+# upstream command line. Remove this patch when upstream swift-rs includes it.
+[patch.crates-io]
+swift-rs = { path = "vendor/swift-rs" }
+
 # ════════════════════════════════════════════════════════════════════════════
 # 发行构型
 # ════════════════════════════════════════════════════════════════════════════
 #
 # `strip = "symbols"`：发行二进制此前保留完整 `.symtab`（111628 个符号 / 54 MB）与 144 处
-# 构建机绝对路径（`/home/sway/Code/polaris/...`）。前者是逆向的免费地图，后者直接泄露构建环境。
+# 构建机绝对路径（`/home/<user>/...`）。前者是逆向的免费地图，后者直接泄露构建环境。
 #
 # **加它之前必须先有门 2**（`src-tauri/tests/test_only_symbols_gated.rs`）：在此之前
 # `nm target/release/polaris | grep Mock` 是唯一能实测「测试替身没进二进制」的手段，strip 掉就没了。
@@ -42,8 +49,7 @@ futures = "0.3"
 # 这条由 `src-tauri/tests/release_escape_hatches.rs::release_profiles_must_not_enable_debug_assertions`
 # 强制，不是靠本注释自觉。
 #
-# `lto = "fat"` + `codegen-units = 1`：全平台开 LTO。依据
-# `~/docs/polaris/design/polaris-mobile-handoff-2026-09-07.md` 约 :136-146 的实测——Android
+# `lto = "fat"` + `codegen-units = 1`：全平台开 LTO。依据 2026-09-07 的实测——Android
 # arm64 `libpolaris_lib.so` 46.6 MB → 32.9 MB（−73.0% vs debug），构建时间 +约 3 分钟（4m46s→7m41s）。
 #
 # **禁止在本段写 `panic = "abort"`**：`src-tauri/src/runtime/subscription_parse.rs:274` 与

@@ -1,0 +1,67 @@
+{
+  "schema": "polaris-native-dns-source-binding-v1",
+  "state": "inactive-source-verification-only",
+  "active": false,
+  "AppAccepted": false,
+  "publicationEligible": false,
+  "repository": "polaris-arch/sing-box-polaris",
+  "repositoryId": 1421657509,
+  "version": "1.15.0-polaris-alpha.12",
+  "tagObject": null,
+  "sourceCommit": "fe182431495711c09bdb3b074ed6aa6309c00cf8",
+  "sourceTree": "9b2fe41af73c5768dccff079ded1e4a489cfa9e1",
+  "producer": {
+    "workflow": ".github/workflows/build.yml",
+    "workflowCommit": "fe182431495711c09bdb3b074ed6aa6309c00cf8",
+    "runId": 39075665574,
+    "runAttempt": 1
+  },
+  "indexArtifact": {
+    "id": 12117466241,
+    "name": "binary-native-index",
+    "bytes": 8936363,
+    "sha256": "242e31e12d707fc9247de1051de803da7c9710b76c7295a755ae48e64ee029e3"
+  },
+  "index": {
+    "name": "polaris-upstream-native-assets.json",
+    "bytes": 6519563,
+    "sha256": "aed2d9ff7f2de716328039e008245b2e1eee38fc79f346f1162e545c2d725dc6"
+  },
+  "sourceArchive": {
+    "name": "sing-box-polaris-source-fe182431495711c09bdb3b074ed6aa6309c00cf8.tar.gz",
+    "bytes": 7987141,
+    "sha256": "485c94ac8da714cc8262b2d0a7da8f940c7b07c4fec19616aed0ee42e28b55c2"
+  },
+  "sourceGitlinks": [
+    {
+      "path": "clients/android",
+      "sha": "ae93152f21457723af77d144f28c1f7be7362aec"
+    },
+    {
+      "path": "clients/apple",
+      "sha": "e232aaf22d6d68773196ffc8e6e79684a6be717c"
+    },
+    {
+      "path": "clients/desktop",
+      "sha": "50f503849148dd73fa4f4bc231119acf5b2f3d7a"
+    }
+  ],
+  "sourceIdentity": {
+    "sourceOverlay": 0,
+    "goModSha256": "27275444718d394dcc31040304ccea65e050c417ef8a85ea7fa6ee6a351e0915",
+    "goSumSha256": "04f10f1f02bd405b9d0e84407e44b35d45af49db7e10a96630679cedaefadeaa",
+    "replacements": [
+      {
+        "module": "github.com/sagernet/sing-tun",
+        "path": "./third_party/sing-tun",
+        "tree": "46c2d2c2232ca4d912d9c30b043304e8ea7b2b5a"
+      },
+      {
+        "module": "github.com/metacubex/utls",
+        "path": "./third_party/metacubex-utls",
+        "tree": "40304faa4cfb50c928732bbbb476e22fb9119735"
+      }
+    ]
+  },
+  "nativeRows": 44
+}

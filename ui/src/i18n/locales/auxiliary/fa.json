@@ -56,7 +56,7 @@
     "update": "به‌روزرسانی",
     "downloading": "در حال دانلود به‌روزرسانی",
     "mirror": "آینه",
-    "cancel": "لغو",
+    "continueInBackground": "ادامه در پس‌زمینه",
     "downloaded": "دانلود کامل شد",
     "noUpdate": "به‌روزرسانی‌ای برای دانلود نیست",
     "noUpdateSubject": "این بررسی بسته‌ای برای {{version}} پیدا نکرد",

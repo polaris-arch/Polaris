@@ -209,3 +209,84 @@ fn explicit_null_is_treated_as_absent() {
     assert_eq!(nested["tunConfig"]["inboundExcludeCidrs"], json!([]));
     assert_eq!(nested["tunConfig"]["strictRoute"], json!(false));
 }
+
+#[test]
+fn retained_key_view_hides_whole_secret_and_is_idempotent() {
+    let mut config = json!({"servers":[{"id":"node","protocol":"tailscale","name":"Node",
+        "tailscaleSettings":{"retainedAuthKey":{"authKey":"tskey-fixture-secret",
+        "controlAuthority":"https://controlplane.tailscale.com"},"unmodeled":"preserved"}}]});
+    let revision = tailscale_credential_revision(&config["servers"][0]).unwrap();
+    ensure_effective_config(&mut config);
+    let ts = &config["servers"][0]["tailscaleSettings"];
+    assert!(ts.get("retainedAuthKey").is_none());
+    assert_eq!(ts["retainedAuthKeyAvailable"], true);
+    assert_eq!(ts["tailscaleCredentialRevision"], revision);
+    assert!(!config.to_string().contains("tskey-fixture-secret"));
+    let first = config.clone();
+    ensure_effective_config(&mut config);
+    assert_eq!(config, first);
+}
+
+#[test]
+fn retained_view_has_real_issuer_semantics_and_no_empty_defaults() {
+    let mut config = json!({"servers":[
+        {"id":"active","protocol":"tailscale","tailscaleSettings":{"authKey":"active-fixture"}},
+        {"id":"empty","protocol":"tailscale","tailscaleSettings":{}},
+        {"id":"mismatch","protocol":"tailscale","tailscaleSettings":{"controlUrl":"https://issuer.invalid/new",
+         "retainedAuthKey":{"authKey":"retained-fixture","controlAuthority":"https://issuer.invalid/old"}}}
+    ]});
+    ensure_effective_config(&mut config);
+    assert!(config["servers"][0]["tailscaleSettings"]["tailscaleCredentialRevision"].is_string());
+    assert!(config["servers"][0]["tailscaleSettings"]
+        .get("retainedAuthKeyAvailable")
+        .is_none());
+    assert_eq!(config["servers"][1]["tailscaleSettings"], json!({}));
+    assert_eq!(
+        config["servers"][2]["tailscaleSettings"]["retainedAuthKeyAvailable"],
+        false
+    );
+    let first = config.clone();
+    ensure_effective_config(&mut config);
+    assert_eq!(first, config);
+    let node = json!({"tailscaleSettings":{"controlUrl":"HTTPS://ISSUER.INVALID/path?x=1"}});
+    assert_eq!(
+        tailscale_control_authority(&node).unwrap(),
+        "https://issuer.invalid/path?x=1"
+    );
+    assert!(tailscale_control_authority(
+        &json!({"tailscaleSettings":{"controlUrl":" https://issuer.invalid"}})
+    )
+    .is_err());
+}
+
+#[test]
+fn credential_revision_binds_actual_target_unknown_fields_without_metadata_noise() {
+    let node = json!({"id":"one","protocol":"tailscale","extra":"one",
+        "tailscaleSettings":{"sourceTag":"original","authKey":"fixture"}});
+    let first = tailscale_credential_revision(&node).unwrap();
+    let mut edited = node.clone();
+    edited["extra"] = json!("two");
+    assert_ne!(tailscale_credential_revision(&edited).unwrap(), first);
+    edited = node.clone();
+    edited["tailscaleSettings"]["retainedAuthKeyAvailable"] = json!(false);
+    edited["tailscaleSettings"]["tailscaleCredentialRevision"] = json!("untrusted");
+    assert_eq!(tailscale_credential_revision(&edited).unwrap(), first);
+}
+
+#[test]
+fn backend_retained_record_is_hidden_even_after_protocol_edit() {
+    let mut config = json!({"servers":[{"id":"node", "protocol":"vless", "tailscaleSettings":{
+        "retainedAuthKey":{"authKey":"cross-protocol-private-sentinel", "controlAuthority":"https://issuer.invalid"},
+        "retainedAuthKeyAvailable":true,"tailscaleCredentialRevision":"old"
+    }}]});
+    ensure_effective_config(&mut config);
+    assert!(!config
+        .to_string()
+        .contains("cross-protocol-private-sentinel"));
+    assert!(config["servers"][0]["tailscaleSettings"]
+        .get("retainedAuthKey")
+        .is_none());
+    assert!(config["servers"][0]["tailscaleSettings"]
+        .get("retainedAuthKeyAvailable")
+        .is_none());
+}

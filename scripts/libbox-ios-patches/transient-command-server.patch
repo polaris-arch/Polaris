@@ -1,0 +1,323 @@
+diff --git a/daemon/instance.go b/daemon/instance.go
+index 9ed6323..c55e4ae 100644
+--- a/daemon/instance.go
++++ b/daemon/instance.go
+@@ -143,7 +143,9 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
+ 	i.outboundManager = service.FromContext[adapter.OutboundManager](ctx)
+ 	i.endpointManager = service.FromContext[adapter.EndpointManager](ctx)
+ 	i.logFactory = boxInstance.LogFactory()
+-	log.SetStdLogger(boxInstance.LogFactory().Logger())
++	if !s.keepDefaultLogger {
++		log.SetStdLogger(boxInstance.LogFactory().Logger())
++	}
+ 	return i, nil
+ }
+ 
+diff --git a/daemon/started_service.go b/daemon/started_service.go
+index 0557d87..13651ed 100644
+--- a/daemon/started_service.go
++++ b/daemon/started_service.go
+@@ -47,6 +47,7 @@ type StartedService struct {
+ 	ctx context.Context
+ 	// platform adapter.PlatformInterface
+ 	handler           PlatformHandler
++	keepDefaultLogger bool
+ 	debug             bool
+ 	oomKillerEnabled  bool
+ 	oomKillerDisabled bool
+@@ -81,6 +82,7 @@ type ServiceOptions struct {
+ 	Context context.Context
+ 	// Platform           adapter.PlatformInterface
+ 	Handler           PlatformHandler
++	KeepDefaultLogger bool
+ 	Debug             bool
+ 	LogMaxLines       int
+ 	OOMKillerEnabled  bool
+@@ -98,6 +100,7 @@ func NewStartedService(options ServiceOptions) *StartedService {
+ 		ctx: options.Context,
+ 		// platform:                options.Platform,
+ 		handler:           options.Handler,
++		keepDefaultLogger: options.KeepDefaultLogger,
+ 		debug:             options.Debug,
+ 		logLines:          logRing{maxLines: options.LogMaxLines},
+ 		oomKillerEnabled:  options.OOMKillerEnabled,
+diff --git a/experimental/libbox/command_server.go b/experimental/libbox/command_server.go
+index 3d9e1af..770016a 100644
+--- a/experimental/libbox/command_server.go
++++ b/experimental/libbox/command_server.go
+@@ -29,6 +29,7 @@ import (
+ )
+ 
+ type CommandServer struct {
++	transient bool
+ 	*daemon.StartedService
+ 	ctx               context.Context
+ 	managedService    *daemon.ManagedService
+@@ -52,6 +53,17 @@ type CommandServerHandler interface {
+ }
+ 
+ func NewCommandServer(handler CommandServerHandler, platformInterface PlatformInterface) (*CommandServer, error) {
++	return newCommandServer(handler, platformInterface, false)
++}
++
++// NewTransientCommandServer creates an independent service host without a command
++// listener or shared configuration, OOM, and power-report diagnostics.
++// StartOrReloadService starts its service; call CloseService before Close.
++func NewTransientCommandServer(handler CommandServerHandler, platformInterface PlatformInterface) (*CommandServer, error) {
++	return newCommandServer(handler, platformInterface, true)
++}
++
++func newCommandServer(handler CommandServerHandler, platformInterface PlatformInterface, transient bool) (*CommandServer, error) {
+ 	ctx := baseContext(platformInterface)
+ 	powerManager := powerreport.NewManager()
+ 	service.MustRegister[*powerreport.Manager](ctx, powerManager)
+@@ -62,6 +74,7 @@ func NewCommandServer(handler CommandServerHandler, platformInterface PlatformIn
+ 	}
+ 	service.MustRegister[adapter.PlatformInterface](ctx, platformWrapper)
+ 	server := &CommandServer{
++		transient:         transient,
+ 		ctx:               ctx,
+ 		handler:           handler,
+ 		platformInterface: platformInterface,
+@@ -72,6 +85,7 @@ func NewCommandServer(handler CommandServerHandler, platformInterface PlatformIn
+ 		Context: ctx,
+ 		// Platform:         platformWrapper,
+ 		Handler:           (*platformHandler)(server),
++		KeepDefaultLogger: transient,
+ 		Debug:             sDebug,
+ 		LogMaxLines:       sLogMaxLines,
+ 		OOMKillerEnabled:  sOOMKillerEnabled,
+@@ -83,16 +97,18 @@ func NewCommandServer(handler CommandServerHandler, platformInterface PlatformIn
+ 		// GroupID:          sGroupID,
+ 		// SystemProxyEnabled: false,
+ 	})
+-	oomRecorder := oomkiller.NewRecorder(OOMRecorderOptions(server.StartedService))
+-	service.MustRegister[*oomkiller.Recorder](ctx, oomRecorder)
+-	oomRecorder.Start()
+-	server.oomRecorder = oomRecorder
++	if !transient {
++		oomRecorder := oomkiller.NewRecorder(OOMRecorderOptions(server.StartedService))
++		service.MustRegister[*oomkiller.Recorder](ctx, oomRecorder)
++		oomRecorder.Start()
++		server.oomRecorder = oomRecorder
++	}
+ 	server.managedService = daemon.NewManagedService(daemon.ManagedServiceOptions{
+ 		Handler:     (*platformHandler)(server),
+ 		Debug:       sDebug,
+-		OOMRecorder: oomRecorder,
++		OOMRecorder: server.oomRecorder,
+ 	})
+-	if sPowerReportEnabled {
++	if !transient && sPowerReportEnabled {
+ 		err := powerManager.Start(PowerReportOptions(server.StartedService))
+ 		if err != nil {
+ 			log.StdLogger().Error(E.Cause(err, "start power report recorder"))
+@@ -138,6 +154,9 @@ func streamAuthInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServe
+ }
+ 
+ func (s *CommandServer) Start() error {
++	if s.transient {
++		return E.New("transient command server cannot start a command listener")
++	}
+ 	var (
+ 		listener net.Listener
+ 		err      error
+@@ -197,7 +216,9 @@ func (s *CommandServer) Close() {
+ 	}
+ 	common.Close(s.listener)
+ 	s.StartedService.Close()
+-	s.oomRecorder.Close()
++	if s.oomRecorder != nil {
++		s.oomRecorder.Close()
++	}
+ 	s.powerManager.Close()
+ }
+ 
+@@ -208,9 +229,11 @@ type OverrideOptions struct {
+ }
+ 
+ func (s *CommandServer) StartOrReloadService(configContent string, options *OverrideOptions) error {
+-	saveConfigSnapshot(configContent)
+-	if s.powerManager.Recorder() != nil {
+-		copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
++	if !s.transient {
++		saveConfigSnapshot(configContent)
++		if s.powerManager.Recorder() != nil {
++			copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
++		}
+ 	}
+ 	err := s.StartedService.StartOrReloadService(s.ctx, configContent, &daemon.OverrideOptions{
+ 		AutoRedirect:   options.AutoRedirect,
+diff --git a/experimental/libbox/command_server_transient_test.go b/experimental/libbox/command_server_transient_test.go
+new file mode 100644
+index 0000000..7a9af75
+--- /dev/null
++++ b/experimental/libbox/command_server_transient_test.go
+@@ -0,0 +1,167 @@
++package libbox
++
++import (
++	"bytes"
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/service/oomkiller"
++	"github.com/sagernet/sing-box/service/powerreport"
++	"github.com/sagernet/sing/service"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/types/known/emptypb"
++)
++
++type transientTestPlatform struct{ PlatformInterface }
++
++func (transientTestPlatform) LocalDNSTransport() LocalDNSTransport        { return nil }
++func (transientTestPlatform) UseProcFS() bool                             { return false }
++func (transientTestPlatform) UsePlatformAutoDetectInterfaceControl() bool { return false }
++func (transientTestPlatform) UnderNetworkExtension() bool                 { return false }
++func (transientTestPlatform) GetInterfaces() (NetworkInterfaceIterator, error) {
++	return newIterator([]*NetworkInterface{}), nil
++}
++func (transientTestPlatform) StartDefaultInterfaceMonitor(InterfaceUpdateListener) error { return nil }
++func (transientTestPlatform) CloseDefaultInterfaceMonitor(InterfaceUpdateListener) error { return nil }
++
++func transientTestSetup(t *testing.T) {
++	t.Helper()
++	base, work, temp, power, maxLines, uid, gid := sBasePath, sWorkingPath, sTempPath, sPowerReportEnabled, sLogMaxLines, sUserID, sGroupID
++	sBasePath = t.TempDir()
++	sWorkingPath = sBasePath
++	sTempPath = sBasePath
++	sPowerReportEnabled = true
++	sLogMaxLines = 32
++	sUserID, sGroupID = os.Getuid(), os.Getgid()
++	t.Cleanup(func() {
++		sBasePath, sWorkingPath, sTempPath, sPowerReportEnabled, sLogMaxLines, sUserID, sGroupID = base, work, temp, power, maxLines, uid, gid
++	})
++}
++
++func TestTransientCommandServerPreservesSharedState(t *testing.T) {
++	transientTestSetup(t)
++	paths := []string{"configuration.json", "command.sock", filepath.Join(oomkiller.DraftDirectoryName, "metadata.json"), filepath.Join(powerreport.DraftDirectoryName, "metadata.json")}
++	marker := []byte(`{"appVersion":"","appMarketingVersion":""}`)
++	for _, path := range paths {
++		full := filepath.Join(sBasePath, path)
++		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(full, marker, 0o600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	server, err := NewTransientCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if server.oomRecorder != nil || service.FromContext[*oomkiller.Recorder](server.ctx) != nil || server.powerManager.Recorder() != nil {
++		t.Fatal("transient host created a shared diagnostics recorder")
++	}
++	if err := server.Start(); err == nil {
++		t.Fatal("transient host accepted command listener start")
++	}
++	if _, err := server.managedService.TriggerOOMReport(context.Background(), &emptypb.Empty{}); status.Code(err) != codes.Unavailable {
++		t.Fatalf("transient OOM report must be unavailable: %v", err)
++	}
++	if err := server.StartOrReloadService("invalid json", &OverrideOptions{}); err == nil {
++		t.Fatal("invalid configuration accepted")
++	}
++	defaultLogger := log.StdLogger()
++	if err := server.StartOrReloadService(`{}`, &OverrideOptions{}); err != nil {
++		t.Fatal(err)
++	}
++	if log.StdLogger() != defaultLogger {
++		t.Fatal("transient service replaced the process default logger")
++	}
++	if err := server.StartOrReloadService(`{}`, &OverrideOptions{}); err != nil {
++		t.Fatal(err)
++	}
++	if err := server.CloseService(); err != nil {
++		t.Fatal(err)
++	}
++	server.Close()
++	if log.StdLogger() != defaultLogger {
++		t.Fatal("transient close changed the process default logger")
++	}
++	for _, path := range paths {
++		content, err := os.ReadFile(filepath.Join(sBasePath, path))
++		if err != nil || !bytes.Equal(content, marker) {
++			t.Fatalf("shared state changed at %s: %v", path, err)
++		}
++	}
++	for _, path := range []string{oomkiller.ReportsDirectoryName, powerreport.ReportsDirectoryName} {
++		if _, err := os.Stat(filepath.Join(sBasePath, path)); !os.IsNotExist(err) {
++			t.Fatalf("transient created reports at %s: %v", path, err)
++		}
++	}
++}
++
++func TestCommandServerRetainsSharedDiagnostics(t *testing.T) {
++	transientTestSetup(t)
++	sPowerReportEnabled = false
++	server, err := NewCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	if server.transient || server.oomRecorder == nil || service.FromContext[*oomkiller.Recorder](server.ctx) == nil {
++		t.Fatal("normal host lost OOM diagnostics")
++	}
++	config := "invalid primary configuration"
++	if err := server.StartOrReloadService(config, &OverrideOptions{}); err == nil {
++		t.Fatal("invalid configuration accepted")
++	}
++	content, err := os.ReadFile(configSnapshotPath())
++	if err != nil || string(content) != config {
++		t.Fatalf("normal host did not save configuration snapshot: %v", err)
++	}
++	if err := server.Start(); err != nil {
++		t.Fatal(err)
++	}
++	if server.listener == nil {
++		t.Fatal("normal host did not start command listener")
++	}
++}
++
++func TestTransientCommandServerCloseKeepsPrimaryService(t *testing.T) {
++	transientTestSetup(t)
++	sPowerReportEnabled = false
++	defaultLogger := log.StdLogger()
++	t.Cleanup(func() { log.SetStdLogger(defaultLogger) })
++	primary, err := NewCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer func() { primary.CloseService(); primary.Close() }()
++	if err := primary.StartOrReloadService(`{"experimental":{"cache_file":{"path":"primary-cache.db"}}}`, &OverrideOptions{}); err != nil {
++		t.Fatal(err)
++	}
++	primaryInstance := primary.Instance()
++	primaryLogger := log.StdLogger()
++	if primaryLogger == defaultLogger {
++		t.Fatal("normal service did not retain default logger replacement")
++	}
++	transient, err := NewTransientCommandServer(nil, transientTestPlatform{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := transient.StartOrReloadService(`{"experimental":{"cache_file":{"path":"transient-cache.db"}}}`, &OverrideOptions{}); err != nil {
++		transient.Close()
++		t.Fatal(err)
++	}
++	if err := transient.CloseService(); err != nil {
++		t.Fatal(err)
++	}
++	transient.Close()
++	if primary.Instance() != primaryInstance || primaryInstance.Box() == nil {
++		t.Fatal("transient close changed the primary service instance")
++	}
++	if log.StdLogger() != primaryLogger {
++		t.Fatal("transient lifecycle changed the primary default logger")
++	}
++}

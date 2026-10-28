@@ -1,0 +1,44 @@
+{
+  "schema": "polaris-desktop-fork-source-v1",
+  "role": "desktop",
+  "sourceURL": "https://github.com/polaris-arch/polaris-box",
+  "sourceCommit": "aafc521b745e0d1a8f50a6a3f41169433f1c2194",
+  "sourceTree": "4ae424d8a99b16a02442d7b2eac1d5e24e938d8e",
+  "sourceTag": "polaris-v1.15.0-alpha.11-2",
+  "sourceTagObject": "71876e8b33d3061bd9abba9618aa3e8c3e22db4e",
+  "upstreamTag": "v1.15.0-alpha.11",
+  "upstreamCommit": "6afeff4c0f7123b5782f888812e96b8c82c7b699",
+  "goVersion": "1.25.5",
+  "patches": [],
+  "dependencyPatches": [],
+  "sourceOwnedReplacements": [
+    {
+      "schemaVersion": 1,
+      "module": "github.com/sagernet/sing-tun",
+      "version": "v0.9.7-0.20261009022811-5c2edb183cc9",
+      "replacementPath": "./third_party/sing-tun",
+      "replacementTree": "18492017863a3bf41df92fe528c2bbe38fe97ab2",
+      "replacementFileCount": 256,
+      "baselineOriginCommit": "5c2edb183cc92eb190d41c04dedfa5519ca3e78c",
+      "baselineZipSha256": "d30c485149d53a88d3d31dd2312b5e4ca97649169ac4d0ed81a918fa80c9bcaf",
+      "baselineModuleSum": "h1:VBWPwC1CM/9ULXCtl120Nh64tmjFsybhBvB3IWzF+Mc=",
+      "baselineFiles": 253,
+      "changedBaselineFiles": [
+        "tun_windows.go"
+      ],
+      "addedFiles": [
+        "windows_dns_configuration.go",
+        "windows_dns_configuration_test.go",
+        "windows_lifecycle_guard_windows_test.go"
+      ],
+      "other252BaselineFilesByteExact": true,
+      "windowsAfterDNSSuffixUnchanged": true,
+      "patchSha256": "812956b42cfbb5d302343998b898b9c6489a93f633b1f446c367c5c24681ecd1",
+      "fingerprintSchema": "fork-source-fingerprint-v1",
+      "fourKernelPolicy": "Collect same schema from each actual new kernel source/build input; existing a01 and mobilealpha8 fingerprints remain historical and unchanged.",
+      "bindingSha256": "fff7ce2035d71e37fc02d06ef22f1e643c147f6adfbde34f69b69d6d9351773b",
+      "bindingPath": "release/dependency-sources/sing-tun-replacement.json",
+      "patchPath": "release/dependency-sources/sing-tun-windows-auto-route.patch"
+    }
+  ]
+}

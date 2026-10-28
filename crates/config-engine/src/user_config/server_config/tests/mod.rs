@@ -1080,3 +1080,17 @@ fn all_protocols_is_exhaustive() {
         "ALL_PROTOCOLS 漏了 slot {missing:?} 对应的变体 —— 依赖它做取材面的门会静默缩小覆盖面"
     );
 }
+
+#[test]
+fn retained_tailscale_record_round_trips_without_debug_secret() {
+    let raw = serde_json::json!({"authKey":"retained-fixture-secret","controlAuthority":"https://issuer.invalid"});
+    let record: super::RetainedTailscaleAuthKey = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&record).unwrap(), raw);
+    let debug = format!("{record:?}");
+    assert!(!debug.contains("retained-fixture-secret"));
+    assert!(!debug.contains("issuer.invalid"));
+    let legacy = serde_json::json!({"authKey":"old-active"});
+    let settings: super::TailscaleSettings = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(settings.retained_auth_key.is_none());
+    assert_eq!(serde_json::to_value(settings).unwrap(), legacy);
+}

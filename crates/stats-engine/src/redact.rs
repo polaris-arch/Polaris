@@ -46,13 +46,14 @@ pub const REDACTED: &str = "<redacted>";
 /// `username` 保留（naive 用户名单独不可用，且有助定位），仅 password 类打码。
 ///
 /// **改这张表 = 改红线**。新增协议若引入新密钥键，必须同步加进来 + 补 `tests` 里的穷举用例。
-pub const SECRET_KEYS: [&str; 17] = [
+pub const SECRET_KEYS: [&str; 18] = [
     "password",
     "uuid",
     "privatekey",
     "privatekeypassphrase",
     "presharedkey",
     "authkey",
+    "retainedauthkey",
     "secret",
     "clashapisecret",
     "token",

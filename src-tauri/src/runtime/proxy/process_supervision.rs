@@ -5,7 +5,7 @@
 //! `win_console.rs`），façade 必须 `pub(crate) use` 再导出（§B.3）。
 
 #[allow(dead_code)] // The managed exact supervisor remains dormant.
-mod direct_custody;
+pub(in crate::runtime::proxy) mod direct_custody;
 #[allow(dead_code)] // No production commit bridge exists in this slice.
 mod direct_stop;
 pub(crate) use direct_custody::DirectCoreSlot;
@@ -39,6 +39,166 @@ use crate::runtime::win_console::no_console_window;
 use super::core_binary::resolve_core_binary;
 use super::startup::attestation_commit_allowed;
 use super::{code, ProxyRuntime, StartError};
+
+/// A private comparison view. Only the native receipt adapter supplies it in
+/// production; a matching census never asserts global resource disposal.
+#[cfg(any(target_os = "ios", test))]
+#[derive(Clone)]
+pub(super) struct WriterRunScope {
+    pub(super) nonce: String,
+    pub(super) digest: String,
+    pub(super) terminal: bool,
+    pub(super) complete: bool,
+    pub(super) nodes: Vec<WriterNodeScope>,
+}
+
+#[cfg(any(target_os = "ios", test))]
+#[derive(Clone)]
+pub(super) struct WriterNodeScope {
+    pub(super) tag: String,
+    pub(super) directory: String,
+    pub(super) file: String,
+    pub(super) terminal: bool,
+}
+
+#[cfg(any(target_os = "ios", test))]
+type WriterNodeSet = std::collections::BTreeSet<(String, String, String)>;
+
+#[cfg(any(target_os = "ios", test))]
+type WriterIndex = std::collections::BTreeMap<String, (WriterRunScope, WriterNodeSet)>;
+
+#[cfg(any(target_os = "ios", test))]
+fn writer_census_index(runs: &[WriterRunScope]) -> Result<WriterIndex, String> {
+    use std::collections::BTreeSet;
+    let unknown = || "nativeRetirementUnknown".to_owned();
+    let hex = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    let mut result = WriterIndex::new();
+    for run in runs {
+        let mut nodes = WriterNodeSet::new();
+        let mut tags = BTreeSet::new();
+        let mut directories = BTreeSet::new();
+        for node in &run.nodes {
+            if node.tag.is_empty()
+                || !Path::new(&node.directory).is_absolute()
+                || Path::new(&node.directory).join("tailscaled.state") != Path::new(&node.file)
+                || !tags.insert(&node.tag)
+                || !directories.insert(&node.directory)
+                || !nodes.insert((node.tag.clone(), node.directory.clone(), node.file.clone()))
+            {
+                return Err(unknown());
+            }
+        }
+        if !hex(&run.nonce)
+            || !hex(&run.digest)
+            || result
+                .insert(run.nonce.clone(), (run.clone(), nodes))
+                .is_some()
+        {
+            return Err(unknown());
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(any(target_os = "ios", test))]
+pub(super) fn verify_writer_census(
+    original: &[WriterRunScope],
+    retired: &[WriterRunScope],
+    digest: &str,
+    main_scope: &[(String, String, String)],
+) -> Result<(), String> {
+    let unknown = || "nativeRetirementUnknown".to_owned();
+    let before = writer_census_index(original)?;
+    let after = writer_census_index(retired)?;
+    let expected: WriterNodeSet = main_scope.iter().cloned().collect();
+    if before.is_empty() || before.len() != after.len() || expected.len() != main_scope.len() {
+        return Err(unknown());
+    }
+    let mut owns_current = false;
+    for (nonce, (run, nodes)) in &before {
+        let (terminal, terminal_nodes) = after.get(nonce).ok_or_else(unknown)?;
+        if run.digest != terminal.digest
+            || nodes != terminal_nodes
+            || !terminal.complete
+            || !terminal.terminal
+            || terminal.nodes.iter().any(|node| !node.terminal)
+        {
+            return Err(unknown());
+        }
+        if run.digest == digest {
+            if nodes != &expected {
+                return Err(unknown());
+            }
+            owns_current = true;
+        }
+    }
+    if !owns_current {
+        return Err(unknown());
+    }
+    Ok(())
+}
+
+/// A failed original Start has no Ready baseline. Its trusted final Go
+/// constructor census must instead match every node in the original claim.
+/// This permits only local token removal, never SDK profile mutation.
+#[cfg(any(target_os = "ios", test))]
+pub(super) fn verify_pre_ready_writer_census(
+    retired: &[WriterRunScope],
+    digest: &str,
+    main_scope: &[(String, String, String)],
+) -> Result<(), String> {
+    let indexed = writer_census_index(retired)?;
+    let expected: WriterNodeSet = main_scope.iter().cloned().collect();
+    if indexed.is_empty() || expected.is_empty() || expected.len() != main_scope.len() {
+        return Err("nativeRetirementUnknown".into());
+    }
+    if indexed.values().any(|(run, nodes)| {
+        run.digest != digest
+            || !run.complete
+            || !run.terminal
+            || nodes != &expected
+            || run.nodes.iter().any(|node| !node.terminal)
+    }) {
+        return Err("nativeRetirementUnknown".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "ios")]
+fn native_writer_scopes(
+    runs: &[tauri_plugin_polaris_ios::TailscaleStoreRetirementInstance],
+) -> Vec<WriterRunScope> {
+    use tauri_plugin_polaris_ios::TailscaleWriterState;
+    let terminal = |state| {
+        matches!(
+            state,
+            TailscaleWriterState::SealedDrained | TailscaleWriterState::NoStoreConstruction
+        )
+    };
+    runs.iter()
+        .map(|run| WriterRunScope {
+            nonce: run.run_nonce.clone(),
+            digest: run.config_digest.clone(),
+            terminal: terminal(run.terminal),
+            complete: run.census_complete,
+            nodes: run
+                .nodes
+                .iter()
+                .map(|node| WriterNodeScope {
+                    tag: node.tag.clone(),
+                    directory: node.state_directory.clone(),
+                    file: node.state_file.clone(),
+                    terminal: terminal(node.writer_state),
+                })
+                .collect(),
+        })
+        .collect()
+}
 
 /// A detached Android Stop can finish after its waiter is cancelled. Drop
 /// ends only the local booking; uncertainty remains sticky across retries.
@@ -270,6 +430,7 @@ pub(super) struct DirectCoreRun {
     #[allow(dead_code)] // Read when the managed coordinator's exact stop gate is wired.
     pub(super) origin: DirectRunOrigin,
     pub(super) main_token: Option<crate::runtime::tailscale_login_core::MainBirthToken>,
+    pub(super) native_members: Option<super::mesh_apply::owner_proof::SealedNativeMembers>,
 }
 
 /// The legacy constructor records Legacy. A future managed coordinator must
@@ -304,6 +465,7 @@ impl DirectCoreRun {
             identity,
             origin: DirectRunOrigin::Legacy,
             main_token: None,
+            native_members: None,
         }
     }
 
@@ -381,6 +543,7 @@ impl DirectCoreRun {
         self.child.as_mut().expect("custody Child retained")
     }
 
+    #[cfg(test)]
     pub(super) fn with_main_token(
         child: Child,
         identity: RunIdentity,
@@ -593,6 +756,129 @@ impl ProxyRuntime {
             let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
             return booking.finish_with_gate(result, &self.mesh, ts_gate);
         }
+        #[cfg(target_os = "ios")]
+        {
+            let owner = self
+                .ios_ready_session
+                .read()
+                .map_err(|_| "nativeRetirementUnknown")?
+                .clone();
+            let Some(owner) = owner else {
+                // An ordinary Stop without the original birth cannot release a TS claim.
+                return tauri_plugin_polaris_ios::stop().await.map(|_| ());
+            };
+            if let super::IosMainOrigin::LocalStart(start) = &owner.origin {
+                if start
+                    .no_store_terminal()
+                    .is_some_and(|receipt| receipt.belongs_to(start))
+                {
+                    if let Some(token) = &owner.main_token {
+                        if !self
+                            .mesh
+                            .release_tailscale_main_states_if_token(token, ts_gate)?
+                        {
+                            return Err("nativeRetirementUnknown".into());
+                        }
+                    }
+                    let mut current = self
+                        .ios_ready_session
+                        .write()
+                        .map_err(|_| "nativeRetirementUnknown")?;
+                    let current = current
+                        .as_mut()
+                        .filter(|current| current.same_origin(&owner))
+                        .ok_or("nativeRetirementUnknown")?;
+                    current.main_token = None;
+                    return Ok(());
+                }
+            }
+            let stopped = match &owner.origin {
+                super::IosMainOrigin::Observed(observed) => {
+                    tauri_plugin_polaris_ios::stop_observed(observed).await?
+                }
+                super::IosMainOrigin::LocalStart(start) => match &owner.ready {
+                    Some(ready) => tauri_plugin_polaris_ios::stop_session(ready).await?,
+                    None => tauri_plugin_polaris_ios::stop_start(start).await?,
+                },
+            };
+            match &owner.origin {
+                super::IosMainOrigin::Observed(observed) => {
+                    let receipt = stopped.retirement().ok_or("nativeRetirementUnknown")?;
+                    if receipt.start_request_id() != observed.request_id()
+                        || receipt.config_digest() != observed.config_digest()
+                        || receipt.session_id() != observed.session_id()
+                        || receipt.source_extension_generation() != observed.extension_generation()
+                    {
+                        return Err("nativeRetirementUnknown".into());
+                    }
+                    let original = native_writer_scopes(observed.original_instances());
+                    let current = original
+                        .iter()
+                        .find(|run| run.digest == owner.config_digest)
+                        .ok_or("nativeRetirementUnknown")?;
+                    let expected: Vec<_> = current
+                        .nodes
+                        .iter()
+                        .map(|node| (node.tag.clone(), node.directory.clone(), node.file.clone()))
+                        .collect();
+                    verify_writer_census(
+                        &original,
+                        &native_writer_scopes(receipt.instances()),
+                        &owner.config_digest,
+                        &expected,
+                    )?;
+                }
+                super::IosMainOrigin::LocalStart(start) => {
+                    if let Some(token) = &owner.main_token {
+                        let receipt = stopped.retirement().ok_or("nativeRetirementUnknown")?;
+                        if receipt.start_request_id() != start.request_id()
+                            || receipt.config_digest() != owner.config_digest
+                        {
+                            return Err("nativeRetirementUnknown".into());
+                        }
+                        let expected = self.mesh.tailscale_main_scope_if_token(token, ts_gate)?;
+                        let retired = native_writer_scopes(receipt.instances());
+                        if let Some(ready) = &owner.ready {
+                            if receipt.session_id() != ready.session_id()
+                                || receipt.source_extension_generation()
+                                    != ready.extension_generation()
+                            {
+                                return Err("nativeRetirementUnknown".into());
+                            }
+                            verify_writer_census(
+                                &native_writer_scopes(ready.original_instances()),
+                                &retired,
+                                &owner.config_digest,
+                                &expected,
+                            )?;
+                        } else {
+                            verify_pre_ready_writer_census(
+                                &retired,
+                                &owner.config_digest,
+                                &expected,
+                            )?;
+                        }
+                        if !self
+                            .mesh
+                            .release_tailscale_main_states_if_token(token, ts_gate)?
+                        {
+                            return Err("nativeRetirementUnknown".into());
+                        }
+                    }
+                }
+            }
+            let mut current = self
+                .ios_ready_session
+                .write()
+                .map_err(|_| "nativeRetirementUnknown")?;
+            let current = current
+                .as_mut()
+                .filter(|current| current.same_origin(&owner))
+                .ok_or("nativeRetirementUnknown")?;
+            current.main_token = None;
+            current.stopped = Some(Arc::new(stopped));
+            return Ok(());
+        }
         if self.core_via_helper.load(Ordering::SeqCst) {
             return self
                 .kill_core_via_helper_with_main(
@@ -776,6 +1062,10 @@ impl ProxyRuntime {
             let result = super::android_bridge::stop_core_with_birth(booking.birth()).await;
             return booking.finish_without_main(result);
         }
+        #[cfg(target_os = "ios")]
+        {
+            return tauri_plugin_polaris_ios::stop().await.map(|_| ());
+        }
         // C6-5：经 helper 起的核 → 经 helper stop（对称）。daemon 摘其受管 child → SIGTERM→宽限→SIGKILL
         // 收割（app 无本地 child 句柄）。阻塞 IPC 挪出 async worker。
         if self.core_via_helper.load(Ordering::SeqCst) {
@@ -857,6 +1147,8 @@ impl ProxyRuntime {
             })?;
             *pid = None;
         }
+        // Metadata reclamation is outside Child/pid/registry custody and cannot undo retire.
+        self.prune_normal_producers();
         log::info!("停核完成：owned Child 已退出并收割（exit={exit}）");
         Ok(())
     }
@@ -1019,6 +1311,20 @@ impl ProxyRuntime {
         if cfg!(target_os = "android") {
             return self.stop_system_started_core().await;
         }
+        #[cfg(target_os = "ios")]
+        {
+            let session = tauri_plugin_polaris_ios::status()
+                .await
+                .map_err(|error| StartError::coded(error, super::code::STARTUP_FAILED))?;
+            let error_code = if session.active {
+                super::code::IOS_SESSION_ACTIVE
+            } else {
+                super::code::STARTUP_FAILED
+            };
+            return session
+                .require_idle()
+                .map_err(|error| StartError::coded(error, error_code));
+        }
         let binary = match resolve_core_binary() {
             Ok(b) => b,
             Err(e) => {
@@ -1060,6 +1366,40 @@ impl ProxyRuntime {
             return Ok(());
         }
         self.escalate_root_orphans(&survivors).await
+    }
+
+    /// A cold host has no running configuration to adopt. Preserve the NE session
+    /// and expose its state while keeping the host runtime's configuration unclaimed.
+    #[cfg(target_os = "ios")]
+    pub(crate) async fn reconcile_ios_session_on_startup(&self) {
+        let generation = self.gate.generation();
+        let observed = tauri_plugin_polaris_ios::status().await;
+        if generation != self.gate.generation() {
+            return; // a user start/stop superseded this cold-host observation
+        }
+        match observed {
+            Ok(session) => {
+                log::info!(
+                    "iOS NE 对账：status={} active={} ownership={} runtimeStopped={:?} cleanupEvidence={}",
+                    session.status, session.active, session.ownership,
+                    session.runtime_stopped, session.cleanup_evidence
+                );
+                if session.active {
+                    self.set_nonfatal_error(
+                        "系统仍有 Polaris iOS VPN 会话；请先在系统设置中停止现有 VPN，再返回连接。",
+                        super::code::IOS_SESSION_ACTIVE,
+                    );
+                } else if let Err(error) = session.require_idle() {
+                    self.set_nonfatal_error(&error, super::code::STARTUP_FAILED);
+                }
+            }
+            Err(error) => {
+                self.set_nonfatal_error(
+                    &format!("无法读取 iOS 系统 VPN 状态：{error}。请检查系统设置后再连接。"),
+                    super::code::STARTUP_FAILED,
+                );
+            }
+        }
     }
 
     /// [`Self::cleanup_stale_cores`] 的 Android 腿。

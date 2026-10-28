@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { deflateRawSync } from 'node:zlib';
 
 import {
   ABIS,
@@ -19,6 +20,7 @@ import {
   isDebugSection,
   parseAapt2Permissions,
   parseArgs,
+  parseZipEntries,
   permissionViolations,
   strippedReport,
   zipOverheadBound,
@@ -142,7 +144,7 @@ function fakeSo({ cronet = 500, naive = 100, elf = true, sections, cls, machine 
   const so = fakeElf({
     cls,
     machine,
-    sections: sections ?? [...REQUIRED_ELF_SECTIONS, '.rodata', '.dynstr', '.bss'],
+    sections: sections ?? [...REQUIRED_ELF_SECTIONS, '.rodata', '.bss'],
     payload: Buffer.concat([
       Buffer.from('cronet'.repeat(cronet)),
       Buffer.from('naive'.repeat(naive)),
@@ -157,7 +159,7 @@ function fakeAppSo({ sections, cls, machine } = {}) {
   return fakeElf({
     cls,
     machine,
-    sections: sections ?? [...REQUIRED_ELF_SECTIONS, '.rodata', '.symtab', '.strtab'],
+    sections: sections ?? [...REQUIRED_ELF_SECTIONS, '.rodata'],
     payload: Buffer.from('app'),
   });
 }
@@ -175,6 +177,7 @@ function goodApk(patch = {}, abi = DEFAULT_ABI) {
   const cls = elfClass === 2 ? 64 : 32;
   members.set(`lib/${abi}/libbox.so`, fakeSo({ cls, machine }));
   members.set(`lib/${abi}/libpolaris_lib.so`, fakeAppSo({ cls, machine }));
+  members.set(`lib/${abi}/libc++_shared.so`, fakeAppSo({ cls, machine }));
   for (let i = 0; i < SRS_COUNT; i += 1) {
     members.set(`${ASSET_UP}${SRS_DIR}/geosite-${i}.srs`, Buffer.from('srs'));
   }
@@ -200,6 +203,8 @@ function goodApk(patch = {}, abi = DEFAULT_ABI) {
     names: [...members.keys()],
     fileSize: entriesCompressedTotal + realisticOverhead,
     entriesCompressedTotal,
+    zipEntries: new Map([...members].map(([name, bytes]) => [name,
+      { method: 8, compressedSize: bytes.length, uncompressedSize: bytes.length, dataOffset: 123 }])),
     readMember: (name) => {
       const hit = members.get(name);
       if (hit === undefined) throw new Error(`测试夹具里没有成员 ${name}`);
@@ -223,7 +228,7 @@ function goodApk(patch = {}, abi = DEFAULT_ABI) {
 }
 
 function run(patch = () => {}, { abi = DEFAULT_ABI, judgeAs = abi } = {}) {
-  const { names, readMember, repoLicense, repoSrsCount, fileSize, entriesCompressedTotal, permissions } =
+  const { names, readMember, repoLicense, repoSrsCount, fileSize, entriesCompressedTotal, permissions, zipEntries } =
     goodApk(patch, abi);
   // `judgeAs` 与 `abi` 分开：造包用一个 ABI、判它用另一个，正是「参数没真的进判据」这条变异要的形状。
   return apkViolations({
@@ -235,6 +240,7 @@ function run(patch = () => {}, { abi = DEFAULT_ABI, judgeAs = abi } = {}) {
     entriesCompressedTotal,
     abi: judgeAs,
     permissions,
+    zipEntries,
   });
 }
 
@@ -242,6 +248,74 @@ function run(patch = () => {}, { abi = DEFAULT_ABI, judgeAs = abi } = {}) {
 function hits(violations, needle) {
   return violations.filter((v) => v.includes(needle)).length;
 }
+
+function oneEntryZip(name, method = 8) {
+  const filename = Buffer.from(name);
+  const payload = Buffer.from('native-library-payload'.repeat(8));
+  const packed = method === 8 ? deflateRawSync(payload) : payload;
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50);
+  local.writeUInt16LE(method, 8);
+  local.writeUInt32LE(packed.length, 18);
+  local.writeUInt32LE(payload.length, 22);
+  local.writeUInt16LE(filename.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50);
+  central.writeUInt16LE(method, 10);
+  central.writeUInt32LE(packed.length, 20);
+  central.writeUInt32LE(payload.length, 24);
+  central.writeUInt16LE(filename.length, 28);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(central.length + filename.length, 12);
+  eocd.writeUInt32LE(local.length + filename.length + packed.length, 16);
+  return Buffer.concat([local, filename, packed, central, filename, eocd]);
+}
+
+test('native ZIP metadata accepts DEFLATE at an unaligned data offset and rejects STORE', () => {
+  const name = `lib/${ABI}/libpolaris_lib.so`;
+  const compressed = parseZipEntries(oneEntryZip(name)).get(name);
+  assert.equal(compressed.method, 8);
+  assert.notEqual(compressed.dataOffset % 16384, 0);
+  assert.ok(compressed.compressedSize < compressed.uncompressedSize);
+  assert.equal(parseZipEntries(oneEntryZip(name, 0)).get(name).method, 0);
+  for (const lib of ['libpolaris_lib.so', 'libbox.so', 'libc++_shared.so']) {
+    const violations = run((input) => { input.zipEntries.get(`lib/${ABI}/${lib}`).method = 0; });
+    assert.equal(violations.length, 1, violations.join(' | '));
+    assert.match(violations[0], /必须用 DEFLATE/);
+  }
+});
+
+test('native compression fails closed on missing metadata and differing ZIP headers', () => {
+  const violations = run((input) => { input.zipEntries = null; });
+  assert.equal(violations.length, 1);
+  assert.match(violations[0], /ZIP 压缩方式读不出来/);
+  const zip = oneEntryZip(`lib/${ABI}/libbox.so`);
+  zip.writeUInt16LE(0, 8);
+  assert.throws(() => parseZipEntries(zip), /local and central headers differ/);
+  assert.throws(() => parseZipEntries(zip.subarray(0, zip.length - 3)), /EOCD missing/);
+});
+
+test('non-runtime .symtab/.strtab are rejected while dynamic export sections stay required', () => {
+  const violations = run((input) => input._members.set(`lib/${ABI}/libpolaris_lib.so`,
+    fakeAppSo({ sections: [...REQUIRED_ELF_SECTIONS, '.symtab', '.strtab'] })));
+  assert.equal(violations.length, 1, violations.join(' | '));
+  assert.match(violations[0], /非运行静态符号表 \.symtab \/ \.strtab/);
+  for (const missing of ['.dynamic', '.dynsym', '.dynstr']) {
+    const errors = run((input) => input._members.set(`lib/${ABI}/libpolaris_lib.so`,
+      fakeAppSo({ sections: [...REQUIRED_ELF_SECTIONS.filter((name) => name !== missing), '.rodata'] })));
+    assert.equal(errors.length, 1, errors.join(' | '));
+    assert.ok(errors[0].includes(missing));
+  }
+});
+
+test('libc++ runtime cannot disappear from the package', () => {
+  const violations = run((input) => input._members.delete(`lib/${ABI}/libc++_shared.so`));
+  assert.equal(violations.length, 1, violations.join(' | '));
+  assert.match(violations[0], /libc\+\+_shared\.so 不在 APK/);
+});
 
 test('反向对照：未变异的合成 APK 全绿', () => {
   assert.deepEqual(run(), []);
@@ -361,6 +435,7 @@ test('工作树 .srs 份数为零 ⇒ 红（`0 === 0` 不许判绿）', () => {
     readMember,
     repoLicense,
     permissions: g.permissions,
+    zipEntries: g.zipEntries,
     repoSrsCount: 0,
     fileSize: g.fileSize,
     entriesCompressedTotal: g.entriesCompressedTotal,
@@ -494,6 +569,7 @@ test('真实尺度的红/绿对照：本机实测的两份产物喂进判据，�
     repoSrsCount: SRS_COUNT,
     abi: DEFAULT_ABI,
     permissions: base.permissions,
+    zipEntries: base.zipEntries,
   };
   const entriesCompressedTotal = 218812042; // 两份包相同
 
@@ -603,7 +679,7 @@ test('正面那一半有牙：节表解析得出但缺 .text/.dynsym ⇒ 红（�
     ),
   );
   assert.equal(violations.length, 1, violations.join(' | '));
-  assert.match(violations[0], /没有 \.text \/ \.dynsym/);
+  assert.match(violations[0], /没有 \.text \/ \.dynamic \/ \.dynsym \/ \.dynstr/);
   assert.match(violations[0], /不构成任何证据/);
 });
 
@@ -622,7 +698,7 @@ test('ELF32 也要解析对（armv7 / i686 两个 ABI 是 32 位）', () => {
   const ok = strippedReport(stripped);
   assert.equal(ok.why, null, `ELF32 应解析成功，实为：${ok.why}`);
   assert.equal(ok.ok, true);
-  assert.equal(ok.sections, 5); // NULL + .text + .dynsym + .rodata + .shstrtab
+  assert.equal(ok.sections, 7); // NULL + four runtime sections + .rodata + .shstrtab
 
   const dirty = fakeElf({ cls: 32, sections: [...REQUIRED_ELF_SECTIONS, ['.debug_info', 999]] });
   const bad = strippedReport(dirty);
@@ -636,10 +712,10 @@ test('ELF32 也要解析对（armv7 / i686 两个 ABI 是 32 位）', () => {
 });
 
 test('elfSectionNames 报出的是**实际读到的**节名与字节数（正面断言的取值口）', () => {
-  const buf = fakeElf({ sections: [['.text', 100], ['.dynsym', 200], ['.debug_info', 300]] });
+  const buf = fakeElf({ sections: [['.text', 100], ['.dynsym', 200], ['.debug_info', 300], '.dynamic', '.dynstr'] });
   const parsed = elfSectionNames(buf);
   assert.equal(parsed.ok, true);
-  assert.deepEqual(parsed.names, ['', '.text', '.dynsym', '.debug_info', '.shstrtab']);
+  assert.deepEqual(parsed.names, ['', '.text', '.dynsym', '.debug_info', '.dynamic', '.dynstr', '.shstrtab']);
   assert.equal(parsed.bytes[1], 100);
   assert.equal(parsed.bytes[2], 200);
   assert.equal(parsed.bytes[3], 300);
@@ -693,8 +769,9 @@ test('ABI 真的进了判据：x86_64 的包按缺省 arm64 判 ⇒ 红（不许
   const violations = run(() => {}, { abi: 'x86_64', judgeAs: 'arm64-v8a' });
   assert.equal(hits(violations, 'lib/arm64-v8a/libbox.so 不在 APK 里'), 1, violations.join(' | '));
   assert.equal(hits(violations, 'lib/arm64-v8a/libpolaris_lib.so 不在 APK 里'), 1, violations.join(' | '));
+  assert.equal(hits(violations, 'lib/arm64-v8a/libc++_shared.so 不在 APK 里'), 1, violations.join(' | '));
   assert.equal(hits(violations, '一个 .so 都没扫到'), 1, violations.join(' | '));
-  assert.equal(violations.length, 3, violations.join(' | '));
+  assert.equal(violations.length, 4, violations.join(' | '));
 });
 
 test('ELF 机器类型对不上 ABI ⇒ 红（路径前缀不校验内容，只有这条看得见）', () => {

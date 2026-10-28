@@ -76,6 +76,27 @@ async fn default_desktop_checker_preserves_accept_and_reject_without_classifying
 }
 
 #[tokio::test]
+async fn dynamic_spawn_checker_preserves_plain_rejection_without_classifying_capacity_text() {
+    struct TextChecker;
+    #[async_trait]
+    impl ConfigChecker for TextChecker {
+        async fn check(&self, _: &Path, _: &Path) -> Result<(), String> {
+            Err(CapacityClosed.to_string())
+        }
+    }
+    let path = Path::new("unused");
+    let accepting: Arc<dyn ConfigChecker> = Arc::new(FakeChecker { ok: true });
+    assert!(accepting.check_for_spawn(path, path).await.is_ok());
+    let rejecting: Arc<dyn ConfigChecker> = Arc::new(TextChecker);
+    match rejecting.check_for_spawn(path, path).await {
+        Err(ConfigCheckFailure::Rejected(detail)) => {
+            assert_eq!(detail, CapacityClosed.to_string())
+        }
+        other => panic!("plain diagnostic changed cause: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn typed_check_and_spawn_capacity_reach_login_outcome_without_registering_a_child() {
     for during_check in [true, false] {
         let spawner = fake_spawner(vec![], false, false);

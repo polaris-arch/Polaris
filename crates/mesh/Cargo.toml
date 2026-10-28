@@ -10,6 +10,7 @@ polaris-config-engine = { path = "../config-engine" }
 polaris-helper-proto = { path = "../helper-proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.11"
 async-trait = { workspace = true }
 
 [dev-dependencies]

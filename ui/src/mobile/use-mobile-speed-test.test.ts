@@ -2,11 +2,13 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { useMobileSpeedTestStore as store, compareSpeedTestRunIds, validSpeedTestRunId, mobileSpeedTestBusy, subscribeMobileSpeedTestProgress, runMobileSpeedTest } from './use-mobile-speed-test';
 import { api } from '@/ipc';
 import { useLatencyStore } from '@/store/use-latency-store';
-import type { SpeedTestInvokeResult } from '@/contracts/speed-test';
+import { useAppStore } from '@/store/app-store';
+import type { SpeedTestInvokeResult, SpeedTestMeasurementContext } from '@/contracts/speed-test';
 
+const applyResults = useLatencyStore.getState().applyLatencyResults;
 const receipt = (runId: string, extra: Partial<SpeedTestInvokeResult> = {}): SpeedTestInvokeResult => ({ runId, results: { a: 12, b: -1 }, outcome: 'completed', notInPool: [], tsNotReady: [], ...extra });
 const done = (runId: string, extra: Record<string, unknown> = {}) => ({ runId, outcome: 'completed' as const, tested: 2, total: 2, serverIds: ['a', 'b'], pending: [], ...extra });
-beforeEach(() => { store.setState({ task: null, request: null, nextToken: 0 }); useLatencyStore.setState({latencyMap:{},testedAt:{}}); });
+beforeEach(() => { store.setState({ task: null, request: null, nextToken: 0 }); useLatencyStore.setState({latencyMap:{},testedAt:{},applyLatencyResults:applyResults}); });
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('mobile measured latency task identity', () => {
@@ -120,8 +122,83 @@ describe('mobile measured latency task identity', () => {
     result({runId:'12',serverId:'a',latency:40});
     finish(receipt('12',{results:{a:40}}));await second;
     expect(useLatencyStore.getState().latencyMap.a).toBe(40);
-    expect(apply).not.toHaveBeenCalled(); // streamed result needs no duplicate receipt write
+    expect(apply).toHaveBeenCalledOnce(); // event and receipt together write the value once
     dispose();
+  });
+
+  it('preparation has no fake total and an early prerequisite rejection clears its own request', async () => {
+    vi.spyOn(api.server, 'speedTest').mockImplementation(async () => {
+      store.getState().progress({ runId: '20', phase: 'preparingConnection' });
+      expect(store.getState().task).toMatchObject({ phase: 'preparingConnection', total: null, ok: null, results: {} });
+      expect(store.getState().begin(['b'], 'nodes')).toBeNull();
+      store.getState().progress({ runId: '20', phase: 'waitingForReady' });
+      throw { code: 'IOS_VPN_PERMISSION_DENIED' };
+    });
+    await expect(runMobileSpeedTest(['a'], 'nodes')).rejects.toMatchObject({ code: 'IOS_VPN_PERMISSION_DENIED' });
+    expect(store.getState().request).toBeNull();
+    expect(store.getState().task).toMatchObject({ phase: 'failed', total: null, results: {} });
+    expect(mobileSpeedTestBusy(store.getState())).toBe(false);
+  });
+
+  it('auto-started current measurement binds after ready; receipt fills a streamed result withheld by status verification', async () => {
+    const node = { id: 'a', name: 'a', protocol: 'vless', address: 'a.example', port: 443 } as const;
+    useAppStore.setState({ servers: [node], selectedServerId: 'a', config: { servers: [node], subscriptions: [] } as never, proxyStatus: { running: false, mainGeneration: 1 } });
+    const context: SpeedTestMeasurementContext = { runId: '21', requestId: 'speed-21', mainGeneration: 2, startTime: 123 };
+    let result!: Parameters<typeof api.server.onSpeedTestResult>[0];
+    vi.spyOn(api.server, 'onSpeedTestProgress').mockReturnValue(() => {});
+    vi.spyOn(api.server, 'onSpeedTestResult').mockImplementation(fn => { result = fn; return () => {}; });
+    vi.spyOn(api.server, 'onSpeedTestDone').mockReturnValue(() => {});
+    vi.spyOn(api.proxy, 'getStatus').mockResolvedValueOnce({ running: false, mainGeneration: 1 })
+      .mockResolvedValue({ running: true, mainGeneration: 2, startTime: 123 });
+    let finish!: (value: SpeedTestInvokeResult) => void;
+    vi.spyOn(api.server, 'speedTest').mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const write = vi.spyOn(useLatencyStore.getState(), 'applyLatencyResults');
+    const dispose = subscribeMobileSpeedTestProgress();
+    const pending = runMobileSpeedTest(['a'], 'current');
+    result({ runId: '21', serverId: 'a', latency: 42, measurementContext: context });
+    await vi.waitFor(() => expect(api.proxy.getStatus).toHaveBeenCalledOnce());
+    expect(useLatencyStore.getState().latencyMap.a).toBeUndefined();
+    expect(store.getState().task?.results.a).toBe(42);
+    expect(store.getState().task?.appliedResults).toEqual({});
+    finish(receipt('21', { results: { a: 42 }, measurementContext: context }));
+    await pending;
+    expect(useLatencyStore.getState().latencyMap.a).toBe(42);
+    expect(write).toHaveBeenCalledOnce();
+    expect(useAppStore.getState().proxyStatus).toMatchObject({ running: true, mainGeneration: 2 });
+    dispose();
+  });
+
+  it.each(['stopped', 'generation', 'selected', 'configuration', 'deleted'] as const)('rejects a ready result after %s changes', async change => {
+    const node = { id: 'a', name: 'a', protocol: 'vless', address: 'a.example', port: 443 } as const;
+    useAppStore.setState({ servers: [node], selectedServerId: 'a', config: { servers: [node], subscriptions: [] } as never, proxyStatus: { running: false, mainGeneration: 1 } });
+    const context: SpeedTestMeasurementContext = { runId: '22', requestId: 'speed-22', mainGeneration: 2, startTime: 123 };
+    let finish!: (value: SpeedTestInvokeResult) => void;
+    vi.spyOn(api.server, 'speedTest').mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const pending = runMobileSpeedTest(['a'], 'current');
+    if (change === 'selected') useAppStore.setState({ selectedServerId: 'b' });
+    if (change === 'configuration') useAppStore.setState({ config: { servers: [node], proxyMode: 'direct' } as never });
+    if (change === 'deleted') useAppStore.setState({ servers: [] });
+    vi.spyOn(api.proxy, 'getStatus').mockResolvedValue({ running: change !== 'stopped', mainGeneration: change === 'generation' ? 3 : 2, startTime: 123 });
+    finish(receipt('22', { results: { a: 42 }, measurementContext: context }));
+    await pending;
+    expect(useLatencyStore.getState().latencyMap.a).toBeUndefined();
+  });
+
+  it('a stop received while getStatus is pending cannot be overwritten by its older running answer', async () => {
+    const node = { id: 'a', name: 'a', protocol: 'vless', address: 'a.example', port: 443 } as const;
+    useAppStore.setState({ servers: [node], selectedServerId: 'a', config: { servers: [node], subscriptions: [] } as never,
+      proxyStatus: { running: true, mainGeneration: 2, startTime: 123 } });
+    const context = { runId: '23', requestId: 'speed-23', mainGeneration: 2, startTime: 123 };
+    vi.spyOn(api.server, 'speedTest').mockResolvedValue(receipt('23', { results: { a: 42 }, measurementContext: context }));
+    let finish!: (status: { running: boolean; mainGeneration: number; startTime: number }) => void;
+    vi.spyOn(api.proxy, 'getStatus').mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const pending = runMobileSpeedTest(['a'], 'nodes');
+    await vi.waitFor(() => expect(api.proxy.getStatus).toHaveBeenCalled());
+    useAppStore.setState({ proxyStatus: { running: false, mainGeneration: 2 } });
+    finish({ running: true, mainGeneration: 2, startTime: 123 });
+    await pending;
+    expect(useLatencyStore.getState().latencyMap.a).toBeUndefined();
+    expect(useAppStore.getState().proxyStatus?.running).toBe(false);
   });
 
 });

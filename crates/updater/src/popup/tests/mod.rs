@@ -387,8 +387,10 @@ fn action_whitelist_per_phase_matches_upstream() {
     assert!(Skip.is_valid_for(PopupPhase::Remind));
     assert!(ViewLog.is_valid_for(PopupPhase::Remind));
     assert!(!Retry.is_valid_for(PopupPhase::Remind));
-    // progress：仅 cancel
+    assert!(Close.is_valid_for(PopupPhase::Remind));
+    // progress：关闭界面，不打断后台任务
     assert!(Cancel.is_valid_for(PopupPhase::Progress));
+    assert!(Close.is_valid_for(PopupPhase::Progress));
     assert!(!Update.is_valid_for(PopupPhase::Progress));
     // error：retry / manualDownload / close
     assert!(Retry.is_valid_for(PopupPhase::Error));

@@ -256,4 +256,19 @@ class MainKernelAttemptTest {
         assertEquals(null, registry.exactCloseTarget(target).owner)
         assertFalse(registry.claim(MainKernelAttempt<Any>()))
     }
+
+    @Test fun scopedStoreBelongsToOriginalMainTicketAndBirthAcrossReloadAndRecreation() {
+        val ledger = AndroidNativeAdmission("main-process").also { it.bootstrap(RequiredMarkerProof.Absent) }
+        val ticket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "original")
+        val original = MainKernelAttempt<Any>(runId = "original", nativeTicket = ticket)
+        val store = original.bindTailscaleStore(ledger)
+        assertTrue(store === original.bindTailscaleStore(ledger))
+        assertEquals(ticket.id, store.wire().getString("nativeTicketId"))
+        assertEquals(original.birthNonce, store.wire().getString("mainBirthNonce"))
+        val next = MainKernelAttempt<Any>(runId = "next", nativeTicket = ledger.reserveOwner(AndroidNativeAdmission.Kind.Main, "next"))
+        assertFalse(store === next.bindTailscaleStore(ledger))
+        assertFalse(store.matches(next.tailscaleStore!!.wire()))
+        assertTrue(runCatching { ledger.bindTailscaleStore(ticket, next.birthNonce) }.isFailure)
+    }
+
 }

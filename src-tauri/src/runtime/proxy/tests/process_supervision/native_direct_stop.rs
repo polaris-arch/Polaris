@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(unix)]
+use crate::runtime::proxy::mesh_apply::owner_proof::{ATTACHED, FACTORY_ENTERED, RETIRED};
+#[cfg(unix)]
+use polaris_core_supervisor::{SingBoxSpawner, TokioSpawner};
 use std::future::{poll_fn, Future};
 use std::io;
 use std::process::ExitStatus;
@@ -124,10 +128,111 @@ async fn live_main_run(
     u32,
 ) {
     let (rt, dir) = test_runtime();
-    let child = spawn_custody_stand_in();
-    let pid = child.id().unwrap();
-    let (identity, token) = install_main_run(&rt, child, pid, server_id).await;
+    #[cfg(unix)]
+    let (identity, token, pid) = protected_main_run(&rt, &dir, server_id).await;
+    #[cfg(not(unix))]
+    let (identity, token, pid) = {
+        let child = spawn_custody_stand_in();
+        let pid = child.id().unwrap();
+        let (identity, token) = install_main_run(&rt, child, pid, server_id).await;
+        (identity, token, pid)
+    };
     (rt, dir, identity, token, pid)
+}
+
+/// Harmless local sleep fixture, routed through the same production factory.
+#[cfg(unix)]
+fn native_fixture_request(
+    dir: &TestDir,
+    stdio: polaris_core_supervisor::StdioPolicy,
+) -> polaris_core_supervisor::SpawnRequest {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = dir.join("native-child-fixture.sh");
+    std::fs::write(&binary, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    polaris_core_supervisor::SpawnRequest::new(
+        binary,
+        dir.join("ignored-native-fixture-config"),
+        stdio,
+    )
+}
+
+#[cfg(unix)]
+async fn protected_main_run(
+    rt: &Arc<ProxyRuntime>,
+    dir: &TestDir,
+    server_id: &str,
+) -> (
+    RunIdentity,
+    crate::runtime::tailscale_login_core::MainBirthToken,
+    u32,
+) {
+    use super::super::super::prerequisite::NormalStartCompletion;
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let mut completion = rt.normal_start_completion(serde_json::Value::Null).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while matches!(
+            &*completion.borrow_and_update(),
+            NormalStartCompletion::Pending(_)
+        ) {
+            completion.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("actual normal producer admission before TS wait");
+    let generation = rt.core_generation();
+    assert!(
+        matches!(&*completion.borrow(), NormalStartCompletion::Starting(owner) if *owner == generation)
+    );
+    let producer = rt.admitted_native_producer(generation).unwrap().unwrap();
+    let state = rt.mesh.tailscale_state_dir(server_id).unwrap();
+    let token = rt.mesh.mint_tailscale_main_birth();
+    let mut reservation = rt
+        .mesh
+        .reserve_tailscale_main_states(
+            &serde_json::json!({"endpoints":[{"type":"tailscale", "state_directory":state}]}),
+            &gate,
+            token.clone(),
+        )
+        .await
+        .unwrap();
+    let (pid, identity) = rt
+        .spawn_direct_native(
+            Some(&producer),
+            generation,
+            || {
+                TokioSpawner::new()
+                    .spawn(native_fixture_request(
+                        dir,
+                        polaris_core_supervisor::StdioPolicy::Discard,
+                    ))
+                    .map(|spawned| spawned.child)
+            },
+            Some(token.clone()),
+            || reservation.arm_external_start(),
+        )
+        .unwrap()
+        .expect("actual protected factory installs fixture Child");
+    *rt.pid.lock().unwrap() = Some(pid);
+    drop(reservation);
+    drop(gate);
+    // The ordinary continuation sees its already-installed Child and returns;
+    // only that actual return closes dispatch. No manual mark-admitted/finished.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !matches!(
+            &*completion.borrow_and_update(),
+            NormalStartCompletion::Finished(Err(_), _)
+        ) {
+            completion.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("ordinary producer returns without starting another core");
+    assert!(
+        !producer.reclaimable(),
+        "attached Child remains a responsibility after observer failure"
+    );
+    (identity, token, pid)
 }
 
 fn assert_retained_main(rt: &ProxyRuntime, server_id: &str, pid: u32) {
@@ -355,6 +460,11 @@ async fn reaped_native_child_survives_commit_error_and_retry_uses_cached_exit() 
         .await
         .unwrap_err();
     assert!(error.contains("main claim release requires TS gate"));
+    #[cfg(unix)]
+    assert!(
+        rt.child.lock().unwrap().native_exit_for_test(),
+        "actual native fact survives fallible registry commit"
+    );
     assert_retained_main(&rt, "native-cached-exit", pid);
     assert_eq!(
         rt.child
@@ -404,6 +514,11 @@ async fn native_exit_does_not_release_successor_main_claim_and_can_retry_origina
         .await
         .unwrap_err()
         .contains("no longer matches"));
+    #[cfg(unix)]
+    assert!(
+        rt.child.lock().unwrap().native_exit_for_test(),
+        "actual native fact survives fallible registry commit"
+    );
     assert_retained_main(&rt, "native-main-successor", pid);
     assert!(rt
         .main_token_for_stop()
@@ -440,6 +555,11 @@ async fn poisoned_registry_retains_native_exit_child_pid_and_claim_without_resig
         .await
         .unwrap_err()
         .contains("registry lock poisoned"));
+    #[cfg(unix)]
+    assert!(
+        rt.child.lock().unwrap().native_exit_for_test(),
+        "actual native fact survives fallible registry commit"
+    );
     assert_retained_main(&rt, "native-main-poison", pid);
     assert_eq!(
         rt.child
@@ -485,12 +605,27 @@ fn windows_native_terminate_uses_owned_handle_without_blocking_pid_command() {
 #[tokio::test]
 async fn old_native_booking_cannot_unbook_retry_or_retire_replacement_run() {
     let (rt, _dir) = test_runtime();
-    let mut child = spawn_custody_stand_in();
-    child.kill().await.unwrap();
+    #[cfg(unix)]
+    let _protected = protected_main_run(&rt, &_dir, "native-booking").await;
+    #[cfg(not(unix))]
+    {
+        let mut child = spawn_custody_stand_in();
+        child.kill().await.unwrap();
+        rt.child
+            .lock()
+            .unwrap()
+            .install_running_for_test(DirectCoreRun::new(child));
+    }
+    #[cfg(unix)]
     rt.child
         .lock()
         .unwrap()
-        .install_running_for_test(DirectCoreRun::new(child));
+        .running_for_test()
+        .unwrap()
+        .child_for_test()
+        .start_kill()
+        .unwrap();
+    let gate = rt.mesh.tailscale_state_gate().await;
     let (identity, old_nonce) = rt
         .child
         .lock()
@@ -524,8 +659,26 @@ async fn old_native_booking_cannot_unbook_retry_or_retire_replacement_run() {
         assert!(slot
             .retire_native_stop(&identity, &old_nonce, |_| panic!("stale release"))
             .is_err());
-        slot.retire_native_stop(&identity, &retry_nonce, |_| Ok(()))
+        #[cfg(unix)]
+        assert!(
+            slot.native_exit_for_test(),
+            "retry keeps original fact but validates current booking"
+        );
+        let terminal = slot
+            .retire_native_stop(&identity, &retry_nonce, |token| {
+                assert!(rt
+                    .mesh
+                    .release_tailscale_main_states_if_token(token, &gate)?);
+                Ok(())
+            })
             .unwrap();
+        #[cfg(unix)]
+        assert!(terminal.as_ref().unwrap().same_run_for_test(&identity));
+        #[cfg(not(unix))]
+        assert!(
+            terminal.is_none(),
+            "synthetic unbound fixture issues no terminal"
+        );
     }
     let replacement = DirectCoreRun::new(spawn_custody_stand_in());
     let replacement_identity = replacement.identity.clone();
@@ -706,4 +859,205 @@ async fn empty_child_slot_and_poisoned_main_registry_never_authorize_exit() {
         .unwrap_err()
         .contains("unknown"));
     assert!(*rt.desktop_shutdown.lock().unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_factory_native_terminal_reclaims_original_cell_and_admits_successor() {
+    let (rt, dir, _identity, _token, _pid) = live_main_run("native-proof-positive").await;
+    let birth_generation = rt.core_generation();
+    let original = rt
+        .admitted_native_producer(birth_generation)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        original.observation().3,
+        vec![ATTACHED],
+        "one actual returned Child seals exactly one member"
+    );
+    assert!(
+        original.observation().2,
+        "ordinary producer actually returned"
+    );
+    let stop_generation = rt
+        .gate
+        .claim_generation(None, polaris_core_supervisor::LifecycleKind::Stop)
+        .unwrap();
+    assert_ne!(birth_generation, stop_generation);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    rt.kill_core_and_release_main(&gate).await.unwrap();
+    assert!(rt.child.lock().unwrap().is_empty());
+    assert_eq!(*rt.pid.lock().unwrap(), None);
+    assert!(!rt.mesh.main_owns_tailscale("native-proof-positive", true));
+    assert_eq!(
+        original.observation().3,
+        vec![RETIRED],
+        "real native wait and real retire consume original birth"
+    );
+    assert!(original.reclaimable());
+    assert!(rt
+        .admitted_native_producer(birth_generation)
+        .unwrap()
+        .is_none());
+    drop(gate);
+    // Successor uses actual ordinary enrollment/admission and same protected factory.
+    let (_identity, _token, _pid) = protected_main_run(&rt, &dir, "native-proof-positive").await;
+    let successor = rt
+        .admitted_native_producer(rt.core_generation())
+        .unwrap()
+        .unwrap();
+    assert!(!Arc::ptr_eq(&original, &successor));
+    assert!(rt.core_generation() > stop_generation);
+    let gate = rt.mesh.tailscale_state_gate().await;
+    rt.kill_core_and_release_main(&gate).await.unwrap();
+    assert!(successor.reclaimable());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn synchronous_drain_panic_retains_factory_entered_unknown_after_dispatch_return() {
+    const CHILD_ENV: &str = "POLARIS_NATIVE_DRAIN_PANIC_FIXTURE";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        // Panic intentionally poisons the real process-singleton check admission.
+        // Isolate that production fault without resetting or weakening the singleton.
+        let dir = fresh_test_dir();
+        let output_path = dir.join("native-drain-panic-worker.log");
+        let output = std::fs::File::create(&output_path).unwrap();
+        let test_name = concat!(
+            module_path!(),
+            "::synchronous_drain_panic_retains_factory_entered_unknown_after_dispatch_return"
+        )
+        .split_once("::")
+        .unwrap()
+        .1;
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(output.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(output))
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+            Ok(status) => status.unwrap(),
+            Err(_) => {
+                child.start_kill().unwrap();
+                tokio::time::timeout(Duration::from_secs(2), child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                panic!("isolated native Drain panic fixture timed out");
+            }
+        };
+        let output = std::fs::read_to_string(output_path).unwrap();
+        assert!(status.success(), "isolated fixture failed: {output}");
+        assert!(
+            output.contains(test_name)
+                && output.contains("running 1 test")
+                && output.contains("test result: ok. 1 passed; 0 failed;")
+                && output.contains("POLARIS_U301A_DRAIN_PANIC_UNKNOWN_CHECKED"),
+            "exact one-test worker must execute every Unknown assertion: {output}"
+        );
+        return;
+    }
+    use super::super::super::prerequisite::NormalStartCompletion;
+    let (rt, _dir) = test_runtime();
+    let gate = rt.mesh.tailscale_state_gate().await;
+    let mut completion = rt.normal_start_completion(serde_json::Value::Null).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while matches!(
+            &*completion.borrow_and_update(),
+            NormalStartCompletion::Pending(_)
+        ) {
+            completion.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let generation = rt.core_generation();
+    let producer = rt.admitted_native_producer(generation).unwrap().unwrap();
+    // /bin/true exits immediately; the permitted stand-in never launches a core.
+    let request = polaris_core_supervisor::SpawnRequest::new(
+        "/bin/true",
+        "/unused-fixture-config",
+        polaris_core_supervisor::StdioPolicy::drain(|_stdout, _stderr| {
+            panic!("fixture synchronous Drain panic")
+        }),
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.spawn_direct_native(
+            Some(&producer),
+            generation,
+            || {
+                TokioSpawner::new()
+                    .spawn(request)
+                    .map(|spawned| spawned.child)
+            },
+            None,
+            || {},
+        )
+    }))
+    .is_err());
+    assert_eq!(
+        producer.observation().3,
+        vec![FACTORY_ENTERED],
+        "factory entered before callback could unwind"
+    );
+    drop(gate);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !matches!(
+            &*completion.borrow_and_update(),
+            NormalStartCompletion::Finished(Err(_), _)
+        ) {
+            completion.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(producer.observation().2);
+    assert!(
+        !producer.reclaimable(),
+        "returned observer error cannot prove no Child after factory panic"
+    );
+    assert!(rt.admitted_native_producer(generation).unwrap().is_some());
+    eprintln!("POLARIS_U301A_DRAIN_PANIC_UNKNOWN_CHECKED");
+}
+
+#[tokio::test]
+async fn unbound_fixture_native_wait_issues_no_typed_birth_fact() {
+    let (rt, _dir) = test_runtime();
+    let child = spawn_custody_stand_in();
+    rt.child
+        .lock()
+        .unwrap()
+        .install_running_for_test(DirectCoreRun::new(child));
+    let (identity, nonce) = rt
+        .child
+        .lock()
+        .unwrap()
+        .begin_native_stop()
+        .unwrap()
+        .unwrap();
+    rt.child
+        .lock()
+        .unwrap()
+        .signal_native_stop(&identity, &nonce, |child| child.start_kill())
+        .unwrap();
+    let native = NativeWaitIo::new(WaitFault::Native);
+    poll_fn(|cx| {
+        rt.child
+            .lock()
+            .unwrap()
+            .poll_native_wait(&identity, &nonce, cx, |child, cx| {
+                native.poll_wait(child, cx)
+            })
+    })
+    .await
+    .unwrap();
+    let mut slot = rt.child.lock().unwrap();
+    assert!(!slot.native_exit_for_test());
+    slot.retire_native_stop(&identity, &nonce, |_| panic!("fixture has no main token"))
+        .unwrap();
+    assert!(slot.is_empty());
 }

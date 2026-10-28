@@ -3,6 +3,25 @@
 use super::*;
 
 #[test]
+fn live_claim_busy_reads_the_already_held_depth() {
+    let gate = LifecycleGate::default();
+    assert_eq!(
+        gate.with_current_generation(0, |live| live.is_busy()),
+        Some(false)
+    );
+    gate.begin();
+    assert_eq!(
+        gate.with_current_generation(0, |live| live.is_busy()),
+        Some(true)
+    );
+    gate.end(LifecycleKind::Start);
+    assert_eq!(
+        gate.with_current_generation(0, |live| live.is_busy()),
+        Some(false)
+    );
+}
+
+#[test]
 fn publication_guard_blocks_all_generation_writers_but_not_readers() {
     use std::sync::{mpsc, Arc};
     use std::time::Duration;

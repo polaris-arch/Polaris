@@ -51,7 +51,8 @@ mod uninstall_command;
 
 pub use app_update::{
     update_check, update_download, update_get_progress, update_install, update_open_releases,
-    update_popup_action, update_popup_show, update_skip, version_get_info,
+    update_popup_action, update_popup_show, update_request_install_permission, update_skip,
+    version_get_info,
 };
 pub use core_update::{
     core_get_version_info, core_replace_manual, core_reset_factory, core_rollback,

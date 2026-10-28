@@ -54,12 +54,13 @@ class TransientLoginHostStateTest {
         val failures = mutableListOf<String>()
         var factoryFailure: Throwable? = null
         var parseFailure: Throwable? = null
+        var parseAction: () -> Unit = {}
         var configure: (FakeEngine) -> Unit = { }
         val host = TransientLoginHostState(
             ledger = ledger,
             queue = queue::submit,
             schedule = clock::schedule,
-            parseDirectories = { parseFailure?.let { throw it }; setOf(directory.canonicalPath) },
+            parseDirectories = { parseAction(); parseFailure?.let { throw it }; setOf(directory.canonicalPath) },
             requireSupported = { },
             createEngine = { id, _, directories, stop ->
                 factoryFailure?.let { throw it }
@@ -73,6 +74,8 @@ class TransientLoginHostStateTest {
             .single { it.ticket.kind == AndroidNativeAdmission.Kind.Login && it.ticket.logicalId == id }.ticket
 
         inner class FakeEngine(val id: String, val stop: () -> Unit) : TransientLoginHostState.Engine {
+            var scopedStore: AndroidTailscaleStoreCustody? = null
+            override fun bindTailscaleStore(store: AndroidTailscaleStoreCustody) { check(scopedStore == null); scopedStore = store }
             val closes = AtomicInteger()
             val resolver = TransientResolverLifecycle(Executor { task -> cancellation.submit { task.run() } })
             val stages = mutableListOf<String>()
@@ -599,4 +602,94 @@ class TransientLoginHostStateTest {
         assertEquals("login-A", f.cache.readText())
         assertEquals(listOf("retry"), f.failures)
     }
+
+    @Test fun typedOldCloseSelectsOriginalEntryAndLateCompletionCannotCloseSuccessor() {
+        val f = Fixture()
+        val started = start(f, "login-A")
+        f.queue.runNext(); await(started.done)
+        val old = f.engine("login-A")
+        val binding = checkNotNull(old.scopedStore).wire()
+        assertEquals("login-A", binding.getString("logicalInstanceId"))
+        val closed = Reply<AndroidNativeFailure?>()
+        f.host.closeTailscale(binding, closed.callback)
+        f.queue.runNext(); await(closed.done)
+        assertEquals(null, closed.value.get())
+        assertEquals(1, old.closes.get())
+        val nextStarted = start(f, "login-B")
+        f.queue.runNext(); await(nextStarted.done)
+        val next = f.engine("login-B")
+        val late = Reply<AndroidNativeFailure?>()
+        f.host.closeTailscale(binding, late.callback); await(late.done)
+        assertEquals(null, late.value.get())
+        assertEquals(0, next.closes.get())
+        assertTrue(f.host.running("login-B"))
+        val forged = org.json.JSONObject(binding.toString()).put("logicalInstanceId", "login-B")
+        val rejected = Reply<AndroidNativeFailure?>()
+        f.host.closeTailscale(forged, rejected.callback); await(rejected.done)
+        assertEquals("nativeRetirementUnknown", rejected.value.get()!!.message)
+        assertEquals(0, next.closes.get())
+        assertEquals(null, old.scopedStore!!.closedRelation(ScopedNativeFixture.file("one")))
+        val cleanup = close(f, "login-B"); f.queue.runNext(); await(cleanup.done)
+    }
+
+    @Test fun coldCreateEngineFailureBeforeStoreBindingKeepsExactTupleReadableAndClosable() {
+        val f = Fixture(); val tuple = ScopedNativeFixture.warm(f.ledger, "warm-factory")
+        f.ledger.beginWarm(tuple)
+        f.factoryFailure = IllegalStateException("factory entered then failed")
+        val reply = Reply<TransientLoginHost.StartFailure?>()
+        f.host.start("warm-factory", ScopedNativeFixture.warmConfig, reply.callback)
+        assertTrue(f.ledger.readWarm(tuple).getString("childNativeTicketId").isNotEmpty())
+        f.queue.runNext(); await(reply.done)
+        assertTrue(reply.value.get() != null); assertTrue(f.engines.isEmpty())
+        val management = f.ledger.readWarm(tuple)
+        assertEquals("Unknown", management.getString("globalState"))
+        assertTrue(management.getBoolean("held")); assertFalse(management.has("runtime"))
+        val close = Reply<AndroidNativeFailure?>()
+        f.ledger.beginWarmClose(tuple, "warm-close")
+        f.host.closeTailscale(tuple, close.callback)
+        if (f.queue.size() > 0) f.queue.runNext()
+        await(close.done)
+        assertEquals(null, close.value.get())
+        assertTrue(f.ledger.readWarm(tuple).getBoolean("held"))
+        assertTrue(runCatching { f.ledger.finishWarm(tuple) }.isFailure)
+        val next = Reply<TransientLoginHost.StartFailure?>()
+        f.host.start("warm-factory", ScopedNativeFixture.warmConfig, next.callback)
+        await(next.done); assertTrue(next.value.get() != null)
+        assertTrue(f.engines.isEmpty())
+    }
+
+    @Test fun warmPreparationFailureBeforeNativeCanCancelOnlyAfterTheRegistrationLeaseCloses() {
+        val f = Fixture(); val tuple = ScopedNativeFixture.warm(f.ledger, "warm-parse")
+        f.ledger.beginWarm(tuple); f.parseFailure = IllegalStateException("parser rejected")
+        val reply = Reply<TransientLoginHost.StartFailure?>()
+        f.host.start("warm-parse", ScopedNativeFixture.warmConfig, reply.callback)
+        await(reply.done)
+        assertTrue(reply.value.get() != null); assertTrue(f.engines.isEmpty()); assertEquals(0, f.queue.size())
+        val management = f.ledger.readWarm(tuple)
+        assertEquals("CancelledBeforeBirth", management.getString("globalState"))
+        assertFalse(management.getBoolean("childRegistrationOpen")); assertEquals("", management.getString("childNativeTicketId"))
+        assertTrue(f.ledger.finishWarm(tuple).getBoolean("released"))
+    }
+
+    @Test fun warmCloseDuringOriginalParsingCancelsExactTicketWithoutGuessingPendingChild() {
+        val f = Fixture(); val tuple = ScopedNativeFixture.warm(f.ledger, "warm-parsing")
+        f.ledger.beginWarm(tuple)
+        val parsing = CountDownLatch(1); val resume = CountDownLatch(1)
+        f.parseAction = { parsing.countDown(); await(resume) }
+        val reply = Reply<TransientLoginHost.StartFailure?>()
+        val thread = Thread { f.host.start("warm-parsing", ScopedNativeFixture.warmConfig, reply.callback) }
+        thread.start(); await(parsing)
+        assertTrue(f.ledger.readWarm(tuple).getBoolean("childRegistrationOpen"))
+        val closed = Reply<AndroidNativeFailure?>()
+        f.ledger.beginWarmClose(tuple, "same-parsing-close")
+        f.host.closeTailscale(tuple, closed.callback); await(closed.done)
+        assertEquals(null, closed.value.get())
+        assertEquals("CancelledBeforeBirth", f.ledger.readWarm(tuple).getString("globalState"))
+        assertTrue(runCatching { f.ledger.finishWarm(tuple) }.isFailure)
+        resume.countDown(); thread.join(2_000); assertFalse(thread.isAlive); await(reply.done)
+        assertTrue(reply.value.get() != null); assertTrue(f.engines.isEmpty()); assertEquals(0, f.queue.size())
+        assertFalse(f.ledger.readWarm(tuple).getBoolean("childRegistrationOpen"))
+        assertTrue(f.ledger.finishWarm(tuple).getBoolean("released"))
+    }
+
 }

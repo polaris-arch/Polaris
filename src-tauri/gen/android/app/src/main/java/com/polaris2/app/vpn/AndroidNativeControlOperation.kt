@@ -29,6 +29,7 @@ internal class AndroidNativeControlOperation private constructor(
                 ledger.cancelBeforeBirth(ticket)
                 return@synchronized false
             }
+            ledger.linkControl(ticket, attempt.nativeTicket)
             action(boundary)
             if (boundary.entered && (attempt.revoked || !allowed())) throw Revoked()
             if (boundary.entered) {

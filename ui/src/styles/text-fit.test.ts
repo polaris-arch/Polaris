@@ -1282,8 +1282,8 @@ describe('⓪ 取材面：移动端每一份 CSS 都必须在面内（新增一�
    *
    * ⚠️ **2026-09-05：设置屏长出了第一份 `.css`**（`settings/settings.css`，K5-02 的两列列流）。
    * 上面那条恰等断言当场红了 —— 记号如期过期，已连同 `CSS_FILES` 一起登记。
-   * 这份 CSS 如今还装独立的网段报告展开明细；它不改设置行本身的几何。
-   * 下面将两族选择器分开核对，设置行几何一旦搬进 CSS，≈162px 的登记仍会红。
+   * 这份 CSS 如今还装独立的网段报告摘要与展开明细；它不改设置行本身的几何。
+   * 下面将报告选择器与设置行分开核对，设置行几何一旦搬进 CSS，≈162px 的登记仍会红。
    */
   it('自曝：设置行几何仍走内联；网段明细独立于设置行', () => {
     expect(
@@ -1291,9 +1291,12 @@ describe('⓪ 取材面：移动端每一份 CSS 都必须在面内（新增一�
       '设置屏的 CSS 不止一份 —— 下面那段射程声明要重写',
     ).toEqual(['../mobile/settings/settings.css']);
     const declarations = ctxOf('../mobile/settings/settings.css').decls;
-    const details = declarations.filter((d) => d.sels.every((sel) => sel.includes('.ms-force-')));
-    expect(details.length, '网段明细 CSS 不在本面，选择器分组失效').toBeGreaterThan(0);
-    const props = [...new Set(declarations.filter((d) => !details.includes(d)).map((d) => d.prop))].sort();
+    const report = declarations.filter((d) => d.sels.every((sel) =>
+      sel.includes('.ms-force-') || sel.includes('.ms-mesh-status'),
+    ));
+    expect(report.length, '网段报告 CSS 不在本面，选择器分组失效').toBeGreaterThan(0);
+    expect(report.some((d) => d.sels.includes('.ms-mesh-status')), '摘要不能离开 CSS 取材面').toBe(true);
+    const props = [...new Set(declarations.filter((d) => !report.includes(d)).map((d) => d.prop))].sort();
     expect(
       props,
       '`settings.css` 声明的属性集变了 —— 它一旦开始装行几何（padding / min-height / font-size…），' +

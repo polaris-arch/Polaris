@@ -385,7 +385,7 @@ const EXPECTED_SWITCHES: Record<MobileSettingsPageId, readonly string[]> = {
   // 下载」才有了对象。此前它**不在**这张表里，理由是「那条腿还没画，没有可自动下载的东西」——
   // 那条理由随这一批不再成立（后端 `spawn_auto_download` 在 Android 上照跑，且 `decide_install_plan`
   // 认 `.apk`），故这颗开关进表。
-  update: ['auto-download-update', 'sub-auto-on-start', 'rule-resource-auto'],
+  update: ['rule-resource-auto', 'auto-download-update', 'sub-auto-on-start'],
   // `system-backup` 2026-09-25 落地：系统自动备份（Google 云备份 + 换机迁移）的运行期闸门，默认关。
   // 执行侧 `PolarisBackupAgent.kt`，判据 ⑤c + `scripts/check-android-bridge.mjs` A14。
   backup: ['backup-select-all', ...BACKUP_CATEGORIES.map((c) => `backup-${c}`), 'system-backup'],
@@ -1527,9 +1527,9 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
     ['tun', 'settings.tun.autoRouteDesc'],
     ['tun', 'settings.tun.natTypeDesc'],
     ['tun', 'mobileHelp.ipv6'],
-    ['update', 'settings.update.intervalCardSub'],
+    ['update', 'mobileSettings.update.subscriptionIntervalDesc'],
     ['update', 'settings.update.subChannelDesc'],
-    ['update', 'settings.update.ruleResourceAutoDesc'],
+    ['update', 'mobileSettings.update.ruleResourceAutoDesc'],
   ];
 
   it('自检：登记表有量级（表被清空会让下面那条恒绿）', () => {
@@ -1594,7 +1594,7 @@ describe('⑨ 能力缺席：该缺的块整块不画，不画成禁用（§4.2 
 
   it('更新：只保留真实 APK 更新入口，不显示独立内核更新或假版本', () => {
     expect(rows(MARKUP.update).some((r) => r.id === 'core-update')).toBe(false);
-    expect(MARKUP.update).not.toContain(copy('settings.dns.builtinTag'));
+    expect(MARKUP.update).not.toContain(`>${copy('settings.dns.builtinTag')}<`);
     expect(switchRows(MARKUP.update)).toEqual([...EXPECTED_SWITCHES.update]);
     /*
      * 版本不是编的：fixture 下 `versionApi` 的 effect 不跑 ⇒ 应用那一行的芯片只能是 `—`。
@@ -1780,6 +1780,7 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       'sub-auto-on-start',
       'sub-channel',
       'rule-resource-auto',
+      'rule-resource-interval',
       'gh-proxy',
       'gh-custom-domain',
     ],

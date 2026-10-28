@@ -34,7 +34,7 @@ body *::-webkit-scrollbar { display: none; }
    * `--safe-*` 同一条接缝、同两条投递通道）。此前这里记着「生产端属 Kotlin 面、刻意不立门」——
    * 那句话的前提（没人能修）已经不成立，两侧的门分别在
    * `mobile-entry.test.ts` ⑧（原生生产端）与 `dynamic-type.test.ts`（CSS 消费端 + 竖排回退）。
-   * iOS 侧仍无生产端，缺省 1 继续兜底。
+   * iOS 由当前 WebView 的 UIFontMetrics.body 比例生产；原生信号到达前缺省 1 兜底。
    *
    * ⚠️ 为什么不能把 `--font-scale` 写进 `tokens.resolved.css`：它不匹配契约 C 的白名单前缀
    *    （`--tap-*` / `--safe-*` / `--shadow-sheet`），写进入口 `mobile-token-parity` 当场红。
@@ -702,3 +702,278 @@ body {
 .m-select-head .m-select-x { flex: none; width: var(--tap-min); min-height: var(--tap-min); padding: 0; justify-content: center; color: hsl(var(--fg-dim)); cursor: pointer; }
 .m-select-x svg { width: 20px; height: 20px; }
 .m-select-group { margin: 12px 12px 4px; color: hsl(var(--fg-dim)); font-size: 0.8125rem; }
+
+
+/* iOS uses one grid and the same scroll, feedback and navigation nodes at
+ * every size. Only navigation changes its placement; pending actions remain
+ * below content in normal flow, including on pushed pages without navigation.
+ * This baseline does not infer a device. Native reserved geometry is consumed
+ * separately by local chrome and panel constraints below.
+ */
+:root[data-mobile-os='ios'] .m-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  position: relative;
+  padding-bottom: var(--safe-b);
+  --ios-rail-w: 80px;
+  --rail-edge-safe: var(--safe-r);
+}
+
+:root[data-mobile-os='ios'][dir='rtl'] .m-shell {
+  --rail-edge-safe: var(--safe-l);
+}
+
+:root[data-mobile-os='ios'] .m-scroll {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+
+:root[data-mobile-os='ios'] .m-dock {
+  display: contents;
+}
+
+:root[data-mobile-os='ios'] .m-pending-slot {
+  grid-area: 2 / 1;
+  min-width: 0;
+  padding-left: var(--safe-l);
+  padding-right: var(--safe-r);
+  background: hsl(var(--surface));
+}
+
+:root[data-mobile-os='ios'] .m-nav {
+  grid-area: 3 / 1;
+  padding-left: var(--safe-l);
+  padding-right: var(--safe-r);
+  border-top: 1px solid hsl(var(--line));
+  background: hsl(var(--surface));
+}
+
+/* The toast overlays the bottom of the content row, above pending actions and
+ * navigation. Its grid containing block follows the same row in either layout.
+ */
+:root[data-mobile-os='ios'] .m-toast-host {
+  grid-area: 1 / 1 / 2 / 2;
+  bottom: 0;
+}
+
+/* Native UIKit traits choose this compatibility layout. These signals are
+ * not device identity, iOS 27.1 verticalBarEdge or fold reserved regions.
+ * The rail follows reading direction until UIKit bar-edge signals are available.
+ */
+:root[data-mobile-os='ios'][data-ios-horizontal-size-class='regular'] .m-shell,
+:root[data-mobile-os='ios'][data-ios-vertical-size-class='compact'] .m-shell {
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+:root[data-mobile-os='ios'][data-ios-horizontal-size-class='regular'] .m-shell[data-navigation='visible'],
+:root[data-mobile-os='ios'][data-ios-vertical-size-class='compact'] .m-shell[data-navigation='visible'] {
+  grid-template-columns: minmax(0, 1fr) max-content;
+}
+
+:root[data-mobile-os='ios'][data-ios-horizontal-size-class='regular'] .m-nav,
+:root[data-mobile-os='ios'][data-ios-vertical-size-class='compact'] .m-nav {
+  grid-column: 2;
+  grid-row: 1 / 3;
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: stretch;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--rail-edge-safe) 0 0;
+  min-height: 0;
+  min-width: 0;
+  border-top: 0;
+  border-inline-start: 1px solid hsl(var(--line));
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+:root[data-mobile-os='ios'][data-ios-horizontal-size-class='regular'] .m-nav-item,
+:root[data-mobile-os='ios'][data-ios-vertical-size-class='compact'] .m-nav-item {
+  flex: 0 0 auto;
+  width: var(--ios-rail-w);
+  min-width: 0;
+  max-width: none;
+  min-height: 64px;
+}
+
+:root[data-mobile-os='ios'][data-ios-horizontal-size-class='regular'] .m-nav-item::before,
+:root[data-mobile-os='ios'][data-ios-vertical-size-class='compact'] .m-nav-item::before {
+  top: 50%;
+  left: auto;
+  inset-inline-start: 0;
+  width: var(--nav-indicator-h);
+  height: var(--nav-indicator-w);
+  transform: translateY(-50%);
+  border-radius: var(--nav-indicator-h);
+}
+
+:root[data-mobile-os='ios'][data-ios-horizontal-size-class='regular'] .m-nav-label,
+:root[data-mobile-os='ios'][data-ios-vertical-size-class='compact'] .m-nav-label {
+  max-width: calc(var(--ios-rail-w) - 8px);
+}
+
+:root[data-mobile-os='ios'][data-ios-horizontal-size-class='regular'][dir='rtl'] .m-nav,
+:root[data-mobile-os='ios'][data-ios-vertical-size-class='compact'][dir='rtl'] .m-nav {
+  padding-left: var(--rail-edge-safe);
+  padding-right: 0;
+}
+
+/* UIKit resolves leading/trailing to a physical side. Grid line numbering
+ * follows dir, so the RTL rules below keep that same physical side. */
+:root[data-mobile-os='ios']:is([data-ios-vertical-bar-side='left'], [data-ios-vertical-bar-side='right']) .m-shell[data-navigation='visible'] {
+  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) max-content;
+}
+:root[data-mobile-os='ios']:is([data-ios-vertical-bar-side='left'], [data-ios-vertical-bar-side='right']) .m-nav {
+  grid-column: 2;
+  grid-row: 1 / 3;
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: stretch;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--safe-r) 0 0;
+  min-height: 0;
+  min-width: 0;
+  border: 0;
+  border-left: 1px solid hsl(var(--line));
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+:root[data-mobile-os='ios']:is([data-ios-vertical-bar-side='left'], [data-ios-vertical-bar-side='right']) .m-nav-item {
+  flex: 0 0 auto;
+  width: var(--ios-rail-w);
+  min-width: 0;
+  max-width: none;
+  min-height: 64px;
+}
+:root[data-mobile-os='ios']:is([data-ios-vertical-bar-side='left'], [data-ios-vertical-bar-side='right']) .m-nav-item::before {
+  top: 50%;
+  inset-inline-start: auto;
+  left: 0;
+  right: auto;
+  width: var(--nav-indicator-h);
+  height: var(--nav-indicator-w);
+  transform: translateY(-50%);
+  border-radius: var(--nav-indicator-h);
+}
+:root[data-mobile-os='ios']:is([data-ios-vertical-bar-side='left'], [data-ios-vertical-bar-side='right']) .m-nav-label {
+  max-width: calc(var(--ios-rail-w) - 8px);
+}
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'] .m-shell[data-navigation='visible'] {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'] .m-shell[data-navigation='visible'] > .m-screen-viewport,
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'] .m-shell[data-navigation='visible'] .m-pending-slot { grid-column: 2; }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'] .m-nav {
+  grid-column: 1;
+  padding: var(--sp-3) 0 0 var(--safe-l);
+  border-left: 0;
+  border-right: 1px solid hsl(var(--line));
+}
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'] .m-nav-item::before { left: auto; right: 0; }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'] .m-shell[data-navigation='visible'] .m-toast-host { grid-area: 1 / 2 / 2 / 3; }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'][dir='rtl'] .m-shell[data-navigation='visible'] {
+  grid-template-columns: minmax(0, 1fr) max-content;
+}
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'][dir='rtl'] .m-shell[data-navigation='visible'] > .m-screen-viewport,
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'][dir='rtl'] .m-shell[data-navigation='visible'] .m-pending-slot { grid-column: 1; }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'][dir='rtl'] .m-nav { grid-column: 2; }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'][dir='rtl'] .m-shell[data-navigation='visible'] .m-toast-host { grid-area: 1 / 1 / 2 / 2; }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='right'][dir='rtl'] .m-shell[data-navigation='visible'] {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='right'][dir='rtl'] .m-shell[data-navigation='visible'] > .m-screen-viewport,
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='right'][dir='rtl'] .m-shell[data-navigation='visible'] .m-pending-slot { grid-column: 2; }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='right'][dir='rtl'] .m-nav { grid-column: 1; }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='right'][dir='rtl'] .m-shell[data-navigation='visible'] .m-toast-host { grid-area: 1 / 2 / 2 / 3; }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='left'][dir] .m-nav { padding: var(--sp-3) 0 0 var(--safe-l); }
+:root[data-mobile-os='ios'][data-ios-vertical-bar-side='right'][dir] .m-nav { padding: var(--sp-3) var(--safe-r) 0 0; }
+
+/* Reserved geometry adjusts only the colliding chrome in its existing flow or
+ * containing block. The scroll/page dimensions are never assigned a safe pane. */
+:root[data-mobile-os='ios'] .m-nav[data-ios-reserved-adjusted],
+:root[data-mobile-os='ios'] .m-pending-slot[data-ios-reserved-adjusted] {
+  width: var(--ios-region-width);
+  max-height: var(--ios-region-height);
+  margin-bottom: var(--ios-region-bottom);
+  margin-left: var(--ios-region-left);
+  justify-self: var(--ios-region-align, start);
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+:root[data-mobile-os='ios'] .m-nav[data-ios-reserved-adjusted='true'] { flex-wrap: wrap; }
+:root[data-mobile-os='ios'] .m-nav[data-ios-reserved-adjusted='rail'] {
+  align-self: start;
+  margin-top: var(--ios-region-top);
+  margin-bottom: 0;
+}
+:root[data-mobile-os='ios'] .m-pending-slot[data-ios-reserved-adjusted] .m-pending { flex-wrap: wrap; }
+:root[data-mobile-os='ios'] .m-toast-host[data-ios-reserved-adjusted] {
+  left: var(--ios-region-left);
+  right: auto;
+  bottom: var(--ios-region-bottom);
+  width: var(--ios-region-width);
+  max-height: var(--ios-region-height);
+  overflow-y: auto;
+}
+:root[data-mobile-os='ios'] .h-sheet[data-ios-reserved-adjusted] {
+  inset-inline-start: auto;
+  inset-inline-end: auto;
+  left: var(--ios-region-left);
+  right: auto;
+  bottom: var(--ios-region-bottom);
+  width: var(--ios-region-width);
+  max-height: var(--ios-region-height);
+}
+:root[data-mobile-os='ios'] .mn-sheet[data-ios-reserved-adjusted] {
+  width: var(--ios-region-width);
+  max-height: var(--ios-region-height);
+  margin-left: var(--ios-region-left);
+  margin-bottom: var(--ios-region-bottom);
+  align-self: var(--ios-region-align, start);
+  box-sizing: border-box;
+}
+:root[data-mobile-os='ios'] .h-acts[data-ios-reserved-adjusted='row'] {
+  width: var(--ios-region-width);
+  margin-left: var(--ios-region-left);
+  margin-right: calc(100% - var(--ios-region-width) - var(--ios-region-left));
+  flex-direction: column;
+  box-sizing: border-box;
+}
+:root[data-mobile-os='ios'] .h-acts[data-ios-reserved-adjusted='row'] .h-act { flex: none; }
+
+
+/* The 554 screen boundary keeps containment and the original scroll node. */
+:root[data-mobile-os='ios'] .m-shell { top: 0; left: 0; width: 100%; height: 100%; padding-left: 0; --nav-icon: 23px; --nav-indicator-w: 28px; }
+:root[data-mobile-os='ios'] .m-screen-viewport { grid-area: 1 / 1; }
+:root[data-mobile-os='ios'] .m-nav {
+  position: static;
+  inset: auto;
+  width: auto;
+  height: auto;
+  border-right: 0;
+  flex-direction: row;
+  justify-content: center;
+  gap: 0;
+  padding: 0 var(--safe-r) 0 var(--safe-l);
+}
+/* Reset the Android wide-window rail baseline for the iOS bottom bar.
+ * More specific UIKit trait/bar-side rail rules above still own the iOS rail. */
+:root[data-mobile-os='ios'] .m-nav-item {
+  flex: 1 1 0;
+  width: auto;
+  min-width: var(--nav-item-min);
+  max-width: var(--nav-item-max);
+  min-height: var(--tap-min);
+  padding: 0;
+}
+:root[data-mobile-os='ios'] .m-nav-item::before {
+  top: 0;
+  left: 50%;
+  right: auto;
+  width: var(--nav-indicator-w);
+  height: var(--nav-indicator-h);
+  transform: translateX(-50%);
+  border-radius: 0 0 var(--nav-indicator-h) var(--nav-indicator-h);
+}

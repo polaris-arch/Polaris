@@ -52,6 +52,91 @@ fn tracker() -> BackoffTracker {
 }
 
 #[test]
+fn resume_after_suspension_only_updates_due_resources_with_their_own_period() {
+    let mut cfg = cfg_with(json!([fresh("a")]));
+    cfg["ruleResourceUpdateIntervalHours"] = json!(6);
+    cfg["subscriptionUpdateIntervalHours"] = json!(0);
+    let mut backoff = tracker();
+    assert!(plan_due_updates(&cfg, NOW, &mut backoff, &all_present)
+        .external_ids
+        .is_empty());
+    assert_eq!(
+        plan_due_updates(&cfg, NOW + 5 * HOUR, &mut backoff, &all_present).external_ids,
+        vec!["a".to_string()]
+    );
+    for disabled in [
+        json!({"ruleResourceUpdateIntervalHours": 0}),
+        json!({"ruleResourceAutoUpdate": false}),
+    ] {
+        let mut disabled_cfg = cfg.clone();
+        disabled_cfg
+            .as_object_mut()
+            .unwrap()
+            .extend(disabled.as_object().unwrap().clone());
+        let plan = plan_due_updates(&disabled_cfg, NOW + 24 * HOUR, &mut backoff, &all_missing);
+        assert!(plan.external_ids.is_empty());
+        assert!(plan.builtin_tags.is_empty());
+        assert!(!catalog_refresh_due(&disabled_cfg, NOW + 24 * HOUR, 0, 0));
+    }
+}
+
+#[test]
+fn repeated_resumes_keep_the_failed_resource_backoff() {
+    let cfg = cfg_with(json!([stale("a")]));
+    let mut backoff = tracker();
+    let builtin_tag = builtin_geo_rulesets()[0].tag.clone();
+    backoff.record_failure("a", NOW);
+    backoff.record_failure(&builtin_id_for(&builtin_tag), NOW);
+    for resumed_at in [NOW, NOW + 1, NOW + BACKOFF_BASE_MS - 1] {
+        let plan = plan_due_updates(&cfg, resumed_at, &mut backoff, &all_present);
+        assert!(plan.external_ids.is_empty());
+        assert!(!plan.builtin_tags.contains(&builtin_tag));
+    }
+    assert_eq!(
+        plan_due_updates(&cfg, NOW + BACKOFF_BASE_MS, &mut backoff, &all_present).external_ids,
+        vec!["a".to_string()]
+    );
+    assert!(
+        plan_due_updates(&cfg, NOW + BACKOFF_BASE_MS, &mut backoff, &all_present)
+            .builtin_tags
+            .contains(&builtin_tag)
+    );
+}
+
+#[test]
+fn startup_timer_and_resume_cannot_run_overlapping_rounds() {
+    let scheduler = Arc::new(RuleResourceScheduler::new());
+    let running = scheduler.try_running_guard().unwrap();
+    let contender = scheduler.clone();
+    assert!(
+        std::thread::spawn(move || contender.try_running_guard().is_none())
+            .join()
+            .unwrap()
+    );
+    assert!(scheduler.try_running_guard().is_none());
+    drop(running);
+    let next = scheduler.try_running_guard().unwrap();
+    drop(next);
+    assert!(!lock_inner(&scheduler.inner).is_running);
+}
+
+#[test]
+fn mobile_resume_uses_the_same_due_round_and_single_flight_gate() {
+    let resumed = fn_body("pub fn on_resume(");
+    assert!(resumed.contains("run_due_updates("));
+    assert!(!resumed.contains("start("));
+    let round = fn_body("async fn run_due_updates(");
+    assert!(round.contains("self.try_running_guard()"));
+    assert!(round.contains("plan_due_updates("));
+    let app = crate_code("lib.rs");
+    let at = app.find("event: tauri::WindowEvent::Resumed").unwrap();
+    let arm = &app[at - 110..at + 340];
+    assert!(arm.contains("#[cfg(mobile)]"));
+    assert!(arm.contains("label == \"main\""));
+    assert!(arm.contains("scheduler.on_resume(app_handle.clone())"));
+}
+
+#[test]
 fn master_switch_only_stops_when_explicitly_false() {
     let mut cfg = cfg_with(json!([stale("a")]));
     cfg["ruleResourceAutoUpdate"] = json!(false);

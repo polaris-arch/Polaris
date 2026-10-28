@@ -327,4 +327,30 @@ class AndroidNativeControlOperationTest {
         assertSame(first, observed)
         assertEquals(AndroidNativeAdmission.State.CancelledBeforeBirth, ledger.state(operation.ticket))
     }
+
+    @Test fun completedReloadUsesItsOriginalMainWholeHistoryAndNeverBorrowsValidationScope() {
+        val ledger = ledger()
+        val attempt = owner(ledger)
+        val store = attempt.bindTailscaleStore(ledger)
+        var native = ScopedNativeFixture.export()
+        val first = ScopedNativeFixture.run("a", "first", listOf("one"))
+        store.invoke("first", { native }) { native = ScopedNativeFixture.export(first) }
+        val operation = reload(ledger)
+        val second = ScopedNativeFixture.run("b", "reload", listOf("two"))
+        assertTrue(operation.runExact(attempt, { true }) { boundary ->
+            boundary.construct { store.invoke("reload", { native }) { native = ScopedNativeFixture.export(first, second) } }
+        })
+        assertEquals(AndroidNativeAdmission.State.Completed, ledger.state(operation.ticket))
+        assertEquals(null, store.closedRelation(ScopedNativeFixture.file("one")))
+        store.closed { ScopedNativeFixture.export(ScopedNativeFixture.retired(first), ScopedNativeFixture.retired(second)) }
+        assertTrue(ledger.unknown(checkNotNull(attempt.nativeTicket)))
+        val rows = ledger.tailscaleTargetAction(store.wire(), ScopedNativeFixture.file("two"), "query", "query").getJSONArray("entries")
+        val row = (0 until rows.length()).map { rows.getJSONObject(it) }.single { it.getString("nativeTicketId") == operation.ticket.id }
+        assertEquals(attempt.nativeTicket!!.id, row.getString("parentNativeTicketId"))
+        assertTrue(row.getBoolean("related"))
+        assertEquals("Completed", row.getString("globalState"))
+        assertFalse(row.has("store"))
+        assertFalse(row.has("validation"))
+    }
+
 }
