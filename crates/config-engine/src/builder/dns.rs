@@ -44,7 +44,7 @@ use polaris_helper_proto::Platform;
 use super::custom_rule_files::{custom_rule_file_base, plan_custom_rule, uses_fake_ip, RulePlan};
 use super::helpers::{
     effective_custom_rules, get_domestic_resolver_tag, get_node_resolver_tag, is_ipv4_host,
-    is_ipv6_host, NodeResolverCtx, DNS_NODE_RACE_TAG, DOMESTIC_BANK_AND_STOCK_DOMAINS,
+    is_ipv6_host, NodeResolverCtx, DOMESTIC_BANK_AND_STOCK_DOMAINS,
 };
 use crate::user_config::builtin_geo_rulesets::{find_builtin, resolve_builtin_rule_set_ref_meta};
 
@@ -128,6 +128,7 @@ pub fn is_lan_dns_ip(value: &str) -> bool {
 
 #[derive(Default, Clone)]
 struct DnsEffectMatcher {
+    all_of: Vec<DnsEffectMatcher>,
     domains: Vec<String>,
     suffixes: Vec<String>,
     keywords: Vec<String>,
@@ -136,16 +137,9 @@ struct DnsEffectMatcher {
 }
 
 impl DnsEffectMatcher {
-    fn append(&mut self, mut other: Self) {
-        self.domains.append(&mut other.domains);
-        self.suffixes.append(&mut other.suffixes);
-        self.keywords.append(&mut other.keywords);
-        self.regexes.append(&mut other.regexes);
-        self.rule_sets.append(&mut other.rule_sets);
-    }
-
     fn is_empty(&self) -> bool {
-        self.domains.is_empty()
+        self.all_of.is_empty()
+            && self.domains.is_empty()
             && self.suffixes.is_empty()
             && self.keywords.is_empty()
             && self.regexes.is_empty()
@@ -154,6 +148,20 @@ impl DnsEffectMatcher {
 }
 
 fn dns_rule_from_matcher(matcher: DnsEffectMatcher) -> DnsRule {
+    if !matcher.all_of.is_empty() {
+        return DnsRule {
+            type_field: Some("logical".into()),
+            mode: Some("and".into()),
+            rules: Some(
+                matcher
+                    .all_of
+                    .into_iter()
+                    .map(dns_rule_from_matcher)
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+    }
     DnsRule {
         rule_set: if matcher.rule_sets.is_empty() {
             None
@@ -245,7 +253,15 @@ fn append_dns_policy_action(
                 return;
             }
             let mut rule = dns_rule_from_matcher(matcher);
-            rule.query_type = Some(vec!["A".into(), "AAAA".into()]);
+            let query_types = Some(vec!["A".into(), "AAAA".into()]);
+            if let Some(children) = rule.rules.as_mut() {
+                children.push(DnsRule {
+                    query_type: query_types,
+                    ..Default::default()
+                });
+            } else {
+                rule.query_type = query_types;
+            }
             rule.action = Some("route".into());
             rule.server = Some("fakeip".into());
             out.push(rule);
@@ -263,7 +279,15 @@ fn append_dns_policy_action(
                 return;
             }
             let mut hosts_rule = dns_rule_from_matcher(matcher.clone());
-            hosts_rule.preferred_by = Some(vec![hosts_tag.clone()]);
+            let preferred_by = Some(vec![hosts_tag.clone()]);
+            if let Some(children) = hosts_rule.rules.as_mut() {
+                children.push(DnsRule {
+                    preferred_by,
+                    ..Default::default()
+                });
+            } else {
+                hosts_rule.preferred_by = preferred_by;
+            }
             hosts_rule.action = Some("route".into());
             hosts_rule.server = Some(hosts_tag);
             out.push(hosts_rule);
@@ -362,7 +386,7 @@ fn append_dns_policy_action(
 /// - `pending_endpoints`：本轮实际发射的 endpoint（tailnet 按名解析 gate 用）。
 /// - `log`：日志回调（注入 ProxyManager.logToManager）。
 /// - `selected_server_tag`：当前选中节点 tag（dns-remote detour / dns-probe-exit-proxy detour）。
-/// - `race_server_port`：本地 race DNS server 端口（>0 = race 就绪）。
+/// - `node_dns_decoy_override`：可选 decoy CIDR 覆盖清单原文。
 /// - `probe_pool_ports`：主核测速探测池端口数（K 个 dns-probe-exit-k）。
 /// - `probe_proxy_port`：出口伴测 / 出口 IP 探测端口（>0 = 就绪）。
 /// - `platform`：运行平台（process.platform；neighbor match + win32 死环判断）。
@@ -375,7 +399,7 @@ pub struct DnsConfigDeps {
     pub pending_endpoints: Vec<Endpoint>,
     pub log: fn(LogLevel, &str),
     pub selected_server_tag: String,
-    pub race_server_port: u16,
+    pub node_dns_decoy_override: Option<String>,
     pub probe_pool_ports: Vec<u16>,
     pub probe_proxy_port: Option<u16>,
     pub platform: String,
@@ -840,29 +864,6 @@ pub fn build_dns_config(
             predefined: None,
             domain_resolver: None,
             detour: Some(deps.selected_server_tag.clone()),
-            endpoint: None,
-            accept_search_domain: None,
-            accept_default_resolvers: None,
-            neighbor_domain: None,
-            address: None,
-            address_resolver: None,
-            inet4_range: None,
-            inet6_range: None,
-        });
-    }
-
-    // issue #147：race on + server 就绪 → 本地 race DNS server（dns-node-race）。
-    // raceServerPort=0（off/未就绪/snapshot）不生成，getNodeResolverTag 同步走单上游、不悬空引用。
-    if deps.race_server_port > 0 && resolve_node_domains_ahead != Some(false) {
-        dns_servers.push(DnsServer {
-            tag: DNS_NODE_RACE_TAG.into(),
-            type_field: Some("udp".into()),
-            server: Some("127.0.0.1".into()),
-            server_port: Some(deps.race_server_port),
-            path: None,
-            predefined: None,
-            domain_resolver: None,
-            detour: None,
             endpoint: None,
             accept_search_domain: None,
             accept_default_resolvers: None,
@@ -1362,7 +1363,12 @@ pub fn build_dns_config(
             .find(|resource| resource.id == resource_id)
             .is_some_and(|resource| {
                 let path = format!("{}/{}", deps.rule_resources_path, resource.file_name);
-                (deps.is_valid_srs_fn)(&path)
+                match resource.format {
+                    crate::user_config::rule::RuleResourceFormat::Binary => {
+                        (deps.is_valid_srs_fn)(&path)
+                    }
+                    crate::user_config::rule::RuleResourceFormat::Source => (deps.exists_fn)(&path),
+                }
             })
     };
     let geo_tag_available = |tag: &str| {
@@ -1497,20 +1503,19 @@ pub fn build_dns_config(
 
         let matchers: Vec<DnsEffectMatcher> =
             if rule.combine_mode == Some(crate::user_config::rule::CombineMode::And) {
-                let mut merged = DnsEffectMatcher::default();
-                let mut complete = true;
-                for condition in &conditions {
-                    if let Some(matcher) = matcher_for(condition) {
-                        merged.append(matcher);
-                    } else {
-                        complete = false;
-                        break;
-                    }
-                }
-                if complete && !merged.is_empty() {
-                    vec![merged]
-                } else {
-                    vec![]
+                // Default DNS domain fields are OR in the core. Each user condition
+                // needs its own headless child to preserve AND (including repeated types).
+                match conditions
+                    .iter()
+                    .map(matcher_for)
+                    .collect::<Option<Vec<_>>>()
+                {
+                    Some(mut children) if children.len() == 1 => vec![children.remove(0)],
+                    Some(children) if !children.is_empty() => vec![DnsEffectMatcher {
+                        all_of: children,
+                        ..Default::default()
+                    }],
+                    _ => vec![], // Any unresolved AND condition makes the whole rule unavailable.
                 }
             } else {
                 conditions.iter().filter_map(matcher_for).collect()
@@ -1535,7 +1540,13 @@ pub fn build_dns_config(
                 if let Some(env) = env {
                     for emitted in &mut dns_rules[start..] {
                         if emitted.action.as_deref() != Some("respond") {
-                            env.apply_to_dns_rule(emitted);
+                            if let Some(children) = emitted.rules.as_mut() {
+                                let mut condition = DnsRule::default();
+                                env.apply_to_dns_rule(&mut condition);
+                                children.push(condition);
+                            } else {
+                                env.apply_to_dns_rule(emitted);
+                            }
                         }
                     }
                 }
@@ -1729,6 +1740,15 @@ pub fn build_dns_config(
         push_bypass_bucket(&mut dns_rules, via_direct, "dns-bootstrap");
     }
 
+    if crate::builder::network_env::default_dns_uses_netenv(config) {
+        if let Some(reason) = deps.probe_facts(config).dhcp_unavailable() {
+            deps.log_warn(&format!(
+                "DNS_DEFAULT_POLICY_UNAVAILABLE:{}",
+                reason.report_code()
+            ));
+        }
+    }
+
     // ── DNS 未命中策略。
     // v2 的默认动作独立于流量代理模式；legacy 配置仍保留 smart/global 的历史派生规则。
     // tailnet / probe 规则稍后从头插入，因此仍然高于这里的用户默认动作。
@@ -1863,6 +1883,79 @@ pub fn build_dns_config(
                 rewrite_ttl: None,
                 ..Default::default()
             });
+            if default_is_fake_ip {
+                // Only non-address questions can reach this action: client A/AAAA
+                // terminated at FakeIP; internal allowFakeIP=false A/AAAA terminated
+                // at the unconditional real-address shadow rule immediately above.
+                // Keep explicit DNS rules and protected LAN/mesh/bootstrap exceptions
+                // ahead of this policy, independent of the traffic proxy mode.
+                let compatible_fallback = DnsPolicyAction::Server {
+                    server_id: BUILTIN_DOMESTIC_DNS_ID.into(),
+                };
+                let fallback = config
+                    .dns_defaults
+                    .as_ref()
+                    .and_then(|defaults| defaults.real_query_fallback_action.as_ref())
+                    .unwrap_or(&compatible_fallback);
+                let before = dns_rules.len();
+                let real_server = match fallback {
+                    DnsPolicyAction::Server { server_id } => {
+                        let configured = config
+                            .dns_servers
+                            .iter()
+                            .find(|server| server.id == *server_id);
+                        // Builtin generation retains legacy compatibility transports.
+                        // An explicitly disabled/Hosts resource must not silently use one.
+                        let compatible_missing = config
+                            .dns_defaults
+                            .as_ref()
+                            .is_none_or(|defaults| defaults.real_query_fallback_action.is_none());
+                        (configured.is_some_and(|server| {
+                            server.enabled && server.kind != DnsServerKind::Hosts
+                        }) || (configured.is_none() && compatible_missing)
+                            || server_id
+                                == crate::user_config::network_profile::BUILTIN_NETENV_DHCP_ID)
+                            && dns_config.servers.iter().any(|server| {
+                                server.tag == dns_server_tag(server_id)
+                                    && server.type_field.as_deref() != Some("hosts")
+                            })
+                    }
+                    _ => true,
+                };
+                if fallback.is_valid_real_query_fallback() && real_server {
+                    append_dns_policy_action(
+                        &mut dns_rules,
+                        DnsEffectMatcher::default(),
+                        fallback,
+                        None,
+                        config.dns_defaults.as_ref(),
+                        &config.dns_server_groups,
+                        &emitted_resource_tags,
+                        enable_fake_ip,
+                        "__real_query_fallback__",
+                        deps.log,
+                    );
+                }
+                if dns_rules.len() == before {
+                    // A stale/disabled resource or unsupported imported action must
+                    // never expose the query through the legacy domestic final.
+                    (deps.log)(LogLevel::Warn, "DNS_REAL_QUERY_FALLBACK_INVALID");
+                    append_dns_policy_action(
+                        &mut dns_rules,
+                        DnsEffectMatcher::default(),
+                        &DnsPolicyAction::Reject {
+                            method: DnsRejectMethod::Default,
+                        },
+                        None,
+                        config.dns_defaults.as_ref(),
+                        &config.dns_server_groups,
+                        &emitted_resource_tags,
+                        enable_fake_ip,
+                        "__real_query_fallback__",
+                        deps.log,
+                    );
+                }
+            }
         } else {
             // 没开 FakeIP（系统代理模式等）：用 geosite 规则各自拿正确 IP。
             if proxy_mode == "smart" {
@@ -2063,7 +2156,9 @@ pub fn build_dns_config(
                 type_field: None,
                 action: Some("route".into()),
                 server: Some("dns-probe-exit-proxy".into()),
-                inbound: Some(OneOrMany::Many(vec!["probe-proxy-in".into()])),
+                inbound: Some(OneOrMany::Many(vec![
+                    crate::builder::helpers::PROBE_PROXY_INBOUND_TAG.into(),
+                ])),
                 disable_cache: Some(true),
                 rewrite_ttl: None,
                 ..Default::default()
@@ -2074,6 +2169,13 @@ pub fn build_dns_config(
     // 探针也不能把本地名称送到公共 DNS；用户规则之间的相对优先级保持原样。
     dns_rules.splice(0..0, lan_rules);
     dns_config.rules = Some(dns_rules);
+    crate::node_dns::append_policy(
+        config,
+        &deps.platform,
+        deps.node_dns_decoy_override.as_deref(),
+        &mut dns_config,
+        deps.log,
+    );
     dns_config
 }
 

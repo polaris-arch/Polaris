@@ -424,7 +424,7 @@ fn network_canary_is_wired_into_lifecycle_legs() {
         start.contains("deps.network_canary_port=self.resolve_network_canary_port("),
         "canary 口必须随每轮端口一起分配进 deps"
     );
-    let stop = compact("    pub(super) async fn stop_inner(");
+    let stop = compact("    async fn stop_inner_attributed(");
     assert_eq!(
         stop.matches("self.disarm_network_canary()").count(),
         1,

@@ -1020,3 +1020,93 @@ fn vendored_proto_matches_every_bundled_core() {
         survey.present.len()
     );
 }
+
+#[test]
+fn whole_core_verdict_checks_every_required_symbol_and_reports_missing_separately() {
+    use proto_wire_check::{verdict_for_core_bytes, WireVerdict};
+    let tables: BTreeMap<&str, BTreeMap<String, u32>> = CHECKED_SYMBOLS
+        .iter()
+        .map(|(kind, name)| {
+            (
+                *name,
+                proto_wire_check::symbol_from_proto_src(PROTO_SRC, *kind, name).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(CHECKED_SYMBOLS.len(), 33);
+    let build = |tables: &BTreeMap<&str, BTreeMap<String, u32>>| {
+        let messages: Vec<_> = CHECKED_SYMBOLS
+            .iter()
+            .filter(|(kind, name)| {
+                *kind == SymbolKind::Message && *name != "Log" && *name != "Log.Message"
+            })
+            .filter_map(|(_, name)| tables.get(name).map(|fields| (*name, fields)))
+            .collect();
+        let enums: Vec<_> = CHECKED_SYMBOLS
+            .iter()
+            .filter(|(kind, _)| *kind == SymbolKind::Enum)
+            .filter_map(|(_, name)| tables.get(name).map(|fields| (*name, fields)))
+            .collect();
+        let nested: Vec<_> = tables
+            .get("Log.Message")
+            .map(|fields| ("Message", fields))
+            .into_iter()
+            .collect();
+        let owners: Vec<_> = tables
+            .get("Log")
+            .map(|fields| ("Log", fields, nested.as_slice()))
+            .into_iter()
+            .collect();
+        synthetic_core_with_nested(&messages, &enums, &owners)
+    };
+    assert_eq!(verdict_for_core_bytes(&build(&tables)), WireVerdict::Match);
+    for (_, name) in CHECKED_SYMBOLS {
+        let mut changed = tables.clone();
+        let fields = changed.get_mut(name).unwrap();
+        let field = fields
+            .keys()
+            .next()
+            .expect("required symbol has fields")
+            .clone();
+        *fields.get_mut(&field).unwrap() += 1;
+        match verdict_for_core_bytes(&build(&changed)) {
+            WireVerdict::Mismatch(report) => {
+                assert!(report.contains(name), "{name}: {report}");
+                assert!(report.contains(&field), "{field}: {report}");
+            }
+            other => panic!("drift of {name} was not rejected: {other:?}"),
+        }
+        let mut missing = tables.clone();
+        missing.remove(name);
+        match verdict_for_core_bytes(&build(&missing)) {
+            WireVerdict::Unobservable(report) => assert!(report.contains(name), "{name}: {report}"),
+            other => panic!("missing {name} lost its diagnostic category: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        verdict_for_core_bytes(b"invalid descriptor"),
+        WireVerdict::Unobservable(_)
+    ));
+}
+
+#[test]
+fn release_guard_uses_one_whole_core_verdict_and_fails_closed() {
+    // Wiring guard complements the synthetic semantic tests above: runtime
+    // replacement permits Unobservable, while release packaging must reject it.
+    let source =
+        polaris_source_probe::mask_comments(&polaris_source_probe::crate_file!("build.rs"));
+    let loop_body = source
+        .split("for (_, core) in &survey.present {")
+        .nth(1)
+        .unwrap();
+    assert_eq!(loop_body.matches("std::fs::read(core)").count(), 1);
+    assert_eq!(
+        loop_body.matches("verdict_for_core_bytes(&bytes)").count(),
+        1
+    );
+    assert!(!loop_body.contains("check_core_against_proto"));
+    assert!(loop_body.contains("WireVerdict::Match => {}"));
+    assert!(loop_body.contains("WireVerdict::Mismatch(report) => panic!"));
+    assert!(loop_body.contains("WireVerdict::Unobservable(report) => panic!"));
+    assert!(loop_body.contains("读不到随包核"));
+}

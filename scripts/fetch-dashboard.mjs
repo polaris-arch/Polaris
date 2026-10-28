@@ -9,13 +9,15 @@
  * 核以 dashboard:{enabled,path:<bundledDir>} 直接 serve 本地文件（零联网）。运行时「刷新面板资源」下载新版
  * 覆盖至 <userData>/dashboard（serve 优先用覆盖版、否则回落内置）。
  *
- * 机制：下载 gh-pages 分支 zipball → 解压 → **剔掉 web-only 残留**（见 [`pruneWebOnlyArtifacts`]）
+ * 机制：下载固定 commit zipball → 校验摘要 → 解压 → **剔掉 web-only 残留**（见 [`pruneWebOnlyArtifacts`]）
  * → 把含 index.html 的目录平铺到 resources/dashboard/。
- * 原子落地：先解到临时目录、校验 index.html 存在再 rename 替换。dereference:true 防符号链接打进包。
+ * 先解到临时目录、校验完整 inventory 并拒绝符号链接，再替换目标。
  *
  * 直移自 上游 scripts/fetch-dashboard.mjs（语言无关）。
  */
-import { execFileSync } from 'child_process';
+import { createHash } from 'node:crypto';
+import { lstatSync } from 'node:fs';
+import { boundedDownload } from './lib/bounded-download.mjs';
 import {
   cpSync,
   existsSync,
@@ -32,6 +34,37 @@ import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
 import { extractZip } from './lib/extract-zip.mjs';
+
+// Fixed official codeload bytes and independently enumerated post-prune inventory.
+export const DASHBOARD_PIN = Object.freeze({
+  commit: 'd77c2f016a7681aa1704e9f83c69139edb230c97',
+  sha256: 'fa3afee26f13fb5a980a8df7598d996c2dba2d5bf9aa4e1ce0b63c46c757511f',
+  bytes: 6717667,
+  inventorySha256: 'd2cca077fc5495b783c501000c39b1a1bf0190c445c5707fd8a093cec19acd67',
+});
+const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
+export function verifyDashboardArchive(bytes, pin = DASHBOARD_PIN) {
+  if (bytes.length !== pin.bytes || digest(bytes) !== pin.sha256) throw new Error('Dashboard archive identity mismatch');
+}
+export function dashboardInventory(dir) {
+  const rows = [];
+  const walk = (base, prefix = '') => {
+    const stat = lstatSync(base);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Dashboard directory redirected');
+    for (const name of readdirSync(base).sort()) {
+      const path = join(base, name), relative = prefix + name, info = lstatSync(path);
+      if (info.isSymbolicLink()) throw new Error('Dashboard symlink forbidden');
+      if (info.isDirectory()) walk(path, relative + '/');
+      else if (info.isFile()) { const bytes = readFileSync(path); rows.push([relative, bytes.length, digest(bytes)]); }
+      else throw new Error('Dashboard non-regular member');
+    }
+  };
+  walk(dir); rows.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  return digest(JSON.stringify(rows));
+}
+export function dashboardFresh(dir) {
+  try { return dashboardInventory(dir) === DASHBOARD_PIN.inventorySha256; } catch { return false; }
+}
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DEST = join(ROOT, 'resources', 'dashboard');
@@ -129,17 +162,10 @@ function main() {
     process.exit(0);
   }
 
-  const ZIP_URL = 'https://github.com/SagerNet/sing-box-dashboard/archive/refs/heads/gh-pages.zip';
-
-  // ⚠️ **本脚本刻意不接 `lib/fetch-stamp.mjs` 的版本判据**（fetch-core / fetch-cronet 都接了）。
-  // 那套判据的指纹是「版本号 + 钉扎 sha」，而 dashboard 这两样**一个都没有**：源是 gh-pages
-  // 分支的活动 zip（上面这个 ZIP_URL 恒定不变、内容随上游滚动），既无版本号也无 sha pin。
-  // 拿恒定的 URL 当指纹只会让判据**恒为 fresh**，即制造一个看起来有版本控制、实则永不失效的门。
-  // 宁可如实保留「文件在就跳过」，把这个缺口摆在明面上：要更新 dashboard 一律 `--force`。
-  // （补 sha pin 是另一件事，见对拍报告里「fetch-dashboard 无 sha256 钉扎」那条，未做。）
-  if (existsSync(join(DEST, 'index.html')) && !FORCE) {
-    console.log(`skip (exists): resources/dashboard/index.html —— 无版本判据，更新须 --force`);
-    process.exit(0);
+  const ZIP_URL = `https://codeload.github.com/SagerNet/sing-box-dashboard/zip/${DASHBOARD_PIN.commit}`;
+  if (!FORCE && dashboardFresh(DEST)) {
+    console.log('skip: dashboard matches pinned final inventory');
+    return;
   }
 
   const work = mkdtempSync(join(tmpdir(), 'polaris-dashboard-'));
@@ -148,8 +174,9 @@ function main() {
 
   try {
     console.log(`downloading sing-box-dashboard (gh-pages) → ${zipPath} ...`);
-    execFileSync('curl', ['-fL', '--retry', '3', '-o', zipPath, ZIP_URL], { stdio: 'inherit' });
+    boundedDownload(ZIP_URL, { output: zipPath, stdio: 'inherit' });
 
+    verifyDashboardArchive(readFileSync(zipPath));
     mkdirSync(extractDir, { recursive: true });
     console.log('extracting ...');
     extractZip(zipPath, extractDir);
@@ -167,10 +194,12 @@ function main() {
     console.log(`pruned ${removed.length} web-only file(s): ${removed.join(', ') || '(none)'}`);
 
     // 原子替换：先拷到 DEST.tmp 再 rename 顶替。
+    if (!dashboardFresh(uiRoot)) throw new Error('Dashboard final inventory differs');
     const tmpDest = `${DEST}.tmp`;
     rmSync(tmpDest, { recursive: true, force: true });
     mkdirSync(dirname(DEST), { recursive: true });
     cpSync(uiRoot, tmpDest, { recursive: true, dereference: true });
+    if (!dashboardFresh(tmpDest)) throw new Error('Dashboard staging inventory differs');
     rmSync(DEST, { recursive: true, force: true });
     renameSync(tmpDest, DEST);
 

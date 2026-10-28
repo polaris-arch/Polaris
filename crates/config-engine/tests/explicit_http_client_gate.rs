@@ -164,7 +164,7 @@ fn gate_deps(platform: &str, serve_dir: Option<String>) -> GenerateConfigDeps {
     GenerateConfigDeps {
         platform: platform.to_string(),
         arch: "x86_64".into(),
-        race_server_port: 0,
+        node_dns_decoy_override: None,
         probe_direct_port: None,
         probe_proxy_port: None,
         debug_probe_mixed_udp: false,
@@ -173,8 +173,7 @@ fn gate_deps(platform: &str, serve_dir: Option<String>) -> GenerateConfigDeps {
         loopback_auth: None,
         probe_pool_ports: vec![],
         lan_resolver_for_dns: None,
-        race_upstream_ips: vec![],
-        race_upstream_ports: vec![],
+
         has_cronet: true,
         cronet_copy_failed: false,
         has_management_api: true, // 金样默认 false；本门必须打开才碰得到 services

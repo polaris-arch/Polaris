@@ -1,0 +1,49 @@
+[
+  {
+    "input": {
+      "servers": [],
+      "subscriptions": []
+    },
+    "canonical": "{\"servers\":[],\"subscriptions\":[]}",
+    "sha256": "64dbb4e29e6f42fe583da14753dd86bd01aeaedd74f038598fdf518f0cb61544"
+  },
+  {
+    "input": {
+      "servers": [
+        {
+          "id": "a",
+          "name": "苏白 😀",
+          "port": 443,
+          "options": {
+            "flag": true,
+            "value": null
+          }
+        }
+      ],
+      "subscriptions": [
+        {
+          "id": "s",
+          "name": "الاشتراك"
+        }
+      ]
+    },
+    "canonical": "{\"servers\":[{\"id\":\"a\",\"name\":\"苏白 😀\",\"options\":{\"flag\":true,\"value\":null},\"port\":443}],\"subscriptions\":[{\"id\":\"s\",\"name\":\"الاشتراك\"}]}",
+    "sha256": "528bd9c464596b0215c761cafffc9dea028a1aa9a8fe37f18bf3f777afcc7364"
+  },
+  {
+    "input": {
+      "z": [
+        3,
+        2,
+        1
+      ],
+      "a": {
+        "constructor": "plain-key",
+        "__proto__": "plain-data",
+        "quoted": "line\nvalue"
+      }
+    },
+    "canonical": "{\"a\":{\"__proto__\":\"plain-data\",\"constructor\":\"plain-key\",\"quoted\":\"line\\nvalue\"},\"z\":[3,2,1]}",
+    "sha256": "59501b6f67b486bfa57538e2065e6413f0584aaa3456e1063894e9ff286f5eec"
+  }
+]

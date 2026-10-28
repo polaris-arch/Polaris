@@ -10,6 +10,7 @@
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import type { AppRule } from '@/contracts/types';
+import { appRuleDisabled } from '@/components/screens/app-policy/app-policy-logic';
 import type { AppPreset } from '@/domain/app-rules-preset';
 
 /**
@@ -64,7 +65,9 @@ export function AppRuleHoverCardContent({
       <div className="tc-sep" />
       <div className="tc-row">
         <span className="tc-lbl">{t('appPolicy.target')}</span>
-        {action === 'direct' ? (
+        {appRuleDisabled(rule) ? (
+          <span className="pill">{t('rules.disabledBadge')}</span>
+        ) : action === 'direct' ? (
           <span className="pill act-direct">{t('rules.targetDirect')}</span>
         ) : action === 'block' ? (
           <span className="pill act-block">{t('rules.targetBlock')}</span>

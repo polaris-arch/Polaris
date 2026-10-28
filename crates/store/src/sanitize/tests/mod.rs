@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 
 #[test]
 fn bad_json_returns_parse_err() {
@@ -8,12 +9,11 @@ fn bad_json_returns_parse_err() {
 
 #[test]
 fn bad_field_skipped_good_field_kept() {
-    // servers 是 string（坏字段）→ 删除；但 customRules 合法 → 保留。
-    // 绝不因 servers 坏而丢弃整份配置（维度7 #7 核心）。
+    // 可选 mixedPort 坏值仍可剔除；合法 servers/customRules 保留。
     let json = r#"{
         "proxyMode": "global",
         "proxyModeType": "systemProxy",
-        "servers": "not-an-array",
+        "servers": [],
         "customRules": [
             {"id":"r1","type":"domain","values":["a.com"],"action":"proxy","enabled":true}
         ],
@@ -22,7 +22,7 @@ fn bad_field_skipped_good_field_kept() {
     let v = sanitize_config(json).unwrap();
     let obj = v.as_object().unwrap();
     // 坏字段已删
-    assert!(!obj.contains_key("servers"));
+    assert_eq!(obj["servers"], json!([]));
     assert!(!obj.contains_key("mixedPort"));
     // 好字段保留
     assert_eq!(obj["proxyMode"], "global");
@@ -111,17 +111,31 @@ fn bool_field_bad_removed() {
 }
 
 #[test]
-fn update_channels_share_the_stable_prerelease_value_domain() {
-    let valid =
-        sanitize_config(r#"{"appUpdateChannel":"prerelease","coreUpdateChannel":"stable"}"#)
-            .unwrap();
+fn app_update_channel_accepts_only_stable_or_prerelease() {
+    let valid = sanitize_config(r#"{"appUpdateChannel":"prerelease"}"#).unwrap();
     assert_eq!(valid["appUpdateChannel"], "prerelease");
-    assert_eq!(valid["coreUpdateChannel"], "stable");
 
-    let invalid =
-        sanitize_config(r#"{"appUpdateChannel":"nightly","coreUpdateChannel":true}"#).unwrap();
+    let invalid = sanitize_config(r#"{"appUpdateChannel":"nightly"}"#).unwrap();
     assert!(invalid.get("appUpdateChannel").is_none());
-    assert!(invalid.get("coreUpdateChannel").is_none());
+}
+
+/// 旧配置里的内核更新设置无论取值是否合法都被删掉；相邻的应用更新通道不受牵连。
+#[test]
+fn retired_core_update_settings_are_dropped() {
+    let v = sanitize_config(
+        r#"{"autoUpdateCore":true,"coreUpdateChannel":"stable",
+            "restrictCoreUpdateToCompatibleMinor":false,"appUpdateChannel":"stable"}"#,
+    )
+    .unwrap();
+    let obj = v.as_object().unwrap();
+    for key in [
+        "autoUpdateCore",
+        "coreUpdateChannel",
+        "restrictCoreUpdateToCompatibleMinor",
+    ] {
+        assert!(!obj.contains_key(key), "{key} 应被删除");
+    }
+    assert_eq!(obj["appUpdateChannel"], "stable");
 }
 
 #[test]
@@ -248,3 +262,194 @@ fn network_profiles_sanitize_drops_idless_entries_and_normalizes_domains() {
     let not_array = sanitize_config(r#"{"networkProfiles": {"id": "x"}}"#).unwrap();
     assert!(not_array.get("networkProfiles").is_none(), "非数组整键删除");
 }
+
+/// 槽位上限按平台取值：桌面 64、Android 32、iOS 16。
+#[test]
+fn the_speed_test_slot_cap_depends_on_the_platform() {
+    for platform in Platform::ALL {
+        let expected = match platform {
+            Platform::Mac | Platform::Win | Platform::Linux => 64,
+            Platform::Android => 32,
+            Platform::Ios | Platform::Other => 16,
+        };
+        assert_eq!(speed_test_slot_cap(*platform), expected, "{platform:?}");
+    }
+}
+
+/// 测速并发：`"auto"` 与 4 到本平台上限的整数保留，其余删除（回落自动）。上限随平台不同，
+/// 桌面设的 48 拿到手机上被清成自动。
+#[test]
+fn speed_test_concurrency_is_kept_only_within_the_platform_range() {
+    let sanitized = |value: Value, platform| {
+        let mut obj = Map::new();
+        obj.insert("speedTestConcurrency".into(), value);
+        speed_test_concurrency_or_remove(&mut obj, platform);
+        obj.get("speedTestConcurrency").cloned()
+    };
+    for (value, platform, kept) in [
+        (json!("auto"), Platform::Linux, true),
+        (json!(4), Platform::Linux, true),
+        (json!(64), Platform::Linux, true),
+        (json!(48), Platform::Linux, true),
+        (json!(48), Platform::Android, false),
+        (json!(32), Platform::Android, true),
+        (json!(17), Platform::Ios, false),
+        (json!(3), Platform::Linux, false),
+        (json!(65), Platform::Linux, false),
+        (json!(8.5), Platform::Linux, false),
+        (json!("16"), Platform::Linux, false),
+        (json!(true), Platform::Linux, false),
+    ] {
+        assert_eq!(
+            sanitized(value.clone(), platform),
+            kept.then_some(value.clone()),
+            "{value} on {platform:?}"
+        );
+    }
+}
+
+/// 逐订阅的两个键与顶层的两个键：类型或取值不对即删除，回到缺省。越界的周期删除而不是钳到边界。
+#[test]
+fn periodic_speed_test_settings_are_removed_not_clamped_when_invalid() {
+    let subscription = |extra: Value| {
+        let mut sub = json!({ "id": "s", "name": "n", "url": "https://a.example/x" });
+        sub.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let config = json!({ "subscriptions": [sub] }).to_string();
+        sanitize_config(&config).unwrap()["subscriptions"][0].clone()
+    };
+    let kept = subscription(json!({ "periodicSpeedTest": true, "speedTestIntervalMinutes": 5 }));
+    assert_eq!(kept["periodicSpeedTest"], true);
+    assert_eq!(kept["speedTestIntervalMinutes"], 5);
+    assert_eq!(
+        subscription(json!({ "speedTestIntervalMinutes": 360 }))["speedTestIntervalMinutes"],
+        360
+    );
+    for bad in [
+        json!(4),
+        json!(361),
+        json!(30.5),
+        json!("30"),
+        json!(-5),
+        json!(null),
+    ] {
+        let sub = subscription(json!({ "speedTestIntervalMinutes": bad }));
+        assert!(
+            sub.get("speedTestIntervalMinutes").is_none(),
+            "{bad} 应被删除而不是钳到边界"
+        );
+        assert_eq!(sub["id"], "s", "坏值只丢这一个键，订阅本身保留");
+    }
+    assert!(subscription(json!({ "periodicSpeedTest": "yes" }))
+        .get("periodicSpeedTest")
+        .is_none());
+
+    let top = |config: Value| sanitize_config(&config.to_string()).unwrap();
+    for policy in ["pause", "reduced", "normal"] {
+        assert_eq!(
+            top(json!({ "speedTestMeteredPolicy": policy }))["speedTestMeteredPolicy"],
+            policy
+        );
+    }
+    for bad in [json!("slow"), json!(4), json!(null)] {
+        assert!(top(json!({ "speedTestMeteredPolicy": bad }))
+            .get("speedTestMeteredPolicy")
+            .is_none());
+    }
+    assert_eq!(
+        top(json!({ "periodicSpeedTestEnabled": false }))["periodicSpeedTestEnabled"],
+        false
+    );
+    assert!(top(json!({ "periodicSpeedTestEnabled": "off" }))
+        .get("periodicSpeedTestEnabled")
+        .is_none());
+    // 缺省值是这几处的单一来源。
+    const { assert!(PERIODIC_SPEED_TEST_ENABLED_DEFAULT) };
+    const { assert!(!PERIODIC_SPEED_TEST_SUBSCRIPTION_DEFAULT) };
+    assert_eq!(SPEED_TEST_METERED_POLICY_DEFAULT, "reduced");
+    assert_eq!(SPEED_TEST_INTERVAL_MINUTES_DEFAULT, 30);
+    assert!(SPEED_TEST_INTERVAL_MINUTES.contains(&SPEED_TEST_INTERVAL_MINUTES_DEFAULT));
+}
+
+/// 选择意图的清洗：形状损坏、或本版本认识但指向的订阅不存在 → 移除；本版本认识且订阅存在 →
+/// 原样保留；结构完好而取值本版本不认识（更新的版本写的模式或作用域）→ 原样保留，读取时不生效。
+/// 订阅本身被清洗掉（缺必填字段）时，指向它的意图一并移除。
+#[test]
+fn the_selection_intent_is_removed_when_broken_or_dangling_and_kept_otherwise() {
+    let cleaned = |intent: Value| {
+        let config = json!({
+            "subscriptions": [
+                { "id": "sub", "name": "n", "url": "https://a.example/x" },
+                { "id": "broken" },
+            ],
+            "selectionIntent": intent,
+        })
+        .to_string();
+        sanitize_config(&config).unwrap()
+    };
+    let valid = crate::selection_intent_auto("sub");
+    assert_eq!(
+        valid,
+        json!({ "mode": "auto", "scope": "subscription", "subscriptionId": "sub" })
+    );
+    let kept = cleaned(valid.clone());
+    assert_eq!(kept["selectionIntent"], valid, "合法时原样保留");
+    assert_eq!(crate::selection_intent_subscription(&kept), Some("sub"));
+    assert!(!crate::selection_intent_unrecognized(&kept));
+
+    // 损坏或悬空：移除。
+    for bad in [
+        crate::selection_intent_auto("missing"),
+        crate::selection_intent_auto("broken"),
+        crate::selection_intent_auto(""),
+        json!({ "mode": "auto", "subscriptionId": "sub" }),
+        json!({ "scope": "subscription", "subscriptionId": "sub" }),
+        json!({ "mode": "auto", "scope": "subscription", "subscriptionId": 7 }),
+        json!({ "mode": "auto", "scope": "subscription" }),
+        json!({ "mode": 1, "scope": "subscription", "subscriptionId": "sub" }),
+        json!({ "mode": "auto", "scope": ["subscription"], "subscriptionId": "sub" }),
+        json!({ "mode": "", "scope": "subscription", "subscriptionId": "sub" }),
+        json!({}),
+        json!("sub"),
+        json!(["sub"]),
+        json!(true),
+        Value::Null,
+    ] {
+        let result = cleaned(bad.clone());
+        assert!(result.get("selectionIntent").is_none(), "{bad} 应被移除");
+        assert_eq!(crate::selection_intent_subscription(&result), None);
+        assert!(!crate::selection_intent_unrecognized(&result));
+        assert_eq!(result["subscriptions"][0]["id"], "sub", "只丢意图这一个键");
+    }
+
+    // 结构完好而取值不认识：原样保留（连同本版本不认识的附加字段），读取时不生效。
+    // 此前 `scope: "global"` 在这里被移除；那样的话，用户从加了全局作用域的新版本回到本版本
+    // 再回去，意图就丢了。
+    for unknown in [
+        json!({ "mode": "auto", "scope": "global" }),
+        json!({ "mode": "auto", "scope": "global", "subscriptionId": "missing", "extra": [1] }),
+        json!({ "mode": "pinned", "scope": "subscription", "subscriptionId": "sub" }),
+        json!({ "mode": "manual", "scope": "subscription", "subscriptionId": "sub" }),
+    ] {
+        let result = cleaned(unknown.clone());
+        assert_eq!(result["selectionIntent"], unknown, "{unknown} 应原样保留");
+        assert_eq!(
+            crate::selection_intent_subscription(&result),
+            None,
+            "不生效"
+        );
+        assert!(crate::selection_intent_unrecognized(&result));
+    }
+
+    // 没有订阅表时本版本认识的意图是悬空的；没有意图键时什么都不做。
+    let no_subscriptions =
+        sanitize_config(&json!({ "selectionIntent": valid }).to_string()).unwrap();
+    assert!(no_subscriptions.get("selectionIntent").is_none());
+    assert!(sanitize_config("{}")
+        .unwrap()
+        .get("selectionIntent")
+        .is_none());
+}
+
+mod audit_regressions;

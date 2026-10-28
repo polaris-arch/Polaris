@@ -64,6 +64,36 @@ fn ci_yml_stripped() -> String {
     yml
 }
 
+/// 精确取 YAML 的一个缩进块；缺失或重名都失败，不能由其它 job/step 喂饱判据。
+fn yml_block(source: &str, header: &str) -> String {
+    let lines: Vec<_> = source.lines().collect();
+    let starts: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| (*line == header).then_some(i))
+        .collect();
+    assert_eq!(starts.len(), 1, "ci.yml 必须恰有一个 `{header}` 块");
+    let start = starts[0];
+    let indent = header.len() - header.trim_start().len();
+    let end = (start + 1..lines.len())
+        .find(|&i| {
+            let line = lines[i];
+            !line.trim().is_empty() && line.len() - line.trim_start().len() <= indent
+        })
+        .unwrap_or(lines.len());
+    lines[start..end].join("\n")
+}
+
+const CROSS_STEP: &str = "      - name: Cross-check platform targets (cfg(windows) / cfg(macos) / cfg(android) / cfg(ios) 分支)";
+
+fn cross_step(yml: &str) -> String {
+    yml_block(&yml_block(yml, "  cross:"), CROSS_STEP)
+}
+
+fn ci_cross_step() -> String {
+    cross_step(&ci_yml_stripped())
+}
+
 /// 🔴 交叉步骤还在，且判据口径是 clippy（不是 check）。
 ///
 /// `cargo check` 对 clippy lint 的检出力为零（见文件头实测），口径本身就是本门要守的事。
@@ -76,7 +106,7 @@ fn ci_yml_stripped() -> String {
 /// "${TARGETS[@]}"`、反腐烂步不动，两条泛锚照样绿 —— 判据必须钉死主步的完整命令行。
 #[test]
 fn cross_step_uses_clippy_not_check() {
-    let yml = ci_yml_stripped();
+    let yml = ci_cross_step();
     assert!(
         yml.contains("rustup target add x86_64-pc-windows-msvc x86_64-apple-darwin"),
         "ci.yml 不再安装交叉 target —— 平台特定代码在 Linux 腿上重新变成零检出"
@@ -95,7 +125,7 @@ fn cross_step_uses_clippy_not_check() {
 /// 不是谁手写的静态列表。
 #[test]
 fn coverage_is_derived_not_hand_maintained() {
-    let yml = ci_yml_stripped();
+    let yml = ci_cross_step();
     assert!(
         yml.contains("cargo metadata --no-deps"),
         "ci.yml 不再用 `cargo metadata --no-deps` 派生包清单 —— 新建 crate 可能不会自动被交叉检查覆盖"
@@ -107,18 +137,47 @@ fn coverage_is_derived_not_hand_maintained() {
     );
 }
 
-/// 🔴 不许硬编码回归：旧口径的 `-p polaris-xxx` 字面量不能在 ci.yml 里复活。
+/// 🔴 不许硬编码回归：`-p polaris-xxx` 不能在 cross job 的交叉主步里复活。
+/// 其它 job 构建真实 helper/cleaner 的 `-p` 不定义交叉覆盖面，不在此门取材面内。
 ///
 /// 派生清单存在的意义就是不需要有人手写/维护 `-p` 列表；一旦有人「顺手加回」一份硬编码，
 /// 覆盖面就会静默退回旧问题（新建 crate 默认不被覆盖，且没有东西会告诉你）。
 #[test]
 fn hardcoded_package_list_does_not_come_back() {
-    let yml = ci_yml_stripped();
+    let yml = ci_cross_step();
     assert!(
         !yml.contains("-p polaris-"),
-        "ci.yml 里出现了 `-p polaris-` 字面量 —— 交叉检查的覆盖面正在从「派生」退回「手写清单」，\
+        "ci.yml 的 cross 主步出现了 `-p polaris-` 字面量 —— 交叉检查的覆盖面正在从「派生」退回「手写清单」，\
          新建 crate 会重新默认不被覆盖，且没有任何东西会提醒你"
     );
+}
+
+#[test]
+fn cross_step_scope_excludes_helper_builds_but_rejects_hardcoded_coverage() {
+    let fixture = format!(
+        "jobs:\n  test:\n    steps:\n      - name: Build helper\n        run: cargo build -p polaris-helper\n  cross:\n    steps:\n{CROSS_STEP}\n        run: cargo clippy --target \"$t\" \"${{TARGETS[@]}}\"\n      - name: Other step\n        run: cargo build -p polaris-cleaner\n  after:\n    run: cargo build -p polaris-helper\n"
+    );
+    let step = cross_step(&fixture);
+    assert!(step.contains("cargo clippy --target"));
+    assert!(!step.contains("-p polaris-"));
+    let hardcoded = fixture.replace(
+        "cargo clippy --target",
+        "cargo clippy -p polaris-helper --target",
+    );
+    assert!(cross_step(&hardcoded).contains("-p polaris-"));
+}
+
+#[test]
+fn cross_step_scope_rejects_missing_moved_or_duplicate_anchors() {
+    let fixture = format!("jobs:\n  cross:\n    steps:\n{CROSS_STEP}\n        run: cargo clippy\n");
+    for invalid in [
+        fixture.replace("  cross:", "  other:"),
+        fixture.replace(CROSS_STEP, "      - name: Other step"),
+        format!("{fixture}{CROSS_STEP}\n        run: cargo clippy\n"),
+        format!("{fixture}  cross:\n    steps: []\n"),
+    ] {
+        assert!(std::panic::catch_unwind(|| cross_step(&invalid)).is_err());
+    }
 }
 
 /// 跑一次 `cargo metadata --no-deps`，返回 workspace 全部包名。
@@ -157,7 +216,7 @@ fn workspace_package_names() -> BTreeSet<String> {
 /// 那一行已被 [`cross_step_uses_clippy_not_check`] 钉住，是「哪些 triple 真的会被检查」
 /// 的单一真相源 —— CI 增删 triple 时本判据自动跟随，不会漂成第二份清单。
 fn ci_cross_targets() -> BTreeSet<String> {
-    let yml = ci_yml_stripped();
+    let yml = ci_cross_step();
     let targets: BTreeSet<String> = yml
         .lines()
         .filter_map(|l| l.trim().strip_prefix("rustup target add "))
@@ -318,5 +377,104 @@ fn ios_bridge_exemption_cannot_expand_targets_even_below_budget() {
             !exemption_surface_fits_budget(table.as_object().unwrap()),
             "iOS bridge 不得扩大 targets：{targets:?}"
         );
+    }
+}
+
+// ── 随仓第三方副本（`[patch]` 的路径源）不在上面那张派生清单里 ──
+//
+// 派生清单取的是 workspace 成员；`[patch]` 指向的路径源不是成员，但 Cargo 只给注册表与 git 来源
+// 的依赖加 lint 上限，路径源一律按本仓代码对待 —— `RUSTFLAGS="-D warnings"` 会用最新工具链新增的
+// lint 去审它。而这类依赖往往只在某一个平台的依赖图里（swift-rs 只在 macOS 宿主的构建依赖与 iOS
+// 目标里），Linux 腿的图里根本没有它，要到原生腿才红。本门守的是每份这样的副本都自带上限。
+
+/// 清单里某一节（表头逐字给出）之内、某个键（`path` / `build`）的全部字符串取值。
+fn manifest_strings_in(manifest: &str, header: &str, key: &str) -> Vec<String> {
+    let needle = format!("{key} = \"");
+    let mut inside = false;
+    let mut found = Vec::new();
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            inside = line == header;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let rest = match line.strip_prefix(&needle) {
+            Some(rest) => Some(rest),
+            None => line.split_once(&format!(" {needle}")).map(|(_, rest)| rest),
+        };
+        if let Some(rest) = rest {
+            if let Some((path, _)) = rest.split_once('"') {
+                found.push(path.to_owned());
+            }
+        }
+    }
+    found
+}
+
+/// 源文件是否以 crate 级属性的形式带着 lint 上限（注释里提到的不算）。
+fn carries_lint_cap(source: &str) -> bool {
+    source
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "#![allow(warnings)]")
+}
+
+#[test]
+fn manifest_path_extraction_and_lint_cap_detection_bite() {
+    let manifest = "[workspace]\nexclude = [\"vendor/a\"]\n\n# [patch.crates-io]\n# c = { path = \"vendor/c\" }\n[patch.crates-io]\na = { path = \"vendor/a\" }\nb = { git = \"https://example.invalid/b\" }\n\n[profile.release]\npath = \"not-a-patch\"\n";
+    assert_eq!(
+        manifest_strings_in(manifest, "[patch.crates-io]", "path"),
+        vec!["vendor/a".to_owned()]
+    );
+    assert!(manifest_strings_in(manifest, "[lib]", "path").is_empty());
+    let package = "[package]\nname = \"a\"\nrebuild = \"no\"\nbuild = \"src/gen.rs\"\n[lib]\npath = \"src/a.rs\"\n";
+    assert_eq!(
+        manifest_strings_in(package, "[package]", "build"),
+        vec!["src/gen.rs".to_owned()]
+    );
+    assert_eq!(
+        manifest_strings_in(package, "[lib]", "path"),
+        vec!["src/a.rs".to_owned()]
+    );
+    assert!(carries_lint_cap("//! docs\n#![allow(warnings)]\nmod a;\n"));
+    assert!(!carries_lint_cap(
+        "//! docs\n// #![allow(warnings)]\nmod a;\n"
+    ));
+    assert!(!carries_lint_cap(
+        "#![allow(dead_code)]\n#[allow(warnings)]\nmod a;\n"
+    ));
+}
+
+#[test]
+fn vendored_path_patches_carry_their_own_lint_cap() {
+    for vendored in manifest_strings_in(&read("Cargo.toml"), "[patch.crates-io]", "path") {
+        let manifest = read(&format!("{vendored}/Cargo.toml"));
+        let lib = manifest_strings_in(&manifest, "[lib]", "path")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "src/lib.rs".to_owned());
+        // 构建脚本是另一个 crate 根，上限要各带各的：清单点名的那个，否则是约定位置的 `build.rs`。
+        let build = manifest_strings_in(&manifest, "[package]", "build")
+            .into_iter()
+            .next()
+            .or_else(|| {
+                repo_root()
+                    .join(&vendored)
+                    .join("build.rs")
+                    .is_file()
+                    .then(|| "build.rs".to_owned())
+            });
+        for root in std::iter::once(lib).chain(build) {
+            assert!(
+                carries_lint_cap(&read(&format!("{vendored}/{root}"))),
+                "{vendored}/{root} 没有 crate 级 `#![allow(warnings)]`：路径源不享受 Cargo 给注册表依赖的 \
+                 lint 上限，原生腿的 `-D warnings` 会直接审这份第三方代码"
+            );
+        }
     }
 }

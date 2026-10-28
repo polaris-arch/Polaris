@@ -61,6 +61,10 @@ import './connections/connections-redesign.css';
 installErrorForwarding();
 disableNativeContextMenu();
 
+// Android carries its own marker only for routing account actions; every layout
+// rule below and in CSS matches 'ios' exactly.
+if (isTauri() && platform() === 'android') document.documentElement.dataset.mobileOs = 'android';
+
 // Keep the iOS layout switch out of desktop and Android. Tauri's OS plugin
 // reports the target at build time, so this is ready before the first render.
 if (isTauri() && platform() === 'ios') {

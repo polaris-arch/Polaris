@@ -2,6 +2,11 @@
 
 use super::*;
 use polaris_config_engine::builder::hotswitch::{HotSwitchKind, HotSwitchPut};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::task::Poll;
+use tokio::sync::Semaphore;
 
 fn global_plan() -> HotSwitchPlan {
     HotSwitchPlan {
@@ -233,3 +238,362 @@ async fn execute_empty_puts_applies_without_disconnect() {
     }
     assert!(api.put_calls.lock().unwrap().is_empty());
 }
+
+// 每条 close 真正挂起，只有测试释放其 permit 才完成；无需 spawn 或墙钟等待。
+// guard 同时记录在途峰值和 future drop，避免“最后关了 40 条”冒充并发/取消证明。
+#[derive(Default)]
+struct BlockingCloseState {
+    puts: Vec<(String, String)>,
+    puts_before_snapshot: Vec<(String, String)>,
+    snapshot_calls: usize,
+    attempted: Vec<String>,
+    entered: Vec<String>,
+    completed: Vec<String>,
+    dropped: Vec<String>,
+    rejected: Vec<String>,
+    failed: Vec<String>,
+    active: usize,
+    peak: usize,
+}
+
+struct BlockingManagementApi {
+    snapshot: Vec<ConnectionSnapshot>,
+    close_gates: HashMap<String, Semaphore>,
+    state: Mutex<BlockingCloseState>,
+    generation_valid: AtomicBool,
+    fail_close: Option<String>,
+    fail_put: Option<String>,
+    fail_snapshot: bool,
+}
+
+impl BlockingManagementApi {
+    fn new(snapshot: Vec<ConnectionSnapshot>) -> Self {
+        let close_gates = snapshot
+            .iter()
+            .map(|c| (c.id.clone(), Semaphore::new(0)))
+            .collect();
+        Self {
+            snapshot,
+            close_gates,
+            state: Mutex::new(BlockingCloseState::default()),
+            generation_valid: AtomicBool::new(true),
+            fail_close: None,
+            fail_put: None,
+            fail_snapshot: false,
+        }
+    }
+
+    fn release(&self, id: &str) {
+        self.close_gates.get(id).unwrap().add_permits(1);
+    }
+
+    fn release_all(&self) {
+        for gate in self.close_gates.values() {
+            gate.add_permits(1);
+        }
+    }
+}
+
+struct ActiveClose<'a> {
+    state: &'a Mutex<BlockingCloseState>,
+    id: String,
+    completed: bool,
+}
+
+impl Drop for ActiveClose<'_> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.active -= 1;
+        if self.completed {
+            state.completed.push(self.id.clone());
+        } else {
+            state.dropped.push(self.id.clone());
+        }
+    }
+}
+
+#[async_trait]
+impl ManagementApi for BlockingManagementApi {
+    async fn select_outbound(
+        &self,
+        selector_tag: &str,
+        member_tag: &str,
+    ) -> Result<(), ManagementError> {
+        self.state
+            .lock()
+            .unwrap()
+            .puts
+            .push((selector_tag.into(), member_tag.into()));
+        if self.fail_put.as_deref() == Some(selector_tag) {
+            return Err(ManagementError::Call("selected PUT failed".into()));
+        }
+        Ok(())
+    }
+
+    async fn first_connection_snapshot(&self) -> Result<Vec<ConnectionSnapshot>, ManagementError> {
+        let mut state = self.state.lock().unwrap();
+        state.snapshot_calls += 1;
+        state.puts_before_snapshot = state.puts.clone();
+        if self.fail_snapshot {
+            return Err(ManagementError::SnapshotTimeout);
+        }
+        Ok(self.snapshot.clone())
+    }
+
+    async fn close_connection(&self, id: &str) -> Result<(), ManagementError> {
+        {
+            let mut state = self.state.lock().unwrap();
+            assert_eq!(state.snapshot_calls, 1, "close must follow the snapshot");
+            state.attempted.push(id.into());
+            // 模拟收到的 API wrapper 在每次 RPC 入场时复核 generation/intent。
+            if !self.generation_valid.load(Ordering::SeqCst) {
+                state.rejected.push(id.into());
+                return Err(ManagementError::NotReady);
+            }
+            state.entered.push(id.into());
+            state.active += 1;
+            state.peak = state.peak.max(state.active);
+        }
+        let mut active = ActiveClose {
+            state: &self.state,
+            id: id.into(),
+            completed: false,
+        };
+        let permit = self.close_gates.get(id).unwrap().acquire().await.unwrap();
+        permit.forget();
+        active.completed = true;
+        if self.fail_close.as_deref() == Some(id) {
+            self.state.lock().unwrap().failed.push(id.into());
+            return Err(ManagementError::Call("selected close failed".into()));
+        }
+        Ok(())
+    }
+}
+
+fn selected_snapshot(count: usize) -> Vec<ConnectionSnapshot> {
+    (0..count)
+        .map(|i| conn(&format!("selected-{i}"), &["tagA", "proxy-selector"], 0))
+        .collect()
+}
+
+fn selected_ids(count: usize) -> Vec<String> {
+    (0..count).map(|i| format!("selected-{i}")).collect()
+}
+
+fn applied_ids(outcome: HotSwitchOutcome) -> Vec<String> {
+    match outcome {
+        HotSwitchOutcome::Applied {
+            disconnect: Some(disconnect),
+        } => disconnect.closed_ids,
+        _ => panic!("expected Applied with disconnect"),
+    }
+}
+
+fn assert_same_ids(actual: &[String], expected: &[String]) {
+    let mut actual = actual.to_vec();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+fn assert_send<T: Send>(_: &T) {}
+
+#[tokio::test]
+async fn execute_bounds_blocking_closes_at_sixteen_and_drains_later_waves() {
+    // 字面值 16 是契约，不从实现常量反推，否则把上限改错也会同步“通过”。
+    for count in [0, 1, 16, 17, 40] {
+        let api = BlockingManagementApi::new(selected_snapshot(count));
+        let exec = SwitchExecutor;
+        let plan = global_plan();
+        let mut execution = Box::pin(exec.execute(&api, &plan, true));
+        // 外层 runtime 需要 Send；只写静态契约，不创建 detached task。
+        assert_send(&execution);
+        let first_poll = futures::poll!(execution.as_mut());
+        let outcome = if count == 0 {
+            match first_poll {
+                Poll::Ready(outcome) => outcome,
+                Poll::Pending => panic!("empty selection must not wait for a close"),
+            }
+        } else {
+            assert!(first_poll.is_pending());
+            {
+                let state = api.state.lock().unwrap();
+                assert_eq!(state.entered.len(), count.min(16));
+                assert_eq!(state.active, count.min(16));
+                assert_eq!(state.peak, count.min(16));
+                assert!(state.completed.is_empty());
+            }
+            api.release_all();
+            execution.await
+        };
+        assert_eq!(applied_ids(outcome), selected_ids(count));
+        let state = api.state.lock().unwrap();
+        assert_same_ids(&state.entered, &selected_ids(count));
+        assert_same_ids(&state.completed, &selected_ids(count));
+        assert_eq!(state.active, 0);
+        assert!(state.peak <= 16);
+        assert!(state.dropped.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn execute_keeps_selected_order_and_best_effort_with_unordered_closes() {
+    let mut snapshot = selected_snapshot(40);
+    snapshot.extend([
+        conn("ghost", &["tagA", "proxy-selector"], 1),
+        conn("new-member", &["tagB", "proxy-selector"], 0),
+        conn("fixed-old-member", &["tagA", "rule-sel-fixed"], 0),
+        conn("direct", &["direct"], 0),
+        conn("unknown-chain", &[], 0),
+    ]);
+    let mut api = BlockingManagementApi::new(snapshot);
+    api.fail_close = Some("selected-3".into());
+    let exec = SwitchExecutor;
+    let plan = global_plan();
+    let mut execution = Box::pin(exec.execute(&api, &plan, true));
+    assert!(futures::poll!(execution.as_mut()).is_pending());
+    // 先完成第一波的最后一条；第二波必须能入场，不等最早那条完成。
+    api.release("selected-15");
+    assert!(futures::poll!(execution.as_mut()).is_pending());
+    {
+        let state = api.state.lock().unwrap();
+        assert_eq!(state.completed, vec!["selected-15".to_string()]);
+        assert_eq!(state.entered.len(), 17);
+        assert!(state.entered.contains(&"selected-16".to_string()));
+        assert_eq!(state.active, 16);
+    }
+    api.release_all();
+    // 返回仍是筛选/尝试口径（含失败 ID），既不按 ACK 顺序，也不删除失败项。
+    assert_eq!(applied_ids(execution.await), selected_ids(40));
+    let state = api.state.lock().unwrap();
+    assert_same_ids(&state.attempted, &selected_ids(40));
+    assert_same_ids(&state.completed, &selected_ids(40));
+    assert_eq!(state.failed, vec!["selected-3".to_string()]);
+    assert_eq!(state.active, 0);
+    assert_eq!(state.peak, 16);
+}
+
+#[tokio::test]
+async fn execute_rechecks_received_api_gate_for_later_close_waves() {
+    let api = BlockingManagementApi::new(selected_snapshot(40));
+    let exec = SwitchExecutor;
+    let plan = global_plan();
+    let mut execution = Box::pin(exec.execute(&api, &plan, true));
+    assert!(futures::poll!(execution.as_mut()).is_pending());
+    assert_eq!(api.state.lock().unwrap().entered.len(), 16);
+    api.generation_valid.store(false, Ordering::SeqCst);
+    api.release_all();
+    // wrapper 已发出的第一波不能撤回；后续 24 条只能被 wrapper 拒绝。
+    // 上层仍负责按 generation 丢弃整个旧 outcome，此处不改历史返回口径。
+    assert_eq!(applied_ids(execution.await), selected_ids(40));
+    let state = api.state.lock().unwrap();
+    assert_same_ids(&state.attempted, &selected_ids(40));
+    assert_same_ids(&state.entered, &selected_ids(16));
+    assert_same_ids(&state.completed, &selected_ids(16));
+    assert_same_ids(&state.rejected, &selected_ids(40)[16..]);
+    assert_eq!(state.active, 0);
+    assert_eq!(state.peak, 16);
+}
+
+#[tokio::test]
+async fn dropping_execute_drops_in_flight_closes_without_starting_stragglers() {
+    let api = BlockingManagementApi::new(selected_snapshot(40));
+    let exec = SwitchExecutor;
+    let plan = global_plan();
+    let mut execution = Box::pin(exec.execute(&api, &plan, true));
+    assert!(futures::poll!(execution.as_mut()).is_pending());
+    assert_eq!(api.state.lock().unwrap().active, 16);
+    drop(execution);
+    {
+        let state = api.state.lock().unwrap();
+        assert_eq!(state.active, 0, "close futures must drop with their owner");
+        assert_same_ids(&state.dropped, &selected_ids(16));
+        assert_same_ids(&state.attempted, &selected_ids(16));
+        assert!(state.completed.is_empty());
+    }
+    api.release_all();
+    tokio::task::yield_now().await;
+    let state = api.state.lock().unwrap();
+    assert_same_ids(&state.attempted, &selected_ids(16));
+    assert_same_ids(&state.dropped, &selected_ids(16));
+    assert!(state.completed.is_empty());
+    assert_eq!(state.active, 0);
+}
+
+#[tokio::test]
+async fn execute_finishes_ordered_puts_before_snapshot_and_close() {
+    let mut plan = global_plan();
+    plan.kind = HotSwitchKind::Both;
+    plan.puts.push(HotSwitchPut {
+        selector_tag: "rule-sel-r1".into(),
+        member_tag: "tagX".into(),
+        old_member_tag: Some("tagY".into()),
+    });
+    let expected_puts = vec![
+        ("proxy-selector".to_string(), "tagB".to_string()),
+        ("rule-sel-r1".to_string(), "tagX".to_string()),
+    ];
+    let api = BlockingManagementApi::new(selected_snapshot(17));
+    let exec = SwitchExecutor;
+    let mut execution = Box::pin(exec.execute(&api, &plan, true));
+    assert!(futures::poll!(execution.as_mut()).is_pending());
+    {
+        let state = api.state.lock().unwrap();
+        assert_eq!(state.puts, expected_puts);
+        assert_eq!(state.puts_before_snapshot, expected_puts);
+        assert_eq!(state.snapshot_calls, 1);
+        assert_eq!(state.entered.len(), 16);
+    }
+    api.release_all();
+    assert_eq!(applied_ids(execution.await), selected_ids(17));
+
+    let mut api = BlockingManagementApi::new(selected_snapshot(17));
+    api.fail_put = Some("proxy-selector".into());
+    let outcome = exec.execute(&api, &plan, true).await;
+    assert!(matches!(outcome, HotSwitchOutcome::Failed { .. }));
+    let state = api.state.lock().unwrap();
+    assert_eq!(state.puts, expected_puts[..1]);
+    assert_eq!(state.snapshot_calls, 0);
+    assert!(state.attempted.is_empty());
+}
+
+#[tokio::test]
+async fn execute_skip_and_snapshot_failure_paths_never_start_close_futures() {
+    for scenario in [
+        "switch-off",
+        "no-old-member",
+        "unchanged-member",
+        "snapshot-fails",
+    ] {
+        let mut api = BlockingManagementApi::new(selected_snapshot(17));
+        let mut plan = global_plan();
+        let interrupt = scenario != "switch-off";
+        match scenario {
+            "no-old-member" => plan.puts[0].old_member_tag = None,
+            "unchanged-member" => plan.puts[0].old_member_tag = Some("tagB".into()),
+            "snapshot-fails" => api.fail_snapshot = true,
+            _ => {}
+        }
+        let exec = SwitchExecutor;
+        let mut execution = Box::pin(exec.execute(&api, &plan, interrupt));
+        let outcome = match futures::poll!(execution.as_mut()) {
+            Poll::Ready(outcome) => outcome,
+            Poll::Pending => panic!("{scenario} must not wait for a close"),
+        };
+        if interrupt {
+            assert!(applied_ids(outcome).is_empty());
+        } else {
+            assert_eq!(outcome, HotSwitchOutcome::Applied { disconnect: None });
+        }
+        let state = api.state.lock().unwrap();
+        assert_eq!(
+            state.snapshot_calls,
+            usize::from(scenario == "snapshot-fails")
+        );
+        assert!(state.attempted.is_empty());
+        assert_eq!(state.active, 0);
+    }
+}
+
+mod audit_regressions;

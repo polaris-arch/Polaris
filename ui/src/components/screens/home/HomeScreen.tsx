@@ -1,3 +1,6 @@
+import { proxyErrorText } from '@/domain/proxy-error-text';
+import { useQualifiedLatencies } from '@/mobile/use-qualified-latencies';
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * Home 屏（提取自原型 polaris-prototype.html L1633-1711）。
  *
@@ -40,10 +43,9 @@ import {
   deriveTakeoverConnState,
 } from './connection-state';
 import { exitAddrText } from './exit-addr';
-import { applyFakeIpTunEntry } from './fakeip-tun-entry';
 import { notifyDesktop } from '@/lib/desktop-notify';
 import { withProxyStartClaim } from '@/lib/proxy-start-claim';
-import { ProxyErrorCode, type UserConfig } from '@/contracts/types';
+import { ProxyErrorCode } from '@/contracts/types';
 import { ConnectionTopology } from './ConnectionTopology';
 import { useSwitchNode } from '@/components/screens/shared/use-switch-node';
 import { switchReceiptFeedback } from '@/components/screens/shared/switch-receipt-feedback';
@@ -61,7 +63,7 @@ import {
 import { resolveExitNodeFlagCode } from '@/domain/exit-flag';
 import { FlagImg } from '@/components/FlagImg';
 import { speedTestableIds } from '@/domain/endpoint-routes';
-import { useLatencyStore, latencyMapWhen } from '@/store/use-latency-store';
+import { useLatencyStore } from '@/store/use-latency-store';
 import { useSystemProxyLive } from '@/store/use-system-proxy-live';
 import { isReverseRegionRouting } from '@/domain/region-routing';
 import {
@@ -238,7 +240,6 @@ export function HomeScreen() {
   const setUnlock = useAppStore((s) => s.setUnlock);
   const beginUnlockCheck = useAppStore((s) => s.beginUnlockCheck);
   const applyUnlockSnapshot = useAppStore((s) => s.applyUnlockSnapshot);
-  const saveConfig = useAppStore((s) => s.saveConfig);
   const switchServer = useAppStore((s) => s.switchServer);
   const switchNode = useSwitchNode();
   const openDialog = useDialogStore((s) => s.open);
@@ -282,7 +283,7 @@ export function HomeScreen() {
    *    返回值的 `applyLatencyResults` 兜底，两条都与本组件订不订阅无关 ⇒ 结果完整落库，
    *    只是本组件不为它重渲；下次打开选单即刻显示全部结果。不丢数据、不推迟、不显示陈旧值。
    */
-  const latencies = useLatencyStore(latencyMapWhen(nodeMenuOpen));
+  const latencies = useQualifiedLatencies(servers, nodeMenuOpen);
   /** 本次解锁快照是否由用户点「网络检测」触发（喂 onUpdated 里的完成 toast，见 onUnlockRefresh）。 */
   const unlockUserRequested = useRef(false);
   /** 当前出口显示名。走 ref 而非直接读闭包：解锁事件订阅 effect 不该因换节点重挂（重挂会丢事件），
@@ -599,6 +600,25 @@ export function HomeScreen() {
         );
         return;
       }
+      // 随包内核文件缺少可执行权限 → 起核前即被拒绝。同样不能落到下面那句「请检查服务器配置」：
+      // 与服务器配置无关，下一步是重新安装应用。
+      if (code === ProxyErrorCode.CORE_NOT_EXECUTABLE) {
+        toast.error(t('errors.coreNotExecutable'));
+        return;
+      }
+      // 确认不了提权助手里的内核与本应用配套 → 拒绝以 TUN 起核。下一步是重装或升级助手，
+      // 同样与服务器配置无关。
+      if (code === ProxyErrorCode.CORE_BUNDLE_MISMATCH ||
+          code === ProxyErrorCode.HELPER_CORE_OCCUPIED ||
+          code === ProxyErrorCode.HELPER_CORE_ABSENT ||
+          code === ProxyErrorCode.HELPER_CORE_INVALID) {
+        toast.error(proxyErrorText({ errorCode: code }, key => t(key)));
+        return;
+      }
+      if (code === ProxyErrorCode.HELPER_CORE_MISMATCH) {
+        toast.error(t('errors.helperCoreMismatch'));
+        return;
+      }
       toast.error(
         action === 'stop' ? t('home.stopProxyFailed') : t('errors.startupFailed'),
       );
@@ -689,6 +709,7 @@ export function HomeScreen() {
     if (!diskConfig) return;
     try {
       const receipt = await switchServer(DIRECT_SERVER_ID);
+      if (!receipt) return;
       const feedback = switchReceiptFeedback(receipt, t('home.directConnection'), t);
       if (feedback?.tone === 'success') toast.success(feedback.text);
       else if (feedback?.tone === 'warning') toast.warning(feedback.text);
@@ -708,6 +729,7 @@ export function HomeScreen() {
     if (!diskConfig || blockDisabledReason) return;
     try {
       const receipt = await switchServer(BLOCK_SERVER_ID);
+      if (!receipt) return;
       const feedback = switchReceiptFeedback(receipt, t('home.routingBlock'), t);
       if (feedback?.tone === 'success') toast.success(feedback.text);
       else if (feedback?.tone === 'warning') toast.warning(feedback.text);
@@ -798,23 +820,12 @@ export function HomeScreen() {
     await Promise.allSettled([onSpeedTest(), onUnlockRefresh()]);
   }, [onSpeedTest, onUnlockRefresh]);
 
-  /* ── 接管方式落盘：写 config.proxyModeType（需重启核才生效，由 configChanged 触发）。
-   * 顺带消费「FakeIP-TUN 待纠正」快照：systemProxy 迁移冻结的 enableFakeIp:false 首次进 TUN 回 true。
-   * 必须在 saveConfig **之前**对目标模式求值（flag 只在目标为 tun 时才消费），故先合成 next 再存。 */
+  /* 接管模式及 FakeIP-TUN 修正在后端最新配置事务内一次完成。 */
   const applyIntercept = useCallback(
     async (v: InterceptKind) => {
       if (!diskConfig) return;
       try {
-        const { config: next, corrected } = applyFakeIpTunEntry({
-          ...diskConfig,
-          proxyModeType: v,
-        });
-        const patch: Partial<UserConfig> = {
-          proxyModeType: next.proxyModeType,
-          dnsConfig: next.dnsConfig,
-        };
-        if (next.dnsDefaults !== undefined) patch.dnsDefaults = next.dnsDefaults;
-        await saveConfig(patch);
+        const { corrected } = await api.config.setTakeover(v);
         // 仅在真把 false 改回 true 时提示（罕见且有实际副作用需告知）；纯消费 flag 不打扰用户。
         // toast 在主窗可见时够用，但接管方式亦可从**托盘浮层**（独立窗口，FX-tray 已加入口）切换 →
         // 主窗 toast 此时看不到，故并发一条系统通知兜底（对齐 上游 notify-user；正文不含节点身份）。
@@ -831,7 +842,7 @@ export function HomeScreen() {
         toast.error(t('settings.proxyMode.failUpdate'));
       }
     },
-    [diskConfig, saveConfig, t]
+    [diskConfig, t]
   );
 
   /* ── 接管方式切换入口：已连接时切换会重启核、瞬断当前连接 → 先弹确认；未连接直接落盘。 */
@@ -1122,6 +1133,7 @@ export function HomeScreen() {
                     </svg>
                   </button>
                   <NodeMenu
+                    autoSelectControls={<SavedAutoSelectControls showStatus t={t} />}
                     open={nodeMenuOpen}
                     servers={servers}
                     subscriptions={config?.subscriptions ?? []}

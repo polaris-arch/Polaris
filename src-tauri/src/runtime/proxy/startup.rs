@@ -17,6 +17,7 @@ use super::core_log::{
 use super::dns_takeover::{dns_takeover_enabled, system_dns_takeover_active};
 use super::lifecycle::{now_ms, sleep_unless_superseded_on};
 use super::platform_contracts::{enumerate_own_lan_cidrs, platform_tag};
+use super::probe_pool_size;
 use super::process_supervision::{pid_alive, DirectCoreSlot, HelperStartToken, HelperStopPermit};
 use super::route_replan::{
     classify_tun_adapter_leg, inferred_binding_replan_needed, interface_availability,
@@ -24,7 +25,6 @@ use super::route_replan::{
     InterfaceFingerprint, RuntimeBindingState, TunAdapterObservation, TunAdapterVerdict,
 };
 use super::tunnel_conflict::own_tunnel_interfaces;
-use super::PROBE_POOL_SIZE;
 use super::{ProxyRuntime, ProxyStatus, StartError};
 use super::{HELPER_GATE_ABORTED_MSG, HELPER_NOT_INSTALLED_MSG, TUN_ADAPTER_MISSING_MSG};
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,9 +63,11 @@ use polaris_config_engine::builder::{
     build_id_to_tag_map, generate_sing_box_config_with_report_and_runtime_bindings,
     GenerateConfigDeps, GenerateOutcome, InvalidNode,
 };
-use polaris_config_engine::singbox::{InboundUser, SingBoxConfig};
+use polaris_config_engine::singbox::{InboundUser, RouteRule, SingBoxConfig};
 use polaris_config_engine::user_config::app_config::UserConfig;
-use polaris_config_engine::user_config::dns_constants::{is_direct_selection, DIRECT_TAG};
+use polaris_config_engine::user_config::dns_constants::{
+    is_block_selection, is_direct_selection, BLOCK_TAG, DIRECT_TAG, PROXY_SELECTOR_TAG,
+};
 use polaris_config_engine::user_config::proxy_mode::ProxyMode;
 use polaris_config_engine::user_config::proxy_ports::{control_api_port, local_proxy_port};
 use polaris_config_engine::user_config::server_config::ServerConfig;
@@ -89,8 +91,7 @@ use serde_json::Value;
 
 use crate::logging::SING_BOX_TARGET;
 use crate::runtime::helper::{
-    HelperBuildProbe, HelperStartResult, HelperStatusSnapshot, HelperStopOps, HelperStopTarget,
-    InstallCoreError, InstallCoreUnsupportedRecord,
+    HelperStartResult, HelperStatusSnapshot, HelperStopOps, HelperStopTarget,
 };
 use crate::runtime::route_binding::plan_runtime_bindings;
 
@@ -130,7 +131,9 @@ impl HelperStartCompletion {
         }
         let known = match result {
             Ok(HelperStartResult::Started(pid)) => Some(*pid),
-            Ok(HelperStartResult::BirthStarted(target)) => Some(target.pid.get()),
+            Ok(
+                HelperStartResult::BirthStarted(target) | HelperStartResult::BirthRejected(target),
+            ) => Some(target.pid.get()),
             Ok(
                 HelperStartResult::NotAdmitted(_)
                 | HelperStartResult::BirthAlready(_)
@@ -157,9 +160,9 @@ impl HelperStartCompletion {
             Ok(HelperStartResult::BirthAlready(target)) => {
                 child.finish_helper_birth_not_admitted(&self.token, Some(*target))
             }
-            Ok(HelperStartResult::BirthStarted(target)) => {
-                child.finish_helper_birth_start(&self.token, *target)
-            }
+            Ok(
+                HelperStartResult::BirthStarted(target) | HelperStartResult::BirthRejected(target),
+            ) => child.finish_helper_birth_start(&self.token, *target),
             Ok(HelperStartResult::Started(_)) => child.finish_helper_start(&self.token, known),
             Err(_) => child.finish_helper_start(&self.token, None),
         };
@@ -337,7 +340,7 @@ pub(super) fn main_core_parse_unit_count(config: &SingBoxConfig) -> usize {
 ///   一个由推导系数算出来的估算值。用一个未经多点实测的公式去否决用户的连接请求，代价与置信度
 ///   完全不匹配；
 /// · 临时核那条上限的判据是「等一个可能永远不会 bind 的核，且这段时间里进程级单飞闸挡住一切后续
-///   测速请求，而僵核形态没有取消按钮」。主核这三条**都不成立**：核崩掉由 `CoreReadyDeps::is_alive`
+///   测速请求，而僵核形态没有取消按钮」。主核这三条**都不成立**：核崩掉由 `CoreReadyDeps::observe_process`
 ///   当场接住；用户中途点停止/重连由 `is_superseded` 接住，且轮询 sleep 本身可被世代变化打断
 ///   （见 [`ProxyRuntime::wait_ready`]）⇒ 等待随时可取消，用户不需要一个替他做主的上限。
 ///
@@ -430,6 +433,27 @@ impl FreePortProvider for PortProviderExcluding {
     }
 }
 
+/// 槽位上限拿不到那么多端口时退到的池大小（槽位上限按平台取值之前的固定值）。
+const PROBE_POOL_FALLBACK_SIZE: usize = 16;
+
+/// 申请「出口探针口 + 测速池」共 `slots + 1` 个互异回环口。整批申请是「任何一个拿不到就全部放弃」，
+/// 槽位上限越高越容易撞上；所以按上限失败时再按 [`PROBE_POOL_FALLBACK_SIZE`] 要一次，仍失败才是空池。
+pub(super) fn allocate_probe_ports<P: FreePortProvider>(
+    allocator: &PortAllocator<P>,
+    exclusions: &PortExclusions,
+    slots: usize,
+) -> Vec<u16> {
+    let ports = allocator.resolve_distinct_free_ports(exclusions, slots + 1);
+    if !ports.is_empty() || slots <= PROBE_POOL_FALLBACK_SIZE {
+        return ports;
+    }
+    let ports = allocator.resolve_distinct_free_ports(exclusions, PROBE_POOL_FALLBACK_SIZE + 1);
+    if !ports.is_empty() {
+        log::warn!("测速池按 {slots} 个槽申请端口失败，降到 {PROBE_POOL_FALLBACK_SIZE} 个槽");
+    }
+    ports
+}
+
 /// 网络场景 canary 入站只听 UDP：候选口按 **UDP** 可绑来取（TCP 口空闲说明不了 UDP 口空闲），
 /// 其余同 [`PortProviderExcluding`]。
 struct UdpPortProviderExcluding {
@@ -473,7 +497,7 @@ pub(super) const SINGBOX_STARTUP_LOG: &str = "singbox-startup.log";
 /// `sing-box check` 成功缓存。只缓存“同一核二进制 + 除运行期随机端口外完全相同的生成配置”；
 /// 任一结构字段或核身份变化都重新真跑 check。
 pub(super) const KERNEL_GATE_CACHE_FILE: &str = "singbox-check-cache.json";
-pub(super) const KERNEL_GATE_CACHE_SCHEMA: u32 = 1;
+pub(super) const KERNEL_GATE_CACHE_SCHEMA: u32 = 2;
 
 /// 一次已成功 `sing-box check` 的可持久身份。
 ///
@@ -486,62 +510,18 @@ pub(super) struct KernelGateCacheRecord {
     pub(super) schema: u32,
     pub(super) binary_path: String,
     pub(super) binary_len: u64,
+    pub(super) binary_sha256: String,
     pub(super) binary_modified_ns: u64,
     pub(super) config_sha256: String,
 }
 
-/// 一次完整 SHA256 对账通过后记住的两侧 payload 身份（仅进程内）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProtectedCoreCacheRecord {
-    pub(super) active: crate::runtime::core_promote::PayloadStamp,
-    pub(super) protected: crate::runtime::core_promote::PayloadStamp,
-}
-
-pub(super) fn protected_core_cache_hit(
-    cached: Option<&ProtectedCoreCacheRecord>,
-    active: &crate::runtime::core_promote::PayloadStamp,
-    protected: Option<&crate::runtime::core_promote::PayloadStamp>,
-) -> bool {
-    protected.is_some_and(|protected| {
-        cached.is_some_and(|cached| cached.active == *active && cached.protected == *protected)
-    })
-}
-
-/// 能力缓存是否命中（**纯函数**）。
-///
-/// 失效键 = helper 自报的 `build_identity`。它在**发布构建**上必变：`build_identity::current()`
-/// 取 `POLARIS_BUILD_ID`（发布流水线注入的 `github.sha`），每次发版都不同 ——`HelperManager` 正是
-/// 拿同一个比较判 `upgradeable`（`manager.rs` 的 `same_proto_build_mismatch`）。
-///
-/// **源码构建下它不变**（如实登记，别当它是万能键）：`POLARIS_BUILD_ID` 未注入时
-/// `build_identity::current()` 回落 `CARGO_PKG_VERSION` —— 开源项目的本地构建、CI 的非发布产物
-/// 都走这条。于是「重编 helper → 点升级/修复 → 新 helper 仍自报同一个 `0.x.y`」这条链上，
-/// 光靠本键失效不了。那一格由 [`crate::runtime::helper::HelperRuntime::install`] 的成功分支主动清记号补上
-/// （`runtime/helper.rs` 的 `clear_install_core_unsupported`）：二进制换了就作废，与它自报什么无关。
-///
-/// [`HelperBuildProbe::Unreachable`] 恒判不命中：探不到 ≠ 还是那个 helper。宁可白跑一轮完整对账，
-/// 也不能把「没问到」当成身份不变——那会让缓存永不失效。
-pub(super) fn install_core_unsupported_cache_hit(
-    cached: Option<&InstallCoreUnsupportedRecord>,
-    probe: &HelperBuildProbe,
-) -> bool {
-    match (cached, probe) {
-        (Some(cached), HelperBuildProbe::Reported(now)) => &cached.helper_build_id == now,
-        _ => false,
-    }
-}
-
-#[derive(Debug)]
-enum ProtectedCoreReconcileOutcome {
-    Cached,
-    Verified,
-    Promoted(String),
-    /// 这个 helper 不支持 install-core：本轮跳过（能力缓存命中）或刚刚记下（首次撞上）。
-    /// `bool` = 是否由缓存命中提前退出（命中与首次撞上的日志必须可分辨，否则「能力探测没跑」
-    /// 与「跑了且命中」在现场长得一样）。
-    InstallCoreUnsupported {
-        from_cache: bool,
-    },
+/// [`code::HELPER_CORE_MISMATCH`] 的诊断文案（zh）；渲染端按稳定码取 i18n 键
+/// `errors.helperCoreMismatch`，本串进日志与无 emitter 时的状态。
+pub(super) fn helper_core_mismatch_message(why: &str) -> String {
+    format!(
+        "无法确认提权助手将要运行的内核就是本应用配套的内核，已拒绝以 TUN 模式启动：{why}。\
+         请到「设置 › Helper」重新安装或升级提权助手后重试。"
+    )
 }
 
 pub(super) fn attestation_commit_allowed(
@@ -581,24 +561,21 @@ pub(super) fn normalize_kernel_gate_config(value: &mut Value) {
             }
         }
     }
-    if let Some(servers) = value
-        .get_mut("dns")
-        .and_then(|dns| dns.get_mut("servers"))
-        .and_then(Value::as_array_mut)
-    {
-        for server in servers {
-            if server.get("tag").and_then(Value::as_str) == Some("dns-node-race") {
-                if let Some(obj) = server.as_object_mut() {
-                    obj.insert("server_port".into(), Value::from(0));
-                }
-            }
-        }
-    }
 }
 
-fn kernel_gate_cache_record(
+#[cfg(test)]
+pub(super) fn kernel_gate_cache_record(
     binary: &Path,
     config: &SingBoxConfig,
+) -> Option<KernelGateCacheRecord> {
+    let digest = crate::runtime::tls_fingerprints::binary_digest(binary).ok()?;
+    kernel_gate_cache_record_with_digest(binary, config, &digest)
+}
+
+fn kernel_gate_cache_record_with_digest(
+    binary: &Path,
+    config: &SingBoxConfig,
+    digest: &str,
 ) -> Option<KernelGateCacheRecord> {
     let metadata = std::fs::metadata(binary).ok()?;
     let modified = metadata
@@ -619,6 +596,7 @@ fn kernel_gate_cache_record(
         schema: KERNEL_GATE_CACHE_SCHEMA,
         binary_path,
         binary_len: metadata.len(),
+        binary_sha256: digest.to_owned(),
         binary_modified_ns: modified_ns,
         config_sha256: polaris_updater::verify::sha256_hex(&normalized),
     })
@@ -716,6 +694,26 @@ pub(super) fn should_prompt_helper_upgrade(
     should_start_via_helper(mode, platform) && status.installed && status.upgradeable
 }
 
+/// 起核前能力探测没通过时落哪个码（纯函数）。
+///
+/// 已装的助手明确不认识探测命令 = 它太旧，这台机器上经助手起核不可能成功。用户要做的与
+/// 「没装」是同一件事（去「设置 › Helper」装 / 升级），重试同样无用，故落
+/// [`code::HELPER_NOT_INSTALLED`]：渲染端据它给出指向助手设置页的引导，崩溃自愈据它立即收手。
+/// 落 [`code::STARTUP_FAILED`] 的话用户看到的是「检查服务器配置」，指错了方向。
+///
+/// 其余情形（通信失败、既有 custody 未清）断言不了「助手太旧」，仍是笼统的启动失败。
+pub(super) fn birth_capability_error_code(
+    error: &crate::runtime::helper::BirthCapabilityError,
+) -> &'static str {
+    match error {
+        crate::runtime::helper::BirthCapabilityError::HelperOutdated(_) => {
+            code::HELPER_NOT_INSTALLED
+        }
+        crate::runtime::helper::BirthCapabilityError::Unavailable(_) => code::STARTUP_FAILED,
+        crate::runtime::helper::BirthCapabilityError::SlotOccupied(_) => code::HELPER_CORE_OCCUPIED,
+    }
+}
+
 /// 一次性闸门的**领取**动作：`true` = 本次领到（可以做那件只做一次的事），`false` = 已被领走。
 ///
 /// 抽成自由函数而不是就地写 `swap`，是为了让「第二次必须领不到」这条属性能被**直接**证伪 ——
@@ -800,32 +798,13 @@ impl ProxyRuntime {
     /// 只是多漏一个进程。这类「绿而带副作用」的坑不可能靠逐条 review 兜住，只能靠这道门。
     #[cfg(test)]
     pub(super) fn core_binary_for_start(&self) -> Result<PathBuf, String> {
+        self.core_binary_resolution_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.core_binary_override
             .lock()
             .ok()
             .and_then(|g| g.clone())
             .ok_or_else(|| TEST_CORE_NOT_INJECTED.to_string())
-    }
-
-    /// 起核失败腿的竞速 sidecar 收口。守卫与
-    /// [`maybe_clear_system_proxy_on_start_failure`](Self::maybe_clear_system_proxy_on_start_failure)
-    /// 完全同构（success 守卫 + `stopping` 守卫），理由也同构：
-    /// - `Ok`（含让位）不收 —— 正在跑（或将被接管方拉起）的核正指着这个端口；
-    /// - 世代已变 = 被更新的 stop/start 接管 —— 接管方**已经**用新配置重起过 sidecar，
-    ///   此时收口会把**别人的** sidecar 停掉，比不收更糟。
-    ///
-    /// 世代守卫**下放到 DNS race owner 的复合临界区内**（而非在此先判后清）：
-    /// 判完到清之间隔着
-    /// 一次函数调用，接管方完全可以在这条缝里提交它的 sidecar —— 那是 check-then-act，不是守卫。
-    pub(super) fn maybe_stop_race_sidecar_on_start_failure(
-        &self,
-        r: &Result<ProxyStatus, StartError>,
-        my_gen: u64,
-    ) {
-        if r.is_ok() {
-            return;
-        }
-        self.dns_race.clear_owned(Some(my_gen));
     }
 
     /// TUN 经 helper 起核的前置校验（R27.3）：当前模式需要提权 helper（TUN@mac/win/linux）**且** helper
@@ -1259,9 +1238,11 @@ impl ProxyRuntime {
             if self.gate.generation() != my_gen {
                 return Ok(self.status());
             }
-            if let Err(message) = capability {
-                self.set_error(&message, code::STARTUP_FAILED);
-                return Err(StartError::coded(message, code::STARTUP_FAILED));
+            if let Err(error) = capability {
+                let error_code = birth_capability_error_code(&error);
+                let message = error.into_message();
+                self.set_error(&message, error_code);
+                return Err(StartError::coded(message, error_code));
             }
         }
         let helper_gate_ms = t_helper_gate.elapsed().as_millis();
@@ -1387,37 +1368,13 @@ impl ProxyRuntime {
         // its monitor. A later start cannot make the old monitor adopt its Child.
         let mut direct_run_identity = None;
 
-        // C11 节点域名解析多源竞速（对齐 上游 start 步骤 3.9 `startNodeDnsRaceServer`）：
-        // 节点 outbound.server 恒是域名，由内核运行期解析多 A → DialSerial 逐 IP 重试；这里给内核
-        // 提供一个只听回环的竞速解析上游，把「单上游被投毒 = 该节点连不上」变成「多上游竞速 + 剔 decoy」。
-        //
-        // **位置不可挪**：必须在重试循环**之外、之前**。
-        // - 在 `generate_deps` 之前 → 端口先拿到才能烧进 config（生成侧只认 `race_server_port > 0`）；
-        // - 在循环之外 → 每次重试重生成 config 时端口保持同一个。放进循环会每轮换口重绑，
-        //   而失败重试正是内核可能已经拿着上一轮 config 的时候，端口漂移 = 解析静默打到死口。
-        let dns_race = async {
-            let started = std::time::Instant::now();
-            self.dns_race
-                .start(
-                    &user_config,
-                    self.config.dir(),
-                    my_gen,
-                    self.helper.platform(),
-                )
-                .await;
-            started.elapsed().as_millis()
-        };
-        let route_binding = async {
-            let started = std::time::Instant::now();
-            let plan = plan_runtime_bindings(&user_config).await;
-            (plan, started.elapsed().as_millis())
-        };
-        let parallel_prestart = std::time::Instant::now();
-        let (dns_race_ms, (mut runtime_binding_plan, route_binding_ms)) =
-            tokio::join!(dns_race, route_binding);
+        // DNS candidates are native core transports; App prestart only plans
+        // the node socket's physical interface binding.
+        let prestart = std::time::Instant::now();
+        let mut runtime_binding_plan = plan_runtime_bindings(&user_config).await;
+        let route_binding_ms = prestart.elapsed().as_millis();
+        let parallel_prestart_ms = route_binding_ms;
         let mut runtime_binding_fingerprint: Option<InterfaceFingerprint> = None;
-        let parallel_prestart_ms = parallel_prestart.elapsed().as_millis();
-        log::info!("起核耗时：节点DNS竞速sidecar预置={dns_race_ms}ms");
         log::info!("起核耗时：节点逐目的网卡规划={route_binding_ms}ms");
 
         let (
@@ -1480,6 +1437,17 @@ impl ProxyRuntime {
             // 拿在手上，闸门按 `Ok` 与否决定跑不跑（解析不到 ⇒ 无核可问 ⇒ failOpen 跳过闸门），
             // emit 之后才在下面 `?`。每尝试解析（字面路径，成本极低）；解析不到 = 终态，不重试（非竞态失败）。
             let binary_res = self.core_binary_for_start();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let startup_cli_proof = if let Ok(path) = &binary_res {
+                // The gate below reuses this observation. Keep the same proof
+                // across every await; a later menu refresh cannot substitute it.
+                crate::runtime::tls_fingerprints::probe_cli_observation(path)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+
             // 起核前的内核闸门：生成 → 写盘 → check → 剥掉内核点名拒收的节点 → 重来，直到内核收下。
             // 首次/结构变更仍真跑 check；同一核 + 同一最终生成配置命中已接受身份时为 0 次。
             let gate = match self
@@ -1642,7 +1610,28 @@ impl ProxyRuntime {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             let binary = std::path::PathBuf::from(IN_PROCESS_CORE_PLACEHOLDER);
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            let binary = binary_res?;
+            let binary = {
+                let binary = binary_res.map_err(|error| {
+                    let error_code = if error.starts_with("CORE_BUNDLE_MISMATCH:") {
+                        code::CORE_BUNDLE_MISMATCH
+                    } else {
+                        code::STARTUP_FAILED
+                    };
+                    self.set_error(&error, error_code);
+                    StartError::coded(error, error_code)
+                })?;
+                // 应用直起时执行的就是安装包里的这个文件，没有任何一步会再给它补可执行位。
+                // 经提权助手起核时执行的是助手目录里的副本，这个文件的权限位不决定成败，故不拦。
+                if !via_helper {
+                    if let Err(msg) = super::core_binary::ensure_core_executable(&binary) {
+                        // `set_error` 自己记日志、落状态并广播 `event:proxyError`；下面的 `Err` 是给
+                        // 等着这次调用结果的发起方的。两个出口都要：托盘与自动连接没有人在等结果。
+                        self.set_error(&msg, code::CORE_NOT_EXECUTABLE);
+                        return Err(StartError::coded(msg, code::CORE_NOT_EXECUTABLE));
+                    }
+                }
+                binary
+            };
             // C5：起核前快照 utun 基线（每尝试；macOS 时序 diff 锚点）——须在核创建 TS 内核接口**前**。
             let t_mesh_baseline = std::time::Instant::now();
             self.mesh.exit_route_snapshot_baseline().await;
@@ -1685,6 +1674,15 @@ impl ProxyRuntime {
             self.admit_legacy_start()?;
             let t_spawn = std::time::Instant::now();
             let main_claim_token = main_reservation.claim_token();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if startup_cli_proof
+                .as_ref()
+                .is_some_and(|entry| !entry.still_current())
+            {
+                return Err(StartError::from(
+                    "Core bytes changed after preflight; retry startup".to_owned(),
+                ));
+            }
             let pid = if cfg!(target_os = "android") {
                 // ── Android 腿（既有 `via_helper` seam 的**第三条腿**）──
                 // 不 spawn、无 child、无 pid：核跑在**本进程内**的 libbox 里，由 `VpnService` 承载
@@ -1764,6 +1762,7 @@ impl ProxyRuntime {
                                 ),
                                 main_token: main_claim_token.clone(),
                                 ready: None,
+                                stop_target: None,
                                 stopped: None,
                             });
                             Ok(start)
@@ -1780,8 +1779,26 @@ impl ProxyRuntime {
                     // Original native request, full main token/config and callback cell
                     // are retained before the single native dispatcher can submit.
                     main_reservation.arm_external_start();
-                    match tauri_plugin_polaris_ios::start_prepared(&start).await {
+                    match async {
+                        let ready =
+                            tauri_plugin_polaris_ios::start_managed_prepared(&start).await?;
+                        // Reload can complete between Ready and host publication.
+                        // Keep the same original start while capturing its full history.
+                        tauri_plugin_polaris_ios::refresh_ready_session(&ready).await
+                    }
+                    .await
+                    {
                         Ok(receipt) => {
+                            if let Some(token) = &main_claim_token {
+                                self.mesh
+                                    .bind_tailscale_main_actual_scope(
+                                        token,
+                                        ts_gate,
+                                        receipt.config_digest(),
+                                        receipt.original_instances(),
+                                    )
+                                    .map_err(StartError::from)?;
+                            }
                             self.gate.with_current_generation(my_gen, |_live| {
                                 if let Ok(mut ready) = self.ios_ready_session.write() {
                                     if let Some(owner) = ready
@@ -1840,9 +1857,12 @@ impl ProxyRuntime {
                     Ok(Some(pid)) => pid,
                     Ok(None) => return Ok(self.status()),
                     // helper 起核失败 = R27.3 已决策终态（前端 SettingsHelper 引导先装 helper），**不重试**。
+                    // 码随这一次的失败出栈：配套闸落 `HELPER_CORE_MISMATCH`，其余没有专属码的
+                    // 一律是笼统的启动失败。
                     Err(e) => {
-                        self.set_error(&e, code::STARTUP_FAILED);
-                        return Err(StartError::coded(e, code::STARTUP_FAILED));
+                        let error_code = e.code.unwrap_or(code::STARTUP_FAILED);
+                        self.set_error(&e.message, error_code);
+                        return Err(StartError::coded(e.message, error_code));
                     }
                 }
             } else {
@@ -1884,6 +1904,10 @@ impl ProxyRuntime {
                 // CWD = 可写 config 目录：GUI 从 Finder/launchd 拉起时父进程 CWD=`/`，核对 dashboard 下载兜底的
                 // 相对目录按 CWD 解析会落 `/dashboard`（只读 mkdir 噪音）。Polaris 生成的其余路径全绝对，不受影响。
                 req.working_dir = Some(self.config.dir().to_path_buf());
+                // Reuse the validated file observation; retain it across synchronous
+                // spawn and bind it to the opaque identity returned for that Child.
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                let launch_tls = startup_cli_proof.clone();
                 let direct_spawn = self.spawn_direct_native(
                     native_producer.as_ref(),
                     my_gen,
@@ -1898,6 +1922,12 @@ impl ProxyRuntime {
                 }
                 match direct_spawn {
                     Ok(Some((pid, identity))) => {
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        if let Ok(mut proof) = self.captured_cli_run.lock() {
+                            *proof = launch_tls
+                                .filter(|entry| entry.still_current())
+                                .map(|entry| (my_gen, identity.clone(), entry));
+                        }
                         log_pipe_handoff = Some(handoff);
                         direct_run_identity = Some(identity);
                         pid
@@ -2193,6 +2223,7 @@ impl ProxyRuntime {
 
         let new_status = ProxyStatus {
             main_generation: my_gen,
+            owned_stop_context: None, // IPC read-time context; never a stored selector mirror.
             running: true,
             // 读时投影字段，存储态恒 false（真值 = `start_inflight` 计数，见字段文档）。
             starting: false,
@@ -2216,6 +2247,36 @@ impl ProxyRuntime {
             error: None,
             error_code: None,
         };
+        // The libbox query now reaches the ready extension on iOS. Old query
+        // support stays unknown; it is never promoted to cache-eligible evidence.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let ready_tls = if !via_helper {
+            self.direct_tls_snapshot(my_gen)
+        } else {
+            #[cfg(target_os = "linux")]
+            {
+                match self.tls_ready_binary_for_pid(pid, true) {
+                    Some(actual) => self.tls_fingerprint_capabilities_for(Some(&actual)).await,
+                    None => crate::runtime::tls_fingerprints::Snapshot::unavailable(
+                        "Loaded core image is unavailable",
+                    ),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                crate::runtime::tls_fingerprints::Snapshot::unavailable(
+                    "Helper loaded-image byte proof is unavailable",
+                )
+            }
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let ready_tls = self.tls_fingerprint_capabilities_for(None).await;
+        if self.gate.generation() != my_gen {
+            return Ok(self.status());
+        }
+        if let Ok(mut identity) = self.captured_core_sha256.lock() {
+            *identity = ready_tls.binary_sha256.map(|digest| (my_gen, digest));
+        }
         // 热切换基准：**与 running 状态同生共死**（此处置、stop 清）→「快照在 ⟺ 核在跑」。
         // 上游 在生成期就回填，但那样起核失败时会留下描述「不存在的核」的快照；此处收紧到就绪后。
         #[cfg(all(target_os = "android", debug_assertions))]
@@ -2231,9 +2292,7 @@ impl ProxyRuntime {
                 &deps,
             ));
         }
-        if let Ok(mut g) = self.current_config.write() {
-            *g = Some(config.clone());
-        }
+        self.commit_coex_current_config(config.clone());
         // The final endpoint set was claimed before native/libbox startup. Keep that claim
         // continuously through readiness; releasing and re-reserving here opens a takeover gap.
         if let Ok(mut snap) = self.startup_snapshot.write() {
@@ -2493,6 +2552,7 @@ impl ProxyRuntime {
         // DNS 热插拔重灌仍由 handle_network_change → dns_reconcile_should_run 独立门控。
         // watcher 只消费别名：Windows 订阅按别名解 LUID，macOS/Linux 按别名做文本匹配。
         self.spawn_network_watcher(
+            my_gen,
             managed_tun_interface
                 .as_ref()
                 .and_then(ExitInterfaceId::alias)
@@ -2517,7 +2577,7 @@ impl ProxyRuntime {
             + helper_gate_ms
             + rules_prep_ms
             + tun_baseline_ms
-            // DNS sidecar 与逐目的网卡规划并行执行；归因总计只能计一次墙钟，不能把两条子耗时相加。
+            // 预置阶段现在仅有逐目的网卡规划，归因总计保留同一墙钟字段。
             + parallel_prestart_ms
             + config_gen_ms
             + mesh_baseline_ms
@@ -2535,7 +2595,7 @@ impl ProxyRuntime {
             "起核耗时：总计={total_ms}ms（已归因={segments_ms}ms 未归因={unattributed_ms}ms：\
              前置校验={preflight_ms}ms helper提权门={helper_gate_ms}ms 规则预置={rules_prep_ms}ms \
              TUN基线={tun_baseline_ms}ms 并行预置墙钟={parallel_prestart_ms}ms \
-             [DNS竞速={dns_race_ms}ms 节点逐目的网卡={route_binding_ms}ms] 配置生成累计={config_gen_ms}ms \
+             [节点逐目的网卡={route_binding_ms}ms] 配置生成累计={config_gen_ms}ms \
              mesh基线累计={mesh_baseline_ms}ms spawn累计={spawn_ms}ms 就绪等待累计={ready_ms}ms \
              TUN适配器累计={tun_adapter_ms}ms 重试退避累计={retry_backoff_ms}ms \
              TUN路由校验={tun_route_ms}ms 系统代理设置={system_proxy_ms}ms \
@@ -2569,12 +2629,12 @@ impl ProxyRuntime {
     /// **残余微竞态**（stop 的 Stop 与本 Start 在 daemon 单 mu 上的到达序）= 真机门（与 上游 同形）。
     pub(super) async fn spawn_core_via_helper(
         self: &Arc<Self>,
-        binary: &Path,
+        _binary: &Path,
         config_path: &Path,
         user_config: &UserConfig,
         my_gen: u64,
         main_reservation: &mut crate::runtime::tailscale_login_core::MainReservation<'_, '_>,
-    ) -> Result<Option<u32>, String> {
+    ) -> Result<Option<u32>, StartError> {
         polaris_core_supervisor::assert_check_admission().map_err(|error| error.to_string())?;
         // 让位早退（与直起临界区的「持锁判世代」同义；helper 核无本地 child 锁可持，靠世代 + 标记守）。
         if self.gate.generation() != my_gen {
@@ -2585,17 +2645,48 @@ impl ProxyRuntime {
             let helper = Arc::clone(&self.helper);
             tokio::task::spawn_blocking(move || helper.require_native_birth_capability())
                 .await
+                .map_err(|error| format!("helper native birth capability task failed: {error}"))?
                 .map_err(|error| {
-                    format!("helper native birth capability task failed: {error}")
-                })??;
+                    let code = birth_capability_error_code(&error);
+                    StartError::coded(error.into_message(), code)
+                })?;
             if self.gate.generation() != my_gen {
                 return Ok(None);
             }
         }
-        // **受保护核对账**（换核在本条腿上真正生效的唯一途径）：helper 只会 exec 它安装期锁定的那个
-        // 路径，故必须先把现役核的**内容**推进去。幂等——hash 相同即零动作、零 IPC。
-        // 放在置 `core_via_helper` 标记与 IPC 之前：此刻还没有受管核，失败也不产生孤儿。
-        self.reconcile_protected_core(binary).await;
+        // Content is installed only by the administrator transaction. Runtime
+        // status must attest the compiled id before any pinned birth request.
+        let helper = Arc::clone(&self.helper);
+        #[cfg(test)]
+        let fixture = self
+            .selected_core_ready_fixture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        #[cfg(not(test))]
+        let fixture: Option<Result<(), String>> = None;
+        let selected_ready = match fixture {
+            Some(result) => result,
+            None => tokio::task::spawn_blocking(move || helper.require_selected_core())
+                .await
+                .map_err(|error| error.to_string())?,
+        };
+        if let Err(why) = selected_ready {
+            // Prefixes are emitted by our selected-id status adapter, never by
+            // parsing a core's version output or arbitrary native diagnostics.
+            let error_code = if why.starts_with("HELPER_CORE_ABSENT:") {
+                code::HELPER_CORE_ABSENT
+            } else if why.starts_with("HELPER_CORE_INVALID:") {
+                code::HELPER_CORE_INVALID
+            } else if why.starts_with("CORE_BUNDLE_MISMATCH:") {
+                code::CORE_BUNDLE_MISMATCH
+            } else {
+                code::HELPER_CORE_MISMATCH
+            };
+            let message = helper_core_mismatch_message(&why);
+            self.set_error(&message, error_code);
+            return Err(StartError::coded(message, error_code));
+        }
         // The lease can reject before any helper operation is queued.
         let helper_call_lease = self.lease_legacy_start().map_err(|error| error.message)?;
         // Fence and helper flag publish under the same Child mutex.
@@ -2605,7 +2696,9 @@ impl ProxyRuntime {
                 .lock()
                 .map_err(|_| "proxy shutdown admission poisoned".to_owned())?;
             if *closing || self.gate.generation() != my_gen {
-                return Err("proxy is shutting down or helper Start was superseded".into());
+                return Err("proxy is shutting down or helper Start was superseded"
+                    .to_owned()
+                    .into());
             }
             polaris_core_supervisor::with_check_admission(|| {
                 let attempt =
@@ -2646,23 +2739,44 @@ impl ProxyRuntime {
         let target = match started {
             Ok(HelperStartResult::Started(pid)) => HelperStopTarget::Legacy(pid),
             Ok(HelperStartResult::BirthStarted(target)) => HelperStopTarget::Birth(target),
+            Ok(HelperStartResult::BirthRejected(target)) => {
+                let (diagnostic, _) = self
+                    .reject_helper_start_with_result(
+                        Arc::clone(&self.helper) as Arc<dyn HelperStopOps>,
+                        &attempt,
+                        HelperStopTarget::Birth(target),
+                        Some(main_reservation),
+                    )
+                    .await;
+                return Err(StartError::coded(
+                    format!("helper content identity mismatch; {diagnostic}"),
+                    code::HELPER_CORE_MISMATCH,
+                ));
+            }
             Ok(HelperStartResult::BirthAlready(target)) => {
-                return Err(format!(
-                    "helper exact birth 已有受管核 {target:?}；本次配置未获启动证明，保留既有 custody"
+                return Err(StartError::coded(
+                    format!(
+                        "existing helper birth {target:?}; this configuration was not admitted"
+                    ),
+                    code::HELPER_CORE_OCCUPIED,
                 ));
             }
             Ok(HelperStartResult::NotAdmitted(blocker)) => {
-                return Err(format!(
-                    "helper 起核未获准：此前受管核 pid={} 仍处于 {blocker:?} custody",
-                    blocker.pid()
+                return Err(StartError::coded(
+                    format!("helper custody still retained: {blocker:?}"),
+                    code::HELPER_CORE_OCCUPIED,
                 ));
             }
             Ok(HelperStartResult::BirthNotAdmitted { target, pending }) => {
-                return Err(format!(
-                    "helper exact birth 起核未获准：既有 custody={target:?} pending={pending}"
+                return Err(StartError::coded(
+                    format!("helper custody still retained: {target:?}, pending={pending}"),
+                    code::HELPER_CORE_OCCUPIED,
                 ));
             }
-            Err(e) => return Err(e),
+            Err(error) if error.starts_with("HELPER_CORE_OCCUPIED:") => {
+                return Err(StartError::coded(error, code::HELPER_CORE_OCCUPIED));
+            }
+            Err(e) => return Err(e.into()),
         };
         let pid = target.pid();
         // The blocking worker already published pid under Child→pid, even if
@@ -2684,204 +2798,10 @@ impl ProxyRuntime {
             // Native exit and reservation compare-remove committed together.
             // The helper backend remains sticky; no platform NoOwner was proved.
             let _ = confirmed_stopped;
-            return Err(message);
+            return Err(message.into());
         }
         log::info!("helper 已起 sing-box：pid={pid}（TUN 提权路径）");
         Ok(Some(pid))
-    }
-
-    /// **受保护核对账**：把现役核推进 helper 锁定的受保护核目录（幂等；内容相同则零动作）。
-    ///
-    /// # 为什么在**每次**经 helper 起核前做，而不是「换核成功后推一次」
-    ///
-    /// 受保护核与现役核至少有四条独立的漂移路径，挂在换核事件上只能堵住第一条：
-    ///  1. 在线换核 / 手动上传 / 回滚 / reset-factory；
-    ///  2. **app 升级触发的重播种**（`core_paths` 的 reseed 写新随包基线进 `core_update/`）——
-    ///     p101 实测正是这条：2026-07-30 12:46 重播种到 1.14.0-beta.3，而受保护核停在 7-29 装 helper
-    ///     时播下的 1.14.0-alpha.45；
-    ///  3. helper 装得比核晚（安装脚本的播种被 `if [ ! -x "$COREDIR/sing-box" ]` 守着，**已存在就不覆盖**，
-    ///     故重装 helper 也修不好已漂移的受保护核）；
-    ///  4. 用户换机器/迁移配置目录。
-    ///
-    /// 起核前对账把这四条一次性收口，且天然覆盖「helper 早就在跑」这个常态（不需要重启 helper：
-    /// 路径不变、内容变新，helper 每次 `start` 现 spawn）。
-    ///
-    /// # 失败处置：只告警不阻断 —— 判定权交给下游的**事实**自证
-    ///
-    /// 本方法失败（IPC 挂了 / hash 不符 / 磁盘满）**不**中止起核：此刻核还没起，中止只会把
-    /// 「版本可能旧」升级成「彻底连不上」。真正该不该向用户报警，由起核后的
-    /// [`attest_running_core_binary`](Self::attest_running_core_binary) 按**实跑二进制**判 ——
-    /// 提升失败但受保护核本来就已是新版（例如上一轮已推成功）时，报警才是噪音。
-    /// 这是刻意的分工：**本方法是机制，自证是判据**。
-    ///
-    /// ⚠️ **但在 Windows 的存量机器上那个判据并不存在**（如实登记，别把它当兜底）：
-    /// `running_exe_path` 在 Windows 上恒 `None`（Medium IL 的 app 读不了 SYSTEM child），
-    /// 自证的第二条腿靠 D2 的 helper `status` 回传 `image=` —— 而**旧 helper 没有这个字段**。
-    /// 于是「旧 helper + Windows」这一格里自证恒落 `Unobservable`：只 warn，不报警、不判失败。
-    /// 那正是本方法失败时最需要判据的那一格（旧 helper 也是 `ERR unknown` 的那一格）。
-    /// helper 升级到本批之后这条腿才真的在；在此之前，Windows 上现场只有日志。
-    async fn reconcile_protected_core(&self, active_core: &Path) {
-        use crate::runtime::core_promote as promote;
-
-        if !promote::platform_has_protected_core(self.helper.platform()) {
-            return; // 当前三平台恒假不成立；留着是给「新增平台没有受保护目录」一条早退。
-        }
-        let Some(src_dir) = active_core.parent().map(Path::to_path_buf) else {
-            log::warn!(
-                "现役核路径无父目录，跳过受保护核对账：{}",
-                active_core.display()
-            );
-            return;
-        };
-        let core_dir = self.helper.protected_core_dir_path();
-        let dest = promote::protected_core_path_in(&core_dir, std::env::consts::OS);
-        let protected_payload_dir = core_dir.clone();
-        let staged_dir = self.config.join(promote::CORE_PROMOTE_DIR_NAME);
-        let helper = Arc::clone(&self.helper);
-        let active_core = active_core.to_path_buf();
-        let core_filename = crate::runtime::core_paths::core_filename().to_owned();
-        let cache = Arc::clone(&self.protected_core_cache);
-        let started = std::time::Instant::now();
-
-        // install_core can replace the executable selected by a later helper
-        // start. Register before queuing the blocking task, including a task
-        // whose async caller is cancelled before the IPC returns.
-        if let Err(error) = self.register_helper_backend() {
-            log::warn!("受保护核对账被 Child custody 拒绝：{error}");
-            return;
-        }
-
-        // 全程同步 FS + 阻塞 IPC（sha256 两个 80MB 量级文件 + 可能的 30s install-core）→ spawn_blocking。
-        let blocking_lease = self.config.retain_active_legacy_start_lease();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let _blocking_lease = blocking_lease;
-            // 能力缓存：这个 helper 构建已经回过 `ERR unknown` 就不必再走整条重路。放在**最前**
-            // ——放在 stage 之后等于白省，两个 80MB 的 sha256 才是这条腿的主要开销。
-            // 探测本身是一次微秒级 ping；探不到（Unreachable）判不命中，宁可白跑一轮。
-            let cached_unsupported = helper.install_core_unsupported_note();
-            // `&&` 的短路是**有意的**：没记过「不支持」时这一路必然不命中，为它去 ping 等于给
-            // mac/linux 的稳态热路径平白加一次 IPC（那两个平台永远不会走到记号那一步）。
-            if cached_unsupported.is_some()
-                && install_core_unsupported_cache_hit(
-                    cached_unsupported.as_ref(),
-                    &helper.helper_build_probe(),
-                )
-            {
-                return Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported {
-                    from_cache: true,
-                });
-            }
-            // 首次完整对账通过后，同一会话内只做廉价 metadata 对账。两侧必须同时可观测且与缓存
-            // 完全一致才命中；任一读取失败/变化都清缓存并回到 SHA256，不把“观测不到”当“没变化”。
-            let active_before = promote::payload_stamp(&src_dir, &core_filename)?;
-            let protected_before =
-                promote::payload_stamp(&protected_payload_dir, &core_filename).ok();
-            let cache_hit = cache.lock().ok().is_some_and(|cached| {
-                protected_core_cache_hit(cached.as_ref(), &active_before, protected_before.as_ref())
-            });
-            if cache_hit {
-                return Ok(ProtectedCoreReconcileOutcome::Cached);
-            }
-            if let Ok(mut cached) = cache.lock() {
-                *cached = None;
-            }
-
-            let src_hash = promote::sha256_file(&active_core)?;
-            // 受保护核读不到（不存在 / 无权限）→ None ⇒ 判「要推」。**不吞成"已最新"**。
-            let dest_hash = promote::sha256_file(&dest).ok();
-            // 核同版但 Cronet 缺失/漂移也必须推：Linux helper 真正执行的是 root 受保护目录，
-            // 只比 sing-box hash 会让旧安装永久缺 libcronet.so，Naive/H3 继续报依赖缺失。
-            let sidecars_match = promote::sidecar_payload_matches(&src_dir, &protected_payload_dir);
-            if promote::decide_promote(&src_hash, dest_hash.as_deref(), sidecars_match)
-                == promote::PromoteDecision::UpToDate
-            {
-                // 只在完整 hash 前后两侧身份均稳定时记缓存。若校验过程中刚好发生换核，当前轮仍沿用
-                // 既有 hash 结论，但下一次连接必须重验，绝不能把竞态后的 metadata 误记成已验证。
-                let active_after = promote::payload_stamp(&src_dir, &core_filename)?;
-                let protected_after =
-                    promote::payload_stamp(&protected_payload_dir, &core_filename)?;
-                if active_before == active_after
-                    && protected_before.as_ref() == Some(&protected_after)
-                {
-                    if let Ok(mut cached) = cache.lock() {
-                        *cached = Some(ProtectedCoreCacheRecord {
-                            active: active_after,
-                            protected: protected_after,
-                        });
-                    }
-                }
-                return Ok(ProtectedCoreReconcileOutcome::Verified);
-            }
-            let names = promote::promote_names(&promote::list_file_names(&src_dir), &core_filename);
-            if names.is_empty() {
-                return Err(format!("现役核目录没有可提升的文件：{}", src_dir.display()));
-            }
-            promote::stage_promote_dir(&src_dir, &staged_dir, &names)?;
-            // 🔴 身份必须在**发 install-core 之前**探。事后再探会把「回 ERR unknown 的那个
-            // helper」与「此刻在管道那头的 helper」混为一谈：UAC 重装是秒级操作，两者之间完全
-            // 可能已经换代 ⇒ 记号写成「**新** helper 不支持」⇒ 本会话内永久跳过对账，而新
-            // helper 其实支持。反过来（探完才换代）只会让记号挂在旧身份上 ⇒ 下次探到新身份即
-            // 失效、重试 —— 方向是安全的。成本与 install-core 本身同量级下可忽略（一次 ping）。
-            let build_before = helper.helper_build_probe();
-            let r = helper.install_core(&staged_dir, &src_hash);
-            // 暂存目录用完即清（硬链不占额外空间，但留着会让下一轮的"先清后建"多做一次 I/O，
-            // 且用户目录里躺一个 80MB 影子核容易被误读为"又一份核"）。
-            let _ = std::fs::remove_dir_all(&staged_dir);
-            // 提升成功也不立即把 metadata 当作“完整对账通过”：helper 对核心做了 hash 校验，但 sidecar
-            // 复制没有独立摘要。下一次连接完整验一次后再进入热路径，避免扩大信任假设。
-            match r {
-                Ok(()) => Ok(ProtectedCoreReconcileOutcome::Promoted(src_hash)),
-                // 能力缺失才记号；`Failed` 一律不记——那可能是磁盘满/瞬态 IPC，下次就好了，
-                // 记下来会把一次偶发失败变成整个会话都不再尝试。
-                // 用的是 `build_before`（发 install-core **之前**探到的身份），理由见那行注释；
-                // 「探不到就不记」由 `note_install_core_unsupported` 统一持有。
-                Err(InstallCoreError::Unsupported) => {
-                    helper.note_install_core_unsupported(&build_before);
-                    Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported { from_cache: false })
-                }
-                Err(e) => Err(e.to_string()),
-            }
-        })
-        .await;
-
-        let elapsed_ms = started.elapsed().as_millis();
-        match outcome {
-            Ok(Ok(ProtectedCoreReconcileOutcome::Cached)) => {
-                log::info!("受保护核元数据缓存命中 → 跳过重复 SHA256（{elapsed_ms}ms）")
-            }
-            Ok(Ok(ProtectedCoreReconcileOutcome::Verified)) => {
-                log::info!("受保护核已与现役核一致（完整校验，{elapsed_ms}ms）→ 跳过提升")
-            }
-            Ok(Ok(ProtectedCoreReconcileOutcome::Promoted(h))) => log::info!(
-                "受保护核已提升到现役核（sha256={}…，{elapsed_ms}ms）：{}",
-                &h[..h.len().min(12)],
-                core_dir.display()
-            ),
-            // 「没执行」必须自曝：命中与首次撞上分两句，否则「能力探测根本没跑」与「跑了且命中」
-            // 在日志里长得一样。行为与本批前完全一致——warn 一句、继续起核（spec §3.5）。
-            Ok(Ok(ProtectedCoreReconcileOutcome::InstallCoreUnsupported { from_cache })) => {
-                if from_cache {
-                    log::warn!(
-                        "已装 helper 不支持 install-core（能力缓存命中，{elapsed_ms}ms）→ 跳过受保护核对账；\
-                         helper 升级后自动重试，本次仍按 helper 锁定的核起（加固未生效）"
-                    );
-                } else {
-                    log::warn!(
-                        "已装 helper 不支持 install-core（ERR unknown，{elapsed_ms}ms）→ 记下能力缺失，\
-                         本会话内不再重复推送；起核继续（加固未生效，等 helper 升级）"
-                    );
-                }
-            }
-            // 只警告不中止：判据在下游的实跑自证（见方法文档）。**Windows + 旧 helper 这一格
-            // 没有那个判据**（`running_exe_path` 恒 None，第二腿要的 `image=` 旧 helper 不带）
-            // ⇒ 自证恒 `Unobservable`，现场只剩这一行 warn。
-            Ok(Err(e)) => log::warn!(
-                "受保护核提升失败（{elapsed_ms}ms；起核继续，由起核后自证判定是否告警）：{e}"
-            ),
-            Err(e) => {
-                log::warn!("受保护核提升任务 join 失败（{elapsed_ms}ms；起核继续）：{e}")
-            }
-        }
     }
 
     /// **规则资源缺失** → 用户可见信号（`RULE_RESOURCES_MISSING`）。
@@ -3023,9 +2943,9 @@ impl ProxyRuntime {
         #[cfg(test)]
         let ready_retry_count = Arc::clone(&self.ready_retry_count);
         let deps = CoreReadyDeps {
-            // 子进程存活：直起走 try_wait 非阻塞收割（Ok(None)=仍在跑；child 被 stop 取走→不活）；
+            // 直起保留 try_wait 三态；Stop 已取走 custody 时让位，不折成进程死亡。
             // helper 核走 pid 探活（kill(pid,0)，root 核跨用户 EPERM 亦判活）。
-            is_alive: Box::new({
+            observe_process: Box::new({
                 let alive_probe_count = Arc::clone(&alive_probe_count);
                 let alive_probe_elapsed_us = Arc::clone(&alive_probe_elapsed_us);
                 move || {
@@ -3034,30 +2954,43 @@ impl ProxyRuntime {
                     // 桥的起核回执就是这条腿的真值（语义与射程见 `android_bridge::core_started`）。
                     // 不能问桥要 `BoxService.state`：本闭包是**同步**的（`Fn()->bool`），跨桥往返是
                     // 异步的，塞进来只能 `block_on`，而它本就跑在 async 上下文里 ⇒ 必 panic。
-                    let alive = if cfg!(target_os = "android") {
-                        super::android_bridge::core_started()
+                    use polaris_core_supervisor::ChildObservation;
+                    let observed = if cfg!(target_os = "android") {
+                        if super::android_bridge::core_started() {
+                            ChildObservation::Alive
+                        } else {
+                            ChildObservation::Exited
+                        }
                     } else if cfg!(target_os = "ios") {
                         #[cfg(target_os = "ios")]
                         {
-                            tauri_plugin_polaris_ios::started()
+                            if tauri_plugin_polaris_ios::started() {
+                                ChildObservation::Alive
+                            } else {
+                                ChildObservation::Exited
+                            }
                         }
                         #[cfg(not(target_os = "ios"))]
                         {
-                            false
+                            ChildObservation::Absent
                         }
                     } else if via_helper {
-                        helper_pid.is_some_and(pid_alive)
+                        if helper_pid.is_some_and(pid_alive) {
+                            ChildObservation::Alive
+                        } else {
+                            ChildObservation::Exited
+                        }
                     } else if let Ok(mut g) = child.lock() {
-                        g.is_running_alive()
+                        g.startup_observation()
                     } else {
-                        false
+                        ChildObservation::Unknown
                     };
                     alive_probe_count.fetch_add(1, Ordering::Relaxed);
                     alive_probe_elapsed_us.fetch_add(
                         started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
                         Ordering::Relaxed,
                     );
-                    alive
+                    observed
                 }
             }),
             // 就绪信号：管理 API 端口 TCP 可连（core-readiness.ts 原义；该口是 h2c gRPC，无 REST 可判）。
@@ -3320,16 +3253,19 @@ impl ProxyRuntime {
             socks: subscription_update_in_port,
             ..subscription_excl
         };
-        let mut probe_ports = PortAllocator::new(PortProviderExcluding {
-            excluded: update_in_port,
-        })
-        .resolve_distinct_free_ports(&pool_excl, PROBE_POOL_SIZE + 1);
+        let mut probe_ports = allocate_probe_ports(
+            &PortAllocator::new(PortProviderExcluding {
+                excluded: update_in_port,
+            }),
+            &pool_excl,
+            probe_pool_size(),
+        );
         let probe_proxy_port = (!probe_ports.is_empty()).then(|| probe_ports.remove(0));
         let pool_ports = probe_ports;
         if probe_proxy_port.is_none() {
             log::warn!(
                 "代理出口探针 + 测速池共 {} 个端口分配失败 → 自动故障探测停用、测速回退活跃出口",
-                PROBE_POOL_SIZE + 1
+                PROBE_POOL_FALLBACK_SIZE + 1
             );
         }
         Ok(StartPorts {
@@ -3467,29 +3403,247 @@ impl ProxyRuntime {
     /// **绝不删文件**（运行中删被挂载文件会致 sing-box reload 报错；删除只在起核 `write_custom_rule_files`
     /// 清扫）。移植 上游 `syncCustomRuleFiles`（:1688）。返回是否全部成功，由调用方按
     /// Full/SelectedOnly 范围选择重启配置；此处不能自行从磁盘 D 排程。
-    pub(super) async fn sync_custom_rule_files(self: &Arc<Self>, config: &UserConfig) -> bool {
-        let dir = self.custom_rules_dir();
-        let expected = build_custom_rule_files(config);
-        for (name, content) in &expected {
-            let file_path = dir.join(name);
-            let cur = std::fs::read_to_string(&file_path).ok();
-            if cur.as_deref() == Some(content.as_str()) {
-                continue;
-            }
-            if let Err(e) = atomic_write_custom_rule(&file_path, content) {
-                log::warn!("热更外化规则文件失败，退回去抖重启：{name}（{e}）");
-                return false;
+    pub(super) async fn sync_custom_rule_files(
+        self: &Arc<Self>,
+        config: &UserConfig,
+        generation: u64,
+        intent: u64,
+    ) -> bool {
+        if !self.selector_operation_is_current(generation, intent) {
+            return false;
+        }
+        let update = match self.rule_content_sync_target(config, generation) {
+            Ok(Some(update)) => update,
+            Ok(None) => return true,
+            Err(()) => return false,
+        };
+        #[cfg(test)]
+        {
+            let stub = self.rule_content_api_stub.lock().unwrap().clone();
+            if let Some(api) = stub {
+                return self
+                    .publish_rule_content(update, generation, intent, api.as_ref())
+                    .await;
             }
         }
-        true
+        let Some((port, secret)) = self.management_endpoint() else {
+            return false;
+        };
+        let api = Self::management_api_at(port, secret).await;
+        self.publish_rule_content(update, generation, intent, &api)
+            .await
+    }
+
+    // R is the committed projection. Overlay the outstanding side effect rather
+    // than assuming equality to R means equality to the running core.
+    fn rule_content_sync_target(
+        &self,
+        config: &UserConfig,
+        generation: u64,
+    ) -> Result<Option<(String, String)>, ()> {
+        let expected = build_custom_rule_files(config);
+        let mut actual = self
+            .current_config
+            .read()
+            .map_err(|_| ())?
+            .clone()
+            .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
+            .map(|v| build_custom_rule_files(&v))
+            .ok_or(())?;
+        let publication = self
+            .rule_content_publication
+            .lock()
+            .map_err(|_| ())?
+            .clone()
+            .filter(|p| p.generation == generation);
+        if let Some(p) = &publication {
+            if !actual.contains_key(&p.name) || !expected.contains_key(&p.name) {
+                return Err(());
+            }
+            actual.insert(p.name.clone(), p.content.clone());
+        }
+        if actual == expected {
+            return Ok(publication.map(|p| (p.name.clone(), expected[&p.name].clone())));
+        }
+        single_rule_content_update(&actual, &expected)
+            .map(|(name, content)| Some((name.to_owned(), content.to_owned())))
+            .ok_or(())
+    }
+
+    pub(super) fn has_uncommitted_rule_content(&self) -> bool {
+        let generation = self.gate.generation();
+        let publication = match self.rule_content_publication.lock() {
+            Ok(state) => state.clone().filter(|p| p.generation == generation),
+            Err(_) => return true,
+        };
+        let Some(p) = publication else {
+            return false;
+        };
+        if p.acknowledged_instance.is_none() {
+            return true;
+        }
+        let applied = self
+            .current_config
+            .read()
+            .ok()
+            .and_then(|v| v.clone())
+            .and_then(|v| serde_json::from_value::<UserConfig>(v).ok())
+            .map(|v| build_custom_rule_files(&v));
+        applied
+            .and_then(|files| files.get(&p.name).cloned())
+            .as_ref()
+            != Some(&p.content)
+    }
+
+    async fn publish_rule_content(
+        self: &Arc<Self>,
+        update: (String, String),
+        generation: u64,
+        intent: u64,
+        api: &dyn RuleContentApi,
+    ) -> bool {
+        let (name, content) = update;
+        let Some(tag) = custom_rule_file_tag(&name) else {
+            return false;
+        };
+        let Ok(before) = api.status(vec![tag.clone()]).await else {
+            return false;
+        };
+        if !self.selector_operation_is_current(generation, intent)
+            || before.instance_started_at_unix_nano == 0
+            || !before
+                .rule_sets
+                .iter()
+                .any(|set| set.tag == tag && !set.closed && set.watcher_state == "watching")
+        {
+            return false;
+        }
+        let digest = polaris_updater::sha256_hex(content.as_bytes());
+        // Unknown BEFORE publication: cancellation/failure cannot erase evidence.
+        // Claim covers the synchronous write, never an await. Stale owners do not roll back.
+        let wrote = self.selector_reconcile.with_intent_claim(|current_intent| {
+            if current_intent != intent {
+                return false;
+            }
+            let _publication = self.gate.lock_generation_publication();
+            if !self.selector_operation_is_current(generation, intent) {
+                return false;
+            }
+            let Ok(mut state) = self.rule_content_publication.lock() else {
+                return false;
+            };
+            *state = Some(RuleContentPublication {
+                generation,
+                name: name.clone(),
+                content: content.clone(),
+                acknowledged_instance: None,
+            });
+            atomic_write_custom_rule(&self.custom_rules_dir().join(&name), &content).is_ok()
+        });
+        self.push_pending_changes();
+        if !wrote {
+            return false;
+        }
+        let wait = async {
+            loop {
+                if !self.selector_operation_is_current(generation, intent) {
+                    return false;
+                }
+                let Ok(status) = api.status(vec![tag.clone()]).await else {
+                    return false;
+                };
+                if !self.selector_operation_is_current(generation, intent)
+                    || status.instance_started_at_unix_nano != before.instance_started_at_unix_nano
+                {
+                    return false;
+                }
+                if rule_content_acknowledged(
+                    &status,
+                    &tag,
+                    &digest,
+                    before.instance_started_at_unix_nano,
+                ) {
+                    return self.selector_reconcile.with_intent_claim(|current_intent| {
+                        if current_intent != intent {
+                            return false;
+                        }
+                        let _publication = self.gate.lock_generation_publication();
+                        if !self.selector_operation_is_current(generation, intent) {
+                            return false;
+                        }
+                        let Ok(mut state) = self.rule_content_publication.lock() else {
+                            return false;
+                        };
+                        let Some(p) = state.as_mut() else {
+                            return false;
+                        };
+                        if p.generation != generation || p.name != name || p.content != content {
+                            return false;
+                        }
+                        p.acknowledged_instance = Some(status.instance_started_at_unix_nano);
+                        true
+                    });
+                }
+                if status
+                    .rule_sets
+                    .iter()
+                    .any(|set| set.closed || set.watcher_state != "watching")
+                {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let applied = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .unwrap_or(false);
+        self.push_pending_changes();
+        applied
+    }
+
+    /// Capture the ordinary startup value inputs once for an unpublished
+    /// candidate. Port numbers are probes, not reservations. This method does
+    /// not open listeners, write rules, generate twice or invoke a kernel gate.
+    pub(super) fn generate_candidate_deps(
+        &self,
+        config: &UserConfig,
+        raw: &Value,
+    ) -> Result<GenerateConfigDeps, String> {
+        let control_port = control_api_port(config);
+        let ports = self.resolve_start_ports(config, control_port)?;
+        let mut deps = self.generate_deps(
+            ports.api,
+            ports.update_in,
+            ports.subscription_update_in,
+            ports.probe_proxy,
+            &ports.probe_pool,
+            raw,
+            false,
+        );
+        deps.network_canary_port = self.resolve_network_canary_port(
+            config,
+            control_port,
+            ports.api,
+            ports.update_in,
+            ports.subscription_update_in,
+        );
+        Ok(deps)
+    }
+
+    /// Read immutable policy input for normal generation, diagnostics and frozen
+    /// candidates alike. Parsing/replacement/fallback live in config-engine.
+    pub(super) fn node_dns_decoy_override(&self) -> Option<String> {
+        read_node_dns_decoy_override(
+            &rule_resource_dir(self.config.dir()).join("gfw-decoy-cidr.txt"),
+            config_log,
+        )
     }
 
     /// 装配 [`GenerateConfigDeps`]（上游侧所有 `this.*` 实例态的真值注入）。
     ///
     /// **边界（未接线的轴一律取保守值，非静默省略）**：
-    /// - `race_server_port` / `race_upstream_ips` 由 `DnsRaceRuntime` 运行期投影注入，
-    ///   该 owner 在本函数**之前**起好 sidecar 并原子提交投影（竞速关 /
-    ///   起 sidecar 失败 → 恒 (0, []) = race off）。
+    /// - `node_dns_decoy_override` captures optional replacement CIDR file text;
+    ///   native policy generation has no listener/port/runtime-owner dependency.
     /// - `probe_direct_port` 仍留空；`probe_proxy_port` 是本次起核独占的健康检查入口，路由固定到
     ///   `proxy-selector`，不经过用户规则。端口分配失败时保持空，自动故障切换按 fail-closed 跳过。
     /// - **§15**：`probe_pool_ports` 由 `resolve_start_ports` 分配的 K 个空闲口注入（非空 → config-engine 建
@@ -3516,15 +3670,10 @@ impl ProxyRuntime {
         let dir = self.config.dir();
         // A2/C13：日志两轴跟随 config（此前硬编码 Info + 不落 disableLogFile）。
         let (log_level, disable_log_file) = log_axes_from_config(config);
-        // C11：race sidecar 运行期状态注入。port>0 才生成 dns-node-race + 放行上游直连。
-        // IP 与端口**两轴同源**（都来自 sidecar 起好时提交的 `ResolvedUpstreams`）：route 的直连放行按
-        // `ip_cidr × port` 叉乘匹配，只下发 IP 会让非标端口的自定义上游在 TUN 下经代理出站（issue #147）。
-        let (race_server_port, race_upstream_ips, race_upstream_ports) =
-            self.dns_race.config_projection();
         GenerateConfigDeps {
             platform: platform_tag().to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            race_server_port,
+            node_dns_decoy_override: self.node_dns_decoy_override(),
             probe_direct_port: None,
             probe_proxy_port,
             debug_probe_mixed_udp: cfg!(all(target_os = "android", debug_assertions)),
@@ -3544,8 +3693,6 @@ impl ProxyRuntime {
                     None
                 }
             },
-            race_upstream_ips,
-            race_upstream_ports,
             // macOS(arm64+x64) cronet 静态编入内核（无 dylib 文件）→ 不能只看落盘，否则误拦所有 naive 节点。
             has_cronet: cronet_available(
                 self.cronet_lib_exists_for_start(),
@@ -3740,22 +3887,51 @@ impl ProxyRuntime {
         if cfg!(not(any(target_os = "android", target_os = "ios"))) {
             self.settle_kernel_validation_admission(binary).await?;
         }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let cli_observation = match binary {
+            Some(path) => crate::runtime::tls_fingerprints::probe_cli_observation(path).await,
+            None => Err(Box::new(
+                crate::runtime::tls_fingerprints::Snapshot::unavailable("No selected core binary"),
+            )),
+        };
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let capabilities = match &cli_observation {
+            Ok(observation) => &observation.snapshot,
+            Err(snapshot) => snapshot.as_ref(),
+        };
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let capabilities = self.tls_fingerprint_capabilities_for(binary).await;
         let started = std::time::Instant::now();
         let mut checks_run: u32 = 0;
         loop {
             // 已剥的节点从 `servers` 摘掉后重新生成（空集合时等价于原配置）。
             let mut effective = user_config.clone();
             effective.servers.retain(|s| !peeled.contains_key(&s.id));
-            let gen_out = generate_sing_box_config_with_report_and_runtime_bindings(
+            #[allow(unused_mut)]
+            let mut gen_out = generate_sing_box_config_with_report_and_runtime_bindings(
                 &effective,
                 &BTreeMap::new(),
                 deps,
                 runtime_bind_interfaces,
             )
             .map_err(|e| format!("sing-box 配置生成失败: {e}"))?;
+            #[cfg(windows)]
+            crate::runtime::windows_directory::bind_configuration(
+                &mut gen_out.config,
+                self.config.dir(),
+            )?;
+            capabilities.validate_config(
+                &serde_json::to_value(&gen_out.config).map_err(|e| e.to_string())?,
+            )?;
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            validate_startup_cli_proof(binary, capabilities, cli_observation.as_ref().ok())?;
             let json = serde_json::to_string_pretty(&gen_out.config)
                 .map_err(|e| format!("sing-box 配置序列化失败: {e}"))?;
-            std::fs::write(config_path, &json)
+            // The iOS managed Start keeps logical bytes in memory until the
+            // fresh original provider proves its bundled source/owner capability.
+            // No runtime-config file is exposed to an older shared-profile reader.
+            #[cfg(not(target_os = "ios"))]
+            write_private_runtime_config(config_path, &json)
                 .map_err(|e| format!("写 sing-box 配置失败 {}: {e}", config_path.display()))?;
 
             // 核解析不到（首启未落核 / 单测未注入）→ 闸门无从判定，照原样下发（failOpen）。
@@ -3775,8 +3951,11 @@ impl ProxyRuntime {
             // 已接受身份缓存以「哪个核 + 哪份配置」为键。Android 上没有核文件可取身份（mtime/size）
             // ⇒ 不进缓存、每次真跑一次 check。这比伪造一个身份诚实：伪造出来的键会在换核（换 aar）
             // 之后仍然命中，等于把闸门静默关掉。
-            let cache_record =
-                binary.and_then(|bin| kernel_gate_cache_record(bin, &gen_out.config));
+            let cache_record = binary.and_then(|bin| {
+                capabilities.binary_sha256.as_deref().and_then(|digest| {
+                    kernel_gate_cache_record_with_digest(bin, &gen_out.config, digest)
+                })
+            });
             if cache_record
                 .as_ref()
                 .is_some_and(|record| self.kernel_gate_cache_hit(record))
@@ -3943,13 +4122,31 @@ impl ProxyRuntime {
 
     /// 本次实际要启动的核心旁是否有 cronet 动态库。
     ///
-    /// 必须与 [`Self::core_binary_for_start`] 同源：环境覆盖、可写核、随包核三条优先级任一变化时，
-    /// 依赖探测都跟着实际 spawn 路径走，不能再固定查配置目录根部。
+    /// 必须与 [`Self::core_binary_for_start`] 同源：依赖探测跟着实际 spawn 路径走，
+    /// 不能固定查某个目录。
     pub(super) fn cronet_lib_exists_for_start(&self) -> bool {
         self.core_binary_for_start()
             .ok()
             .is_some_and(|core| cronet_lib_exists_beside_core(&core, std::env::consts::OS))
     }
+}
+
+/// Validate this gate's retained query proof, including after a peel/check await.
+/// Shared lookup eviction is unrelated to whether these selected bytes changed.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(super) fn validate_startup_cli_proof(
+    binary: Option<&Path>,
+    capabilities: &crate::runtime::tls_fingerprints::Snapshot,
+    proof: Option<&crate::runtime::tls_fingerprints::CliObservation>,
+) -> Result<(), String> {
+    if let (Some(binary), Some(expected)) = (binary, capabilities.binary_sha256.as_deref()) {
+        if !proof.is_some_and(|proof| {
+            proof.matches(binary) && proof.snapshot.binary_sha256.as_deref() == Some(expected)
+        }) {
+            return Err("Core bytes changed after capability query; retry startup".into());
+        }
+    }
+    Ok(())
 }
 
 /// `ProxyRuntime::generate_and_gate` 的产物：**已落盘**的那份配置 + 本次全部剔除报告。
@@ -3963,7 +4160,7 @@ pub(super) struct GateOutcome {
     /// 🔴 **已落盘的那一份配置的字节，逐字**（不是把 `config` 再序列化一次）。
     ///
     /// 存在的唯一理由是 Android：核是进程内 `.so`，起核 = 把这串交给 `libbox`。它与
-    /// `std::fs::write(config_path, &json)` 写下去的是**同一个 `json` 变量** ⇒ 诊断包直读的
+    /// `write_private_runtime_config(config_path, &json)` 写下去的是**同一个 `json` 变量** ⇒ 诊断包直读的
     /// `runtime_config_path()` 与内核实际吃的那份不可能漂。
     ///
     /// **不可改成「从盘上读回来再交给 libbox」**：那样诊断与内核就有了两条路径，而这条链上唯一
@@ -4125,6 +4322,28 @@ fn attribute_rejected_node(
         RejectedArray::Endpoints => &config.endpoints.as_ref()?.get(rejection.index)?.tag,
     };
     Some((tag_to_id.get(tag)?.clone(), tag.clone()))
+}
+
+/// Missing overrides are normal; other read failures get a redacted bounded warning.
+pub(super) fn read_node_dns_decoy_override(
+    path: &Path,
+    log: fn(polaris_config_engine::user_config::LogLevel, &str),
+) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            // Do not expose local paths or file contents; missing is the normal default.
+            log(
+                polaris_config_engine::user_config::LogLevel::Warn,
+                &format!(
+                    "Node DNS decoy override read failed ({:?}); using built-in prefixes",
+                    error.kind()
+                ),
+            );
+            None
+        }
+    }
 }
 
 /// 规则资源目录（`<data>/rule-resource/`）。**目录名的唯一定义点** —— config 生成侧的
@@ -4439,6 +4658,313 @@ pub(super) fn region_reverse_rule_sets_intact(
         .all(|t| defined.contains(t.as_str()))
 }
 
+/// Block is a routing shape, not a legacy outbound tag. Keep every matcher in
+/// the Default comparison so new RouteRule fields cannot silently widen proof.
+fn block_route_shape_matches(singbox_config: &SingBoxConfig) -> bool {
+    fn references_selected_exit(rule: &RouteRule) -> bool {
+        rule.outbound.as_deref() == Some(PROXY_SELECTOR_TAG)
+            || rule
+                .rules
+                .as_ref()
+                .is_some_and(|children| children.iter().any(references_selected_exit))
+    }
+
+    enum ScopeProof {
+        Unconditional,
+        Scoped(BTreeSet<String>),
+        Unknown,
+    }
+
+    fn finite_strings(value: &Value) -> Option<Vec<String>> {
+        let mut values = match value {
+            Value::String(value) => vec![value.clone()],
+            Value::Array(values) => values
+                .iter()
+                .map(|value| value.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        };
+        if values.is_empty()
+            || values.len() > 1024
+            || values
+                .iter()
+                .any(|value| value.trim().is_empty() || value.chars().any(char::is_control))
+        {
+            return None;
+        }
+        values.sort();
+        values.dedup();
+        Some(values)
+    }
+
+    // An upper bound on covered addresses, not a CIDR evaluator or expansion.
+    // IPv6 prefixes beyond /64 round upward by one unit, never to a false proof.
+    fn bounded_cidrs(values: &[String]) -> bool {
+        let mut covered = [0u128; 2];
+        for value in values {
+            let (address, prefix) = value
+                .split_once('/')
+                .map_or((value.as_str(), None), |(address, prefix)| {
+                    (address, Some(prefix))
+                });
+            let Ok(address) = address.parse::<std::net::IpAddr>() else {
+                return false;
+            };
+            let (family, bits, precision) = if address.is_ipv4() {
+                (0, 32u32, 32u32)
+            } else {
+                (1, 128u32, 64u32)
+            };
+            let prefix = match prefix {
+                Some(prefix) => match prefix.parse::<u32>() {
+                    Ok(prefix) => prefix,
+                    Err(_) => return false,
+                },
+                None => bits,
+            };
+            if prefix > bits {
+                return false;
+            }
+            covered[family] += 1u128 << precision.saturating_sub(prefix);
+            if covered[family] >= 1u128 << precision {
+                return false;
+            }
+        }
+        true
+    }
+
+    // This proves only supported positive shapes. Each atom is an entire leaf,
+    // not an assumed AND of its fields (domain/address fields may be grouped OR).
+    fn prove_scope(node: &Value, depth: usize, remaining: &mut usize) -> ScopeProof {
+        if depth > 8 || *remaining == 0 {
+            return ScopeProof::Unknown;
+        }
+        *remaining -= 1;
+        let Some(mut fields) = node.as_object().cloned() else {
+            return ScopeProof::Unknown;
+        };
+        let invert = fields
+            .remove("invert")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        // Mode alone can cover the whole active branch; it never proves scope.
+        fields.remove("clash_mode");
+        let kind = fields
+            .remove("type")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        if kind == "logical" {
+            let mode = fields
+                .remove("mode")
+                .and_then(|value| value.as_str().map(str::to_owned));
+            let children = fields.remove("rules");
+            let Some(children) = children.as_ref().and_then(Value::as_array) else {
+                return ScopeProof::Unknown;
+            };
+            if invert || !fields.is_empty() || children.is_empty() || children.len() > 64 {
+                return ScopeProof::Unknown;
+            }
+            match mode.as_deref() {
+                Some("and") => {
+                    let mut bounds = BTreeSet::new();
+                    let mut unknown = false;
+                    for child in children {
+                        match prove_scope(child, depth + 1, remaining) {
+                            ScopeProof::Scoped(atoms) => bounds.extend(atoms),
+                            ScopeProof::Unknown => unknown = true,
+                            ScopeProof::Unconditional => {}
+                        }
+                    }
+                    if !bounds.is_empty() {
+                        ScopeProof::Scoped(bounds)
+                    } else if unknown {
+                        ScopeProof::Unknown
+                    } else {
+                        ScopeProof::Unconditional
+                    }
+                }
+                Some("or") => {
+                    let mut common: Option<BTreeSet<String>> = None;
+                    for child in children {
+                        match prove_scope(child, depth + 1, remaining) {
+                            ScopeProof::Unconditional => return ScopeProof::Unconditional,
+                            ScopeProof::Unknown => return ScopeProof::Unknown,
+                            ScopeProof::Scoped(atoms) => {
+                                common = Some(match common {
+                                    Some(previous) => {
+                                        previous.intersection(&atoms).cloned().collect()
+                                    }
+                                    None => atoms,
+                                });
+                            }
+                        }
+                    }
+                    match common {
+                        Some(bounds) if !bounds.is_empty() => ScopeProof::Scoped(bounds),
+                        _ => ScopeProof::Unknown,
+                    }
+                }
+                _ => ScopeProof::Unknown,
+            }
+        } else {
+            if !kind.is_empty() && kind != "default" {
+                return ScopeProof::Unknown;
+            }
+            // Normalize every current empty collection/Listable or empty scalar
+            // matcher; an unknown future field is retained and fails closed.
+            fields.retain(|key, value| {
+                let known = matches!(
+                    key.as_str(),
+                    "protocol"
+                        | "network"
+                        | "rule_set"
+                        | "domain"
+                        | "domain_suffix"
+                        | "domain_keyword"
+                        | "domain_regex"
+                        | "geosite"
+                        | "ip_cidr"
+                        | "source_ip_cidr"
+                        | "port"
+                        | "port_range"
+                        | "source_port"
+                        | "source_port_range"
+                        | "source_mac_address"
+                        | "source_hostname"
+                        | "process_name"
+                        | "process_path"
+                        | "package_name"
+                        | "process_name_not"
+                        | "inbound"
+                        | "preferred_by"
+                        | "dns_server_address"
+                        | "dns_search_domain"
+                );
+                !known
+                    || !(value.is_null()
+                        || value.as_array().is_some_and(Vec::is_empty)
+                        || value.as_object().is_some_and(serde_json::Map::is_empty)
+                        || value.as_str() == Some(""))
+            });
+            // The pinned engine matches an empty leaf before applying invert.
+            if fields.is_empty() {
+                return ScopeProof::Unconditional;
+            }
+            if invert {
+                return ScopeProof::Unknown;
+            }
+            let mut positive = false;
+            let mut destination_family = None;
+            for (key, value) in &mut fields {
+                let family = match key.as_str() {
+                    "domain" | "domain_suffix" => Some("names"),
+                    "domain_keyword" => Some("keywords"),
+                    "ip_cidr" => Some("addresses"),
+                    "rule_set" => Some("builtin-set"),
+                    _ => None,
+                };
+                if let Some(family) = family {
+                    if destination_family.is_some_and(|previous| previous != family) {
+                        return ScopeProof::Unknown;
+                    }
+                    destination_family = Some(family);
+                }
+                if matches!(key.as_str(), "port" | "source_port") {
+                    let ports = value
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_else(|| vec![value.clone()]);
+                    if ports.is_empty()
+                        || ports.len() > 1024
+                        || ports
+                            .iter()
+                            .any(|port| !port.as_u64().is_some_and(|port| port <= 65535))
+                    {
+                        return ScopeProof::Unknown;
+                    }
+                    positive = true;
+                    *value = Value::Array(ports);
+                    continue;
+                }
+                let Some(values) = finite_strings(value) else {
+                    return ScopeProof::Unknown;
+                };
+                let bounded = match key.as_str() {
+                    "domain" => values.iter().all(|value| !matches!(value.as_str(), "." | "*")),
+                    "domain_suffix" => values.iter().all(|value| value.trim_matches('.').contains('.') && !value.contains('*')),
+                    "domain_keyword" => values.iter().all(|value| value.chars().count() >= 2 && !value.contains('*')),
+                    "ip_cidr" | "source_ip_cidr" => bounded_cidrs(&values),
+                    "rule_set" => values.len() == 1 && (values[0] == polaris_config_engine::user_config::builtin_geo_rulesets::PRIVATE_DOMAIN_DIRECT_TAG || polaris_config_engine::user_config::builtin_geo_rulesets::is_bundled_geo_tag(&values[0])),
+                    "protocol" | "inbound" | "process_name" | "process_path" | "package_name" | "source_mac_address" | "source_hostname" => values.iter().all(|value| value != "*"),
+                    "network" => {
+                        if values.iter().any(|value| !matches!(value.as_str(), "tcp" | "udp" | "icmp")) { return ScopeProof::Unknown; }
+                        values.len() == 1
+                    }
+                    _ => return ScopeProof::Unknown,
+                };
+                if !bounded && key != "network" {
+                    return ScopeProof::Unknown;
+                }
+                positive |= bounded;
+                *value = Value::Array(values.into_iter().map(Value::String).collect());
+            }
+            if positive {
+                ScopeProof::Scoped(BTreeSet::from([Value::Object(fields).to_string()]))
+            } else {
+                ScopeProof::Unknown
+            }
+        }
+    }
+
+    fn terminates_before_block(rule: &RouteRule) -> bool {
+        let terminal_route = rule.action.as_deref() == Some("route")
+            || (rule.action.is_none() && rule.outbound.is_some());
+        if !terminal_route {
+            return false;
+        }
+        // Action options do not constrain matching. Keep all matcher fields,
+        // including future fields, for the explicit bounded proof above.
+        let matcher = RouteRule {
+            action: None,
+            outbound: None,
+            server: None,
+            no_drop: None,
+            sniffer: None,
+            rewrite_target: None,
+            timeout: None,
+            domain_resolver: None,
+            override_address: None,
+            tls_spoof: None,
+            tls_spoof_method: None,
+            ..rule.clone()
+        };
+        let Ok(node) = serde_json::to_value(matcher) else {
+            return true;
+        };
+        let mut remaining = 64;
+        !matches!(prove_scope(&node, 0, &mut remaining), ScopeProof::Scoped(_))
+    }
+
+    let Some(route) = singbox_config.route.as_ref() else {
+        return false;
+    };
+    if route.final_outbound.as_deref() != Some(DIRECT_TAG) {
+        return false;
+    }
+    let Some((last, preceding)) = route.rules.split_last() else {
+        return false;
+    };
+    let reject = RouteRule {
+        action: Some("reject".to_string()),
+        // no_drop changes the rejection method, not its matching scope.
+        no_drop: last.no_drop,
+        ..RouteRule::default()
+    };
+    last == &reject
+        && !route.rules.iter().any(references_selected_exit)
+        && !preceding.iter().any(terminates_before_block)
+}
+
 pub(super) fn attest_effective_exit(
     user_config: &UserConfig,
     singbox_config: &SingBoxConfig,
@@ -4447,6 +4973,32 @@ pub(super) fn attest_effective_exit(
     // 门①：用户显式选「全直连」模式 → `final=direct` 是设计语义，不是降级。
     if user_config.proxy_mode == ProxyMode::Direct {
         return ExitAttestation::Match;
+    }
+    // Block must precede reverse/mesh exemptions, and stale persisted selection
+    // must precede its success. Non-block and explicit direct-mode gates retain
+    // their existing order and meaning.
+    if is_block_selection(user_config.selected_server_id.as_deref()) {
+        let started_with = user_config.selected_server_id.as_deref();
+        if let Some(persisted) = persisted_selected_id {
+            if started_with != Some(persisted) {
+                return ExitAttestation::StaleSelection {
+                    persisted: persisted.to_string(),
+                    started_with: started_with.unwrap_or("<none>").to_string(),
+                };
+            }
+        }
+        if block_route_shape_matches(singbox_config) {
+            return ExitAttestation::Match;
+        }
+        return match effective_exit_tag(singbox_config) {
+            Some(actual) if actual != BLOCK_TAG => ExitAttestation::WrongExit {
+                expected_tag: BLOCK_TAG.to_string(),
+                actual_tag: actual,
+            },
+            _ => ExitAttestation::UnresolvedExit {
+                expected_tag: BLOCK_TAG.to_string(),
+            },
+        };
     }
     // 门②：smart + 地区反向（回国：本地走代理·海外直连）→ `final=direct` 同为设计语义。
     // 这两门不放行就会对**用户自己选的模式**天天误报，告警一旦有假就会被整体无视。
@@ -4558,3 +5110,104 @@ pub(super) fn server_ids(config: &Value) -> std::collections::HashSet<String> {
     }
     set
 }
+
+#[derive(Clone)]
+pub(super) struct RuleContentPublication {
+    generation: u64,
+    name: String,
+    content: String,
+    acknowledged_instance: Option<i64>,
+}
+pub(super) trait RuleContentApi: Send + Sync {
+    fn status(
+        &self,
+        tags: Vec<String>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        polaris_singbox_grpc::daemon::RuleSetStatusResponse,
+                        polaris_switch_engine::ManagementError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    >;
+}
+impl RuleContentApi for crate::runtime::management_api::GrpcManagementApi {
+    fn status(
+        &self,
+        tags: Vec<String>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        polaris_singbox_grpc::daemon::RuleSetStatusResponse,
+                        polaris_switch_engine::ManagementError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.rule_set_status(tags))
+    }
+}
+fn single_rule_content_update<'a>(
+    previous: &BTreeMap<String, String>,
+    expected: &'a BTreeMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
+    if previous.keys().ne(expected.keys()) {
+        return None;
+    }
+    let mut changed = expected
+        .iter()
+        .filter(|(name, content)| previous.get(*name) != Some(*content));
+    let (name, content) = changed.next()?;
+    if changed.next().is_some() {
+        return None;
+    }
+    Some((name.as_str(), content.as_str()))
+}
+fn custom_rule_file_tag(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".json")?;
+    if !stem.starts_with("custom-rule-") || stem.contains('/') || stem.contains('\\') {
+        return None;
+    }
+    Some(stem.replace(".dns", "-dns"))
+}
+fn rule_content_acknowledged(
+    status: &polaris_singbox_grpc::daemon::RuleSetStatusResponse,
+    tag: &str,
+    digest: &str,
+    instance: i64,
+) -> bool {
+    instance != 0
+        && status.instance_started_at_unix_nano == instance
+        && status.rule_sets.iter().any(|s| {
+            s.tag == tag
+                && s.active_digest == digest
+                && s.revision > 0
+                && !s.closed
+                && s.watcher_state == "watching"
+        })
+}
+fn write_private_runtime_config(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or("runtime config has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let metadata = std::fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("runtime config parent must be a real directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    polaris_store::fs::durable_atomic_write(path, text, &polaris_store::fs::random_tmp_suffix())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests;

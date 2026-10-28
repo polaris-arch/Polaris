@@ -413,6 +413,7 @@ fn commit_create(
         let mut subscription = request;
         subscription["createdAt"] = json!(super::current_iso());
         append_subscription(config, subscription);
+        // The shared reconciliation preserves both direct and block sentinel selections.
         let recon = reconcile_subscription_servers(
             config,
             operation_id,

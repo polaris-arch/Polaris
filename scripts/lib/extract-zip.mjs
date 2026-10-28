@@ -1,22 +1,24 @@
 /**
- * zip 解压：三个 fetch 脚本（core / cronet / dashboard）共用的**单一真值点**。
+ * zip 解压：三个 fetch 脚本（protoc / cronet / dashboard）共用的**单一真值点**。
  *
  * ── 为什么必须分平台，统一不了一条命令 ──
  *   · **Linux 只能走 `unzip`**：GNU tar 不认 zip（本机实测 tar 1.35：
  *     `tar: This does not look like a tar archive`）。ubuntu-22.04 runner 自带 unzip，
  *     已由绿过的 linux 打包腿（run 30968735116）实证。
- *   · **Windows 只能走 `tar`**：`unzip` 在 GH windows runner 上**不保证存在** ——
+ *   · **Windows 只能走 System32 的 `tar.exe`**：`unzip` 在 GH windows runner 上**不保证存在** ——
  *     `actions/runner-images` 的 windows-2022 清单只列了 7zip，MSYS2 明写
  *     「pre-installed on image but not added to PATH」，Git bash 的 `usr/bin` 里有没有
  *     unzip 未经证实。而 `C:\Windows\System32\tar.exe` 是 **bsdtar**（Windows 10 1803 /
  *     Server 2019 起随系统自带），bsdtar 认 zip。
- *     三个 fetch step 都没写 `shell:` ⇒ Windows 上默认 pwsh，拿的是系统 PATH。
+ *     必须使用这个绝对路径：node 会继承调用方 PATH，Git Bash 的 GNU tar 可能排在前面，
+ *     并把 `C:\...` 的盘符当远端主机（`Cannot connect to C: resolve failed`）。
+ *     与 ci.yml 的 NASM 步复用同一个 System32 bsdtar，不依赖调用方是 bash 还是 pwsh。
  *   · macOS 的 tar 同为 bsdtar，两条都成立；跟 Linux 一起走 unzip，让判据收敛成
- *     「win32 → tar，其余 → unzip」这一条。
+ *     「win32 → System32 bsdtar，其余 → unzip」这一条。
  *
  * 🔴 **不要写成「先试 unzip，失败再 fallback tar」**：静默 fallback 会让「unzip 其实不在」
  *    这个事实永远不被观测到，下次换 runner 镜像时原样复发，且届时报错点已经漂到别处。
- *    判据按平台写死，并把实际用的解压器打进日志 —— 换了镜像行为变化时肉眼可见。
+ *    判据按平台写死，错误保留实际调用的解压器；缺失或失败立即抛出。
  *
  * 🔴 **只提供「全解」，不提供「按成员选择性解压」**：此前 fetch-cronet 用 unzip 的
  *    `-j`（junk-paths）配一个通配 pattern 只解出要的那一个成员，那套 flag 语义
@@ -35,10 +37,10 @@ import { join } from 'path';
 export function extractZip(archive, destDir) {
   if (process.platform === 'win32') {
     // bsdtar：`-x` 解，`-f` 指定档，`-C` 指定落点。zip 由 libarchive 自动识别，不需 `-z`。
-    execFileSync('tar', ['-xf', archive, '-C', destDir], { stdio: 'inherit' });
+    execFileSync('C:\\Windows\\System32\\tar.exe', ['-xf', archive, '-C', destDir], { stdio: 'inherit', shell: false });
   } else {
     // `-q` 静默（日志里只留下面那行汇总），`-o` 覆盖同名不交互提问（CI 里没有 stdin 可答）。
-    execFileSync('unzip', ['-q', '-o', archive, '-d', destDir], { stdio: 'inherit' });
+    execFileSync('unzip', ['-q', '-o', archive, '-d', destDir], { stdio: 'inherit', shell: false });
   }
 }
 

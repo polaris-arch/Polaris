@@ -16,19 +16,20 @@
 //! 注：各运行时的访问器（dir / path / platform / config 等）为后续 actor 批次（crash-recovery /
 //! stats-worker / mesh-warp）预留注入点；当前仅 command 层用到子集，`dead_code` 全模块放行。
 
+pub(crate) mod auto_select;
 pub mod auto_switch;
 pub mod config;
+pub mod core_attest;
+pub(crate) mod core_identity;
 pub mod core_paths;
-pub mod core_promote;
-pub mod core_swap;
-pub mod core_update_scheduler;
-pub mod core_validation;
-/// 路径型环境逃生门的信任级判定单点（`POLARIS_SINGBOX_PATH` / `POLARIS_HELPER_PATH`）。
+/// 路径型环境逃生门的信任级判定单点（`POLARIS_HELPER_PATH`）。
 pub(crate) mod env_trust;
 pub mod geo_seed;
 pub mod helper;
 pub mod http;
 pub mod management_api;
+pub(crate) mod measurement_ledger;
+pub mod measurement_scheduler;
 pub mod mesh;
 /// pending `modified`（全维）与测速 dirty（5 维）两条判据的单点定义 + 包含关系不变式。
 pub mod node_fingerprints;
@@ -44,8 +45,11 @@ pub mod subscription_create;
 pub mod subscription_parse;
 pub mod subscription_scheduler;
 pub mod taildrop;
+#[cfg(any(unix, windows, test))]
+mod tailscale_directory;
 pub mod tailscale_login_core;
 pub mod tailscale_status;
+pub(crate) mod tls_fingerprints;
 pub mod uninstall;
 pub mod unlock;
 pub mod update_install;
@@ -90,7 +94,7 @@ pub struct AppRuntime {
     pub stats: Arc<StatsRelay>,
     pub helper: Arc<HelperRuntime>,
     pub mesh: Arc<MeshRuntime>,
-    /// 更新运行时（App 自更新 + 内核更新 + mini 弹窗会话）。
+    /// 更新运行时（App 自更新 + 内核版本读取 + mini 弹窗会话）。
     pub updater: Arc<UpdaterRuntime>,
     /// 传输层单点：**全 App 唯一**的真实 HTTP/TLS 客户端（见 `runtime/http.rs`）。
     /// 订阅拉取 / 内核下载 / 解锁检测 / WARP 全部经它注入既有窄 trait。
@@ -164,8 +168,6 @@ impl AppRuntime {
             helper.clone(),
             mesh.clone(),
             proxy_clearer,
-            // C11：竞速 sidecar 的 DoH 上游走同一个 `HttpRuntime`（workspace 唯一真实 HTTP/TLS 客户端）。
-            http.clone(),
         ));
         Ok(Self {
             config,
@@ -248,3 +250,6 @@ impl AppRuntime {
         &self.subscription_parse
     }
 }
+
+#[cfg(windows)]
+pub(crate) mod windows_directory;

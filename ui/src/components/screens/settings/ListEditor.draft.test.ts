@@ -104,7 +104,7 @@ describe('接线：行输入打字不得碰父级，blur 才提交', () => {
   it('删除 / 添加 / 批量导入都基于 draft，不基于 value', () => {
     expect(SRC).toContain('commit(draft.filter((_, i) => i !== idx))');
     expect(SRC).toContain("commit([...draft, ''])");
-    expect(SRC).toContain('parseBulkEntries(importDraft, [...draft], max)');
+    expect(SRC).toContain('parseBulkEntries(importDraft, [...draft], max, entryIdentity)');
     // 渲染也必须走草稿，否则打字看不见（草稿变了但画的是 value）。
     expect(SRC).toContain('{draft.map((entry, idx) => (');
   });

@@ -1,0 +1,35 @@
+{
+  "sourceArchiveSha256": "c220eedd5e95af73ed9098bea8b62241e44ce23546950b10cf972a52a52ea9a0",
+  "sourceMember": "46eb-SFA-1.15.0-polaris-alpha.12-arm64-v8a-unsigned.apk-AndroidManifest.xml",
+  "sourceCommit": "46eb46721034564b05ae321aa21761a2e4c7b0f6",
+  "manifestSha256": "51b322d12a9675c2f5d1f2a4fdd813e4b2cedf1c38e8ea3a660912d9f9f570f3",
+  "bytes": 22876,
+  "packageName": "io.nekohasekai.sfa",
+  "permissions": [
+    [
+      {
+        "namespace": "http://schemas.android.com/apk/res/android",
+        "name": "name",
+        "raw": "io.nekohasekai.sfa.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+        "type": 3,
+        "data": 136,
+        "dataOffset": 13020,
+        "string": "io.nekohasekai.sfa.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+      },
+      {
+        "namespace": "http://schemas.android.com/apk/res/android",
+        "name": "protectionLevel",
+        "raw": null,
+        "type": 17,
+        "data": 2,
+        "dataOffset": 13040,
+        "string": null
+      }
+    ]
+  ],
+  "applicationVersion": "1.15.0-polaris-alpha.12 / versionCode744",
+  "formatterSourceVersion": "AOSP frameworks/base 4466434976a21434bc44e4d97c7168b464ac1e01 tools/aapt2/Debug.cpp + ResourceValues.cpp",
+  "producerAapt2Version": null,
+  "versionBoundary": "Original producer tool version was not retained. Actual acquisition regression must report SDK AAPT2 version; no fabricated capture or old-aapt text fixture.",
+  "scope": "Original SFA compiled AXML, not Polaris App acceptance. Real acquisition positive plus unchanged permission-name numeric mutations; App registry must still reject SFA package."
+}

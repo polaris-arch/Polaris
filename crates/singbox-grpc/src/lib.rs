@@ -40,17 +40,18 @@ pub mod daemon {
 mod h2c;
 mod reconnect;
 
-// vendored proto ⇄ 真核 wire 契约对拍器。**同一份文件被三处 `include!`**：
-// `build.rs`（release 硬门，随包核）、`tests/bundled_core_wire.rs`（开发机 + 无核的机制自验）、
-// 以及这里（**运行期**：换核前对拍用户即将换上的那份非随包核）。
+// vendored proto ⇄ 真核 wire 契约对拍器。**同一份文件被多处 `include!`**：
+// `build.rs`（release 硬门，对拍随包核）、`tests/` 下的 wire 测试（开发机 + 无核的机制自验）、
+// 以及这里（把吃字节的判据作为库 API 再导出）。
 //
-// 为什么运行期也要一份：前两处的取材面都是 `resources/*/sing-box` 这四条路径，而**在线换核与
-// 用户自带 fork 会让非随包核跑起来** —— 那条路径此前无任何 wire 对拍，正是 2026-08-05 那类
-// 「字段号漂一位 ⇒ 整条流静默死掉」在本仓仍然敞着的一格。
+// 应用执行的内核只从安装包的资源目录解析，没有在线换核、也没有导入自带内核的入口，所以运行期
+// 没有「即将换上的另一份内核」需要对拍，本库也不在运行期主动对拍任何内核；随包核的对拍发生在
+// 构建期（`build.rs`）。这里保留的 [`proto_wire_check::verdict_for_core_bytes`] 只回答一件事：
+// 给定的这份字节，其 wire 形状与 vendored proto 是否一致。它不回答这份内核是否与应用版本配套。
 //
-// 不做成 `mod`：`build.rs` 不能依赖它正在构建的这个 crate，而三处必须共用同一份判据与符号表。
+// 不做成 `mod`：`build.rs` 不能依赖它正在构建的这个 crate，而各处必须共用同一份判据与符号表。
 // 模块里的 `repo_root()` / `bundled_cores()` 依赖 `CARGO_MANIFEST_DIR`（构建期常量），
-// 运行期无意义 —— 运行期只用 [`proto_wire_check::verdict_for_core_bytes`]（吃字节，不碰路径）。
+// 运行期无意义；库 API 只再导出吃字节、不碰路径的那一个。
 include!("../proto_wire_check.rs");
 
 pub use proto_wire_check::{verdict_for_core_bytes, WireVerdict};
@@ -72,7 +73,22 @@ use tonic::Request;
 /// unary 调用 deadline：对齐 上游 `UNARY_DEADLINE_MS`（2000ms）。
 /// 核启动中（TCP accept 但 StartedService 方法尚未 serve）或 wedged 时 gRPC 永不返回 →
 /// UI Close/Close-All 按钮永久 spinner；2s deadline 保证必 settle（DEADLINE_EXCEEDED）。
+///
+/// 它管的是**整次调用**：从调用方发起，到拿到应答或错误，含 lazy channel 的拨号。两层各管一段：
+/// - 请求上的 `grpc-timeout`（`Request::set_timeout`）：tonic 在 channel 就绪**之后**才起算，
+///   同时把期限告知服务端；它管不到拨号。
+/// - `within_unary_deadline`：从发起起算的本地时钟，把拨号也算在内。
+///
+/// 拨号本身另以 [`CONNECT_TIMEOUT`] 为限（不分摊本期限：连得上时应答仍有完整的 2s）。
 pub const UNARY_DEADLINE: Duration = Duration::from_millis(2000);
+
+/// 单次 TCP 拨号的上限，对经本 crate 的每条 channel 生效（unary、快照、各条流的建流与重连）。
+///
+/// 端点恒是本机回环，连得上时拨号是亚毫秒级的；到这个时限还没连上，等同于连不上，报
+/// `Unavailable`，与对端拒连同一类。取 [`UNARY_DEADLINE`] 的一半：没人监听而系统又迟迟不报拒连时
+/// （Windows 对回环拒连要重发 SYN，约 2s 才报回），调用在期限之内就以「连不上」收场，而不是恰好
+/// 压在期限上、报成哪一种错误全凭先后。
+pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// 连接首帧快照兜底超时：对齐 上游 `closeOldNodeConnectionsAfterHotSwitch` 的
 /// `guard = setTimeout(..., 3000)`。首帧不来 → 放弃断连（宁可漏关，不泄漏订阅、不阻断已成功的热切换）。
@@ -81,6 +97,17 @@ pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
 /// 连接首帧订阅的推送间隔（纳秒）。对齐 上游 `subscribeConnections(1_000_000_000, cb)`——
 /// 只取首帧（reset 全量），间隔实际不影响结果。
 const SNAPSHOT_INTERVAL_NS: i64 = 1_000_000_000;
+
+/// 单会话 Connection 事件流的单帧解码上限：64 MiB（tonic 默认是 4 MiB）。
+///
+/// 这条流的首帧躲不开全量：内核的 `SubscribeConnections` 进循环前无条件发一帧「全部活动连接 +
+/// 保留的已关闭连接」，请求里只有一个 `interval` 字段，没有「只要新增」的选项
+/// （`daemon/started_service.go` 的 `SubscribeConnections` / `buildInitialConnectionState`）。
+/// 已关闭连接内核封顶 1000 条（`common/trafficcontrol/manager.go` 的 `closedConnectionsLimit`），
+/// 活动连接没有上限。单条记录的大头是规则描述、域名与进程路径，按 0.5 KiB 估，默认的 4 MiB 只够
+/// 约 8000 条，重度使用下首帧会被拒、整条流报错；64 MiB 够约 13 万条，同时仍是一个有界值，
+/// 回环上一个异常的对端不能让本进程无限分配。
+pub const CONNECTION_EVENTS_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// sing-box 管理 API 端点描述（host + port）。本地端点 → h2c（明文 HTTP/2）。
 #[derive(Clone, Debug)]
@@ -119,6 +146,31 @@ pub struct SingBoxApiClient {
     /// 原始 target（`host:port`，IPv6 已方括号包裹）；流订阅重连用（h2c::connect_h2c 会自加 http://）。
     target: String,
     secret: Option<String>,
+}
+
+/// 把一次 unary 调用收在 [`UNARY_DEADLINE`] 之内，从发起起算。
+///
+/// 到期一律报 `DeadlineExceeded`。tonic 自己那只按 `grpc-timeout` 走的本地时钟到期时报的是
+/// `Cancelled`，两只时钟取同一个期限、谁先被看见不确定，所以「已到期限的 `Cancelled`」也归到这里
+/// —— 调用方看到的到期只有一种说法。
+async fn within_unary_deadline<T>(
+    call: impl std::future::Future<Output = Result<T, tonic::Status>>,
+) -> Result<T, ClientError> {
+    let expired = || {
+        ClientError::Status(tonic::Status::deadline_exceeded(format!(
+            "no answer from the management API within {UNARY_DEADLINE:?}"
+        )))
+    };
+    let started = tokio::time::Instant::now();
+    match tokio::time::timeout(UNARY_DEADLINE, call).await {
+        Err(_) => Err(expired()),
+        Ok(Err(status))
+            if status.code() == tonic::Code::Cancelled && started.elapsed() >= UNARY_DEADLINE =>
+        {
+            Err(expired())
+        }
+        Ok(answer) => Ok(answer?),
+    }
 }
 
 impl SingBoxApiClient {
@@ -174,7 +226,7 @@ impl SingBoxApiClient {
             outbound_tag: member_tag.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.select_outbound(req).await?;
+        within_unary_deadline(c.select_outbound(req)).await?;
         Ok(())
     }
 
@@ -184,7 +236,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::ClashMode { mode: mode.into() }));
         req.set_timeout(UNARY_DEADLINE);
-        c.set_clash_mode(req).await?;
+        within_unary_deadline(c.set_clash_mode(req)).await?;
         Ok(())
     }
 
@@ -192,7 +244,22 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        Ok(c.get_clash_mode_status(req).await?.into_inner())
+        Ok(within_unary_deadline(c.get_clash_mode_status(req))
+            .await?
+            .into_inner())
+    }
+
+    /// Read active rule-set state from this authenticated core instance.
+    pub async fn get_rule_set_status(
+        &self,
+        tags: Vec<String>,
+    ) -> Result<daemon::RuleSetStatusResponse, ClientError> {
+        let mut c = self.client();
+        let mut req = self.with_auth(Request::new(daemon::RuleSetStatusRequest { tags }));
+        req.set_timeout(UNARY_DEADLINE);
+        Ok(within_unary_deadline(c.get_rule_set_status(req))
+            .await?
+            .into_inner())
     }
 
     /// Tailscale：热重设出口节点（不重启核）。按 `endpoint_tag` 定位具体 tailscale 端点，
@@ -209,7 +276,7 @@ impl SingBoxApiClient {
             stable_id: stable_id.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.set_tailscale_exit_node(req).await?;
+        within_unary_deadline(c.set_tailscale_exit_node(req)).await?;
         Ok(())
     }
 
@@ -221,7 +288,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(submission));
         req.set_timeout(UNARY_DEADLINE);
-        c.submit_open_connect_auth_response(req).await?;
+        within_unary_deadline(c.submit_open_connect_auth_response(req)).await?;
         Ok(())
     }
 
@@ -233,7 +300,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(cancel));
         req.set_timeout(UNARY_DEADLINE);
-        c.cancel_open_connect_auth_challenge(req).await?;
+        within_unary_deadline(c.cancel_open_connect_auth_challenge(req)).await?;
         Ok(())
     }
 
@@ -245,7 +312,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(submission));
         req.set_timeout(UNARY_DEADLINE);
-        c.submit_open_vpn_challenge_response(req).await?;
+        within_unary_deadline(c.submit_open_vpn_challenge_response(req)).await?;
         Ok(())
     }
 
@@ -257,7 +324,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(cancel));
         req.set_timeout(UNARY_DEADLINE);
-        c.cancel_open_vpn_challenge(req).await?;
+        within_unary_deadline(c.cancel_open_vpn_challenge(req)).await?;
         Ok(())
     }
 
@@ -268,7 +335,7 @@ impl SingBoxApiClient {
             id: id.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.close_connection(req).await?;
+        within_unary_deadline(c.close_connection(req)).await?;
         Ok(())
     }
 
@@ -282,7 +349,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        c.close_all_connections(req).await?;
+        within_unary_deadline(c.close_all_connections(req)).await?;
         Ok(())
     }
 
@@ -307,7 +374,9 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        let resp = c.get_default_log_level(req).await?.into_inner();
+        let resp = within_unary_deadline(c.get_default_log_level(req))
+            .await?
+            .into_inner();
         // prost 对未知枚举值回落 default(=PANIC)，那会把「上游加了新级别」伪装成「核在 panic 级」。
         // 故用 try_from 自己判：识别不出就报错，由调用方呈现成「未知」——不猜。
         daemon::LogLevel::try_from(resp.level).map_err(|_| {
@@ -328,7 +397,9 @@ impl SingBoxApiClient {
     /// 首帧超时（3s）→ [`ClientError::SnapshotTimeout`]（调用方跳过断连，不阻断已成功的 PUT）。
     /// 返回快照含**已关闭的死连接**（内核历史环）——由调用方按 `closedAt` 过滤。
     pub async fn first_connection_snapshot(&self) -> Result<Vec<daemon::Connection>, ClientError> {
-        let mut c = self.client();
+        let mut c = self
+            .client()
+            .max_decoding_message_size(CONNECTION_EVENTS_MAX_FRAME_BYTES);
         let req = self.with_auth(Request::new(daemon::SubscribeConnectionsRequest {
             interval: SNAPSHOT_INTERVAL_NS,
         }));
@@ -347,6 +418,43 @@ impl SingBoxApiClient {
             Ok(r) => r,
             Err(_) => Err(ClientError::SnapshotTimeout),
         }
+    }
+
+    /// 订阅 Connection 事件流的**单会话**版本：不自动重连，流断即结束。
+    ///
+    /// 给必须绑定在同一个核实例上的读取用：[`Self::subscribe_connections`] 断开后会重建，重建出来的
+    /// 流可能已经连到换代后的核。首帧是全量（活动连接加内核保留的已关闭连接），其后的新增与关闭
+    /// 即时推送；`interval_ns` 只管流量增量帧的节奏。建流带 [`SNAPSHOT_TIMEOUT`] 兜底。
+    ///
+    /// 单帧解码上限取 [`CONNECTION_EVENTS_MAX_FRAME_BYTES`]（理由见该常量）。
+    pub async fn connection_events_once(
+        &self,
+        interval_ns: i64,
+    ) -> Result<tonic::Streaming<daemon::ConnectionEvents>, ClientError> {
+        let mut c = self
+            .client()
+            .max_decoding_message_size(CONNECTION_EVENTS_MAX_FRAME_BYTES);
+        let req = self.with_auth(Request::new(daemon::SubscribeConnectionsRequest {
+            interval: interval_ns,
+        }));
+        match tokio::time::timeout(SNAPSHOT_TIMEOUT, c.subscribe_connections(req)).await {
+            Ok(stream) => Ok(stream?.into_inner()),
+            Err(_) => Err(ClientError::SnapshotTimeout),
+        }
+    }
+
+    /// 连到 `endpoint` 并开一条单会话的 Connection 事件流（[`Self::connection_events_once`]）。
+    ///
+    /// 只用调用方给的端点与 secret，不读任何运行态：流属于调用方指定的那个核，核换代后它自己结束。
+    pub async fn connection_events_at(
+        endpoint: Endpoint,
+        secret: impl Into<String>,
+        interval_ns: i64,
+    ) -> Result<tonic::Streaming<daemon::ConnectionEvents>, ClientError> {
+        Self::connect(endpoint, secret)
+            .await?
+            .connection_events_once(interval_ns)
+            .await
     }
 
     /// 取各出站 group 的**运行期选择**快照（`SubscribeGroups` 首帧），带 [`SNAPSHOT_TIMEOUT`] 兜底。
@@ -431,7 +539,7 @@ impl SingBoxApiClient {
         let mut c = self.client();
         let mut req = self.with_auth(Request::new(daemon::Empty {}));
         req.set_timeout(UNARY_DEADLINE);
-        c.clear_logs(req).await?;
+        within_unary_deadline(c.clear_logs(req)).await?;
         Ok(())
     }
 
@@ -534,7 +642,7 @@ impl SingBoxApiClient {
             endpoint_tag: endpoint_tag.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.mark_taildrop_inbox_read(req).await?;
+        within_unary_deadline(c.mark_taildrop_inbox_read(req)).await?;
         Ok(())
     }
 
@@ -550,7 +658,7 @@ impl SingBoxApiClient {
             name: name.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.delete_taildrop_file(req).await?;
+        within_unary_deadline(c.delete_taildrop_file(req)).await?;
         Ok(())
     }
 
@@ -571,7 +679,7 @@ impl SingBoxApiClient {
             name: name.into(),
         }));
         req.set_timeout(UNARY_DEADLINE);
-        c.cancel_taildrop_receiving(req).await?;
+        within_unary_deadline(c.cancel_taildrop_receiving(req)).await?;
         Ok(())
     }
 
@@ -734,7 +842,8 @@ impl TaildropSendOutput {
     }
 }
 
-/// 客户端错误：连接失败 / tonic Status（含 Unauthenticated=16 / DeadlineExceeded=4）。
+/// 客户端错误：连接失败 / tonic Status（含 Unauthenticated=16 / DeadlineExceeded=4 /
+/// Unavailable=14：拨号被拒或超过 [`CONNECT_TIMEOUT`]）。
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("transport error connecting to sing-box management API: {0}")]

@@ -444,7 +444,7 @@ describe('④ 装配面：两件 chrome 真的被摆进了停靠区（不是「�
  * 就是「要对齐」的意图声明（若本意恒 16 该写 `var(--sp-4)`），本门守的是这个意图不被级联静默吃掉。
  */
 describe('⑤ 停靠区页边距：响应标量在 .m-dock 上也解析（否则断点上与内容页错位）', () => {
-  const RESPONSIVE_COND = /@container\s+mscreen\s*\(\s*min-width:/;
+  const RESPONSIVE_COND = /@container\s+mchrome\s*\(\s*min-width:/;
   const REQUIRED = ['.m-page', '.m-dock'].map((s) => selectorKey(s));
 
   /** 每个「声明了 `--page-inset` 的断点块」里缺了哪些必备选择器。空数组 = 都覆盖到了。 */
@@ -481,14 +481,14 @@ describe('⑤ 停靠区页边距：响应标量在 .m-dock 上也解析（否则
     ).toBe(true);
     // 反向对照：合成一份「只覆写 .m-page」的 CSS，谓词必须点名缺的那一个。
     const onlyPage = contextOf([
-      { file: '<synthetic>', css: '@container mscreen (min-width: 37.5em){.m-page{--page-inset:24px}}' },
+      { file: '<synthetic>', css: '@container mchrome (min-width: 37.5em){.m-page{--page-inset:24px}}' },
     ]).decls;
-    expect(gaps(onlyPage)).toEqual(['@container mscreen (min-width: 37.5em) 缺 .m-dock']);
+    expect(gaps(onlyPage)).toEqual(['@container mchrome (min-width: 37.5em) 缺 .m-dock']);
     // 正面对照：两个都写上就不报了（证明它不是恒红）。
     const both = contextOf([
       {
         file: '<synthetic>',
-        css: '@container mscreen (min-width: 37.5em){.m-page{--page-inset:24px}.m-dock{--page-inset:24px}}',
+        css: '@container mchrome (min-width: 37.5em){.m-page{--page-inset:24px}.m-dock{--page-inset:24px}}',
       },
     ]).decls;
     expect(gaps(both)).toEqual([]);
@@ -597,3 +597,177 @@ describe('⑥ toast 宿主的 z 序：高于移动端每一个弹层（否则表
     ).toEqual([]);
   });
 });
+
+
+it('real common container aligns page and dock at three widths, RTL, large type and iOS rail', async () => {
+  const { measure } = await import('@/styles/css-oracle.test-support');
+  const { inMobileShell } = await import('@/styles/mount.test-support');
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 390, height: 844 }, rootAttrs: { dir: 'ltr', style: 'font-size:16px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(16);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(16);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 390, height: 844 }, rootAttrs: { dir: 'ltr', style: 'font-size:24px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(16);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(16);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 390, height: 844 }, rootAttrs: { dir: 'rtl', style: 'font-size:16px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(16);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(16);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 390, height: 844 }, rootAttrs: { dir: 'rtl', style: 'font-size:24px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(16);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(16);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 760, height: 844 }, rootAttrs: { dir: 'ltr', style: 'font-size:16px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(24);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(24);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 760, height: 844 }, rootAttrs: { dir: 'ltr', style: 'font-size:24px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(16);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(16);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 760, height: 844 }, rootAttrs: { dir: 'rtl', style: 'font-size:16px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(24);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(24);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 760, height: 844 }, rootAttrs: { dir: 'rtl', style: 'font-size:24px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(16);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(16);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 1100, height: 844 }, rootAttrs: { dir: 'ltr', style: 'font-size:16px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(32);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(32);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 1100, height: 844 }, rootAttrs: { dir: 'ltr', style: 'font-size:24px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(24);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(24);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 1100, height: 844 }, rootAttrs: { dir: 'rtl', style: 'font-size:16px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(32);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(32);
+  }
+  {
+    const actual = await measure({ ctx: 'mobile', html: inMobileShell('<p>Content</p>'),
+      viewport: { width: 1100, height: 844 }, rootAttrs: { dir: 'rtl', style: 'font-size:24px',
+        'data-mobile-os': 'ios', 'data-ios-horizontal-size-class': 'regular' } }, [
+      { select: 'html', props: ['container-name', 'font-size'] },
+      { select: '.m-page', props: ['--page-inset', 'padding-left', 'padding-right'] },
+      { select: '.m-dock', props: ['--page-inset'] },
+    ]);
+    expect(actual.get('html', 'container-name')).toContain('mchrome');
+    expect(actual.get('.m-page', '--page-inset').trim()).toBe(actual.get('.m-dock', '--page-inset').trim());
+    expect(actual.rect('.m-page').width).toBeGreaterThan(0);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-left'))).toBe(24);
+    expect(Number.parseFloat(actual.get('.m-page', 'padding-right'))).toBe(24);
+  }
+}, 60_000);

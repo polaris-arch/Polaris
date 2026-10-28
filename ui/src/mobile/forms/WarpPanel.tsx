@@ -1,3 +1,4 @@
+import { applyOnDemand } from '@/components/dialogs/on-demand-field';
 /**
  * 移动端 **Cloudflare WARP 接入表**（注册 / 编辑）—— 批 3，销掉 `register:mesh-join:warp`。
  *
@@ -67,7 +68,7 @@ import {
   type WarpPlan,
 } from '@/components/dialogs/warp-spec';
 import { applyDetour, endpointDetourOptions, DETOUR_NONE } from '@/components/dialogs/detour-options';
-import { buildWarpSettings } from '@/components/dialogs/wg-logic';
+import { buildWarpSettings, workersInputInvalid } from '@/components/dialogs/wg-logic';
 import { buildRegisteredWarpServer, saveRegisteredWarp, type WarpRegistrationAttempt } from '@/components/dialogs/warp-registration';
 import { findWarpNode } from '@/domain/warp';
 import { registerWarpIfSlotFree } from '@/domain/mesh-singleton-guard';
@@ -253,6 +254,11 @@ export function WarpPanel({
       setNotice({ tone: 'err', text: t('warp.errEndpoint') });
       return;
     }
+    if (workersInputInvalid(draft.workers)) {
+      revealAdvanced();
+      setNotice({ tone: 'err', text: t('wg.errWorkers') });
+      return;
+    }
     setSubmitting(true);
     setNotice(isEdit ? undefined : {
       tone: 'info', text: t(registration ? 'warp.registeredPending' : 'warp.registering'),
@@ -296,6 +302,7 @@ export function WarpPanel({
           wireguardSettings: buildWarpSettings(editNode.wireguardSettings ?? {}, draft),
         };
         applyDetour(next, currentDetour);
+        applyOnDemand(next, draft.onDemand);
         if (bindInterface) next.bindInterface = bindInterface;
         else delete next.bindInterface;
         await api.server.update(next);
@@ -461,6 +468,7 @@ export function WarpPanel({
             }}
           >
             <MobileFields fields={spec} values={draft} onChange={setField} t={t} />
+            {workersInputInvalid(draft.workers) && <p className="m-form-err" role="alert">{t('wg.errWorkers')}</p>}
           </FormGroup>
           </fieldset>
 

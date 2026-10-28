@@ -333,7 +333,9 @@ pub fn build_tailscale_endpoint(
     let mut ep = Endpoint {
         type_field: "tailscale".into(),
         tag: tag.to_string(),
-        domain_resolver: None,
+        // Control/DERP bootstrap must not re-enter this endpoint's own
+        // preferred_by / MagicDNS policy while Tailscale is starting.
+        domain_resolver: Some(DomainResolver::Tag("dns-bootstrap".into())),
         detour: detour_tag.map(String::from),
         // 线格式占位：按需连接的**策略**由 `builder::outbounds::apply_on_demand` 在 push 前统一注入，
         // 不在各 endpoint 构造器里各读一次 `server.on_demand`（四条腿各读一次 = 四个可遗漏点）。

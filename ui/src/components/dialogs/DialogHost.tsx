@@ -2,8 +2,8 @@
  * DialogHost —— 弹窗唯一挂载点（挂 AppShell 内，§1.3）。
  *
  * 按 store.stack 顺序渲染每个弹窗组件（各自包 <Modal> 原语）。原生 dialog 按 showModal 顺序叠 top-layer，
- * store 栈镜像之 —— 数组顺序 = 叠放次序（末尾最顶层）。用 index 作 key：栈只做 push/pop，
- * 保留项 index 稳定 → 不触发无谓重挂。
+ * store 栈镜像之 —— 数组顺序 = 叠放次序（末尾最顶层）。instanceId 同时作为 key 和关闭目标，
+ * 下层异步完成只移除自己的实例，保留上层实例及表单状态。
  *
  * **本文件在 Phase A 冻结**：所有 kind 的 case + import 一次到位，各批（D2–D5）只覆写自己那个
  * *Dialog 组件文件（单一 owner），不改本文件 → 并行零写冲突。switch 的 default 走 never 兜底：
@@ -41,7 +41,7 @@ import { VpnAuthDialog } from './VpnAuthDialog';
 function renderDialog(desc: DialogEntry) {
   switch (desc.kind) {
     case 'res-url':
-      return <ResUrlDialog />;
+      return <ResUrlDialog instanceId={desc.instanceId} />;
     case 'confirm':
       return <ConfirmDialog payload={desc.payload} />;
     case 'node':
@@ -53,17 +53,17 @@ function renderDialog(desc: DialogEntry) {
     case 'sub-create-task':
       return <SubscriptionCreateTaskDialog instanceId={desc.instanceId} operationId={desc.operationId} />;
     case 'warp':
-      return <WarpDialog edit={desc.edit} />;
+      return <WarpDialog instanceId={desc.instanceId} edit={desc.edit} />;
     case 'ts-login':
       return <TsLoginDialog serverId={desc.serverId} replaceIdentity={desc.replaceIdentity} />;
     case 'ts-settings':
-      return <TsSettingsDialog serverId={desc.serverId} />;
+      return <TsSettingsDialog instanceId={desc.instanceId} serverId={desc.serverId} />;
     case 'taildrop':
       return <TaildropDialog serverId={desc.serverId} />;
     case 'vpn-auth':
-      return <VpnAuthDialog protocol={desc.protocol} serverId={desc.serverId} />;
+      return <VpnAuthDialog instanceId={desc.instanceId} protocol={desc.protocol} serverId={desc.serverId} />;
     case 'wg':
-      return <WgDialog serverId={desc.serverId} />;
+      return <WgDialog instanceId={desc.instanceId} serverId={desc.serverId} />;
     case 'mesh-join':
       return (
         <MeshJoinDialog
@@ -73,23 +73,23 @@ function renderDialog(desc: DialogEntry) {
         />
       );
     case 'rule':
-      return <RuleDialog ruleId={desc.ruleId} preset={desc.preset} initialPlane={desc.initialPlane} />;
+      return <RuleDialog instanceId={desc.instanceId} ruleId={desc.ruleId} preset={desc.preset} initialPlane={desc.initialPlane} />;
     case 'dns-server':
-      return <DnsServerDialog serverId={desc.serverId} />;
+      return <DnsServerDialog instanceId={desc.instanceId} serverId={desc.serverId} />;
     case 'dns-group':
-      return <DnsGroupDialog groupId={desc.groupId} />;
+      return <DnsGroupDialog instanceId={desc.instanceId} groupId={desc.groupId} />;
     case 'network-profiles':
-      return <NetworkProfilesDialog />;
+      return <NetworkProfilesDialog instanceId={desc.instanceId} />;
     case 'network-profile':
-      return <NetworkProfileDialog profileId={desc.profileId} onSaved={desc.onSaved} />;
+      return <NetworkProfileDialog instanceId={desc.instanceId} profileId={desc.profileId} onSaved={desc.onSaved} />;
     case 'proc-pick':
       return <ProcPickDialog initialSelected={desc.initialSelected} onPick={desc.onPick} />;
     case 'rule-pick':
       return <RulePickDialog subject={desc.subject} onPick={desc.onPick} />;
     case 'app-add':
-      return <AppAddDialog />;
+      return <AppAddDialog instanceId={desc.instanceId} />;
     case 'res-catalog':
-      return <ResCatalogDialog />;
+      return <ResCatalogDialog instanceId={desc.instanceId} />;
     case 'backup-import':
       return <BackupImportDialog instanceId={desc.instanceId} />;
     default: {

@@ -41,6 +41,8 @@ struct TestServices {
     child: Mutex<Option<ChildHandle>>,
     uid: i64,
     runner_calls: AtomicUsize,
+    pinned_calls: Mutex<Vec<(polaris_helper_proto::core_protocol::PinnedStartParams, u32)>>,
+    native_pinned_fixture: bool,
 }
 
 impl TestServices {
@@ -50,7 +52,15 @@ impl TestServices {
             child: Mutex::new(None),
             uid: 0,
             runner_calls: AtomicUsize::new(0),
+            pinned_calls: Mutex::new(Vec::new()),
+            native_pinned_fixture: false,
         }
+    }
+
+    fn pinned_fixture(token: &str) -> Self {
+        let mut services = Self::new(token);
+        services.native_pinned_fixture = true;
+        services
     }
 
     fn runner_calls(&self) -> usize {
@@ -95,6 +105,39 @@ impl crate::platform::macos::exec::CommandRunner for TestServices {
 }
 
 impl MacServices for TestServices {
+    fn native_caller_allowed(
+        &self,
+        uid: Option<u32>,
+        id: Option<&polaris_helper_proto::core_manifest::CoreId>,
+    ) -> bool {
+        if self.native_pinned_fixture {
+            uid == Some(1000) && id.is_some_and(|id| id.as_str() == "a".repeat(64))
+        } else {
+            uid == Some(0)
+        }
+    }
+    fn native_start_pinned(
+        &self,
+        params: &polaris_helper_proto::core_protocol::PinnedStartParams,
+        uid: u32,
+    ) -> Result<polaris_helper_proto::NativeBirthStart, SpawnError> {
+        if !self.native_pinned_fixture {
+            return Err(SpawnError::NotImplemented);
+        }
+        self.pinned_calls
+            .lock()
+            .unwrap()
+            .push((params.clone(), uid));
+        Ok(polaris_helper_proto::NativeBirthStart::Started {
+            target: polaris_helper_proto::HelperBirthTarget::parse_wire(
+                "4242",
+                "01010101010101010101010101010101",
+            )
+            .unwrap(),
+            timing: None,
+            created: None,
+        })
+    }
     fn token_store(&self) -> &dyn TokenStore {
         self
     }
@@ -125,7 +168,7 @@ impl MacServices for TestServices {
 }
 
 fn test_config() -> MacConfig {
-    MacConfig::new("/sb", "/Users/test/Polaris", "/tmp/support", "/tmp/core")
+    MacConfig::new("/tmp/support", "/tmp/core")
 }
 
 // ===== decode_request（对照 Go handle() readLine 序列）=====
@@ -165,38 +208,53 @@ fn decode_freeport() {
 }
 
 #[test]
-fn decode_start_full() {
-    let mut lines = vec![
-        "/tmp/c.json".to_owned(),
-        "/tmp/l.log".to_owned(),
-        "1".to_owned(),
-        "1234".to_owned(),
-    ]
-    .into_iter();
-    let r = decode_request("start", &mut lines).unwrap();
-    match r {
-        Request::Start(p) => {
-            assert_eq!(p.cfg, "/tmp/c.json");
-            assert_eq!(p.log, "/tmp/l.log");
-            assert!(p.fwd);
-            assert_eq!(p.parent_pid, Some(1234));
-        }
-        other => panic!("{other:?}"),
+fn decoder_rejects_retired_start_and_content_frames() {
+    for command in [
+        "start",
+        "start-native-birth-safe",
+        "install-core",
+        "start-reap-safe",
+        "start-birth-safe",
+    ] {
+        let mut frame = vec!["/caller/input".to_owned(), "a".repeat(64)].into_iter();
+        assert!(matches!(
+            decode_request(command, &mut frame),
+            Err(DecodeError::UnknownCommand(_))
+        ));
     }
 }
-
 #[test]
-fn decode_start_without_ppid() {
-    // helper.go:513: ppid 可选（EOF → 0 → None）
-    let mut lines = vec!["/tmp/c.json".to_owned(), "".to_owned(), "0".to_owned()].into_iter();
-    let r = decode_request("start", &mut lines).unwrap();
-    match r {
-        Request::Start(p) => {
-            assert_eq!(p.parent_pid, None);
-            assert!(!p.fwd);
-        }
-        other => panic!("{other:?}"),
-    }
+fn decoder_admits_only_pinned_native_start_shape() {
+    let id = "a".repeat(64);
+    let mut frame = vec![
+        id.clone(),
+        "/caller/cfg".into(),
+        "/caller/log".into(),
+        "1".into(),
+        "42".into(),
+    ]
+    .into_iter();
+    assert!(matches!(
+        decode_request(
+            polaris_helper_proto::command::common::NATIVE_START_PINNED_BIRTH,
+            &mut frame
+        ),
+        Ok(Request::NativeStartPinned(_))
+    ));
+    let mut extra = vec![
+        id,
+        "/caller/cfg".into(),
+        "".into(),
+        "0".into(),
+        "42".into(),
+        "extra".into(),
+    ]
+    .into_iter();
+    assert!(decode_request(
+        polaris_helper_proto::command::common::NATIVE_START_PINNED_BIRTH,
+        &mut extra
+    )
+    .is_err());
 }
 
 #[test]
@@ -221,19 +279,6 @@ fn decode_route_del() {
     let mut lines = vec!["utun3".to_owned(), "::/0".to_owned()].into_iter();
     let r = decode_request("route-del", &mut lines).unwrap();
     assert!(matches!(r, Request::RouteDel(_)));
-}
-
-#[test]
-fn decode_install_core() {
-    let mut lines = vec!["/tmp/staging".to_owned(), "abcd".repeat(16)].into_iter();
-    let r = decode_request("install-core", &mut lines).unwrap();
-    match r {
-        Request::InstallCore(p) => {
-            assert_eq!(p.src_dir, "/tmp/staging");
-            assert_eq!(p.want_hash.len(), 64);
-        }
-        other => panic!("{other:?}"),
-    }
 }
 
 #[test]
@@ -474,7 +519,7 @@ fn oversized_token_command_and_ordinary_argument_all_fail_before_dispatch() {
     frames.push([b"T\n".to_vec(), oversized.clone(), b"\n".to_vec()].concat());
     frames.push(
         [
-            b"T\nstart\n".to_vec(),
+            b"T\nroute-add\n".to_vec(),
             oversized,
             b"\n/tmp/log\n0\n".to_vec(),
         ]
@@ -495,21 +540,133 @@ fn oversized_token_command_and_ordinary_argument_all_fail_before_dispatch() {
 }
 
 #[test]
-fn process_conn_start_full_flow() {
-    let svc = TestServices::new("T");
-    let cfg = test_config();
-    let input = Cursor::new(b"T\nstart\n/Users/test/Polaris/c.json\n\n0\n".to_vec());
+fn process_conn_pinned_start_full_flow_with_native_peer() {
+    use polaris_helper_proto::{
+        codec,
+        core_manifest::CoreId,
+        core_protocol::{PinnedBirthStart, PinnedStartParams},
+        NativeBirthStart, Platform, Response, ResponseKind, StartParams,
+    };
+    let params = PinnedStartParams {
+        id: CoreId::parse(&"a".repeat(64)).unwrap(),
+        common: StartParams {
+            cfg: "/Users/test/Polaris/c.json".into(),
+            log: String::new(),
+            fwd: false,
+            parent_pid: None,
+        },
+    };
+    let svc = TestServices::pinned_fixture("T");
+    let bytes = codec::encode(
+        Platform::Mac,
+        "T",
+        &Request::NativeStartPinned(params.clone()),
+    );
     let mut output = Vec::new();
-    let outcome = process_connection(input, &mut output, &svc, &cfg, None);
+    let outcome = process_connection_from_peer(
+        Cursor::new(bytes),
+        &mut output,
+        &svc,
+        &test_config(),
+        None,
+        Some(1000),
+    );
     assert!(matches!(outcome, ConnOutcome::Done));
-    // spawn_child mock 返回 4242；新版三平台 helper 追加可选分段计时。
-    let line = String::from_utf8(output).unwrap();
-    assert!(matches!(
-        polaris_helper_proto::Response::parse(line.trim_end()),
-        polaris_helper_proto::Response::Ok(polaris_helper_proto::ResponseKind::Start(
-            polaris_helper_proto::Start::StartedTimed { pid: 4242, .. }
-        ))
-    ));
+    // The real frame decoder and peer admission reach only the injected native
+    // pinned service. No executable or native process is run by this fixture.
+    let target = polaris_helper_proto::HelperBirthTarget::parse_wire(
+        "4242",
+        "01010101010101010101010101010101",
+    )
+    .unwrap();
+    assert_eq!(
+        Response::parse(String::from_utf8(output).unwrap().trim_end()),
+        Response::Ok(ResponseKind::PinnedStart {
+            id: params.id.clone(),
+            start: PinnedBirthStart::Native(NativeBirthStart::Started {
+                target,
+                timing: None,
+                created: None,
+            }),
+        })
+    );
+    assert_eq!(*svc.pinned_calls.lock().unwrap(), [(params.clone(), 1000)]);
+    assert_eq!(svc.runner_calls(), 0);
+    assert!(svc.child.lock().unwrap().is_none());
+    for (token, uid, id, expected_code) in [
+        (
+            "wrong-token",
+            Some(1000),
+            params.id.clone(),
+            polaris_helper_proto::ErrorCode::Auth,
+        ),
+        (
+            "T",
+            None,
+            params.id.clone(),
+            polaris_helper_proto::ErrorCode::Auth,
+        ),
+        (
+            "T",
+            Some(1001),
+            params.id.clone(),
+            polaris_helper_proto::ErrorCode::Start,
+        ),
+        (
+            "T",
+            Some(1000),
+            CoreId::parse(&"b".repeat(64)).unwrap(),
+            polaris_helper_proto::ErrorCode::Start,
+        ),
+    ] {
+        let svc = TestServices::pinned_fixture("T");
+        let mut rejected = params.clone();
+        rejected.id = id;
+        let bytes = codec::encode(Platform::Mac, token, &Request::NativeStartPinned(rejected));
+        let mut output = Vec::new();
+        process_connection_from_peer(
+            Cursor::new(bytes),
+            &mut output,
+            &svc,
+            &test_config(),
+            None,
+            uid,
+        );
+        assert!(
+            matches!(Response::parse(String::from_utf8(output).unwrap().trim_end()),
+            Response::Err(error) if error.code == expected_code)
+        );
+        assert!(svc.pinned_calls.lock().unwrap().is_empty());
+        assert_eq!(svc.runner_calls(), 0);
+        assert!(svc.child.lock().unwrap().is_none());
+    }
+}
+
+#[test]
+fn retired_start_frames_are_refused_without_consuming_parameters_or_spawning() {
+    for command in [
+        "start",
+        polaris_helper_proto::command::common::NATIVE_START_BIRTH,
+    ] {
+        let svc = TestServices::new("T");
+        let frame = format!(
+            "T\n{command}\n{}\n\n0\n",
+            "x".repeat(MAX_WIRE_LINE_BYTES + 1)
+        );
+        let mut output = Vec::new();
+        process_connection_from_peer(
+            Cursor::new(frame),
+            &mut output,
+            &svc,
+            &test_config(),
+            None,
+            Some(1000),
+        );
+        assert_eq!(String::from_utf8(output).unwrap(), "ERR unknown\n");
+        assert!(svc.pinned_calls.lock().unwrap().is_empty());
+        assert_eq!(svc.runner_calls(), 0);
+        assert!(svc.child.lock().unwrap().is_none());
+    }
 }
 
 #[test]
@@ -563,13 +720,16 @@ fn cache_prepare_preserves_bytes_and_uses_confdir_owner() {
     use std::os::unix::fs::MetadataExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let cache = dir.path().join(CHOWN_FILES[0]);
+    // macOS TMPDIR may traverse /var -> /private/var. Resolve fixture ancestors,
+    // then exercise the production no-follow boundary at the actual cache leaf.
+    let root = dir.path().canonicalize().unwrap();
+    let cache = root.join(CHOWN_FILES[0]);
     std::fs::write(&cache, b"keep-cache-bytes").unwrap();
 
-    sys::prepare_cache_for_user(dir.path().to_str().unwrap()).unwrap();
+    sys::prepare_cache_for_user(root.to_str().unwrap()).unwrap();
 
     assert_eq!(std::fs::read(&cache).unwrap(), b"keep-cache-bytes");
-    let dir_meta = std::fs::metadata(dir.path()).unwrap();
+    let dir_meta = std::fs::metadata(&root).unwrap();
     let cache_meta = std::fs::metadata(&cache).unwrap();
     assert_eq!(cache_meta.uid(), dir_meta.uid());
     assert_eq!(cache_meta.gid(), dir_meta.gid());
@@ -579,13 +739,23 @@ fn cache_prepare_preserves_bytes_and_uses_confdir_owner() {
 #[test]
 fn cache_prepare_refuses_symlink_without_touching_target() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("target");
+    // macOS TMPDIR may traverse /var -> /private/var. Resolve fixture ancestors,
+    // then exercise the production no-follow boundary at the actual cache leaf.
+    let root = dir.path().canonicalize().unwrap();
+    let target = root.join("target");
     std::fs::write(&target, b"untouched").unwrap();
-    std::os::unix::fs::symlink(&target, dir.path().join(CHOWN_FILES[0])).unwrap();
+    std::os::unix::fs::symlink(&target, root.join(CHOWN_FILES[0])).unwrap();
 
-    let error = sys::prepare_cache_for_user(dir.path().to_str().unwrap()).unwrap_err();
+    let error = sys::prepare_cache_for_user(root.to_str().unwrap()).unwrap_err();
 
-    assert!(error.contains("安全打开 cache.db 失败"), "{error}");
+    assert!(
+        error.starts_with("prepare pinned runtime cache: "),
+        "{error}"
+    );
+    assert!(std::fs::symlink_metadata(root.join(CHOWN_FILES[0]))
+        .unwrap()
+        .file_type()
+        .is_symlink());
     assert_eq!(std::fs::read(target).unwrap(), b"untouched");
 }
 

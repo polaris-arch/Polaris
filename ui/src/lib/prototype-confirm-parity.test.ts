@@ -413,8 +413,11 @@ const PARITY: readonly ParityRow[] = [
   },
   {
     site: 'case:core-rollback',
-    impl: { key: 'core-rollback', file: 'components/screens/settings/use-core-update.ts' },
-    note: '内核回滚',
+    impl: null,
+    note:
+      '有意缺席，不是待修：原型的「内核回滚」站点所确认的动作在实现侧已整体不存在。产品不变量是' +
+      '「应用运行的内核应是与该应用版本配套的随包内核」，应用内不提供回滚、替换或更新内核的入口，' +
+      '设置页的内核卡是只读信息卡（`CoreInfoCard.tsx`，卡内零控件，由它自己的测试钉着）。',
   },
   {
     site: 'case:rule-del-dlg',

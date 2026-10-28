@@ -199,12 +199,23 @@ fn staged_full_save_never_blindly_clears_the_backend_marker() {
 
 #[test]
 fn config_broadcast_routes_through_the_persisted_stale_guard() {
-    let body = crate::commands::guard_scan::top_level_fn_body(
-        &crate_code("commands/config.rs"),
+    let source = crate_code("commands/config.rs");
+    let wrapper = crate::commands::guard_scan::top_level_fn_body(
+        &source,
         "pub(crate) fn broadcast_config_changed_with(",
     );
+    assert!(wrapper.contains("broadcast_config_changed_with_completion("));
+    let body = crate::commands::guard_scan::top_level_fn_body(
+        &source,
+        "pub(crate) fn broadcast_config_changed_with_completion<F>(",
+    );
+    let core = crate::commands::guard_scan::top_level_fn_body(
+        &source,
+        "pub(crate) async fn apply_config_broadcast_core<F, C>(",
+    );
     assert!(
-        body.contains("switch_persisted_config_if_current(")
+        body.contains("apply_config_broadcast_core(")
+            && core.contains("switch_persisted_config_if_current(")
             && body.contains("intent_generation,")
             && body.contains("move |current|"),
         "配置广播不得直调 switch_mode_with；否则乱序 task 可把运行核退回旧快照"
@@ -214,8 +225,15 @@ fn config_broadcast_routes_through_the_persisted_stale_guard() {
         "App 日志/原生主题投影也必须在同一过期广播闸门之后"
     );
     assert!(
-        !body.contains("proxy.switch_mode_with("),
+        !body.contains("proxy.switch_mode_with(") && !core.contains("proxy.switch_mode_with("),
         "旧入口会跳过磁盘真值复核"
+    );
+    let apply = core.find(".await").unwrap();
+    let settle = core.find("settle_selected_switch_receipt(").unwrap();
+    let completion = core.find("completion(proxy, accepted)").unwrap();
+    assert!(
+        apply < settle && settle < completion,
+        "completion must follow actual Apply and current receipt settlement"
     );
 }
 
@@ -347,4 +365,71 @@ fn backup_import_of_unchanged_class_still_overrides_concurrent_same_class_edit()
     .unwrap();
     let reopened = ConfigManager::new(dir.clone()).load_full().unwrap();
     assert_eq!(reopened["servers"][0]["id"], json!("manual-original"));
+}
+
+#[test]
+fn takeover_consumes_latest_fake_ip_flag_without_overwriting_dns_edits() {
+    let dir = temp_dir("takeover-latest-dns");
+    let manager = ConfigManager::new(dir.clone());
+    manager
+        .update(|config| {
+            config["dnsConfig"]["enableFakeIp"] = json!(false);
+            config["dnsConfig"]["fakeIpTunAutoEnable"] = json!(true);
+            config["dnsConfig"]["concurrent"] = json!("latest-dns-edit");
+            config["subscriptionUserAgent"] = json!("latest-scheduler-edit");
+            Decision::Write(())
+        })
+        .unwrap();
+    let corrected = std::cell::Cell::new(false);
+    let (_, saved, _) = config_takeover_edit(&manager, ProxyModeType::Tun, &corrected).unwrap();
+    assert!(corrected.get());
+    assert_eq!(saved["dnsConfig"]["enableFakeIp"], json!(true));
+    assert_eq!(saved["dnsConfig"]["concurrent"], json!("latest-dns-edit"));
+    assert_eq!(
+        saved["subscriptionUserAgent"],
+        json!("latest-scheduler-edit")
+    );
+    let corrected_again = std::cell::Cell::new(false);
+    config_takeover_edit(&manager, ProxyModeType::Tun, &corrected_again).unwrap();
+    assert!(!corrected_again.get());
+}
+
+#[test]
+fn partial_backup_shared_dependency_conflict_leaves_every_category_and_disk_unchanged() {
+    let dir = temp_dir("backup-dependency-conflict");
+    let manager = ConfigManager::new(dir.clone());
+    manager.update(|config| {
+        config["customRuleSets"] = json!([{"id":"shared", "name":"local", "rules":["local.example"]}]);
+        config["trafficRules"] = json!([{"id":"route-kept", "type":"ruleSet", "values":["shared"], "action":"direct", "enabled":true}]);
+        config["routeRuleOrder"] = json!(["route-kept"]);
+        Decision::Write(())
+    }).unwrap();
+    // Establish the real reload-normalized baseline before the rejected import.
+    // Store load synchronizes legacy rule mirrors; that migration is fixture setup.
+    let before = manager.load_full().unwrap();
+    assert_eq!(before["customRules"], before["trafficRules"]);
+    assert_eq!(before["policyRules"], before["trafficRules"]);
+    let disk_before = std::fs::read(manager.path()).unwrap();
+    let backup = json!({
+        "customRuleSets":[{"id":"shared", "name":"foreign", "rules":["foreign.example"]}],
+        "dnsRules":[{"id":"dns-imported", "type":"domain", "values":["new.example"], "enabled":true,
+            "effects":{"dns":{"enabled":true,"resolver":"direct","answerMode":"real"}}}],
+        "dnsRuleOrder":["dns-imported"], "logLevel":"debug"
+    });
+    let error = match backup_import_save_core(
+        &manager,
+        &backup,
+        &[BackupCategory::DnsRules, BackupCategory::GeneralSettings],
+        None,
+        "linux",
+        None,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("partial shared-resource replacement must reject the whole transaction"),
+    };
+    assert!(
+        matches!(error, polaris_store::StoreError::Validation(ref code) if code == SHARED_DEPENDENCY_CONFLICT)
+    );
+    assert_eq!(manager.current().unwrap(), before);
+    assert_eq!(std::fs::read(manager.path()).unwrap(), disk_before);
 }

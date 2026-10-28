@@ -401,3 +401,309 @@ async fn non_android_system_backup_toggle_fails_honestly() {
 
 #[cfg(test)]
 mod scoped_store_tests;
+
+fn s5_wire(query: u64, source: &str, seq: serde_json::Value) -> DeviceConditionsWire {
+    serde_json::from_value(serde_json::json!({
+        "metered": true, "powerSave": true, "queryId": query.to_string(),
+        "networkObservation": {"version":1,"sourceEpoch":source,"seq":seq,"currentKnown":false,"coverageGap":true}
+    })).unwrap()
+}
+const S5_SOURCE_A: &str = "ffffffff-ffff-4fff-9fff-ffffffffffff";
+const S5_SOURCE_B: &str = "00000000-0000-4000-9000-000000000001";
+
+#[test]
+fn s5_android_bridge_exact_integers_and_optional_invalid_fields_preserve_policy() {
+    let mut gate = DeviceQueryGate::default();
+    let query = gate.issue().unwrap();
+    for integer in [0, 9_007_199_254_740_993u64, i64::MAX as u64] {
+        let result = gate
+            .finish(
+                query,
+                s5_wire(query, S5_SOURCE_A, serde_json::json!(integer.to_string())),
+            )
+            .unwrap();
+        assert!(result.metered && result.power_save);
+        assert_eq!(result.network.unwrap().seq, integer);
+    }
+    for invalid in [
+        serde_json::json!(0),
+        serde_json::json!(1.5),
+        serde_json::json!("-1"),
+        serde_json::json!("00"),
+        serde_json::json!("01"),
+        serde_json::json!("+1"),
+        serde_json::json!(" 1"),
+        serde_json::json!("1.0"),
+        serde_json::json!("9223372036854775808"),
+        serde_json::Value::Null,
+    ] {
+        let result = gate
+            .finish(query, s5_wire(query, S5_SOURCE_A, invalid.clone()))
+            .unwrap();
+        assert!(result.metered && result.power_save, "{invalid}");
+        assert!(result.network.is_none(), "{invalid}");
+    }
+    for field in [
+        "version",
+        "sourceEpoch",
+        "seq",
+        "currentKnown",
+        "coverageGap",
+    ] {
+        let mut wire = s5_wire(query, S5_SOURCE_A, serde_json::json!("2"));
+        wire.network_observation
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        let result = gate.finish(query, wire).unwrap();
+        assert!(result.network.is_none(), "missing {field}");
+        assert!(result.metered && result.power_save);
+    }
+    for (field, invalid) in [
+        ("version", serde_json::json!(2)),
+        ("version", serde_json::json!(1.0)),
+        ("sourceEpoch", serde_json::json!("not-a-source")),
+        ("sourceEpoch", serde_json::json!(S5_SOURCE_A.to_uppercase())),
+        ("currentKnown", serde_json::json!(1)),
+        ("coverageGap", serde_json::json!("false")),
+    ] {
+        let mut wire = s5_wire(query, S5_SOURCE_A, serde_json::json!("2"));
+        wire.network_observation[field] = invalid;
+        assert!(
+            gate.finish(query, wire).unwrap().network.is_none(),
+            "{field}"
+        );
+    }
+    let legacy =
+        serde_json::from_str::<DeviceConditionsWire>(r#"{"metered":true,"powerSave":false}"#)
+            .unwrap();
+    let result = gate.finish(query, legacy).unwrap();
+    assert!(result.network.is_none());
+    assert!(result.metered);
+    assert!(!result.power_save);
+    for invalid_query in [
+        serde_json::json!(query),
+        serde_json::json!("01"),
+        serde_json::json!("2"),
+        serde_json::Value::Null,
+    ] {
+        let mut wire = s5_wire(query, S5_SOURCE_A, serde_json::json!("2"));
+        wire.query_id = invalid_query;
+        assert!(gate.finish(query, wire).unwrap().network.is_none());
+    }
+}
+
+#[test]
+fn s5_android_bridge_latest_query_fences_completion_and_delayed_publication_before_legal_source_swap(
+) {
+    use crate::runtime::auto_select::NativeNetworkHistory;
+    let mut gate = DeviceQueryGate::default();
+    let mut history = NativeNetworkHistory::default();
+    let q1 = gate.issue().unwrap();
+    let old = gate
+        .finish(q1, s5_wire(q1, S5_SOURCE_A, serde_json::json!("9")))
+        .unwrap()
+        .network
+        .unwrap();
+    assert_eq!(
+        gate.publish(&old, |network| history.observe(network)),
+        Some(false)
+    );
+    let q2 = gate.issue().unwrap();
+    assert!(gate
+        .finish(q1, s5_wire(q1, S5_SOURCE_A, serde_json::json!("100")))
+        .is_none());
+    assert_eq!(gate.publish(&old, |network| history.observe(network)), None);
+    let new = gate
+        .finish(q2, s5_wire(q2, S5_SOURCE_B, serde_json::json!("1")))
+        .unwrap()
+        .network
+        .unwrap();
+    assert_eq!(
+        gate.publish(&new, |network| history.observe(network)),
+        Some(false),
+        "new source baseline, UUID order is irrelevant"
+    );
+    assert_eq!(history.current().unwrap().source, S5_SOURCE_B);
+    let q3 = gate.issue().unwrap();
+    let retired = gate
+        .finish(q3, s5_wire(q3, S5_SOURCE_A, serde_json::json!("101")))
+        .unwrap()
+        .network
+        .unwrap();
+    assert_eq!(
+        gate.publish(&retired, |network| history.observe(network)),
+        Some(false)
+    );
+    assert_eq!(
+        history.current().unwrap().source,
+        S5_SOURCE_B,
+        "retired source cannot switch back even via newer query"
+    );
+}
+
+async fn s5_fake_native_budget(
+    query: u64,
+    started: tokio::sync::oneshot::Sender<u64>,
+    response: tokio::sync::oneshot::Receiver<DeviceConditionsWire>,
+    returned: tokio::sync::oneshot::Sender<()>,
+    budget: std::time::Duration,
+) -> Result<DeviceConditionsWire, String> {
+    started.send(query).unwrap();
+    // Mirror the existing native adapter's detached receive lifetime. This is fake native I/O,
+    // not a claim that the host executes Tauri/Android call_with_budget.
+    let native = tokio::spawn(async move {
+        let wire = response.await.unwrap();
+        returned.send(()).unwrap();
+        wire
+    });
+    match tokio::time::timeout(budget, native).await {
+        Ok(Ok(wire)) => Ok(wire),
+        Ok(Err(_)) => Err("fake native task failed".to_owned()),
+        Err(_) => Err("fake native budget expired".to_owned()),
+    }
+}
+
+#[tokio::test]
+async fn s5_android_bridge_timeout_and_cancel_late_responses_have_no_publication_permit() {
+    use crate::runtime::auto_select::NativeNetworkHistory;
+    let gate = std::sync::Arc::new(std::sync::Mutex::new(DeviceQueryGate::default()));
+    let mut history = NativeNetworkHistory::default();
+    for cancel in [false, true] {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let (returned_tx, returned_rx) = tokio::sync::oneshot::channel();
+        let queries = std::sync::Arc::clone(&gate);
+        let query = tokio::spawn(async move {
+            read_device_conditions_from(&queries, |id| {
+                s5_fake_native_budget(
+                    id,
+                    started_tx,
+                    response_rx,
+                    returned_tx,
+                    std::time::Duration::from_millis(if cancel { 5000 } else { 1 }),
+                )
+            })
+            .await
+        });
+        let old_id = started_rx.await.unwrap();
+        if cancel {
+            query.abort();
+            assert!(query.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(query.await.unwrap().unwrap_err().contains("budget"));
+        }
+        let fresh = read_device_conditions_from(&gate, |id| {
+            std::future::ready(Ok(s5_wire(id, S5_SOURCE_B, serde_json::json!("3"))))
+        })
+        .await
+        .unwrap()
+        .network
+        .unwrap();
+        gate.lock()
+            .unwrap()
+            .publish(&fresh, |next| history.observe(next));
+        response_tx
+            .send(s5_wire(old_id, S5_SOURCE_A, serde_json::json!("999")))
+            .unwrap();
+        returned_rx.await.unwrap(); // Late native receive succeeds; timed-out/cancelled waiter cannot consume it.
+        assert_eq!(history.current().unwrap().source, S5_SOURCE_B);
+        assert_eq!(history.current().unwrap().seq, 3);
+    }
+}
+
+#[tokio::test]
+async fn s5_android_bridge_actual_query_flow_supersedes_old_source_and_allows_new_baseline_and_growth(
+) {
+    use crate::runtime::auto_select::NativeNetworkHistory;
+    let gate = std::sync::Arc::new(std::sync::Mutex::new(DeviceQueryGate::default()));
+    let mut history = NativeNetworkHistory::default();
+    let initial = read_device_conditions_from(&gate, |id| {
+        std::future::ready(Ok(s5_wire(id, S5_SOURCE_A, serde_json::json!("9"))))
+    })
+    .await
+    .unwrap()
+    .network
+    .unwrap();
+    assert_eq!(
+        gate.lock()
+            .unwrap()
+            .publish(&initial, |next| history.observe(next)),
+        Some(false)
+    );
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let queries = std::sync::Arc::clone(&gate);
+    let old = tokio::spawn(async move {
+        read_device_conditions_from(&queries, |id| {
+            started_tx.send(id).unwrap();
+            async move { Ok(response_rx.await.unwrap()) }
+        })
+        .await
+    });
+    let old_id = started_rx.await.unwrap();
+    let fresh = read_device_conditions_from(&gate, |id| {
+        std::future::ready(Ok(s5_wire(id, S5_SOURCE_B, serde_json::json!("0"))))
+    })
+    .await
+    .unwrap()
+    .network
+    .unwrap();
+    assert_eq!(
+        gate.lock()
+            .unwrap()
+            .publish(&fresh, |next| history.observe(next)),
+        Some(false)
+    );
+    response_tx
+        .send(s5_wire(old_id, S5_SOURCE_A, serde_json::json!("100")))
+        .unwrap();
+    assert!(old.await.unwrap().unwrap_err().contains("superseded"));
+    assert_eq!(
+        gate.lock()
+            .unwrap()
+            .publish(&initial, |next| history.observe(next)),
+        None
+    );
+    let next = read_device_conditions_from(&gate, |id| {
+        std::future::ready(Ok(s5_wire(id, S5_SOURCE_B, serde_json::json!("1"))))
+    })
+    .await
+    .unwrap()
+    .network
+    .unwrap();
+    assert_eq!(
+        gate.lock()
+            .unwrap()
+            .publish(&next, |next| history.observe(next)),
+        Some(true)
+    );
+    let retired = read_device_conditions_from(&gate, |id| {
+        std::future::ready(Ok(s5_wire(id, S5_SOURCE_A, serde_json::json!("101"))))
+    })
+    .await
+    .unwrap()
+    .network
+    .unwrap();
+    assert_eq!(
+        gate.lock()
+            .unwrap()
+            .publish(&retired, |next| history.observe(next)),
+        Some(false)
+    );
+    assert_eq!(history.current().unwrap().source, S5_SOURCE_B);
+    assert_eq!(history.current().unwrap().seq, 1);
+}
+
+#[test]
+fn s5_android_bridge_query_exhaustion_never_wraps() {
+    let mut gate = DeviceQueryGate {
+        issued: u64::MAX - 1,
+    };
+    assert_eq!(gate.issue(), Some(u64::MAX));
+    assert_eq!(gate.issue(), None);
+    assert_eq!(gate.issued, u64::MAX);
+    assert!(DeviceQueryGate::default()
+        .finish(0, s5_wire(0, S5_SOURCE_A, serde_json::json!("0")))
+        .is_none());
+}

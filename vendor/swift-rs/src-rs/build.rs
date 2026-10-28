@@ -3,6 +3,9 @@ use std::{env, fmt::Display, path::Path, path::PathBuf, process::Command};
 
 use serde::Deserialize;
 
+#[path = "ios_exports.rs"]
+mod ios_exports;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SwiftTarget {
@@ -228,9 +231,19 @@ impl SwiftLinker {
         for package in self.packages {
             let package_path =
                 Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join(&package.path);
-            let out_path = Path::new(&env::var("OUT_DIR").unwrap())
-                .join("swift-rs")
-                .join(&package.name);
+            let cargo_out = PathBuf::from(env::var("OUT_DIR").unwrap());
+            let build_package_path = if matches!(&rust_target.os, RustTargetOS::IOS) {
+                ios_exports::stage(
+                    &package.name,
+                    &env::var("CARGO_PKG_VERSION").unwrap(),
+                    &package_path,
+                    &cargo_out,
+                )
+                .expect("Cannot stage the locked iOS Swift C entry points")
+            } else {
+                package.path.clone()
+            };
+            let out_path = cargo_out.join("swift-rs").join(&package.name);
 
             let sdk_path_output = Command::new("xcrun")
                 .args(["--sdk", &rust_target.sdk.to_string(), "--show-sdk-path"])
@@ -246,7 +259,7 @@ impl SwiftLinker {
             let sdk_path = String::from_utf8_lossy(&sdk_path_output.stdout);
 
             let mut command = Command::new("swift");
-            command.current_dir(&package.path);
+            command.current_dir(&build_package_path);
 
             let arch = match std::env::consts::ARCH {
                 "aarch64" => "arm64",

@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn shared_backup_dependency_conflict_has_its_stable_ui_code() {
+    assert_eq!(
+        backup_save_error_code(&polaris_store::StoreError::validation(
+            SHARED_DEPENDENCY_CONFLICT,
+        )),
+        "sharedDependencyConflict"
+    );
+    assert_eq!(
+        backup_save_error_code(&polaris_store::StoreError::validation(
+            "unrelated validation failure",
+        )),
+        "saveFailed"
+    );
+    assert_eq!(
+        backup_save_error_code(&polaris_store::StoreError::Io("private local path".into(),)),
+        "saveFailed"
+    );
+}
+
+#[test]
 fn backup_failure_exposes_only_the_stable_error_code() {
     let payload = backup_failure("writeFailed");
     assert_eq!(payload["success"], false);

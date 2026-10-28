@@ -6,12 +6,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# serde/serde_json = VersionManifest 解析（GitHub release JSON / 自定义清单）；workspace 既有依赖（非新增第三方）。
+# serde/serde_json = GitHub release JSON 解析；workspace 既有依赖（非新增第三方）。
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 # polaris-helper-proto = 复用 codec::is_valid_sha256_hex（去重 verify.rs 本地副本；manifest.rs 经 crate::verify:: 路径调用）。
 polaris-helper-proto = { path = "../helper-proto" }
-# sha2/hex = 核心 staged 更新 SHA256 校验（移植自 Polaris shared/file-hash.ts 的 createHash('sha256')）。
+# sha2/hex = 应用安装包的 SHA256 校验。
 # 与 helper 同口径（crates/helper/Cargo.toml 已用 sha2 = "0.11"）。
 sha2 = "0.11"
 hex = "0.4"
@@ -19,7 +19,7 @@ hex = "0.4"
 thiserror = "2"
 
 [features]
-# test-utils = 把 crate 内的**跨 crate 测试替身**（MockFs / MockFailOp / MemoryStateStore）暴露给下游。
+# test-utils = 把 crate 内的**跨 crate 测试替身**（MockFs / MockFailOp）暴露给下游。
 #
 # 为什么必须是 feature 而不是 `#[cfg(test)]`：`test` cfg 只在**被测 crate 自己**编译测试目标时为真；
 # 下游（src-tauri）编译自己的测试时，polaris-updater 仍是以 `test` off 编译的普通依赖 ⇒ 替身消失、

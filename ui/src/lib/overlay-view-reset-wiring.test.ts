@@ -15,7 +15,7 @@
  *
  *  - `ui/src/tray/**` 与 `ui/src/update-popup/**` 的非测试源码；
  *  - 其中形如 `const [x, setX] = useState<'a' | 'b'>('a')` 的**联合字面量 state**；
- *  - 以及 `window.addEventListener('focus', …)` 的处理器体（内联箭头函数或具名 const 均可）。
+ *  - focus 处理器与成功 show 桥的有界 AST 调用链（内联、具名 const、唯一 ref 回调）。
  *
  * # 什么算「视图态」
  *
@@ -30,6 +30,7 @@
  * **真机仍需看一眼**：窗显隐由 Rust 侧控制，`focus` 事件是否每次弹出都触发要设备上确认。
  */
 import { describe, it, expect } from 'vitest';
+import { parse } from '@babel/parser';
 import { IS_TEST_ONLY_MODULE } from '@/contracts/test-only-modules';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
@@ -60,7 +61,7 @@ function code(src: string): string {
 
 const FILES = OVERLAY_DIRS.flatMap((d) => walk(join(SRC, d))).map((f) => ({
   rel: relative(SRC, f).split(sep).join('/'),
-  src: code(readFileSync(f, 'utf8')),
+  src: readFileSync(f, 'utf8'),
 }));
 
 // ── 解析器 ──────────────────────────────────────────────────────────────────
@@ -95,43 +96,147 @@ function parseUnionStates(rel: string, src: string): UnionState[] {
   return out;
 }
 
-/** 取从 `from` 起第一个 `{` 开始的配平大括号块。 */
-function braceBody(src: string, from: number): string {
-  const open = src.indexOf('{', from);
-  if (open < 0) return '';
-  let depth = 0;
-  for (let i = open; i < src.length; i++) {
-    if (src[i] === '{') depth++;
-    else if (src[i] === '}' && --depth === 0) return src.slice(open, i + 1);
+/** Bounded AST call graph: only direct executable statements are followed. Nested
+ * unused functions, comments, strings, conditional decoys and unresolved bindings
+ * cannot stand in for a reset. Four edges cover focus -> ref -> reset today.
+ */
+type FlowNode = { type: string; [key: string]: unknown };
+const flowNode = (value: unknown): value is FlowNode => typeof value === 'object' && value !== null
+  && 'type' in value && typeof value.type === 'string';
+const identifier = (value: unknown, name: string): boolean => flowNode(value) && value.type === 'Identifier' && value.name === name;
+const stringValue = (value: unknown, text: string): boolean => flowNode(value) && value.type === 'StringLiteral' && value.value === text;
+function reference(value: unknown): string | null {
+  if (!flowNode(value)) return null;
+  if (value.type === 'Identifier' && typeof value.name === 'string') return value.name;
+  if (value.type === 'MemberExpression' && value.computed === false && flowNode(value.property)
+    && value.property.type === 'Identifier') {
+    const object = reference(value.object);
+    return object === null ? null : `${object}.${String(value.property.name)}`;
   }
-  return '';
+  return null;
 }
-
-/** 全部 `window.addEventListener('focus', …)` 处理器体（内联箭头 + 具名 const 两种写法）。 */
-function focusHandlerBodies(src: string): string[] {
-  const out: string[] = [];
-  const re = /window\.addEventListener\(\s*'focus'\s*,\s*/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(src))) {
-    const rest = src.slice(m.index + m[0].length);
-    const named = /^([A-Za-z_$][\w$]*)\s*\)/.exec(rest);
-    if (named) {
-      const declAt = src.indexOf(`const ${named[1]} = `);
-      if (declAt >= 0) out.push(braceBody(src, declAt));
-    } else {
-      out.push(braceBody(src, m.index + m[0].length));
+function parseFlow(src: string): FlowNode[] {
+  const ast = parse(src, { sourceType: 'module', plugins: ['typescript', 'jsx'] });
+  const nodes: FlowNode[] = [];
+  // Only the component render and its directly registered effects execute here.
+  // Never collect registrations or bindings inside an unrelated unused function.
+  function statements(value: unknown): void {
+    for (const statement of Array.isArray(value) ? value.filter(flowNode) : []) {
+      if (statement.type === 'ExportDefaultDeclaration' && flowNode(statement.declaration)) {
+        statements([statement.declaration]);
+      } else if (statement.type === 'FunctionDeclaration' && identifier(statement.id, 'TrayMenu')
+        && flowNode(statement.body)) {
+        statements(statement.body.body);
+      } else if (statement.type === 'VariableDeclaration' && Array.isArray(statement.declarations)) {
+        nodes.push(...statement.declarations.filter(flowNode));
+      } else if (statement.type === 'ExpressionStatement' && flowNode(statement.expression)) {
+        const expression = statement.expression;
+        nodes.push(expression);
+        if (expression.type === 'CallExpression' && ['useEffect', 'useLayoutEffect'].some(name => identifier(expression.callee, name))
+          && Array.isArray(expression.arguments) && flowNode(expression.arguments[0])) {
+          const effect = expression.arguments[0];
+          if (effect.type === 'ArrowFunctionExpression' && flowNode(effect.body) && effect.body.type === 'BlockStatement') {
+            statements(effect.body.body);
+          }
+        }
+      } else if (statement.type === 'ReturnStatement' || statement.type === 'ThrowStatement') break;
     }
+  }
+  statements(ast.program.body);
+  return nodes;
+}
+function callback(target: unknown, nodes: FlowNode[]): FlowNode | null {
+  if (!flowNode(target)) return null;
+  if (target.type === 'ArrowFunctionExpression' || target.type === 'FunctionExpression') return target;
+  const name = reference(target);
+  if (!name) return null;
+  const declarations = nodes.filter(n => n.type === 'VariableDeclarator' && reference(n.id) === name);
+  const assignments = nodes.filter(n => n.type === 'AssignmentExpression' && reference(n.left) === name);
+  // Reassigned identifiers and multiple ref writes are intentionally not inferred.
+  const values = name.endsWith('.current')
+    ? assignments.filter(n => n.operator === '=').map(n => n.right)
+    : assignments.length ? [] : declarations.map(n => n.init);
+  if (values.length !== 1 || !flowNode(values[0])) return null;
+  const value = values[0];
+  return value.type === 'ArrowFunctionExpression' || value.type === 'FunctionExpression' ? value : null;
+}
+function directExpressions(body: unknown): FlowNode[] {
+  if (!flowNode(body)) return [];
+  if (body.type !== 'BlockStatement') return [body];
+  const out: FlowNode[] = [];
+  for (const statement of Array.isArray(body.body) ? body.body.filter(flowNode) : []) {
+    if (statement.type === 'ExpressionStatement' && flowNode(statement.expression)) out.push(statement.expression);
+    // Anything after return is unreachable. Never walk nested declarations or branches.
+    if (statement.type === 'ReturnStatement') {
+      if (flowNode(statement.argument)) out.push(statement.argument);
+      break;
+    }
+    if (statement.type === 'ThrowStatement') break;
   }
   return out;
 }
-
-/** 该视图态在某条 focus 腿里被复位回默认值了吗。 */
+function reachesReset(target: unknown, nodes: FlowNode[], st: UnionState, depth = 0): boolean {
+  if (depth > 4) return false;
+  const fn = callback(target, nodes);
+  if (!fn) return false;
+  return directExpressions(fn.body).some(expression => {
+    if (expression.type !== 'CallExpression' || !Array.isArray(expression.arguments)) return false;
+    const args = expression.arguments;
+    const reset = identifier(expression.callee, st.setter) && args.length === 1
+      && (st.init === 'null' ? flowNode(args[0]) && args[0].type === 'NullLiteral'
+        : stringValue(args[0], st.init.slice(1, -1)));
+    return reset || (args.length === 0 && reachesReset(expression.callee, nodes, st, depth + 1));
+  });
+}
+function focusCallbacks(nodes: FlowNode[]): unknown[] {
+  return nodes.filter(n => n.type === 'CallExpression' && reference(n.callee) === 'window.addEventListener'
+    && Array.isArray(n.arguments) && n.arguments.length === 2 && stringValue(n.arguments[0], 'focus'))
+    .map(n => (n.arguments as unknown[])[1]);
+}
 function hasResetLeg(src: string, st: UnionState): boolean {
-  const call = `${st.setter}(${st.init})`;
-  return focusHandlerBodies(src).some((b) => b.includes(call));
+  const nodes = parseFlow(src);
+  return focusCallbacks(nodes).some(target => reachesReset(target, nodes, st));
+}
+function hasShowResetLeg(src: string, st: UnionState): boolean {
+  const nodes = parseFlow(src);
+  const assignments = nodes.filter(n => n.type === 'AssignmentExpression' && n.operator === '='
+    && reference(n.left) === 'window.__POLARIS_TRAY_REMEASURE__');
+  if (assignments.length !== 1) return false;
+  const fn = callback(assignments[0].right, nodes);
+  if (!fn || !Array.isArray(fn.params) || fn.params.length !== 1 || !identifier(fn.params[0], 'reason')
+    || !flowNode(fn.body) || !Array.isArray(fn.body.body)) return false;
+  const statements = fn.body.body;
+  // Keep geometry/unknown calls measurement-only, and only an exact show reason resets.
+  if (statements.length !== 2 || !flowNode(statements[0]) || statements[0].type !== 'ExpressionStatement'
+    || !flowNode(statements[0].expression) || statements[0].expression.type !== 'CallExpression'
+    || !identifier(statements[0].expression.callee, 'requestRemeasure')) return false;
+  const branch = statements[1];
+  if (!flowNode(branch) || branch.type !== 'IfStatement' || branch.alternate !== null
+    || !flowNode(branch.test) || branch.test.type !== 'BinaryExpression' || branch.test.operator !== '==='
+    || !identifier(branch.test.left, 'reason') || !stringValue(branch.test.right, 'show')) return false;
+  const consequent = branch.consequent;
+  if (!flowNode(consequent) || consequent.type !== 'ExpressionStatement' || !flowNode(consequent.expression)
+    || consequent.expression.type !== 'CallExpression' || reference(consequent.expression.callee) !== 'refreshOnShow.current'
+    || !Array.isArray(consequent.expression.arguments) || consequent.expression.arguments.length) return false;
+  return reachesReset(consequent.expression.callee, nodes, st);
 }
 
-const STATES = FILES.flatMap((f) => parseUnionStates(f.rel, f.src));
+/** Rust is not TS: inspect this single function's executable body, not the whole file.
+ * The early return on show failure must precede the precise show bridge.
+ */
+function hostShowsOnlyAfterSuccess(source: string): boolean {
+  const src = code(source);
+  const start = src.indexOf('pub(super) fn show_ready_overlay(');
+  if (start < 0) return false;
+  const next = src.indexOf('\npub', start + 1);
+  const body = src.slice(start, next < 0 ? undefined : next);
+  const show = /if let Err\(e\) = win\.show\(\)\s*\{\s*log::warn!\("(?:\\.|[^"\\])*"\);\s*return;\s*\}/.exec(body);
+  if (!show) return false;
+  const tail = body.slice(show.index + show[0].length);
+  return /^\s*reposition\(win\);\s*let _ = win\.eval\("window\.__POLARIS_TRAY_REMEASURE__\?\.\('show'\);"\);/.test(tail);
+}
+
+const STATES = FILES.flatMap((f) => parseUnionStates(f.rel, code(f.src)));
 
 // ── 自曝 ────────────────────────────────────────────────────────────────────
 
@@ -171,9 +276,9 @@ const REGISTRY: readonly Row[] = [
     role: 'view',
     reset: 'wired',
     note:
-      '对齐原型 `proto:4009 openTray()` 的 `trayView(false)`：`onFocus` 里有 `setView(\'main\')`。' +
+      '对齐原型 `proto:4009 openTray()`：focus 与宿主成功 show 都经 refreshOnShow.current 复位主视图。' +
       '托盘窗常驻不重建（tray.rs 「预建一次（隐藏）」）⇒ 组件永不卸载、state 永不自动复位，' +
-      '这条腿是唯一保障 —— 删掉它就回到「上次停在二级视图、下次点图标仍停在二级」。' +
+      '两条入口共享复位实现；非激活窗可能不发 focus，宿主 show 桥必须保留。' +
       '切节点 / 切直连处的复位只覆盖「选完就关」那条路径，按返回键或点外部关闭时不经过它们，' +
       '故不能拿那两处顶替本条。**「实际停在哪」仍需真机确认**：窗显隐由 Rust 侧控，' +
       'focus 事件是否每次弹出都触发，这一层看不到。',
@@ -193,7 +298,7 @@ const REGISTRY: readonly Row[] = [
     role: 'transient',
     reset: 'wired',
     note:
-      '`latest | failed | null` 是单次展开会话里的检查更新回执，不是层级视图；`onFocus` 通过 ' +
+      '`latest | failed | null` 是单次展开会话里的检查更新回执，不是层级视图；共享 show/focus 回调通过 ' +
       '`setUpdateResult(null)` 明确清掉上一轮结果，避免 warm WebView 下次展开仍展示陈旧结论。',
   },
 ] as const;
@@ -232,6 +337,50 @@ describe('守卫自检：解析器正反两向都判得动（防「恒判缺失�
     expect(hasResetLeg(inline, parseUnionStates('x.tsx', inline)[0]), '内联写法没被认出来').toBe(
       true,
     );
+  });
+
+  it('focus/ref and show/ref chains reject disconnected, conditional and stale decoys', () => {
+    const sample = [
+      "const [view, setView] = useState<'main' | 'nodes'>('main');",
+      'const refreshOnShow = useRef(() => {});',
+      "refreshOnShow.current = () => { setView('main'); };",
+      'const onFocus = () => refreshOnShow.current();',
+      "window.addEventListener('focus', onFocus);",
+      "window.__POLARIS_TRAY_REMEASURE__ = (reason) => { requestRemeasure(); if (reason === 'show') refreshOnShow.current(); };",
+    ].join('\n');
+    const state = parseUnionStates('x.tsx', sample)[0];
+    expect(hasResetLeg(sample, state)).toBe(true);
+    expect(hasShowResetLeg(sample, state)).toBe(true);
+    for (const broken of [
+      sample.replace("refreshOnShow.current = () => { setView('main'); };", ''),
+      sample.replace("setView('main');", "/* setView('main'); */"),
+      sample.replace("setView('main');", "setView('nodes');"),
+      sample.replace("setView('main');", "const unused = () => setView('main');"),
+      sample.replace("setView('main');", "if (false) setView('main');"),
+      sample.replace("setView('main');", "return; setView('main');"),
+      sample + '\nrefreshOnShow.current = () => {};',
+      'const unused = () => { ' + sample + ' };',
+    ]) {
+      expect(hasResetLeg(broken, state)).toBe(false);
+      expect(hasShowResetLeg(broken, state)).toBe(false);
+    }
+    expect(hasResetLeg(sample.replace('() => refreshOnShow.current()', '() => {}'), state)).toBe(false);
+    expect(hasResetLeg(sample.replace("'focus', onFocus", "'blur', onFocus"), state)).toBe(false);
+    expect(hasShowResetLeg(sample.replace("reason === 'show'", "reason === 'geometry'"), state)).toBe(false);
+    expect(hasShowResetLeg(sample.replace("if (reason === 'show') ", ''), state)).toBe(false);
+    expect(hasShowResetLeg(sample.replace("if (reason === 'show') refreshOnShow.current();", "if (reason === 'show') requestRemeasure();"), state)).toBe(false);
+  });
+
+  it('host show notification follows successful show and never failure or geometry', () => {
+    const host = readFileSync(join(SRC, '../../src-tauri/src/tray/window.rs'), 'utf8');
+    expect(hostShowsOnlyAfterSuccess(host)).toBe(true);
+    const start = host.indexOf('pub(super) fn show_ready_overlay(');
+    const before = host.slice(0, start);
+    const body = host.slice(start);
+    expect(hostShowsOnlyAfterSuccess(before + body.replace("?.('show')", "?.('geometry')"))).toBe(false);
+    expect(hostShowsOnlyAfterSuccess(before + body.replace('return;', ''))).toBe(false);
+    expect(hostShowsOnlyAfterSuccess(before + body.replace('win.show()', 'win.hide()'))).toBe(false);
+    expect(hostShowsOnlyAfterSuccess('/* pub(super) fn show_ready_overlay() { if let Err(e) = win.show() { return; } } */')).toBe(false);
   });
 
   it('复位腿检测器能判「无」——负向对照', () => {
@@ -285,6 +434,14 @@ describe('G14：浮层视图态必须登记，视图态必须有 show/focus 复�
     expect(mismatch, '登记的复位状态与磁盘现状不符 —— 改了实现就把登记一起改').toEqual([]);
   });
 
+  it('托盘成功 show 桥也到达每一个已登记的复位，geometry 不恢复交互', () => {
+    const tray = FILES.find((file) => file.rel === 'tray/TrayMenu.tsx')!;
+    for (const row of REGISTRY.filter((row) => row.file === tray.rel && row.reset === 'wired')) {
+      const state = STATES.find((state) => state.file === row.file && state.name === row.name)!;
+      expect(hasShowResetLeg(tray.src, state), `${row.name} disconnected from successful show`).toBe(true);
+    }
+  });
+
   it('缺复位腿的视图态必须逐条写明理由，且不许诉诸「本仓先例」', () => {
     for (const r of REGISTRY.filter((x) => x.reset === 'missing')) {
       expect(r.note.length, `${r.file}::${r.name} 的理由太短`).toBeGreaterThan(30);
@@ -300,6 +457,6 @@ describe('G14：浮层视图态必须登记，视图态必须有 show/focus 复�
   it('托盘至少有一条 focus 腿（复位腿要挂的地方还在）', () => {
     // 这条挡的是「onFocus 整个被删掉」——那时 hasResetLeg 恒假，上面几条会显得「一切照旧」。
     const tray = FILES.find((f) => f.rel === 'tray/TrayMenu.tsx')!;
-    expect(focusHandlerBodies(tray.src).length, '托盘的 window focus 监听没了').toBeGreaterThan(0);
+    expect(focusCallbacks(parseFlow(tray.src)).length, '托盘的 window focus 监听没了').toBeGreaterThan(0);
   });
 });

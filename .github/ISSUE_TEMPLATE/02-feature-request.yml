@@ -19,7 +19,7 @@ body:
         - Connection, proxy, or TUN / 连接、代理或 TUN
         - Subscription or node management / 订阅或节点管理
         - Rules or DNS / 规则或 DNS
-        - Application or core update / 应用或内核更新
+        - Application update / 应用更新
         - Installation or platform integration / 安装或平台集成
         - Interface or localization / 界面或本地化
         - Performance or resource usage / 性能或资源占用

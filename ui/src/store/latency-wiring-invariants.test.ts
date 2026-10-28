@@ -88,7 +88,7 @@ describe('T2：订阅挂窗口级持久位置，不得退回业务组件', () =>
   });
 
   it('托盘窗订阅在 TrayMenu 根（独立 JS 堆，本窗自己的持久位置）', () => {
-    expect(read(TRAY)).toContain('subscribeLatencyEvents()');
+    expect(read(TRAY)).toContain('subscribeLatencyEvents({ poll: false })');
   });
 
   it.each([HOME, NODES, NODE_CARD, STATUSBAR])(

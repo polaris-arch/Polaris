@@ -165,6 +165,9 @@ import {
   contextOf,
   explain,
   resolve,
+  shorthandComponent,
+  topLevelParts,
+  type Env,
   type CssContext,
   type CtxName,
 } from './css-cascade.test-support';
@@ -545,8 +548,8 @@ const BOX4 = new Set(['padding', 'margin', 'inset']);
  */
 const box4 = (v: string) => `${v} ${v} ${v} ${v}`;
 
-function declIn(ctx: CssContext, where: string, selector: string, prop: string): string {
-  const r = resolve({ sel: selector, prop, decls: ctx, where: UNCONDITIONAL });
+function declIn(ctx: CssContext, where: string, selector: string, prop: string, env?: Env): string {
+  const r = resolve({ sel: selector, prop, decls: ctx, where: UNCONDITIONAL, env });
   if (r.winner === null)
     throw new Error(
       `CSS 里读不到 ${where} \`${selector}\` 的 \`${prop}\` —— 选择器被改名/删除？\n${explain(r)}`,
@@ -626,10 +629,44 @@ const px = (v: string): number => {
 };
 /** `padding: a b c d` 简写 → 左右内边距之和。 */
 function padX(shorthand: string): number {
-  const parts = shorthand.trim().split(/\s+/).map(px);
-  if (parts.length === 1) return parts[0] * 2;
-  return parts[1] * 2; // 2/3/4 值写法里第 2 个都是左右
+  const parts = topLevelParts(shorthand);
+  // 本模型只结算已解析为非负 px 的 padding；非法形状不能悄悄变成可用宽度。
+  if (
+    parts.length < 1 || parts.length > 4 ||
+    parts.some((v) =>
+      !/^(?:[+-]?(?:\d+(?:\.\d*)?|\.\d+)px|[+-]?0(?:\.0+)?)$/i.test(v) ||
+      !Number.isFinite(parseFloat(v)) || parseFloat(v) < 0,
+    )
+  ) throw new Error(`不是 1–4 个非负 px padding 值：\`${shorthand}\``);
+  // decl() 已逐边层叠成 T/R/B/L。四值里的 L 不能再拿 R 代替。
+  return parseFloat(shorthandComponent(shorthand, 'right')!) +
+    parseFloat(shorthandComponent(shorthand, 'left')!);
 }
+describe('横向 padding 结算（POL-U36）', () => {
+  it.each([
+    ['4px', 8], ['1px 4px', 8], ['1px 4px 3px', 8],
+    ['0px 4px 0px 20px', 24], ['0 20px 0 4px', 24], ['+0 +4px', 8],
+  ] as const)('1–4 值语义：%s ⇒ %s', (value, expected) => {
+    expect(padX(value)).toBe(expected);
+  });
+
+  it.each(['', '1px 2px 3px 4px 5px', '4pxjunk', 'auto', '-1px 4px', 'calc(4px + 2px)'])
+    ('拒绝非法或未解析的几何值：%s', (value) => {
+      expect(() => padX(value)).toThrow(/padding 值/);
+    });
+
+  it.each(['ltr', 'rtl'] as const)('保持 %s 的逻辑属性、源序与 important 胜出值', (dir) => {
+    const css = '.probe { padding: 1px 4px 3px 20px; padding-inline-start: 30px; }' +
+      '.probe { padding-right: 7px !important; padding-inline-end: 40px; padding-right: 99px; }';
+    const ctx = contextOf([{ file: 'padding-probe.css', css }]);
+    const values = (['top', 'right', 'bottom', 'left'] as const).map((edge) =>
+      declIn(ctx, 'padding-probe.css', '.probe', `padding-${edge}`, { dir }),
+    );
+    expect(values).toEqual(dir === 'ltr' ? ['1px', '7px', '3px', '30px'] : ['1px', '7px', '3px', '40px']);
+    expect(padX(values.join(' '))).toBe(dir === 'ltr' ? 37 : 47);
+  });
+});
+
 /**
  * 间距阶梯 `--sp-N` 的真值（`prototype.css` 的 `:root`，见 index.css 段注释：prototype.css 是最后一个
  * @import，它自带一整套同选择器令牌声明 ⇒ tokens.css 那份不是生效的那份）。

@@ -51,7 +51,7 @@ export function NodesTabs({
         <div ref={navigation.scrollRef} className="nd-tabs-scroll" id="node-tabs-scroll" onScroll={navigation.measure}>
           <div ref={navigation.contentRef} className="sub-tabs" data-tabgroup="">
             {groups.map((g) => {
-              const label = g.isManual
+              const label = g.isAll ? t('nodes.tab.all') : g.isManual
                 ? t('nodes.tab.manual')
                 : g.isMesh
                   ? t('nodes.tab.mesh')

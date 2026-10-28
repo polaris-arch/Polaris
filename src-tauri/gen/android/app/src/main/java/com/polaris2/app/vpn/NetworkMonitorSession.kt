@@ -3,7 +3,7 @@ package com.polaris2.app.vpn
 /** A fresh platform callback belongs to one SDK registration of one attempt. */
 internal interface NetworkMonitorEvents<N> {
     fun available(network: N)
-    fun capabilitiesChanged(network: N)
+    fun capabilitiesChanged(network: N, notVpn: Boolean = false)
     fun lost(network: N)
 }
 
@@ -19,6 +19,53 @@ internal data class NetworkMonitorSnapshot(val revoked: Boolean, val lookups: In
     val delivering: Int, val registering: Boolean, val registered: Boolean,
     val firstFailure: Throwable?)
 
+/** Exact process-lived history, guarded by the coordinator metadata gate. Network identities stay private. */
+internal data class DefaultNetworkObservationSnapshot(val sourceEpoch: String, val seq: String,
+    val currentKnown: Boolean, val coverageGap: Boolean)
+
+internal class DefaultNetworkObservation<N>(private val sourceEpoch: String = java.util.UUID.randomUUID().toString()) {
+    private var session: Any? = null
+    private var candidate: N? = null
+    private var anchor: N? = null
+    private var seq = 0L
+    private var currentKnown = false
+    private var coverageGap = true
+
+    fun start(token: Any) { session = token; candidate = null; currentKnown = false }
+    fun available(token: Any, network: N) {
+        if (session !== token) return
+        candidate = network
+        currentKnown = false
+    }
+    fun capabilities(token: Any, network: N, notVpn: Boolean) {
+        if (session !== token || candidate != network) return
+        if (!notVpn) { currentKnown = false; coverageGap = true; return }
+        val previous = anchor
+        if (previous != null && previous != network) {
+            // Exhaustion becomes unavailable rather than wrapping and inventing a baseline.
+            if (seq == Long.MAX_VALUE) { currentKnown = false; coverageGap = true; return }
+            seq++
+        }
+        anchor = network
+        currentKnown = true
+    }
+    fun lost(token: Any, network: N) {
+        if (session !== token || candidate != network) return
+        candidate = null
+        currentKnown = false
+        coverageGap = true
+    }
+    fun stop(token: Any) {
+        if (session !== token) return
+        session = null
+        candidate = null
+        currentKnown = false
+        coverageGap = true
+        // Keep source, known anchor and every confirmed change across attempt restarts.
+    }
+    fun snapshot() = DefaultNetworkObservationSnapshot(sourceEpoch, seq.toString(), currentKnown, coverageGap)
+}
+
 /** All publication/revocation/permits use this small metadata gate. SDK and JNI never hold it. */
 internal class NetworkMonitorCoordinator<N, L>(
     private val registration: (NetworkMonitorEvents<N>) -> NetworkMonitorRegistration,
@@ -29,6 +76,8 @@ internal class NetworkMonitorCoordinator<N, L>(
 ) {
     private val gate = Any()
     private var active: NetworkMonitorSession<N, L>? = null
+    private val observation = DefaultNetworkObservation<N>()
+    fun networkObservation() = synchronized(gate) { observation.snapshot() }
     val defaultNetwork: N? get() = synchronized(gate) { active?.network }
 
     fun createSession(): NetworkMonitorSession<N, L> = NetworkMonitorSession(this)
@@ -36,7 +85,7 @@ internal class NetworkMonitorCoordinator<N, L>(
     internal fun makeRegistration(session: NetworkMonitorSession<N, L>): NetworkMonitorRegistration =
         registration(object : NetworkMonitorEvents<N> {
             override fun available(network: N) = event(session, network, 0)
-            override fun capabilitiesChanged(network: N) = event(session, network, 1)
+            override fun capabilitiesChanged(network: N, notVpn: Boolean) = event(session, network, 1, notVpn)
             override fun lost(network: N) = event(session, network, 2)
         })
 
@@ -48,6 +97,7 @@ internal class NetworkMonitorCoordinator<N, L>(
             session.started = true
             session.registering = true
             active = session
+            observation.start(session)
             session.revision
         }
         try {
@@ -89,12 +139,17 @@ internal class NetworkMonitorCoordinator<N, L>(
         launch?.let { pump(session, it) }
     }
 
-    private fun event(session: NetworkMonitorSession<N, L>, network: N, kind: Int) {
+    private fun event(session: NetworkMonitorSession<N, L>, network: N, kind: Int, notVpn: Boolean = false) {
         val launch = synchronized(gate) {
             if (active !== session || session.revoked || !session.started) return
             // The callback object is immutable and unique to this session's SDK
             // registration. Even equal Network values cannot cross this identity.
             if (kind != 0 && session.network != network) return
+            when (kind) {
+                0 -> observation.available(session, network)
+                1 -> observation.capabilities(session, network, notVpn)
+                2 -> observation.lost(session, network)
+            }
             session.network = if (kind == 2) null else network
             session.revision++
             enqueue(session)
@@ -197,7 +252,7 @@ internal class NetworkMonitorCoordinator<N, L>(
         session.current?.let { seal(it) }
         session.current = null
         session.network = null
-        if (active === session) active = null
+        if (active === session) { observation.stop(session); active = null }
     }
 
     internal fun stop(session: NetworkMonitorSession<N, L>) {

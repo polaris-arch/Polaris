@@ -612,7 +612,6 @@ fn every_uri_leg_hands_its_blocking_io_off_the_async_task() {
         "commands/misc/logs.rs",
         "commands/misc/backup.rs",
         "commands/taildrop.rs",
-        "commands/updater/core_update.rs",
     ] {
         let hits = crate_code(file).matches("PluginFiles::new(").count();
         if hits > 0 {

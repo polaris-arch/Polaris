@@ -166,6 +166,15 @@ pub fn config_generation_norm(
         }
     }
 
+    proj.insert(
+        "utlsPolicy".into(),
+        serde_json::json!(config
+            .utls_policy
+            .as_deref()
+            .and_then(crate::user_config::normalize::normalize_token)
+            .unwrap_or_else(|| "follow".into())),
+    );
+
     // 一等流量规则投影（缺省兼容 policyRules/customRules）。targetServerId 由 selector 热切，不进 norm。
     let traffic_rules_proj = {
         let dns_rule_active = |rule: &crate::user_config::rule::Rule| match &rule.effects {
@@ -230,15 +239,24 @@ pub fn config_generation_norm(
                             })
                         })
                         .collect();
-                    serde_json::json!({
-                        "__ext": 1,
-                        "id": r.id,
-                        "action": r.route_action(),
-                        "targetServerId": null,
-                        "combineMode": r.combine_mode,
-                        "bypassFakeIP": r.bypass_fakeip.unwrap_or(false),
-                        "conds": conds,
-                    })
+                    // Watchers own matcher values only; all outer rule semantics invalidate the core.
+                    let mut value = serde_json::to_value(r).expect("serializable rule");
+                    if let Some(object) = value.as_object_mut() {
+                        for key in ["remarks", "targetServerId", "values", "conditions", "type"] {
+                            object.remove(key);
+                        }
+                        if let Some(route) = object
+                            .get_mut("effects")
+                            .and_then(serde_json::Value::as_object_mut)
+                            .and_then(|effects| effects.get_mut("route"))
+                            .and_then(serde_json::Value::as_object_mut)
+                        {
+                            route.remove("targetServerId");
+                        }
+                        object.insert("__ext".into(), serde_json::json!(1));
+                        object.insert("conds".into(), serde_json::json!(conds));
+                    }
+                    value
                 }
             })
             .collect();
@@ -307,20 +325,7 @@ pub fn config_generation_norm(
     sorted_rr.sort_by(|a, b| a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or("")));
     proj.insert("ruleResources".into(), serde_json::Value::Array(sorted_rr));
 
-    // servers 投影：server_ids 过滤 + id 排序 + server_fingerprint。
-    let mut servers_proj: Vec<serde_json::Value> = config
-        .servers
-        .iter()
-        .filter(|s| server_ids.map(|ids| ids.contains(&s.id)).unwrap_or(true))
-        .map(|s| serde_json::Value::String(server_fingerprint(s)))
-        .collect();
-    servers_proj.sort_by(|a, b| {
-        // server_fingerprint 已含 id，但 Polaris 按 server.id 排序后再 fingerprint。
-        // 此处直接对 fingerprint 串排序（等价：fingerprint 内含 id，排序结果一致）。
-        a.as_str().unwrap_or("").cmp(b.as_str().unwrap_or(""))
-    });
-    // 注意：Polaris 先按 server.id.localeCompare 排序再 map fingerprint。
-    // 为字节精确对齐，需先按 id 排序。修正：
+    // servers 投影：过滤后按 id 稳定排序，每个节点只计算一次指纹。
     let mut servers_with_id: Vec<(&str, String)> = config
         .servers
         .iter()
@@ -333,8 +338,6 @@ pub fn config_generation_norm(
         .map(|(_, fp)| serde_json::Value::String(fp))
         .collect();
     proj.insert("servers".into(), serde_json::Value::Array(servers_final));
-    // 消除未使用警告（servers_proj 被 servers_final 替代）。
-    let _ = servers_proj;
 
     stable_stringify(&serde_json::Value::Object(proj))
 }

@@ -1,6 +1,9 @@
 use super::*;
 use std::sync::Mutex;
 
+#[cfg(target_os = "macos")]
+mod spawn_diagnostic;
+
 /// MockRunner：记录所有调用 + 按预设规则返回结果。测试完全不触碰宿主命令。
 #[derive(Default)]
 struct MockRunner {

@@ -24,6 +24,7 @@
  */
 
 import type { FieldSpec, FormValues } from './field-spec';
+import { NODE_UTLS_OPTIONS, SHADOW_UTLS_OPTIONS } from '@/domain/utls';
 
 /** 节点表单支持的 17 协议（不含 wireguard/tailscale，见上方文件头注释）。 */
 export type NodeProto =
@@ -140,22 +141,9 @@ const O_NET: readonly (readonly [string, string])[] = [
   ['httpupgrade', 'HTTPUpgrade'],
   ['http', 'HTTP/2'],
 ];
-const O_FP: readonly (readonly [string, string])[] = [
-  ['chrome', 'Chrome'],
-  ['firefox', 'Firefox'],
-  ['safari', 'Safari'],
-  ['edge', 'Edge'],
-  ['random', 'random'],
-];
-/**
- * uTLS 指纹选项 **带「不启用」首项** —— vmess / trojan 专用，与 vless/anytls 的 `O_FP` 分开是因为
- * **后端缺省值按协议不同**（`builder/outbound.rs` 的 `final_fp`）：缺 `fingerprint` 时 vless/anytls
- * 回落 `chrome`，其余协议回落 `none`，而 `final_fp === 'none'` 时整个 `tls.utls` 块不下发。
- * 若这两个协议直接复用 `O_FP`，`draftFromSpecs` 会把首项 `chrome` 当默认值 seed 进草稿 ⇒ 新建的
- * vmess/trojan 节点凭空多出 `utls: {enabled:true, fingerprint:"chrome"}`，与今天的生成结果不同。
- * 空串首项 = 「不下发该键」= 后端缺省 `none`（同 vless 的 flow / hy2 的 bbr 的既有写法）。
- */
-const O_FP_OPT: readonly (readonly [string, string])[] = [['', 'none'], ...O_FP];
+// Missing intent is a compatibility default, distinct from core default and disabled.
+const O_FP = NODE_UTLS_OPTIONS;
+const O_FP_OPT = NODE_UTLS_OPTIONS;
 
 /**
  * TLS 栈引擎档位（`tls.engine`）—— **首项必须是空串**。
@@ -600,7 +588,7 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
       { t: 'text', k: 'stlsSni', label: 'node.field.stlsSni', ph: 'www.microsoft.com', when: whenStls },
       // 指纹沿用全仓 O_FP（vless/anytls 同一份）；后端 `ShadowTlsSettings::fingerprint` 是开放 String +
       // 消费点归一，缺省回落 chrome，故本表不必与 uTLS 取值集同步扩张。存量的表外值由渲染层保留（见 FieldSpec）。
-      { t: 'select', k: 'stlsFp', label: 'node.field.stlsFp', options: O_FP, when: whenStls },
+      { t: 'select', k: 'stlsFp', label: 'node.field.stlsFp', options: SHADOW_UTLS_OPTIONS, when: whenStls },
       // 真实端口：Rust 侧 `port: Option<u16>`，None **或 0** 都降级用节点主端口（outbounds.rs 显式判 `p != 0`），故 opt。
       { t: 'number', k: 'stlsPort', label: 'node.field.stlsPort', ph: '443', opt: true, when: whenStls },
       ...F_MUX,

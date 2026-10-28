@@ -120,7 +120,9 @@ const POLICY_FORM: &str = "StdioPolicy::";
 /// `.spawn()` 写成不带实参的形态是有意的：`Command::spawn` 不收参数，而 `thread::spawn(closure)` /
 /// `tokio::spawn(fut)` / `spawner.spawn(&req)` 都带实参，写成 `.spawn()` 就不会把线程池和 trait
 /// 调用误当成起进程。
-const CHILD_CREATION_FORMS: &[&str] = &[".spawn()", ".output()"];
+// CheckCustody 的两种输入复用同一个私有同步工厂；其实际 builder.spawn、
+// 同 run 的 Child 交接和此处调用绑定由下方精确接线门另行钉住。
+const CHILD_CREATION_FORMS: &[&str] = &[".spawn()", ".output()", "Self::attach_child("];
 
 /// 自带排空语义的等待形态：并发读两条流直到 EOF，等待与排空是同一个动作。
 ///
@@ -142,6 +144,7 @@ const KNOWN_DRAIN_FORMS: &[&str] = &[
     "spawn_pipe_drainers",
     "pipe_to_log(",
     "pipe_to_log_with_secrets(",
+    "pipe_to_log_with_secrets_owned(",
     "drain(",
     "lines()",
     // 直接读到 EOF。**这一条今天没有任何生产站点在用**，它在集合里是因为它是 `resolvectl` 那条腿在
@@ -152,6 +155,12 @@ const KNOWN_DRAIN_FORMS: &[&str] = &[
     // CheckCustody 的两条流由 OutputCapture::read 立即起独立 read_to_end 任务。
     // 精确接线与真实读体由 check_custody_starts_both_eof_readers_before_return 钉住。
     "output.read(",
+    // StdCommandRunner 的两条流各交给一个 CommandReader，起线程跑原来那个读到 EOF 的 `drain`。
+    // 精确接线与真实读体由 std_command_runner_starts_both_eof_readers_before_it_waits 钉住。
+    "CommandReader::start(",
+    // Legacy observer: two independent bounded EOF readers before polling.
+    // Real input reader and both thread handoffs are separately pinned below.
+    "capture(",
 ];
 
 /// 「带着两条未排空管道的 child」这件事在**类型**上的全部落点。
@@ -236,7 +245,7 @@ const PIPED_SITES: &[PipedSite] = &[
     PipedSite {
         file: "crates/core-supervisor/src/config_gate/check_custody.rs",
         // 常规平台 check 子进程的 custody owner，返回前两条流均交给 EOF 任务。
-        anchor: "fn spawn(",
+        anchor: "fn spawn_mode(",
         kind: SiteKind::Sink,
         drain_forms: &["output.read("],
     },
@@ -250,6 +259,12 @@ const PIPED_SITES: &[PipedSite] = &[
         kind: SiteKind::Producer,
         drain_forms: &[],
     },
+    PipedSite {
+        file: "crates/helper/src/legacy_use.rs",
+        anchor: "fn observe_command(",
+        kind: SiteKind::Sink,
+        drain_forms: &["capture("],
+    },
     // ── crates/helper（特权守护进程 / 服务；卡死后果比 app 侧重）──
     PipedSite {
         file: "crates/helper/src/platform/linux/resolved_dns.rs",
@@ -260,7 +275,7 @@ const PIPED_SITES: &[PipedSite] = &[
     },
     PipedSite {
         file: "crates/helper/src/platform/linux/server.rs",
-        anchor: "impl CoreSpawner for AmbientCapsSpawner {",
+        anchor: "fn spawn_verified(",
         kind: SiteKind::Sink,
         drain_forms: &["spawn_pipe_loggers_with_file"],
     },
@@ -282,18 +297,6 @@ const PIPED_SITES: &[PipedSite] = &[
     },
     PipedSite {
         file: "crates/helper/src/platform/windows/winproc/win.rs",
-        // D4 的 `ipconfig /flushdns`：SYSTEM 下跑，两条流局部自捕（ipconfig 的失败文字在 stdout）。
-        anchor: "fn flush_dns(&self) -> Result<(), String> {",
-        kind: SiteKind::Sink,
-        // 两条流各一个读线程读到 EOF，**先于**有界等待与 `child.wait()`。
-        // 此前这条腿用 `.output()`：排空是对的，但没有上界 —— ipconfig 卡在 DNS Client 服务上时，
-        // 这条连接线程与它占的管道实例被一起扣住（见 `windows::logic::FLUSH_DNS_TIMEOUT_MS`）。
-        // 换成「读线程 + `WaitForSingleObject` 有界等待 + 到点硬杀」之后，排空形态从自带排空的
-        // `.output()` 变成显式的 `read_to_string(`，故必须登记在这里。
-        drain_forms: &["read_to_string("],
-    },
-    PipedSite {
-        file: "crates/helper/src/platform/windows/winproc/win.rs",
         anchor: "fn spawn_tracked(",
         kind: SiteKind::Sink,
         drain_forms: &[
@@ -304,10 +307,12 @@ const PIPED_SITES: &[PipedSite] = &[
     // ── crates/system-integration ──
     PipedSite {
         file: "crates/system-integration/src/exec.rs",
-        anchor: "impl CommandRunner for StdCommandRunner {",
+        // 起进程与取管道搬进了固有方法 `run_observed`；`CommandRunner::run` 只剩把它的结果折回
+        // 旧返回形态的一行，自己不再开管道。
+        anchor: "impl StdCommandRunner {",
         kind: SiteKind::Sink,
         // 本仓最早把「先轮询后读会死锁」写进文档的地方，也是 300 KB 灌满行为门的被测对象。
-        drain_forms: &["drain("],
+        drain_forms: &["CommandReader::start("],
     },
     // ── src-tauri（GUI 宿主进程）──
     //
@@ -395,9 +400,10 @@ const PRODUCER_CONSUMERS: &[Consumer] = &[
     Consumer {
         file: "src-tauri/src/runtime/speedtest.rs",
         // 锚点在**批级**入口：T1-R1 分批之后 `TempCoreSession::run` 变成轮级薄壳（切批 + 心跳 +
-        // 唯一终态），起核那一段连同 spawn 请求的构造留在 `run_batch` —— 分批**没有**新开第二条
-        // spawn 路径，它仍然是全 app 唯一那份 `SpawnRequest` 装配。
-        anchor: "async fn run_batch<Meas, MeasFut>(",
+        // 唯一终态），`run_batch` 再缩成准入与登记，起核那一段连同 spawn 请求的构造落在
+        // `run_admitted_batch` —— 两次拆分都**没有**新开第二条 spawn 路径，它仍然是全 app 唯一那份
+        // `SpawnRequest` 装配。
+        anchor: "async fn run_admitted_batch<Meas, MeasFut>(",
         drain_form: "pipe_to_log(",
         // 测速临时核：本轮根因所在的那条腿。target 必须是它自己的，`fatal`/`handoff` 都没有。
         wiring: &[
@@ -410,13 +416,13 @@ const PRODUCER_CONSUMERS: &[Consumer] = &[
         file: "src-tauri/src/runtime/tailscale_login_core.rs",
         // Prepared attempts moved production spawn assembly here; start_login is a test-only wrapper.
         anchor: "async fn launch_attempt(",
-        drain_form: "pipe_to_log_with_secrets(",
+        drain_form: "pipe_to_log_with_secrets_owned(",
         // 瞬态登录核：整改前这条腿在源码级上是**零门**（计数判据被一行补计数的调用绕过），
         // 而它与临时核共用同一个 spawner、同一份排空实现，缺陷形态完全同构。
         wiring: &[
             "StdioPolicy::drain(move|stdout,stderr|{",
-            "pipe_to_log_with_secrets(stdout,LOGIN_CORE_LOG_TARGET,None,None,secrets.clone(),);",
-            "pipe_to_log_with_secrets(stderr,LOGIN_CORE_LOG_TARGET,None,None,secrets);",
+            "pipe_to_log_with_secrets_owned(stdout,LOGIN_CORE_LOG_TARGET,None,None,secrets.clone(),);",
+            "pipe_to_log_with_secrets_owned(stderr,LOGIN_CORE_LOG_TARGET,None,None,secrets,);",
         ],
     },
 ];
@@ -1112,8 +1118,28 @@ fn check_custody_starts_both_eof_readers_before_return() {
         &index,
         "crates/core-supervisor/src/config_gate/check_custody.rs",
     );
-    let spawn = block_of(owner, "fn spawn(");
+    let spawn = block_of(owner, "fn spawn_mode(");
     let compact: String = spawn.chars().filter(|c| !c.is_whitespace()).collect();
+    let factory_call = "Self::attach_child(run,&mutbuilder)";
+    // 此新增形态只登记原 custody 的两条实际调用；不能把同名空 helper
+    // 当作其它站点的 spawn 信用。
+    assert_eq!(owner.masked.matches("Self::attach_child(").count(), 2);
+    assert!(surface
+        .iter()
+        .filter(|scanned| scanned.rel != owner.rel)
+        .all(|scanned| !scanned.masked.contains("Self::attach_child(")));
+    assert_eq!(compact.matches(factory_call).count(), 1);
+    let returned_child = "letchild=run.child.as_mut().expect(";
+    assert_eq!(compact.matches(returned_child).count(), 1);
+    assert!(compact.find(factory_call).unwrap() < compact.find(returned_child).unwrap());
+    let attach = block_of(owner, "fn attach_child(");
+    let attach_compact: String = attach.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(attach_compact.matches("builder.spawn()").count(), 1);
+    assert_eq!(attach_compact.matches("run.child=Some(child);").count(), 1);
+    assert!(
+        attach_compact.find("builder.spawn()").unwrap()
+            < attach_compact.find("run.child=Some(child);").unwrap()
+    );
     for wiring in [
         "letstdout=child.stdout.take();",
         "letstderr=child.stderr.take();",
@@ -1125,13 +1151,105 @@ fn check_custody_starts_both_eof_readers_before_return() {
             1,
             "custody 接线漂移：{wiring}"
         );
+        assert!(compact.find(returned_child).unwrap() < compact.find(wiring).unwrap());
         assert!(compact.find(wiring).unwrap() < compact.find("Ok(Ok((request,output)))").unwrap());
     }
     let read = block_of(owner, "fn read<R:");
     assert!(read.contains("tokio::spawn("), "EOF reader 必须立即起任务");
+    let read_compact: String = read.chars().filter(|c| !c.is_whitespace()).collect();
+    let read_task = read_compact
+        .split_once("tokio::spawn(asyncmove{")
+        .expect("the actual asynchronous read task must exist")
+        .1
+        .split_once("});letmuttasks=")
+        .expect("reader registration must remain outside the read task")
+        .0;
+    // The capability query retains at most 64 KiB per stream, while both
+    // actual pipes keep draining after that retention budget is exhausted.
+    assert!(compact.contains("max_bytes:config.is_none().then_some(64*1024),"));
+    for required in [
+        "letmutchunk=[0_u8;8192];",
+        "letmutoverflow=false;",
+        "loop{matchpipe.read(&mutchunk).await{",
+        "Ok(0)=>break,",
+        "letremaining=output.max_bytes.map(|limit|limit.saturating_sub(bytes.len())).unwrap_or(count);",
+        "bytes.extend_from_slice(&chunk[..count.min(remaining)]);",
+        "overflow|=count>remaining;",
+        "ifoverflow{ifletOk(muterrors)=output.errors.lock(){errors.push(",
+    ] {
+        assert_eq!(
+            read_task.matches(required).count(),
+            1,
+            "bounded EOF capture lost its exact source contract: {required}"
+        );
+    }
+    let count_arm = read_task
+        .split_once("Ok(count)=>{")
+        .expect("the real read count arm must exist")
+        .1
+        .split_once("Err(error)=>{")
+        .expect("the real read error arm must remain distinct")
+        .0;
     assert!(
-        read.contains("pipe.read_to_end("),
-        "读任务必须将真实 pipe 读到 EOF"
+        !count_arm.contains("break") && !count_arm.contains("return"),
+        "a data/overflow chunk must continue draining instead of leaving the reader"
+    );
+    assert_eq!(
+        read_task.matches("break").count(),
+        2,
+        "only EOF and a pipe I/O error end the drain loop"
+    );
+    assert_eq!(
+        read_task.matches("return").count(),
+        1,
+        "only a missing pipe may return before draining"
+    );
+    assert!(
+        !read.contains("read_to_end("),
+        "bounded capture must not restore an unbounded read"
+    );
+}
+
+/// `CommandReader::start(` 进了 [`KNOWN_DRAIN_FORMS`]，而它只是一个名字：这里钉住它背后确实是
+/// 「两条流各起一个线程读到 EOF，且早于第一次等待」。少了这条，把 `start` 的线程体换成别的东西、
+/// 或只接一条流，[`every_piped_site_is_registered_and_drains_before_it_waits`] 都照绿。
+#[test]
+fn std_command_runner_starts_both_eof_readers_before_it_waits() {
+    let surface = scan_surface();
+    let index = surface_by_path(&surface);
+    let owner = file_of(&index, "crates/system-integration/src/exec.rs");
+    // 这个形态只给它自己的家记信用；别处出现同名 helper 不能借它的名字过门。
+    assert!(surface
+        .iter()
+        .filter(|scanned| scanned.rel != owner.rel)
+        .all(|scanned| !scanned.masked.contains("CommandReader::start(")));
+    let run = block_of(owner, "impl StdCommandRunner {");
+    let compact: String = run.chars().filter(|c| !c.is_whitespace()).collect();
+    let first_wait = first_of(&compact, WAIT_FORMS).expect("轮询等待必须还在这个块里");
+    for wiring in [
+        "letstdout=CommandReader::start(child.stdout.take());",
+        "letstderr=CommandReader::start(child.stderr.take());",
+    ] {
+        assert_eq!(
+            compact.matches(wiring).count(),
+            1,
+            "runner 接线漂移：{wiring}"
+        );
+        assert!(
+            compact.find(wiring).unwrap() < first_wait,
+            "排空必须早于第一次等待：{wiring}"
+        );
+    }
+    let reader = block_of(owner, "impl CommandReader {");
+    let reader_compact: String = reader.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        reader_compact.contains("std::thread::Builder::new().spawn(move||drain(pipe))"),
+        "reader 必须立即起线程跑 `drain`"
+    );
+    let drain = block_of(owner, "fn drain(");
+    assert!(
+        drain.contains("pipe.read_to_end("),
+        "读线程必须把真实 pipe 读到 EOF"
     );
 }
 
@@ -2002,4 +2120,54 @@ fn the_order_leg_is_red_on_the_historical_resolvectl_defect() {
         err.contains("晚于等待"),
         "红的不是次序腿，而是别的东西（{err}）—— 那这次回放仍然没有证明次序判据对真缺陷敏感"
     );
+}
+
+fn legacy_capture_wiring_is_complete(owner: &str, reader: &str) -> bool {
+    let compact: String = owner.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(wait) = first_of(&compact, WAIT_FORMS) else {
+        return false;
+    };
+    for stream in ["out", "err"] {
+        let handoff = format!("let{stream}=std::thread::spawn(move||capture({stream}));");
+        if compact.matches(&handoff).count() != 1
+            || compact.find(&handoff).is_none_or(|at| at >= wait)
+            || !compact.contains(&format!(
+                "let{stream}=child.{}.take()",
+                if stream == "out" { "stdout" } else { "stderr" }
+            ))
+            || !compact.contains(&format!("{stream}.join()"))
+        {
+            return false;
+        }
+    }
+    let reader: String = reader.chars().filter(|c| !c.is_whitespace()).collect();
+    reader.contains("input.by_ref().take(OUTPUT_LIMIT+1).read_to_end(&mutbytes)?")
+        && reader.contains("ifbytes.len()asu64>OUTPUT_LIMIT")
+        && reader.contains("returnErr(")
+}
+
+#[test]
+fn legacy_observer_starts_both_bounded_readers_before_waiting_and_joins_them() {
+    let surface = scan_surface();
+    let index = surface_by_path(&surface);
+    let owner = file_of(&index, "crates/helper/src/legacy_use.rs");
+    let run = block_of(owner, "fn observe_command(");
+    let reader = block_of(owner, "fn capture(");
+    assert!(legacy_capture_wiring_is_complete(run, reader));
+    for broken in [
+        run.replace("capture(out)", "ignore(out)"),
+        run.replace("capture(err)", "ignore(err)"),
+        run.replace(".join()", ".discard()"),
+        format!("child.try_wait();{run}"),
+    ] {
+        assert!(!legacy_capture_wiring_is_complete(&broken, reader));
+    }
+    assert!(!legacy_capture_wiring_is_complete(
+        run,
+        &reader.replace(".take(OUTPUT_LIMIT + 1)", "")
+    ));
+    assert!(!legacy_capture_wiring_is_complete(
+        run,
+        &reader.replace(".read_to_end(", ".ignore(")
+    ));
 }

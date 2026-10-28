@@ -16,6 +16,11 @@
  * 广播 `configChanged` → 浮层这里重解析（`refreshTrayLang`，见 `TrayMenu.tsx` 的两个调用时刻）。
  */
 
+import { measurement as measurementZhCN } from '@/i18n/locales/zh-CN.json';
+import { measurement as measurementZhTW } from '@/i18n/locales/zh-TW.json';
+import { measurement as measurementEnUS } from '@/i18n/locales/en-US.json';
+import { measurement as measurementRu } from '@/i18n/locales/ru.json';
+import { measurement as measurementFa } from '@/i18n/locales/fa.json';
 import { createAuxI18n } from '@/i18n/auxiliary';
 import { tray as zhCN } from '@/i18n/locales/auxiliary/zh-CN.json';
 import { tray as zhTW } from '@/i18n/locales/auxiliary/zh-TW.json';
@@ -50,7 +55,20 @@ export const trayLang = i18n.lang;
  * **这一代 WebView**内不会自行重算。没有这条重解析腿，用户在主窗改语言后只能等回收重建，当前浮层
  * 会继续显示旧语言。
  */
-export const refreshTrayLang = i18n.refresh;
+export const refreshTrayLang = () => {
+  const lang = i18n.refresh();
+  measurementI18n.refresh();
+  return lang;
+};
 
 /** 取浮层文案。键即 `locales/*.json` 的 `tray.*`，5 语种齐备（缺哪个语种由 locale-parity 门先转红）。 */
 export const t = i18n.t;
+
+type MeasurementKey = `measurement.${Extract<keyof typeof measurementEnUS, string>}`;
+const measurementI18n = createAuxI18n<MeasurementKey>('measurement', {
+  'zh-CN': measurementZhCN, 'zh-TW': measurementZhTW, 'en-US': measurementEnUS, ru: measurementRu, fa: measurementFa,
+});
+/** Same refreshed language as the rest of the warm tray, even in an isolated JS window. */
+const isMeasurementKey = (key: string): key is MeasurementKey => key.startsWith('measurement.')
+  && Object.prototype.hasOwnProperty.call(measurementEnUS, key.slice('measurement.'.length));
+export const measurementT = (key: string): string => isMeasurementKey(key) ? measurementI18n.t(key) : key;

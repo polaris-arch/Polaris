@@ -183,3 +183,5 @@ fn windows_patterns_align() {
     // 不对齐前缀 → 空。
     assert!(ipv4_cidr_to_windows_patterns("100.64.0.0/10").is_empty());
 }
+
+mod audit_regressions;

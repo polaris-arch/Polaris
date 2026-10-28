@@ -1,13 +1,25 @@
 name: Desktop Core Sources
 
-# One four-native-producer bundle per caller run. Receipts remain transport
-# evidence; the unchanged consumer verifies all four actual binaries before use.
+# Committed release or temporary-desktop selection verifies four immutable inputs
+# on their real native hosts. Temporary producer receipts retain their own schema
+# and do not grant formal publication approval.
+# Source-mode callers build four native cores. Explicit technical validation builds
+# Windows and retrieves three reviewed D origins, or four fresh cores for an
+# explicitly frozen source-owned replacement. Receipts are never relabeled.
+# Every consumer still verifies all four actual binaries before use.
 on:
   workflow_call:
     inputs:
+      preserve_run:
+        type: boolean
+        default: false
       candidate:
         type: string
         required: true
+      native_validation:
+        type: boolean
+        required: false
+        default: false
     outputs:
       candidate:
         value: ${{ inputs.candidate }}
@@ -25,21 +37,46 @@ env:
   CORE_CANDIDATE: ${{ inputs.candidate }}
   CORE_RUN_ID: ${{ github.run_id }}
   CORE_RUN_ATTEMPT: ${{ github.run_attempt }}
+  POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.native_validation && '1' || '0' }}
 
 jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.source-plan.outputs.matrix }}
+      legacy_origins: ${{ steps.source-plan.outputs.legacy_origins }}
+      release: ${{ steps.source-plan.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Select producers from verified frozen manifest
+        id: source-plan
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$CORE_CANDIDATE" ]
+          [ -z "$(git status --porcelain --untracked-files=no)" ]
+          node --input-type=module -e 'import {desktopProducerPlan} from "./scripts/desktop-core/validation-origin.mjs"; const p=desktopProducerPlan(process.cwd(),process.env.POLARIS_NATIVE_PAYLOAD_VALIDATION === "1"); console.log("matrix="+JSON.stringify(p.matrix)); console.log("legacy_origins="+p.legacyOrigins); console.log("release="+p.release)' >> "$GITHUB_OUTPUT"
+
   produce:
-    name: native core (${{ matrix.platform }})
+    needs: plan
+    name: native core input (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {"platform":"linux","os":"ubuntu-22.04","host":"linux","arch":"x64"}
-          - {"platform":"win","os":"windows-2022","host":"win32","arch":"x64"}
-          - {"platform":"mac-x64","os":"macos-15-intel","host":"darwin","arch":"x64"}
-          - {"platform":"mac-arm64","os":"macos-15","host":"darwin","arch":"arm64"}
+        # Frozen DNS inputs use four fresh native producers in this attempt.
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
+      - name: Set absolute release-consumer job deadline
+        shell: bash
+        run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 89 * 60000) + "\n")'
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.candidate }}
@@ -62,11 +99,14 @@ jobs:
           [[ "$CORE_CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
           [ "$(git rev-parse HEAD)" = "$CORE_CANDIDATE" ]
           [ -z "$(git status --porcelain --untracked-files=no)" ]
+          if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
+            node --input-type=module -e 'import {validationContext} from "./scripts/desktop-core/validation-origin.mjs"; validationContext(process.env.CORE_CANDIDATE)'
+          fi
           node -e 'if (process.platform !== process.env.CORE_HOST || process.arch !== process.env.CORE_ARCH) throw Error("native producer host differs")'
 
       - name: Read pinned source Go version
         id: go-pin
-        run: node -e 'console.log("version=" + require("./scripts/libbox-patches/source-manifest.json").goVersion)' >> "$GITHUB_OUTPUT"
+        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
         with:
@@ -74,7 +114,7 @@ jobs:
           cache: false
 
       - name: Verify native macOS SDK and compiler
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && needs.plan.outputs.release != 'true'
         run: |
           set -euo pipefail
           sdk="$(xcrun --sdk macosx --show-sdk-path)"
@@ -92,11 +132,18 @@ jobs:
 
       # On Windows the unchanged producer performs native systemconfig Go unit
       # tests. Darwin CGO uses the actual SDK above; no cross-host substitute.
-      - name: Produce exact platform source artifact
+      - name: Acquire exact platform core input
         env:
+          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
           CORE_PLATFORM: ${{ matrix.platform }}
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
-        run: node scripts/fetch-core.mjs --producer --platform="$CORE_PLATFORM" --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.plan.outputs.release }}" = true ]; then
+            node scripts/desktop-core/release-native-gates.mjs acquire --platform="$CORE_PLATFORM" --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          else
+            node scripts/fetch-core.mjs --producer --platform="$CORE_PLATFORM" --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          fi
 
       - uses: actions/upload-artifact@v7
         with:
@@ -107,8 +154,11 @@ jobs:
           retention-days: 7
 
   assemble:
-    name: verify four source artifacts
-    needs: produce
+    name: verify four native core inputs
+    needs: [plan, produce]
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-22.04
     outputs:
       artifact_name: ${{ steps.bundle.outputs.artifact_name }}
@@ -124,7 +174,7 @@ jobs:
 
       - name: Read pinned source Go version
         id: go-pin
-        run: node -e 'console.log("version=" + require("./scripts/libbox-patches/source-manifest.json").goVersion)' >> "$GITHUB_OUTPUT"
+        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
         with:
@@ -132,8 +182,10 @@ jobs:
           cache: false
 
       # Default download scope is this workflow run, including reusable jobs.
-      # No token/run-id override may turn this into a previous-run fallback.
+      # Ordinary downloads have no previous-run fallback. The separate validation
+      # downloader below accepts only committed exact origin IDs/ZIP/receipt pins.
       - name: Download Linux source artifact from this attempt
+        if: needs.plan.outputs.legacy_origins != 'true'
         uses: actions/download-artifact@v8
         with:
           name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-linux
@@ -146,24 +198,44 @@ jobs:
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - name: Download Intel macOS source artifact from this attempt
+        if: needs.plan.outputs.legacy_origins != 'true'
         uses: actions/download-artifact@v8
         with:
           name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-mac-x64
           path: ${{ runner.temp }}/desktop-core-bundle
 
       - name: Download arm64 macOS source artifact from this attempt
+        if: needs.plan.outputs.legacy_origins != 'true'
         uses: actions/download-artifact@v8
         with:
           name: desktop-core-producer-${{ inputs.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}-mac-arm64
           path: ${{ runner.temp }}/desktop-core-bundle
 
+      - uses: actions/setup-python@v6
+        if: needs.plan.outputs.legacy_origins == 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Retrieve reviewed unchanged native origins
+        if: needs.plan.outputs.legacy_origins == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/desktop-core/validation-download.py --bundle-dir="$RUNNER_TEMP/desktop-core-bundle"
+
       - name: Assemble and verify exact candidate bundle
         id: bundle
         env:
+          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: |
           set -euo pipefail
-          node scripts/fetch-core.mjs --assemble --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          if [ "${{ needs.plan.outputs.release }}" = true ]; then
+            node scripts/desktop-core/release-native-gates.mjs assemble --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          elif [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
+            node scripts/fetch-core.mjs --assemble --validation-origin --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          else
+            node scripts/fetch-core.mjs --assemble --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
+          fi
           node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
           echo "artifact_name=desktop-core-bundle-$CORE_CANDIDATE-$CORE_RUN_ID-$CORE_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 

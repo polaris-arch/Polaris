@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
+use futures::StreamExt;
 
 use polaris_config_engine::builder::hotswitch::HotSwitchPlan;
 
@@ -35,6 +36,9 @@ use crate::precision_disconnect::{
     select_connections_to_close, switched_pairs_from_puts, ConnectionSnapshot,
     PrecisionDisconnectOutcome, SwitchedMemberPair,
 };
+
+/// 与 runtime 单条断连相同的上限；只调度已通过精准筛选的 ID。
+const CLOSE_CONCURRENCY: usize = 16;
 
 /// sing-box 管理 API 的最小契约（热切换 + 连接管理）。
 ///
@@ -62,7 +66,7 @@ pub trait ManagementApi: Send + Sync {
     /// 取连接列表首帧快照（精准断连用）。
     ///
     /// 上游 `subscribeConnections(1_000_000_000, cb)` 的首帧（reset 帧 = 内核当前全量连接）。
-    /// 带 3s 兜底超时（上游 `guard = setTimeout(..., 3000)`）：首帧不来时返回空（跳过断连，
+    /// 带 3s 兜底超时（上游 `guard = setTimeout(..., 3000)`）：首帧不来时返回错误（跳过断连并报告，
     /// 宁可漏关不泄漏订阅）。返回当前全量连接快照（含已关闭的死连接历史环，由本层过滤）。
     async fn first_connection_snapshot(&self) -> Result<Vec<ConnectionSnapshot>, ManagementError>;
 }
@@ -160,12 +164,13 @@ impl SwitchExecutor {
         HotSwitchOutcome::Applied { disconnect }
     }
 
-    /// 精准断连：取连接首帧 → 筛命中 pair 的活连接 → 逐条关。
+    /// 精准断连：取连接首帧 → 筛命中 pair 的活连接 → 有界并发逐条关。
     ///
     /// 上游 `closeOldNodeConnectionsAfterHotSwitch`（L2015-2068）。pair 从 puts 现算
     /// （实际改变了指向的 selector 的 (selector, 旧成员) 对）。
     ///
-    /// best-effort：连接首帧超时 / 关连接失败 → 不阻断热切换（已 PUT 成功），仅影响断连计数。
+    /// best-effort：连接首帧超时 / 关连接失败 → 不阻断热切换（已 PUT 成功）。
+    /// outcome 保留筛选时的 ID 顺序和口径，不是逐条关闭成功的 ACK 收据。
     async fn precision_disconnect(
         &self,
         api: &dyn ManagementApi,
@@ -175,18 +180,32 @@ impl SwitchExecutor {
         if pairs.is_empty() {
             return PrecisionDisconnectOutcome::default();
         }
-        // 连接首帧（3s 兜底超时由 trait 实现负责）。超时 / 失败 → 空列表（跳过断连，不阻断热切）。
+        // 连接首帧（3s 兜底超时由 trait 实现负责）。超时 / 失败 → 显式错误结果（跳过断连，不阻断热切）。
         let snapshot = match api.first_connection_snapshot().await {
             Ok(s) => s,
-            Err(_) => return PrecisionDisconnectOutcome::default(),
+            Err(error) => {
+                return PrecisionDisconnectOutcome {
+                    snapshot_error: Some(error.to_string()),
+                    ..PrecisionDisconnectOutcome::default()
+                }
+            }
         };
         let outcome = select_connections_to_close(&snapshot, &pairs);
-        // 逐条关（best-effort：失败仅忽略，不阻断——上游 `void client.closeConnection(id).catch(()=>{})`）。
-        for id in &outcome.closed_ids {
-            let _ = api.close_connection(id).await;
-        }
+        // 复用 runtime 的 owned ID + 借用 API + buffer_unordered 模式，不调用 close-all。
+        // ID 按需克隆，最多 16 条在途；不收集无用的结果，也不改变 outcome 的选择顺序。
+        // 无 spawn：外层 future 被取消时，一起丢弃尚未完成的关闭 future。已发出的 RPC 无法撤回。
+        let mut closes = futures::stream::iter(outcome.closed_ids.iter().cloned())
+            .map(|id| close_selected_connection(api, id))
+            .buffer_unordered(CLOSE_CONCURRENCY);
+        while closes.next().await.is_some() {}
+        drop(closes);
         outcome
     }
+}
+
+/// 沿用收到的 API（含上层 generation/intent gate）；单项失败不阻断其余选中 ID。
+async fn close_selected_connection(api: &dyn ManagementApi, id: String) {
+    let _ = api.close_connection(&id).await;
 }
 
 /// 测试用 mock 管理 API：可预设 PUT 成功/失败 + 连接快照。

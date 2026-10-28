@@ -36,6 +36,7 @@ fn ticket() -> ReadyMainTicket {
         local_http_proxy: Some(LocalHttpProxy {
             port: 9878,
             auth: None,
+            inbound: crate::runtime::proxy::LocalInbound::Mixed,
         }),
         committed: AtomicBool::new(true),
     });
@@ -423,13 +424,6 @@ impl super::super::system_takeover::SystemProxyClearer for NoSystemProxy {
         Ok(false)
     }
 }
-struct NoNetwork;
-#[async_trait]
-impl polaris_dns_race::DohPost for NoNetwork {
-    async fn post_dns_message(&self, _: &str, _: Vec<u8>) -> Result<Vec<u8>, String> {
-        panic!("prerequisite pure tests cannot use host network")
-    }
-}
 pub(super) fn runtime() -> (Arc<ProxyRuntime>, crate::test_support::TestDir) {
     let dir = crate::test_support::TestDir::new("polaris-prerequisite-");
     let runtime = Arc::new(ProxyRuntime::new(
@@ -441,7 +435,6 @@ pub(super) fn runtime() -> (Arc<ProxyRuntime>, crate::test_support::TestDir) {
         ),
         Arc::new(crate::runtime::mesh::MeshRuntime::new(dir.to_path_buf())),
         Box::new(NoSystemProxy),
-        Arc::new(NoNetwork),
     ));
     (runtime, dir)
 }
@@ -470,7 +463,6 @@ pub(super) fn credential_runtime(
         ),
         Arc::clone(&mesh),
         Box::new(NoSystemProxy),
-        Arc::new(NoNetwork),
     ));
     let gate = Arc::clone(&runtime.gate);
     (runtime, mesh, dir, gate)

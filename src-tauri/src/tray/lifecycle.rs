@@ -78,6 +78,13 @@ impl OverlayLifecycle {
         self.show_requested = false;
     }
 
+    /// Ignore cold-build focus noise; an explicit dismiss always cancels intent.
+    pub(super) fn dismiss(&mut self, visible: bool, explicit: bool) {
+        if visible || explicit {
+            self.hide();
+        }
+    }
+
     pub(super) fn reset(&mut self) {
         // 让旧 renderer 的迟到 ready 回执失效；新冷建再递增一次不影响语义。
         self.generation = self.generation.wrapping_add(1);

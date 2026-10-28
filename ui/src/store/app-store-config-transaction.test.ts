@@ -28,6 +28,7 @@ vi.mock('@/ipc', () => ({
   api: {
     config: {
       get: () => getMock(),
+      onChangedReady: async () => () => {},
       save: (config: UserConfig, deferRestart: boolean, baseVersion: string) =>
         saveMock(config, deferRestart, baseVersion),
       patch: (patch: Partial<UserConfig>) => patchMock(patch),
@@ -118,7 +119,7 @@ describe('配置保存与下一次启动的事务边界', () => {
     expect(useAppStore.getState().config).toBeNull();
 
     const second = useAppStore.getState().loadConfig(true);
-    await vi.waitFor(() => expect(getMock).toHaveBeenCalledTimes(2));
+    expect(getMock).toHaveBeenCalledTimes(1);
     releaseCleanExit(false);
     await Promise.all([first, second]);
 
@@ -195,13 +196,14 @@ describe('配置保存与下一次启动的事务边界', () => {
     expect(useStagedConfigStore.getState().entries).toEqual([ENTRY]);
   });
 
-  it('即时编辑只发送本次字段补丁，并采用后端合并后的完整配置', async () => {
+  it('即时编辑只发送本次字段补丁，并采用写后 fresh 读取的完整配置', async () => {
     const backendMerged = {
       ...CONFIG,
       logLevel: 'debug',
       subscriptions: [{ id: 'sub-1', etag: 'concurrent-newer' }],
     } as unknown as UserConfig;
     patchMock.mockResolvedValue(backendMerged);
+    getMock.mockResolvedValueOnce(backendMerged);
 
     await useAppStore.getState().saveConfig({ logLevel: 'debug' });
 

@@ -730,3 +730,36 @@ fn privileged_sid_whitelist_is_exactly_system_and_administrators() {
         assert!(!is_privileged_sid(sid), "{sid} 不该在白名单里");
     }
 }
+
+#[test]
+fn native_config_acl_does_not_accept_other_users_or_unknown_aces() {
+    let sid = "S-1-5-21-1-2-3-1000";
+    let mut sec = locked_down_fixture();
+    sec.owner_sid = Some(sid.into());
+    sec.dacl
+        .as_mut()
+        .unwrap()
+        .retain(|ace| is_privileged_sid(&ace.sid));
+    sec.dacl.as_mut().unwrap().push(Ace {
+        sid: sid.into(),
+        mask: 0x001F_01FF,
+        kind: AceKind::Allow,
+        flags: 0,
+    });
+    assert!(is_private_user_config(&sec, sid));
+    for other in [
+        Ace {
+            sid: "S-1-5-32-545".into(),
+            mask: READ_EXECUTE_ACCESS_MASK,
+            kind: AceKind::Allow,
+            flags: 0,
+        },
+        Ace::unreadable(),
+    ] {
+        let mut bad = sec.clone();
+        bad.dacl.as_mut().unwrap().push(other);
+        assert!(!is_private_user_config(&bad, sid));
+    }
+    sec.dacl = None;
+    assert!(!is_private_user_config(&sec, sid));
+}

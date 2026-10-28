@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '@/contracts/types';
 import type { WarpWireGuardDraft } from '@/domain/warp';
-import { executeWarpRegistration, type WarpRegistrationExecution, type WarpRegistrationSession } from './warp-registration';
+import { buildRegisteredWarpServer, executeWarpRegistration, type WarpRegistrationExecution, type WarpRegistrationSession } from './warp-registration';
 
 const draft: WarpWireGuardDraft = {
   address: 'engage.cloudflareclient.com', port: 2408, privateKey: 'private', peerPublicKey: 'peer',
@@ -80,4 +80,13 @@ describe('WARP registration followed by confirmed persistence', () => {
     expect(blocked.save).not.toHaveBeenCalled();
     expect(blocked.mintId).not.toHaveBeenCalled();
   });
+});
+
+
+it('registered WARP payload applies top-level onDemand and preserves registered identity', () => {
+  const attempt = { registered: draft, id: 'warp-on-demand', saved: false };
+  const enabled = buildRegisteredWarpServer(attempt, 'WARP', null, { onDemand: true }, '', '');
+  expect(enabled.onDemand).toBe(true);
+  expect(enabled.wireguardSettings?.privateKey).toBe(draft.privateKey);
+  expect(buildRegisteredWarpServer(attempt, 'WARP', null, { onDemand: false }, '', '').onDemand).toBeUndefined();
 });

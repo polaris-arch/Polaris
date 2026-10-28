@@ -25,10 +25,11 @@ import {
   type ResUrlError,
 } from './res-url-logic';
 
-export function ResUrlDialog() {
+export function ResUrlDialog({ instanceId }: { instanceId: string }) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((s) => s.closeInstance);
+  const close = () => closeInstance(instanceId);
 
   const [url, setUrl] = useState('');
   const [name, setName] = useState('');
@@ -73,7 +74,7 @@ export function ResUrlDialog() {
     if (submitting) return;
     if (url.trim() || name.trim()) {
       // 脏态 → 嵌套确认（放弃更改）。onConfirm 关两层：confirm + 本弹窗。
-      open({
+      const confirmId = open({
         kind: 'confirm',
         payload: {
           title: t('resources.urlDlgDiscardTitle'),
@@ -81,8 +82,8 @@ export function ResUrlDialog() {
           confirmLabel: t('resources.urlDlgDiscard'),
           danger: true,
           onConfirm: () => {
-            close(); // pop confirm
-            close(); // pop 本弹窗
+            closeInstance(confirmId);
+            close(); // close only the originating form
           },
         },
       });

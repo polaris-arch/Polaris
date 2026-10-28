@@ -36,7 +36,7 @@
  *    `MOBILE_NAMESPACES`，**或**该键在移动端生产源码里有消费点（字面量，或拼键的父路径前缀）。
  *    ⚠️ 这一层收窄是**故意**的射程选择，不是偷懒：全仓还有一批「桌面自己也没接」的同形文案
  *    （`procPick.empty` / `resCatalog.errUnavailable` / `resources.urlDlgErrUnavailable` /
- *    `settings.coreVersion.noRollbackEntryNote` / `helper.*` / `settings.about.uninstallKindUnsupported`），
+ *    `helper.*` / `settings.about.uninstallKindUnsupported`），
  *    它们是**桌面的**债，把它们算进「移动端还欠多少条」会让这个数字失去意义。
  *    ⚠️ `nodes/absence-register.ts` **不算消费文件**：那是 B 面的真值源，它引用一条 `reasonKey`
  *      是「登记」不是「渲染」。两面各数一遍同一件事只会把账做虚。B 面那侧另有一条正面断言

@@ -13,14 +13,23 @@
 //! - 端口簿记：[`port_bookkeeping`]
 //! - SIGTERM→宽限→SIGKILL 升级：[`process_killer`]
 //! - spawn/exit 事件采集：[`spawner`]
+//!
+//! ## `unsafe_code` 政策
+//!
+//! crate 根是 `deny`（不是 `forbid`）：默认禁 unsafe，只有 Windows 进程接口的两个模块
+//! （`job_object`、`stale_core::windows`，均为 `cfg(windows)`）在具体 item 上局部放开，每处
+//! 带 `SAFETY` 说明。作业对象与进程命令行读取只有 Win32 / NT 接口可用，没有 std 途径。
+//! 与 `polaris-helper` 的做法相同；非 Windows 目标上本 crate 仍然零 unsafe。
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 /// 起核前的内核闸门：拿即将下发的 config 真跑 `sing-box check`，把内核点名拒收的节点剥掉。
 pub mod config_gate;
 pub mod crash_recovery;
 #[cfg(target_os = "linux")]
 pub mod exact_spawn;
+#[cfg(windows)]
+pub mod job_object;
 pub mod lifecycle_gate;
 pub mod port_bookkeeping;
 pub mod process_killer;
@@ -30,10 +39,10 @@ pub mod stale_core;
 
 pub use config_gate::{
     assert_check_admission, begin_check_shutdown, decide_peel, parse_kernel_rejection,
-    run_check_raw, run_config_check, run_config_check_within, settle_check_cleanup,
-    shutdown_checks_for_exit, with_check_admission, ConfigCheckVerdict, KernelRejection, PeelStep,
-    RawCheck, RejectedArray, ValidationLifecycleError, CONFIG_CHECK_TIMEOUT,
-    INVALID_REASON_KERNEL_REJECTED, PEEL_TIME_BUDGET,
+    run_check_raw, run_config_check, run_config_check_within, run_tls_fingerprint_query,
+    settle_check_cleanup, shutdown_checks_for_exit, with_check_admission, ConfigCheckVerdict,
+    KernelRejection, PeelStep, RawCheck, RejectedArray, ValidationLifecycleError,
+    CONFIG_CHECK_TIMEOUT, INVALID_REASON_KERNEL_REJECTED, PEEL_TIME_BUDGET,
 };
 pub use crash_recovery::{
     classify_child_exit, restart_backoff_ms, AutoRestartOutcome, ChildObservation,
@@ -55,4 +64,8 @@ pub use spawner::{
     ChildStream, SingBoxSpawner, SpawnError, SpawnRequest, SpawnedChild, StdioPolicy, StdioSink,
     TokioSpawner,
 };
-pub use stale_core::{is_our_core, is_our_core_raw, scan_running_cores, stale_pids, CoreProcess};
+pub use stale_core::{
+    app_run_config_name, is_our_core, macos_ps, owner_from_uid, process_owner_uid,
+    scan_running_cores, stale_cores, stale_pids, unreadable_core_rows, CoreProcess, ProcessHold,
+    ProcessOwner, StaleCores,
+};

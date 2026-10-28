@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import type { SubscriptionConfig } from '@/contracts/types';
 /**
  * 首页视图模型 —— **呈现层与接线层之间的唯一契约**。
@@ -93,6 +94,8 @@ export type CoreLifecycle = 'stopped' | 'starting' | 'running' | 'stopping' | 'e
 export type NodeIdentity =
   | {
       readonly kind: 'node';
+      readonly serverId?: string;
+      readonly displayedServer?: ServerConfig;
       readonly name: string;
       readonly protocolLabel: string;
       /** 有验证过的国家码才有旗；**绝不合成一个回退国家**。 */
@@ -191,6 +194,7 @@ export interface HomeScreenViewProps {
   readonly pickerQuery: string;
   readonly onPickerQuery: (q: string) => void;
   readonly pickRows: readonly NodePickRow[];
+  readonly autoSelectControls?: ReactNode;
   readonly pickerSubscriptions?: readonly SubscriptionConfig[];
   readonly onUseAsExit: (server: ServerConfig) => void;
   /**

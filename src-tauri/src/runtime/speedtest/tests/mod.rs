@@ -8,6 +8,11 @@ use async_trait::async_trait;
 use polaris_core_supervisor::CONFIG_CHECK_TIMEOUT;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::commands::speedtest::{FailKind, FailPhase, MeasureFailure};
+
+/// 测量闭包的「真实超时」夹具。
+const TIMED_OUT: MeasureFailure = MeasureFailure::new(FailPhase::Measure, FailKind::Timeout);
+
 fn env() -> CoreBuildEnv {
     CoreBuildEnv {
         platform: "linux".to_string(),
@@ -127,10 +132,10 @@ fn temp_planner_partitions_system_interfaces_without_losing_userspace_nodes() {
 /// - 把 `absent` 并进 `failed` → 第 1 组转红且三分之和溢出（`also_assert_total` 在 debug 下当场炸）。
 #[test]
 fn speed_test_summary_splits_timeout_from_never_measured() {
-    let m = |pairs: &[(&str, i64)]| -> serde_json::Map<String, Value> {
+    let m = |pairs: &[(&str, i64)]| -> RoundResults {
         pairs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), json!(v)))
+            .map(|(k, v)| ((*k).to_string(), u32::try_from(*v).map_err(|_| TIMED_OUT)))
             .collect()
     };
     let intended: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| (*s).into()).collect();
@@ -166,7 +171,7 @@ fn speed_test_summary_splits_timeout_from_never_measured() {
 
     // 全员未测（让位/中断）：一个 `-1` 都不该被伪造出来。
     let s = summarize_speed_test(
-        &serde_json::Map::new(),
+        &RoundResults::new(),
         &intended,
         4,
         Some(InterruptReason::CoreExited),
@@ -362,6 +367,7 @@ fn plan_applies_explicit_bindings_to_the_physical_dialer() {
         ..Default::default()
     }));
     shadow.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "secret".into(),
         sni: "tls.example.com".into(),
         fingerprint: Some("Chrome".into()),
@@ -422,6 +428,7 @@ async fn real_core_accepts_bound_shadow_tls_temp_config() {
         ..Default::default()
     }));
     server.shadow_tls_settings = Some(ShadowTlsSettings {
+        utls_mode: None,
         password: "shape-only-secret".into(),
         sni: "tls.example.com".into(),
         fingerprint: Some("Chrome".into()),
@@ -1015,11 +1022,11 @@ async fn drive_round_of_one_batch<Meas, MeasFut>(
     superseded: &(dyn Fn() -> bool + Sync),
     watch: &mut TempCoreWatch<'_>,
     measure: Meas,
-    emit: &mut (dyn FnMut(&str, Value) + Send),
-) -> (serde_json::Map<String, Value>, &'static str)
+    emit: &mut dyn MeasurementEvents,
+) -> (RoundResults, &'static str)
 where
     Meas: Fn(u16) -> MeasFut,
-    MeasFut: std::future::Future<Output = Option<u32>> + Send + 'static,
+    MeasFut: std::future::Future<Output = Measured> + Send + 'static,
 {
     let intended: Vec<String> = nodes
         .iter()
@@ -1085,13 +1092,16 @@ async fn measures_all_nodes_when_never_superseded() {
         2,
         &superseded_at(0),
         &mut healthy_watch(),
-        |_| async { Some(120_u32) },
-        &mut |ev, _| events.push(ev.to_string()),
+        |_| async { Ok(120_u32) },
+        &mut |ev: &str, _: Value| events.push(ev.to_string()),
     )
     .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3);
-    assert_eq!(results["a1111111"], json!(120));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(120)
+    );
     assert_eq!(
         events
             .iter()
@@ -1118,12 +1128,15 @@ async fn genuine_timeout_is_recorded_as_minus_one() {
         8,
         &superseded_at(0),
         &mut healthy_watch(),
-        |_| async { None },
-        &mut |_, _| {},
+        |_| async { Err(TIMED_OUT) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "completed");
-    assert_eq!(results["a1111111"], json!(-1));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(-1)
+    );
 }
 
 /// 让位①（发新活之前）：第 1 次询问即让位 → 一个节点都不测、零**逐节点**事件、`interrupted`。
@@ -1142,8 +1155,8 @@ async fn interrupts_before_dispatching_without_measuring() {
         8,
         &superseded_at(1),
         &mut healthy_watch(),
-        |_| async { Some(120_u32) },
-        &mut |ev, payload| events.push((ev.to_string(), payload)),
+        |_| async { Ok(120_u32) },
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
     )
     .await;
     assert_eq!(outcome, "interrupted");
@@ -1186,8 +1199,8 @@ async fn discards_in_flight_values_when_main_core_arrives() {
         8,
         &superseded_at(2), // 批首过、测量后命中
         &mut healthy_watch(),
-        |_| async { Some(999_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(999_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "interrupted");
@@ -1207,8 +1220,8 @@ async fn keeps_measured_prefix_on_later_interruption() {
         2,
         &superseded_at(5),
         &mut healthy_watch(),
-        |_| async { Some(120_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(120_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "interrupted");
@@ -1254,10 +1267,10 @@ async fn a_slow_node_does_not_block_the_rest_of_the_queue() {
                     tokio::time::sleep(Duration::from_millis(400)).await;
                     mlog.lock().unwrap().push("slow-done".to_string());
                 }
-                Some(120_u32)
+                Ok(120_u32)
             }
         },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_RESULT {
                 let id = payload["serverId"].as_str().unwrap().to_string();
                 elog.lock().unwrap().push(format!("emit:{id}"));
@@ -1318,10 +1331,10 @@ async fn never_exceeds_the_concurrency_limit() {
                 peak.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 live.fetch_sub(1, Ordering::SeqCst);
-                Some(120_u32)
+                Ok(120_u32)
             }
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
 
@@ -1344,13 +1357,17 @@ async fn zero_concurrency_degrades_to_serial_not_to_nothing() {
         0,
         &superseded_at(0),
         &mut healthy_watch(),
-        |port| async move { Some(u32::from(port)) },
-        &mut |_, _| {},
+        |port| async move { Ok(u32::from(port)) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3, "0 并发是配置错误，不是「不测」的意思");
-    assert_eq!(results["a1111111"], json!(1), "串行也不得让结果与端口错位");
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(1),
+        "串行也不得让结果与端口错位"
+    );
 }
 
 /// 🔴 **让位②（在飞轮询）：supersede 命中即 `abort_all` + 立刻返回，不等在飞测量收尾。**
@@ -1378,9 +1395,9 @@ async fn aborts_in_flight_measurements_instead_of_waiting_for_them() {
             // 测量 30s 不返回：只有真 abort 才能让本函数在 5s 内收场。
             |_| async {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                Some(120_u32)
+                Ok(120_u32)
             },
-            &mut |_, _| {},
+            &mut |_: &str, _: Value| {},
         ),
     )
     .await
@@ -1409,14 +1426,18 @@ async fn in_flight_polling_does_not_disturb_slow_but_uninterrupted_measurements(
         // 比轮询间隔长 → 至少触发一次轮询，且必须不影响结果。
         |port| async move {
             tokio::time::sleep(Duration::from_millis(TEMP_CORE_SUPERSEDE_POLL_MS + 120)).await;
-            Some(u32::from(port))
+            Ok(u32::from(port))
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "completed");
     assert_eq!(results.len(), 3);
-    assert_eq!(results["a1111111"], json!(1), "轮询不得让结果与端口错位");
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(1),
+        "轮询不得让结果与端口错位"
+    );
 }
 
 /// 🔴 **逐节点回填**：先测完的节点必须在**其它节点还在飞**的时候就上屏。
@@ -1445,10 +1466,10 @@ async fn reports_each_node_as_soon_as_it_finishes() {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     mlog.lock().unwrap().push("c-measured".to_string());
                 }
-                Some(120_u32)
+                Ok(120_u32)
             }
         },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_RESULT {
                 let id = payload["serverId"].as_str().unwrap().to_string();
                 elog.lock().unwrap().push(format!("emit:{id}"));
@@ -1489,12 +1510,12 @@ async fn progress_counter_is_strictly_monotonic() {
         &mut healthy_watch(),
         |port| async move {
             if port == 1 {
-                None // 真实超时 → -1，不计入 ok
+                Err(TIMED_OUT) // 真实超时 → -1，不计入 ok
             } else {
-                Some(120_u32)
+                Ok(120_u32)
             }
         },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_PROGRESS {
                 tested_seq.push(payload["tested"].as_i64().unwrap());
                 ok_seq.push(payload["ok"].as_i64().unwrap());
@@ -1524,13 +1545,22 @@ async fn each_node_measures_through_its_own_port() {
         8,
         &superseded_at(0),
         &mut healthy_watch(),
-        |port| async move { Some(u32::from(port)) },
-        &mut |_, _| {},
+        |port| async move { Ok(u32::from(port)) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
-    assert_eq!(results["a1111111"], json!(10));
-    assert_eq!(results["b1111111"], json!(20));
-    assert_eq!(results["c1111111"], json!(30));
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["a1111111"],
+        json!(10)
+    );
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["b1111111"],
+        json!(20)
+    );
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)["c1111111"],
+        json!(30)
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1739,7 +1769,7 @@ async fn typed_capacity_spawn_stops_the_actual_speedtest_round_without_a_child()
         &three_nodes(),
         &|| false,
         |_| async { panic!("measured after admission rejection") },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(outcome, TempCoreOutcome::AndroidCapacityClosed(_)));
@@ -1757,7 +1787,7 @@ async fn capacity_check_stops_the_actual_speedtest_round_before_spawn_or_measure
         &three_nodes(),
         &|| false,
         |_| async { panic!("measured after admission rejection") },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(outcome, TempCoreOutcome::AndroidCapacityClosed(_)));
@@ -1826,6 +1856,7 @@ fn harness_opts(ready: bool, spawn_fail: bool, ports: Vec<u16>, opts: HarnessOpt
         deps: TempCoreDeps {
             #[cfg(not(target_os = "android"))]
             pc_custody: Arc::new(PcTempCoreCustody::default()),
+            expected_core_sha256: None,
             spawner: Arc::new(FakeSpawner {
                 terminated: Arc::clone(&terminated),
                 spawns: Arc::clone(&spawns),
@@ -1849,6 +1880,7 @@ fn harness_opts(ready: bool, spawn_fail: bool, ports: Vec<u16>, opts: HarnessOpt
             },
             log_level: "warn".to_string(),
             ready_timeout_override_ms: Some(400),
+            cancel: SpeedTestCancel::default(),
         },
         terminated,
         spawns,
@@ -1878,8 +1910,8 @@ async fn temp_final_system_interface_guard_rejects_planner_bypass_before_spawn()
             &h.deps,
             &[node],
             &|| false,
-            |_| async { Some(50_u32) },
-            &mut |_, _| {},
+            |_| async { Ok(50_u32) },
+            &mut |_: &str, _: Value| {},
         )
         .await;
         let TempCoreOutcome::SystemInterfaceRequired(error) = outcome else {
@@ -1909,8 +1941,8 @@ async fn session_kills_core_and_removes_config_on_success() {
         &h.deps,
         &nodes,
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     match out {
@@ -1954,8 +1986,8 @@ async fn session_reports_failure_without_faking_results_when_not_ready() {
         &h.deps,
         &three_nodes(),
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Failed(_)), "得到 {out:?}");
@@ -1973,8 +2005,8 @@ async fn session_never_spawns_when_already_superseded() {
         &h.deps,
         &three_nodes(),
         &|| true,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Superseded), "得到 {out:?}");
@@ -1991,8 +2023,8 @@ async fn session_fails_atomically_when_ports_are_short() {
         &h.deps,
         &three_nodes(),
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Failed(_)), "得到 {out:?}");
@@ -2015,8 +2047,8 @@ async fn session_rejects_invalid_config_before_spawning() {
         &h.deps,
         &three_nodes(),
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     match out {
@@ -2039,8 +2071,8 @@ async fn session_cleans_up_config_when_spawn_fails() {
         &h.deps,
         &three_nodes(),
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Failed(_)), "得到 {out:?}");
@@ -2056,8 +2088,8 @@ async fn session_is_noop_for_empty_node_set() {
         &h.deps,
         &[],
         &|| false,
-        |_| async { Some(1_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(1_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }));
@@ -2140,10 +2172,10 @@ async fn session_registers_inflight_pid_so_app_exit_cleanup_can_reach_it() {
                 if temp_core_pids().contains(&self_pid) {
                     probe.store(true, Ordering::SeqCst);
                 }
-                Some(50_u32)
+                Ok(50_u32)
             }
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
@@ -2258,8 +2290,8 @@ async fn temp_core_drains_stderr_so_a_flooding_core_never_wedges() {
         &h.deps,
         &three_nodes(),
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
@@ -2328,9 +2360,9 @@ async fn session_reports_core_exit_as_interrupted_without_faking_results() {
         &|| false,
         |_| async {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            Some(50_u32)
+            Ok(50_u32)
         },
-        &mut |ev, payload| {
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2389,8 +2421,8 @@ async fn a_core_that_stops_answering_ends_the_round_as_unresponsive() {
         4,
         &superseded_at(0),
         &mut watch,
-        |_| async { None }, // 每个节点都判 -1
-        &mut |ev, payload| {
+        |_| async { Err(TIMED_OUT) }, // 每个节点都判 -1
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2435,8 +2467,8 @@ async fn a_responding_core_finishes_the_round_despite_a_full_streak_of_failures(
         4,
         &superseded_at(0),
         &mut watch,
-        |_| async { None },
-        &mut |_, _| {},
+        |_| async { Err(TIMED_OUT) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(
@@ -2479,8 +2511,8 @@ async fn failures_below_the_streak_never_probe_the_core() {
         4,
         &superseded_at(0),
         &mut watch,
-        |_| async { None },
-        &mut |_, _| {},
+        |_| async { Err(TIMED_OUT) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert_eq!(outcome, "completed");
@@ -2504,8 +2536,8 @@ async fn superseded_round_reports_the_superseded_reason() {
         8,
         &superseded_at(1), // 发活前即让位
         &mut healthy_watch(),
-        |_| async { Some(120_u32) },
-        &mut |ev, payload| {
+        |_| async { Ok(120_u32) },
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2528,8 +2560,8 @@ async fn completed_round_carries_no_reason_field() {
         8,
         &superseded_at(0),
         &mut healthy_watch(),
-        |_| async { Some(120_u32) },
-        &mut |ev, payload| {
+        |_| async { Ok(120_u32) },
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2544,10 +2576,10 @@ async fn completed_round_carries_no_reason_field() {
     );
 }
 
-/// 🔴 **A6**：诊断档（`debug`/`trace`）收尾把配置**改名留档**，固定名、覆盖式。
+/// 🔴 **A6**：诊断档（`debug`/`trace`）收尾把配置去凭据留档，固定名、覆盖式。
 ///
 /// **牙**：① 退回无条件删除 → 留档断言转红（排查临时核绕不开「这一轮到底给核喂了什么」，而抢在
-/// 收尾前 `cp` 在真机上抢不住）；② 留档写成「复制」而不是「改名」→ 原文件仍在，第一条断言转红
+/// 收尾前 `cp` 在真机上抢不住）；② 留档保留原始运行配置 → 原文件仍在，第一条断言转红
 /// （留档是给人看的证据，不该同时还留着一份原名的活配置）。
 #[tokio::test]
 async fn diagnostic_level_keeps_the_last_temp_config_under_a_fixed_name() {
@@ -2557,14 +2589,14 @@ async fn diagnostic_level_keeps_the_last_temp_config_under_a_fixed_name() {
         &h.deps,
         &three_nodes(),
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
     assert!(
         !h.dir.join(TEMP_CORE_CONFIG_NAME).exists(),
-        "留档是**改名**：原路径必须消失，否则下次会话会把它当自己的配置覆盖，等于没留"
+        "去凭据留档：原路径必须消失，否则下次会话会把它当自己的配置覆盖，等于没留"
     );
     let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
     assert!(kept.exists(), "诊断档必须留下最后一份临时核配置");
@@ -2572,7 +2604,7 @@ async fn diagnostic_level_keeps_the_last_temp_config_under_a_fixed_name() {
     assert_eq!(
         cfg["log"]["level"],
         json!("debug"),
-        "留下来的必须是**本轮真下发的那一份**"
+        "诊断投影必须保留本轮下发的日志级别"
     );
     cleanup(&h.dir);
 }
@@ -2597,10 +2629,22 @@ async fn diagnostic_level_keeps_the_last_temp_config_under_a_fixed_name() {
 #[test]
 fn temp_core_wires_both_streams_into_its_own_target_at_spawn_time() {
     let src = crate_code("runtime/speedtest.rs");
-    // 锚点是**批级**那个入口（T1-R1 分批之后 `run` 变成轮级薄壳，spawn 请求的构造留在 `run_batch`）。
-    let body = crate::commands::guard_scan::impl_method_body(
+    // 锚点是**批级已准入**那一段：`run_batch` 现在只剩「让位 + 准入锁 + 登记本批」的薄壳，spawn
+    // 请求的构造随其余批体搬进了 `run_admitted_batch`。取材面跟着被守的那几行走，不跟着函数名走。
+    let shell = crate::commands::guard_scan::impl_method_body(
         &src,
         "    async fn run_batch<Meas, MeasFut>(",
+    );
+    assert!(
+        shell.contains("Self::run_admitted_batch(")
+            && !shell.contains("SpawnRequest")
+            && !shell.contains("StdioPolicy"),
+        "`run_batch` 必须仍把本批交给 `run_admitted_batch`，且自己不装配 spawn 请求 —— \
+         否则下面的判据钉在一段生产上不走的代码上，或漏掉第二份装配"
+    );
+    let body = crate::commands::guard_scan::impl_method_body(
+        &src,
+        "    async fn run_admitted_batch<Meas, MeasFut>(",
     );
     // 自检：封顶真的生效（切片里不得混进同 impl 的其它方法）。
     assert!(
@@ -2704,7 +2748,7 @@ fn exit_flag_future(
 /// 跑一轮「核退出与测量失败**同一 tick** 就绪」的时序：测量任务自己置退出标志再返回 `None`
 /// —— 对应真机上「内核先关掉核的全部 socket（`exit_files`），在飞的 `open_tunnel` 立刻返 `None`，
 /// 而 `child.wait()` 也在同一轮就绪」。
-async fn run_core_exit_in_the_same_tick() -> (serde_json::Map<String, Value>, &'static str) {
+async fn run_core_exit_in_the_same_tick() -> (RoundResults, &'static str) {
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut watch = TempCoreWatch {
         pid: 7,
@@ -2723,10 +2767,10 @@ async fn run_core_exit_in_the_same_tick() -> (serde_json::Map<String, Value>, &'
             let trip = Arc::clone(&trip);
             async move {
                 trip.store(true, Ordering::SeqCst); // 核在这一刻已经没了
-                None // …于是这次拨号立刻失败
+                Err(TIMED_OUT) // …于是这次拨号立刻失败
             }
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await
 }
@@ -2796,8 +2840,8 @@ async fn a_core_exit_seen_between_select_and_record_makes_the_node_absent() {
             false
         },
         &mut watch,
-        |_| async { None },
-        &mut |ev, payload| {
+        |_| async { Err(TIMED_OUT) },
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_DONE {
                 done.push(payload);
             }
@@ -2894,13 +2938,9 @@ fn the_only_child_stream_drain_reads_bytes_not_lines() {
     );
 }
 
-/// 🔴 **回到非诊断档时，上一次的留档必须被收掉**（它含全部被测节点的凭证）。
+/// 回到非诊断档仍收掉上一份诊断投影，也兼容回收升级前的原始留档。
 ///
-/// 留档与 `singbox-runtime.json` 泄露等级相同，但那份**有主**（核在跑就该在、换配置即被覆盖），
-/// 这份**无主**：用户为排查把级别拨到 debug 跑一轮、随后拨回 info，这份带凭证的文件就永远躺在
-/// config 目录里，没有任何路径会再碰它。
-///
-/// **牙**：删掉非诊断路径里那句 `remove_file(TEMP_CORE_LAST_CONFIG_NAME)` ⇒ 转红。
+/// **牙**：删掉非诊断路径的旧留档回收 ⇒ 转红。
 #[tokio::test]
 async fn leaving_the_diagnostic_level_reclaims_the_credential_bearing_leftover() {
     let mut h = harness(true, false, vec![20001, 20002, 20003]);
@@ -2909,8 +2949,8 @@ async fn leaving_the_diagnostic_level_reclaims_the_credential_bearing_leftover()
         &h.deps,
         &three_nodes(),
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
@@ -2922,13 +2962,13 @@ async fn leaving_the_diagnostic_level_reclaims_the_credential_bearing_leftover()
         &h.deps,
         &three_nodes(),
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(
         !kept.exists(),
-        "回到非诊断档必须收掉上一次的留档 —— 那是一份无主的、含节点密码/uuid/WG 私钥的文件"
+        "回到非诊断档必须收掉上一份留档（含升级前可能带凭据的旧档）"
     );
     cleanup(&h.dir);
 }
@@ -3231,8 +3271,8 @@ async fn oversized_batch_is_refused_before_spawning_and_says_why() {
         &h.deps,
         &nodes,
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
         &mut progress,
     )
     .await;
@@ -3286,7 +3326,8 @@ async fn oversized_batch_is_refused_before_spawning_and_says_why() {
 fn the_oversize_refusal_logs_the_numbers_it_refused_on() {
     let body = crate::commands::guard_scan::impl_method_body(
         &module_code("runtime/speedtest"),
-        "    async fn run_batch<Meas, MeasFut>(",
+        // 规模门随批体搬进了 `run_admitted_batch`（`run_batch` 只剩准入与登记）。
+        "    async fn run_admitted_batch<Meas, MeasFut>(",
     );
     let at_err = body
         .find("Err(budget)")
@@ -3394,8 +3435,8 @@ async fn no_progress_event_escapes_before_the_readiness_gate_resolves() {
         &h.deps,
         &three_nodes(),
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |ev, _| events.push(ev.to_string()),
+        |_| async { Ok(50_u32) },
+        &mut |ev: &str, _: Value| events.push(ev.to_string()),
     )
     .await;
     assert!(
@@ -3923,8 +3964,8 @@ async fn run_round(h: &Harness, nodes: &[TempNode]) -> (TempCoreOutcome, Vec<(St
         &h.deps,
         nodes,
         &|| false,
-        |_| async { Some(50_u32) },
-        &mut |ev, payload| events.push((ev.to_string(), payload)),
+        |_| async { Ok(50_u32) },
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
     )
     .await;
     (out, events)
@@ -4085,6 +4126,67 @@ async fn every_batch_boundary_is_bridged_by_two_heartbeats() {
     cleanup(&h.dir);
 }
 
+/// Deterministic cache pressure inside the actual pre-spawn config-check await.
+/// Script-wrapper bytes are hashed but never executed on any desktop platform.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct EvictingCapabilityChecker {
+    replace_binary: bool,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[async_trait]
+impl ConfigChecker for EvictingCapabilityChecker {
+    async fn check(&self, binary: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+        for index in 0..4 {
+            let other = binary.with_file_name(format!("cache-pressure-{index}"));
+            // Each invocation creates distinct paths even in a multi-batch round.
+            let other = other.with_extension(uuid::Uuid::new_v4().to_string());
+            std::fs::write(&other, b"#!/bin/sh\n").unwrap();
+            let snapshot = crate::runtime::tls_fingerprints::probe_cli(&other).await;
+            assert!(snapshot.binary_sha256.is_some());
+        }
+        assert!(
+            crate::runtime::tls_fingerprints::cached_cli(binary).is_none(),
+            "the selected binary must actually be evicted before check returns"
+        );
+        if self.replace_binary {
+            let modified = std::fs::metadata(binary).unwrap().modified().unwrap();
+            let replacement = binary.with_extension("replacement");
+            // Same length and restored mtime: only the retained file identity detects it.
+            std::fs::write(&replacement, b"#!/bin/xx\n").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&replacement)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            std::fs::rename(&replacement, binary).unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tokio::test]
+async fn cache_eviction_does_not_hide_a_binary_replacement_during_check() {
+    let mut h = harness(true, false, vec![20_001, 20_002, 20_003]);
+    h.deps.checker = Arc::new(EvictingCapabilityChecker {
+        replace_binary: true,
+    });
+    let (out, events) = run_round(&h, &three_nodes()).await;
+    assert!(
+        matches!(out, TempCoreOutcome::Failed(ref detail)
+            if detail == "Core bytes changed after temporary-core validation"),
+        "the retained proof must reject a real replacement even after eviction: {out:?}"
+    );
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(
+        events.is_empty(),
+        "no measurement events may escape a rejected binary"
+    );
+    cleanup(&h.dir);
+}
+
 /// 🔴 **中间某一批就绪失败时，空窗仍然被切开** —— 就绪心跳里 `|| progress.tested() > 0` 那半个判据
 /// 的**唯一**触发路径。
 ///
@@ -4125,7 +4227,7 @@ async fn a_failed_middle_batch_still_bridges_the_silent_window() {
     let doomed: Vec<String> = batches[1].iter().map(|n| n.id.clone()).collect();
 
     // 第 2 批：spawn 成功、走进就绪门、耗满预算后失败（**不是** spawn 失败）。
-    let h = harness_opts(
+    let mut h = harness_opts(
         true,
         false,
         (0..TEMP_CORE_BATCH_MAX_NODES)
@@ -4136,6 +4238,14 @@ async fn a_failed_middle_batch_still_bridges_the_silent_window() {
             ..Default::default()
         },
     );
+    // Force the shared capability lookup to forget this batch during check.
+    // The live batch must retain its own file proof and still run all three batches.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        h.deps.checker = Arc::new(EvictingCapabilityChecker {
+            replace_binary: false,
+        });
+    }
     let (out, events) = run_round(&h, &nodes).await;
 
     let TempCoreOutcome::Ran { results, outcome } = out else {
@@ -4318,8 +4428,8 @@ async fn superseded_between_batches_stops_the_round_before_starting_another_core
         &h.deps,
         &nodes,
         &move || trip_read.load(Ordering::SeqCst),
-        |_| async { Some(50_u32) },
-        &mut |ev, payload| {
+        |_| async { Ok(50_u32) },
+        &mut |ev: &str, payload: Value| {
             if ev == EVENT_SPEED_TEST_RESULT
                 && results_seen.fetch_add(1, Ordering::SeqCst) + 1 >= first_batch
             {
@@ -4418,8 +4528,8 @@ async fn superseding_a_round_that_already_lost_a_batch_still_reports_superseded(
             }
             failed_once.load(Ordering::SeqCst)
         },
-        |_| async { Some(50_u32) },
-        &mut |_, _| {},
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
     )
     .await;
 
@@ -4476,10 +4586,10 @@ async fn each_batch_registers_and_releases_its_own_inflight_pid() {
             let writer = Arc::clone(&writer);
             async move {
                 writer.lock().unwrap().push(inflight_temp_core_pids());
-                Some(50_u32)
+                Ok(50_u32)
             }
         },
-        &mut |_, _| {},
+        &mut |_: &str, _: Value| {},
     )
     .await;
     assert!(matches!(out, TempCoreOutcome::Ran { .. }), "得到 {out:?}");
@@ -4503,3 +4613,543 @@ async fn each_batch_registers_and_releases_its_own_inflight_pid() {
     );
     cleanup(&h.dir);
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// 未连接标记与取消：经生产同一个盖章出口收集临时核腿一整轮的事件。
+// ══════════════════════════════════════════════════════════════════════════
+
+fn temp_round_events(nodes: &[TempNode]) -> crate::commands::speedtest::RunEvents {
+    use crate::commands::speedtest::{
+        CoreInstance, MeasurePath, RunEvents, SpeedTestOrigin, SpeedTestRequest,
+    };
+    let request = SpeedTestRequest {
+        origin: SpeedTestOrigin::Manual,
+        targets: nodes.iter().map(|n| n.id.clone()).collect(),
+        scope: None,
+        path: MeasurePath::Candidate,
+        url: "http://www.gstatic.com/generate_204".to_string(),
+    };
+    let fingerprints = nodes
+        .iter()
+        .map(|n| (n.id.clone(), format!("fp-{}", n.id)))
+        .collect();
+    RunEvents::new("9", &request, CoreInstance::Temp, None, fingerprints, None)
+}
+
+/// 临时核腿的**每条**逐节点结果（出值的与失败的）都带「未连接测量」标记：实例只标种类、
+/// 不带世代，配置摘要与网络代次为空；节点指纹照带。
+#[tokio::test]
+async fn every_temp_core_result_is_marked_disconnected() {
+    let h = harness(true, false, vec![20001, 20002, 20003]);
+    let nodes = three_nodes();
+    let mut events = temp_round_events(&nodes);
+    let mut collected: Vec<(String, Value)> = Vec::new();
+    let out = TempCoreSession::run(
+        &h.deps,
+        &nodes,
+        &|| false,
+        |port| async move {
+            if port == 20002 {
+                Err(TIMED_OUT)
+            } else {
+                Ok(50_u32)
+            }
+        },
+        &mut events.sink(|ev: &str, payload: Value| collected.push((ev.to_string(), payload))),
+    )
+    .await;
+    assert!(matches!(
+        out,
+        TempCoreOutcome::Ran {
+            outcome: "completed",
+            ..
+        }
+    ));
+    let results: Vec<&Value> = collected
+        .iter()
+        .filter(|(ev, _)| ev == EVENT_SPEED_TEST_RESULT)
+        .map(|(_, payload)| payload)
+        .collect();
+    assert_eq!(results.len(), 3, "三个节点各一条结果：{collected:?}");
+    for payload in results {
+        let identity = &payload["identity"];
+        assert_eq!(identity["context"], json!("disconnected"), "{payload}");
+        assert_eq!(identity["instance"], json!({ "kind": "temp" }));
+        assert_eq!(identity["configDigest"], Value::Null);
+        assert_eq!(identity["networkEpoch"], Value::Null);
+        assert_eq!(identity["path"], json!("candidate"));
+        let id = payload["serverId"].as_str().unwrap();
+        assert_eq!(identity["nodeFingerprint"], json!(format!("fp-{id}")));
+        assert_eq!(payload["runId"], json!("9"));
+    }
+    assert_eq!(
+        collected
+            .iter()
+            .filter(|(_, payload)| payload["status"] == json!("failed"))
+            .count(),
+        1,
+        "失败的那条同样带标记，且带阶段与成因"
+    );
+    cleanup(&h.dir);
+}
+
+/// 取消并入让位判据：在飞测量永不返回时，取消命中后整轮以「被取消」收尾 ——
+/// 未出值的节点缺席（没有 -1），核照常被杀。
+#[tokio::test]
+async fn a_cancelled_temp_core_round_reports_cancelled_and_kills_the_core() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    let cancel = SpeedTestCancel::default();
+    h.deps.cancel = cancel.clone();
+    let nodes = three_nodes();
+    let mut collected: Vec<(String, Value)> = Vec::new();
+    let first_result = tokio::sync::Notify::new();
+    let run = async {
+        TempCoreSession::run(
+            &h.deps,
+            &nodes,
+            &|| false,
+            |port| async move {
+                if port == 20001 {
+                    return Ok(50_u32);
+                }
+                std::future::pending::<Measured>().await
+            },
+            &mut |ev: &str, payload: Value| {
+                if ev == EVENT_SPEED_TEST_RESULT {
+                    first_result.notify_one();
+                }
+                collected.push((ev.to_string(), payload));
+            },
+        )
+        .await
+    };
+    let trigger = async {
+        // Cancel only after production has recorded the first result. A wall-clock
+        // delay can expire during startup or before the completed task is joined.
+        first_result.notified().await;
+        cancel.cancel(InterruptReason::Cancelled);
+    };
+    let (out, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(run, trigger)
+    })
+    .await
+    .expect("the round must emit its first result and finish cancellation within the test budget");
+    let TempCoreOutcome::Ran { results, outcome } = out else {
+        panic!("已有节点出值的一轮应以 Ran 收尾，得到 {out:?}");
+    };
+    assert_eq!(outcome, "interrupted");
+    assert_eq!(results.len(), 1, "未出值的节点缺席：{results:?}");
+    assert_eq!(
+        crate::commands::speedtest::round_results_json(&results)[&nodes[0].id],
+        json!(50)
+    );
+    let done: Vec<&Value> = collected
+        .iter()
+        .filter(|(ev, _)| ev == EVENT_SPEED_TEST_DONE)
+        .map(|(_, payload)| payload)
+        .collect();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0]["reason"], json!("cancelled"));
+    assert_eq!(done[0]["pending"], json!([nodes[1].id, nodes[2].id]));
+    assert_eq!(
+        h.terminated.load(Ordering::SeqCst),
+        1,
+        "被取消的一轮同样要杀核"
+    );
+    cleanup(&h.dir);
+}
+
+/// 轮出口的 outcome 与成因由同一处决定：`completed` 永不带成因，被取消只改写「让位」那一档。
+/// 让成因另取取消句柄（不看 outcome）→ 第一行与第三行转红。
+#[test]
+fn round_exit_keeps_outcome_and_reason_in_step() {
+    use InterruptReason::{Cancelled, CoreExited, CoreUnresponsive, Preempted, Superseded};
+    for (interrupt, cancel, failed_batches, want) in [
+        // 一轮已经测完，取消句柄才被置位：仍是 completed，不带 cancelled。
+        (None, Some(Cancelled), 0, ("completed", None)),
+        (None, None, 0, ("completed", None)),
+        // 检查点记下让位、取消句柄已置位：成因以句柄为准。
+        (
+            Some(Superseded),
+            Some(Cancelled),
+            0,
+            ("interrupted", Some(Cancelled)),
+        ),
+        (
+            Some(Superseded),
+            Some(Preempted),
+            0,
+            ("interrupted", Some(Preempted)),
+        ),
+        (Some(Superseded), None, 0, ("interrupted", Some(Superseded))),
+        // 核退出 / 核无响应不被取消盖掉。
+        (
+            Some(CoreExited),
+            Some(Cancelled),
+            0,
+            ("interrupted", Some(CoreExited)),
+        ),
+        (
+            Some(CoreUnresponsive),
+            Some(Preempted),
+            1,
+            ("interrupted", Some(CoreUnresponsive)),
+        ),
+        // 有失败批而没有中断成因：interrupted，不带成因（与引入取消之前相同）。
+        (None, None, 1, ("interrupted", None)),
+        (None, Some(Cancelled), 1, ("interrupted", None)),
+    ] {
+        assert_eq!(
+            round_exit(interrupt, cancel, failed_batches),
+            want,
+            "interrupt={interrupt:?} cancel={cancel:?} failed_batches={failed_batches}"
+        );
+    }
+}
+
+/// 临时核腿的每条结果都带 `binding` 块：策略 `node_pin`、结论 `static`、依据 `config`，请求的是
+/// 该节点在临时核里的 tag；失败的结果同样带。临时核没有运行期读回，绑定只由配置结构保证。
+#[tokio::test]
+async fn temp_core_results_carry_a_static_node_pin_binding() {
+    let mut nodes = three_nodes();
+    nodes[1].is_endpoint = true;
+    // 第三个节点在临时核配置里带前置出站（ShadowTLS 外层那一类）。
+    nodes[2].node = json!({ "detour": "shadow-outer" });
+    let mut events: Vec<(String, Value)> = Vec::new();
+    let (results, outcome) = drive_round_of_one_batch(
+        &nodes,
+        &[1, 2, 3],
+        8,
+        &superseded_at(0),
+        &mut healthy_watch(),
+        |port| async move {
+            if port == 3 {
+                Err(TIMED_OUT)
+            } else {
+                Ok(120_u32)
+            }
+        },
+        &mut |ev: &str, payload: Value| events.push((ev.to_string(), payload)),
+    )
+    .await;
+    assert_eq!(outcome, "completed");
+    assert_eq!(results.len(), 3);
+    let bindings: BTreeMap<String, Value> = events
+        .iter()
+        .filter(|(ev, _)| ev == EVENT_SPEED_TEST_RESULT)
+        .map(|(_, payload)| {
+            (
+                payload["serverId"].as_str().unwrap().to_string(),
+                payload["binding"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(bindings.len(), 3, "三条结果各一个 binding 块：{events:?}");
+    for (node, (kind, detour)) in nodes.iter().zip([
+        ("outbound", None),
+        ("endpoint", None),
+        ("outbound", Some("shadow-outer")),
+    ]) {
+        let mut expected = json!({
+            "policy": "node_pin",
+            "requestedTag": node.tag,
+            "requestedKind": kind,
+            "verdict": "static",
+            "source": "config",
+        });
+        if let Some(detour) = detour {
+            expected["staticDetour"] = json!(detour);
+        }
+        assert_eq!(bindings[&node.id], expected, "{}", node.id);
+    }
+}
+
+/// Q6 integration: the actual planner/protocol serializers feed the same retire
+/// path as real sessions, but all core/checker/measurement dependencies are fake.
+#[tokio::test]
+async fn diagnostic_archive_scrubs_actual_planner_outputs() {
+    let secret = "Q6_SYNTHETIC_PLANNER_CREDENTIAL";
+    let mut raw_servers = Vec::new();
+    for protocol in ["vless", "vmess", "trojan", "naive", "ssh"] {
+        raw_servers.push(json!({"id":format!("node-{protocol}"),"name":"synthetic",
+            "protocol":protocol,"address":"vpn.invalid","port":443,
+            "uuid":secret,"password":secret,"username":secret,
+            "sshSettings":{"user":secret,"password":secret,"privateKey":secret,
+                "privateKeyPath":secret,"privateKeyPassphrase":secret},
+            "tlsSettings":{"serverName":"vpn.invalid"}}));
+    }
+    raw_servers.push(
+        json!({"id":"node-oc","name":"synthetic","protocol":"openconnect",
+        "openconnectSettings":{"server":"vpn.invalid:443","username":secret,"password":secret,
+            "token":{"mode":"totp","secret":secret},"mtu":1300}}),
+    );
+    raw_servers.push(
+        json!({"id":"node-ovpn","name":"synthetic","protocol":"openvpn-client",
+        "openvpnClientSettings":{"server":"vpn.invalid","server_port":1194,
+            "username":secret,"password":secret,"network":"udp","mtu":1400,
+            "tls":{"certificate":[secret],"key":[secret],"ca":[secret]}}}),
+    );
+    raw_servers.push(
+        json!({"id":"node-custom","name":"synthetic","protocol":"custom",
+        "customSettings":{"outbound":{"type":"http","server":"vpn.invalid","server_port":443,
+            "headers":{"Authorization":secret,"Cookie":secret},
+            "path":format!("/api?auth={secret}"),"unknown_credential":{"nested":secret}}}}),
+    );
+    let servers: Vec<ServerConfig> = raw_servers
+        .into_iter()
+        .map(|v| serde_json::from_value(v).unwrap())
+        .collect();
+    let plan = plan_temp_core(&servers, &env());
+    assert!(plan.unusable.is_empty(), "{:?}", plan.unusable);
+    assert_eq!(plan.testable.len(), 8);
+    let ports = (20100..20108).collect::<Vec<u16>>();
+    assert!(build_temp_core_config(&plan.testable, &ports, "debug")
+        .to_string()
+        .contains(secret));
+    let mut h = harness(true, false, ports);
+    h.deps.log_level = "debug".into();
+    let out = TempCoreSession::run(
+        &h.deps,
+        &plan.testable,
+        &|| false,
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
+    )
+    .await;
+    assert!(matches!(out, TempCoreOutcome::Ran { .. }), "{out:?}");
+    let archived: Value =
+        serde_json::from_slice(&std::fs::read(h.dir.join(TEMP_CORE_LAST_CONFIG_NAME)).unwrap())
+            .unwrap();
+    assert!(!archived.to_string().contains(secret));
+    assert_eq!(archived["inbounds"].as_array().unwrap().len(), 8);
+    assert_eq!(archived["endpoints"].as_array().unwrap().len(), 2);
+    assert_eq!(archived["_diagnostic"]["sanitized"], true);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    cleanup(&h.dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn atomic_runtime_config_replaces_unwritable_old_inode_and_retires_secrets() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.log_level = "debug".into();
+    let raw = h.dir.join(TEMP_CORE_CONFIG_NAME);
+    let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
+    std::fs::write(&raw, "Q6_SYNTHETIC_RAW_SECRET").unwrap();
+    std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o0)).unwrap();
+    std::fs::write(&kept, "Q6_SYNTHETIC_OLD_SECRET").unwrap();
+    let out = TempCoreSession::run(
+        &h.deps,
+        &three_nodes(),
+        &|| false,
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
+    )
+    .await;
+    assert!(matches!(out, TempCoreOutcome::Ran { .. }), "{out:?}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
+    assert!(!raw.exists());
+    let archived = std::fs::read_to_string(&kept).unwrap();
+    assert!(!archived.contains("Q6_SYNTHETIC_RAW_SECRET"));
+    assert!(!archived.contains("Q6_SYNTHETIC_OLD_SECRET"));
+    let diagnostic: Value = serde_json::from_str(&archived).unwrap();
+    assert_eq!(diagnostic["_diagnostic"]["sanitized"], true);
+    cleanup(&h.dir);
+}
+
+#[tokio::test]
+async fn checker_rejection_and_drop_keep_only_a_sanitized_diagnostic_projection() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.log_level = "debug".into();
+    h.deps.checker = Arc::new(FakeChecker { ok: false });
+    let mut nodes = three_nodes();
+    for node in &mut nodes {
+        node.node = json!({"type":"trojan","tag":node.tag,"password":"Q6_SYNTHETIC_SECRET"});
+    }
+    let out = TempCoreSession::run(
+        &h.deps,
+        &nodes,
+        &|| false,
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
+    )
+    .await;
+    assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert!(!h.dir.join(TEMP_CORE_CONFIG_NAME).exists());
+    let kept = std::fs::read_to_string(h.dir.join(TEMP_CORE_LAST_CONFIG_NAME)).unwrap();
+    assert!(!kept.contains("Q6_SYNTHETIC_SECRET"));
+    let cfg: Value = serde_json::from_str(&kept).unwrap();
+    assert_eq!(cfg["outbounds"][0]["type"], "trojan");
+    assert_eq!(cfg["_diagnostic"]["sanitized"], true);
+    cleanup(&h.dir);
+}
+
+#[test]
+fn temporary_local_failure_keeps_typed_result_and_legacy_ledger_failure() {
+    use crate::commands::speedtest::{
+        CoreInstance, FailKind, FailPhase, MeasureFailure, MeasurePath, RunEvents, SpeedTestOrigin,
+        SpeedTestRequest,
+    };
+    use crate::runtime::measurement_ledger::MeasurementLedger;
+    let ledger = Box::leak(Box::new(MeasurementLedger::new()));
+    let request = SpeedTestRequest {
+        origin: SpeedTestOrigin::Manual,
+        targets: vec!["node".to_owned()],
+        scope: None,
+        path: MeasurePath::Candidate,
+        url: "https://example.invalid/".to_owned(),
+    };
+    let mut events = RunEvents::new(
+        "1",
+        &request,
+        CoreInstance::Temp,
+        None,
+        BTreeMap::new(),
+        None,
+    )
+    .with_ledger(ledger);
+    let local = Err(MeasureFailure::new(FailPhase::Connect, FailKind::Local));
+    let binding = Binding::static_node_pin("tag-node", false, None);
+    let mut results = RoundResults::new();
+    let mut progress = RoundProgress::new(1);
+    let mut collected = Vec::new();
+    record_measured(
+        &mut results,
+        &mut progress,
+        &mut events.sink(|event, payload| collected.push((event.to_owned(), payload))),
+        "node",
+        &local,
+        Some(&binding),
+    );
+    assert_eq!(results["node"], local);
+    assert_eq!(collected[0].1["latency"], -1);
+    assert_eq!(collected[0].1["binding"]["verdict"], "static");
+    let digest = polaris_updater::sha256_hex(request.url.as_bytes());
+    let entry = ledger.candidate_entry("node", &digest).unwrap();
+    assert_eq!(
+        entry.measured,
+        Err(MeasureFailure::new(FailPhase::Connect, FailKind::Transport))
+    );
+}
+
+#[test]
+fn temp_plan_applies_global_utls_to_node_and_shadow_without_changing_the_subscription() {
+    use polaris_config_engine::user_config::protocol_settings::{ShadowTlsSettings, TlsSettings};
+    use polaris_config_engine::user_config::server_config::SecurityMode;
+    let mut node = srv("global-utls", Protocol::Vless);
+    node.security = Some(SecurityMode::Tls);
+    node.tls_settings = Some(TlsSettings::default());
+    node.shadow_tls_settings = Some(ShadowTlsSettings {
+        password: "secret".into(),
+        sni: "example.com".into(),
+        ..Default::default()
+    });
+    let before = serde_json::to_value(&node).unwrap();
+    let plan = plan_temp_core_with_utls_policy(
+        std::slice::from_ref(&node),
+        &env(),
+        &BTreeMap::new(),
+        Some("safari"),
+    );
+    assert_eq!(plan.testable.len(), 1);
+    assert_eq!(
+        plan.testable[0].node["tls"]["utls"]["fingerprint"],
+        "safari"
+    );
+    assert_eq!(
+        plan.testable[0].companion_outbounds[0]["tls"]["utls"]["fingerprint"],
+        "safari"
+    );
+    assert_eq!(serde_json::to_value(&node).unwrap(), before);
+    node.tls_settings.as_mut().unwrap().engine = Some("apple".into());
+    let mut native = env();
+    native.platform = "darwin".into();
+    let invalid =
+        plan_temp_core_with_utls_policy(&[node], &native, &BTreeMap::new(), Some("safari"));
+    assert!(invalid.testable.is_empty());
+    assert_eq!(
+        invalid.unusable[0].1,
+        UnusableReason::BuildFailed(
+            "uTLS requires the Go TLS engine; disable uTLS or select Go TLS."
+        )
+    );
+}
+
+#[test]
+fn temp_shadow_disabled_utls_uses_the_same_standard_tls_fallback_as_main() {
+    use polaris_config_engine::user_config::protocol_settings::ShadowTlsSettings;
+    use polaris_config_engine::user_config::utls::UtlsMode;
+    for (mode, fp) in [
+        (Some(UtlsMode::Disabled), Some("chrome")),
+        (None, Some("none")),
+    ] {
+        let mut node = srv("shadow", Protocol::Shadowsocks);
+        node.shadowsocks_settings = Some(Box::new(
+            polaris_config_engine::user_config::protocol_settings::ShadowsocksSettings {
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                plugin: None,
+                plugin_opts: None,
+            },
+        ));
+        node.shadow_tls_settings = Some(ShadowTlsSettings {
+            utls_mode: mode,
+            fingerprint: fp.map(str::to_owned),
+            password: "pw".into(),
+            sni: "example.com".into(),
+            ..Default::default()
+        });
+        let before = serde_json::to_value(&node).unwrap();
+        let plan = plan_temp_core_with_utls_policy(
+            std::slice::from_ref(&node),
+            &env(),
+            &BTreeMap::new(),
+            None,
+        );
+        assert_eq!(plan.testable.len(), 1);
+        let tls = &plan.testable[0].companion_outbounds[0]["tls"];
+        assert_eq!(tls["enabled"], true);
+        assert!(tls.get("utls").is_none());
+        assert_eq!(serde_json::to_value(node).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn failed_runtime_config_publication_preserves_unowned_destination_before_spawn() {
+    let mut h = harness(true, false, vec![20001, 20002, 20003]);
+    h.deps.log_level = "debug".into();
+    let raw = h.dir.join(TEMP_CORE_CONFIG_NAME);
+    let kept = h.dir.join(TEMP_CORE_LAST_CONFIG_NAME);
+    std::fs::create_dir(&raw).unwrap();
+    std::fs::write(raw.join("sentinel"), b"unowned destination").unwrap();
+    std::fs::write(&kept, b"previous archive").unwrap();
+    let out = TempCoreSession::run(
+        &h.deps,
+        &three_nodes(),
+        &|| false,
+        |_| async { Ok(50_u32) },
+        &mut |_: &str, _: Value| {},
+    )
+    .await;
+    assert!(matches!(out, TempCoreOutcome::Failed { .. }), "{out:?}");
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read(raw.join("sentinel")).unwrap(),
+        b"unowned destination"
+    );
+    assert_eq!(std::fs::read(&kept).unwrap(), b"previous archive");
+    assert!(!std::fs::read_dir(&h.dir).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
+    cleanup(&h.dir);
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+mod private_temp_config_regressions;
+mod temp_config_writer_regressions;

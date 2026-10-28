@@ -1,13 +1,16 @@
 /**
  * 更新设置页编排。
  *
- * 应用安装包与 sing-box 内核各自有独立的状态机、事件来源与失败面，分别由 AppUpdateCard 和
- * CoreUpdateCard 持有；本页只保留跨域设置项的顺序和配置写入。
+ * 应用安装包的状态机、事件来源与失败面由 AppUpdateCard 持有；sing-box 内核只有一张只读信息卡
+ * （CoreInfoCard），它要的那份版本信息由本页挂载时读一次。其余是跨域设置项的顺序和配置写入。
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { UserConfig } from '@/contracts/types';
+import type { CoreVersionInfo } from '@/contracts/types/update';
 import { GH_PROXY_PRESETS } from '@/domain/gh-proxy';
+import type { HelperStatus } from '@/contracts/types/runtime';
+import { coreApi, helperApi } from '@/ipc/api-client';
 import {
   Card,
   Phead,
@@ -20,7 +23,7 @@ import {
   TextInput,
 } from './Primitives';
 import AppUpdateCard from './AppUpdateCard';
-import CoreUpdateCard from './CoreUpdateCard';
+import CoreInfoCard from './CoreInfoCard';
 import {
   backgroundIntervalSelectValue,
   ruleResourceAutoStatus,
@@ -40,6 +43,33 @@ type SubProxyPolicy = 'follow' | 'proxy' | 'direct';
 export default function SettingsUpdate({ config, update }: SettingsUpdateProps) {
   const { t } = useTranslation();
   const [ghCustomMode, setGhCustomMode] = useState(false);
+  const [coreInfo, setCoreInfo] = useState<CoreVersionInfo | null>(null);
+  const [selectedCore, setSelectedCore] = useState<HelperStatus['selectedCore']>();
+  useEffect(() => {
+    let cancelled = false;
+    void coreApi
+      .getVersionInfo()
+      .then((info) => {
+        if (!cancelled) setCoreInfo(info);
+      })
+      .catch((error: unknown) => {
+        console.error('[SettingsUpdate] core version info unavailable:', error);
+      });
+    const readInstalledCore = () => {
+      void helperApi.getStatus().then((status) => {
+        if (!cancelled) setSelectedCore(status.selectedCore);
+      }).catch((error: unknown) => {
+        if (!cancelled) setSelectedCore((previous) => previous ? { ...previous, state: 'unavailable' } : undefined);
+        console.error('[SettingsUpdate] selected core status unavailable:', error);
+      });
+    };
+    readInstalledCore();
+    const off = helperApi.onUpgradeable(readInstalledCore);
+    return () => {
+      cancelled = true;
+      off();
+    };
+  }, []);
   const interval = backgroundIntervalSelectValue(config);
   const ghProxy = ghCustomMode
     ? 'custom'
@@ -125,7 +155,7 @@ export default function SettingsUpdate({ config, update }: SettingsUpdateProps) 
       </SetBlock>
 
       <AppUpdateCard config={config} update={update} />
-      <CoreUpdateCard config={config} update={update} />
+      <CoreInfoCard info={coreInfo} selectedCore={selectedCore} />
 
       <Card pad style={{ marginBottom: 16 }}>
         <SetRow

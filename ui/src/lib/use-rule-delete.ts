@@ -30,10 +30,10 @@ import { useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { Rule } from '@/contracts/types';
 import { api } from '@/ipc';
-import { useAppStore, useEffectiveRules } from '@/store/app-store';
+import { effectiveCollection, useAppStore, useEffectiveRules } from '@/store/app-store';
 import { useStagedConfigStore } from '@/store/staged-config-store';
 import { useStagingActive } from '@/store/use-staging-active';
-import { editRoute, splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
+import { configCanonicalText, editRoute, splitStagedOnly, stagedOnlyIds, stagingActive } from '@/lib/staged-config';
 
 /** 删一条规则；失败抛出（调用点自己决定怎么报）。 */
 export type DeleteRuleFn = (rule: Rule) => Promise<void>;
@@ -57,6 +57,18 @@ export function useRuleDelete(plane: 'route' | 'dns' = 'route'): DeleteRuleFn {
 
   return useCallback(
     async (rule: Rule) => {
+      const state = useAppStore.getState();
+      const disk = plane === 'dns' ? state.dnsRules : state.rules;
+      const staged = useStagedConfigStore.getState();
+      const entries = staged.entries;
+      const stagingEnabled = stagingActive(staged.enabled,
+        (state.proxyStatus?.running ?? false) || state.proxyStarting || state.proxyStopping,
+        entries.length);
+      const effective = effectiveCollection(collectionKey, disk, entries);
+      const current = effective.find((candidate) => candidate.id === rule.id);
+      if (!current || configCanonicalText(current) !== configCanonicalText(rule)) {
+        throw new Error('RULE_CONFLICT');
+      }
       // 配置暂存闸门（与 NodeDialog 同形）。规则删除是纯配置变更；节点/资源等带磁盘或远端清理的
       // 删除也走暂存，但由后端 Apply journal 在旧核退出后执行副作用，二者不再靠 UI 特判分叉。
       // 集合实体的「删除」= `nextValue: null`（见 `staged-config.ts` 的 `upsertById`）。
@@ -66,8 +78,8 @@ export function useRuleDelete(plane: 'route' | 'dns' = 'route'): DeleteRuleFn {
       const split = splitStagedOnly(
         'rule.delete',
         [rule.id],
-        stagedOnlyRuleIds,
-        stagedEntries,
+        stagedOnlyIds(effective, disk),
+        entries,
         collectionKey
       );
       for (const entryId of split.revertEntryIds) revertStaged(entryId);
@@ -86,7 +98,7 @@ export function useRuleDelete(plane: 'route' | 'dns' = 'route'): DeleteRuleFn {
         });
         return; // 零 IPC 写、零磁盘写（FR-1）
       }
-      await api.rules.delete(rule.id, plane);
+      await api.rules.delete(rule.id, plane, rule);
       // 写后端即刷 store，否则列表里被删的那条还在（store.rules 只由 loadConfig/saveConfig 写）。
       void loadConfig(true);
     },

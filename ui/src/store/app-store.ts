@@ -22,6 +22,7 @@ import type { TailscaleStatusEvent } from '../contracts/tailscale-status';
 import type { ServerSwitchReceipt } from '../contracts/server-switch';
 import { api } from '../ipc';
 import { withConfigWriteLock } from '../lib/config-write-lock';
+import { configReadGeneration } from '../lib/config-read-generation';
 import { replay, type StagedEntry } from '../lib/staged-config';
 import {
   flushStagedPendingSync,
@@ -37,16 +38,6 @@ import { retainItemsById, retainRecordKeys } from './retain-entities';
 
 // 兼容旧的类型别名（Polaris 习惯）
 type ProxyMode = UserConfig['proxyMode'];
-
-/**
- * 可用的内核更新（常驻入口数据源）。放 store 使 CoreManagementCard 卸载后入口仍留存。
- */
-export interface AvailableCoreUpdate {
-  latestVersion: string;
-  downloadUrl: string;
-  /** 是否跨当前 minor 带；true 时 UI 用警告色 + 风险文案。 */
-  crossBand?: boolean;
-}
 
 /**
  * 解锁检测显示态：提到 store 使其跨首页组件卸载存活（切导航离开 → 卸载但检测态留存，切回直接展示不重跑）。
@@ -116,20 +107,244 @@ export interface ConfigEntityMutation {
   value: unknown | null;
 }
 
-// loadConfig 单飞：防 configChanged 风暴 / 启动期重复拉取（替代原 isLoading 重入守卫）
-let loadConfigInflight: Promise<void> | null = null;
-// loadConfig 代际计数：mutation 成功后自增，使在飞的旧 load 回填被丢弃（避免用旧快照覆盖 store）。
-let loadConfigGeneration = 0;
+/** These numbers order this WebView only; none is a backend revision/baseVersion. */
+export interface ConfigPublication {
+  config: UserConfig;
+  serial: number;
+  epoch: number;
+  reason: string;
+}
+type ConfigScope = 'main' | 'tray';
+type ConfigSession = {
+  scope: ConfigScope;
+  leases: number;
+  requests: number;
+  ready: Promise<void> | null;
+  off: (() => void) | null;
+};
+type ConfigWaiter = {
+  session: ConfigSession;
+  minimumEpoch: number;
+  resolve: (publication: ConfigPublication) => void;
+  reject: (error: unknown) => void;
+  cleanup: () => void;
+};
+let configScope: ConfigScope | null = null;
+let configSession: ConfigSession | null = null;
+let requestedEpoch = 0;
+let publicationSerial = 0;
+let refreshReason = 'mount';
+let refreshNeeded = false;
+// Keep the native flight even after disposal: JS invalidation cannot cancel Rust I/O.
+let loadConfigInflight: { session: ConfigSession; epoch: number } | null = null;
+const configWaiters = new Set<ConfigWaiter>();
 
-function invalidateLoadConfig(): void {
-  loadConfigGeneration++;
-  loadConfigInflight = null;
+function invalidateLoadConfig(reason: string): number {
+  refreshReason = reason;
+  configReadGeneration.invalidate();
+  return ++requestedEpoch;
+}
+
+const configRefreshMessages = {
+  CONFIG_REFRESH_CANCELLED: () => i18n.t('errors.configRefreshCancelled'),
+  CONFIG_REFRESH_SCOPE_MISMATCH: () => i18n.t('errors.configRefreshScopeMismatch'),
+  CONFIG_REFRESH_INVALID_RESPONSE: () => i18n.t('errors.configRefreshInvalidResponse'),
+} as const;
+function configRefreshError(code: keyof typeof configRefreshMessages): Error & { code: string } {
+  return Object.assign(new Error(configRefreshMessages[code]()), { code });
+}
+
+type ConfigProjection = Pick<AppState, 'config' | 'servers' | 'selectedServerId' | 'rules' | 'dnsRules'>;
+function prepareConfigPublication(config: UserConfig): ConfigProjection {
+  // IPC can resolve malformed data (including undefined outside Tauri). Prepare
+  // every mirror before changing publication serial, generation or store state.
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw configRefreshError('CONFIG_REFRESH_INVALID_RESPONSE');
+  }
+  const projection = {
+    config,
+    servers: config.servers ?? [], selectedServerId: config.selectedServerId,
+    rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
+    dnsRules: config.dnsRules ?? [],
+  };
+  if (!Array.isArray(projection.servers) || !Array.isArray(projection.rules) || !Array.isArray(projection.dnsRules)
+    || (projection.selectedServerId != null && typeof projection.selectedServerId !== 'string')) {
+    throw configRefreshError('CONFIG_REFRESH_INVALID_RESPONSE');
+  }
+  return projection;
+}
+
+function publishConfig(config: UserConfig, epoch: number, reason: string,
+  projection = prepareConfigPublication(config)): ConfigPublication {
+  const publication = { config, epoch, reason, serial: ++publicationSerial };
+  configReadGeneration.published();
+  useAppStore.setState({ ...projection, configPublication: { epoch, reason, serial: publication.serial } });
+  return publication;
+}
+
+function releaseUnusedSession(session: ConfigSession): void {
+  if (session !== configSession || session.leases || session.requests) return;
+  configSession = null;
+  session.off?.();
+  session.off = null;
+  refreshNeeded = false;
+  invalidateLoadConfig('dispose');
+  useAppStore.setState({ configLoading: false });
+}
+
+function settleConfigWaiters(session: ConfigSession, result: ConfigPublication | null, error?: unknown, maximumEpoch = Infinity): void {
+  for (const waiter of configWaiters) {
+    if (waiter.session !== session || waiter.minimumEpoch > (result?.epoch ?? maximumEpoch)) continue;
+    configWaiters.delete(waiter);
+    waiter.cleanup();
+    session.requests--;
+    if (result) waiter.resolve(result); else waiter.reject(error);
+  }
+  releaseUnusedSession(session);
+}
+
+function ensureConfigListener(session: ConfigSession): Promise<void> {
+  if (session.ready) return session.ready;
+  const registration = api.config.onChangedReady(() => {
+    if (session !== configSession) return;
+    invalidateLoadConfig('signal');
+    refreshNeeded = true;
+    pumpConfigRefresh();
+  }).then((off) => {
+    if (session !== configSession) { off(); return; }
+    session.off = off;
+  });
+  session.ready = registration;
+  void registration.then(() => pumpConfigRefresh(), (error) => {
+    if (session !== configSession || session.ready !== registration) return;
+    session.ready = null;
+    refreshNeeded = false;
+    useAppStore.setState({ configLoading: false });
+    settleConfigWaiters(session, null, error);
+    console.error('[app-store] config listener failed:', error);
+  });
+  return registration;
+}
+
+function getConfigSession(scope = configScope ?? 'main'): ConfigSession {
+  if (configScope && configScope !== scope) throw configRefreshError('CONFIG_REFRESH_SCOPE_MISMATCH');
+  configScope = scope;
+  if (!configSession) {
+    configSession = { scope, leases: 0, requests: 0, ready: null, off: null };
+    invalidateLoadConfig('activate');
+    refreshNeeded = true;
+  }
+  return configSession;
+}
+
+function pumpConfigRefresh(): void {
+  const session = configSession;
+  if (!session || !session.off || !refreshNeeded || loadConfigInflight) return;
+  refreshNeeded = false;
+  const flight = { session, epoch: requestedEpoch };
+  const reason = refreshReason;
+  loadConfigInflight = flight;
+  // Exactly one beginRead per actual native GET, never per waiter.
+  const readGeneration = configReadGeneration.beginRead();
+  const current = () => session === configSession && flight.epoch === requestedEpoch
+    && configReadGeneration.isCurrent(readGeneration);
+  useAppStore.setState({ configLoading: true });
+  let completed = false;
+  let publicationStarted = false;
+  void (async () => {
+    try {
+      const config = await api.config.get();
+      if (!current()) return;
+      const projection = prepareConfigPublication(config);
+      if (!current()) return;
+      if (session.scope === 'main') await hydrateStagedConfig(config, current);
+      if (!current()) return;
+      refreshNeeded = false;
+      publicationStarted = true;
+      const publication = publishConfig(config, flight.epoch, reason, projection);
+      completed = true;
+      settleConfigWaiters(session, publication);
+    } catch (error) {
+      // A publish/observer exception belongs to this flight even though our own
+      // publication advanced the generation. Do not turn it into an endless retry.
+      if (publicationStarted || current()) {
+        completed = true;
+        // An observer may synchronously request a newer epoch (or reacquire a
+        // different session) before throwing. Keep that real tail-read intent.
+        if (session === configSession && flight.epoch === requestedEpoch) refreshNeeded = false;
+        settleConfigWaiters(session, null, error, flight.epoch);
+        console.error('[app-store] loadConfig failed:', error);
+      }
+    } finally {
+      if (loadConfigInflight !== flight) return;
+      loadConfigInflight = null;
+      // A dedicated read/publication can invalidate us without changing the epoch.
+      // Waiters still require a real shared publication, so arrange a tail read.
+      if (session === configSession && (!completed || [...configWaiters].some((w) => w.session === session))) refreshNeeded = true;
+      if (configSession) {
+        useAppStore.setState({ configLoading: refreshNeeded });
+        pumpConfigRefresh();
+      }
+    }
+  })();
+}
+
+/** One listener per WebView. Importing this module never acquires a lease. */
+export function acquireConfigSync({ scope }: { scope: ConfigScope }): () => void {
+  const session = getConfigSession(scope);
+  session.leases++;
+  if (!loadConfigInflight) refreshNeeded = true;
+  void ensureConfigListener(session);
+  pumpConfigRefresh();
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    session.leases--;
+    releaseUnusedSession(session);
+  };
+}
+
+/** A fresh caller requires a GET started at/after this synchronous barrier. */
+export function refreshConfig({ fresh = false, reason = 'refresh', signal }: { fresh?: boolean; reason?: string; signal?: AbortSignal } = {}): Promise<ConfigPublication> {
+  if (signal?.aborted) return Promise.reject(configRefreshError('CONFIG_REFRESH_CANCELLED'));
+  const session = getConfigSession();
+  const minimumEpoch = fresh ? invalidateLoadConfig(reason) : requestedEpoch;
+  if (!loadConfigInflight) refreshReason = reason;
+  session.requests++;
+  const result = new Promise<ConfigPublication>((resolve, reject) => {
+    const abort = () => {
+      if (!configWaiters.delete(waiter)) return;
+      waiter.cleanup();
+      session.requests--;
+      reject(configRefreshError('CONFIG_REFRESH_CANCELLED'));
+      releaseUnusedSession(session);
+    };
+    const waiter: ConfigWaiter = { session, minimumEpoch, resolve, reject,
+      cleanup: () => signal?.removeEventListener('abort', abort) };
+    configWaiters.add(waiter);
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+  if (!loadConfigInflight || loadConfigInflight.epoch !== requestedEpoch) refreshNeeded = true;
+  void ensureConfigListener(session);
+  pumpConfigRefresh();
+  return result;
+}
+
+/** Call inside the existing write queue, when the mutation actually begins. */
+export function beginConfigMutation(): number { return invalidateLoadConfig('mutation'); }
+
+/** Saving and reading settle separately. Never republish an unversioned write reply. */
+export function reconcileConfigMutation(): { barrier: number; settled: Promise<ConfigPublication> } {
+  const settled = refreshConfig({ fresh: true, reason: 'mutation-settled' });
+  return { barrier: requestedEpoch, settled };
 }
 
 export interface AppState {
   // ── 配置 ──
   config: UserConfig | null;
   configLoading: boolean;
+  configPublication: Omit<ConfigPublication, 'config'> | null;
 
   // ── 代理运行态 ──
   proxyStatus: ProxyStatus | null;
@@ -169,9 +384,6 @@ export interface AppState {
   // ── helper（macOS 提权）──
   helperStatus: HelperStatus | null;
 
-  // ── 可用更新 ──
-  availableCoreUpdate: AvailableCoreUpdate | null;
-
   // ── 隐私模式 ──
   privacyMode: boolean;
 
@@ -188,6 +400,8 @@ export interface AppState {
 
   // ── 动作 ──
   loadConfig: (force?: boolean) => Promise<void>;
+  /** Publish only a complete authoritative selection readback. No writes or optimistic intent. */
+  acceptSelectionConfig: (config: UserConfig) => Promise<void>;
   /** 原子更新本次明确变动的顶层字段；未列出的字段保留后端锁内最新值。 */
   saveConfig: (patch: Partial<UserConfig>) => Promise<void>;
   /** 在后端锁内最新集合上按实体主键提交；多条 mutation 同盘提交，避免数组快照覆盖与半成功。 */
@@ -195,7 +409,7 @@ export interface AppState {
   updateProxyMode: (mode: ProxyMode) => Promise<void>;
   startProxy: () => Promise<void>;
   stopProxy: () => Promise<void>;
-  switchServer: (serverId: string) => Promise<ServerSwitchReceipt>;
+  switchServer: (serverId: string) => Promise<ServerSwitchReceipt | null>;
   setProxyStatus: (status: ProxyStatus | null) => void;
   refreshProxyStatus: () => Promise<void>;
   setTrafficStats: (stats: TrafficStats | null) => void;
@@ -238,6 +452,7 @@ const initialUnlock: UnlockDisplayState = {
 export const useAppStore = create<AppState>((set, get) => ({
   config: null,
   configLoading: false,
+  configPublication: null,
 
   proxyStatus: null,
   proxyStarting: false,
@@ -263,99 +478,47 @@ export const useAppStore = create<AppState>((set, get) => ({
   invalidNodes: [],
 
   helperStatus: null,
-  availableCoreUpdate: null,
   privacyMode: false,
   tailscaleStatuses: {},
   serverPageAction: null,
 
   loadConfig: async (force?: boolean) => {
-    // 单飞：已在飞且非 force → 复用（防 configChanged 风暴）
-    if (!force && loadConfigInflight) {
-      return loadConfigInflight;
-    }
-
-    const myGeneration = ++loadConfigGeneration;
-    set({ configLoading: true });
-
-    loadConfigInflight = (async () => {
-      try {
-        const config = await api.config.get();
-        // 代际比对：mutation 成功后自增代际，在飞的旧 load（拿的是 mutation 前旧快照）回填被丢弃
-        if (myGeneration !== loadConfigGeneration) {
-          // 被 force 刷新取代时，不能让调用者把「旧 fetch 已结束」错当成「最新 config 已发布」。
-          // 新一代若已存在就等它；若被 mutation 作废，mutation 已同步发布自己的最新快照。
-          await loadConfigInflight;
-          return;
-        }
-
-        // 首次暂存恢复要先消费 clean-exit 标记。等它完成才发布 config：否则编辑入口会在
-        // baseline 仍为 null 时可达，随后 hydrate 的恢复快照会覆盖刚刚写入的 staged 条目。
-        await hydrateStagedConfig(config);
-        // 水合 await 期间可能收到更新的 configChanged；旧代际绝不能在较新快照之后发布。
-        if (myGeneration !== loadConfigGeneration) {
-          await loadConfigInflight;
-          return;
-        }
-
-        set({
-          config,
-          servers: config.servers ?? [],
-          selectedServerId: config.selectedServerId,
-          rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
-          dnsRules: config.dnsRules ?? [],
-          configLoading: false,
-        });
-      } catch (err) {
-        if (myGeneration !== loadConfigGeneration) return;
-        set({ configLoading: false });
-        console.error('[app-store] loadConfig failed:', err);
-      } finally {
-        if (myGeneration === loadConfigGeneration) {
-          loadConfigInflight = null;
-        }
-      }
-    })();
-
-    return loadConfigInflight;
+    try { await refreshConfig({ fresh: force, reason: force ? 'reload' : 'load' }); }
+    catch (error) { console.error('[app-store] loadConfig failed:', error); }
   },
 
-  // 即时编辑只传本次明确变动的顶层字段。后端在单一配置写锁内把 patch 合到最新磁盘值上，故订阅刷新、
-  // 托盘和主窗互相不会因陈旧整份快照而覆盖。仍与 staged 保存共用 webview 写队列，避免本窗口自己把
-  // `config.get → staged replay → versioned save` 的乐观事务撞成冲突。
+  acceptSelectionConfig: async (config) => {
+    // Callers retain their dedicated-read generation check before this boundary.
+    publishConfig(config, -1, 'selection');
+    const publication = configReadGeneration.current();
+    if (configScope !== 'tray') await hydrateStagedConfig(config, () => configReadGeneration.isCurrent(publication));
+  },
+
   saveConfig: async (patch) => {
     try {
-      const config = await withConfigWriteLock(() => api.config.patch(patch));
-      invalidateLoadConfig();
-      set({
-        config,
-        servers: config.servers ?? [],
-        selectedServerId: config.selectedServerId,
-        rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
-        dnsRules: config.dnsRules ?? [],
+      await withConfigWriteLock(async () => {
+        beginConfigMutation();
+        await api.config.patch(patch);
       });
-      hydrateStagedConfig(config);
-    } catch (err) {
-      console.error('[app-store] saveConfig failed:', err);
-      throw err;
+    } catch (error) {
+      void reconcileConfigMutation().settled.catch(() => {});
+      throw error;
     }
+    // A failed read is not a failed save and must not encourage duplicate writes.
+    await reconcileConfigMutation().settled.catch(() => {});
   },
 
   mutateConfigEntities: async (mutations) => {
     try {
-      const config = await withConfigWriteLock(() => api.config.mutateEntities(mutations));
-      invalidateLoadConfig();
-      set({
-        config,
-        servers: config.servers ?? [],
-        selectedServerId: config.selectedServerId,
-        rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
-        dnsRules: config.dnsRules ?? [],
+      await withConfigWriteLock(async () => {
+        beginConfigMutation();
+        await api.config.mutateEntities(mutations);
       });
-      hydrateStagedConfig(config);
-    } catch (err) {
-      console.error('[app-store] mutateConfigEntities failed:', err);
-      throw err;
+    } catch (error) {
+      void reconcileConfigMutation().settled.catch(() => {});
+      throw error;
     }
+    await reconcileConfigMutation().settled.catch(() => {});
   },
 
   updateProxyMode: async (mode) => {
@@ -401,21 +564,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   switchServer: async (serverId) => {
     // 与暂存保存/配置补丁共用同一条 webview 内写队列：快速连点必须按调用顺序落盘，
     // 否则较慢的旧 IPC 可能最后回包，把最后一次点击覆盖回旧节点。
-    const { receipt, config } = await withConfigWriteLock(async () => {
+    const readback = await withConfigWriteLock(async () => {
       const receipt = await api.server.switch(serverId);
-      return { receipt, config: await api.config.get() };
+      const readGeneration = configReadGeneration.beginRead();
+      try {
+        return { receipt, config: await api.config.get(), readGeneration };
+      } catch (error) {
+        if (!configReadGeneration.isCurrent(readGeneration)) return null;
+        throw error;
+      }
     });
-    invalidateLoadConfig();
-    set({
-      config,
-      servers: config.servers ?? [],
-      selectedServerId: config.selectedServerId,
-      rules: config.trafficRules ?? config.policyRules ?? config.customRules ?? [],
-      dnsRules: config.dnsRules ?? [],
-    });
-    const hydration = hydrateStagedConfig(config);
+    if (!readback || !configReadGeneration.isCurrent(readback.readGeneration)) return null;
+    const { receipt, config } = readback;
+    publishConfig(config, -1, 'selection');
+    const publicationGeneration = configReadGeneration.current();
+    const hydration = configScope === 'tray' ? Promise.resolve()
+      : hydrateStagedConfig(config, () => configReadGeneration.isCurrent(publicationGeneration));
     if (typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios') await hydration;
-    return receipt;
+    // A newer publication/read also owns feedback during asynchronous iOS hydration.
+    return configReadGeneration.isCurrent(publicationGeneration) ? receipt : null;
   },
 
   setProxyStatus: (status) => set({ proxyStatus: status }),
@@ -592,6 +759,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       old.loggedIn === event.loggedIn &&
       old.expired === event.expired &&
       old.authURL === event.authURL &&
+      old.canShareFiles === event.canShareFiles &&
+      old.waitingFileCount === event.waitingFileCount &&
+      old.receivingFileCount === event.receivingFileCount &&
+      old.unreadFileCount === event.unreadFileCount &&
       JSON.stringify(old.details) === JSON.stringify(event.details) &&
       old.peers.length === event.peers.length &&
       old.peers.every((p, i) => {
@@ -661,9 +832,11 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   /** 同上，首页版（消费点 HomeScreen 的高亮 effect）。 */
 
-  reset: () =>
+  reset: () => {
+    invalidateLoadConfig('reset');
     set({
       config: null,
+      configPublication: null,
       configLoading: false,
       proxyStatus: null,
       proxyStarting: false,
@@ -679,7 +852,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       pendingChanges: EMPTY_PENDING,
       invalidNodes: [],
       helperStatus: null,
-      availableCoreUpdate: null,
       privacyMode: false,
       // 原始帧只在核跑着时有意义（reset 语义 = 回到「什么都不知道」），清掉即回落到
       // 「无帧 → 出口告警不据陈旧帧下认证/离线结论」。
@@ -690,8 +862,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 不随一次 app 状态重置而「变成未登录」。
       tailscaleAuthUrls: {},
       tailscaleLoginInitiated: {},
-    }),
+    });
+    if (configSession) { refreshNeeded = true; pumpConfigRefresh(); }
+  },
 }));
+
+// Includes mutation results, staged-store publications and external setState
+// callers. Whole-config freshness cannot be inferred from selection context.
+useAppStore.subscribe((state, previous) => {
+  if (state.config === previous.config) return;
+  if (state.configPublication === previous.configPublication || !state.config) configReadGeneration.published();
+  // Staged-save and legacy authoritative publishers remain visible to hooks, but
+  // cannot satisfy a settlement barrier with a pre-barrier snapshot.
+  if (state.config && state.configPublication === previous.configPublication) {
+    publishConfig(state.config, -1, 'external-publication');
+  }
+});
 
 // ─────────────────────────── effectiveConfig（暂存回显的唯一读点）───────────────────────────
 

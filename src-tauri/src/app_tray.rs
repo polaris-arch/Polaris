@@ -185,7 +185,6 @@ pub(crate) fn reconcile_tray_visual(
 /// | 用户主动断开 | `STOPPED` | ✅ |
 /// | 核异常退出 / 自动重启失败 | 仅 `ERROR` | ❌ 停在实心 |
 /// | `proxy_restart` 失败（核已停） | **零 emit** | ❌ 停在实心 |
-/// | updater 换核前停核 | **零 emit** | ❌ 停在实心 |
 /// | 休眠唤醒后失效 | **零 emit** | ❌ |
 ///
 /// 回读真值把问题收敛回「当下核在不在跑」这一个可直接观测的事实（`ProxyRuntime::status().running`，
@@ -1014,12 +1013,12 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
                         i18n::key::TRAY_CONNECT,
                     ),
                     TrayProxyAction::Stop => (
-                        commands::proxy::proxy_stop(app.clone(), state).await,
+                        commands::proxy::proxy_stop_unconditional(app.clone(), state).await,
                         i18n::key::TRAY_DISCONNECT,
                     ),
                     // 起核期 `running=false`，仍必须走 stop；这是自绘托盘已经建立的取消契约。
                     TrayProxyAction::Cancel => (
-                        commands::proxy::proxy_stop(app.clone(), state).await,
+                        commands::proxy::proxy_stop_unconditional(app.clone(), state).await,
                         i18n::key::TRAY_CANCEL_STARTUP,
                     ),
                 };
@@ -1062,39 +1061,8 @@ pub(crate) fn run_menu_action(app: &tauri::AppHandle, action: MenuAction) {
             tauri::async_runtime::spawn_blocking(move || {
                 let lang = i18n::app_lang(&app);
                 let state = app.state::<AppRuntime>();
-                let Ok(mut cfg) = state.config().current() else {
-                    notify_menu_action_error(
-                        &app,
-                        lang,
-                        i18n::key::TRAY_GROUP_TAKEOVER,
-                        &i18n::t(lang, i18n::key::NATIVE_UNKNOWN_ERROR),
-                    );
-                    return;
-                };
-                cfg["proxyModeType"] = serde_json::Value::String(kind.to_string());
-                // 与浮层 / 主窗同源：切到 TUN 时消费「FakeIP-TUN 待纠正」快照（见 tray::apply_fake_ip_tun_entry）。
-                // 纠正涉及 proxyModeType + dnsConfig/dnsDefaults，作为一个顶层补丁原子落盘；不能拆成
-                // 多次 set_value（会广播/重启多次），也不能拿托盘打开时的旧快照整份覆盖。
-                if crate::tray::apply_fake_ip_tun_entry(&mut cfg) {
-                    log::info!(
-                        "托盘原生菜单进入 TUN：已自动回填 enableFakeIp=true（消费迁移期待纠正快照）"
-                    );
-                }
-                // `defer_restart=None`：托盘切接管方式是**用户此刻要它生效**的动作，不是「保存」，
-                // 不得降级到待应用差集（降了 = 点了切 TUN 却什么都没发生）。
-                // `base_version=None`：托盘不产生 staged（spec §Q8-b 闸 2），它永远是「被合并方」
-                // 而非「冲突方」——挂上乐观并发只会让托盘操作在别人写盘时莫名失败。
-                let mut patch = serde_json::Map::new();
-                for key in ["proxyModeType", "dnsConfig", "dnsDefaults"] {
-                    if let Some(value) = cfg.get(key).cloned() {
-                        patch.insert(key.to_string(), value);
-                    }
-                }
-                let response = commands::config::config_patch(
-                    app.clone(),
-                    state,
-                    serde_json::Value::Object(patch),
-                );
+                // Read/transform/save the latest config under the same writer boundary.
+                let response = commands::config::config_takeover(app.clone(), state, kind);
                 notify_menu_response_failure(&app, lang, i18n::key::TRAY_GROUP_TAKEOVER, &response);
             });
         }

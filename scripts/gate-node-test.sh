@@ -40,6 +40,15 @@ required_tests=(
   # Desktop source graph predicates may not disappear from the host fixture gate.
   scripts/build-desktop-core.test.mjs
   scripts/desktop-core-ci-wiring.test.mjs
+  # 内核从安装目录直接运行后的两条打包侧判据：被删/改名时安装器照样编得过、dmg 照样出得来。
+  scripts/nsis-core-sweep.test.mjs
+  scripts/macos-nested-code.test.mjs
+  # 卸载钩子里唯一提权执行的那一段：脚本随命令行进入提权进程、删除前逐项校验、退出码被消费。
+  scripts/nsis-helper-cleanup.test.mjs
+  scripts/release-assets.test.mjs
+  scripts/mobile-source-unit.test.mjs
+  scripts/apple-ci-impact.test.mjs
+  scripts/ci-workflow-efficiency.test.mjs
 )
 for file in "${required_tests[@]}"; do
   [ -f "$file" ] || {
@@ -48,57 +57,25 @@ for file in "${required_tests[@]}"; do
   }
 done
 
-# 🔴 输出与退出码必须**分两步**取（2026-09-05 修）。旧版写成 `out="$(node --test …)"`：
-#    node 非零时 `set -e` 在**赋值那一行**就把脚本掐掉，下面的 printf 一行都执行不到 ⇒
-#    门 rc=1 而日志是**空文件**（实测 `wc -l` = 0）。门红的时候看不见红在哪，读的人只会
-#    以为是脚本坏了或 cwd 不对，去查一个不存在的问题。
-#    `|| rc=$?` 让这次赋值成为 `||` 列表的左支，errexit 按定义不介入，于是输出先落地、再据 rc 退出。
-rc=0
-out="$(node --test --test-reporter=tap scripts/*.test.mjs 2>&1)" || rc=$?
-printf '%s\n' "$out"
-if [ "$rc" -ne 0 ]; then
-  echo "::error::gate-node-test: node --test 退出码 $rc —— 失败用例见上面 TAP 输出里的 'not ok' 行" >&2
-  exit "$rc"
-fi
-
-# 同一形状的姊妹腿（同根因，同批一起修）：TAP 格式真的变了时 grep 匹不到，pipefail 让整条管道
-# rc=1 ⇒ errexit 又会在**这一行**掐掉脚本，而下面那个 `-z` 分支正是**专为这种情况**写的报错，
-# 它在旧版里永远到不了。`|| true` 把管道 rc 吞掉，让判断落回 `-z` 那一支去打它该打的话。
-pass="$(printf '%s\n' "$out" | grep -E '^# pass [0-9]+$' | awk '{print $3}')" || true
-if [ -z "${pass:-}" ]; then
-  echo "::error::gate-node-test: 未能从输出里解析出 '# pass N' 行，TAP 格式可能变了" >&2
-  exit 1
-fi
-# 下限随合同条数走。**加了用例就要抬这个数**，否则新用例被整批删掉时本门照绿——那正是这条
-# 下限存在的理由。变更史：
-#   68 → 76（2026-09-05）verify-apk 死字节判据的 8 条（正反变异 + 带的两个沿 + 两条取材面自检
-#           + 算式手算对拍 + 真实尺度红绿对照）
-#   76 → 86（2026-09-05）verify-apk 原生库剥符号判据的 10 条（DWARF 回来 / libbox 出处路由 /
-#           `.zdebug_*` 旧拼写 / 三条取材面自检 / 正面断言有牙 / ELF32 / 节表取值口）
-#   86 → 96（2026-09-05）verify-apk 判据 ABI 参数化的 8 条（parseArgs 三条：缺省不变 / 取得到 /
-#           未知取值必抛；四 ABI 全绿的反向对照；换 ABI 判必须红；机器类型与位宽各一条；
-#           非缺省 ABI 下 ③⑥ 仍有牙）+ gate-rust-ci-parity 的 2 条（dep-info 对差门的实质对拍
-#           与它的切片自检）
-#   86 → 98（2026-09-05）assert-r8-evidence 的 12 条（B07 注释污染正反回放 / keep 指向不存在的
-#           类时 seeds 说话 / wry 成员没保住 / 反向对照有牙 / 空产物 / 判定面塌 / seeds 行数下限 /
-#           五根针逐条删除对照 / 注释行提取）
-#   98 → 103（2026-09-05）assert-r8-evidence 按**来源段**归因的 5 条（A11 正反回放：本批那个
-#           keep 块被 Tauri 生成的 proguard-wry.pro 喂绿 / 外部来源的针被抄进本仓段不算数 /
-#           没有段落标记时不许退化成全文匹配 / 段落切分与来源判定自检）
-#   两条线在同一处各自抬过下限（96 与 103），合并后两批测试都在 ⇒ 下限按合并态实测重定。
-#   113 → 124（2026-09-06）wiring-verdict 的 11 条（报告块切分 / 失败条数解析 / 三个 marker 各自
-#           缺席 / 半真门没跑 / 销账不许报成门坏了 / 漂移分流不许吞掉真失败 / 无漂移 token 的红 /
-#           清零→升格→rc=0 完整路径 / it.skip 那条路 / 正常态的反向对照）
-#   124 → 132（2026-09-06）verify-apk 出厂权限集判据（⑦）的 8 条（真 aapt2 输出的反向对照 /
-#           行首锚定不许把 `permission:` 算成请求 / 注入 QUERY_ALL_PACKAGES 必红 / 误删一条必红 /
-#           自建 permission 多一条必红 / 取材面塌陷红在取材面 / 下限有牙 / 登记表 8+3 与理由自检）
-#   132 → 141（2026-09-30）PC runtime publication freeze 的 9 条策略/变异回归。
-#   141 → 212（2026-09-30）冻结现有 200 条 + desktop source graph 12 条纯 fixture 合同。
-#   212 → 217（2026-09-30）G1 的 5 条逐平台 patched/transport presence 与 fingerprint 合同。
-#   217 → 223（2026-10-01）6 条 native source workflow/candidate/bundle/reuse/impact 纯接线合同。
-#   真实 tiny Go buildInfo 用显式 opt-in 单独执行，不借其 skip 数满足下限。
-#   223 → 231（2026-10-05）8 条 ZIP 压缩／静态符号／运行元数据与 libbox 来源原字节合同。
-if [ "$pass" -lt 231 ]; then
-  echo "::error::gate-node-test: 只 pass 了 $pass 条（当前固定合同下限 231）—— 必需合同测试是否被误删/改名/漏跑？" >&2
-  exit 1
-fi
+# Stream TAP directly without retaining a second complete log in the shell.
+# pipefail keeps the runner exit status authoritative; the terminal count adds
+# coverage protection and never substitutes for successful test execution.
+node --test --test-reporter=tap scripts/*.test.mjs 2>&1 | (
+  summaries=0
+  passed=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s\n' "$line"
+    if [[ "$line" =~ ^#\ pass\ ([0-9]+)$ ]]; then
+      summaries=$((summaries + 1))
+      passed="${BASH_REMATCH[1]}"
+    fi
+  done
+  if [ "$summaries" -ne 1 ]; then
+    echo '::error::gate-node-test: expected exactly one TAP pass summary' >&2
+    exit 1
+  fi
+  if [ "$passed" -lt 501 ]; then
+    echo "::error::gate-node-test: only $passed passes; mandatory minimum is 501" >&2
+    exit 1
+  fi
+)

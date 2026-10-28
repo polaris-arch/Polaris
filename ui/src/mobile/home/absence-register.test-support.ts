@@ -35,8 +35,10 @@ export const HOME_PARITY: ScreenParityRegister = {
   primitiveModules: [],
   // 「给这个主机加一条规则」的菜单项片段（拓扑图右键面板的内容）住在 `components/` 下，
   // 但它渲染的是 `rules.*` 屏级文案 —— 按 ⓪ 组那条判据它是**内容**，不是通用原语。
-  extraBlockSources: ['ui/src/components/RuleSubjectMenuItems.tsx'],
-  sharedPrimitives: ['ui/src/components/FlagImg.tsx'],
+  // MeasurementLabel owns measurement status/path copy, so its ledger display is
+  // a content block even though desktop and mobile use the same implementation.
+  extraBlockSources: ['ui/src/components/RuleSubjectMenuItems.tsx', 'ui/src/mobile/MeasurementLabel.tsx'],
+  sharedPrimitives: ['ui/src/components/FlagImg.tsx', 'ui/src/mobile/SavedAutoSelectControls.tsx'],
   slotHandoffGates: [
     { file: 'ui/src/mobile/mobile-chrome.test.tsx', mustContain: '③ 反向分流指示器（真机 2026-07-20 §1.4 的移植）' },
     { file: 'ui/src/mobile/home/home-screen.test.tsx', mustContain: '① DOM 序 = 重要性序，不许被断点重排' },
@@ -247,6 +249,14 @@ export const HOME_PARITY: ScreenParityRegister = {
   ],
 
   blocks: [
+    {
+      id: 'MeasurementLabel',
+      disposition: {
+        kind: 'ported',
+        mobile: { file: 'ui/src/mobile/home/HomeNodePickerList.tsx', mustContain: '<MeasurementLabel serverId={server.id} displayedServer={server} translate={t} />' },
+      },
+      note: '节点选择行的测量内容块直接复用同一已验证账本呈现，含不可读/测量目的说明与保存配置资格；首页当前出口另外以 purpose="current" 接同一组件，不将暂存编辑继承旧测量值。',
+    },
     {
       id: 'ConnectionTopology',
       disposition: {

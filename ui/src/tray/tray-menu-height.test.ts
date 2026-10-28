@@ -318,9 +318,15 @@ describe('接线门：TrayMenu 装了桥、清了锁、把重量依赖接进了 
   });
 
   it('腿 A：把 __POLARIS_TRAY_REMEASURE__ 挂上 window，回调里清锁并逼一次重量', () => {
-    expect(MENU).toContain(
-      'window.__POLARIS_TRAY_REMEASURE__ = requestRemeasure',
+    const bridge = slice(
+      MENU,
+      'window.__POLARIS_TRAY_REMEASURE__ = (reason) => {',
+      '};',
     );
+    const alwaysRemeasureThenExactShow = (source: string) => /^\s*requestRemeasure\(\);\s*if \(reason === 'show'\) refreshOnShow\.current\(\);\s*$/.test(source);
+    expect(alwaysRemeasureThenExactShow(bridge)).toBe(true);
+    expect(alwaysRemeasureThenExactShow(bridge.replace('requestRemeasure();', ''))).toBe(false);
+    expect(alwaysRemeasureThenExactShow(bridge.replace("reason === 'show'", "reason !== 'geometry'"))).toBe(false);
     const body = slice(
       MENU,
       'const requestRemeasure = useCallback(',

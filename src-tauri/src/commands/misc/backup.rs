@@ -15,7 +15,7 @@ use crate::runtime::AppRuntime;
 use polaris_store::backup::{
     build_backup_info, count_category, detect_categories, mesh_routing_owner_dependencies,
     parse_backup_content, pick_categories, sanitize_unavailable_interface_bindings, BackupCategory,
-    BACKUP_CATEGORIES, BACKUP_FILE_VERSION,
+    BACKUP_CATEGORIES, BACKUP_FILE_VERSION, SHARED_DEPENDENCY_CONFLICT,
 };
 
 /// 把前端传来的类别串解析成枚举；空 / None → 全选。
@@ -405,7 +405,7 @@ pub async fn backup_import_apply(
         Ok(saved) => saved,
         Err(e) => {
             log::warn!("[backup] import save failed: {e}");
-            return Ok(ApiResponse::ok(backup_failure("saveFailed")));
+            return Ok(ApiResponse::ok(backup_failure(backup_save_error_code(&e))));
         }
     };
     if saved.cross_platform_disabled_rules > 0 {
@@ -454,6 +454,15 @@ pub async fn backup_import_apply(
 /// 备份失败的用户面只带稳定码。原始 OS/路径错误只记日志，不能越过 IPC 变成跨语种 UI 文案。
 fn backup_failure(code: &str) -> Value {
     json!({ "success": false, "errorCode": code })
+}
+
+fn backup_save_error_code(error: &polaris_store::StoreError) -> &'static str {
+    match error {
+        polaris_store::StoreError::Validation(code) if code == SHARED_DEPENDENCY_CONFLICT => {
+            "sharedDependencyConflict"
+        }
+        _ => "saveFailed",
+    }
 }
 
 /// 上游 `BACKUP_GET_INFO`：当前配置摘要。

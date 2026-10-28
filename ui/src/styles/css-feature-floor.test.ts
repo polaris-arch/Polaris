@@ -749,9 +749,107 @@ const vendorPrefixed = (name: string) => /^(::?)?-(webkit|moz|ms|o)-/.test(name)
 
 const key = (h: Hit) => `${h.cat}:${h.name}`;
 
-/** 守卫必须测到这个特性本身，否则 @supports 会退化成万能豁免。 */
-const guardCovers = (h: Hit) =>
-  h.guards.some((cond) => cond.toLowerCase().includes(h.name.toLowerCase()));
+/**
+ * Support proof is narrower than lexical inventory: successful parsing must entail
+ * the feature, rather than merely accept its spelling inside an opaque payload.
+ * Only direct dimensions on size properties and whole root color functions are
+ * modeled. URL/string/custom-ident fields and arbitrary nested function arguments
+ * provide no unit/function evidence. Unmodeled valid forms intentionally stay red.
+ */
+function declarationCovers(declaration: Decl, hit: Hit): boolean {
+  const prop = declaration.prop.toLowerCase();
+  const value = declaration.value.trim();
+  const name = hit.name.toLowerCase();
+  if (!value || prop.startsWith('--')) return false;
+  // These functions defer value checking until substitution/computed-value time.
+  if ([...value.matchAll(FN)].some((m) => /^(var|env|attr)$/i.test(m[1]))) return false;
+  if (hit.cat === 'prop') return prop === name;
+  if (hit.cat === 'unit') {
+    if (!/^(?:(?:min|max)-)?(?:width|height|inline-size|block-size)$/.test(prop)) return false;
+    const dimension = /^([+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)([a-zA-Z]+)$/.exec(value);
+    return dimension !== null && Number.isFinite(Number(dimension[1])) &&
+      dimension[2].toLowerCase() === name;
+  }
+  if (hit.cat === 'fn' && prop === 'color') {
+    const root = /^([a-zA-Z][a-zA-Z0-9-]*)\(/.exec(value);
+    if (!root || root[1].toLowerCase() !== name) return false;
+    if (!/^(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color|color-mix|light-dark)$/.test(name)) return false;
+    let depth = 1;
+    for (let i = root[0].length; i < value.length; i++) {
+      if (value[i] === '(') depth++;
+      else if (value[i] === ')' && --depth === 0) return i === value.length - 1;
+    }
+  }
+  return false;
+}
+
+/**
+ * True means every path that enables this condition positively tests the feature.
+ * NOT never proves support; AND needs one proof, OR needs a proof in every arm.
+ * Unknown/general-enclosed syntax is deliberately not a proof. Declaration atoms
+ * reuse the parser with narrow typed-value proofs, not the lexical inventory.
+ */
+function conditionCovers(condition: string, hit: Hit): boolean {
+  const text = condition.trim();
+  if (!text || /^not\b/i.test(text)) return false;
+  const arms: string[] = [];
+  const operators: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let firstClose = -1;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '(') depth++;
+    else if (text[i] === ')') {
+      if (--depth < 0) return false;
+      if (depth === 0 && firstClose < 0) firstClose = i;
+    } else if (depth === 0 && /\s/.test(text[i])) {
+      const op = /^\s+(and|or)\s+/i.exec(text.slice(i));
+      if (op) {
+        arms.push(text.slice(start, i).trim());
+        operators.push(op[1].toLowerCase());
+        i += op[0].length - 1;
+        start = i + 1;
+      }
+    }
+  }
+  if (depth !== 0) return false;
+  if (operators.length) {
+    arms.push(text.slice(start).trim());
+    // Mixing AND/OR without grouping is not valid CSS supports syntax.
+    if (arms.some((arm) => !arm) || new Set(operators).size !== 1) return false;
+    return operators[0] === 'and'
+      ? arms.some((arm) => conditionCovers(arm, hit))
+      : arms.every((arm) => conditionCovers(arm, hit));
+  }
+
+  const matchesHit = (css: string) => collect(css).some((atom) =>
+    atom.cat === hit.cat && atom.name.toLowerCase() === hit.name.toLowerCase(),
+  );
+  if (text[0] === '(' && firstClose === text.length - 1) {
+    const inner = text.slice(1, -1).trim();
+    // Reuse declaration structure, then require a recognized semantic token role.
+    if (/^-?[a-zA-Z][\w-]*\s*:/.test(inner) && !/[;{}]/.test(inner)) {
+      const css = `.supports-probe { ${inner}; }`;
+      const { decls } = parse(css);
+      return decls.length === 1 && declarationCovers(decls[0], hit);
+    }
+    // This also rejects custom-property atoms rather than recursing forever.
+    return conditionCovers(inner, hit);
+  }
+  if (/^selector\(/i.test(text) && firstClose === text.length - 1) {
+    const selector = text.slice(text.indexOf('(') + 1, -1);
+    // Forgiving selector-list functions may discard an unsupported arm. Until the
+    // collector models that grammar, their tokens cannot certify feature support.
+    if (!selector.trim() || /[{};]|:(?:is|where)\(/i.test(selector)) return false;
+    return matchesHit(`${selector} {}`);
+  }
+  return false;
+}
+
+/** Nested @supports blocks are an AND: one ancestor proof is enough. */
+const guardCovers = (h: Hit) => h.guards.some((condition) =>
+  conditionCovers(condition.replace(/^@supports\s+/i, ''), h),
+);
 
 const lineOf = (css: string, index: number) => css.slice(0, index).split('\n').length;
 
@@ -830,16 +928,25 @@ const handwrittenSources = (): Source[] => {
 const HANDWRITTEN = handwrittenSources();
 const HANDWRITTEN_ALL = HANDWRITTEN.map((s) => s.css).join('\n');
 
-/** Tailwind v4 的真实输出。构建失败必须炸出来 —— 静默跳过等于这条腿从来没跑过。 */
-const buildTailwindCss = async (): Promise<string> => {
+/**
+ * One immutable fixture for this suite. Every consumer checks the same input;
+ * negative controls modify the returned string, never the source/config/files.
+ * Cache the Promise (including rejection), not just success, so concurrent calls
+ * compile once and a build failure still reaches every independent assertion.
+ */
+const TAILWIND_INPUT = Object.freeze({
+  from: join(HERE, 'index.css'),
+  css: readFileSync(join(HERE, 'index.css'), 'utf8'),
+});
+let tailwindBuild: Promise<string> | undefined;
+const buildTailwindCss = (): Promise<string> => tailwindBuild ??= (async () => {
   const [{ default: postcss }, { default: tw }] = await Promise.all([
     import('postcss'),
     import('@tailwindcss/postcss'),
   ]);
-  const from = join(HERE, 'index.css');
-  const res = await postcss([tw()]).process(readFileSync(from, 'utf8'), { from });
+  const res = await postcss([tw()]).process(TAILWIND_INPUT.css, { from: TAILWIND_INPUT.from });
   return res.css;
-};
+})();
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -993,6 +1100,84 @@ describe('③ 反向对照：越界必红、合法必绿、守卫必须测它自
     expect(vs[0].guardedButUntested).toBe(true);
   });
 
+  it.each([
+    'not (height: 100dvh)',
+    '(not (height: 100dvh))',
+    '(height: 100dvh) or (display: grid)',
+    '((height: 100dvh) and (display: grid)) or (width: 1px)',
+    '(--dvh: 1)',
+    '(--probe: 100dvh)',
+    '(height: var(--probe, 100dvh))',
+    '(height: env(probe, 100dvh))',
+    '(height: 100dvh) or future(100dvh)',
+    'future(height: 100dvh)',
+    '(height: 100dvh) and (display: grid) or (width: 1px)',
+  ])('逻辑/自定义属性负控仍然拒绝 dvh：%s', (condition) => {
+    const css = `@supports ${condition} { .x { height: 100dvh; } }`;
+    expect(violationsIn('guard-mutant', stripNoise(css)).map((v) => v.key)).toContain('unit:dvh');
+  });
+
+  it.each([
+    '(background-image: url(100dvh))',
+    '(background-image: url("100dvh"))',
+    '(content: "100dvh")',
+    '(font-family: 100dvh)',
+    '(animation-name: probe-100dvh)',
+    '(height: opaque(100dvh))',
+    '(height: calc(100dvh))', // valid CSS, but outside this deliberately narrow proof
+    '(height: 100dvh junk)',
+    '(height: 100dvh 1px)',
+    '(height: -100dvh)',
+    '(height: attr(data-height type(<length>), 100dvh))',
+  ])('N2-R01：URL/字符串/不透明或未建模值不能证明单位支持：%s', (condition) => {
+    const css = `@supports ${condition} { .x { height: 100dvh; } }`;
+    expect(violationsIn('opaque-unit-guard', stripNoise(css)).map((v) => v.key)).toContain('unit:dvh');
+  });
+
+  it.each([
+    '(content: "color-mix(in oklab, red, blue)")',
+    '(font-family: "color-mix(in oklab, red, blue)")',
+    '(font-family: color-mix)',
+    '(background-image: image-set("color-mix(in oklab, red, blue)" 1x))',
+    '(color: opaque(color-mix(in oklab, red, blue)))',
+    '(color: var(--accent, color-mix(in oklab, red, blue)))',
+    '(color: env(accent, color-mix(in oklab, red, blue)))',
+    '(color: attr(data-color, color-mix(in oklab, red, blue)))',
+    '(color: color-mix(in oklab, red, blue) junk)',
+  ])('N2-R01：不透明、嵌套、非法或延迟值不能证明颜色函数支持：%s', (condition) => {
+    const css = `@supports ${condition} { .x { color: color-mix(in oklab, red, blue); } }`;
+    expect(violationsIn('opaque-function-guard', stripNoise(css)).map((v) => v.key)).toContain('fn:color-mix');
+  });
+
+  it.each([
+    '(height: 100dvh)',
+    '(min-height: 1dvh)',
+    '((height: 100dvh))',
+    '(display: grid) and (height: 100dvh)',
+    '(height: 100dvh) or (width: 1dvh)',
+    '((height: 100dvh) and (display: grid)) or ((width: 1dvh) and (display: flex))',
+  ])('正向原子及充分 AND/OR 证明保持放行：%s', (condition) => {
+    expect(violationsIn('proved-guard', stripNoise(`@supports ${condition} { .x { height: 100dvh; } }`))).toEqual([]);
+  });
+
+  it('嵌套守卫复用栈，属性/函数/选择器必须匹配同类真实原子', () => {
+    expect(violationsIn('nested', stripNoise(
+      '@supports (height: 100dvh) { @supports (display: grid) { .x { height: 100dvh; } } }',
+    ))).toEqual([]);
+    for (const [condition, body, expected] of [
+      [`(--${FIELD_SIZING}: content)`, `${FIELD_SIZING}: content`, `prop:${FIELD_SIZING}`],
+      ['(--probe: color-mix(in oklab, red, blue))', 'color: color-mix(in oklab, red, blue)', 'fn:color-mix'],
+      ['(color: var(--color-mix))', 'color: color-mix(in oklab, red, blue)', 'fn:color-mix'],
+    ]) {
+      const css = `@supports ${condition} { .x { ${body}; } }`;
+      expect(violationsIn('typed-atom', stripNoise(css)).map((v) => v.key)).toContain(expected);
+    }
+    expect(violationsIn('property', stripNoise(`@supports (${FIELD_SIZING}: content) { .x { ${FIELD_SIZING}: content; } }`))).toEqual([]);
+    expect(violationsIn('function', stripNoise('@supports (color: color-mix(in oklab, red, blue)) { .x { color: color-mix(in oklab, red, blue); } }'))).toEqual([]);
+    expect(violationsIn('selector', stripNoise(`@supports selector(:${POPOVER_OPEN}) { .x:${POPOVER_OPEN} { opacity: 1; } }`))).toEqual([]);
+    expect(violationsIn('selector-or', stripNoise(`@supports selector(:${POPOVER_OPEN}) or (display: grid) { .x:${POPOVER_OPEN} { opacity: 1; } }`)).map((v) => v.key)).toContain(`pseudo::${POPOVER_OPEN}`);
+  });
+
   it('变异写进真实取材面同样判红（面是走目录树发现的，不是写死的文件清单）', () => {
     // 与 CLI 侧那次「真改文件跑门」互补：这里证明**新文件**会自动进面。
     const probe: Source = { label: 'src/styles/__probe.css', css: '.p{ color: oklch(0.5 0 0); }' };
@@ -1038,6 +1223,15 @@ describe('④ 手写面豁免项的兜底必须真的在（豁免不是空头支
 });
 
 describe('⑤ 构建产物面：Tailwind v4 生成的 CSS 同样 ≤ Chromium 105', () => {
+  it('相同冻结输入共享在途 Promise，负控不污染共用输出', async () => {
+    const first = buildTailwindCss();
+    expect(buildTailwindCss()).toBe(first);
+    const original = await first;
+    const mutant = original + '\n.__cache_probe { height: 100svh; }';
+    expect(mutant).not.toBe(original);
+    expect(await buildTailwindCss()).toBe(original);
+  });
+
   it('构建输出里的全部特性都在名单内（v4 preflight 会自己生成 color-mix / 1lh）', async () => {
     const built = stripNoise(await buildTailwindCss());
     expect(parse(built).decls.length, '构建输出为空 —— 这条腿没跑').toBeGreaterThan(5000);

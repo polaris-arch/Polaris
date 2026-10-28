@@ -195,32 +195,50 @@ pub enum Request {
     Ping,
     /// `version`（无参数行）。
     Version,
+    PrepareHelperUpgrade,
+    CancelHelperUpgrade,
+    /// Read-only verification of one installed content identity.
+    CoreStatus {
+        id: crate::core_manifest::CoreId,
+    },
+    LinuxStartPinned(crate::core_protocol::PinnedStartParams),
+    NativeStartPinned(crate::core_protocol::PinnedStartParams),
     /// `status`（无参数行）。
     Status,
     /// `stop [<pid>]`（受管 pid 身份行可选，见 [`stop_pid_matches`]）。
     ///
     /// `pid: Some(p)` = 「只停 p 这个受管核」；`pid: None` = 旧语义「停你当前受管的那个」
     /// （不发身份行，帧与旧客户端逐字节一致）。
-    Stop { pid: Option<u32> },
+    Stop {
+        pid: Option<u32>,
+    },
     /// Linux native-reap Stop capability. The distinct command token makes
     /// old helpers reject before mutating their child state.
-    LinuxStop { pid: Option<u32> },
+    LinuxStop {
+        pid: Option<u32>,
+    },
     /// Linux exact birth Start; carries the same path/config lines as `LinuxStart`.
     LinuxStartBirth(LinuxStartParams),
     /// Linux exact birth Status; no argument lines.
     LinuxStatusBirth,
     /// Linux exact birth Stop; both identity lines are required.
-    LinuxStopBirth { target: HelperBirthTarget },
+    LinuxStopBirth {
+        target: HelperBirthTarget,
+    },
     /// macOS/Windows exact native birth Start. Legacy helpers reject this command.
     NativeStartBirth(StartParams),
     /// Read-only native birth capability and custody status.
     NativeStatusBirth,
     /// Stop one exact native birth; both identity lines are mandatory.
-    NativeStopBirth { target: HelperBirthTarget },
+    NativeStopBirth {
+        target: HelperBirthTarget,
+    },
     /// `cleanup`（无参数行）。
     Cleanup,
     /// `freeport <port>`（行3/行2 = 端口字符串）。
-    FreePort { port: u16 },
+    FreePort {
+        port: u16,
+    },
     /// mac/win：`start <cfg> <log> <fwd> <ppid?>`。
     Start(StartParams),
     /// linux：`start-reap-safe <singbox> <cfg> <log> <fwd> <ppid?>`。
@@ -234,21 +252,34 @@ pub enum Request {
     /// Linux：`resolved-dns-set <interface> <server-ip>`（proto v1 兼容扩展）。
     LinuxDnsSet(LinuxDnsSetParams),
     /// Linux：`resolved-dns-revert <interface>`（proto v1 兼容扩展）。
-    LinuxDnsRevert { interface_name: String },
+    LinuxDnsRevert {
+        interface_name: String,
+    },
     /// `default-restore <gateway>`（mac proto v8）。
-    DefaultRestore { gateway_ipv4: String },
+    DefaultRestore {
+        gateway_ipv4: String,
+    },
     /// `flush-dns`（mac proto v9，无参数行）。
     FlushDns,
+    /// Windows native DNS cache API; separate capability excludes old subprocess helpers.
+    WindowsFlushDnsNative,
     /// macOS：`system-proxy-transaction <hex-json>`。兼容 proto v1 的能力扩展；旧 helper
     /// 返回 `ERR unknown`，客户端可在零系统修改时安全回落既有 networksetup 路径。
-    MacProxyTransaction { payload_hex: String },
+    MacProxyTransaction {
+        payload_hex: String,
+    },
     /// macOS compare-and-apply/restore transaction. Separate wire command is intentional: an old
     /// helper must reject before decoding instead of accepting new JSON fields with old semantics.
-    MacProxyCompareTransaction { payload_hex: String },
+    MacProxyCompareTransaction {
+        payload_hex: String,
+    },
     /// macOS compare transaction 的纯能力探测：无 payload、无系统写。
     MacProxyCompareCapability,
     /// `iface-metric <iface> <metric>`（win 退役命令，proto v3-v5）。
-    IfaceMetric { iface: String, metric: u16 },
+    IfaceMetric {
+        iface: String,
+        metric: u16,
+    },
     /// `uninstall`（win，无参数行）。
     Uninstall,
 }
@@ -260,6 +291,11 @@ impl Request {
         match self {
             Self::Ping => command::common::PING,
             Self::Version => command::common::VERSION,
+            Self::PrepareHelperUpgrade => command::common::PREPARE_HELPER_UPGRADE,
+            Self::CancelHelperUpgrade => command::common::CANCEL_HELPER_UPGRADE,
+            Self::CoreStatus { .. } => command::common::CORE_STATUS,
+            Self::LinuxStartPinned(_) => command::linux::START_PINNED_BIRTH,
+            Self::NativeStartPinned(_) => command::common::NATIVE_START_PINNED_BIRTH,
             Self::Status => command::common::STATUS,
             Self::Stop { .. } => command::common::STOP,
             Self::LinuxStop { .. } => command::linux::STOP_REAP_SAFE,
@@ -280,6 +316,7 @@ impl Request {
             Self::LinuxDnsRevert { .. } => command::linux::RESOLVED_DNS_REVERT,
             Self::DefaultRestore { .. } => command::mac::DEFAULT_RESTORE,
             Self::FlushDns => command::mac::FLUSH_DNS,
+            Self::WindowsFlushDnsNative => command::win::FLUSH_DNS_NATIVE,
             Self::MacProxyTransaction { .. } => command::mac::SYSTEM_PROXY_TRANSACTION,
             Self::MacProxyCompareTransaction { .. } => {
                 command::mac::SYSTEM_PROXY_COMPARE_TRANSACTION
@@ -296,13 +333,21 @@ impl Request {
     /// （Go 的 `readLine` 对 EOF 返回 `""`，故少发一行 ≠ 协议错，只是该参数取默认值 —— 如 start 的 ppid）。
     pub fn write_args(&self, out: &mut Vec<String>) {
         match self {
+            Self::CoreStatus { id } => out.push(id.as_str().to_owned()),
+            Self::LinuxStartPinned(params) | Self::NativeStartPinned(params) => {
+                out.push(params.id.as_str().to_owned());
+                push_start_args(&params.common, out);
+            }
             Self::Ping
+            | Self::PrepareHelperUpgrade
+            | Self::CancelHelperUpgrade
             | Self::Version
             | Self::Status
             | Self::LinuxStatusBirth
             | Self::NativeStatusBirth
             | Self::Cleanup
             | Self::FlushDns
+            | Self::WindowsFlushDnsNative
             | Self::MacProxyCompareCapability
             | Self::Uninstall => {
                 // 无参数行

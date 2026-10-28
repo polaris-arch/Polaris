@@ -15,13 +15,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::builder::custom_rule_files::uses_fake_ip;
 use crate::builder::custom_rules::{build_custom_rules, CustomRulesDeps};
 use crate::builder::endpoint_routes::{
-    collect_targeted_mixed, force_route_emission_order_key, force_route_leg,
-    mesh_force_routed_servers, mesh_forced_route_cidrs, mesh_node_carries_full_tunnel,
-    settle_force_route_claims, settled_force_route_cidrs, should_force_route_subnets,
-    tailnet_rule_file_base, ForceRouteLeg, MeshRouteCandidate, MeshRouteEmissionCandidate,
-    MeshRouteSource, ObservedTailnetAddresses, SourcedCidr, MAX_MESH_ROUTE_REPORT_CANDIDATES,
-    MAX_MESH_ROUTE_REPORT_CIDRS, MAX_MESH_ROUTE_REPORT_EVIDENCE_BYTES, TAILNET_CGNAT,
-    TAILNET_ULA_V6,
+    collect_targeted_mixed, engaged_mesh_forced_route_cidrs, force_route_emission_order_key,
+    force_route_leg, mesh_node_carries_full_tunnel, settle_force_route_claims,
+    settled_force_route_cidrs, should_force_route_subnets, tailnet_rule_file_base, ForceRouteLeg,
+    MeshRouteCandidate, MeshRouteEmissionCandidate, MeshRouteSource, ObservedTailnetAddresses,
+    SourcedCidr, MAX_MESH_ROUTE_REPORT_CANDIDATES, MAX_MESH_ROUTE_REPORT_CIDRS,
+    MAX_MESH_ROUTE_REPORT_EVIDENCE_BYTES, TAILNET_CGNAT, TAILNET_ULA_V6,
 };
 use crate::builder::helpers::{
     apply_rule_set_prune, effective_app_rules, effective_custom_rules,
@@ -45,7 +44,7 @@ use crate::user_config::proxy_mode::ProxyMode;
 use crate::user_config::region_routing::{
     effective_region_routing, region_foreign_geo, region_local_geo,
 };
-use crate::user_config::rule::RuleAction;
+use crate::user_config::rule::{RuleAction, RuleResourceFormat};
 use crate::user_config::rules::rule_ip_cidrs;
 use crate::user_config::server_config::{is_mesh_node, Protocol, ServerConfig};
 use crate::user_config::system_proxy_bypass::{bypass_lan_cidrs, effective_bypass_lan};
@@ -132,19 +131,6 @@ pub struct RouteConfigDeps<'a> {
     pub pending_endpoints: &'a [crate::singbox::Endpoint],
     pub log: fn(LogLevel, &str),
     pub on_degraded: fn(),
-    /// issue #147：本地 race server 的【自定义】上游 IP（内置 ali/dnspod 已在 BOOTSTRAP_DIRECT_DNS_IPS）。
-    /// 缺省空 = race off / 无自定义上游（零变化）。
-    pub race_upstream_ips: Vec<String>,
-    /// issue #147：上面那些上游**实际在用的端口**（由 `polaris-dns-race` 的 `ResolvedUpstreams::direct_ports`
-    /// 一路下发到此，见该字段文档）。缺省空 = race off（端口集逐字节回 `[53,443]` 基线，金样不动）。
-    ///
-    /// **本 builder 只消费、不复算**：真实上游集是 Tier 分桶 + canonical 去重 + Tier1 上限 + TUN 下摘
-    /// `system` 之后的结果，那条选择链只在 `polaris-dns-race` 里完整存在。此处曾就地从
-    /// `config.dns_config` 重新导出一遍端口（只认 `nodeResolverPool` 点名的纯 IP 条目，刻意不复制分桶/
-    /// 去重/上限 ⇒ 真实集的**超集**）—— 方向是安全的，但那是**第二份真值源**：它与 sidecar 的选择
-    /// 逻辑靠人肉对齐，任何一侧改口径都不会让另一侧转红。改成随 IP 一起注入后，两轴同源、同一次遍历
-    /// 产出，结构上不可能分叉。
-    pub race_upstream_ports: Vec<u16>,
     /// 运行时 rules 目录（内置 geo .srs 路径前缀）。对拍固定假路径。
     pub runtime_rules_dir: String,
     /// 用户规则资源目录（res:`<id>` 文件路径前缀）。对拍固定假路径。
@@ -308,12 +294,10 @@ pub fn build_route_config_with_report(
     let rule_targeted_server_ids = collect_targeted_mixed(&custom_rules_eff, &app_rules_eff);
 
     // mesh 重叠提醒（layer-2 兜底，非阻断）。基准只取「本轮实际会发射 force-route」的节点（与块 0c 同 gate）。
-    let mesh_cidrs_for_warn = mesh_forced_route_cidrs(
-        &mesh_force_routed_servers(
-            &config.servers,
-            config.selected_server_id.as_deref(),
-            &rule_targeted_server_ids,
-        ),
+    let mesh_cidrs_for_warn = engaged_mesh_forced_route_cidrs(
+        &config.servers,
+        config.selected_server_id.as_deref(),
+        &rule_targeted_server_ids,
         &deps.observed_tailnet_addresses,
     );
     if !mesh_cidrs_for_warn.is_empty() {
@@ -409,7 +393,9 @@ pub fn build_route_config_with_report(
     }
     if deps.probe_proxy_port.is_some() {
         rules.push(RouteRule {
-            inbound: Some(OneOrMany::Many(vec!["probe-proxy-in".to_string()])),
+            inbound: Some(OneOrMany::Many(vec![
+                crate::builder::helpers::PROBE_PROXY_INBOUND_TAG.to_string(),
+            ])),
             action: Some("route".to_string()),
             outbound: Some(selected_server_tag.to_string()),
             ..empty_matcher()
@@ -493,20 +479,11 @@ pub fn build_route_config_with_report(
             dns_direct_cidrs.push(c);
         }
     }
-    for ip in &deps.race_upstream_ips {
-        if let Some(c) = host_to_exclude_cidr(ip) {
-            dns_direct_cidrs.push(c);
-        }
-    }
     // :53=UDP / :443=DoH（恒）。DoT(:853) 二期未实现——无 DoT 上游，不为永不工作的协议开无用端口。
     let mut dns_ports: Vec<u32> = vec![53, 443];
     if let Some((_, port)) = &custom_domestic_dns {
         dns_ports.push(u32::from(*port));
     }
-    // issue #147：race 上游的**实际端口**必须与它的 IP 一起放行（两轴缺一，规则就匹配不上 ⇒ TUN 下该
-    // 上游经代理出站/回环）。端口由 sidecar 侧的真实上游集下发（`race_upstream_ports`，见该字段文档），
-    // **本处不复算**。race off 时两轴同为空 ⇒ 端口集逐字节回 `[53,443]` 基线，金样输出不动。
-    dns_ports.extend(deps.race_upstream_ports.iter().copied().map(u32::from));
     let dns_ports_dedup: Vec<u32> = dedupe(dns_ports);
     rules.push(RouteRule {
         ip_cidr: Some(dns_direct_cidrs),
@@ -1642,6 +1619,7 @@ pub fn build_route_config_with_report(
         } else {
             // applyRuleSetPrune 操作整个 SingBoxConfig.route；这里构造只含 route 的壳（其它必填字段用最小值）。
             let mut singbox = crate::singbox::SingBoxConfig {
+                polaris_windows_directory: None,
                 log: crate::singbox::LogConfig {
                     level: "info".to_string(),
                     timestamp: false,
@@ -1896,19 +1874,27 @@ pub(super) fn add_local_geo_rule_set(
     let local = find_builtin(tag)
         .map(|builtin| format!("{}/{}", deps.runtime_rules_dir, builtin.file_name))
         .filter(|path| (deps.is_valid_srs_fn)(path))
+        .map(|path| (path, "binary"))
         .or_else(|| {
-            config
+            let resource = config
                 .rule_resources
                 .iter()
-                .find(|resource| resource.id == tag)
-                .map(|resource| format!("{}/{}", deps.rule_resources_path, resource.file_name))
-                .filter(|path| (deps.is_valid_srs_fn)(path))
+                .find(|resource| resource.id == tag)?;
+            let path = format!("{}/{}", deps.rule_resources_path, resource.file_name);
+            let (available, format) = match resource.format {
+                RuleResourceFormat::Binary => ((deps.is_valid_srs_fn)(&path), "binary"),
+                RuleResourceFormat::Source => (
+                    crate::builder::custom_rule_files::ext_rule_file_exists(&path),
+                    "source",
+                ),
+            };
+            available.then_some((path, format))
         });
-    if let Some(path) = local {
+    if let Some((path, format)) = local {
         rs.push(RuleSet {
             tag: tag.to_string(),
             type_field: "local".to_string(),
-            format: "binary".to_string(),
+            format: format.to_string(),
             path: Some(path),
             url: None,
             http_client: None,

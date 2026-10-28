@@ -3259,3 +3259,67 @@ fn changing_original_tailscale_protocol_removes_owned_credentials_without_resurr
         .get("retainedAuthKey")
         .is_none());
 }
+
+#[test]
+fn credential_index_preserves_order_missing_ids_and_duplicate_rejection() {
+    use serde_json::json;
+    let previous = json!({"servers": [
+        {"id": "a", "protocol": "vmess"},
+        {"id": "b", "protocol": "vmess"},
+        {"protocol": "vmess"}
+    ]});
+    let mut incoming = json!({"servers": [
+        {"id": "b", "protocol": "vmess"},
+        {"protocol": "vmess"},
+        {"id": "new", "protocol": "vmess"},
+        {"id": "a", "protocol": "vmess"}
+    ]});
+    let expected = incoming.clone();
+    reconcile_tailscale_credentials(&previous, &mut incoming, None).unwrap();
+    assert_eq!(incoming, expected);
+
+    // Unreferenced duplicate IDs never rejected an otherwise valid snapshot.
+    let duplicated = json!({"servers": [{"id":"a"}, {"id":"a"}, {"id":"a"}]});
+    let mut unrelated = json!({"servers": [{"id":"b", "protocol":"vmess"}]});
+    reconcile_tailscale_credentials(&duplicated, &mut unrelated, None).unwrap();
+    for trusted in [None, Some("a")] {
+        let mut matched = json!({"servers": [{"id":"a", "protocol":"vmess"}]});
+        let error =
+            reconcile_tailscale_credentials(&duplicated, &mut matched, trusted).unwrap_err();
+        assert!(error.to_string().contains("credentialRevisionChanged"));
+    }
+    // All non-string IDs shared the absent-ID lookup key, including JSON null.
+    for old in [json!([{}, {"id": null}]), json!([{"id": 1}, {"id": false}])] {
+        let mut missing = json!({"servers": [{"protocol":"vmess"}]});
+        assert!(
+            reconcile_tailscale_credentials(&json!({"servers":old}), &mut missing, None)
+                .unwrap_err()
+                .to_string()
+                .contains("credentialRevisionChanged")
+        );
+    }
+    let mut no_nodes = json!({});
+    reconcile_tailscale_credentials(&duplicated, &mut no_nodes, None).unwrap();
+}
+
+#[test]
+fn credential_index_keeps_each_nodes_own_secret_when_reordered() {
+    use serde_json::json;
+    let previous = json!({"servers": [
+        {"id":"a", "protocol":"tailscale", "tailscaleSettings":{"authKey":"key-a"}},
+        {"id":"b", "protocol":"tailscale", "tailscaleSettings":{"authKey":"key-b"}}
+    ]});
+    let mut incoming = json!({"servers": [
+        {"id":"b", "protocol":"tailscale", "tailscaleSettings":{}},
+        {"id":"a", "protocol":"tailscale", "tailscaleSettings":{}}
+    ]});
+    reconcile_tailscale_credentials(&previous, &mut incoming, None).unwrap();
+    assert_eq!(
+        incoming["servers"][0]["tailscaleSettings"]["authKey"],
+        "key-b"
+    );
+    assert_eq!(
+        incoming["servers"][1]["tailscaleSettings"]["authKey"],
+        "key-a"
+    );
+}

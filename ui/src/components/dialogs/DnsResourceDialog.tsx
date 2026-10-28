@@ -5,7 +5,7 @@
  * 这样取消不会留下半份配置，保存失败也会保留用户已经填写的内容。
  */
 
-import { useState, type ReactNode } from 'react';
+import { useCallback, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import type {
   DnsServerGroup,
@@ -100,17 +100,20 @@ function defaultPort(type: DnsServerKind): string {
 type ConfigUpdate = UseConfigResult['update'];
 
 function DnsServerForm({
+  instanceId,
   config,
   update,
   base,
 }: {
+  instanceId: string;
   config: UserConfig;
   update: ConfigUpdate;
   base?: DnsServerResource;
 }) {
   const { t } = useTranslation();
   const open = useDialogStore((state) => state.open);
-  const close = useDialogStore((state) => state.close);
+  const closeInstance = useDialogStore((state) => state.closeInstance);
+  const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const isEdit = base != null;
   const builtin = base ? isProtectedDnsServer(base.id) : false;
   const bootstrap = base?.id === 'builtin-bootstrap';
@@ -160,7 +163,7 @@ function DnsServerForm({
       close();
       return;
     }
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('rules.discardTitle'),
@@ -168,7 +171,7 @@ function DnsServerForm({
         confirmLabel: t('rules.discard'),
         danger: true,
         onConfirm: () => {
-          close();
+          closeInstance(confirmId);
           close();
         },
       },
@@ -407,17 +410,20 @@ function DnsServerForm({
 }
 
 function DnsGroupForm({
+  instanceId,
   config,
   update,
   base,
 }: {
+  instanceId: string;
   config: UserConfig;
   update: ConfigUpdate;
   base?: DnsServerGroup;
 }) {
   const { t } = useTranslation();
   const open = useDialogStore((state) => state.open);
-  const close = useDialogStore((state) => state.close);
+  const closeInstance = useDialogStore((state) => state.closeInstance);
+  const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const isEdit = base != null;
   const [name, setName] = useState(base?.name ?? t('settings.dns.groupNewName'));
   const [mode, setMode] = useState<'race' | 'fallback'>(base?.mode ?? 'race');
@@ -443,7 +449,7 @@ function DnsGroupForm({
       close();
       return;
     }
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('rules.discardTitle'),
@@ -451,7 +457,7 @@ function DnsGroupForm({
         confirmLabel: t('rules.discard'),
         danger: true,
         onConfirm: () => {
-          close();
+          closeInstance(confirmId);
           close();
         },
       },
@@ -643,14 +649,17 @@ function DnsGroupForm({
 }
 
 function DnsResourceState({
+  instanceId,
   resource,
   resourceId,
 }: {
+  instanceId: string;
   resource: 'server' | 'group';
   resourceId?: string;
 }) {
   const { t } = useTranslation();
-  const close = useDialogStore((state) => state.close);
+  const closeInstance = useDialogStore((state) => state.closeInstance);
+  const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const { config, loading, error, update, reload } = useConfig();
   const isEdit = resourceId != null;
   const title = t(
@@ -705,14 +714,14 @@ function DnsResourceState({
   }
 
   return resource === 'server'
-    ? <DnsServerForm config={config} update={update} base={base as DnsServerResource | undefined} />
-    : <DnsGroupForm config={config} update={update} base={base as DnsServerGroup | undefined} />;
+    ? <DnsServerForm instanceId={instanceId} config={config} update={update} base={base as DnsServerResource | undefined} />
+    : <DnsGroupForm instanceId={instanceId} config={config} update={update} base={base as DnsServerGroup | undefined} />;
 }
 
-export function DnsServerDialog({ serverId }: { serverId?: string }) {
-  return <DnsResourceState resource="server" resourceId={serverId} />;
+export function DnsServerDialog({ instanceId, serverId }: { instanceId: string; serverId?: string }) {
+  return <DnsResourceState instanceId={instanceId} resource="server" resourceId={serverId} />;
 }
 
-export function DnsGroupDialog({ groupId }: { groupId?: string }) {
-  return <DnsResourceState resource="group" resourceId={groupId} />;
+export function DnsGroupDialog({ instanceId, groupId }: { instanceId: string; groupId?: string }) {
+  return <DnsResourceState instanceId={instanceId} resource="group" resourceId={groupId} />;
 }

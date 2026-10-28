@@ -138,3 +138,36 @@ fn write_sets_0600_perms_on_unix() {
     assert!(verify("pw", &read(&StdFs, &path).unwrap()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn hex_decode_rejects_unicode_and_non_hex_without_panicking() {
+    for bad in [
+        "€x", "a€", "é", "🔒", "中a", "0", "abc", "zz", "+1", " 1", "1\n",
+    ] {
+        assert_eq!(hex_decode(bad), None, "malformed hex: {bad:?}");
+    }
+    assert_eq!(hex_decode("00aAfF"), Some(vec![0, 0xaa, 0xff]));
+    assert_eq!(hex_decode(""), Some(Vec::new()));
+}
+
+#[test]
+fn verify_malformed_unicode_salt_and_hash_fail_closed() {
+    let good = PrivacyPasswordHash {
+        algo: "scrypt".into(),
+        salt: "01".repeat(SALT_LEN),
+        hash: "4f503871c3495339889efd3948600b779d013bc9c4cff0882dcde3f7421f919c".into(),
+        params: PARAMS,
+    };
+    for bad in ["€x", "a€", "é", "🔒", "0", "zz", "+1"] {
+        let mut stored = good.clone();
+        stored.salt = bad.into();
+        assert!(!verify("password", &stored), "invalid salt: {bad:?}");
+        stored = good.clone();
+        stored.hash = bad.into();
+        assert!(!verify("password", &stored), "invalid hash: {bad:?}");
+    }
+    let mut uppercase = good.clone();
+    uppercase.hash.make_ascii_uppercase();
+    assert!(verify("password", &uppercase));
+    assert!(!verify("wrong", &uppercase));
+}

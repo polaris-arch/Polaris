@@ -14,11 +14,12 @@
  * 失败：后端 `apply_unlock_rate_limit` sleep(300ms) 弱限速，await 期间禁用按钮/输入防连点暴力。
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
 import { api } from '@/ipc';
 import { resolveUnlockAttempt } from '@/domain/privacy';
+import { useDialogTopLayerStore } from '@/components/dialogs/dialog-top-layer';
 
 export default function LockOverlay() {
   const { t } = useTranslation();
@@ -28,6 +29,19 @@ export default function LockOverlay() {
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current;
+    if (!privacyMode || !dialog) return;
+    if (!dialog.open) dialog.showModal();
+    useDialogTopLayerStore.getState().register(dialog);
+    inputRef.current?.focus();
+    return () => {
+      useDialogTopLayerStore.getState().unregister(dialog);
+      if (dialog.open) dialog.close();
+    };
+  }, [privacyMode]);
 
   // 进入锁定态：查是否设了密码（决定空密码放行）+ 复位输入/错误 + 聚焦密码框（对齐原型 openLock）。
   useEffect(() => {
@@ -71,7 +85,10 @@ export default function LockOverlay() {
   if (!privacyMode) return null;
 
   return (
-    <div className="overlay" id="lock-overlay" role="dialog" aria-modal="true" aria-label={t('privacy.title')}>
+    <dialog ref={dialogRef} className="overlay" id="lock-overlay" aria-label={t('privacy.title')}
+      onCancel={(event) => event.preventDefault()}
+      style={{ position: 'fixed', inset: 0, margin: 0, width: '100vw', height: '100vh', maxWidth: 'none', maxHeight: 'none', border: 0, background: 'hsl(var(--bg))' }}>
+
       <div className="lock-box">
         <div className="lock-mk">
           <svg viewBox="-46 -46 92 92">
@@ -111,6 +128,6 @@ export default function LockOverlay() {
           {err}
         </div>
       </div>
-    </div>
+    </dialog>
   );
 }

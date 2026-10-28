@@ -54,7 +54,7 @@
 //! 环境开关）随 Batch A 收尾一并删除 —— 基线的唯一用途是「允许存量、只禁新增」，
 //! 存量归零之后它就只剩两种可能：要么恒真的死代码，要么下一个人误以为还有存量可以往里加。
 //!
-//! [`WHITELIST`] 保留 —— 那 6 条是**机制性**永久例外（跨模块/跨 crate 可见的测试基础设施，
+//! [`WHITELIST`] 保留 —— 那 5 条是**机制性**永久例外（跨模块/跨 crate 可见的测试基础设施，
 //! 外移后可见性穿不过私有 `tests` mod），不随 Batch A 消失。
 //!
 //! # 不在射程内（显式声明，不是遗漏）
@@ -114,7 +114,7 @@ struct Exempt {
 /// **本身是私有的**。Rust 的可见性是逐段收窄的：`pub(crate)` / `pub` 的 item 一旦被一个私有
 /// 父 mod 包住，crate 内/crate 外的消费方就再也 `use` 不到。要修就得把每个文件的
 /// `mod tests;` 都提成 `pub(crate) mod tests;`——那等于把**全仓每个文件的私有自测**
-/// 一起提升成 crate 公开面，代价远大于这 6 条例外。
+/// 一起提升成 crate 公开面，代价远大于这 5 条例外。
 ///
 /// - **删掉任何一条 ⇒ 该 mod 变成命中 ⇒ 不在基线集里 ⇒ 门红**（回放已验证）。
 /// - **任何一条对不上真实源码（文件改名 / mod 改名 / 已外移）⇒ 门红**，
@@ -126,12 +126,6 @@ const WHITELIST: &[Exempt] = &[
         reason: "`pub(crate)` 扫描型守卫的公共取材器，被 commands/ 下多个子模块的测试复用。\
                  外移则跨模块不可达（见上方机制说明）；且它位于文件头部、其后 93% 是生产代码，\
                  正是「测试不在文件尾」的活样本。",
-    },
-    Exempt {
-        file: "src-tauri/src/runtime/core_update_scheduler.rs",
-        name: "method_scan",
-        reason: "`pub(crate)` 方法级扫描器，供 runtime 下其它模块的测试断言内核更新调度的方法集。\
-                 消费方在别的文件里 ⇒ 外移后 `use` 不到。",
     },
     Exempt {
         file: "src-tauri/src/runtime/speedtest_tunnel.rs",
@@ -550,7 +544,7 @@ fn render(v: &[ModRecord]) -> String {
 // 门
 // ============================================================================
 
-/// 主门：全仓不得有内联 `#[cfg(test)] mod … { }`（白名单 6 条除外）。
+/// 主门：全仓不得有内联 `#[cfg(test)] mod … { }`（白名单 5 条除外）。
 #[test]
 fn no_new_inline_test_mods() {
     let v = violations();

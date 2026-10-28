@@ -27,8 +27,7 @@ fn deps_default<'a>(pending: &'a [Endpoint]) -> RouteConfigDeps<'a> {
         pending_endpoints: pending,
         log: noop_log,
         on_degraded: noop_degraded,
-        race_upstream_ips: vec![],
-        race_upstream_ports: vec![],
+
         runtime_rules_dir: "/fake/rules".to_string(),
         rule_resources_path: "/fake/res".to_string(),
         custom_rules_dir: "/fake/custom-rules".to_string(),
@@ -1580,14 +1579,8 @@ fn dns_config_with_custom_pool(pool: &[&str], custom: &[(&str, &str)]) -> UserCo
     config
 }
 
-/// 【不变式：race 上游的 IP 与端口必须一起放行】
-///
-/// 端口集写死 `[53,443]` 时，`https://9.9.9.9:8443/q` 与 `udp://9.9.9.9:5353` 的流量匹配不上
-/// 直连规则 → TUN 下经代理出站 → 起核自举窗内该上游恒 FAIL/回环。
-///
-/// **变异锁**：删掉 `build_route` 里的 `dns_ports.extend(deps.race_upstream_ports…)` → 转红。
 #[test]
-fn race_custom_upstream_nonstandard_ports_are_direct_allowed() {
+fn native_candidates_do_not_create_application_route_bypasses() {
     let config = dns_config_with_custom_pool(
         &["ali", "my-doh", "my-udp"],
         &[
@@ -1595,92 +1588,12 @@ fn race_custom_upstream_nonstandard_ports_are_direct_allowed() {
             ("my-udp", "udp://9.9.9.9:5353"),
         ],
     );
-    let mut deps = deps_default(&[]);
-    // race 就绪（sidecar 已起）：两轴均由 `polaris-dns-race` 的真实上游集下发。
-    deps.race_upstream_ips = vec!["9.9.9.9".to_string()];
-    deps.race_upstream_ports = vec![443, 8443, 5353];
-    let rc = build_route_config(&config, &empty_id_map(), &deps);
-
-    let ports = dns_direct_ports(&rc);
-    assert!(
-        ports.contains(&53) && ports.contains(&443),
-        "恒定端口不得丢"
-    );
-    assert!(
-        ports.contains(&8443),
-        "自定义 DoH 非标端口须放行，实际: {ports:?}"
-    );
-    assert!(
-        ports.contains(&5353),
-        "自定义 UDP 非 53 口须放行，实际: {ports:?}"
-    );
-    // IP 也必须在（两轴缺一不可，否则规则照样匹配不上）。
-    let rule_has_ip = rc.rules.iter().any(|r| {
-        r.ip_cidr
-            .as_ref()
-            .is_some_and(|c| c.contains(&"9.9.9.9/32".to_string()))
-    });
-    assert!(rule_has_ip, "自定义上游 IP 须进直连放行");
-    // 端口集仍须去重（`443` 由恒定集与 race 集各贡献一次）。
-    let mut sorted = ports.clone();
-    sorted.sort_unstable();
-    sorted.dedup();
-    assert_eq!(sorted.len(), ports.len(), "端口集不得有重复项: {ports:?}");
-}
-
-/// race off（两轴皆空）→ 端口集**逐字节回现状**，金样不动。
-///
-/// 配置里**故意留着**一个声明了非标端口的自定义上游：race off 时它不该有任何影响
-/// （sidecar 都没起，放行它的端口纯属白开口子）。
-#[test]
-fn race_off_leaves_dns_direct_ports_untouched() {
-    let config = dns_config_with_custom_pool(&["my-doh"], &[("my-doh", "https://9.9.9.9:8443/q")]);
-    let deps = deps_default(&[]); // race 两轴默认空
-    let rc = build_route_config(&config, &empty_id_map(), &deps);
-    assert_eq!(
-        dns_direct_ports(&rc),
-        vec![53, 443],
-        "race off 时不得叠加任何端口"
-    );
-}
-
-/// 【不变式：端口集**只**来自 `deps.race_upstream_ports`，route 不得照 `dnsConfig` 复算】
-///
-/// 曾经这里有一个 `race_custom_upstream_ports(config)`：就地从 `nodeResolverPool` + `nodeResolverCustom`
-/// 再导出一遍端口。它与 sidecar 侧 `resolve_upstreams` 的选择逻辑（Tier 分桶 / canonical 去重 /
-/// Tier1 上限 / TUN 摘 `system`）**刻意不一致**（取超集），于是同一件事有了两份真值源 —— 两边任
-/// 一侧改口径都不会让另一侧转红。现在端口随 IP 由 sidecar 一路下发，本 builder 只消费。
-///
-/// 判据构造成「配置说一套、注入说另一套」：`dnsConfig` 里点名的是 `:9443`，注入进来的是 `:8443`。
-/// 只有真的不复算，输出才会跟着注入走。
-///
-/// **变异锁**：把 `race_custom_upstream_ports(config)` 那行加回去 → `9443` 断言立刻转红。
-#[test]
-fn dns_direct_ports_come_only_from_deps_never_recomputed_from_config() {
-    let config = dns_config_with_custom_pool(
-        &["ali", "selected"],
-        &[
-            // 配置层面点名 :9443；但真实上游集（注入）里是 :8443。
-            ("selected", "https://8.8.8.8:9443/q"),
-            ("domain", "https://dns.google:9444/q"), // 域名 → sidecar 侧拒绝腿
-            ("dot", "tls://1.1.1.1:8853"),           // DoT 二期 → sidecar 侧拒绝腿
-        ],
-    );
-    let mut deps = deps_default(&[]);
-    deps.race_upstream_ips = vec!["9.9.9.9".to_string()];
-    deps.race_upstream_ports = vec![8443];
-    let ports = dns_direct_ports(&build_route_config(&config, &empty_id_map(), &deps));
-    assert!(
-        ports.contains(&8443),
-        "注入的端口必须落进规则，实际: {ports:?}"
-    );
-    for unwanted in [9443u32, 9444, 8853] {
-        assert!(
-            !ports.contains(&unwanted),
-            "{unwanted} 只存在于 dnsConfig、不在注入的真实上游集里 → 不得被放行（复算复活的信号），\
-                 实际: {ports:?}"
-        );
-    }
+    let rc = build_route_config(&config, &empty_id_map(), &deps_default(&[]));
+    assert_eq!(dns_direct_ports(&rc), vec![53, 443]);
+    assert!(!rc.rules.iter().any(|r| r
+        .ip_cidr
+        .as_ref()
+        .is_some_and(|c| c.contains(&"9.9.9.9/32".to_string()))));
 }
 
 #[test]
@@ -1907,4 +1820,42 @@ fn non_block_exit_keeps_update_in_on_proxy_selector() {
             "selected={selected:?} 时 update-in 不该被改写"
         );
     }
+}
+
+#[test]
+fn selected_opt_in_mesh_keeps_force_route_when_always_route_is_false() {
+    let mut config = UserConfig::default();
+    config.proxy_mode = ProxyMode::Global;
+    config.selected_server_id = Some("wg".into());
+    config.servers = vec![crate::user_config::server_config::ServerConfig {
+        id: "wg".into(),
+        name: "WG".into(),
+        protocol: Protocol::Wireguard,
+        address: "203.0.113.1".into(),
+        port: 51820,
+        wireguard_settings: Some(Box::new(
+            crate::user_config::server_config::WireGuardSettings {
+                allowed_ips: vec!["10.20.0.0/16".into()],
+                allow_internet: Some(true),
+                always_route_subnets: Some(false),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }];
+    let pending = [Endpoint {
+        type_field: "wireguard".into(),
+        tag: "WG".into(),
+        ..Default::default()
+    }];
+    let ids = BTreeMap::from([("wg".to_string(), "WG".to_string())]);
+    let route = build_route_config(&config, &ids, &deps_default(&pending));
+    assert!(route
+        .rules
+        .iter()
+        .any(|rule| rule.outbound.as_deref() == Some("WG")
+            && rule
+                .ip_cidr
+                .as_ref()
+                .is_some_and(|cidrs| cidrs.contains(&"10.20.0.0/16".to_string()))));
 }

@@ -690,3 +690,50 @@ fn remote_url_rule_set_warns() {
         "远程 URL 跳过须留线索：{warns:?}"
     );
 }
+
+#[test]
+fn local_source_resources_use_source_presence_and_keep_binary_magic_gate() {
+    use crate::user_config::rule::{RuleResource, RuleResourceFormat};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("source.json"),
+        br#"{"version":3,"rules":[{"domain":["api.example.com"]}]}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("broken.srs"), b"not SRS").unwrap();
+    std::fs::write(dir.path().join("valid.srs"), b"SRS\x03").unwrap();
+    let resources: Vec<_> = [
+        ("source", "source.json", RuleResourceFormat::Source),
+        ("broken", "broken.srs", RuleResourceFormat::Binary),
+        ("valid", "valid.srs", RuleResourceFormat::Binary),
+        ("missing", "missing.json", RuleResourceFormat::Source),
+    ]
+    .into_iter()
+    .map(|(id, file, format)| RuleResource {
+        id: id.into(),
+        name: id.into(),
+        category: "test".into(),
+        source_url: "https://rules.invalid/rules".into(),
+        file_name: file.into(),
+        format,
+        size: 0,
+        downloaded_at: "test".into(),
+    })
+    .collect();
+    let mut deps = deps_default();
+    deps.rule_resources_path = dir.path().to_string_lossy().into_owned();
+    deps.exists_fn = |path| std::path::Path::new(path).is_file();
+    deps.is_valid_srs_fn = |path| {
+        crate::user_config::builtin_geo_rulesets::is_valid_srs_file(std::path::Path::new(path))
+    };
+    let mut definitions = Vec::new();
+    assert_eq!(
+        resolve_resource_rule_set("source", &resources, &mut definitions, &deps),
+        Some("local-rs-source".into())
+    );
+    assert_eq!(definitions[0].format, "source");
+    assert!(resolve_resource_rule_set("broken", &resources, &mut definitions, &deps).is_none());
+    assert!(resolve_resource_rule_set("missing", &resources, &mut definitions, &deps).is_none());
+    assert!(resolve_resource_rule_set("valid", &resources, &mut definitions, &deps).is_some());
+    assert_eq!(definitions[1].format, "binary");
+}

@@ -180,11 +180,9 @@ const READ_CALLS: readonly string[] = [
    */
   'api.logs.legacyInfo',
   'api.logs.onReceivedBatchReady',
-  // 配置广播的订阅登记（`mobile/config-sync.ts`）：它是一次**订阅**，同步返回退订闭包、
-  // 不落盘、也没有用户在等回执 —— 与 `api.stats.onStatsUpdated` 同类。真正会失败的那件事是
-  // 回调里的 `loadConfig(true)`（一次读），失败落 console，没有可归因的控件。
-  'api.config.onChanged',
   'api.proxy.onLifecycle',
+  // The readiness-aware form only registers the same read-only lifecycle subscription.
+  'api.proxy.onLifecycleReady',
   'api.proxy.getPendingChanges',
   'api.ipInfo.get',
   'api.ruleResources.list',

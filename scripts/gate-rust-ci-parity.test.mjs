@@ -111,8 +111,9 @@ function faceCheckerCall(text) {
   return m[1].replace(/"\$\{?[A-Za-z_]\w*\}?\/([\w.-]+)"/g, '$1').trim();
 }
 
-// 5 个门：ci.yml 的 step 名 → gate-rust.sh 的 run_gate 名 → 若该步骤有 env 限定则给出变量名。
+// 6 个 CI 步骤（两个 fmt 共用同一本机门）：ci.yml 的 step 名 → gate-rust.sh 的 run_gate 名 → 若该步骤有 env 限定则给出变量名。
 const GATES = [
+  { ci: 'Check workspace formatting before native compilation', sh: 'fmt', envVar: null },
   { ci: 'Check formatting', sh: 'fmt', envVar: null },
   { ci: 'Clippy (deny warnings)', sh: 'clippy', envVar: 'RUSTFLAGS' },
   { ci: 'Rustdoc documentation invariants (deny four lints)', sh: 'rustdoc', envVar: 'RUSTDOCFLAGS' },
@@ -123,7 +124,8 @@ const GATES = [
 function loadStripped() {
   const ciRaw = readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8');
   const shRaw = readFileSync(join(ROOT, 'scripts/gate-rust.sh'), 'utf8');
-  return { ci: stripComments(ciRaw), sh: stripComments(shRaw) };
+  const controlledRaw = readFileSync(join(ROOT, 'scripts/run-native-dns-controlled-tests.mjs'), 'utf8');
+  return { ci: stripComments(ciRaw), sh: stripComments(shRaw), controlled: controlledRaw };
 }
 
 /** ci.yml 里那条 Android 影响面完备性步骤的名字（本文件多处引用，抠成常量免得写歪一处不自知）。 */
@@ -145,11 +147,71 @@ const ANDROID_FACE_STEP = 'Android impact face must be registered (dep-info 对�
  *   · 跨目标那两条 → 目标三元组集合两侧一致；
  *   · dep-info 对差那条 → 两条 cargo check 的选择器两侧一致且互相对称、checker 调用形态一致。
  */
+// The final two entries are deliberately CI-only manual candidate checks: the
+// local no-kernel boundary prevents mirroring them in gate-rust.sh. They may not
+// replace any ordinary gate. assertCandidateOnlySteps pins their exact opt-in
+// scope and commands below; native-dns-ci-routing.test.mjs checks admission,
+// payload identity, exact Rust namespaces and failure/evidence routing.
+const CANDIDATE_BUILD_STEP = 'Build actual candidate helper bytes and freeze the separate App identity';
+const CANDIDATE_RUNTIME_STEP = 'Run exact controlled App lifecycle hot-switch and stats tests';
 const MIRRORED_BUT_NOT_VERBATIM = [
   'Cross-check platform targets (cfg(windows) / cfg(macos) / cfg(android) / cfg(ios) 分支)',
   'Cross-target exemptions must still be necessary',
   ANDROID_FACE_STEP,
+  CANDIDATE_BUILD_STEP,
+  CANDIDATE_RUNTIME_STEP,
 ];
+
+function assertCandidateOnlySteps(ci, controlled) {
+  const build = extractCiStepBlock(ci, CANDIDATE_BUILD_STEP);
+  const runtime = extractCiStepBlock(ci, CANDIDATE_RUNTIME_STEP);
+  for (const block of [build, runtime]) {
+    const condition = block.match(/\sif: ([^\n]+)/)?.[1];
+    assert.ok(condition?.includes("needs.cheap_format.outputs.native_dns_candidate != ''"));
+    assert.match(block, /set -euo pipefail/);
+    assert.doesNotMatch(block, /continue-on-error/);
+  }
+  const commands = (block) => block.split('\n').map((line) => line.trim()).filter((line) => line.startsWith('cargo '));
+  assert.deepEqual(commands(build), [
+    'cargo build --locked -p polaris-helper --bin polaris-helper 2>&1 | tee native-dns-ci-evidence/helper-build.log',
+    'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner 2>&1 | tee native-dns-ci-evidence/cleaner-build.log',
+  ]);
+  assert.match(build, /if \[ "\$RUNNER_OS" = Windows \]; then/);
+  assert.ok(build.includes('export POLARIS_BUILD_ID="$CORE_CANDIDATE"'));
+  assert.ok(build.indexOf('export POLARIS_BUILD_ID=') < build.indexOf('cargo build --locked'));
+  assert.ok(build.indexOf('cargo build --locked') < build.indexOf('node scripts/prepare-core-identity.mjs'));
+  assert.deepEqual(commands(runtime), []);
+  assert.ok(runtime.includes('node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"'));
+  assert.match(runtime, /node --test scripts\/native-dns-ci-routing\.test\.mjs/);
+  assert.match(runtime, /scripts\/run-native-dns-controlled-tests\.test\.mjs/);
+  assert.ok(controlled.includes("args: ['test', '--locked', '-p', 'polaris', '--lib', '--no-run', '--message-format=json']"));
+  assert.equal((controlled.match(/'--no-run'/g) ?? []).length, 1);
+  assert.ok(controlled.includes("args: [name, '--exact', '--ignored', '--nocapture', '--test-threads=1']"));
+  assert.match(controlled, /summaries\.length === 1/);
+  assert.match(controlled, /test result: ok\. 1 passed; 0 failed; 0 ignored;/);
+  assert.match(runtime, /!cancelled\(\)/);
+  assert.match(runtime, /steps\.workspace_build\.outcome == 'success'/);
+}
+
+test('the two candidate-only Cargo steps retain exact commands, admitted scope and failure checks', () => {
+  const { ci, controlled } = loadStripped();
+  assertCandidateOnlySteps(ci, controlled);
+});
+for (const [name, source, before, after] of [
+  ['candidate admission removed', 'ci', "needs.cheap_format.outputs.native_dns_candidate != ''", 'true'],
+  ['helper build selector weakened', 'ci', 'cargo build --locked -p polaris-helper --bin polaris-helper', 'cargo build -p polaris-helper'],
+  ['cleaner selector changed', 'ci', 'cargo build --locked -p polaris-windows-cleaner --bin polaris-cleaner', 'cargo build --locked -p polaris-helper --bin polaris-helper'],
+  ['controlled runner disconnected', 'ci', 'node scripts/run-native-dns-controlled-tests.mjs', 'node scripts/other.mjs'],
+  ['controlled build selector weakened', 'controlled', "'--lib', '--no-run'", "'--no-run'"],
+  ['ignored tests broadened', 'controlled', "name, '--exact', '--ignored'", "name, '--ignored'"],
+  ['zero-test evidence accepted', 'controlled', 'test result: ok. 1 passed; 0 failed; 0 ignored;', 'test result: ok.'],
+  ['duplicated verdict accepted', 'controlled', 'summaries.length === 1', 'summaries.length >= 1'],
+]) test(`candidate-only Cargo registration rejects ${name}`, () => {
+  const fixture = loadStripped();
+  assert.ok(fixture[source].includes(before));
+  fixture[source] = fixture[source].replaceAll(before, after);
+  assert.throws(() => assertCandidateOnlySteps(fixture.ci, fixture.controlled), { name: 'AssertionError' });
+});
 
 /**
  * 从一段文本里抠出 rust 目标三元组（`x86_64-pc-windows-msvc` / `aarch64-linux-android` 这类）。
@@ -196,6 +258,41 @@ test('跨目标门覆盖的目标三元组，ci.yml 与 gate-rust.sh 一致', ()
       `${name} 里找不到 scripts/cross-target-exempt.json —— 豁免表的路径两侧必须同源`
     );
   }
+});
+
+/**
+ * 「随仓路径源零诊断」门：两侧调的是**同一条命令**，且它的目标清单就是跨目标门的那一份。
+ *
+ * 这一步在 ci.yml 里不直接出现 `cargo`（cargo 在被调脚本里），所以下面那条按「跑 cargo 的步骤」
+ * 取材的完备性断言看不见它 —— 不在这里单独钉，CI 侧删掉这一步或本机侧漏掉镜像都不会有任何东西变红。
+ * 目标清单写在两侧的调用行里而不在脚本里：钉成与跨目标门同一份，新增一个交叉目标时这一步不会落下。
+ */
+const VENDORED_STEP = 'Vendored path sources stay diagnostic-free';
+
+test(`「${VENDORED_STEP}」门：ci.yml 与 gate-rust.sh 逐字调同一条命令，目标清单同跨目标门`, () => {
+  const { ci, sh } = loadStripped();
+  const ciCommand = extractRunCommand(extractCiStepBlock(ci, VENDORED_STEP), `ci.yml "${VENDORED_STEP}"`);
+  const shLine = sh.split('\n').map((l) => l.trim()).find((l) => l.startsWith('run_gate cross-vendored '));
+  assert.ok(shLine, 'gate-rust.sh 里找不到 "run_gate cross-vendored …" 这一行');
+  assert.equal(shLine.slice('run_gate cross-vendored '.length), ciCommand, '命令本身不一致（ci.yml → gate-rust.sh）');
+
+  assert.ok(
+    ciCommand.startsWith('bash scripts/check-vendored-path-sources.sh '),
+    `这一步调的不是那份脚本：${ciCommand}`
+  );
+  const crossTriples = targetTriples(extractCiStepBlock(ci, MIRRORED_BUT_NOT_VERBATIM[0]));
+  assert.ok(crossTriples.length > 0, '跨目标门里一个三元组都没抠到 —— 下面的比对恒真');
+  assert.deepEqual(
+    targetTriples(ciCommand),
+    crossTriples,
+    '随仓路径源门的目标清单与跨目标门不是同一份 —— 新增的交叉目标在这一步被落下了'
+  );
+
+  // 脚本自己不许再带一份清单，也必须真的在数诊断（而不是只看 cargo 的退出码）。
+  const script = stripComments(readFileSync(join(ROOT, 'scripts/check-vendored-path-sources.sh'), 'utf8'));
+  assert.deepEqual(targetTriples(script.replace(/aarch64-linux-android\b/g, '')), [], '脚本里出现了写死的目标三元组');
+  assert.ok(script.includes('--message-format=json >'), '脚本没有把 cargo 的 JSON 诊断流落盘');
+  assert.ok(script.includes('.reason == "compiler-message" and .package_id == $id'), '脚本没有按包 id 数诊断');
 });
 
 /**
@@ -298,7 +395,10 @@ test('ci.yml 里跑 cargo 的步骤，要么在 GATES 里、要么在非逐字�
       if (sub === 'install') return false;
       return true;
     });
-    if (isGate) cargoSteps.push(m[1]);
+    // The controlled step delegates its single Cargo build to this exact runner;
+    // assertCandidateOnlySteps above pins both the call and the runner's selectors.
+    const delegatedGate = body.includes('node scripts/run-native-dns-controlled-tests.mjs "${tests[@]}"');
+    if (isGate || delegatedGate) cargoSteps.push(m[1]);
   }
   assert.ok(cargoSteps.length > 0, '一个跑 cargo 的步骤都没抠到 —— 取材面是空的，本断言恒真');
 

@@ -1,7 +1,7 @@
 //! 一等 DNS 资源与策略动作。
 //!
 //! `DnsServerResource` 回答“问谁、从哪个出口问”；`DnsPolicyAction` 回答“命中后怎么答”。
-//! 节点拨号 resolver 不在本模块：#4444 解锁前仍由 `dns-race` sidecar 承担。
+//! 节点拨号 resolver 由 node_dns 模块生成隔离的内核原生策略。
 
 #![forbid(unsafe_code)]
 
@@ -30,16 +30,15 @@ pub fn dns_server_tag(id: &str) -> String {
             crate::builder::network_env::NETENV_DNS_TAG.to_string()
         }
         _ => {
-            let safe: String = id
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
+            let mut safe = String::new();
+            for byte in id.bytes() {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+                    safe.push(char::from(byte));
+                } else {
+                    use std::fmt::Write;
+                    write!(&mut safe, "~{byte:02x}").expect("write to String");
+                }
+            }
             format!("dns-user-{safe}")
         }
     }
@@ -254,6 +253,15 @@ pub enum DnsPolicyAction {
     FollowRouteDefault,
 }
 
+impl DnsPolicyAction {
+    /// Default FakeIP's non-address queries may use one real resolver or reject.
+    /// Resource existence and availability are checked by the write/compiler layers.
+    #[must_use]
+    pub const fn is_valid_real_query_fallback(&self) -> bool {
+        matches!(self, Self::Server { .. } | Self::Reject { .. })
+    }
+}
+
 fn default_rcode() -> String {
     "NOERROR".to_string()
 }
@@ -279,6 +287,13 @@ pub struct DnsPolicyDefaults {
     pub proxy_server_id: String,
     #[serde(rename = "unmatchedAction", skip_serializing_if = "Option::is_none")]
     pub unmatched_action: Option<DnsPolicyAction>,
+    /// Default FakeIP's non-A/AAAA fallback, independent of traffic mode. Missing
+    /// values preserve the legacy domestic resolver; new installs set this explicitly.
+    #[serde(
+        rename = "realQueryFallbackAction",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub real_query_fallback_action: Option<DnsPolicyAction>,
     #[serde(rename = "connectionResolution", default)]
     pub connection_resolution: DnsConnectionResolution,
 }

@@ -714,33 +714,47 @@ def component_cli_tests(root):
     approved = ['--build-policy', str(paths['policy']), '--build-policy-sha256', ios.digest(paths['policy'].read_bytes()),
                 '--tools', str(paths['tools']), '--tools-sha256', ios.digest(paths['tools'].read_bytes())]
     original = ['--source-receipt', str(paths['source']), '--apple-input', str(paths['input'])]
+    assemble = ['build', '--component', '--phase', 'assemble', *approved, *original,
+                '--evidence-dir', str(root / 'fresh-evidence')]
+    publish = ['build', '--component', '--phase', 'publish', *approved, *original,
+               '--staged-generation', str(stage), '--output-root', str(output), '--output-fingerprint', 'a' * 64]
+    retired = [assemble, publish, ['build'], ['build', '--historical'], ['build', '--component'],
+               ['build', '--phase', 'publish'], publish + ['--historical'], publish + ['--offline'],
+               publish + ['/foreign-source'], publish + ['--previous-build-policy', str(paths['policy'])]]
+    for command in (assemble, publish):
+        for flag in ('--build-policy-sha256', '--tools-sha256'):
+            wrong = command.copy(); wrong[wrong.index(flag) + 1] = '0' * 64
+            retired.append(wrong)
+            missing = command.copy(); index = missing.index(flag); del missing[index:index + 2]
+            retired.append(missing)
+    # Even complete old approvals cannot reach a component import, source or
+    # tool read, assembly, receipt creation, publication, or output mutation.
+    with ExitStack() as stack:
+        forbidden = []
+        for owner, name in [(ios, 'component_module'), (ios, 'final_preflight'),
+                            (ios, 'approved_component_inputs'), (ios, 'source_helpers'),
+                            (ios, 'source_check'), (ios, 'provision_source'), (ios, 'run'),
+                            (component, 'read_json'), (component, 'assemble_component'),
+                            (component, 'make_receipt'), (component, 'publish_component'),
+                            (component.inputs.subprocess, 'run'), (component.platform, 'system'),
+                            (shutil, 'copyfile'), (shutil, 'copytree'), (os, 'symlink'),
+                            (tempfile, 'TemporaryDirectory'), (Path, 'read_bytes'),
+                            (Path, 'read_text'), (Path, 'open'), (Path, 'write_bytes'),
+                            (Path, 'write_text'), (Path, 'mkdir')]:
+            forbidden.append(stack.enter_context(mock.patch.object(owner, name,
+                side_effect=AssertionError('Retired CLI reached ' + name))))
+        rejected(lambda: ios.build_component(SimpleNamespace()), ios.LEGACY_BUILD_RETIRED)
+        for command in retired:
+            rejected(lambda command=command: ios.main(command), ios.LEGACY_BUILD_RETIRED)
+        check(all(call.call_count == 0 for call in forbidden), 'retired production had side effects')
     with mock.patch.object(ios, 'component_module', return_value=component), \
             mock.patch.object(component, 'driver', return_value=ios), \
             mock.patch.object(ios, 'run', side_effect=AssertionError('CLI executed a compiler')):
-        # Only the explicit first-assembly leg calls the existing assembler;
-        # publication finalizes the same retained bytes without another assembly.
-        pending = copy.deepcopy(policy); pending.update(componentInventory=[], assembly={})
-        paths['source'].write_text(json.dumps({'evidenceScope': 'source-only', 'sourceReceipt': f['receipt']}))
-        paths['policy'].write_text(json.dumps(pending))
-        assembly_approved = approved.copy(); assembly_approved[3] = ios.digest(paths['policy'].read_bytes())
-        with mock.patch.object(component, 'assemble_component', return_value={'stagedGeneration': str(stage), 'published': False}) as assemble, \
-                mock.patch.object(component, 'make_receipt', side_effect=AssertionError('first assembly finalized receipt')), \
-                redirect_stdout(io.StringIO()) as printed:
-            ios.main(['build', '--component', '--phase', 'assemble', *assembly_approved, *original, '--evidence-dir', str(root / 'fresh-evidence')])
-            assemble.assert_called_once_with(apple_input, f['receipt'], pending, f['tools'], root / 'fresh-evidence')
-            check(json.loads(printed.getvalue())['published'] is False, 'first assembly claimed publication')
-        paths['policy'].write_text(json.dumps(policy))
-        paths['source'].write_text(json.dumps(f['receipt']))
+        # Low-level synthetic fixture creation is separate from the retired CLI.
+        # Existing historical parser/publication fixtures and readonly consumers
+        # remain covered without reopening a production command.
         receipt = component.make_receipt(stage / 'Libbox.xcframework', f['receipt'], apple_input, policy, f['tools'])
-        publish = ['build', '--component', '--phase', 'publish', *approved, *original,
-                   '--staged-generation', str(stage), '--output-root', str(output), '--output-fingerprint', receipt['outputFingerprint']]
-        with mock.patch.object(component, 'assemble_component', side_effect=AssertionError('publication reassembled Framework')), \
-                mock.patch.object(component, 'make_receipt', wraps=component.make_receipt) as make, \
-                mock.patch.object(component, 'publish_component', wraps=component.publish_component) as publisher, \
-                redirect_stdout(io.StringIO()) as printed:
-            ios.main(publish)
-            check(make.call_count == publisher.call_count == 1, 'publication did not reuse original make/publish once')
-            selected = json.loads(printed.getvalue())
+        selected = component.publish_component(stage, receipt, output, build_policy=policy, tools=f['tools'])
         generation = Path(selected['generationRoot'])
         receipt_sha = ios.digest(Path(selected['receiptPath']).read_bytes())
         identity = ['--output-fingerprint', receipt['outputFingerprint'], '--receipt-sha256', receipt_sha]
@@ -750,7 +764,7 @@ def component_cli_tests(root):
         check(json.loads(printed.getvalue())['finalArtifactAdmission'] is False, 'component claimed final App/appex admission')
         with mock.patch.object(component.os, 'readlink', wraps=os.readlink) as links, redirect_stdout(io.StringIO()) as printed:
             ios.main(['resolve-component', '--output-root', str(output), *approved, *identity])
-        check(json.loads(printed.getvalue()) == selected, 'CLI resolver differs from publisher snapshot')
+        check(json.loads(printed.getvalue()) == selected, 'CLI resolver differs from historical fixture snapshot')
         check(sum(Path(call.args[0]).name == '.libbox-current' for call in links.call_args_list) == 1,
               'CLI resolver read current more than once')
         # An already resolved generation remains pinned even when current changes.
@@ -758,23 +772,14 @@ def component_cli_tests(root):
         with mock.patch.object(component, 'resolve_component', side_effect=AssertionError('fixed verifier reread current')), redirect_stdout(io.StringIO()):
             ios.main(fixed)
         check(generation.name == receipt['outputFingerprint'], 'pinned generation changed after current swap')
-        for action in [fixed + ['--historical'], publish + ['--historical'], publish + ['--offline'], publish + ['/foreign-source'],
-                       ['build', '--phase', 'publish'], ['verify', '--generation-root', str(generation)]]:
+        for action in [fixed + ['--historical'], ['verify', '--generation-root', str(generation)]]:
             rejected(lambda: ios.main(action), '')
-        # No bad external approval reaches assembly/copy/publication. Stored
-        # policy/receipt hashes alone never supply the missing expected hash.
-        with mock.patch.object(component, 'assemble_component', side_effect=AssertionError('bad approval assembled')), \
-                mock.patch.object(component, 'publish_component', side_effect=AssertionError('bad approval published')):
-            for flag in ('--build-policy-sha256', '--tools-sha256'):
-                wrong = publish.copy(); wrong[wrong.index(flag) + 1] = '0' * 64
-                rejected(lambda: ios.main(wrong), 'SHA256 differs')
-                missing = publish.copy(); index = missing.index(flag); del missing[index:index + 2]
-                rejected(lambda: ios.main(missing), 'SHA256 required')
-            wrong = publish.copy(); wrong[-1] = '0' * 64
-            rejected(lambda: ios.main(wrong), 'output fingerprint differs')
-            rejected(lambda: ios.main(publish + ['--previous-build-policy', str(paths['policy'])]), 'complete approved previous')
-            rejected(lambda: ios.main(['build', '--component', '--phase', 'assemble', *approved, *original,
-                                      '--evidence-dir', str(root / 'second-assembly')]), 'pending inventory/assembly')
+        # Readonly verification still requires independently approved raw hashes.
+        for flag in ('--build-policy-sha256', '--tools-sha256'):
+            wrong = fixed.copy(); wrong[wrong.index(flag) + 1] = '0' * 64
+            rejected(lambda: ios.main(wrong), 'SHA256 differs')
+            missing = fixed.copy(); index = missing.index(flag); del missing[index:index + 2]
+            rejected(lambda: ios.main(missing), 'SHA256 required')
         for flag, value, reason in [('--output-fingerprint', '0' * 64, 'immutable generation'),
                                     ('--receipt-sha256', '0' * 64, 'receipt SHA256 differs'),
                                     ('--generation-root', str(output / '.libbox-current'), 'immutable generation')]:

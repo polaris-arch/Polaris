@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { parseWgQuickConf } from '@/domain/wg-quick';
 import {
   splitCsv,
   emptyWgDraft,
@@ -442,4 +443,17 @@ describe('validateWgDraft', () => {
     const draft = parseConfToDraft(SAMPLE_CONF) as WgDraft;
     expect(validateWgDraft('n', draft)).toBeNull();
   });
+});
+
+
+it('never mixes fields from a second wg-quick peer into the first peer', () => {
+  const header = '[Interface]\nPrivateKey = first-private\nAddress = 10.0.0.2/32\n';
+  const second = '\n[Peer]\nPublicKey = second-public\nPresharedKey = second-secret\nEndpoint = second.example:99\nAllowedIPs = 0.0.0.0/0';
+  const first = '\n[Peer]\nPublicKey = first-public\nEndpoint = first.example:1234';
+  const parsed = parseWgQuickConf(header + first + second);
+  expect(parsed?.address).toBe('first.example');
+  expect(parsed?.settings.peerPublicKey).toBe('first-public');
+  expect(parsed?.settings.preSharedKey).toBeUndefined();
+  expect(parsed?.settings.allowedIPs).toBeUndefined();
+  expect(parseWgQuickConf(header + '\n[Peer]\nPublicKey = first-public' + second)).toBeNull();
 });

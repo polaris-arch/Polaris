@@ -61,8 +61,6 @@ const ANCHORS = [
   'components/screens/resources/ResourcesScreen.tsx',
   'components/screens/app-policy/AppPolicyScreen.tsx',
   'components/dialogs/RuleDialog.tsx',
-  'components/screens/settings/use-core-update.ts',
-  'components/screens/settings/CoreUpdateCard.tsx',
 ] as const;
 
 if (FILES.length < 100) {
@@ -167,6 +165,12 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
     });
   }
 
+  it('RulesScreen 的删除确认与武装态绑定同一 plane 和完整规则快照', () => {
+    const c = code(get('components/screens/rules/RulesScreen.tsx'));
+    expect(c).toContain('confirmTwice(`${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`,');
+    expect(c).toContain('deleteConfirming={armed === `${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`}');
+  });
+
   it('NodesScreen 的删节点 / 批删走原地二次点击（原型 :4140 node-del / :4137 batch-del）', () => {
     const c = code(get('components/screens/nodes/use-node-deletion.ts'));
     expect(c).toContain("from '@/lib/confirm-twice'");
@@ -201,22 +205,15 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
       const c = code(get(rel));
       expect(c, '没有消费共用实现').toContain("from '@/lib/confirm-twice'");
       expect(c).toMatch(/useConfirmTwice\(\)/);
+      expect(c, '删除确认必须绑定 plane 和完整实体快照').toContain(
+        'const deleteIntentKey = `${RULE_DEL_KEY}:${initialPlane}:${configCanonicalText(base ?? null)}`',
+      );
+      expect(c).toContain('confirmTwice(deleteIntentKey,');
       expect(c, '武装态必须真的接到 armed 上（只调 confirmTwice 不渲染 = 隐形闸门）').toMatch(
-        /armed === [A-Z_]+_KEY/,
+        /armed === deleteIntentKey/,
       );
     });
   }
-
-  it('内核更新 owner 持有原地二次确认，呈现卡消费同一武装态（原型 :4075 core-rollback）', () => {
-    const owner = code(get('components/screens/settings/use-core-update.ts'));
-    const card = code(get('components/screens/settings/CoreUpdateCard.tsx'));
-    expect(owner, '状态 owner 没有消费共用确认实现').toContain("from '@/lib/confirm-twice'");
-    expect(owner).toMatch(/useConfirmTwice\(\)/);
-    expect(owner, '回滚必须经 confirmTwice 武装').toMatch(/confirmTwice\(CORE_ROLLBACK_KEY/);
-    expect(card, '武装态没有传到按钮，首次点击会没有可见反馈').toMatch(
-      /armed === CORE_ROLLBACK_KEY && 'confirming'/,
-    );
-  });
 
   /**
    * 武装态必须**真的渲染出来** —— 只调 `confirmTwice` 而按钮不挂 `.confirming`，用户点第一下
@@ -231,17 +228,13 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
     ['components/screens/resources/ResourcesScreen.tsx', /armed === GEO_RESET_KEY && 'confirming'/],
     ['components/screens/resources/ResourcesScreen.tsx', /deleteConfirming && 'confirming'/],
     ['components/screens/app-policy/AppPolicyScreen.tsx', /confirming && 'confirming'/],
-    ['components/dialogs/RuleDialog.tsx', /armed === RULE_DEL_KEY && 'confirming'/],
+    ['components/dialogs/RuleDialog.tsx', /armed === deleteIntentKey && 'confirming'/],
     // 规则行内删除：状态在 RulesScreen（单槽），翻红在 RuleItem —— 两段都要钉，只钉一头就留下
     // 「state 有了但没传下去」或「传下去了但没挂 class」两种隐形闸门（同 NodesScreen / NodeCard 那对）。
     ['components/screens/rules/RuleItem.tsx', /cn\('nd-a err', deleteConfirming && 'confirming'\)/],
-    [
-      'components/screens/settings/CoreUpdateCard.tsx',
-      /armed === CORE_ROLLBACK_KEY && 'confirming'/,
-    ],
   ] as const;
 
-  it('本批 7 处武装态都挂上了 `.confirming`（不留隐形闸门）', () => {
+  it('登记的 6 处武装态都挂上了 `.confirming`（不留隐形闸门）', () => {
     const offenders = ARMED_RENDER.filter(([rel, re]) => !re.test(code(get(rel)))).map(
       ([rel, re]) => `${rel} :: ${re.source}`,
     );
@@ -256,10 +249,10 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
    */
   it('RulesScreen 把 armed / 删除回调都真的传给了 RuleItem（原型 :4097 rule-del）', () => {
     const c = code(get('components/screens/rules/RulesScreen.tsx'));
-    expect(c, '行内删除没走 confirmTwice').toMatch(/confirmTwice\(`\$\{RULE_DEL_PREFIX\}\$\{rule\.id\}`/);
+    expect(c, '行内删除没走 confirmTwice').toMatch(/confirmTwice\(`\$\{RULE_DEL_PREFIX\}\$\{plane\}:\$\{configCanonicalText\(rule\)\}`/);
     expect(c, '删除回调没接到行上（按钮整个不渲染）').toContain('onDelete={requestDelete}');
     expect(c, '武装态没传下去 —— 按钮永远不翻红').toContain(
-      'deleteConfirming={armed === `${RULE_DEL_PREFIX}${rule.id}`}',
+      'deleteConfirming={armed === `${RULE_DEL_PREFIX}${plane}:${configCanonicalText(rule)}`}',
     );
   });
 });
@@ -275,8 +268,7 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
    * ✅ **上一轮登记的 4 条债务已于 2026-07-29 第二批清零**（`res-del` / `geo-reset` / `app-remove` /
    * `rule-del-dlg` 全部改为原地二次点击）⇒ ResourcesScreen 与 AppPolicyScreen 整份出表，
    * RuleDialog 由 2 降到 1（剩下的那处是「放弃更改？」脏态确认，非破坏性操作）。
-   * 同批把 3 处**确认整个缺席**的补上（`reset-pending` / `geo-reset` / `core-rollback`），
-   * 其中 `core-rollback` 落在 SettingsUpdate，它的 3 处弹窗都与回滚无关，故计数不变。
+   * 同批把 2 处**确认整个缺席**的补上（`reset-pending` / `geo-reset`）。
    *
    * NodesScreen 余下的 2 处（删订阅 `requestSubDelete` / 注销 WARP `removeWarpNode`）**不是**债务：
    * 原型里没有对应的 confirmTwice 调用点，属本仓自加的确认，维持弹窗。
@@ -300,8 +292,13 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     'components/dialogs/use-subscription-create-dialog-operation.ts': 1,
     // renderer 重建的可见任务用同一条取消语义，独立 surface 也必须纳入清册。
     'components/dialogs/SubscriptionCreateTaskDialog.tsx': 1,
-    'components/dialogs/TsLoginDialog.tsx': 1,
+    // 脏表单放弃 + 主连接持有该节点时换号前的告知。后者不能原地确认：它要说明的是**另一个对象**
+    // 的后果（代理会被断开且保持断开、登录完成后需手动重连），按钮翻红再点一次说不出这段话。
+    'components/dialogs/TsLoginDialog.tsx': 2,
     'components/dialogs/TsSettingsDialog.tsx': 1,
+    // 桌面两个登出入口（TS 设置弹窗、组网卡）共用的一处：主连接持有该节点时，确认「断开代理并
+    // 退出登录、代理保持断开」。理由同上：后果落在代理连接上，需成段说明。
+    'components/dialogs/ts-logout-confirm.ts': 1,
     'components/dialogs/WarpDialog.tsx': 1,
     'components/dialogs/WgDialog.tsx': 1,
     'components/dialogs/dialog-store.ts': 1, // union 的类型声明，非调用点
@@ -314,7 +311,6 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     // 清理系统代理会改系统级网络状态，且用户明确要求二次确认；需要成段说明风险，不适合原地双击。
     'components/screens/settings/SettingsNetwork.tsx': 1,
     'components/screens/settings/use-app-update.ts': 1,
-    'components/screens/settings/use-core-update.ts': 2,
     'components/screens/settings/use-config.ts': 1,
     /*
      * ── 移动端（2026-09-06 批 2：表单宿主 + 节点面）──────────────────────────────
@@ -333,8 +329,10 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     // 后者走 `node-deletion#removeWarpNode`，确认由本面板经 `confirm:` 那个 deps 开，
     // 故两颗共用**一处** `open({ kind: 'confirm' …})`（它就是那个 deps 的实现）。
     'mobile/forms/WarpPanel.tsx': 2,
-    'mobile/forms/TsLoginPanel.tsx': 1, // 脏表单放弃
-    'mobile/forms/TsSettingsPanel.tsx': 3, // 脏表单放弃 + 退出登录 + 主核持有时明确确认断开再退出
+    'mobile/forms/TsLoginPanel.tsx': 2, // 脏表单放弃 + 换号会断开持有该节点的代理且不重连时的事前告知
+    // 脏表单放弃 + 退出登录 + 调用后端之前告知「会断开持有该节点的代理并保持断开」
+    // + 后端拒绝（主核持有）时明确确认断开再退出
+    'mobile/forms/TsSettingsPanel.tsx': 4,
     'mobile/forms/SubFormPanel.tsx': 2, // 脏表单放弃 + 恢复面「取消添加」（ζ 批 A8，同桌面 SubscriptionCreateTaskDialog 那一处）
     // Taildrop 收件箱（批 16）：删一个待处理文件 —— 破坏性，叠一层确认面板。
     // 本面板**没有**脏表单放弃那一处：它不是一张表单，关掉不丢任何草稿。

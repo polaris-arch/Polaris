@@ -5,7 +5,7 @@ import { MobileSelect as MobileSelect } from '../MobileSelect';
  * # 复用的是判据，重写的只有呈现
  *
  * 桌面 `RuleDialog.tsx` 那 516 行里，真正是判据的部分早就住在纯 `.ts` 里，本面板原样吃它们：
- *  · 草稿编辑 —— `rule-cond.ts` 的 `setCondTypeAt` / `toggleCondValueAt` / `splitVals` /
+ *  · 草稿编辑 —— `rule-cond.ts` 的 `setCondTypeAt` / `toggleCondValueAt` / `parseConditionValues` /
  *    `invalidCondValues` / `computeTestMatch`，以及候选面的 `matchRuleValueOptions` /
  *    `offPoolSelectedOptions`；
  *  · 候选池 —— `use-rule-pools.ts` 的 `useRulePools`（惰性取数 + 排序快照，零 DOM 依赖）；
@@ -71,7 +71,8 @@ import {
   offPoolSelectedOptions,
   selectedValueSet,
   setCondTypeAt,
-  splitVals,
+  parseConditionValues,
+  formatConditionValues,
   toggleCondValueAt,
   type Cond,
 } from '@/components/dialogs/rule-cond';
@@ -157,7 +158,7 @@ export function RuleFormPanel({
 
   const [conds, setConds] = useState<Cond[]>(() => {
     if (base) {
-      const existing = ruleConditions(base).map((c) => ({ t: c.type, v: c.values.join(', ') }));
+      const existing = ruleConditions(base).map((c) => ({ t: c.type, v: formatConditionValues(c.type, c.values) }));
       return existing.length > 0 ? existing : [{ t: DEFAULT_RULE_TYPE, v: '' }];
     }
     return [{ t: preset?.type ?? DEFAULT_RULE_TYPE, v: preset?.value ?? '' }];
@@ -876,7 +877,7 @@ function CondEditor({
   const rsPick = isResRef ? ruleSetPickState(pools.resItems, query) : 'ok';
 
   const typeLabel = t(ruleTypeNameKey(cond.t));
-  const valueCount = splitVals(cond.v).length;
+  const valueCount = parseConditionValues(cond.t, cond.v).length;
 
   return (
     <section className="m-form-group">

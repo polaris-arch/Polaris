@@ -234,7 +234,11 @@ pub(super) fn resolve_resource_rule_set(
         }
     };
     let file_path = format!("{}/{}", deps.rule_resources_path, res.file_name);
-    if !deps.is_valid_srs_file(&file_path) {
+    let available = match res.format {
+        crate::user_config::rule::RuleResourceFormat::Binary => deps.is_valid_srs_file(&file_path),
+        crate::user_config::rule::RuleResourceFormat::Source => (deps.exists_fn)(&file_path),
+    };
+    if !available {
         deps.log_warn(&format!(
             "ruleSet 规则引用的资源文件缺失/损坏，已跳过: {}",
             res.file_name
@@ -293,7 +297,7 @@ pub fn apply_rule_action(
         RuleAction::Proxy => Some({
             // anti-drift：指定目标节点的规则 → 指向独立 rule-sel-<ruleId> selector，绝不直绑节点。
             if let Some(rid) = rule_id {
-                format!("rule-sel-{rid}")
+                crate::builder::helpers::custom_rule_selector_tag(rid)
             } else if let Some(tid) = target_server_id {
                 id_to_tag_map
                     .get(tid)

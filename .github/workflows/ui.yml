@@ -32,15 +32,26 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      preserve_run:
+        description: '保留固定源码审计运行；不被后续普通手动运行取消'
+        type: boolean
+        default: false
   # 供 package.yml 复用作发布前置门：CI 绿但前端红也不许**发布**。
   # （2026-09-04 起本门与打包腿并行；判据挂在 package.yml 的 release job 上，不在 package job 上。）
   workflow_call:
+    inputs:
+      preserve_run:
+        type: boolean
+        default: false
 
 # 判据与 ci.yml 一致：调用方名称进入并发组，独立 UI 与 Package 内复用门互不取消；
 # 同一调用方/ref 的旧 main/PR 跑仍由新跑顶掉。
+# Automatic tips replace only tips of the same caller/ref. Fixed audits and
+# merge queue groups have run-specific identities; tags never cancel.
 concurrency:
-  group: ui-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+  group: ui-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push') }}
 
 jobs:
   test:
@@ -76,8 +87,8 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm.outputs.store_path }}
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('ui/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-pnpm-
+          key: ${{ runner.os }}-node26-pnpm11.24.0-${{ hashFiles('ui/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-node26-pnpm11.24.0-
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -107,11 +118,14 @@ jobs:
           node scripts/gen-third-party-licenses.mjs --check
 
       - name: Test
-        run: pnpm exec vitest run --exclude 'src/lib/prototype-confirm-parity.test.ts'
+        # Each worker can cold-compile CSS and launch Chromium. Bound that
+        # concurrency so fixture startup stays within its existing 30s budget.
+        run: pnpm exec vitest run --maxWorkers=2 --exclude 'src/lib/prototype-confirm-parity.test.ts'
 
       - name: Browser form round trip (mock IPC, no app or core)
         run: |
           pnpm exec playwright install --with-deps chromium
+          POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts --maxWorkers=1
           pnpm exec playwright test --config playwright.config.ts
 
       - name: Browser form failure evidence (mock fixture only)

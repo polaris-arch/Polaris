@@ -202,3 +202,17 @@ describe('缎带身份', () => {
     expect(set.has(target.id)).toBe(true);
   });
 });
+
+
+it('translated Others never collides with a real host and locale changes preserve node/link IDs', async () => {
+  const { TOPOLOGY_OTHERS_KEY } = await import('@/contracts/types');
+  const aggregate = aggregateHosts(2);
+  aggregate.hosts[0].name = TOPOLOGY_OTHERS_KEY;
+  aggregate.hosts[1].name = 'Other.example';
+  const en = computeTopologyLayout(aggregate, 600, () => 'Other.example', 400);
+  const zh = computeTopologyLayout(aggregate, 600, () => '其他', 400);
+  expect(new Set(en.nodes.map(node => node.id)).size).toBe(en.nodes.length);
+  expect(en.nodes.filter(node => node.type === 'host')).toHaveLength(2);
+  expect(en.nodes.map(node => node.id)).toEqual(zh.nodes.map(node => node.id));
+  expect(en.links.map(link => link.id)).toEqual(zh.links.map(link => link.id));
+});

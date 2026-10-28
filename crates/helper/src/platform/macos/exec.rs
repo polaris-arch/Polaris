@@ -93,6 +93,83 @@ impl std::error::Error for RunError {}
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemRunner;
 
+// Only unit-test builds on macOS carry this closed diagnostic vocabulary.
+// Never derive emitted labels from command arguments, environment or paths.
+#[cfg(all(test, target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestSpawnLabel {
+    RunEcho,
+    OutputEcho,
+    NonzeroExit,
+    Other,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl TestSpawnLabel {
+    fn from_test_name(name: Option<&str>) -> Self {
+        match name {
+            Some("platform::macos::exec::tests::system_runner_run_echo") => TestSpawnLabel::RunEcho,
+            Some("platform::macos::exec::tests::system_runner_output_echo") => {
+                TestSpawnLabel::OutputEcho
+            }
+            Some("platform::macos::exec::tests::system_runner_nonzero_exit") => {
+                TestSpawnLabel::NonzeroExit
+            }
+            _ => TestSpawnLabel::Other,
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[derive(Clone, Copy)]
+struct TestSpawnObservation {
+    operation: u64,
+    label: TestSpawnLabel,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static TEST_SPAWN_OBSERVATION: std::cell::Cell<Option<TestSpawnObservation>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_spawn_correlation() -> Option<(u64, &'static str)> {
+    TEST_SPAWN_OBSERVATION
+        .with(|slot| slot.get())
+        .map(|context| {
+            let label = match context.label {
+                TestSpawnLabel::RunEcho => "run-echo",
+                TestSpawnLabel::OutputEcho => "output-echo",
+                TestSpawnLabel::NonzeroExit => "nonzero-exit",
+                TestSpawnLabel::Other => "other",
+            };
+            (context.operation, label)
+        })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl TestSpawnObservation {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let thread = std::thread::current();
+        let label = TestSpawnLabel::from_test_name(thread.name());
+        Self {
+            operation: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            label,
+        }
+    }
+
+    fn observe(self, phase: &'static str, child_pid: Option<u32>) {
+        TEST_SPAWN_OBSERVATION.with(|slot| {
+            let previous = slot.replace(Some(self));
+            crate::core_store::observe_test_spawn("mac-system-runner", phase, child_pid);
+            slot.set(previous);
+        });
+    }
+}
+
 impl SystemRunner {
     #[must_use]
     pub const fn new() -> Self {
@@ -111,13 +188,21 @@ impl SystemRunner {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        #[cfg(all(test, target_os = "macos"))]
+        let observation = TestSpawnObservation::new();
+        #[cfg(all(test, target_os = "macos"))]
+        observation.observe("before-spawn", None);
         let child = cmd.spawn().map_err(|e| RunError::Spawn(e.to_string()))?;
         let child_id = child.id();
+        #[cfg(all(test, target_os = "macos"))]
+        observation.observe("spawn-returned", Some(child_id));
 
         // 子线程：阻塞 wait_with_output（回收子进程资源 + 捕获管道）
         let (tx, rx) = mpsc::channel::<Result<Output, String>>();
         let join = std::thread::spawn(move || {
             let result = child.wait_with_output().map_err(|e| e.to_string());
+            #[cfg(all(test, target_os = "macos"))]
+            observation.observe("wait-returned", Some(child_id));
             let _ = tx.send(result);
         });
 

@@ -55,10 +55,11 @@ function AppAddIcon() {
   );
 }
 
-export function AppAddDialog() {
+export function AppAddDialog({ instanceId }: { instanceId: string }) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((state) => state.closeInstance);
+  const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const closeAll = useDialogStore((s) => s.closeAll);
   const navigate = useNavStore((s) => s.navigate);
   const stagingEnabled = useStagingActive();
@@ -241,7 +242,7 @@ export function AppAddDialog() {
       close();
       return;
     }
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('appAdd.discardTitle'),
@@ -249,7 +250,7 @@ export function AppAddDialog() {
         confirmLabel: t('node.discard'),
         danger: true,
         onConfirm: () => {
-          close();
+          closeInstance(confirmId);
           close();
         },
       },

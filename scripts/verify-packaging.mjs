@@ -22,7 +22,8 @@
  *     构建后：`--root` 收 **bundle 根**（`target/release/bundle`，传了 --target 时
  *     `target/<triple>/release/bundle`），对该 label 的**每个 bundle target 各自**断言
  *     「恰含本平台那一份内核、且字节大小与源 `resources/<平台>/` 一致」。
- *     Linux 原核额外要求 SHA/权限完全一致；AppImage 实际成员的同一契约由 postprocess 重封后校验。
+ *     Linux 原核与两动态 Cronet 库要求完整 SHA/权限一致；Cronet 还须匹配 manifest pin及静态 ABI。
+ *     AppImage 实际成员的同一契约由 postprocess 重封后校验。
  *     ⚠️ 不可指向 `target/release`：那里的 `_up_/resources/` 是 **cargo build script 的 staging copy**，
  *        与 bundler 有没有把内核铺进包无关，打在它上面等于没有门（详见 BUNDLE_TREES 注释）。
  *     ⚠️ windows 腿是**例外**：NSIS 把资源从源路径直接编进 .exe，bundle 侧无副本可扫，
@@ -34,18 +35,19 @@
  *     Windows 契约尤其脆，且**按形态分成两条互不相交的规则**：
  *       - installed → `.exe` 且名含 `win`。Tauri NSIS 默认名 `Polaris_<ver>_x64-setup.exe`
  *         **不含 win** ⇒ 不改名的话 Windows 用户永远收不到更新且静默。
- *       - loose（便携）→ `polaris-portable-*.zip`。便携产物是 zip，结构性进不了上面那条 `.exe`
+ *       - loose（便携）→ `Polaris_<版本>_x64-win-Portable.zip`。便携产物是 zip，结构性进不了上面那条 `.exe`
  *         过滤；此前两个形态共用同一候选集 ⇒ 便携用户恒被发 NSIS 安装器（#72 形态错配本体，
  *         2026-07-22 修）。故这里两条规则各自断言，只镜像一半就等于没守住便携形态。
- *     `--label release` 是**聚合口径**（四 job 产物汇进同一 release 后跑）：断言两个架构的 dmg
+ *     `--label release` 是**桌面聚合口径**（四 job 产物汇进同一 release 后跑）：断言两个架构的 dmg
  *     各恰一个 + win setup 恰一个 + 便携 zip 恰一个 + linux 双形态各恰一个（6 个平台交付物，
  *     聚合 release 另含 SHA256SUMS），
  *     且便携候选与安装态候选不相交。per-job 口径断言「不得出现另一架构」，
  *     聚合侧两架构本就都在，故必须分开，不能复用。
+ *     `--label release-all` 在最终发布聚合时再要求三种 Android APK，完整九件资产与 SHA256SUMS 恰等。
  *
  *     assets 模式除命名外还有**两道内容门**（射程都只覆盖 updater 会真正命中的那些资产）：
  *       - **体积门（U2）**：`> MAX_UPDATE_ASSET_BYTES` 即红。见该常量文档；
- *       - **摘要门（U3）**：`--label release` 下 `SHA256SUMS` 缺失、格式坏、覆盖面对不上或
+ *       - **摘要门（U3）**：`--label release` / `release-all` 下 `SHA256SUMS` 缺失、格式坏、覆盖面对不上或
  *         逐条摘要不符即红。见 [`checkSha256Sums`]。
  *     `--names-only` 供**发布后**那一遍用：那时喂进来的是按真实资产名造的**同名空文件**
  *     （不回下 ~600 MB 真产物），体积与摘要在其上不可判定，故显式跳过并在输出里如实标注 ——
@@ -64,14 +66,21 @@
  * 退出码：0 = 全部不变量成立；1 = 有违反（逐条打印）；2 = 用法错误（缺必填参数）。
  */
 
-import { readFileSync, existsSync, lstatSync, statSync, readdirSync, openSync, readSync, closeSync } from 'fs';
+import { readFileSync, existsSync, lstatSync, realpathSync, statSync, readdirSync, openSync, readSync, closeSync } from 'fs';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { join, dirname, resolve, basename, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { appImageRuntimeViolations } from './postprocess-appimage.mjs';
-import { frozenSourceVersion } from './desktop-core/source-graph.mjs';
+import { verifyCronetPayload } from './lib/cronet-payload.mjs';
+import { nsisCoreSweepViolations } from './lib/nsis-core-sweep.mjs';
+import { nsisHelperCleanupViolations } from './lib/nsis-helper-cleanup.mjs';
+import { assetMatches, assetNames } from './release-assets.mjs';
+import { frozenSourceVersion, hasDesktopSource, validateSourcePins, desktopSourceManifestPath, verifyHash, validateForkNotice } from './desktop-core/source-graph.mjs';
 import { verifyPackagedSource } from './desktop-core/bundle.mjs';
+import { verifySelectedCoreManifest } from './lib/core-identity.mjs';
+import { hasDesktopRelease, loadReleaseContract, releasePayloadMembers, validateReleaseNotice } from './desktop-core/release-consumer.mjs';
+import { hasTemporaryDesktop, loadTemporaryDesktopSelection, loadCandidate, verifiedCandidateSource, verifyCandidateAppCarrier, validateTemporaryDesktopNotice } from './desktop-core/native-dns-candidate.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_TAURI = join(ROOT, 'src-tauri');
@@ -967,45 +976,75 @@ function checkLicenseArtifacts(base, platforms, manifest, workflow) {
   //
   // 取材面是 NOTICE 全文（纯文本，无注释/字符串层需要剥）。两条正则各自**至少命中一次**是正面断言：
   // 只写「不许出现别的版本号」会被「把版本号整段删掉」骗过（删了就一处都不命中，仍是零违反）。
-  const version = String(manifest.bundledCoreVersion ?? '');
-  const sourceVersion = frozenSourceVersion(manifest);
-  if (sourceVersion && (!texts.NOTICE.includes(`桌面源码修复构建：${sourceVersion}`)
-      || !texts.NOTICE.includes(manifest.sourceBuild.sourceManifestSha256)
-      || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches'))) {
-    fail('NOTICE: 四平台源码修复构建版本/共同source manifest摘要/共享补丁指引必须与冻结输入一致');
-  }
-  if (manifest.windowsBuild) {
-    const build = manifest.windowsBuild;
-    if (!texts.NOTICE.includes(`Windows 修复构建：${build.version}`)
-        || !texts.NOTICE.includes(`https://github.com/SagerNet/sing-box/tree/${build.sourceCommit}`)
-        || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches')) {
-      fail('NOTICE: Windows 修复构建版本/固定源码/补丁指引必须与 manifest 一致');
+  if (hasTemporaryDesktop(manifest)) {
+    try { validateTemporaryDesktopNotice(texts.NOTICE, ROOT); }
+    catch (error) { fail(error.message); }
+  } else if (hasDesktopRelease(manifest)) {
+    try {
+      const contract = loadReleaseContract(ROOT, manifest);
+      const android = join(ROOT, 'scripts/libbox-patches/source-manifest.json');
+      const apple = join(ROOT, 'scripts/libbox-ios-patches/source-manifest.json');
+      verifyHash(android, manifest.sourceBuild.sourceManifestSha256);
+      const identity = (path) => ({ sourceCommit: readJson(path).sourceCommit,
+        manifestSha256: createHash('sha256').update(readFileSync(path)).digest('hex') });
+      validateReleaseNotice(texts.NOTICE, manifest, contract, { android: identity(android), apple: identity(apple) });
+    } catch (error) { fail(error.message); }
+  } else if (hasDesktopSource(manifest)) {
+    try {
+      const spec = validateSourcePins(manifest, 'linux', false);
+      const path = join(ROOT, desktopSourceManifestPath(spec));
+      verifyHash(path, spec.sourceManifestSha256);
+      const source = readJson(path);
+      const androidPath = join(ROOT, 'scripts/libbox-patches/source-manifest.json');
+      const applePath = join(ROOT, 'scripts/libbox-ios-patches/source-manifest.json');
+      verifyHash(androidPath, manifest.sourceBuild.sourceManifestSha256);
+      const identity = (path) => ({ sourceCommit: readJson(path).sourceCommit,
+        manifestSha256: createHash('sha256').update(readFileSync(path)).digest('hex') });
+      validateForkNotice(texts.NOTICE, manifest, source,
+        { android: identity(androidPath), apple: identity(applePath) });
+    } catch (error) { fail(error.message); }
+  } else {
+    const version = String(manifest.bundledCoreVersion ?? '');
+    const sourceVersion = frozenSourceVersion(manifest);
+    if (sourceVersion && (!texts.NOTICE.includes(`桌面源码修复构建：${sourceVersion}`)
+        || !texts.NOTICE.includes(manifest.sourceBuild.sourceManifestSha256)
+        || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/libbox-patches'))) {
+      fail('NOTICE: 四平台源码修复构建版本/共同source manifest摘要/共享补丁指引必须与冻结输入一致');
     }
-  }
-  if (!/^\d[\w.\-+]*$/.test(version)) {
-    fail(`core-manifest.json: bundledCoreVersion ${JSON.stringify(manifest.bundledCoreVersion)} 形态不可用 —— NOTICE 版本对拍无从进行`);
-    return;
-  }
-  const proseVersions = [...texts.NOTICE.matchAll(/sing-box\s+v([\d][\w.\-+]*)/g)].map((m) => m[1]);
-  const tagVersions = [...texts.NOTICE.matchAll(/https:\/\/github\.com\/SagerNet\/sing-box\/tree\/v([\d][\w.\-+]*)/g)].map((m) => m[1]);
-  if (proseVersions.length === 0) {
-    fail(`NOTICE: 找不到形如 \`sing-box v<版本>\` 的版本提法 —— 随包内核版本必须在 NOTICE 正文里显式出现（应为 v${version}）`);
-  }
-  if (tagVersions.length === 0) {
-    fail(
-      `NOTICE: 找不到 \`https://github.com/SagerNet/sing-box/tree/v<版本>\` 形态的源码 tag 链接 —— ` +
-        `GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，缺了这条链接指引就不成立（应为 v${version}）`
-    );
-  }
-  for (const [where, list] of [['正文版本提法', proseVersions], ['源码 tag 链接', tagVersions]]) {
-    for (const v of list) {
-      if (v !== version) {
-        fail(
-          `NOTICE 的${where}写的是 v${v}，core-manifest.json 的 bundledCoreVersion 是 ${version} —— ` +
-            `声明指向的对应源码与包里那份二进制不是同一版，GPLv3 §6 的源码指引随之失效`
-        );
+    if (manifest.windowsBuild) {
+      const build = manifest.windowsBuild;
+      if (!texts.NOTICE.includes(`Windows 修复构建：${build.version}`)
+          || !texts.NOTICE.includes(`https://github.com/SagerNet/sing-box/tree/${build.sourceCommit}`)
+          || !texts.NOTICE.includes('https://github.com/polaris-arch/Polaris/tree/main/scripts/core-patches')) {
+        fail('NOTICE: Windows 修复构建版本/固定源码/补丁指引必须与 manifest 一致');
       }
     }
+    if (!/^\d[\w.\-+]*$/.test(version)) {
+      fail(`core-manifest.json: bundledCoreVersion ${JSON.stringify(manifest.bundledCoreVersion)} 形态不可用 —— NOTICE 版本对拍无从进行`);
+      return;
+    }
+    const proseVersions = [...texts.NOTICE.matchAll(/sing-box\s+v([\d][\w.\-+]*)/g)].map((m) => m[1]);
+    const tagVersions = [...texts.NOTICE.matchAll(/https:\/\/github\.com\/SagerNet\/sing-box\/tree\/v([\d][\w.\-+]*)/g)].map((m) => m[1]);
+    if (proseVersions.length === 0) {
+      fail(`NOTICE: 找不到形如 \`sing-box v<版本>\` 的版本提法 —— 随包内核版本必须在 NOTICE 正文里显式出现（应为 v${version}）`);
+    }
+    if (tagVersions.length === 0) {
+      fail(
+        `NOTICE: 找不到 \`https://github.com/SagerNet/sing-box/tree/v<版本>\` 形态的源码 tag 链接 —— ` +
+          `GPLv3 §6 要求在二进制旁给出获取对应源码的明确指引，缺了这条链接指引就不成立（应为 v${version}）`
+      );
+    }
+    for (const [where, list] of [['正文版本提法', proseVersions], ['源码 tag 链接', tagVersions]]) {
+      for (const v of list) {
+        if (v !== version) {
+          fail(
+            `NOTICE 的${where}写的是 v${v}，core-manifest.json 的 bundledCoreVersion 是 ${version} —— ` +
+              `声明指向的对应源码与包里那份二进制不是同一版，GPLv3 §6 的源码指引随之失效`
+          );
+        }
+      }
+    }
+
   }
 
   // ── ④ 版权行单一真值：NOTICE 的版权行必须与 LICENSE 里那行逐字一致（同 checkMacOpenGuide 的口径）。
@@ -1126,6 +1165,7 @@ function checkLinuxAppImagePostprocess(workflow) {
  *  - 两条 `--label release` 调用必须都在（少一条 = 有一遍没跑，或者判据认不出它了 ⇒ 红）；
  *  - 上传前那条（`--dir …/dist-release`）**不得**带 `--names-only`；
  *  - 发布后那条（`--dir "$outdir"`，喂的是同名空文件）**必须**带；
+ *  - 两条 `--label release-all` 调用都读 `dist-release` 真产物，**不得**带 `--names-only`；
  *  - 全 workflow 里带 `--names-only` 的调用**恰好一条** —— 防它蔓延到 per-job 三条腿。
  *
  * 认不出（重命名了 `$outdir`、改了目录形态）一律判红：判据取不到时装作通过，等于把这条纪律删掉。
@@ -1141,7 +1181,7 @@ function checkNamesOnlyDiscipline(workflow) {
     .split('\n')
     .map(stripYamlComment)
     .filter((l) => l.includes('verify-packaging.mjs') && l.includes('assets --label'));
-  const release = calls.filter((l) => l.includes('--label release'));
+  const release = calls.filter((l) => /--label release(?:\s|$)/.test(l));
   if (release.length !== 2) {
     fail(
       `.github/workflows/package.yml: 应恰有 2 条 \`assets --label release\` 调用（上传前全口径 + 发布后仅命名），` +
@@ -1171,6 +1211,13 @@ function checkNamesOnlyDiscipline(workflow) {
     fail(
       `.github/workflows/package.yml: 发布后那条 release 口径缺 \`--names-only\` —— ` +
         `那一遍喂的是同名空文件，会拿 0 字节去比摘要，得到一片与真实状态无关的恒红。`
+    );
+  }
+  const complete = calls.filter((l) => /--label release-all(?:\s|$)/.test(l));
+  if (complete.length !== 2 || complete.some((l) => !/--dir dist-release(?:\s|$)/.test(l) || l.includes('--names-only'))) {
+    fail(
+      '.github/workflows/package.yml: 两条 release-all 完整发布检查必须读 dist-release 真产物，' +
+        '且不得带 --names-only（生成最终清单后一次、公开前再一次）。'
     );
   }
   const withFlag = calls.filter((l) => l.includes('--names-only'));
@@ -1403,7 +1450,7 @@ function checkWindowsInstallMode(base) {
   }
 }
 
-/** Windows NSIS 三条自定义钩子的静态契约（安装前清 legacy；安装后归一形态；卸载后清 helper）。 */
+/** Windows NSIS 四条自定义钩子的静态契约（安装/卸载前结束本目录内核；安装前清 legacy；安装后归一形态；卸载后清 helper）。 */
 function checkWindowsInstallerHooks(base) {
   const errorsBefore = errors.length;
   checkWindowsNsisLocalization(base);
@@ -1444,8 +1491,9 @@ function checkWindowsInstallerHooks(base) {
     }
   }
   const selectorCalls = source.match(/!insertmacro PolarisSelectLang\s+\$R8/g) ?? [];
-  if (selectorCalls.length !== 4) {
-    fail(`nsis-hooks.nsh: 四处安装/卸载进度文案都必须经五语选择宏，实为 ${selectorCalls.length} 处`);
+  // 5 处进度文案 + native 卸载腿的 4 类失败提示；普通权限服务/目录探测已移除。
+  if (selectorCalls.length !== 9) {
+    fail(`nsis-hooks.nsh: 九处安装/卸载文案都必须经五语选择宏，实为 ${selectorCalls.length} 处`);
   }
   const pre = nsisHookBody(source, 'NSIS_HOOK_PREINSTALL');
   if (pre === null) {
@@ -1481,8 +1529,18 @@ function checkWindowsInstallerHooks(base) {
     fail('nsis-hooks.nsh: 缺既有 NSIS_HOOK_POSTUNINSTALL（真卸载会遗留外置 helper）');
   }
   checkWindowsHookPrivilegeBoundary(source);
+  // 内核从安装目录运行 ⇒ 安装/卸载动文件前必须先结束映像在本目录内的内核，且判据是路径不是进程名。
+  // 判据本体与它的反向对照在 `lib/nsis-core-sweep.mjs` / `nsis-core-sweep.test.mjs`。
+  for (const violation of nsisCoreSweepViolations(source)) {
+    fail(`nsis-hooks.nsh 内核清扫门：${violation}`);
+  }
+  // 卸载腿的提权清理：脚本随命令行进入提权进程（不落盘）、删除前逐项校验、退出码被消费。
+  // 判据本体与它的反向对照在 `lib/nsis-helper-cleanup.mjs` / `nsis-helper-cleanup.test.mjs`。
+  for (const violation of nsisHelperCleanupViolations(source)) {
+    fail(`nsis-hooks.nsh 提权清理门：${violation}`);
+  }
   if (errors.length === errorsBefore) {
-    note('Windows NSIS：English/简中/繁中/Russian/Farsi，系统预选+语言选择器；安装前清 legacy resources；安装后清 portable marker；真卸载后清外置 helper');
+    note('Windows NSIS：English/简中/繁中/Russian/Farsi，系统预选+语言选择器；安装/卸载前先让主程序退出、再按映像路径结束本安装目录内的内核；安装前清 legacy resources；安装后清 portable marker；真卸载后清外置 helper');
   }
 }
 
@@ -1513,8 +1571,8 @@ function checkWindowsInstallerHooks(base) {
  * 2. 代码面不得出现 `$LOCALAPPDATA`。NSIS 把该常量在 **all 上下文**下映射到
  *    `CSIDL_COMMON_APPDATA`（实证 NSIS `Source/build.cpp` 的 `m_ShellConstants.add`）⇒ 在 all 上下文里
  *    写 `$LOCALAPPDATA\Polaris` 得到的是 `C:\ProgramData\Polaris`，正是 helper 的受保护目录。
- *    本文件**现在就有一段跑在 all 上下文里**（POSTUNINSTALL 的 `SetShellVarContext all`），
- *    按 per-user 直觉写这个常量，删掉的是 helper 而不是旧副本。
+ *    currentUser 当前不切到 all；仍禁止在此钩子消费该用户路径常量，以免未来改安装上下文时
+ *    按 per-user 直觉写的常量被解析为 helper 受保护目录。
  * 3. 代码面不得出现 `UninstallString`。读它只有一个用途 —— 去跑旧版自带的卸载器；而那个 exe 躺在
  *    用户可写目录里 ⇒ 以管理员身份执行一个攻击者可替换的二进制。
  *
@@ -1545,7 +1603,7 @@ function checkWindowsHookPrivilegeBoundary(source) {
     '!macro NSIS_HOOK_PREINSTALL',
     '!macro NSIS_HOOK_POSTINSTALL',
     '!macro NSIS_HOOK_POSTUNINSTALL',
-    'SetShellVarContext all',
+    'InitPluginsDir',
   ]) {
     if (!face.includes(anchor)) {
       fail(`nsis-hooks.nsh 提权边界门：代码面缺锚点 ${JSON.stringify(anchor)} —— 剥注释把代码也剥掉了，本门恒绿`);
@@ -1577,7 +1635,7 @@ function checkWindowsHookPrivilegeBoundary(source) {
   // ③ per-user 路径常量：all 上下文下 $LOCALAPPDATA 就是 ProgramData。
   if (face.includes('$LOCALAPPDATA')) {
     fail(
-      `nsis-hooks.nsh 提权边界门：代码面出现 $LOCALAPPDATA。本文件运行在 SetShellVarContext all 下，` +
+      `nsis-hooks.nsh 提权边界门：代码面出现 $LOCALAPPDATA。若安装上下文切到 all，` +
         `NSIS 把它映射到 CSIDL_COMMON_APPDATA ⇒ 取到的是 C:\\ProgramData（helper 的受保护目录），` +
         `不是用户的 %LOCALAPPDATA%。确需 per-user 路径的话要显式切上下文并在此登记理由。`
     );
@@ -1616,6 +1674,7 @@ function checkWindowsHookPrivilegeBoundary(source) {
  * 那里管**塞没塞进去**。
  */
 function checkMacOpenGuide() {
+  const errorsBefore = errors.length;
   const guidePath = join(ROOT, 'packaging', 'macos-dmg-open-guide.txt');
   if (!existsSync(guidePath)) {
     fail(`packaging/macos-dmg-open-guide.txt 不存在 —— dmg 内附引导那一步会直接失败`);
@@ -1683,7 +1742,55 @@ function checkMacOpenGuide() {
   if (verifyCount !== 2) {
     fail(`package.yml 的 app strict verify 应恰好 2 次（封印后 + 最终 dmg 开箱），实为 ${verifyCount} 次`);
   }
-  note('macOS dmg：首次打开引导一致，且最终 app bundle 已封印并经开箱 strict verify');
+  // 内核与 helper 在 Contents/Resources 下，bundle 封印不替它们各自的签名作证 ⇒ 逐个判定必须
+  // 两处都在：封印前（seal：内核只校验，helper 可补签）与最终 dmg 开箱（verify，只读）。seal 必须排在
+  // bundle 封印之前 —— 反过来的话 helper 补签改掉的字节会让刚封好的资源哈希失配。两处都必须把本腿的
+  // 源内核交给脚本：脚本据此断言包内内核与它逐字节相同（打包链没有改写内核）。脚本本体的控制流由
+  // `macos-nested-code.test.mjs` 持有。
+  const CORE_REF = 'core_ref="resources/${{ matrix.mac_arch_tag }}/sing-box"';
+  const NESTED_SEAL = 'bash scripts/macos-nested-code.sh seal "${apps[0]}" "$core_ref"';
+  const NESTED_VERIFY = 'if ! bash scripts/macos-nested-code.sh verify "${apps[0]}" "$core_ref"; then';
+  const nestedCalls = pkg.split('scripts/macos-nested-code.sh').length - 1;
+  const nestedSealCount = pkg.split(NESTED_SEAL).length - 1;
+  const nestedVerifyCount = pkg.split(NESTED_VERIFY).length - 1;
+  if (nestedSealCount !== 1) {
+    fail(`package.yml 封印前的内核/helper 逐个判定（seal，带源内核）应恰好 1 次，实为 ${nestedSealCount} 次`);
+  } else if (signCount === 1 && pkg.indexOf(NESTED_SEAL) > pkg.indexOf(SIGN)) {
+    fail('package.yml 的内核/helper 逐个判定（seal）排在 bundle 封印之后 —— helper 补签会让已封的资源哈希失配');
+  }
+  if (nestedVerifyCount !== 1) {
+    fail(`package.yml 最终 dmg 开箱的内核/helper 逐个判定（verify，带源内核）应恰好 1 次，实为 ${nestedVerifyCount} 次`);
+  } else if (signCount === 1 && pkg.indexOf(NESTED_VERIFY) < pkg.indexOf(SIGN)) {
+    fail('package.yml 的内核/helper 逐个判定（verify）排在 bundle 封印之前 —— 它验的不是最终产物');
+  }
+  // 不带源内核的第三种调用形态会绕开「逐字节相同」那条断言。
+  if (nestedCalls !== 2) {
+    fail(`package.yml 对 macos-nested-code.sh 的调用应恰好 2 处（seal + verify），实为 ${nestedCalls} 处`);
+  }
+  const coreRefCount = pkg.split(CORE_REF).length - 1;
+  if (coreRefCount !== 2) {
+    fail(`package.yml 应在封印与开箱两步各定义一次源内核路径 ${CORE_REF}，实为 ${coreRefCount} 次`);
+  }
+  // `mac_arch_tag` 被当成 resources 下的平台目录名用 ⇒ 它必须等于该腿登记的内核目录。
+  const macLegs = (parseMatrixInclude(pkg) ?? []).filter((leg) => String(leg.label).startsWith('macos-'));
+  if (macLegs.length === 0) {
+    fail('package.yml 的平台矩阵里一条 macOS 腿都没解析到 —— 源内核路径无从核对');
+  }
+  for (const leg of macLegs) {
+    if (leg.mac_arch_tag !== LABEL_TO_CORE[leg.label]) {
+      fail(
+        `package.yml matrix 腿 '${leg.label}' 的 mac_arch_tag=${JSON.stringify(leg.mac_arch_tag)} ` +
+          `≠ 内核目录 ${JSON.stringify(LABEL_TO_CORE[leg.label])} —— 逐个判定会拿错源内核`
+      );
+    }
+  }
+  if (!existsSync(join(ROOT, 'scripts/macos-nested-code.sh'))) {
+    fail('scripts/macos-nested-code.sh 不存在 —— package.yml 调用的逐个验签脚本缺失');
+  }
+  // 有违反就不打这句「成立」：否则失败输出里会并存一句字面为假的 ok。
+  if (errors.length === errorsBefore) {
+    note('macOS dmg：首次打开引导一致，最终 app bundle 已封印并经开箱 strict verify；包内内核/helper 封印前与开箱各逐个判定一次（内核只校验并与源内核逐字节比对）');
+  }
 }
 
 // ───────────────────────── 模式 2：构建产物载荷 ─────────────────────────
@@ -1714,6 +1821,12 @@ const PAYLOAD_FAMILIES = [
     consequence:
       '用户机器上 resolve_helper_binary → Err ⇒ 特权 helper 装不上（TUN / 路由 / DNS 接管整条不可用），' +
       'app 仍能启动，故不装 TUN 试一次发现不了',
+  },
+  {
+    what: 'polaris-cleaner',
+    names: new Set(['polaris-cleaner.exe']),
+    requiredLabels: new Set(['windows']),
+    consequence: 'Native helper removal / embedded NSIS fallback unavailable',
   },
   {
     what: 'Cronet sidecar',
@@ -1970,12 +2083,12 @@ function checkPayload(label, root) {
       // linuxdeploy 合法改写 rpath（本机 1-alpha-20251107-1 实测：helper 1222440B → 1230912B，
       // sha 变，**GNU Build ID 前后同值**）。故体积失配时，appimage 侧用 Build ID 作「合法改写」
       // 的豁免证据（同 ⇒ 绿）；任一侧读不出 Build ID 或不同 ⇒ 红。**不把 Build ID 当普适判据**：
-      // Linux sing-box 是随包原字节种子（postprocess 恢复 linuxdeploy 加工前的源），
+      // Linux sing-box 与 Cronet 是随包原字节种子（postprocess 恢复已核源），
       // 必须独立比 SHA/权限，不能用相同体积或 Build ID 豁免替代内容身份。
       // deb / staging / mac 腿：tauri-bundler 是纯 fs::copy（fs_utils.rs），恒比体积。
       for (const p of seen.get(expected) ?? []) {
         const coreManifest = family.what === 'sing-box' ? readJson(join(SRC_TAURI, 'core-manifest.json')) : undefined;
-        if (coreManifest && frozenSourceVersion(coreManifest)) {
+        if (coreManifest && (hasTemporaryDesktop(coreManifest) || Object.hasOwn(coreManifest, 'desktopRelease') || hasDesktopSource(coreManifest) || frozenSourceVersion(coreManifest))) {
           try { verifyPackagedSource(ROOT, coreManifest, expected, p); }
           catch (error) { fail(`${scope.name}: frozen source artifact/receipt mismatch: ${error.message}`); }
         } else if (label === 'windows' && family.what === 'sing-box') {
@@ -1984,12 +2097,30 @@ function checkPayload(label, root) {
             fail(`${scope.name}: Windows 修复核 SHA-256 与 manifest 不符：${p}`);
           }
         }
+        if (family.what === 'polaris-helper') {
+          try {
+            verifySelectedCoreManifest(dirname(p), srcDir, expected);
+            if (hasTemporaryDesktop(readJson(join(SRC_TAURI, 'core-manifest.json'))))
+              verifyCandidateAppCarrier(dirname(p), verifiedCandidateSource(ROOT), expected);
+          }
+          catch (error) { fail(`${scope.name}: compiled installation payload differs: ${error.message}`); }
+        }
         const src = join(srcDir, basename(p));
         if (!existsSync(src)) {
           fail(`${scope.name}: 产物里有 ${p}，但源 ${src} 不存在 —— 完整性无从比对（前置缺失判红，不跳过）`);
           continue;
         }
-        if (label === 'linux' && family.what === 'sing-box') {
+        if (family.what === 'Cronet sidecar') {
+          try {
+            const name = expected === 'linux' ? 'libcronet.so' : 'libcronet.dll';
+            if (basename(p) !== name) throw new Error(`wrong Cronet filename for ${expected}: ${basename(p)}`);
+            verifyCronetPayload(src, p, expected, readJson(join(SRC_TAURI, 'core-manifest.json')));
+          } catch (error) {
+            fail(`${scope.name}: Cronet source/final content or static ABI mismatch: ${error.message}`);
+          }
+          continue; // no size / GNU Build ID exemption for Cronet
+        }
+        if (label === 'linux' && ['sing-box', 'polaris-helper'].includes(family.what)) {
           if (!lstatSync(p).isFile() || !lstatSync(src).isFile()
               || createHash('sha256').update(readFileSync(p)).digest('hex') !== createHash('sha256').update(readFileSync(src)).digest('hex')
               || (lstatSync(p).mode & 0o7777) !== (lstatSync(src).mode & 0o7777)) {
@@ -2025,14 +2156,14 @@ function checkPayload(label, root) {
   if (trees.length > 0) {
     note(
       `payload：${label} → 产物验证，${scopes.map((s) => s.name).join(' + ')} 各自命中 ${expected} 的 ` +
-        `${payloadFamilies.map((f) => f.what).join(' + ')}（${label === 'linux' ? 'Linux 原核 SHA/权限一致；其余体积一致或 appimage ELF Build ID 豁免' : '体积与源一致'}）`
+        `${payloadFamilies.map((f) => f.what).join(' + ')}（${label === 'linux' ? 'Linux 原核及 Cronet 固定 SHA/权限、Cronet 静态 ABI 一致；其余体积一致或 appimage ELF Build ID 豁免' : label === 'windows' ? 'Cronet 固定 SHA/权限及静态 ABI 一致；其余体积一致' : '体积与源一致'}）`
     );
   } else {
     // 如实标注，不冒充产物验证：NSIS 把资源从**源路径**直接编进 .exe，bundle 侧没有可扫的副本，
     // 故这条腿只能证明「cargo 侧 staging 恰好只有本平台那几份且体积对」，证明不了安装器内容。
     note(
       `payload：${label} → **staging 检查**（不是产物验证）：扫的是 cargo build 铺的 ${root}/_up_/resources/，` +
-        `恰含 ${expected} 的 ${payloadFamilies.map((f) => f.what).join(' + ')} 且体积与源一致。` +
+        `恰含 ${expected} 的 ${payloadFamilies.map((f) => f.what).join(' + ')} 且 Cronet 固定 SHA/权限及静态 ABI 一致、其余体积与源一致。` +
         `NSIS 从源路径直接编译资源进 .exe，bundle 侧无副本可扫 ⇒ ` +
         `「安装器内容是否含这些二进制」在本仓无自动门，由 Windows 真机安装验证覆盖。`
     );
@@ -2093,24 +2224,24 @@ function checkLinuxAppImageRuntime(rootDir) {
  * 与 `crates/updater/src/github.rs::find_suitable_update_asset` 同口径（**大小写敏感**）。
  *
  * Windows 侧那个函数按形态分两条**互不相交**的规则，故这里也是两个函数，别只镜像一半：
- *  - [`updaterWindowsCandidates`] ← installed 形态（`.exe` 且名含 `win`）；
- *  - [`updaterPortableCandidates`] ← loose 形态（`polaris-portable-` 前缀 + `.zip`）。
+ *  - [`updaterWindowsCandidates`] ← installed 形态（`Polaris_版本_x64-win-setup.exe`）；
+ *  - [`updaterPortableCandidates`] ← loose 形态（`Polaris_` 前缀 + `_x64-win-Portable.zip` 后缀）。
  *
  * 只镜像 installed 那条正是本轮修掉的缺陷得以长期存活的原因之一：便携形态在 release 里
  * 有没有可选的产物，此前**没有任何断言按 updater 的口径**去问。
  */
 function updaterWindowsCandidates(names) {
-  return names.filter((n) => n.endsWith('.exe') && n.includes('win'));
+  return names.filter((n) => assetMatches(n, 'x64-win-setup.exe'));
 }
-/** loose（便携）形态的候选集 = `github.rs` 的 `PORTABLE_ZIP_PREFIX` + `.zip`，逐字同口径。 */
+/** loose（便携）形态的候选集 = `github.rs` 的 `PORTABLE_ZIP_SUFFIX`，逐字同口径。 */
 function updaterPortableCandidates(names) {
-  return names.filter((n) => n.startsWith('polaris-portable-') && n.endsWith('.zip'));
+  return names.filter((n) => assetMatches(n, 'x64-win-Portable.zip'));
 }
 function updaterMacCandidates(names, archTag) {
-  return names.filter((n) => n.includes(archTag) && n.endsWith('.dmg'));
+  return names.filter((n) => assetMatches(n, archTag === 'mac-arm64' ? 'aarch64-mac.dmg' : 'x64-mac.dmg'));
 }
 /**
- * Linux 两形态的候选集 = `github.rs` 的 Linux 分支（`app_image.first()` / `deb.first()`），逐字同口径。
+ * Linux 两形态的候选集与 `github.rs` 同口径：规范命名的 amd64 deb / AppImage。
  *
  * 抽成函数而不是内联过滤：内联过的地方有**四处**（per-job 体积门、release 体积门、release 命名断言、
  * per-job `linux` 命名分支的 deb / AppImage 两条），与 mac/win 靠共享函数自动跟随选包规则不同，
@@ -2118,7 +2249,7 @@ function updaterMacCandidates(names, archTag) {
  * @param {string[]} names @param {'.deb'|'.AppImage'} [ext] 只要某一形态时传，缺省两形态都算
  */
 function updaterLinuxCandidates(names, ext) {
-  return names.filter((n) => (ext ? n.endsWith(ext) : n.endsWith('.deb') || n.endsWith('.AppImage')));
+  return names.filter((n) => (ext ? assetMatches(n, `amd64-linux${ext}`) : assetMatches(n, 'amd64-linux.deb') || assetMatches(n, 'amd64-linux.AppImage')));
 }
 
 // ───────────── U2：updater 目标资产的体积门 ─────────────
@@ -2143,7 +2274,7 @@ function updaterLinuxCandidates(names, ext) {
  * | `*-mac-arm64.dmg` | 54,232,313（12 份留存里的最大值） | 51.72 | 本地 `/tmp/polaris-mac*` CI 产物 |
  * | `*-mac-x64.dmg`   | 51,102,510 | 48.73 | run 30990315709（记录在 vault `~/docs/polaris/design/polaris-windows-packaging-first-green-2026-08-05.md`，**不在本仓**） |
  * | `*-win-setup.exe` | 39,015,611 | 37.21 | run 31659532293 |
- * | `polaris-portable-*.zip` | 53,347,731 | 50.88 | run 31659532293 |
+ * | `Polaris_<版本>_x64-win-Portable.zip` | 53,347,731 | 50.88 | run 31659532293 |
  * | `*_amd64.deb`     | —（字节未记录） | 53.42 | run 32109475236 |
  *
  * 取 **200 MiB ≈ 实测最大值（122.58 MiB，linux AppImage）的 1.63 倍**：
@@ -2205,7 +2336,7 @@ const MEASURED_MAX_UPDATE_ASSET_BYTES = 128_530_936;
  *   （此前打在仓库根，本 job 量不到它，只有 tag 时的聚合口径量得到 —— 超限要等四条腿的构建
  *   成本全付完才发现）。射程里有它就必须有人保证它在场，故 windows 分支同时断言它恰有一个，
  *   否则体积门会变成一条恒为空的断言。
- * - `linux` 腿两形态都算：per-job 口径只断言「各至少一个」，故这里也不假设恰好一个。
+ * - `linux` 腿两形态都算：per-job 与聚合口径都要求各恰好一个。
  */
 function updaterTargetNames(label, names) {
   switch (label) {
@@ -2217,7 +2348,9 @@ function updaterTargetNames(label, names) {
     case 'linux':
       return updaterLinuxCandidates(names);
     case 'release':
+    case 'release-all':
       return [
+        ...(label === 'release-all' ? names.filter((n) => ['arm64-v8a', 'armeabi-v7a', 'universal'].some((abi) => assetMatches(n, `${abi}-android.apk`))) : []),
         ...updaterMacCandidates(names, 'mac-arm64'),
         ...updaterMacCandidates(names, 'mac-x64'),
         ...updaterWindowsCandidates(names),
@@ -2365,9 +2498,21 @@ function checkAssets(label, dir, namesOnly = false) {
   }
   // 命名契约按**文件名**判，体积/摘要两道内容门要按**路径**读 —— 故收全路径再投影出名字，
   // 而不是像原来那样只收名字（dist-release 下平铺与嵌套并存，名字回不去路径）。
-  const paths = walk2(abs);
+  // Linux passes the whole bundle directory, including deb/AppDir staging.
+  // Its dashboard assets are ten directories deep; share inventory's explicit
+  // budget and fail closed beyond it rather than truncating a legitimate caller.
+  const paths = walk2(abs, [], 0, 24);
   const names = paths.map((p) => basename(p));
   const pathOf = (n) => paths.find((p) => basename(p) === n);
+  // Pin version, spelling and inventory together; old-name copies and unregistered assets fail closed.
+  const version = JSON.parse(readFileSync(join(SRC_TAURI, 'tauri.conf.json'), 'utf8')).version;
+  const expected = assetNames(version, label);
+  const published = label.startsWith('release') ? names.filter((name) => name !== SHA256SUMS_NAME)
+    : names.filter((name) => /\.(?:exe|zip|dmg|deb|AppImage|apk)$/.test(name));
+  const missing = expected.filter((name) => !published.includes(name));
+  const extra = published.filter((name) => !expected.includes(name));
+  if (missing.length || extra.length) fail(`正式资产命名/集合不符：missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)}`);
+
   if (names.length === 0) {
     fail(`assets 模式：${abs} 下没有任何文件`);
     return;
@@ -2394,7 +2539,7 @@ function checkAssets(label, dir, namesOnly = false) {
     );
     return;
   }
-  if (label === 'release') {
+  if (label === 'release' || label === 'release-all') {
     const dupeAssets = dupesOf(names);
     if (dupeAssets.length > 0) {
       fail(
@@ -2409,7 +2554,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const cands = updaterWindowsCandidates(names);
     if (cands.length !== 1) {
       fail(
-        `Windows updater 契约：应恰有 1 个「.exe 且名含 win」的产物，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
+        `Windows updater 契约：应恰有 1 个「Polaris_版本_x64-win-setup.exe」的产物，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
           `  0 个 ⇒ find_suitable_update_asset 恒返回 None，用户永远收不到更新且静默；\n` +
           `  >1 个 ⇒ 选哪个取决于 release 资产顺序，不确定。\n` +
           `  全部产物：${JSON.stringify(names)}`
@@ -2427,7 +2572,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const portable = updaterPortableCandidates(names);
     if (portable.length !== 1) {
       fail(
-        `Windows updater 契约：dist-win/ 下 \`polaris-portable-*.zip\`（loose 形态唯一候选）应恰有 1 个，` +
+        `Windows updater 契约：dist-win/ 下 \`Polaris_<版本>_x64-win-Portable.zip\`（loose 形态唯一候选）应恰有 1 个，` +
           `实为 ${portable.length} 个 ${JSON.stringify(portable)}。\n` +
           `  0 个 ⇒ 便携产物没进本 job 的资产目录（多半是被打回仓库根）⇒ 本腿的体积门空转；\n` +
           `  >1 个 ⇒ updater 取首个命中，选谁取决于 release 资产顺序。\n` +
@@ -2440,7 +2585,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const cands = updaterMacCandidates(names, mine);
     if (cands.length !== 1) {
       fail(
-        `macOS updater 契约：应恰有 1 个名含 '${mine}' 的 .dmg，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
+        `macOS updater 契约：应恰有 1 个 '${mine === 'mac-arm64' ? 'aarch64-mac.dmg' : 'x64-mac.dmg'}' 后缀的产物，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
           `  0 个 ⇒ find_suitable_update_asset 对该架构恒返回 None，该架构用户永远收不到更新且静默\n` +
           `        （2026-07-21 起已取消「任意 .dmg」回落：宁可不更新，也不发错架构包）。\n` +
           `  >1 个 ⇒ 选哪个取决于 release 资产顺序，不确定。\n` +
@@ -2449,10 +2594,10 @@ function checkAssets(label, dir, namesOnly = false) {
     }
     const wrong = updaterMacCandidates(names, other);
     if (wrong.length !== 0) {
-      fail(`macOS updater 契约：本 job 不应产出名含 '${other}' 的 dmg，实为 ${JSON.stringify(wrong)}`);
+      fail(`macOS updater 契约：本 job 不应产出另一架构 '${other}' 的 dmg，实为 ${JSON.stringify(wrong)}`);
     }
     if (cands.length === 1 && wrong.length === 0) note(`assets：${label} → updater 唯一命中 '${cands[0]}'`);
-  } else if (label === 'release') {
+  } else if (label === 'release' || label === 'release-all') {
     // 本分支自己的错误计数起点：末尾那句 note 只能在**本分支**没报错时打。
     // 读模块全局 `errors.length === 0` 今天碰巧对（release 是最后一项），
     // 一旦有别的检查排在它前面就静默失效。
@@ -2465,7 +2610,7 @@ function checkAssets(label, dir, namesOnly = false) {
       const cands = updaterMacCandidates(names, archTag);
       if (cands.length !== 1) {
         fail(
-          `release 契约：名含 '${archTag}' 的 .dmg 应恰有 1 个，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
+          `release 契约：'${archTag === 'mac-arm64' ? 'aarch64-mac.dmg' : 'x64-mac.dmg'}' 后缀的产物应恰有 1 个，实为 ${cands.length} 个 ${JSON.stringify(cands)}。\n` +
             `  0 个 ⇒ 该架构用户 find_suitable_update_asset 恒 None，永远收不到更新且静默；\n` +
             `  >1 个 ⇒ updater 取首个命中，选谁取决于 release 资产顺序。`
         );
@@ -2474,7 +2619,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const win = updaterWindowsCandidates(names);
     if (win.length !== 1) {
       fail(
-        `release 契约：「.exe 且名含 win」应恰有 1 个，实为 ${win.length} 个 ${JSON.stringify(win)}。\n` +
+        `release 契约：「Polaris_版本_x64-win-setup.exe」应恰有 1 个，实为 ${win.length} 个 ${JSON.stringify(win)}。\n` +
           `  0 个 ⇒ Windows 安装态选不到更新；>1 个 ⇒ updater 取首个命中，选谁取决于资产顺序。`
       );
     } else if (!win[0].includes('setup')) {
@@ -2511,7 +2656,7 @@ function checkAssets(label, dir, namesOnly = false) {
     const portable = updaterPortableCandidates(names);
     if (portable.length !== 1) {
       fail(
-        `release 契约：\`polaris-portable-*.zip\`（免安装绿色版 = updater loose 形态的唯一候选）应恰有 1 个，` +
+        `release 契约：\`Polaris_<版本>_x64-win-Portable.zip\`（免安装绿色版 = updater loose 形态的唯一候选）应恰有 1 个，` +
           `实为 ${portable.length} 个 ${JSON.stringify(portable)}。\n` +
           `  0 个 ⇒ 便携用户恒收不到更新（github.rs 的 Windows loose 分支无回落，返回 None）；\n` +
           `  >1 个 ⇒ updater 取首个命中，选谁取决于 release 资产顺序。`
@@ -2556,37 +2701,33 @@ function checkAssets(label, dir, namesOnly = false) {
   // 摘要门只挂**聚合口径**：`SHA256SUMS` 是四个 job 的产物汇进 dist-release 之后才生成的
   // （一个 release 一份，按资产名索引），per-job 目录里结构性不存在它 —— 在那儿断言它必然恒红。
   // `--names-only` 下仍验它**在场**（那一层用空文件也判得了），只跳过内容比对。
-  if (label === 'release') checkSha256Sums(names, pathOf, namesOnly);
+  if (label === 'release' || label === 'release-all') checkSha256Sums(names, pathOf, namesOnly);
 }
 
-/**
- * 递归收集文件**全路径**（命名契约用 `basename` 投影，内容门直接拿路径读）。
- * 无名字过滤 —— 与 [`walk`]（按名字白名单收 6 个二进制）互补，inventory 模式要的正是全枚举。
- *
- * 🔴 **深度上限必须可调**：deb 的资源根在 bundle 根下第 6 层
- * （`deb/<pkg>/data/usr/lib/<Product>/`），再进 `_up_/resources/dashboard/assets/<file>` 就是第 11 层。
- * 旧写死的 `depth > 8` 对 assets 模式够用（那几个目录都很浅），换成清点整棵资源树就会**静默截断**——
- * 而截断的方向是「少看见文件」，正是白名单门最怕的假绿。故上限提到参数位，调用方按射程显式给。
- * 默认值保持 8：既有调用方（`checkAssets`）的行为一字不变。
- *
- * 🔴 **软链必须跟进**（与 [`walk`] 同一条教训，2026-08-05 mac CI 实证）：`Dirent.isDirectory()`
- * 对指向目录的软链恒为 false ⇒ 整棵子树被跳过。macOS 的 `.app` 里资源可能是软链，
- * 而「跳过一棵子树」在白名单门下就是「白名单外的东西没被看见」。改用 `statSync`（跟随软链）判类型，
- * 断链跳过（`statSync` 抛），环路由深度上限兜住。
+/** Full inventory walk: fail closed on incomplete traversal. Dirent avoids a stat
+ * for ordinary files; only directories and symlinks require identity/type lookup.
+ * Ancestor inode identities detect loops without hiding distinct alias paths.
  */
-function walk2(dir, out = [], depth = 0, maxDepth = 8) {
-  if (depth > maxDepth) return out;
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, e.name);
-    let st;
-    try {
-      st = statSync(full);
-    } catch {
-      continue; // 断链：不是文件也不是目录，两个模式都无从判定
+function walk2(dir, out = [], depth = 0, maxDepth = 8, ancestors = new Set()) {
+  if (depth > maxDepth) throw new InputError(`inventory depth limit ${maxDepth} exceeded: ${dir}`);
+  const identity = statSync(dir);
+  const key = `${identity.dev}:${identity.ino}`;
+  const canonical = realpathSync(dir);
+  if (ancestors.has(key) || ancestors.has(canonical)) throw new InputError(`inventory symlink cycle: ${dir}`);
+  ancestors.add(key);
+  ancestors.add(canonical);
+  try {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, e.name);
+      const st = e.isSymbolicLink() ? statSync(full) : e;
+      if (st.isDirectory()) walk2(full, out, depth + 1, maxDepth, ancestors);
+      else if (st.isFile()) out.push(full);
+      else throw new InputError(`inventory unsupported member: ${full}`);
     }
-    if (st.isDirectory()) walk2(full, out, depth + 1, maxDepth);
-    else if (st.isFile()) out.push(full);
-  }
+  } catch (error) {
+    if (error instanceof InputError) throw error;
+    throw new InputError(`inventory cannot enumerate ${dir}: ${error.message}`);
+  } finally { ancestors.delete(key); ancestors.delete(canonical); }
   return out;
 }
 
@@ -2739,9 +2880,10 @@ function expectedSrsCount() {
  *
  * `min`/`max` 是**份数**约束，只在 artifact/staging 清点里生效（`--static` 时源是工作树，
  * helper 由 CI 现编现铺、内核 gitignore 不入库，份数在那儿不可判定 ⇒ 显式跳过并标注，见 [`checkInventory`]）。
+ * 发布合同的 core-release 成员是已下载的精确输入，--static 同样逐项要求一份。
  * 它挡的是白名单门的经典假绿：**空目录也满足「没有多余文件」**。
  */
-function payloadAllowRules(label, coreDir, srsCount) {
+function payloadAllowRules(label, coreDir, srsCount, releaseContract, temporary = false) {
   const core = reQuote(coreDir);
   const rules = [
     {
@@ -2822,6 +2964,13 @@ function payloadAllowRules(label, coreDir, srsCount) {
       why: '特权 helper：缺了 resolve_helper_binary → Err ⇒ TUN / 路由 / DNS 接管整条不可用，而 app 照常启动（2026-08-10 出过三平台静默缺 helper 的货）。',
     },
     {
+      id: 'installed-core-manifest',
+      re: new RegExp(`^_up_/resources/${core}/core-manifest\\.json$`),
+      min: 1,
+      max: 1,
+      why: 'B2b/B3 本平台安装输入：严格内容 id、完整 core/sidecar 字节和实际 helper 哈希；helper 构建/签名后、App 编译前冻结。',
+    },
+    {
       id: 'main-binary',
       re: /^(polaris|Polaris)(\.exe)?$/,
       min: 0,
@@ -2836,6 +2985,15 @@ function payloadAllowRules(label, coreDir, srsCount) {
       why: 'macOS bundler 自己铺进 Contents/Resources/ 的 app 图标（来自 bundle.icon，不经 bundle.resources），只有 mac 那两棵树里有。',
     },
   ];
+  if (label === 'windows') {
+    rules.push({
+      id: 'native-cleaner',
+      re: /^_up_\/resources\/win\/polaris-cleaner\.exe$/,
+      min: 1,
+      max: 1,
+      why: 'Windows 固定 native cleaner：manager 卸载与 NSIS 嵌入 payload 同源，缺失时 helper 缺失/旧版的 UAC 卸载兜底无法完成；只允许这一精确文件，不放行其他 exe。',
+    });
+  }
   // Cronet 只随 linux/windows 出货（macOS 已静态集成）：mac 侧多一份 libcronet 就是纯死重，
   // 故那两个 label **不登记这条规则** ⇒ 真出现了会以「未登记」判红，而不是被一条宽规则放行。
   if (label === 'linux' || label === 'windows') {
@@ -2847,6 +3005,25 @@ function payloadAllowRules(label, coreDir, srsCount) {
       why: 'Naive/H3 出站的 Cronet 动态库，核在 initialize 阶段就要它、且必须与核同目录；缺了那两类节点直接起不来。',
     });
   }
+  if (temporary) rules.push({
+    id: 'temporary-app-carrier',
+    re: new RegExp(`^_up_/resources/${core}/candidate-carrier\\.json$`),
+    min: 1, max: 1,
+    why: 'Committed temporary default carrier receipt: exact source/App/run and actual helper/cleaner bytes, verified with the compiled core manifest before and after packaging.',
+  });
+  // Legal/source/provenance bytes retain their original reviewed archive paths.
+  // Temporary archives use direct members; historical releases keep core-release/.
+  // Neither branch grants a directory-wide exemption for arbitrary files.
+  const row = temporary ? releaseContract.platforms[coreDir] : undefined;
+  const members = temporary ? Object.keys(row.archive.members).sort()
+    .map((name) => name.slice(row.archive.root.length + 1))
+    .filter((name) => name !== row.core.member && name !== row.sidecar?.member)
+    : releaseContract ? releasePayloadMembers(releaseContract, coreDir) : [];
+  for (const member of members) rules.push({
+    id: `release-member:${member}`, re: new RegExp(`^${reQuote(`_up_/resources/${coreDir}/${member}`)}$`),
+    min: 1, max: 1, releaseMember: true,
+    why: '已验发布合同本平台 archive.members 中的许可、对应源码索引或原出处；必须按原路径随核分发。',
+  });
   return rules;
 }
 
@@ -2898,7 +3075,12 @@ function checkInventory(label, { root, isStatic }) {
     return;
   }
   const srs = expectedSrsCount(); // 读不出来会抛 InputError → 顶层转成一条可读的违反，不静默
-  const rules = payloadAllowRules(label, coreDir, srs.count);
+  const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'), '包内容清单缺少内核 manifest');
+  const temporary = hasTemporaryDesktop(manifest);
+  if (temporary) loadTemporaryDesktopSelection(ROOT, manifest);
+  const releaseContract = temporary ? loadCandidate(ROOT)
+    : hasDesktopRelease(manifest) ? loadReleaseContract(ROOT, manifest) : undefined;
+  const rules = payloadAllowRules(label, coreDir, srs.count, releaseContract, temporary);
 
   /** @type {{rel:string, abs:string, from?:string}[]} */
   let items = [];
@@ -3024,7 +3206,7 @@ function checkInventory(label, { root, isStatic }) {
   // 🔴 份数按**每棵资源树各自**算，不是全局汇总（同 payload 模式「每个 bundle target 各自命中」）：
   // linux 一次出 deb + appimage 两棵树，汇总口径下「deb 里 2 份内核 + appimage 里 0 份」= 2 份，
   // 与「各 1 份」在数上无法区分 —— 那正是「计数不等于位置」的原型。
-  const resTrees = [...new Set(items.map((it) => it.tree))].sort();
+  const resTrees = [...new Set([...(isStatic && releaseContract ? [`conf:${confName}`] : []), ...items.map((it) => it.tree)])].sort();
   // 两段拼 key 用 U+001F（单元分隔符）而不是裸 NUL：源码里出现裸 NUL 字节会让 grep / ripgrep
   // 把整个文件判成 binary 而「找不到也不报错」地跳过——
   // 任何以 grep 为基础的仓库级审计会静默漏掉本文件（打包判据的单点）。
@@ -3053,9 +3235,10 @@ function checkInventory(label, { root, isStatic }) {
     );
   }
 
-  if (enforceCounts) {
+  if (enforceCounts || releaseContract) {
     for (const t of resTrees) {
       for (const r of rules) {
+        if (!enforceCounts && !r.releaseMember) continue;
         const got = hitsOf.get(keyOf(t, r.id));
         if (got.length >= r.min && got.length <= r.max) continue;
         const want = r.min === r.max ? `恰 ${r.min}` : `${r.min}~${r.max === Infinity ? '不限' : r.max}`;
@@ -3082,7 +3265,7 @@ function checkInventory(label, { root, isStatic }) {
       (enforceCounts
         ? `，且份数在登记区间内（.srs 份数真值 ${srs.count} 取自 ${srs.where}：\`${srs.slice}\`）`
         : `。⚠️ 本模式**只判「多余」方向**：源是工作树，helper 由 CI 现编现铺、内核 gitignore 不入库，` +
-          `「份数够不够」在这里不可判定，由 payload / inventory --root 覆盖`) +
+          `「份数够不够」在这里不可判定，由 payload / inventory --root 覆盖；发布合同成员仍逐项要求恰1份`) +
       (isStatic ? '' : `；射程外（bundler/cargo 自己铺的、不由 bundle.resources 决定）${outOfScope} 个文件未清点`)
   );
 }
@@ -3104,6 +3287,21 @@ try {
 }
 
 function runMode() {
+  const manifest = readJson(join(SRC_TAURI, 'core-manifest.json'));
+  if (hasTemporaryDesktop(manifest)) {
+    try { loadTemporaryDesktopSelection(ROOT, manifest); }
+    catch (error) { fail(`Temporary desktop admission failed: ${error.message}`); return; }
+  } else if (hasDesktopRelease(manifest)) {
+    try { loadReleaseContract(ROOT, manifest); }
+    catch (error) { fail(`Desktop release admission failed: ${error.message}`); return; }
+  } else if (hasDesktopSource(manifest)) {
+    try {
+      for (const key of Object.keys(CORE_TO_CONF)) validateSourcePins(manifest, key, false);
+    } catch (error) {
+      fail(`Desktop source admission failed: ${error.message}`);
+      return; // Never enter a legacy/bytes-only branch after invalid D admission.
+    }
+  }
 switch (mode) {
   case 'confs':
     checkConfs();

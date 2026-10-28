@@ -242,7 +242,7 @@ export function Csel({
       }
       return;
     }
-    if (e.key === 'Escape') return; // Modal.onCancel 统一处理 ESC 链（避免双关）
+    if (e.key === 'Escape' && ctx) return; // Modal owns its native cancel event.
     // LOW-8：↑/↓ 跳过 disabled 选项，禁用行永不落为 active（否则 Enter 在其上是无声 no-op，体感卡死）。
     const { active: next, action } = cselKeyReduce(active, flat.length, e.key, (i) => flat[i]?.disabled === true);
     if (action === 'close-blur') {
@@ -251,7 +251,9 @@ export function Csel({
     }
     if (action === 'none') return;
     e.preventDefault();
-    if (action === 'move') {
+    if (action === 'close') {
+      closeMenu();
+    } else if (action === 'move') {
       setActive(next);
       // 落进折叠组 ⇒ 就地展开那一组。组头不在焦点链里（菜单一 Tab 就关），不展开的话折叠组里的
       // 选项对键盘用户是**不可达的死区** —— 折叠是给鼠标省滚动的，不该顺手把一批节点藏死。

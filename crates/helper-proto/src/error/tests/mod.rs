@@ -133,6 +133,7 @@ known_codes! {
     Start => "start",
     Dscacheutil => "dscacheutil",
     Ipconfig => "ipconfig",
+    DnsCache => "dns-cache",
     ResolvedDns => "resolved-dns",
     SystemProxy => "system-proxy",
     SetMetric => "set-metric",

@@ -664,9 +664,16 @@ const SITES: readonly ActionSite[] = [
   {
     file: 'mobile/forms/TsSettingsPanel.tsx',
     callee: 'api.server.tailscaleGetStatus',
+    count: 2,
+    route: 'no-staged-only-id',
+    why: '两处都不传实体 id（无参调用，拉的是整机 TS 状态快照，同 TsSettingsDialog）：出口候选拉取，以及登出前判断运行中的代理是否持有该节点',
+  },
+  {
+    file: 'mobile/forms/TsLoginPanel.tsx',
+    callee: 'api.server.tailscaleGetStatus',
     count: 1,
     route: 'no-staged-only-id',
-    why: '不传实体 id（无参调用，拉的是整机 TS 状态快照，同 TsSettingsDialog）',
+    why: '不传实体 id（无参调用，拉的是整机 TS 状态快照）：换号前判断运行中的代理是否持有该节点',
   },
   {
     file: 'mobile/forms/TsSettingsPanel.tsx',

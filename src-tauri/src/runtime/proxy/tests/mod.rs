@@ -1,3 +1,6 @@
+pub(crate) mod real_core_cleanup;
+use real_core_cleanup::RealCoreCleanupGuard;
+
 use super::core_log::*;
 use super::lifecycle::StopClaim;
 use super::*;
@@ -5,6 +8,18 @@ use super::*;
 // 导入即 `unused_imports`），故测试 prelude 直接 glob 这两个 owner 模块。
 use super::process_supervision::*;
 use super::recovery::*;
+
+/// Windows 上测试结束**自己起的**进程用（模拟核崩溃）。生产没有按 pid 结束进程的原语：清扫认的是
+/// 扫描时留住的句柄，这里也经它走。
+#[cfg(windows)]
+fn send_signal(pid: u32, signal: polaris_core_supervisor::Signal) {
+    if let Some(process) = polaris_core_supervisor::scan_running_cores()
+        .into_iter()
+        .find(|process| process.pid == pid)
+    {
+        NativeStaleCoreIo.end(&process, signal);
+    }
+}
 
 /// 🔴 **出口 IP 重探腿与 unlock 失效腿必须成对**——起核 / 停核 / 热切三点，一个都不许漏。
 ///
@@ -39,6 +54,7 @@ mod exit_ip_wiring_guard;
 mod android_probe_loan;
 mod android_takeover;
 mod core_log;
+mod exit_proxy_restore;
 mod hot_switch;
 mod lifecycle;
 mod login_fallback;
@@ -61,7 +77,7 @@ mod unlock_refresh;
 // 变成 `unused_imports`）。
 use super::network_monitor::*;
 use super::route_replan::*;
-use crate::test_support::{module_code, TestDir};
+use crate::test_support::{crate_file, module_code, repo_file, TestDir};
 // B6：`ts_exit` 域的自由项（`ts_exit_became_ready` / `ts_all_running` /
 // `log_ts_state_transitions` / `TsExitRecoverGuard`）随生产码搬进 `proxy::ts_exit`，
 // 顶部那条 `use super::*;` 只覆盖 façade ⇒ 子模块的 `pub(super)` 项要显式再引一次。
@@ -148,6 +164,23 @@ fn sweep_stale_test_dirs() {
 fn fresh_test_dir() -> TestDir {
     sweep_stale_test_dirs();
     TestDir::new(TEST_DIR_PREFIX)
+}
+
+pub(in crate::runtime::proxy) struct TestDnsFlushExec;
+
+impl polaris_system_integration::dns_flush::FlushExec for TestDnsFlushExec {
+    fn windows_flush(&self, _timeout: std::time::Duration) -> Result<(), String> {
+        Ok(())
+    }
+    fn exec(
+        &self,
+        _cmd: &polaris_system_integration::dns_flush::FlushCommand,
+        _timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        // Runtime behavior tests simulate a successful flush; command construction,
+        // rejection and failures are covered with injected execs in system-integration.
+        Ok(())
+    }
 }
 
 /// 系统代理清理收口 mock：只**记录调用次数**，不触碰宿主系统代理（本机硬约束：绝不真跑
@@ -255,13 +288,7 @@ fn test_runtime_with_clearer_on(
         platform,
     ));
     let mesh = Arc::new(MeshRuntime::new(dir.to_path_buf()));
-    let rt = Arc::new(ProxyRuntime::new(
-        config,
-        helper,
-        mesh,
-        clearer,
-        Arc::new(NoNetworkDoh),
-    ));
+    let rt = Arc::new(ProxyRuntime::new(config, helper, mesh, clearer));
     (rt, dir)
 }
 
@@ -275,17 +302,14 @@ fn test_runtime_in_on(dir: PathBuf, helper: HelperRuntime) -> Arc<ProxyRuntime> 
                 .to_string_lossy()
                 .into_owned(),
         ));
-    let rt = Arc::new(ProxyRuntime::new(
-        config,
-        helper,
-        mesh,
-        clearer,
-        Arc::new(NoNetworkDoh),
-    ));
+    let rt = Arc::new(ProxyRuntime::new(config, helper, mesh, clearer));
     assert!(rt.metadata_validation_admission.lock().unwrap().is_none());
     // This factory supplies no native core. Metadata calls own their admission fixture;
     // a supplied binary still selects the original native settlement/check path.
     *rt.metadata_validation_admission.lock().unwrap() = Some(Ok(()));
+    // 本工厂也没有受保护核目录可对账：经替身 helper 起核的用例关心的是 custody 与协议，
+    // 配套闸另有专门的用例（它们把这个桩清掉，走真对账）。
+    *rt.selected_core_ready_fixture.lock().unwrap() = Some(Ok(()));
     rt
 }
 
@@ -296,7 +320,7 @@ fn test_runtime() -> (Arc<ProxyRuntime>, TestDir) {
 
 /// 同 [`test_runtime`]，但收口器换成 [`RecordingClearer`] mock，额外返回其调用计数句柄——
 /// 用于断言「失败腿是否真调到了 ensure_cleared」。
-fn test_runtime_recording() -> (
+pub(crate) fn test_runtime_recording() -> (
     Arc<ProxyRuntime>,
     TestDir,
     Arc<std::sync::atomic::AtomicUsize>,
@@ -310,13 +334,7 @@ fn test_runtime_recording() -> (
         calls: Arc::clone(&calls),
     });
     (
-        Arc::new(ProxyRuntime::new(
-            config,
-            helper,
-            mesh,
-            clearer,
-            Arc::new(NoNetworkDoh),
-        )),
+        Arc::new(ProxyRuntime::new(config, helper, mesh, clearer)),
         dir,
         calls,
     )
@@ -441,13 +459,7 @@ fn test_runtime_installed_helper(
                 .to_string_lossy()
                 .into_owned(),
         ));
-    let rt = Arc::new(ProxyRuntime::new(
-        config,
-        helper,
-        mesh,
-        clearer,
-        Arc::new(NoNetworkDoh),
-    ));
+    let rt = Arc::new(ProxyRuntime::new(config, helper, mesh, clearer));
     let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     rt.set_error_emitter(Box::new(RecordingErrorEmitter {
         helper_upgrade_prompts: Arc::clone(&prompts),
@@ -491,17 +503,14 @@ fn bad_config() -> Value {
 /// 立退型假核则让闸门收到一个假的「配置无效」。二者都不是被测行为，是假核没跟上真核的契约。
 #[cfg(unix)]
 fn write_fake_core(dir: &std::path::Path, name: &str, run_body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join(name);
     // 按**整条 argv** 找 `check`，不按位置：闸门发的是 `--disable-color check -c <path>`
     // （`check` 在 `$2`），而 spawn 发的是 `run -c <path>`。写死 `$1` 会漏掉前者（实测：漏了就等于
     // 假核对 check 走 run 的语义，常驻型假核把闸门吊到超时）。
-    std::fs::write(
+    crate::test_support::write_executable_stand_in(
         &p,
         format!("#!/bin/sh\ncase \" $* \" in *\" check \"*) exit 0;; esac\n{run_body}\n"),
-    )
-    .unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     p
 }
 
@@ -566,7 +575,139 @@ fn local_only_config(mixed: u16) -> Value {
     })
 }
 
-fn require_core() -> PathBuf {
+fn candidate_real_core_selection(
+    mode: Option<&std::ffi::OsStr>,
+    path_override: Option<&std::ffi::OsStr>,
+) -> Result<bool, &'static str> {
+    match mode {
+        None => Ok(false),
+        Some(value) if value == "1" && path_override.is_none() => Ok(true),
+        Some(_) => Err("candidate real-core tests require explicit mode and no path override"),
+    }
+}
+
+#[test]
+fn candidate_real_core_selection_rejects_wrong_mode_and_any_override() {
+    use std::ffi::OsStr;
+    assert_eq!(candidate_real_core_selection(None, None), Ok(false));
+    assert_eq!(
+        candidate_real_core_selection(None, Some(OsStr::new("fixture"))),
+        Ok(false)
+    );
+    assert_eq!(
+        candidate_real_core_selection(Some(OsStr::new("1")), None),
+        Ok(true)
+    );
+    for invalid in ["", "0", "true"] {
+        assert!(candidate_real_core_selection(Some(OsStr::new(invalid)), None).is_err());
+    }
+    for path in ["", "original-candidate", "other-core"] {
+        assert!(
+            candidate_real_core_selection(Some(OsStr::new("1")), Some(OsStr::new(path))).is_err()
+        );
+    }
+}
+
+fn committed_real_core_default(manifest: &Value, contract_bytes: &str) -> bool {
+    if manifest.get("desktopTemporary").is_some() {
+        assert!(
+            manifest.get("desktopRelease").is_none(),
+            "exclusive desktop selection required"
+        );
+        return true;
+    }
+    let Some(selection) = manifest.get("desktopRelease") else {
+        return false;
+    };
+    let contract: Value = serde_json::from_str(contract_bytes).expect("committed release contract");
+    if contract["schema"] != "polaris-upstream-native-release-consumer-v1" {
+        return false;
+    }
+    // Full contract/installation validation belongs to build.rs and the normal
+    // compiled carrier resolver. This selector binds the same original bytes.
+    assert_eq!(
+        selection["contractPath"],
+        "scripts/desktop-core/release-contract.json"
+    );
+    assert_eq!(
+        selection["contractSha256"],
+        polaris_updater::sha256_hex(contract_bytes.as_bytes())
+    );
+    true
+}
+
+#[test]
+fn committed_real_core_default_requires_exact_upstream_bytes() {
+    let contract = r#"{"schema":"polaris-upstream-native-release-consumer-v1"}"#;
+    let mut manifest = serde_json::json!({"desktopRelease": {
+        "contractPath": "scripts/desktop-core/release-contract.json",
+        "contractSha256": polaris_updater::sha256_hex(contract.as_bytes())
+    }});
+    assert!(committed_real_core_default(&manifest, contract));
+    assert!(!committed_real_core_default(
+        &manifest,
+        r#"{"schema":"polaris-box-release-consumer-contract-v1"}"#
+    ));
+    assert!(!committed_real_core_default(
+        &serde_json::json!({}),
+        contract
+    ));
+    assert!(committed_real_core_default(
+        &serde_json::json!({"desktopTemporary": {}}),
+        contract
+    ));
+    manifest["desktopRelease"]["contractSha256"] = "wrong".into();
+    assert!(std::panic::catch_unwind(|| committed_real_core_default(&manifest, contract)).is_err());
+}
+
+pub(crate) fn require_core() -> PathBuf {
+    let explicit = std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE");
+    let manifest = serde_json::from_str::<Value>(&crate_file("core-manifest.json"))
+        .expect("committed core selection");
+    let committed_default = committed_real_core_default(
+        &manifest,
+        &repo_file("scripts/desktop-core/release-contract.json"),
+    );
+    let selected = explicit
+        .as_deref()
+        .or_else(|| committed_default.then_some(std::ffi::OsStr::new("1")));
+    let candidate = candidate_real_core_selection(
+        selected,
+        std::env::var_os("POLARIS_SINGBOX_PATH").as_deref(),
+    )
+    .expect("invalid real-core test selection");
+    if candidate {
+        // Run the same compiled carrier resolver/content verifier as normal App
+        // selection, then use the existing per-instance test spawn admission.
+        // No global test fallback is enabled and no runtime path is injected by env.
+        let path = resolve_core_binary().expect("compiled candidate carrier must resolve");
+        let platform = crate::runtime::core_identity::current_platform().unwrap();
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(if explicit.is_some() {
+                "../resources/.native-dns-app"
+            } else {
+                "../resources"
+            })
+            .join(platform)
+            .join(if platform == "win" {
+                "sing-box.exe"
+            } else {
+                "sing-box"
+            });
+        assert_eq!(
+            path, expected,
+            "candidate lifecycle must use the compiled carrier"
+        );
+        println!(
+            "[candidate bundled core] path={} core_id={} source={}",
+            path.display(),
+            crate::runtime::core_identity::selected_id(platform)
+                .unwrap()
+                .as_str(),
+            crate::runtime::core_identity::selected_source_commit(platform).unwrap()
+        );
+        return path;
+    }
     let path = PathBuf::from(std::env::var("POLARIS_SINGBOX_PATH").expect(
         "真机验证需 POLARIS_SINGBOX_PATH 指向真实 sing-box 二进制（前置缺失即失败，不静默跳过）",
     ));
@@ -578,7 +719,8 @@ fn require_core() -> PathBuf {
     path
 }
 
-/// 真核测试专用 runtime：环境变量只负责显式选择文件，真正的 spawn 权限仍按实例注入。
+/// Candidate tests resolve the compiled carrier; historical opt-in tests retain
+/// their explicit path override. Both keep the existing per-instance spawn gate.
 fn real_core_runtime() -> (Arc<ProxyRuntime>, TestDir, PathBuf) {
     let core = require_core();
     let (rt, dir) = test_runtime();
@@ -590,33 +732,10 @@ async fn lock_real_core_tests() -> tokio::sync::MutexGuard<'static, ()> {
     crate::runtime::REAL_CORE_TEST_LOCK.lock().await
 }
 
-/// `ps -p <pid>` 实证进程存在（不信 status 自述，走系统 ground truth）。
-fn ps_alive(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .output()
-        .map(|o| {
-            o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
-        })
-        .unwrap_or(false)
-}
-
-/// 系统内 sing-box 进程数（孤儿检测）。
-///
-/// 用 `pgrep -x`（**精确进程名**）而非 `ps | grep 'sing-box run'`：后者会把「命令行里含该字面量」
-/// 的 shell/测试进程本身算进去 —— 我在人工核对时就被这个假计数骗过一次（报 3 实为 0）。
-fn singbox_proc_count() -> usize {
-    std::process::Command::new("pgrep")
-        .args(["-x", "sing-box"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .count()
-        })
-        .unwrap_or(0)
-}
+// Both observers fail the test on unavailable or malformed OS evidence. Windows
+// uses native process handles/snapshots; no POSIX tools or runtime status claims.
+mod process_observation;
+use process_observation::{ps_alive, singbox_proc_count};
 
 /// 等 pid 变化（去抖重启 ~1.5s + 起核就绪）。返回新 pid（超时返 None）。
 async fn wait_pid_change(rt: &Arc<ProxyRuntime>, old_pid: u32, secs: u64) -> Option<u32> {
@@ -699,6 +818,7 @@ type ExitBlockedMarks = Arc<Mutex<Vec<String>>>;
 struct RecordingErrorEmitter {
     events: ErrorEvents,
     error_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    coex_hook: Option<Arc<dyn Fn(Value) + Send + Sync>>,
     invalid_frames: InvalidNodeFrames,
     residual: ResidualEvents,
     ts_status: TsStatusEvents,
@@ -706,6 +826,7 @@ struct RecordingErrorEmitter {
     openvpn_status: OpenVpnStatusEvents,
     mesh_login_fallback: MeshLoginFallbackEvents,
     auto_node_switched: AutoNodeSwitchedEvents,
+    auto_select_status: Arc<Mutex<Vec<Value>>>,
     config_changed: Arc<std::sync::atomic::AtomicUsize>,
     unlock_invalidations: UnlockInvalidations,
     exit_ip_refreshes: ExitIpRefreshes,
@@ -775,6 +896,9 @@ impl ProxyErrorEmitter for RecordingErrorEmitter {
             .unwrap()
             .push(payload.clone());
     }
+    fn emit_auto_select_status(&self, status: &Value) {
+        self.auto_select_status.lock().unwrap().push(status.clone());
+    }
     fn emit_config_changed(&self) {
         self.config_changed.fetch_add(1, Ordering::SeqCst);
     }
@@ -805,6 +929,11 @@ impl ProxyErrorEmitter for RecordingErrorEmitter {
     }
     fn emit_lifecycle(&self, event: &ProxyLifecycleEvent) {
         self.lifecycle.lock().unwrap().push(event.clone());
+    }
+    fn emit_coex_state(&self, state: Value) {
+        if let Some(hook) = &self.coex_hook {
+            hook(state);
+        }
     }
     fn emit_network_profile_match_changed(&self) {
         self.network_match_changed.fetch_add(1, Ordering::SeqCst);
@@ -1049,13 +1178,7 @@ fn test_runtime_recording_full(
     let config = Arc::new(ConfigManager::new(dir.clone()));
     let helper = Arc::new(HelperRuntime::never_installed_for_tests(dir.clone()));
     let mesh = Arc::new(MeshRuntime::new(dir.clone()));
-    let rt = Arc::new(ProxyRuntime::new(
-        config,
-        helper,
-        mesh,
-        clearer,
-        Arc::new(NoNetworkDoh),
-    ));
+    let rt = Arc::new(ProxyRuntime::new(config, helper, mesh, clearer));
     let invalid_frames: InvalidNodeFrames = Arc::new(Mutex::new(Vec::new()));
     let residual: ResidualEvents = Arc::new(Mutex::new(Vec::new()));
     rt.set_error_emitter(Box::new(RecordingErrorEmitter {
@@ -1075,13 +1198,7 @@ fn test_runtime_errors_with_clearer(
     let config = Arc::new(ConfigManager::new(dir.clone()));
     let helper = Arc::new(HelperRuntime::never_installed_for_tests(dir.clone()));
     let mesh = Arc::new(MeshRuntime::new(dir.clone()));
-    let rt = Arc::new(ProxyRuntime::new(
-        config,
-        helper,
-        mesh,
-        clearer,
-        Arc::new(NoNetworkDoh),
-    ));
+    let rt = Arc::new(ProxyRuntime::new(config, helper, mesh, clearer));
     let events: ErrorEvents = Arc::new(Mutex::new(Vec::new()));
     rt.set_error_emitter(Box::new(RecordingErrorEmitter {
         events: Arc::clone(&events),
@@ -1112,10 +1229,9 @@ fn flush_ready_runtime() -> (Arc<ProxyRuntime>, TestDir, u64) {
 /// 「第一次 vs 之后」靠**落盘 marker** 记状态：闸门每轮都是一个**全新子进程**，进程内变量存不住。
 #[cfg(unix)]
 fn write_fake_checking_core(dir: &std::path::Path, reject_index: usize) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let p = dir.join("fake-checking-sing-box");
     let marker = dir.join("gate-check-seen").to_string_lossy().into_owned();
-    std::fs::write(
+    crate::test_support::write_executable_stand_in(
         &p,
         format!(
             "#!/bin/sh\ncase \" $* \" in *\" check \"*)\n\
@@ -1125,19 +1241,16 @@ fn write_fake_checking_core(dir: &std::path::Path, reject_index: usize) -> PathB
                  unknown outbound type: zzz' >&2\n\
                  exit 1;;\nesac\nexit 1\n"
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     p
 }
 
 /// 恒接受 `check` 的假核，并把真实进程启动次数累计到文件。
 #[cfg(unix)]
 fn write_fake_accepting_core(dir: &std::path::Path) -> (PathBuf, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
     let binary = dir.join("fake-accepting-sing-box");
     let counter = dir.join("gate-check-count");
-    std::fs::write(
+    crate::test_support::write_executable_stand_in(
         &binary,
         format!(
             "#!/bin/sh\ncase \" $* \" in *\" check \"*)\n\
@@ -1145,8 +1258,98 @@ fn write_fake_accepting_core(dir: &std::path::Path) -> (PathBuf, PathBuf) {
                  n=$((n + 1))\nprintf '%s\\n' \"$n\" > {counter}\nexit 0;;\nesac\nexit 1\n",
             counter = counter.to_string_lossy()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     (binary, counter)
+}
+
+/// Real DNS controller + durable temp marker, injected only at the OS-operation boundary.
+/// Used by proxy and the actual desktop ExitCleanupState preparation regressions.
+pub(crate) struct DnsRecoveryFixture {
+    pub fail_restore: Arc<AtomicBool>,
+    pub marker: PathBuf,
+    pub original_marker: Vec<u8>,
+    pub writes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(crate) fn install_dns_recovery_fixture(rt: &ProxyRuntime) -> DnsRecoveryFixture {
+    use polaris_system_integration::dns_ops::{DnsMarker, SystemDnsController, SystemDnsOps};
+    struct DnsOps {
+        fail: Arc<AtomicBool>,
+        state: Mutex<Vec<String>>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl SystemDnsOps for DnsOps {
+        fn takeover_supported(&self) -> bool {
+            true
+        }
+        fn list_targets(
+            &self,
+        ) -> Result<Vec<String>, polaris_system_integration::error::SystemIntegrationError>
+        {
+            Ok(vec!["fixture-service".into()])
+        }
+        fn read_dns(
+            &self,
+            _: &str,
+        ) -> Result<Vec<String>, polaris_system_integration::error::SystemIntegrationError>
+        {
+            Ok(self.state.lock().unwrap().clone())
+        }
+        fn read_effective_resolvers(
+            &self,
+        ) -> Result<Vec<String>, polaris_system_integration::error::SystemIntegrationError>
+        {
+            Ok(self.state.lock().unwrap().clone())
+        }
+        fn apply_dns(
+            &self,
+            _: &str,
+            ips: &[String],
+        ) -> Result<(), polaris_system_integration::error::SystemIntegrationError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) && ips == ["192.0.2.53".to_owned()] {
+                return Err(
+                    polaris_system_integration::error::SystemIntegrationError::dns(
+                        "injected restore failure",
+                    ),
+                );
+            }
+            *self.state.lock().unwrap() = ips.to_vec();
+            Ok(())
+        }
+    }
+    let fail_restore = Arc::new(AtomicBool::new(true));
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let marker = rt.config.dir().join("system-dns.marker.json");
+    let mut controller = SystemDnsController::new(
+        DnsOps {
+            fail: Arc::clone(&fail_restore),
+            state: Mutex::new(vec!["192.0.2.53".into()]),
+            writes: Arc::clone(&writes),
+        },
+        DnsMarker::new(
+            polaris_system_integration::StdMarkerFs,
+            marker.to_string_lossy().into_owned(),
+        ),
+    );
+    controller.set_dns();
+    let original_marker = std::fs::read(&marker).unwrap();
+    let controller = Arc::new(Mutex::new(controller));
+    rt.set_test_dns_restore(Arc::new(move || {
+        let mut controller = controller
+            .lock()
+            .map_err(|_| "fixture DNS controller poisoned")?;
+        controller.restore_dns();
+        if controller.has_marker() {
+            Err("DNS restoration retained its original marker".into())
+        } else {
+            Ok(())
+        }
+    }));
+    DnsRecoveryFixture {
+        fail_restore,
+        marker,
+        original_marker,
+        writes,
+    }
 }

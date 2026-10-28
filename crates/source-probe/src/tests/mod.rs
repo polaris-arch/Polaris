@@ -836,3 +836,37 @@ fn the_scan_surface_includes_the_module_root_file() {
         "`mod.rs` 被收了两遍 —— 计数型断言会因此翻倍"
     );
 }
+
+mod audit_regressions;
+
+#[test]
+fn downloaded_core_legal_boundary_is_exact_and_keeps_app_resources_in_scope() {
+    for platform in ["linux", "win", "mac-x64", "mac-arm64"] {
+        assert!(is_downloaded_core_legal_root(&format!(
+            "resources/{platform}/core-release/licenses"
+        )));
+        for relative in [
+            format!("resources/{platform}"),
+            format!("resources/{platform}/core-release"),
+            format!("resources/{platform}/core-release/licenses-extra"),
+            format!("resources/{platform}/core-release/licenses.rs"),
+            format!("resources/{platform}/core-release/licenses/project.kt"),
+            format!("resources/{platform}/core-release/src"),
+            format!("resources/{platform}/licenses"),
+        ] {
+            assert!(!is_downloaded_core_legal_root(&relative), "{relative}");
+        }
+    }
+    for relative in [
+        "resources/unknown/core-release/licenses",
+        "resources/android/core-release/licenses",
+        "resources/core-release/licenses",
+        "src-tauri/src/resources/win/core-release/licenses",
+        "resources/win/core-release/licenses/../src",
+        "resources/win/core-release/licenses/",
+        "Resources/win/core-release/licenses",
+        "resources",
+    ] {
+        assert!(!is_downloaded_core_legal_root(relative), "{relative}");
+    }
+}

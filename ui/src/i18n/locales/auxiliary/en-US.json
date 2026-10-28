@@ -21,7 +21,6 @@
     "noEffectInDirect": "No effect in Direct",
     "groupManual": "Manual Nodes",
     "groupMesh": "Mesh",
-    "timeout": "timeout",
     "cancelStartup": "Cancel startup",
     "disconnect": "Disconnect",
     "connect": "Connect",
@@ -71,7 +70,6 @@
     "errDigestFieldInvalid": "The release digest field is malformed (publisher issue; retrying will not help)",
     "errCacheDirFailed": "Failed to create the update cache directory",
     "errDownloadFailed": "Failed to download the update package",
-    "errBackendUnavailable": "The download backend is unavailable",
     "errDownloadTaskFailed": "The download task terminated abnormally",
     "errSizeMismatch": "Package size does not match the release manifest (possibly truncated or tampered)",
     "errDigestHexInvalid": "The release sha256 digest is not valid hex (publisher issue; retrying will not help)",
@@ -91,7 +89,6 @@
     "logFileType": "Log File",
     "configPickTitle": "Select Configuration File",
     "configFileType": "Configuration File",
-    "corePickTitle": "Select the sing-box core executable",
     "taildropSaveTitle": "Save Received File",
     "taildropSendTitle": "Choose Files to Send",
     "allFiles": "All Files",
@@ -119,6 +116,9 @@
     "debugReportBusy": "Preparing report…",
     "debugReportHint": "Includes device details, recent logs, and redacted configuration. Review before sharing.",
     "debugReportDone": "Share sheet opened. Choose a recipient.",
-    "debugReportFailed": "Could not prepare or share the report. Retry or collect logs via ADB."
+    "debugReportFailed": "Could not prepare or share the report. Retry or collect logs via ADB.",
+    "sessionProxyPending": "System proxy restoration is unconfirmed. Cancel shutdown and retry exiting Polaris to avoid connection problems.",
+    "sessionCancelled": "Shutdown was cancelled. The proxy has stopped; you can reconnect when needed.",
+    "sessionCancelFailed": "Shutdown was cancelled, but proxy shutdown is unconfirmed. Retry stopping the proxy in Polaris."
   }
 }

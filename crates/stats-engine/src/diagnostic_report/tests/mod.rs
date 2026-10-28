@@ -546,3 +546,184 @@ fn 组合面_空配置不panic() {
     let md = assemble_diagnostic_report(&src);
     assert!(md.contains("# Polaris 诊断报告"));
 }
+
+#[test]
+fn assembly_redacts_native_vpn_credentials_from_typed_user_and_real_endpoint_builder() {
+    use polaris_config_engine::builder::endpoints::build_vpn_client_endpoint;
+    use polaris_config_engine::user_config::server_config::{Protocol, ServerConfig};
+    use polaris_config_engine::user_config::UserConfig;
+
+    // 走实际 UserConfig serde 和生成入口，不用手造 generated JSON 来掩盖字段拼写/层级漂移。
+    let user = UserConfig {
+        servers: vec![
+            ServerConfig {
+                id: "ov-tls".into(),
+                name: "OpenVPN TLS".into(),
+                protocol: Protocol::OpenvpnClient,
+                address: "ov.example".into(),
+                port: 1194,
+                openvpn_client_settings: Some(Box::new(serde_json::from_value(json!({
+                    "server": "ov.example", "server_port": 1194,
+                    "tls": {
+                        "client_key": ["-----BEGIN PRIVATE KEY-----", "OV_CLIENT_KEY_BODY", "-----END PRIVATE KEY-----"],
+                        "certificate": ["-----BEGIN CERTIFICATE-----", "PUBLIC_OV_CA", "-----END CERTIFICATE-----"],
+                        "client_certificate": ["-----BEGIN CERTIFICATE-----", "PUBLIC_OV_CLIENT", "-----END CERTIFICATE-----"],
+                        "control_wrap": {"type": "tls_crypt", "key": ["OV_CONTROL_WRAP_BODY"]}
+                    }
+                })).unwrap())),
+                ..Default::default()
+            },
+            ServerConfig {
+                id: "ov-static".into(),
+                name: "OpenVPN Static".into(),
+                protocol: Protocol::OpenvpnClient,
+                address: "static.example".into(),
+                port: 1194,
+                openvpn_client_settings: Some(Box::new(serde_json::from_value(json!({
+                    "server": "static.example", "server_port": 1194,
+                    "mode": "static_key", "static_key": ["OV_STATIC_KEY_BODY"],
+                    "cipher": "AES-128-CBC", "auth": "SHA256"
+                })).unwrap())),
+                ..Default::default()
+            },
+            ServerConfig {
+                id: "oc".into(),
+                name: "OpenConnect VPN".into(),
+                protocol: Protocol::Openconnect,
+                address: "oc.example".into(),
+                port: 443,
+                openconnect_settings: Some(Box::new(serde_json::from_value(json!({
+                    "server": "oc.example:443", "flavor": "anyconnect", "password": "OC_PASSWORD",
+                    "cookie": "OC_COOKIE", "token": {"mode": "totp", "secret": "OC_TOKEN"},
+                    "form_entries": [{"form_id": "login", "name": "vendor_secret", "value": "OC_FORM_SECRET"}],
+                    "tls": {
+                        "client_key": "-----BEGIN RSA PRIVATE KEY-----\nOC_CLIENT_KEY_BODY\n-----END RSA PRIVATE KEY-----",
+                        "client_key_password": "OC_CLIENT_PASSPHRASE",
+                        "mca_key": "OC_MCA_KEY", "mca_key_password": "OC_MCA_PASSPHRASE",
+                        "certificate_authority": "PUBLIC_OC_CA", "client_certificate": "PUBLIC_OC_CLIENT",
+                        "mca_certificate": "PUBLIC_OC_MCA", "peer_fingerprint": "PUBLIC_FINGERPRINT"
+                    }
+                })).unwrap())),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let endpoints: Vec<Value> = user
+        .servers
+        .iter()
+        .map(|server| {
+            serde_json::to_value(build_vpn_client_endpoint(server, &server.id, None).unwrap())
+                .unwrap()
+        })
+        .collect();
+    let raw_user = serde_json::to_value(&user).unwrap();
+    let raw_generated = json!({"endpoints": endpoints, "public_key": "PUBLIC_KEY_CONTROL", "key": "ORDINARY_KEY_CONTROL"});
+    // 确认夹具确实把原生材料带进两种配置；若生产 builder 停止下发，测试也不会假绿。
+    for raw in [&raw_user, &raw_generated] {
+        let text = raw.to_string();
+        for secret in [
+            "OV_CLIENT_KEY_BODY",
+            "OV_CONTROL_WRAP_BODY",
+            "OV_STATIC_KEY_BODY",
+            "OC_CLIENT_KEY_BODY",
+            "OC_MCA_KEY",
+            "OC_COOKIE",
+            "OC_FORM_SECRET",
+        ] {
+            assert!(text.contains(secret), "fixture missing {secret}");
+        }
+    }
+    let report = assemble_diagnostic_report(&DiagnosticReportSource {
+        user_config: raw_user,
+        singbox_config: raw_generated,
+        ..Default::default()
+    });
+    for secret in [
+        "OV_CLIENT_KEY_BODY",
+        "OV_CONTROL_WRAP_BODY",
+        "OV_STATIC_KEY_BODY",
+        "OC_PASSWORD",
+        "OC_COOKIE",
+        "OC_TOKEN",
+        "OC_FORM_SECRET",
+        "OC_CLIENT_KEY_BODY",
+        "OC_CLIENT_PASSPHRASE",
+        "OC_MCA_KEY",
+        "OC_MCA_PASSPHRASE",
+    ] {
+        assert!(!report.contains(secret), "diagnostic leak: {secret}");
+    }
+    for public in [
+        "PUBLIC_OV_CA",
+        "PUBLIC_OV_CLIENT",
+        "PUBLIC_OC_CA",
+        "PUBLIC_OC_CLIENT",
+        "PUBLIC_OC_MCA",
+        "PUBLIC_FINGERPRINT",
+    ] {
+        assert_eq!(
+            report.matches(public).count(),
+            2,
+            "public certificate must survive in both sections: {public}"
+        );
+    }
+    for useful in [
+        "PUBLIC_KEY_CONTROL",
+        "ORDINARY_KEY_CONTROL",
+        "tls_crypt",
+        "AES-128-CBC",
+        "SHA256",
+        "anyconnect",
+    ] {
+        assert!(
+            report.contains(useful),
+            "diagnostic signal disappeared: {useful}"
+        );
+    }
+}
+
+#[test]
+fn assembly_keeps_redacting_identity_when_unrelated_unicode_changes_folded_length() {
+    let report = assemble_diagnostic_report(&DiagnosticReportSource {
+        app: AppSection {
+            os: "İİ device K".into(),
+            ..Default::default()
+        },
+        user_config: json!({"servers": [{"address": "a.com", "name": "İstanbul 节点"}]}),
+        singbox_config: json!({"outbounds": [{"server": "a.com"}]}),
+        app_log_tail: "İ dial A.COM via İSTANBUL 节点 K".into(),
+        singbox_log_tail: "peer a.com:443".into(),
+        ..Default::default()
+    });
+    for identity in ["a.com", "A.COM", "İstanbul 节点", "İSTANBUL 节点"] {
+        assert!(!report.contains(identity), "identity leak: {identity}");
+    }
+    assert!(report.contains("İİ device K"));
+    assert_eq!(report.matches("<domain-1>").count(), 4);
+    assert_eq!(report.matches("<node-1>").count(), 2);
+}
+
+#[test]
+fn assembly_redacts_greek_final_sigma_variants_in_both_directions() {
+    for (configured, logged) in [("ΚΟΣΜΟΣ", "κοσμος"), ("κοσμος", "ΚΟΣΜΟΣ")]
+    {
+        let report = assemble_diagnostic_report(&DiagnosticReportSource {
+            app: AppSection {
+                os: "İ device K".into(),
+                ..Default::default()
+            },
+            user_config: json!({"servers": [{"name": configured}]}),
+            singbox_config: json!({"outbounds": [{"tag": logged}]}),
+            app_log_tail: format!("İ peer {logged} K"),
+            singbox_log_tail: format!("peer {configured}"),
+            ..Default::default()
+        });
+        for identity in [configured, logged] {
+            assert!(!report.contains(identity), "identity leak: {identity}");
+        }
+        assert_eq!(report.matches("<node-1>").count(), 4);
+        assert!(report.contains("İ device K"));
+        assert!(report.contains("İ peer <node-1> K"));
+    }
+}

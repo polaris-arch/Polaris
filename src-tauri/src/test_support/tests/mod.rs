@@ -28,15 +28,24 @@ use super::*;
 /// 取材面漏掉根文件就是只有一半判据（2026-08-30 修复前 `module_source` 正是只走目录）。
 const MISC_MARKERS: [(&str, &str); 7] = [
     (
-        "misc.rs",
+        "commands/misc.rs",
         "pub use autostart::{auto_start_get_status, auto_start_set}",
     ),
-    ("autostart.rs", "pub async fn auto_start_set"),
-    ("backup.rs", "pub async fn backup_export"),
-    ("dashboard.rs", "pub async fn open_singbox_dashboard"),
-    ("ipinfo.rs", "pub(crate) fn ipinfo_probe_is_current"),
-    ("logs.rs", "pub(crate) fn clear_log_stream_window"),
-    ("support.rs", "pub(super) fn node_platform"),
+    ("commands/misc/autostart.rs", "pub async fn auto_start_set"),
+    ("commands/misc/backup.rs", "pub async fn backup_export"),
+    (
+        "commands/misc/dashboard.rs",
+        "pub async fn open_singbox_dashboard",
+    ),
+    (
+        "commands/misc/ipinfo.rs",
+        "pub(crate) fn ipinfo_probe_is_current",
+    ),
+    (
+        "commands/misc/logs.rs",
+        "pub(crate) fn clear_log_stream_window",
+    ),
+    ("commands/misc/support.rs", "pub(super) fn node_platform"),
 ];
 
 #[test]
@@ -193,7 +202,7 @@ fn module_source_covers_every_production_file_of_a_real_module() {
         + usize::from(src.join("commands/misc.rs").is_file());
     assert_eq!(files.len(), on_disk, "取材文件数与磁盘实况对不上");
     assert!(
-        files.iter().any(|(rel, _)| rel == "misc.rs"),
+        files.iter().any(|(rel, _)| rel == "commands/misc.rs"),
         "取材面里没有模块根 `misc.rs` —— 模块的源码有一半在根文件里"
     );
     assert_eq!(files.len(), MISC_MARKERS.len(), "夹具清单该更新了");
@@ -278,5 +287,111 @@ fn a_tests_directory_stays_out_of_the_scan_surface_on_a_copy() {
     assert!(
         !blob.contains(IN_TESTS),
         "`tests/` 的内容混进了生产扫描面 —— 基于它的否定型断言会被测试夹具顶红/顶绿"
+    );
+}
+
+// ── method_body ──
+
+/// **守卫的守卫**：证明 [`method_body`] 真的截在方法自己的括号上。
+///
+/// 没有这条，「我按括号配对封了顶」只是一句注释。
+#[test]
+fn method_body_stops_at_the_methods_own_brace() {
+    let src = "impl X {\n    fn target(&self) {\n        if a { inside(); }\n    }\n\n    fn later(&self) {\n        outside();\n    }\n}\n";
+    let body = method_body(src, "fn target(");
+    assert!(body.contains("inside()"), "必须包含被守方法自己的函数体");
+    assert!(
+        !body.contains("outside()"),
+        "**封顶失效**：切到了同一个 impl 的后续方法 → 守卫可被「删这里、加那里」骗过"
+    );
+
+    // 字符串里的花括号（`format!("{x}")` 之类）不得计入深度。
+    let with_fmt = "impl X {\n    fn target(&self) {\n        log(\"a {b} c }\");\n        tail();\n    }\n\n    fn later(&self) {\n        outside();\n    }\n}\n";
+    let body = method_body(with_fmt, "fn target(");
+    assert!(
+        body.contains("tail()"),
+        "字符串字面量里的右花括号被误当作方法结束"
+    );
+    assert!(!body.contains("outside()"));
+
+    // 行注释里的花括号同理。
+    let with_comment = "impl X {\n    fn target(&self) {\n        // } 这不是结束\n        tail();\n    }\n\n    fn later(&self) {\n        outside();\n    }\n}\n";
+    let body = method_body(with_comment, "fn target(");
+    assert!(body.contains("tail()"));
+    assert!(!body.contains("outside()"));
+
+    // 🔴 **剥注释**：跳过注释里的花括号只决定「切到哪」，不决定「切出来的文本喂谁」。
+    // 消费者全是 `contains` / `find` / `count()` 型判据，注释里的同名文本会替生产调用点作证。
+    let fed_by_comment =
+        "impl X {\n    fn target(&self) {\n        real_call();\n        // real_call() 只出现在整行注释里\n    }\n}\n";
+    assert_eq!(
+        method_body(fed_by_comment, "fn target(")
+            .matches("real_call()")
+            .count(),
+        1,
+        "整行注释里的锚点文本必须被剥掉，否则 `count()==N` 类判据可被注释充数"
+    );
+    let only_comment =
+        "impl X {\n    fn target(&self) {\n        // real_call() 被删了，只剩这行注释\n    }\n}\n";
+    assert!(
+        !method_body(only_comment, "fn target(").contains("real_call()"),
+        "**假绿**：生产调用点删光、只剩注释时，正面 `contains` 必须转红"
+    );
+}
+
+/// 锚点消失必须 panic（转红），而不是返回空切片让断言恒真。
+#[test]
+#[should_panic(expected = "锚点消失")]
+fn missing_anchor_panics_instead_of_silently_passing() {
+    method_body("fn other() {\n}\n", "fn nonexistent(");
+}
+
+/// 🔴 [`write_executable_stand_in`] 落下的替身，在别的线程不停 `fork` 时也必须每次都起得来。
+///
+/// 旁边那些线程就是全量测试里「别的用例正好在 `fork`」的浓缩版。把落盘换回「本进程
+/// `std::fs::write` + 加执行位」，本条在同样的轮数里稳定撞出十几次
+/// `Text file busy (os error 26)`。
+///
+/// 并发度与轮数都有上界：子进程只是 `sh -c :`，不碰网络、不留状态。
+#[cfg(unix)]
+#[test]
+fn executable_stand_in_always_starts_while_other_threads_fork() {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const FORKING_THREADS: usize = 4;
+    const ROUNDS: usize = 100;
+
+    let dir = TestDir::new("polaris-stand-in-race-");
+    let stop = AtomicBool::new(false);
+    let mut failures = Vec::new();
+    std::thread::scope(|scope| {
+        for _ in 0..FORKING_THREADS {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = Command::new("/bin/sh")
+                        .args(["-c", ":"])
+                        .stdin(Stdio::null())
+                        .status();
+                }
+            });
+        }
+        for round in 0..ROUNDS {
+            let stand_in = dir.join(format!("stand-in-{round}"));
+            write_executable_stand_in(&stand_in, "#!/bin/sh\nexit 0\n");
+            match Command::new(&stand_in).stdin(Stdio::null()).status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => failures.push(format!("第 {round} 轮：{status}")),
+                Err(error) => failures.push(format!("第 {round} 轮：{error}")),
+            }
+        }
+        // 先收齐结果再断言：在这里 panic 会让上面那些线程永远等不到停止信号。
+        stop.store(true, Ordering::Relaxed);
+    });
+    assert!(
+        failures.is_empty(),
+        "替身没能每次都起来（共 {} 次）：\n  {}",
+        failures.len(),
+        failures.join("\n  ")
     );
 }

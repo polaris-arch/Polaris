@@ -611,6 +611,9 @@ async fn local_owner_fact_does_not_infer_vacancy_from_missing_pid_or_retained_cl
             cancel_tx,
             closed_rx,
             _child: None,
+            native: None,
+            drain: None,
+            config_path: None,
         },
     );
     let gate = reg.state_gate().await;
@@ -1495,7 +1498,7 @@ async fn prepare_tombstones_are_bounded_and_evicted_starts_are_rejected() {
 #[tokio::test]
 async fn login_creates_private_parent_without_prior_main_core_start() {
     let root = temp_ud();
-    let ud = root.join("not-created/app-config");
+    let ud = root.join("not-created").join("app-config");
     let reg = reg_with(
         fake_spawner(vec![], false, false),
         fake_subscriber(false),
@@ -2502,11 +2505,91 @@ fn explicit_credential_resolution_never_trusts_metadata_or_changes_issuer_on_reu
     );
 }
 
+#[test]
+fn keyless_identity_replacement_enters_the_backend_transaction_only_where_the_backend_owns_it() {
+    // A node that has only ever signed in through the browser: no key, no retained record,
+    // therefore no credential revision for the renderer to echo.
+    let saved = json!({"servers":[{"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{}}]});
+    let candidate = json!({"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{}});
+    let mut switch = request("switch");
+    switch.replace_identity = true;
+
+    let (resolved, owned) =
+        resolve_tailscale_credential_candidate_for(&saved, &candidate, &switch, true).unwrap();
+    assert!(
+        owned,
+        "the backend that retires identities itself must own this request"
+    );
+    assert_eq!(resolved["id"], "ts1");
+    assert!(resolved["tailscaleSettings"].get("authKey").is_none());
+    assert!(uses_credential_transaction(&resolved, &switch, true));
+
+    // Where the renderer orchestrates logout, save and login, the same request stays untouched.
+    assert_eq!(
+        resolve_tailscale_credential_candidate_for(&saved, &candidate, &switch, false).unwrap(),
+        (candidate.clone(), false)
+    );
+    assert!(!uses_credential_transaction(&candidate, &switch, false));
+    assert_eq!(
+        resolve_tailscale_credential_candidate(&saved, &candidate, &switch)
+            .unwrap()
+            .1,
+        cfg!(target_os = "android")
+    );
+
+    // An ordinary sign-in of the same node is never a transaction, and a stale revision claim
+    // is still refused instead of being waved through by the replacement flag.
+    let plain = request("plain");
+    assert_eq!(
+        resolve_tailscale_credential_candidate_for(&saved, &candidate, &plain, true).unwrap(),
+        (candidate.clone(), false)
+    );
+    assert!(!uses_credential_transaction(&candidate, &plain, true));
+    switch.expected_credential_revision = Some("stale-revision".into());
+    assert_eq!(
+        resolve_tailscale_credential_candidate_for(&saved, &candidate, &switch, true).unwrap_err(),
+        "credentialRevisionChanged"
+    );
+
+    // A node that does hold a key has a revision. Where the backend owns the replacement, a
+    // request that does not echo that revision is refused: the flag never stands in for the CAS.
+    let keyed_saved = json!({"servers":[{"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{
+        "authKey":"stored-fixture"
+    }}]});
+    let mut blind = request("switch-blind");
+    blind.replace_identity = true;
+    assert_eq!(
+        resolve_tailscale_credential_candidate_for(&keyed_saved, &candidate, &blind, true)
+            .unwrap_err(),
+        "credentialRevisionChanged"
+    );
+
+    // Replacing with a new key on such a node still parks that key for compensation.
+    let mut keyed = request("switch-key");
+    keyed.replace_identity = true;
+    keyed.mode = LoginMode::Authkey;
+    let with_key =
+        json!({"id":"ts1", "protocol":"tailscale", "tailscaleSettings":{"authKey":"new-fixture"}});
+    let (resolved, owned) =
+        resolve_tailscale_credential_candidate_for(&saved, &with_key, &keyed, true).unwrap();
+    assert!(owned);
+    assert_eq!(resolved["tailscaleSettings"]["authKey"], "new-fixture");
+    assert_eq!(
+        resolved["tailscaleSettings"]["retainedAuthKey"]["authKey"],
+        "new-fixture"
+    );
+}
+
 #[cfg(not(target_os = "ios"))]
 #[tokio::test]
 async fn logout_parks_actual_key_and_retires_only_auth_preserving_taildrop_and_history() {
     let fixture = CredentialFixture::new(true);
+    // This local auth projection fixture is legacy state, not a forged native
+    // directory capability; managed retirement is covered by real interop tests.
+    let legacy = fixture.directory.join("tailscale").join("ts1");
+    std::fs::create_dir_all(&legacy).unwrap();
     let state = fixture.mesh.tailscale_state_dir("ts1").unwrap();
+    assert_eq!(state, legacy);
     std::fs::create_dir_all(state.join("Taildrop")).unwrap();
     std::fs::write(state.join("Taildrop/user-file"), b"user-content").unwrap();
     let sealed = polaris_source_probe::repo_bytes_in(
@@ -3279,7 +3362,12 @@ fn android_cold_uses_one_original_validation_and_exact_config_stem_under_held_wa
     assert!(warm.find("make_warm_tuple").unwrap() < warm.find("reserve_android_action").unwrap());
     assert!(warm.find("reserve_android_action").unwrap() < warm.find("begin_warm").unwrap());
     assert!(warm.contains("with_tailscale_credential_birth(generation, attempt"));
-    assert!(launch.find("begin_warm").unwrap() < launch.find("self.spawner.spawn(req)").unwrap());
+    assert!(
+        launch.find("begin_warm").unwrap()
+            < launch
+                .find("self.spawner.spawn_with_temp_native_birth(req")
+                .unwrap()
+    );
     assert_eq!(launch.matches("self.checker.check_for_spawn(").count(), 1);
     assert!(!launch.contains("spawn_with_android"));
     assert!(!launch.contains("Uuid"));
@@ -3344,4 +3432,156 @@ fn android_cold_uses_one_original_validation_and_exact_config_stem_under_held_wa
     assert!(finish.contains("finish_warm(tuple).await.is_err()"));
     assert!(finish.contains("close_warm(tuple"));
     assert!(finish.rfind("finish_warm").unwrap() < finish.find("release_android_action").unwrap());
+}
+
+#[tokio::test]
+async fn f1_prepared_unclaimed_attempt_is_retained_and_late_claim_has_no_effects() {
+    const MARKER: &str = "POLARIS_F1_LOGIN_PREPARED_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let test = format!(
+            "{}::f1_prepared_unclaimed_attempt_is_retained_and_late_claim_has_no_effects",
+            module_path!().split_once("::").unwrap().1
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+    let spawner = fake_spawner(vec![], false, false);
+    let reg = reg_with(
+        spawner.clone(),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    reg.prepare("ts1", "f1-original").await.unwrap();
+    let original = reg.attempts.get("ts1", "f1-original").unwrap();
+    let capture = reg.pc_producer_view().await.unwrap();
+    let pause = polaris_core_supervisor::config_gate::pause_check_producers().unwrap();
+    let view = capture.into_view();
+    assert_eq!(view.member_count(), 1);
+    assert!(Arc::ptr_eq(&view.attempts[0], &original));
+    assert!(reg.prepare("ts1", "f1-late").await.is_err());
+    let ud = temp_ud();
+    let server = ts_server("ts1", "myts");
+    assert!(matches!(
+        reg.start_attempt(
+            &server,
+            &ud,
+            request("f1-original"),
+            &offline,
+            Arc::new(FakeEmitter::default())
+        )
+        .await,
+        StartLoginOutcome::Failed(_)
+    ));
+    assert!(
+        !original.claimed.load(Ordering::SeqCst),
+        "pause cannot move credential-before-claim boundary"
+    );
+    assert_eq!(spawner.count.load(Ordering::SeqCst), 0);
+    assert!(login_configs(&ud).is_empty());
+    view.verify_surrender().unwrap();
+    pause.surrender().unwrap();
+    reg.prepare("ts1", "f1-next").await.unwrap();
+    std::fs::remove_dir_all(ud).unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_main_reservation_accepts_only_logical_or_exact_selected_physical_state() {
+    let reg = reg_with(
+        fake_spawner(vec![], false, false),
+        fake_subscriber(false),
+        true,
+        Duration::from_secs(60),
+    );
+    let root = temp_ud();
+    let gate = reg.state_gate().await;
+    let logical = root.join("tailscale").join("ts1");
+    let physical = crate::runtime::windows_directory::actual_directory(&root, "ts1").unwrap();
+    assert_ne!(physical, logical);
+    assert!(!physical.exists());
+    for accepted in [&logical, &physical] {
+        let generated = json!({"endpoints":[{"type":"tailscale", "state_directory":accepted}]});
+        let reservation = reg
+            .reserve_main_states(&generated, &root, &gate, reg.mint_main_birth())
+            .await
+            .unwrap();
+        assert!(reservation.claim_token().is_some());
+        drop(reservation);
+        assert_eq!(
+            reg.owner_state_under_gate("ts1", &gate),
+            TsRegistryOwnerState::Vacant
+        );
+        assert!(
+            !physical.exists(),
+            "reservation must not create native custody"
+        );
+    }
+    let duplicate = json!({"endpoints":[
+        {"type":"tailscale", "state_directory":logical},
+        {"type":"tailscale", "state_directory":physical}
+    ]});
+    assert!(
+        reg.reserve_main_states(&duplicate, &root, &gate, reg.mint_main_birth())
+            .await
+            .is_err(),
+        "logical and physical names must not book the same ID twice"
+    );
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    for rejected in [
+        root.join("other").join("ts1"),
+        physical.join("nested"),
+        root.join("tailscale-windows-v1-sibling").join("ts1"),
+        root.join("tailscale-windows-v1").join("CON"),
+    ] {
+        let generated = json!({"endpoints":[
+            {"type":"tailscale", "state_directory":logical},
+            {"type":"tailscale", "state_directory":rejected}
+        ]});
+        assert!(reg
+            .reserve_main_states(&generated, &root, &gate, reg.mint_main_birth())
+            .await
+            .is_err());
+        assert_eq!(
+            reg.owner_state_under_gate("ts1", &gate),
+            TsRegistryOwnerState::Vacant
+        );
+    }
+    std::fs::create_dir_all(&logical).unwrap();
+    std::fs::write(logical.join("sentinel"), b"legacy bytes").unwrap();
+    assert_eq!(
+        crate::runtime::windows_directory::actual_directory(&root, "ts1").unwrap(),
+        logical
+    );
+    let shadowed = json!({"endpoints":[{"type":"tailscale", "state_directory":physical}]});
+    assert!(
+        reg.reserve_main_states(&shadowed, &root, &gate, reg.mint_main_birth())
+            .await
+            .is_err(),
+        "a physical sibling is invalid once legacy state is selected"
+    );
+    assert_eq!(
+        reg.owner_state_under_gate("ts1", &gate),
+        TsRegistryOwnerState::Vacant
+    );
+    assert_eq!(
+        std::fs::read(logical.join("sentinel")).unwrap(),
+        b"legacy bytes"
+    );
+    assert!(
+        crate::runtime::windows_directory::DirectoryLease::acquire(&root, "ts1", true).is_err()
+    );
 }

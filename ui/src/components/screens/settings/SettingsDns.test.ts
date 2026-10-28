@@ -383,3 +383,16 @@ describe('DNS 上游预设表：内容门（共享面，改表必须同时过两
     expect(zh.map((p) => p.value)).toEqual(en.map((p) => p.value));
   });
 });
+
+
+describe('N1 case-sensitive DNS upstream identity', () => {
+  it('keeps URL path/query case distinct while reconciling equivalent authority to one ID', () => {
+    const previous = [{ id: 'keep', spec: 'https://DNS.EXAMPLE:443/Query?Token=A' }];
+    const next = reconcileCustomUpstreams(previous,
+      ['https://dns.example/Query?Token=A', 'https://dns.example/query?Token=A', 'https://dns.example/Query?Token=a'],
+      (() => { let id = 0; return () => `new-${++id}`; })());
+    expect(next).toHaveLength(3);
+    expect(next[0].id).toBe('keep');
+    expect(new Set(next.map(item => item.id)).size).toBe(3);
+  });
+});

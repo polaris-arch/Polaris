@@ -1,0 +1,6 @@
+# Registry extension for the documented hosted public-preview label. This
+# parser setting does not provision a runner or change workflow routing.
+# https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+self-hosted-runner:
+  labels:
+    - xcode-27

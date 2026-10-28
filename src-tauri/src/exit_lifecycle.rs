@@ -331,6 +331,10 @@ pub(crate) fn final_exit_best_effort(app: &tauri::AppHandle) {
         if exit_is_committed(app) {
             return;
         }
+        // WM_ENDSESSION reaches final Exit directly, bypassing ExitRequested.
+        // Normal Quit/Restart have already committed and retain their DNS flush.
+        #[cfg(windows)]
+        polaris_system_integration::windows_session::begin_final_exit();
         tauri::async_runtime::block_on(async {
             match prepare_desktop_exit(app).await {
                 Ok(ready) => {

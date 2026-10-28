@@ -1,6 +1,7 @@
 use super::*;
 use crate::platform::macos::exec::RunError;
 use crate::token::FileTokenStore;
+use polaris_helper_proto::response::Start as StartResp;
 use std::sync::Mutex;
 
 // 测试用 services bundle：注入 FileTokenStore（tempfile）+ 记录型 runner + 可控 child。
@@ -117,22 +118,24 @@ fn default_native_services_never_upgrade_legacy_void_stop_to_receipt() {
     let services = TestServices::new("token");
     let target = HelperBirthTarget::parse_wire("42", "01010101010101010101010101010101").unwrap();
     assert_eq!(
-        dispatch(
+        dispatch_from_peer(
             &services,
             &test_config(),
             "token",
-            &Request::NativeStatusBirth
+            &Request::NativeStatusBirth,
+            Some(0)
         ),
         Response::Ok(ResponseKind::NativeBirthStatus(
             NativeBirthStatus::Unknown { target: None }
         ))
     );
     assert_eq!(
-        dispatch(
+        dispatch_from_peer(
             &services,
             &test_config(),
             "token",
-            &Request::NativeStopBirth { target }
+            &Request::NativeStopBirth { target },
+            Some(0)
         ),
         Response::Ok(ResponseKind::NativeBirthStop(NativeBirthStop::Unknown {
             target
@@ -145,11 +148,12 @@ fn default_native_services_never_upgrade_legacy_void_stop_to_receipt() {
         parent_pid: None,
     };
     assert!(matches!(
-        dispatch(
+        dispatch_from_peer(
             &services,
             &test_config(),
             "token",
-            &Request::NativeStartBirth(params)
+            &Request::NativeStartBirth(params),
+            Some(0)
         ),
         Response::Err(_)
     ));
@@ -210,26 +214,9 @@ fn legacy_requests_cannot_bypass_native_custody_or_apply_forwarding() {
 
 fn test_config() -> MacConfig {
     MacConfig::new(
-        "/usr/local/lib/polaris/sing-box",
-        "/Users/test/Polaris",
         "/Library/Application Support/Polaris",
         "/Library/Application Support/Polaris/core",
     )
-}
-
-fn assert_started_timed(resp: Response, want_pid: u32) {
-    match resp {
-        Response::Ok(ResponseKind::Start(StartResp::StartedTimed {
-            pid,
-            timing,
-            created,
-        })) => {
-            assert_eq!(pid, want_pid);
-            assert_eq!(timing.job_ms, 0, "macOS 没有 Windows Job Object");
-            assert_eq!(created, None, "身份 token 仅 Windows 回传");
-        }
-        other => panic!("预期带计时的 started，实得 {other:?}"),
-    }
 }
 
 #[test]
@@ -374,7 +361,7 @@ fn status_running_after_start() {
     // helper.go:427-428
     let svc = TestServices::new("t");
     let cfg = test_config();
-    let _ = dispatch(&svc, &cfg, "t", &Request::Start(proto_start_params()));
+    *svc.child.lock().unwrap() = Some(ChildHandle { pid: 5555 });
     let resp = dispatch(&svc, &cfg, "t", &Request::Status);
     match resp {
         Response::Ok(ResponseKind::Status(Status::Running {
@@ -408,7 +395,7 @@ fn stop_stopped_when_child_present() {
     // helper.go:440-441
     let svc = TestServices::new("t");
     let cfg = test_config();
-    let _ = dispatch(&svc, &cfg, "t", &Request::Start(proto_start_params()));
+    *svc.child.lock().unwrap() = Some(ChildHandle { pid: 5555 });
     let resp = dispatch(&svc, &cfg, "t", &Request::Stop { pid: None });
     match resp {
         Response::Ok(ResponseKind::Stop(Stop::Stopped { pid })) => assert_eq!(pid, 5555),
@@ -430,7 +417,7 @@ fn stop_refuses_to_kill_when_managed_pid_is_another_session() {
     let svc = TestServices::new("t");
     let cfg = test_config();
     // daemon 手里的是新会话的核（TestServices 的 spawn 固定报 5555）。
-    let _ = dispatch(&svc, &cfg, "t", &Request::Start(proto_start_params()));
+    *svc.child.lock().unwrap() = Some(ChildHandle { pid: 5555 });
     let resp = dispatch(&svc, &cfg, "t", &Request::Stop { pid: Some(4242) });
     assert_eq!(
         resp,
@@ -452,152 +439,13 @@ fn stop_refuses_to_kill_when_managed_pid_is_another_session() {
 fn stop_proceeds_when_managed_pid_matches() {
     let svc = TestServices::new("t");
     let cfg = test_config();
-    let _ = dispatch(&svc, &cfg, "t", &Request::Start(proto_start_params()));
+    *svc.child.lock().unwrap() = Some(ChildHandle { pid: 5555 });
     let resp = dispatch(&svc, &cfg, "t", &Request::Stop { pid: Some(5555) });
     assert_eq!(
         resp,
         Response::Ok(ResponseKind::Stop(Stop::Stopped { pid: 5555 }))
     );
     assert!(svc.child.lock().unwrap().is_none(), "匹配时须真摘 child");
-}
-
-// ===== start =====
-
-#[test]
-fn start_already_when_child_exists() {
-    // helper.go:521-523: OK already <pid>
-    let svc = TestServices::new("t");
-    let cfg = test_config();
-    let _ = dispatch(&svc, &cfg, "t", &Request::Start(proto_start_params()));
-    let resp = dispatch(&svc, &cfg, "t", &Request::Start(proto_start_params()));
-    match resp {
-        Response::Ok(ResponseKind::Start(StartResp::Already { pid })) => {
-            assert_eq!(pid, 5555)
-        }
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
-fn start_no_config_when_empty_cfg() {
-    // helper.go:525-527: ERR no-config
-    let svc = TestServices::new("t");
-    let cfg = test_config();
-    let mut p = proto_start_params();
-    p.cfg = String::new();
-    let resp = dispatch(&svc, &cfg, "t", &Request::Start(p));
-    assert!(matches!(
-        resp,
-        Response::Err(ProtoError {
-            code: ErrorCode::NoConfig,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn start_config_path_denied_when_outside_confdir() {
-    // helper.go:528-531: ERR config-path-denied
-    let svc = TestServices::new("t");
-    let cfg = test_config(); // conf_dir = /Users/test/Polaris
-    let mut p = proto_start_params();
-    p.cfg = "/etc/passwd".into(); // 越权
-    let resp = dispatch(&svc, &cfg, "t", &Request::Start(p));
-    assert!(matches!(
-        resp,
-        Response::Err(ProtoError {
-            code: ErrorCode::ConfigPathDenied,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn start_ok_when_cfg_inside_confdir() {
-    let svc = TestServices::new("t");
-    let cfg = test_config();
-    let mut p = proto_start_params();
-    p.cfg = "/Users/test/Polaris/config.json".into();
-    let resp = dispatch(&svc, &cfg, "t", &Request::Start(p));
-    assert_started_timed(resp, 5555);
-}
-
-/// log 与 cfg 走同一条白名单 —— 不校验就是「root 在任意位置建文件并持续追加写」。
-#[test]
-fn start_log_path_denied_when_outside_confdir() {
-    let svc = TestServices::new("t");
-    let cfg = test_config(); // conf_dir = /Users/test/Polaris
-    let mut p = proto_start_params();
-    // cfg 合法，只有 log 越界 —— 单独钉住 log 这一格。
-    p.cfg = "/Users/test/Polaris/singbox-runtime.json".into();
-    p.log = "/etc/newsyslog.d/pwn.conf".into();
-    let resp = dispatch(&svc, &cfg, "t", &Request::Start(p));
-    assert!(
-        matches!(
-            resp,
-            Response::Err(ProtoError {
-                code: ErrorCode::LogPathDenied,
-                ..
-            })
-        ),
-        "{resp:?}"
-    );
-}
-
-/// 生产形态（cfg 与 log 同在 confDir）必须放行 —— 否则上面那条可能被「恒拒」满足。
-#[test]
-fn start_ok_when_log_inside_confdir() {
-    let svc = TestServices::new("t");
-    let cfg = test_config();
-    let mut p = proto_start_params();
-    p.cfg = "/Users/test/Polaris/singbox-runtime.json".into();
-    p.log = "/Users/test/Polaris/singbox-startup.log".into();
-    let resp = dispatch(&svc, &cfg, "t", &Request::Start(p));
-    assert_started_timed(resp, 5555);
-}
-
-/// 空 log = 不重定向（`server.rs` 的 `if !log.is_empty()`），必须放行。
-#[test]
-fn start_ok_when_log_empty() {
-    let svc = TestServices::new("t");
-    let cfg = test_config();
-    let mut p = proto_start_params();
-    p.cfg = "/Users/test/Polaris/singbox-runtime.json".into();
-    p.log = String::new();
-    let resp = dispatch(&svc, &cfg, "t", &Request::Start(p));
-    assert_started_timed(resp, 5555);
-}
-
-#[test]
-fn start_fwd_enables_ip_forwarding() {
-    // helper.go:534-537: allowLan → sysctl net.inet.ip.forwarding=1 + ip6.forwarding=1
-    let svc = TestServices::new("t");
-    let cfg = test_config();
-    let mut p = proto_start_params();
-    p.cfg = "/Users/test/Polaris/c.json".into();
-    p.fwd = true;
-    let _ = dispatch(&svc, &cfg, "t", &Request::Start(p));
-    let calls = svc.calls();
-    let sysctls: Vec<_> = calls
-        .iter()
-        .filter(|(p, _)| p == "/usr/sbin/sysctl")
-        .collect();
-    assert_eq!(sysctls.len(), 2, "应有 ipv4 + ipv6 两次 sysctl");
-    assert!(sysctls
-        .iter()
-        .any(|(_, a)| a.contains(&"net.inet.ip.forwarding=1".to_string())));
-    assert!(sysctls
-        .iter()
-        .any(|(_, a)| a.contains(&"net.inet6.ip6.forwarding=1".to_string())));
-}
-
-fn proto_start_params() -> polaris_helper_proto::request::StartParams {
-    polaris_helper_proto::request::StartParams {
-        cfg: "/Users/test/Polaris/c.json".into(),
-        log: String::new(),
-        fwd: false,
-        parent_pid: None,
-    }
 }
 
 // ===== route-add / route-del =====
@@ -744,110 +592,37 @@ fn flush_dns_response_wire() {
     assert_eq!(line, "OK flushed");
 }
 
-// ===== cleanup =====
-
+// Retired dispatch cannot copy, sign, spawn, or signal any payload.
 #[test]
-fn cleanup_pkill_and_clears_child() {
-    // helper.go:444-449: pkill -9 -f "<singboxBin> run" + 摘 child
+fn retired_start_and_content_requests_never_reach_privileged_operations() {
     let svc = TestServices::new("t");
-    let cfg = test_config();
-    let _ = dispatch(&svc, &cfg, "t", &Request::Start(proto_start_params()));
-    let resp = dispatch(&svc, &cfg, "t", &Request::Cleanup);
-    assert!(matches!(resp, Response::Ok(ResponseKind::Cleaned)));
-    let calls = svc.calls();
-    let pkill = calls
-        .iter()
-        .find(|(p, _)| p == "/usr/bin/pkill")
-        .expect("应有 pkill 调用");
-    assert!(pkill.1.contains(&"-9".to_string()));
-    assert!(pkill.1.contains(&"-f".to_string()));
-    assert!(pkill
-        .1
-        .contains(&"/usr/local/lib/polaris/sing-box run".to_string()));
-    // child 被摘除
+    for request in [
+        Request::Start(proto_start_params()),
+        Request::NativeStartBirth(proto_start_params()),
+        Request::InstallCore(polaris_helper_proto::InstallCoreParams {
+            src_dir: "/untrusted/source".into(),
+            want_hash: "a".repeat(64),
+        }),
+    ] {
+        assert!(matches!(
+            dispatch_from_peer(&svc, &test_config(), "t", &request, Some(0)),
+            Response::Err(ProtoError {
+                code: ErrorCode::Unknown,
+                ..
+            })
+        ));
+    }
+    assert!(svc.calls().is_empty());
     assert!(svc.child.lock().unwrap().is_none());
 }
-
-// ===== install-core（文件操作 + mac 签名）=====
-
 #[test]
-fn install_core_bad_args() {
-    // helper.go:583-584 → installCore → :137 bad-args
+fn empty_cleanup_does_not_sweep_external_images_by_name() {
     let svc = TestServices::new("t");
-    let cfg = test_config();
-    let resp = dispatch(
-        &svc,
-        &cfg,
-        "t",
-        &Request::InstallCore(InstallCoreParams {
-            src_dir: "".into(),
-            want_hash: "a".repeat(64),
-        }),
-    );
     assert!(matches!(
-        resp,
-        Response::Err(ProtoError {
-            code: ErrorCode::BadArgs,
-            ..
-        })
+        dispatch(&svc, &test_config(), "t", &Request::Cleanup),
+        Response::Ok(ResponseKind::Cleaned)
     ));
-}
-
-#[test]
-fn install_core_coredir_unset() {
-    let svc = TestServices::new("t");
-    let mut cfg = test_config();
-    cfg.core_dir = String::new();
-    let resp = dispatch(
-        &svc,
-        &cfg,
-        "t",
-        &Request::InstallCore(InstallCoreParams {
-            src_dir: "/tmp/x".into(),
-            want_hash: "a".repeat(64),
-        }),
-    );
-    assert!(matches!(
-        resp,
-        Response::Err(ProtoError {
-            code: ErrorCode::CoredirUnset,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn install_core_success_runs_xattr_and_codesign() {
-    // helper.go:195-196: 文件就位后 xattr -cr + codesign --force --deep -s -
-    use sha2::{Digest, Sha256};
-    let src = tempfile::tempdir().unwrap();
-    let sb = b"fake sing-box";
-    std::fs::write(src.path().join("sing-box"), sb).unwrap();
-    let mut h = Sha256::new();
-    h.update(sb);
-    let hash = hex::encode(h.finalize());
-
-    let svc = TestServices::new("t");
-    let cfg = test_config();
-    // 用临时 core_dir
-    let core_tmp = tempfile::tempdir().unwrap();
-    let mut cfg2 = cfg.clone();
-    cfg2.core_dir = core_tmp.path().to_string_lossy().into_owned();
-
-    let resp = dispatch(
-        &svc,
-        &cfg2,
-        "t",
-        &Request::InstallCore(InstallCoreParams {
-            src_dir: src.path().to_string_lossy().into_owned(),
-            want_hash: hash,
-        }),
-    );
-    assert!(matches!(resp, Response::Ok(ResponseKind::Installed)));
-    // 验证 xattr + codesign 被调
-    let calls = svc.calls();
-    assert!(calls.iter().any(|(p, _)| p == "/usr/bin/xattr"));
-    assert!(calls.iter().any(|(p, _)| p == "/usr/bin/codesign"));
+    assert!(svc.calls().is_empty());
 }
 
 // ===== 未知/不属于 mac 谱系的命令 =====
@@ -989,4 +764,13 @@ fn dispatch_freeport_still_requires_auth() {
 #[test]
 fn file_token_store_trait_compat() {
     let _store = FileTokenStore::new("/tmp/nonexistent");
+}
+
+fn proto_start_params() -> polaris_helper_proto::StartParams {
+    polaris_helper_proto::StartParams {
+        cfg: "/tmp/Polaris/config.json".into(),
+        log: "/tmp/Polaris/log".into(),
+        fwd: true,
+        parent_pid: Some(3333),
+    }
 }

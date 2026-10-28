@@ -148,6 +148,168 @@ pub(crate) async fn bindable_interfaces() -> Result<Vec<BindableInterface>, Stri
     })
 }
 
+#[cfg(target_os = "android")]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceConditionsArgs {
+    query_id: String,
+}
+
+/// Optional versioned native history is decoded separately: malformed/missing history never invents zero
+/// and never erases valid metered/power-save policy readings from an older bridge.
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceConditionsWire {
+    metered: bool,
+    power_save: bool,
+    #[serde(default)]
+    query_id: serde_json::Value,
+    #[serde(default)]
+    network_observation: serde_json::Value,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug)]
+pub(crate) struct QueriedDeviceConditions {
+    pub metered: bool,
+    pub power_save: bool,
+    pub network: Option<crate::runtime::auto_select::NativeNetworkObservation>,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn exact_decimal(value: &serde_json::Value) -> Option<u64> {
+    let text = value.as_str()?;
+    let integer = text.parse::<u64>().ok()?;
+    (integer.to_string() == text).then_some(integer)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn decode_network(
+    query: u64,
+    response: &DeviceConditionsWire,
+) -> Option<crate::runtime::auto_select::NativeNetworkObservation> {
+    if exact_decimal(&response.query_id)? != query {
+        return None;
+    }
+    let object = response.network_observation.as_object()?;
+    if object.get("version")?.as_u64()? != 1 {
+        return None;
+    }
+    let source = object.get("sourceEpoch")?.as_str()?;
+    let uuid = uuid::Uuid::parse_str(source).ok()?;
+    if uuid.to_string() != source {
+        return None;
+    }
+    let seq = exact_decimal(object.get("seq")?)?;
+    // Kotlin's producer is Long: reject integers outside its exact nonnegative domain.
+    if seq > i64::MAX as u64 {
+        return None;
+    }
+    Some(crate::runtime::auto_select::NativeNetworkObservation {
+        query,
+        source: source.to_owned(),
+        seq,
+        current_known: object.get("currentKnown")?.as_bool()?,
+        coverage_gap: object.get("coverageGap")?.as_bool()?,
+    })
+}
+
+/// Issue and completion/publication admission share one short metadata lock, never held across native I/O.
+#[cfg(any(target_os = "android", test))]
+#[derive(Default)]
+struct DeviceQueryGate {
+    issued: u64,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl DeviceQueryGate {
+    fn issue(&mut self) -> Option<u64> {
+        self.issued = self.issued.checked_add(1)?;
+        Some(self.issued)
+    }
+    fn finish(&self, query: u64, wire: DeviceConditionsWire) -> Option<QueriedDeviceConditions> {
+        if query == 0 || query != self.issued {
+            return None;
+        }
+        Some(QueriedDeviceConditions {
+            metered: wire.metered,
+            power_save: wire.power_save,
+            network: decode_network(query, &wire),
+        })
+    }
+    fn publish<R>(
+        &self,
+        observation: &crate::runtime::auto_select::NativeNetworkObservation,
+        consume: impl FnOnce(&crate::runtime::auto_select::NativeNetworkObservation) -> R,
+    ) -> Option<R> {
+        (observation.query != 0 && observation.query == self.issued).then(|| consume(observation))
+    }
+}
+
+#[cfg(target_os = "android")]
+static DEVICE_QUERIES: std::sync::Mutex<DeviceQueryGate> =
+    std::sync::Mutex::new(DeviceQueryGate { issued: 0 });
+
+#[cfg(target_os = "android")]
+pub(crate) fn publish_device_network(
+    observation: &crate::runtime::auto_select::NativeNetworkObservation,
+    consume: impl FnOnce(&crate::runtime::auto_select::NativeNetworkObservation),
+) {
+    DEVICE_QUERIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .publish(observation, consume);
+}
+
+/// The actual query orchestration, with native I/O injected for host tests. No response-side cache mutation.
+#[cfg(any(target_os = "android", test))]
+async fn read_device_conditions_from<F>(
+    queries: &std::sync::Mutex<DeviceQueryGate>,
+    invoke: impl FnOnce(u64) -> F,
+) -> Result<QueriedDeviceConditions, String>
+where
+    F: std::future::Future<Output = Result<DeviceConditionsWire, String>>,
+{
+    let query = queries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .issue()
+        .ok_or_else(|| "Android device query sequence exhausted".to_owned())?;
+    let wire = invoke(query).await?;
+    queries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish(query, wire)
+        .ok_or_else(|| "Android device conditions query superseded".to_owned())
+}
+
+/// Read-only bounded query. Detached timeout callbacks cannot publish, and superseded results cannot switch source.
+#[cfg(target_os = "android")]
+pub(crate) async fn device_conditions() -> Result<QueriedDeviceConditions, String> {
+    let plugin = plugin_handle().map_err(|(msg, _)| msg)?;
+    read_device_conditions_from(&DEVICE_QUERIES, |query| async move {
+        call_with_budget::<DeviceConditionsWire, _>(
+            plugin,
+            "deviceConditions",
+            DeviceConditionsArgs {
+                query_id: query.to_string(),
+            },
+            LOCAL_STATE_TIMEOUT,
+            None,
+        )
+        .await
+        .map_err(|error| match error {
+            BridgeCallError::Invoke(_) => "Android device conditions query failed".to_owned(),
+            BridgeCallError::TimedOut => "Android device conditions query timed out".to_owned(),
+            BridgeCallError::TaskFailed(_) => {
+                "Android device conditions query unavailable".to_owned()
+            }
+        })
+    })
+    .await
+}
+
 /// 🔴 **六档超时的相对大小是判据的一部分，编译期就挡住**。
 ///
 /// `authStatus` 只是一次 binder 往返（最短），`installApk` 是本地调用 + 一次 startActivity，
@@ -716,6 +878,78 @@ where
         Ok(Err(join)) => Err(BridgeCallError::TaskFailed(join.to_string())),
         Err(_) => Err(BridgeCallError::TimedOut),
     }
+}
+
+/// Read only the finite current engine identities needed to arm a debug close timeout.
+#[cfg(all(target_os = "android", debug_assertions))]
+pub(crate) async fn debug_transient_close_targets() -> Result<serde_json::Value, String> {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct DebugTransientCloseTarget {
+        target_kind: String,
+        instance_id: String,
+        target_token: String,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DebugTransientCloseTargetsResponse {
+        targets: Vec<DebugTransientCloseTarget>,
+    }
+    let plugin =
+        plugin_handle().map_err(|_| "Transient close timeout targets unavailable".to_owned())?;
+    let reply = call_with_budget::<DebugTransientCloseTargetsResponse, _>(
+        plugin,
+        "debugTransientCloseTargets",
+        (),
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .map_err(|_| "Transient close timeout targets unavailable".to_owned())?;
+    if reply.targets.len() > 9 {
+        return Err("Transient close timeout targets unavailable".to_owned());
+    }
+    serde_json::to_value(reply.targets)
+        .map_err(|_| "Transient close timeout targets unavailable".to_owned())
+}
+
+/// Arms one current engine; only an App process restart clears an uncertain arm or blocked Close.
+#[cfg(all(target_os = "android", debug_assertions))]
+pub(crate) async fn debug_transient_close_timeout(
+    target_kind: String,
+    instance_id: String,
+    target_token: String,
+) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DebugTransientCloseTimeoutPayload {
+        target_kind: String,
+        instance_id: String,
+        target_token: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct DebugTransientCloseTimeoutResponse {
+        state: String,
+    }
+    let plugin =
+        plugin_handle().map_err(|_| "Transient close timeout bridge unavailable".to_owned())?;
+    let reply = call_with_budget::<DebugTransientCloseTimeoutResponse, _>(
+        plugin,
+        "debugTransientCloseTimeout",
+        DebugTransientCloseTimeoutPayload {
+            target_kind,
+            instance_id,
+            target_token,
+        },
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    .map_err(|_| "Transient close timeout arm unconfirmed; restart the App process".to_owned())?;
+    if reply.state != "armedUntilProcessRestart" {
+        return Err("Transient close timeout arm unconfirmed; restart the App process".to_owned());
+    }
+    Ok(reply.state)
 }
 
 /// Debug 报告使用相同的保活调用器；失败不影响代理生命周期。
@@ -1921,3 +2155,35 @@ pub(crate) async fn transient_login_running(instance_id: &str) -> Result<bool, S
 /// checks never promote ordinary/global close to owner or SDK disposal proof.
 #[cfg(any(target_os = "android", test))]
 pub(crate) mod tailscale_store;
+
+#[cfg(target_os = "android")]
+pub(super) async fn tls_fingerprint_capabilities() -> crate::runtime::tls_fingerprints::Snapshot {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct TLSFingerprintCapabilitiesResponse {
+        document: Option<String>,
+        binary_sha256: String,
+    }
+    let plugin = match plugin_handle() {
+        Ok(plugin) => plugin,
+        Err((reason, _)) => return crate::runtime::tls_fingerprints::Snapshot::unavailable(reason),
+    };
+    match call_with_budget::<TLSFingerprintCapabilitiesResponse, _>(
+        plugin,
+        "tlsFingerprintCapabilities",
+        (),
+        Duration::from_secs(5),
+        None,
+    )
+    .await
+    {
+        Ok(reply) => crate::runtime::tls_fingerprints::Snapshot::from_native(
+            reply.document.as_deref(),
+            &reply.binary_sha256,
+            "loaded-jni-so",
+        ),
+        Err(_) => crate::runtime::tls_fingerprints::Snapshot::unavailable(
+            "Loaded libbox TLS capabilities unavailable",
+        ),
+    }
+}

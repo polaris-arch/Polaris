@@ -19,6 +19,7 @@
 //! 不手写清单）。命中前先用 [`polaris_source_probe::mask_comments_and_strings`] 剥掉注释与
 //! 字面量 —— 本门自己的说明里就写满了 `include_str!`，不剥就全是假阳性。
 
+use polaris_source_probe::is_downloaded_core_legal_root;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -599,12 +600,82 @@ fn no_file_shaped_test_modules_anywhere() {
 /// | 命名空间 | 约定 | 为什么 |
 /// |---|---|---|
 /// | Rust 模块（`<member>/src/**`、`<member>/tests/**` 下的目录与 `.rs`） | `snake_case` | **语言强制**：`-` 不是合法标识符字符，`mod dns-race;` 编不过。想用 kebab 目录只能靠 `#[path]`，而本仓禁用 `#[path]` |
-/// | 其它一切（crate 根、前端、脚本、资源、仓库根） | `kebab-case` | 仓库约定；Cargo 包名本身也是 kebab（`polaris-dns-race`） |
+/// | 精确登记的 mobile-core Python 导入模块 | `snake_case` | Python 模块标识符；目录仍为 kebab，新文件不自动豁免 |
+/// | 其它一切（crate 根、前端、脚本、资源、仓库根） | `kebab-case` | 仓库约定；Cargo 包名本身也是 kebab（`polaris-config-engine`） |
 ///
-/// 所以 `crates/dns-race/`（crate 根，kebab）里装着 `src/dns_race/`（模块，snake）是**对的**。
+/// 所以 `crates/config-engine/`（crate 根，kebab）里装着 `src/node_dns/`（模块，snake）是**对的**。
 ///
 /// 本门把「碰巧一致」变成「守得住」：两侧各自不许出现对方的分隔符。
 ///
+/// Importable Python modules use identifiers, not Cargo package/directory spelling.
+/// Register the existing mobile producer namespace precisely; siblings/new names
+/// still require an explicit decision and every entry must exist in the census.
+const PYTHON_MODULE_FILES: &[&str] = &[
+    "scripts/mobile-core/test_producer.py",
+    "scripts/mobile-core/apple_rust.py",
+    "scripts/mobile-core/apple_tls_fingerprint.py",
+    "scripts/mobile-core/test_apple_tls_fingerprint.py",
+    "scripts/mobile-core/test_apple_entry.py",
+    "scripts/mobile-core/ci_android.py",
+    "scripts/mobile-core/test_outputs.py",
+    // Python unittest discover requires test_*.py; exact source-checkout regression module.
+    "scripts/mobile-core/test_source_checkout.py",
+    "scripts/mobile-core/test_native_inputs.py",
+    "scripts/mobile-core/test_delivery_boundaries.py",
+    "scripts/mobile-core/ci_apple.py",
+    "scripts/mobile-core/native_inputs.py",
+    "scripts/mobile-core/build_apple_app.py",
+    "scripts/mobile-core/fork_input.py",
+    "scripts/mobile-core/source_policy.py",
+    "scripts/mobile-core/test_source_policy.py",
+    "scripts/mobile-core/android_sdk.py",
+    "scripts/mobile-core/test_inputs.py",
+    "scripts/mobile-core/apple_admission.py",
+    "scripts/mobile-core/apple_handoff.py",
+    "scripts/mobile-core/apple_merge_reuse.py",
+    "scripts/mobile-core/test_apple_merge_reuse.py",
+    "scripts/mobile-core/test_apple_admission.py",
+    "scripts/mobile-core/test_apple_handoff.py",
+    "scripts/mobile-core/test_apple_progress.py",
+    "scripts/mobile-core/test_apple_read_reuse.py",
+];
+
+fn registered_python_module(rel: &str) -> bool {
+    PYTHON_MODULE_FILES.contains(&rel)
+}
+
+#[test]
+fn python_module_namespace_is_exact_and_keeps_unknown_underscore_paths_red() {
+    assert!(registered_python_module(
+        "scripts/mobile-core/test_native_inputs.py"
+    ));
+    for path in PYTHON_MODULE_FILES {
+        assert!(registered_python_module(path));
+        let stem = Path::new(path).file_stem().unwrap().to_str().unwrap();
+        assert!(stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+    for path in [
+        "scripts/mobile-core/unknown_module.py",
+        "scripts/mobile-core/test_delivery_boundaries_extra.py",
+        "scripts/mobile-core/nested/test_delivery_boundaries.py",
+        "scripts/other/test_delivery_boundaries.py",
+        "scripts/mobile-core/test_native_inputs_extra.py",
+        "scripts/other/test_native_inputs.py",
+        "scripts/mobile-core/nested/test_native_inputs.py",
+        "scripts/other/ci_apple.py",
+        "scripts/mobile-core/nested/ci_apple.py",
+        "ui/src/ci_apple.py",
+        "scripts/mobile-core/apple_handoff_extra.py",
+        "scripts/mobile-core/apple_admission_extra.py",
+        "scripts/mobile-core/nested/apple_handoff.py",
+        "scripts/other/test_apple_progress.py",
+    ] {
+        assert!(!registered_python_module(path));
+    }
+    let unique: BTreeSet<_> = PYTHON_MODULE_FILES.iter().collect();
+    assert_eq!(unique.len(), PYTHON_MODULE_FILES.len());
+}
+
 /// **变异探针**：`mkdir crates/store/src/foo-bar` ⇒ Rust 侧转红；
 /// `mkdir crates/foo_bar` ⇒ 非 Rust 侧转红。
 #[test]
@@ -612,6 +683,7 @@ fn directory_and_file_naming_is_uniform_within_each_namespace() {
     let root = workspace_root();
     let mut rust_side = Vec::new();
     let mut kebab_side = Vec::new();
+    let mut python_seen = BTreeSet::new();
 
     // ── Rust 模块命名空间：`-` 一律违规 ──────────────────────────────────
     for member in workspace_members(&root) {
@@ -621,7 +693,7 @@ fn directory_and_file_naming_is_uniform_within_each_namespace() {
                 continue;
             }
             let mut found = Vec::new();
-            // 取材面的根是 `src` / `tests` **本身**，不是仓库根：`crates/dns-race/` 这一层是
+            // 取材面的根是 `src` / `tests` **本身**，不是仓库根：`crates/config-engine/` 这一层是
             // crate 根（kebab，归另一套命名空间），把它算进来会误报。
             collect_rs(&dir, &dir, &mut found);
             for (rel, _) in found {
@@ -668,7 +740,9 @@ fn directory_and_file_naming_is_uniform_within_each_namespace() {
                 // （`terminalThemes-D55_FX1d.js`），本仓改不了也不该改 —— 与排除 `target/`、
                 // `node_modules/`、`src-tauri/gen/` 同理。这不是「为了变绿开的白名单」，
                 // 是取材面本来就不该包含它。
-                if child_rel == "resources/dashboard" {
+                // Downloaded core notices likewise preserve upstream paths. Prune only
+                // the four exact legal roots; all other resources stay in scope.
+                if child_rel == "resources/dashboard" || is_downloaded_core_legal_root(&child_rel) {
                     continue;
                 }
                 if path.is_dir() {
@@ -685,6 +759,10 @@ fn directory_and_file_naming_is_uniform_within_each_namespace() {
                     stack.push((path, child_rel));
                     continue;
                 }
+                if registered_python_module(&child_rel) {
+                    python_seen.insert(child_rel);
+                    continue;
+                }
                 if name.contains('_') {
                     kebab_side.push(format!("  {child_rel}（文件名含 `_`）"));
                 }
@@ -692,6 +770,14 @@ fn directory_and_file_naming_is_uniform_within_each_namespace() {
         }
     }
 
+    let expected: BTreeSet<String> = PYTHON_MODULE_FILES
+        .iter()
+        .map(|p| (*p).to_owned())
+        .collect();
+    assert_eq!(
+        python_seen, expected,
+        "Python namespace entries must remain actual files"
+    );
     assert!(
         rust_side.is_empty(),
         "Rust 模块命名空间里出现了 `-`（模块名必须是合法标识符，`-` 编不过；\

@@ -8,12 +8,25 @@ repository.workspace = true
 [dependencies]
 tokio = { version = "1", features = ["process", "rt", "net", "sync", "time", "macros", "io-util"] }
 thiserror = "2"
+log = "0.4"
 
 # Existing locked implementations, only for Linux immutable preparation.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", features = ["fs"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 sha2 = "0.11"
+
+# Windows 进程接口：作业对象（直起的核随主程序一起结束）与孤儿清扫的进程枚举 / 命令行读取。
+# 与 helper / src-tauri 同一个 windows-sys 版本；仅 cfg(windows) 参与编译。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Wdk_System_Threading",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["process", "rt", "rt-multi-thread", "net", "sync", "time", "macros", "io-util", "test-util"] }

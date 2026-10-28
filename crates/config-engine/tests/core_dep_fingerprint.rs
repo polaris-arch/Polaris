@@ -2,32 +2,20 @@
 //!
 //! # 为什么需要这一道（本门的第一个也是唯一的现存消费点：`sing-tun` 的 DNS 模式默认值）
 //!
-//! 本仓的 DNS 截获**完全建立在一个上游默认值上**，而那个默认值我们从不写进配置：
-//!
-//! - `route.rules` 里一条 `port:[53] + action:"hijack-dns"`（`builder/route.rs`），
-//!   配一个哨兵 IP `CONTROLLED_TUN_DNS_IP = 8.8.8.8`（`user_config/dns_constants.rs`，
-//!   **故意排除出 `BOOTSTRAP_DIRECT_DNS_IPS`**，否则被直连放行就逃逸了劫持）。
-//! - tun inbound 里**不发** `dns_mode` ⇒ 用的是 sing-tun 的默认值。
-//!   定版源码（`sing-tun@v0.9.0-beta.4` `tun.go:127-132`）：
-//!   `func (o *Options) DNSModeOrDefault() string { if o.DNSMode == "" { return DNSModeHijack } … }`
-//!
-//! 即：**默认是 `hijack`，我们整套 DNS 分流就靠它**。上游哪天把默认改成 `native`，
-//! 生成的配置一个字节都不变、`sing-box check` 照样 rc=0、全仓单测照样全绿，而用户侧的表现是
-//! **能上网但分流失效**（DNS 不再进规则引擎 ⇒ FakeIP / 国内外分流 / dns-race 全部旁路）。
-//! 这正是本仓反复吃亏的那类「看起来正常」的失败。
-//!
-//! # 为什么是「钉依赖版本」而不是「把 `dns_mode: hijack` 写进配置」
-//!
-//! 写进配置看着更直接，但代价在金样：`fixtures/config-snapshot.json` 是 **上游 4.2.6 冻结的
-//! parity 基线**（`golden_config_snapshot.rs` 开头明文「只重生、不手改」），而 上游侧不发这个键。
-//! 加一个 Polaris-only 的键 ⇒ 每个 TUN 场景当场 delta，且**永远无法靠重生对齐**（重生一次回来一次）。
-//! 为一个假想风险换掉一道真门的可信度，不划算。
-//!
-//! 于是判据挪到**依赖指纹**上：核一 bump，`sing-tun` 版本串必变 ⇒ 本门红 ⇒ 人被迫回去看一眼
-//! `DNSModeOrDefault` 的默认值还是不是 `hijack`，确认后才更新下面的常量。
-//! **判据独立于被检查的那个值** —— 这是 `28f5d46` 修 cronet go.mod 对拍时立下的同一条：
-//! 同一类坏味道曾出现在 Cronet：把待发现的依赖版本再写进 manifest 当新鲜度判据。现在 Cronet 版本
-//! 只从随包 sing-box tag 的 `go.mod` 解析，manifest 只保留库本体 SHA-256 pin。
+//! 当前契约（2026-10-10，候选适配；发布门仍关闭）：
+//! - route 的 port53/hijack-dns、哨兵与 bootstrap 直连顺序不变。
+//! - 已知 desktop TUN auto_route=false 显式发 typed hijack；true/缺席仍 true 且省略 dns_mode。
+//! - mobile alpha.8、未知平台和非 TUN 不发新键；原 37 金样不改。
+//! - 精确审计候选为 D052297f735b80bdae5b2536ef2a07d04979a0511 的
+//!   sing-tun v0.9.7-0.20261009022811-5c2edb183cc9，模块 ZIP
+//!   h1:VBWPwC1CM/9ULXCtl120Nh64tmjFsybhBvB3IWzF+Mc=；tun.go 的空模式
+//!   只在 AutoRoute=true 返回 hijack，false 返回 disabled。后面的旧版审计是历史记录。
+//! - 新版 Windows configure 去掉两处 AutoRoute guard；直接显式 hijack 会把旧 false
+//!   的 SetDNS(family,nil,nil) 改为派生 server，故必须由 source owner 恢复 IPv4/IPv6 guard
+//!   和 else nil，保留外部配置 bypass、family/error/Start 边界，并交真实调用代码的 mock 矩阵。
+//!   EMPTY mode 也必须覆盖 true→derived / false→nil；mock 和 check 都不是设备验收。
+//! - 本文件保留旧严格版本 pin。新 source/tagObject/replacement/receipt 未签收，不猜填、不放行。
+//!   仅候选生成测试绿不能发布；最终版本、替换模块及 hash 从新真实 receipt 取，再重新审默认。
 //!
 //! # 射程（自曝，别把绿读大）
 //!
@@ -58,7 +46,8 @@ const GATE_NAME: &str = "依赖指纹门未完整执行";
 /// 随包核当前使用的 `sing-tun` 版本。
 ///
 /// 🔴 **改这个常量之前，先做这件事**：去读该版本 `tun.go` 的 `DNSModeOrDefault()`，
-/// 确认 `o.DNSMode == ""` 时返回的仍是 `DNSModeHijack`。取源码的路径（符号表被剥时仍可用）：
+/// 按平台和 AutoRoute 审计空模式默认及 OS 副作用；true 默认必须仍为 hijack，
+/// false 必须由显式模式与已签源码保持旧契约。取源码的路径（符号表被剥时仍可用）：
 ///
 /// ```text
 /// go version -m <随包核>                     # 读出 sing-tun 的确切版本（伪版本带 commit）
@@ -184,6 +173,333 @@ fn extract_dep_version(bin: &[u8], module: &str) -> Option<String> {
     std::str::from_utf8(&rest[..end]).ok().map(str::to_owned)
 }
 
+// Decode only Go 1.18+ inline BuildInfo, not arbitrary plaintext in the binary.
+// Format/framing comes from installed Go debug/buildinfo and cmd/go/modload.
+#[derive(Debug)]
+struct EmbeddedReplacement {
+    path: String,
+    version: String,
+    h1: String,
+}
+
+#[derive(Debug)]
+struct EmbeddedModule {
+    kind: String,
+    version: String,
+    replacement: Option<EmbeddedReplacement>,
+}
+
+#[derive(Debug)]
+struct EmbeddedIdentity {
+    go_version: String,
+    modules: std::collections::BTreeMap<String, EmbeddedModule>,
+    settings: std::collections::BTreeMap<String, String>,
+}
+
+fn inline_string<'a>(bin: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], &'static str> {
+    let mut len = 0u64;
+    let mut terminated = false;
+    for shift in (0..70).step_by(7) {
+        let byte = *bin.get(*cursor).ok_or("truncated inline string length")?;
+        *cursor += 1;
+        if shift == 63 && byte > 1 {
+            return Err("overflow inline string length");
+        }
+        len |= u64::from(byte & 127) << shift;
+        if byte < 128 {
+            terminated = true;
+            break;
+        }
+    }
+    if !terminated || len > 1024 * 1024 {
+        return Err("invalid inline string length");
+    }
+    let end = cursor
+        .checked_add(len as usize)
+        .ok_or("inline string overflow")?;
+    let data = bin.get(*cursor..end).ok_or("truncated inline string")?;
+    *cursor = end;
+    Ok(data)
+}
+
+// Go h1 checksums are canonical base64 encodings of a 32-byte module hash.
+// Parsing the shape does not authorize its value: the existing release/candidate
+// verifier compares the complete module graph and original bytes to the receipt.
+fn module_h1_checksum(sum: &str) -> bool {
+    let Some(encoded) = sum.strip_prefix("h1:") else {
+        return false;
+    };
+    let bytes = encoded.as_bytes();
+    bytes.len() == 44
+        && bytes[43] == b'='
+        && bytes[..43]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/'))
+        && b"AEIMQUYcgkosw048".contains(&bytes[42])
+}
+
+fn embedded_identity(bin: &[u8]) -> Result<EmbeddedIdentity, &'static str> {
+    const MAGIC: &[u8] = b"\xff Go buildinf:";
+    const START: &[u8] = &[
+        0x30, 0x77, 0xaf, 0x0c, 0x92, 0x74, 0x08, 0x02, 0x41, 0xe1, 0xc1, 0x07, 0xe6, 0xd6, 0x18,
+        0xe6,
+    ];
+    const END: &[u8] = &[
+        0xf9, 0x32, 0x43, 0x31, 0x86, 0x18, 0x20, 0x72, 0x00, 0x82, 0x42, 0x10, 0x41, 0x16, 0xd8,
+        0xf2,
+    ];
+    let headers: Vec<_> = bin
+        .windows(MAGIC.len())
+        .enumerate()
+        .filter_map(|(at, value)| {
+            let header = bin.get(at..at + 32)?;
+            (value == MAGIC
+                && at.is_multiple_of(16)
+                && header[14] == 8
+                && header[15] & 2 == 2
+                && header[15] <= 3
+                && header[16..].iter().all(|byte| *byte == 0))
+            .then_some(at)
+        })
+        .collect();
+    if headers.len() != 1 {
+        return Err("missing/duplicate inline Go BuildInfo");
+    }
+    let mut cursor = headers[0] + 32;
+    let go_version = std::str::from_utf8(inline_string(bin, &mut cursor)?)
+        .map_err(|_| "invalid Go version")?
+        .to_owned();
+    let framed = inline_string(bin, &mut cursor)?;
+    if framed.len() < 33
+        || !framed.starts_with(START)
+        || !framed.ends_with(END)
+        || framed[framed.len() - 17] != b'\n'
+    {
+        return Err("invalid module framing");
+    }
+    let info =
+        std::str::from_utf8(&framed[16..framed.len() - 16]).map_err(|_| "invalid module text")?;
+    let mut result = EmbeddedIdentity {
+        go_version,
+        modules: Default::default(),
+        settings: Default::default(),
+    };
+    let mut previous: Option<String> = None;
+    for line in info.split_terminator('\n') {
+        let parts: Vec<_> = line.split('\t').collect();
+        match parts[0] {
+            "mod" | "dep" => {
+                if !(3..=4).contains(&parts.len())
+                    || parts[1].is_empty()
+                    || parts[2].is_empty()
+                    || result.modules.contains_key(parts[1])
+                {
+                    return Err("duplicate/malformed module");
+                }
+                result.modules.insert(
+                    parts[1].to_owned(),
+                    EmbeddedModule {
+                        kind: parts[0].to_owned(),
+                        version: parts[2].to_owned(),
+                        replacement: None,
+                    },
+                );
+                previous = Some(parts[1].to_owned());
+            }
+            "=>" => {
+                let key = previous.take().ok_or("unbound replacement")?;
+                if !(3..=4).contains(&parts.len()) || parts[1].is_empty() {
+                    return Err("malformed replacement");
+                }
+                let sum = parts.get(3).copied().unwrap_or("");
+                // fe182's original four-platform BuildInfo contains both local
+                // (devel) replacements with an empty sum and a versioned
+                // tailscale module replacement with its h1 sum. Keep the forms
+                // distinct; never discard a nonempty sum to make a row local.
+                if parts[2] == "(devel)" {
+                    if !sum.is_empty() {
+                        return Err("malformed local replacement");
+                    }
+                } else if !parts[2].starts_with('v')
+                    || parts[2].len() == 1
+                    || parts[2].chars().any(char::is_whitespace)
+                    || parts[1].starts_with(['.', '/', '\\'])
+                    || parts[1].chars().any(char::is_whitespace)
+                    || !module_h1_checksum(sum)
+                {
+                    return Err("malformed versioned replacement");
+                }
+                let module = result
+                    .modules
+                    .get_mut(&key)
+                    .ok_or("missing replacement module")?;
+                if module.replacement.is_some() {
+                    return Err("duplicate replacement");
+                }
+                module.replacement = Some(EmbeddedReplacement {
+                    path: parts[1].to_owned(),
+                    version: parts[2].to_owned(),
+                    h1: sum.to_owned(),
+                });
+            }
+            "build" => {
+                if parts.len() != 2 {
+                    return Err("malformed build setting");
+                }
+                let (key, value) = parts[1].split_once('=').ok_or("invalid build setting")?;
+                if key.is_empty() || result.settings.contains_key(key) {
+                    return Err("duplicate build setting");
+                }
+                let value = if value.starts_with('"') {
+                    serde_json::from_str::<String>(value)
+                        .map_err(|_| "invalid quoted build setting")?
+                } else {
+                    value.to_owned()
+                };
+                result.settings.insert(key.to_owned(), value);
+                previous = None;
+            }
+            "path" if parts.len() == 2 && !parts[1].is_empty() => {
+                previous = None;
+            }
+            "" if line.is_empty() => {
+                previous = None;
+            }
+            _ => return Err("unsupported BuildInfo row"),
+        }
+    }
+    Ok(result)
+}
+
+fn verify_desktop_embedded_identity(
+    bytes: &[u8],
+    source: &serde_json::Value,
+    spec: &serde_json::Value,
+    receipt: &serde_json::Value,
+    observed_build_id: &str,
+) -> Result<(), &'static str> {
+    let declared = spec["sourceOwnedReplacements"]
+        .as_array()
+        .ok_or("missing source-owned declaration")?;
+    if declared.len() != 1
+        || source["sourceOwnedReplacements"] != spec["sourceOwnedReplacements"]
+        || receipt["sourceOwnedReplacements"] != spec["sourceOwnedReplacements"]
+        || source["schema"] != "polaris-desktop-fork-source-v1"
+        || source["role"] != "desktop"
+        || !matches!(
+            source["sourceURL"].as_str(),
+            Some(
+                "https://github.com/polaris-arch/polaris-box"
+                    | "https://github.com/polaris-arch/sing-box-polaris"
+            )
+        )
+        || source["sourceTagObject"]
+            .as_str()
+            .is_none_or(|value| !hex_pin(value, 40))
+        || source["sourceCommit"]
+            .as_str()
+            .is_none_or(|value| !hex_pin(value, 40))
+        || source["sourceTree"] != spec["buildTree"]
+        || spec["sourceMode"] != "fork-commit-v1"
+        || receipt["schema"] != "polaris-desktop-core-v1"
+        || receipt["version"] != spec["version"]
+        || receipt["sourceFingerprint"] != spec["sourceReceiptFingerprint"]
+        || receipt["sourceReceipt"]["sourceCommit"] != source["sourceCommit"]
+    {
+        return Err("source-owned receipt/source identity differs");
+    }
+    let identity = embedded_identity(bytes)?;
+    if identity.go_version
+        != format!(
+            "go{}",
+            source["goVersion"].as_str().ok_or("missing toolchain")?
+        )
+    {
+        return Err("embedded toolchain differs");
+    }
+    let roots: Vec<_> = identity
+        .modules
+        .iter()
+        .filter(|(_, value)| value.kind == "mod")
+        .collect();
+    if roots.len() != 1
+        || roots[0].0 != "github.com/sagernet/sing-box"
+        || roots[0].1.replacement.is_some()
+        || identity.settings.get("vcs.revision").map(String::as_str)
+            != source["sourceCommit"].as_str()
+        || identity.settings.get("vcs.modified").map(String::as_str) != Some("false")
+    {
+        return Err("embedded unique root/clean VCS differs");
+    }
+    let dep = &declared[0];
+    if dep["module"] != SING_TUN_MODULE || dep["replacementPath"] != "./third_party/sing-tun" {
+        return Err("source-owned module/path differs");
+    }
+    let actual = identity
+        .modules
+        .get(SING_TUN_MODULE)
+        .ok_or("missing linked sing-tun")?;
+    if actual.kind != "dep"
+        || Some(actual.version.as_str()) != dep["version"].as_str()
+        || actual.replacement.as_ref().map(|replacement| {
+            (
+                replacement.path.as_str(),
+                replacement.version.as_str(),
+                replacement.h1.as_str(),
+            )
+        }) != Some(("./third_party/sing-tun", "(devel)", ""))
+        || identity
+            .modules
+            .iter()
+            .any(|(module, value)| value.replacement.is_some() && module != SING_TUN_MODULE)
+    {
+        return Err("embedded unique source-owned replacement differs");
+    }
+    let fingerprint = receipt["platformInputFingerprint"]
+        .as_str()
+        .ok_or("missing platform input")?;
+    let build_id = format!("polaris-desktop-source-v1-{fingerprint}");
+    // Go omits -ldflags from BuildInfo with -trimpath. Reuse the existing
+    // consumer's static Go buildid reader; never execute the target kernel.
+    if !hex_pin(fingerprint, 64) || receipt["buildID"] != build_id || observed_build_id != build_id
+    {
+        return Err("actual production BuildID differs");
+    }
+    Ok(())
+}
+
+fn verify_release_dependency(
+    bytes: &[u8],
+    declared: &serde_json::Value,
+) -> Result<(), &'static str> {
+    let identity = embedded_identity(bytes)?;
+    let actual = identity
+        .modules
+        .get(SING_TUN_MODULE)
+        .ok_or("missing published sing-tun")?;
+    if declared["module"] != SING_TUN_MODULE
+        || declared["version"].as_str() != Some(actual.version.as_str())
+        || actual.kind != "dep"
+        || actual.replacement.as_ref().map(|replacement| {
+            (
+                replacement.path.as_str(),
+                replacement.version.as_str(),
+                replacement.h1.as_str(),
+            )
+        }) != Some(("./third_party/sing-tun", "(devel)", ""))
+    {
+        return Err("published sing-tun dependency/replacement differs");
+    }
+    Ok(())
+}
+
+fn hex_pin(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[test]
 fn bundled_core_still_uses_the_pinned_sing_tun() {
     let present = present_cores();
@@ -200,10 +516,168 @@ fn bundled_core_still_uses_the_pinned_sing_tun() {
         eprintln!("⚠ 依赖指纹门只看到部分平台，未覆盖的平台本轮没有被检查。");
     }
 
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("src-tauri/core-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let desktop = &manifest["desktopSourceBuild"];
+    let owned_mode = desktop.get("sourceOwnedReplacements").is_some();
     for (core, path) in &present {
+        // Emit from Rust: Command::output captures the verifier's own stderr until exit.
+        let stage_started = |stage: &str| {
+            eprintln!(
+                "CORE_DEP_FINGERPRINT platform={} stage={stage} event=start",
+                core.key
+            );
+            std::time::Instant::now()
+        };
+        let stage_finished = |stage: &str, started: std::time::Instant| {
+            eprintln!(
+                "CORE_DEP_FINGERPRINT platform={} stage={stage} event=done elapsed_ms={}",
+                core.key,
+                started.elapsed().as_millis()
+            );
+        };
+        let started = stage_started("read-core");
         let bytes =
             std::fs::read(path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
+        stage_finished("read-core", started);
 
+        if std::env::var_os("POLARIS_NATIVE_DNS_CANDIDATE").is_some()
+            || manifest.get("desktopTemporary").is_some()
+        {
+            // Explicit manual validation or the committed temporary desktop default.
+            // The same verifier rechecks source, bytes and the full graph.
+            let inspected = std::process::Command::new("node")
+                .args(["--input-type=module", "-e", "import {verifyCandidatePayload} from './scripts/desktop-core/native-dns-candidate.mjs'; import {releaseSingTunDependency} from './scripts/desktop-core/release-consumer.mjs'; const p=verifyCandidatePayload(process.cwd(),process.argv[1],process.argv[2]); console.log(JSON.stringify(releaseSingTunDependency(p.row)));"])
+                .arg(core.key)
+                .arg(path)
+                .current_dir(repo_root())
+                .output()
+                .expect("Node candidate dependency verifier required");
+            assert!(
+                inspected.status.success(),
+                "{}: candidate dependency verification failed: {}",
+                core.key,
+                String::from_utf8_lossy(&inspected.stderr)
+            );
+            let declared: serde_json::Value = serde_json::from_slice(&inspected.stdout)
+                .expect("Candidate dependency row must be JSON");
+            verify_release_dependency(&bytes, &declared)
+                .unwrap_or_else(|error| panic!("{}: {error}", core.key));
+            continue;
+        }
+        if manifest.get("desktopRelease").is_some() {
+            // The existing release verifier checks the exact public contract, App
+            // adapter/receipt, original bytes, full module graph and actual BuildID.
+            // It observes native Mac signatures on Mac; no foreign core is run.
+            let started = stage_started("release-verify");
+            let inspected = std::process::Command::new("node")
+                .args(["--input-type=module", "-e", "import fs from 'node:fs'; import {loadReleaseContract,verifyPackagedRelease,releaseSingTunDependency} from './scripts/desktop-core/release-consumer.mjs'; const root=process.cwd(), m=JSON.parse(fs.readFileSync('src-tauri/core-manifest.json')), key=process.argv[1], core=process.argv[2], c=loadReleaseContract(root,m); verifyPackagedRelease(root,m,key,core); console.log(JSON.stringify(releaseSingTunDependency(c.platforms[key])));"])
+                .arg(core.key)
+                .arg(path)
+                .current_dir(repo_root())
+                .output()
+                .expect("Node release dependency verifier required");
+            assert!(
+                inspected.status.success(),
+                "{}: published dependency verification failed: {}",
+                core.key,
+                String::from_utf8_lossy(&inspected.stderr)
+            );
+            let declared: serde_json::Value = serde_json::from_slice(&inspected.stdout)
+                .expect("Release dependency row must be JSON");
+            stage_finished("release-verify", started);
+            let started = stage_started("embedded-scan");
+            verify_release_dependency(&bytes, &declared)
+                .unwrap_or_else(|error| panic!("{}: {error}", core.key));
+            stage_finished("embedded-scan", started);
+            continue;
+        }
+        if owned_mode {
+            let source: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(
+                    repo_root().join("scripts/desktop-core/source-manifest.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let metadata = repo_root().join("resources/.source-receipts");
+            let receipt: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(metadata.join(format!("{}.json", core.key))).unwrap(),
+            )
+            .unwrap();
+            let bundle: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(metadata.join("bundle.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                bundle["platforms"]
+                    .as_object()
+                    .is_some_and(|platforms| platforms.len() == 4),
+                "strict four-core receipt inventory required"
+            );
+            assert_eq!(receipt["platform"], core.key);
+            assert_eq!(receipt["candidate"], bundle["candidate"]);
+            let context = &receipt["producerContext"];
+            assert_eq!(context["repository"], "polaris-arch/Polaris");
+            assert_eq!(context["repositoryId"], "1347028220");
+            assert_eq!(context["candidate"], bundle["candidate"]);
+            for field in ["runId", "runAttempt"] {
+                assert!(
+                    context[field]
+                        .as_str()
+                        .is_some_and(|v| v.parse::<u64>().is_ok_and(|n| n > 0)),
+                    "producer context missing: {field}"
+                );
+            }
+            if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+                for (field, env) in [
+                    ("runId", "GITHUB_RUN_ID"),
+                    ("runAttempt", "GITHUB_RUN_ATTEMPT"),
+                    ("workflowRef", "GITHUB_WORKFLOW_REF"),
+                    ("workflowHead", "GITHUB_SHA"),
+                    ("ref", "GITHUB_REF"),
+                    ("event", "GITHUB_EVENT_NAME"),
+                ] {
+                    assert_eq!(
+                        context[field].as_str(),
+                        std::env::var(env).ok().as_deref(),
+                        "current producer context differs: {field}"
+                    );
+                }
+            }
+            if bundle["schema"] == "polaris-desktop-validation-bundle-v2" {
+                assert_eq!(bundle["mode"], "source-owned-all-current-v1");
+                let mut origin = context.clone();
+                origin["kind"] = "current-native".into();
+                assert_eq!(
+                    bundle["origins"][core.key], origin,
+                    "old native attempt cannot be relabeled"
+                );
+            } else {
+                assert_eq!(bundle["schema"], "polaris-desktop-bundle-v1");
+            }
+            let buildid = std::process::Command::new("go")
+                .args(["tool", "buildid"])
+                .arg(path)
+                .env("GOTOOLCHAIN", "local")
+                .env("GOWORK", "off")
+                .env("GOENV", "off")
+                .output()
+                .expect("static Go buildid reader required; target core is not executed");
+            assert!(
+                buildid.status.success(),
+                "{}: static BuildID read failed",
+                core.key
+            );
+            let actual_build_id = std::str::from_utf8(&buildid.stdout)
+                .expect("Go BuildID must be UTF-8")
+                .trim();
+            verify_desktop_embedded_identity(&bytes, &source, desktop, &receipt, actual_build_id)
+                .unwrap_or_else(|error| panic!("{}: {error}", core.key));
+            continue;
+        }
         // 提不出来 = 本门失效（Go 换了 modinfo 编码 / 核被 strip 得更狠 / 拿到的不是 Go 二进制）。
         // 这种情况必须**红**而不是跳过 —— 否则本门会从「守着依赖」静静退化成「永远绿」。
         let actual = extract_dep_version(&bytes, SING_TUN_MODULE).unwrap_or_else(|| {
@@ -220,11 +694,12 @@ fn bundled_core_still_uses_the_pinned_sing_tun() {
              ⚠ 只有这一格不符时，其余平台那几份仍是 pin 住的版本 —— 那更可能是\
              「升核只重拉了部分平台」，而不是上游换了依赖：先看 `node scripts/fetch-core.mjs`\
              是不是漏了 `--platform`（不传该 flag = 全平台）。\n\
-             本仓的 DNS 截获依赖 sing-tun 的 `DNSModeOrDefault()` 默认值为 `hijack`\
-             （tun inbound 刻意不下发 `dns_mode`）。默认值一变，生成的配置一字节不动、\
-             `sing-box check` 照样 rc=0，而用户侧表现是「能上网但分流失效」。\n\
-             ⇒ 先读新版 `tun.go` 的 `DNSModeOrDefault()` 确认默认仍是 `DNSModeHijack`，\
-             再更新 core_dep_fingerprint.rs 的 SING_TUN_PINNED。取源码路径见该常量的文档注释。\n",
+             桌面 TUN auto_route=false 显式下发 typed dns_mode:hijack；true/缺省保持 true 且省略该键，\
+             仍依赖精确审计的默认值。mobile alpha.8、未知平台和非 TUN 不发新键。\n\
+             ⇒ 按平台/AutoRoute 复核新版 DNSModeOrDefault() 与调用副作用；Windows 必须先签收\
+             IPv4/IPv6 AutoRoute guards、else SetDNS(family,nil,nil) 及实际调用 mock 矩阵，\
+             保留 external bypass/family/error/Start 边界。源码/tagObject/replacement/hash/receipt\
+             未定不得猜填，不能只更新 SING_TUN_PINNED 放行；实际门仍保持严格四核版本检查。\n",
             core.key, core.rel
         );
     }
@@ -266,4 +741,318 @@ fn ci_step_still_wired() {
         "package.yml 里找不到 `--test core_dep_fingerprint` —— 打包腿没在跑依赖指纹门，\
          缺核时它会静静跳过而没人知道"
     );
+}
+
+/// Pending-source release lock, not a claim about OS behavior. Remove/update only
+/// together with independently signed corrected source/dependency receipt/tests.
+#[test]
+fn candidate_d_dns_dependency_has_not_been_release_authorized() {
+    let candidate = b"dep\tgithub.com/sagernet/sing-tun\tv0.9.7-0.20261009022811-5c2edb183cc9\th1:VBWPwC1CM/9ULXCtl120Nh64tmjFsybhBvB3IWzF+Mc=\n";
+    let version = extract_dep_version(candidate, SING_TUN_MODULE).unwrap();
+    assert_ne!(
+        version, SING_TUN_PINNED,
+        "unmodified D must remain blocked pending Windows source fix"
+    );
+    let source: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("scripts/desktop-core/source-manifest.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    if source.get("sourceOwnedReplacements").is_none() {
+        assert_eq!(source["sourceCommit"], "052297f735b80bdae5b2536ef2a07d04979a0511", "source changed: re-audit exact dependency/default/Windows contract before changing this lock");
+    }
+}
+
+fn framed_identity_fixture(info: &str) -> Vec<u8> {
+    fn append(bytes: &mut Vec<u8>, data: &[u8]) {
+        let mut size = data.len();
+        while size >= 128 {
+            bytes.push((size as u8 & 127) | 128);
+            size >>= 7;
+        }
+        bytes.push(size as u8);
+        bytes.extend_from_slice(data);
+    }
+    let mut bytes = vec![0u8; 32];
+    bytes[..14].copy_from_slice(b"\xff Go buildinf:");
+    bytes[14] = 8;
+    bytes[15] = 2;
+    append(&mut bytes, b"go1.25.5");
+    let mut framed = vec![
+        0x30, 0x77, 0xaf, 0x0c, 0x92, 0x74, 0x08, 0x02, 0x41, 0xe1, 0xc1, 0x07, 0xe6, 0xd6, 0x18,
+        0xe6,
+    ];
+    framed.extend_from_slice(info.as_bytes());
+    framed.extend_from_slice(&[
+        0xf9, 0x32, 0x43, 0x31, 0x86, 0x18, 0x20, 0x72, 0x00, 0x82, 0x42, 0x10, 0x41, 0x16, 0xd8,
+        0xf2,
+    ]);
+    append(&mut bytes, &framed);
+    bytes
+}
+
+#[test]
+fn source_owned_embedded_identity_rejects_plaintext_and_broken_framing() {
+    let info = "path\tgithub.com/sagernet/sing-box/cmd/sing-box\nmod\tgithub.com/sagernet/sing-box\tv0.0.0-fixture\ndep\tgithub.com/sagernet/sing-tun\tv0.9.7-fixture\n=>\t./third_party/sing-tun\t(devel)\n\nbuild\tvcs.modified=false\n";
+    let bytes = framed_identity_fixture(info);
+    assert_eq!(
+        embedded_identity(&bytes).unwrap().modules[SING_TUN_MODULE]
+            .replacement
+            .as_ref()
+            .unwrap()
+            .path,
+        "./third_party/sing-tun"
+    );
+    assert!(embedded_identity(info.as_bytes()).is_err());
+    assert!(embedded_identity(&bytes[..bytes.len() - 1]).is_err());
+    let mut bad = bytes.clone();
+    *bad.last_mut().unwrap() ^= 1;
+    assert!(embedded_identity(&bad).is_err());
+    let mut duplicate = bytes.clone();
+    while !duplicate.len().is_multiple_of(16) {
+        duplicate.push(0);
+    }
+    duplicate.extend_from_slice(&bytes);
+    assert!(embedded_identity(&duplicate).is_err());
+    for extra in [
+        "dep\tgithub.com/sagernet/sing-tun\tv9\n",
+        "build\tvcs.modified=true\n",
+        "=>\t./arbitrary\t(devel)\n",
+    ] {
+        assert!(embedded_identity(&framed_identity_fixture(&format!("{info}{extra}"))).is_err());
+    }
+}
+
+#[test]
+fn source_owned_embedded_identity_requires_exact_root_replacement_vcs_and_build_identity() {
+    let commit = "c".repeat(40);
+    let fp = "f".repeat(64);
+    let source_fp = "a".repeat(64);
+    let declaration = serde_json::json!([{ "module": SING_TUN_MODULE, "version": "v0.9.7-fixture", "replacementPath": "./third_party/sing-tun" }]);
+    let source = serde_json::json!({ "schema": "polaris-desktop-fork-source-v1", "role": "desktop", "sourceURL": "https://github.com/polaris-arch/polaris-box",
+      "sourceTagObject": "b".repeat(40), "sourceCommit": commit, "sourceTree": "d".repeat(40), "goVersion": "1.25.5", "sourceOwnedReplacements": declaration });
+    let spec = serde_json::json!({ "sourceMode": "fork-commit-v1", "sourceOwnedReplacements": declaration, "buildTree": "d".repeat(40), "version": "1.0.0.polaris.1", "sourceReceiptFingerprint": source_fp });
+    let receipt = serde_json::json!({ "schema": "polaris-desktop-core-v1", "version": "1.0.0.polaris.1", "sourceOwnedReplacements": declaration, "sourceFingerprint": source_fp,
+      "sourceReceipt": {"sourceCommit": commit}, "platformInputFingerprint": fp, "buildID": format!("polaris-desktop-source-v1-{fp}") });
+    let info = format!("path\tgithub.com/sagernet/sing-box/cmd/sing-box\nmod\tgithub.com/sagernet/sing-box\tv0.0.0-fixture\ndep\t{SING_TUN_MODULE}\tv0.9.7-fixture\n=>\t./third_party/sing-tun\t(devel)\n\nbuild\tvcs.revision={commit}\nbuild\tvcs.modified=false\nbuild\t-trimpath=true\n");
+    let actual_build_id = format!("polaris-desktop-source-v1-{fp}");
+    verify_desktop_embedded_identity(
+        &framed_identity_fixture(&info),
+        &source,
+        &spec,
+        &receipt,
+        &actual_build_id,
+    )
+    .unwrap();
+    let mut migrated_source = source.clone();
+    migrated_source["sourceURL"] =
+        serde_json::json!("https://github.com/polaris-arch/sing-box-polaris");
+    verify_desktop_embedded_identity(
+        &framed_identity_fixture(&info),
+        &migrated_source,
+        &spec,
+        &receipt,
+        &actual_build_id,
+    )
+    .unwrap();
+    for url in [
+        "https://github.com/polaris-arch/sing-box-polaris/",
+        "https://github.com/polaris-arch/sing-box-polaris-other",
+    ] {
+        migrated_source["sourceURL"] = serde_json::json!(url);
+        assert!(verify_desktop_embedded_identity(
+            &framed_identity_fixture(&info),
+            &migrated_source,
+            &spec,
+            &receipt,
+            &actual_build_id,
+        )
+        .is_err());
+    }
+    for changed in [
+        info.replace("sing-box\tv0", "sing-box-extra\tv0"),
+        info.replace("(devel)", "v1"),
+        info.replace("./third_party/sing-tun", "/absolute/sing-tun"),
+        info.replace("vcs.modified=false", "vcs.modified=true"),
+        info.replace(&commit, &"e".repeat(40)),
+        info.replace("v0.9.7-fixture", "v0.9.8-fixture"),
+        format!("{info}mod\texample.com/workspace\tv0.0.0\n"),
+        format!("{info}dep\texample.com/extra\tv1\n=>\t./extra\t(devel)\n"),
+    ] {
+        assert!(verify_desktop_embedded_identity(
+            &framed_identity_fixture(&changed),
+            &source,
+            &spec,
+            &receipt,
+            &actual_build_id
+        )
+        .is_err());
+    }
+    for id in [
+        format!("polaris-dns-technical-v1-{fp}"),
+        String::new(),
+        format!("polaris-desktop-source-v1-{}", "e".repeat(64)),
+    ] {
+        assert!(verify_desktop_embedded_identity(
+            &framed_identity_fixture(&info),
+            &source,
+            &spec,
+            &receipt,
+            &id
+        )
+        .is_err());
+    }
+    let mut wrong_version = receipt.clone();
+    wrong_version["version"] = "candidate".into();
+    assert!(verify_desktop_embedded_identity(
+        &framed_identity_fixture(&info),
+        &source,
+        &spec,
+        &wrong_version,
+        &actual_build_id
+    )
+    .is_err());
+    let mut technical = receipt.clone();
+    technical["schema"] = "polaris-dns-technical-native-v1".into();
+    assert!(verify_desktop_embedded_identity(
+        &framed_identity_fixture(&info),
+        &source,
+        &spec,
+        &technical,
+        &actual_build_id
+    )
+    .is_err());
+}
+
+#[test]
+fn published_dependency_still_rejects_wrong_version_path_and_missing_modinfo() {
+    let declared = serde_json::json!({"module": SING_TUN_MODULE, "version": "v0.9.7-fixture"});
+    let info = "path\tgithub.com/sagernet/sing-box/cmd/sing-box\nmod\tgithub.com/sagernet/sing-box\tv0.0.0-fixture\ndep\tgithub.com/sagernet/sing-tun\tv0.9.7-fixture\n=>\t./third_party/sing-tun\t(devel)\n\nbuild\tvcs.modified=false\n";
+    assert!(verify_release_dependency(&framed_identity_fixture(info), &declared).is_ok());
+    for bad in [
+        info.replace("v0.9.7-fixture", "v0.9.8-fixture"),
+        info.replace("./third_party/sing-tun", "./other"),
+        info.replace("(devel)", "v1.0.0"),
+        info.replace(
+            "github.com/sagernet/sing-tun",
+            "github.com/sagernet/sing-tun-extra",
+        ),
+    ] {
+        assert!(verify_release_dependency(&framed_identity_fixture(&bad), &declared).is_err());
+    }
+    assert!(verify_release_dependency(info.as_bytes(), &declared).is_err());
+}
+
+// Exact replacement rows shared by all four fe182 native candidate archives.
+// Ordinary dependencies/build settings are omitted only from this parser fixture;
+// production still checks the entire receipt-bound graph before this Rust gate.
+fn native_candidate_replacement_fixture() -> &'static str {
+    concat!(
+        "path\tgithub.com/sagernet/sing-box/cmd/sing-box\n",
+        "mod\tgithub.com/sagernet/sing-box\tv1.15.0-polaris-alpha.12\t\n",
+        "dep\tgithub.com/metacubex/utls\tv1.8.8\n",
+        "=>\t./third_party/metacubex-utls\t(devel)\t\n\n",
+        "dep\tgithub.com/sagernet/sing-tun\tv0.9.7-0.20261013140216-9ffa5391a2ad\n",
+        "=>\t./third_party/sing-tun\t(devel)\t\n\n",
+        "dep\tgithub.com/sagernet/tailscale\tv1.102.1-sing-box-1.14-mod.5.0.20260925112514-35e61219dedd\n",
+        "=>\tgithub.com/polaris-arch/tailscale\tv1.102.1-sing-box-1.14-mod.5.0.20261016043520-2f8810107046\th1:+7AyRBB7rvyU/QQ7eOQuGvLxmPF3kA7O/r+ar0I1X50=\n\n",
+    )
+}
+
+#[test]
+fn published_dependency_accepts_native_candidate_mixed_replacements() {
+    let info = native_candidate_replacement_fixture();
+    let bytes = framed_identity_fixture(info);
+    let identity = embedded_identity(&bytes).unwrap();
+    assert_eq!(identity.modules.len(), 4);
+    for (module, path, version, h1) in [
+        (
+            "github.com/metacubex/utls",
+            "./third_party/metacubex-utls",
+            "(devel)",
+            "",
+        ),
+        (SING_TUN_MODULE, "./third_party/sing-tun", "(devel)", ""),
+        (
+            "github.com/sagernet/tailscale",
+            "github.com/polaris-arch/tailscale",
+            "v1.102.1-sing-box-1.14-mod.5.0.20261016043520-2f8810107046",
+            "h1:+7AyRBB7rvyU/QQ7eOQuGvLxmPF3kA7O/r+ar0I1X50=",
+        ),
+    ] {
+        let actual = identity.modules[module].replacement.as_ref().unwrap();
+        assert_eq!(actual.path, path);
+        assert_eq!(actual.version, version);
+        assert_eq!(actual.h1, h1);
+    }
+    let declared = serde_json::json!({
+        "module": SING_TUN_MODULE,
+        "version": "v0.9.7-0.20261013140216-9ffa5391a2ad",
+        "h1": "",
+    });
+    verify_release_dependency(&bytes, &declared).unwrap();
+    // Local rows without Go's trailing empty sum field remain supported.
+    verify_release_dependency(
+        &framed_identity_fixture(&info.replace("(devel)\t\n", "(devel)\n")),
+        &declared,
+    )
+    .unwrap();
+    for changed in [
+        info.replace("9ffa5391a2ad", "000000000000"),
+        info.replace("./third_party/sing-tun", "./third_party/sing-tun-extra"),
+        info.replace("=>\t./third_party/sing-tun\t(devel)\t\n", ""),
+        info.replace(
+            "=>\t./third_party/sing-tun\t(devel)\t",
+            "=>\tgithub.com/polaris-arch/sing-tun\tv1.0.0\th1:+7AyRBB7rvyU/QQ7eOQuGvLxmPF3kA7O/r+ar0I1X50=",
+        ),
+    ] {
+        // These are parseable graphs, but none can replace the exact local pin.
+        assert!(embedded_identity(&framed_identity_fixture(&changed)).is_ok());
+        assert!(verify_release_dependency(&framed_identity_fixture(&changed), &declared).is_err());
+    }
+}
+
+#[test]
+fn embedded_replacements_reject_malformed_checksums_and_unbound_rows() {
+    let sum = "h1:+7AyRBB7rvyU/QQ7eOQuGvLxmPF3kA7O/r+ar0I1X50=";
+    let dep = "dep\tgithub.com/sagernet/tailscale\tv1.0.0\n";
+    let replacement = format!("=>\tgithub.com/polaris-arch/tailscale\tv1.0.1\t{sum}\n");
+    let info = format!("{dep}{replacement}");
+    assert!(embedded_identity(&framed_identity_fixture(&info)).is_ok());
+    for changed in [
+        info.replace(sum, ""),
+        info.replace(&format!("\t{sum}"), ""),
+        info.replace(sum, "h1:AAAA="),
+        info.replace("h1:", "h2:"),
+        info.replace("X50=", "X50!"),
+        info.replace("X50=", "X51="), // Noncanonical base64 padding bits.
+        info.replace("+7Ay", "_7Ay"),
+        info.replace("\tv1.0.1\t", "\t(devel)\t"),
+        info.replace("\tv1.0.1\t", "\t\t"),
+        info.replace("\tv1.0.1\t", "\tv\t"),
+        info.replace("\tv1.0.1\t", "\tv1.0.1 extra\t"),
+        info.replace(
+            "github.com/polaris-arch/tailscale",
+            "./third_party/tailscale",
+        ),
+        info.replace("github.com/polaris-arch/tailscale", ""),
+        info.replace(sum, &format!("{sum}\textra")),
+        format!("{info}{replacement}"),
+        format!("{dep}\n{replacement}"),
+        format!("{dep}build\tvcs.modified=false\n{replacement}"),
+        replacement,
+    ] {
+        assert!(
+            embedded_identity(&framed_identity_fixture(&changed)).is_err(),
+            "malformed or unbound replacement was accepted: {changed:?}"
+        );
+    }
+    let local = "dep\tgithub.com/sagernet/sing-tun\tv0.9.7-fixture\n=>\t./third_party/sing-tun\t(devel)\t\n";
+    for changed in [
+        local.replace("(devel)\t", &format!("(devel)\t{sum}")),
+        local.replace("(devel)", "v1.0.0"),
+        local.replace("(devel)", ""),
+    ] {
+        assert!(embedded_identity(&framed_identity_fixture(&changed)).is_err());
+    }
 }

@@ -11,13 +11,42 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      preserve_run:
+        description: 固定源码审计不被后续 tip 取消
+        type: boolean
+        default: false
+      mode:
+        type: choice
+        options: [ordinary, native-payload]
+        default: ordinary
+        required: true
+      apple_include_simulator:
+        description: 'ordinary 验证额外编译 sim-arm64 App/PacketTunnel；不能与 defer_apple 同用'
+        type: boolean
+        default: false
+      defer_apple:
+        description: '临时只验证非Apple；Apple未验证，完整风险门仍不通过，不发布产物'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+# 同一 PR / 同一分支上，新提交取消旧提交的在途运行（2026-10-07 复核并收口）。
+#
+# 🔴 此前「新一批 pending 到旧一批结束」的成因**不在本段**：本段早就对 PR 与 main 写了取消。
+#    真正让取消落空的是 package.yml 的 package job 用 `always()` 作状态函数 —— 取消时 GitHub 对在途
+#    job 重新求值 `if`，恒真的不取消，四条打包腿（各 14–25 分钟）照跑到底，新跑在本并发组里干等。
+#    已在那边改成 `!cancelled()`（实证与 run 号写在该 job 的 `if` 上方）。只改本段修不了那个现象。
+#
+# Automatic PR/main/ordinary dispatch tips are replaceable. Explicit fixed
+# audits and merge groups use independent run IDs throughout reusable calls;
+# publishing tag paths remain outside this workflow. Cancellation must reach
+# nested installer/mobile jobs without bypassing their required result gates.
 concurrency:
-  group: release-risk-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+  group: release-risk-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}${{ (inputs.preserve_run || github.event.inputs.preserve_run == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && format('-fixed-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'merge_group' && !inputs.preserve_run && github.event.inputs.preserve_run != 'true' && (github.event_name == 'pull_request' || github.event_name == 'push') }}
 
 jobs:
   pc_runtime_release_policy:
@@ -40,9 +69,34 @@ jobs:
       preflight: ${{ steps.impact.outputs.preflight }}
       has_package: ${{ steps.impact.outputs.has_package }}
       android: ${{ steps.impact.outputs.android }}
+      apple: ${{ steps.impact.outputs.apple }}
       unregistered: ${{ steps.impact.outputs.unregistered }}
       candidate: ${{ github.event.pull_request.head.sha || github.sha }}
+      native_validation: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'native-payload' && 'true' || 'false' }}
     steps:
+      - name: Validate manual Apple simulator scope
+        if: github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator
+        shell: bash
+        env:
+          VALIDATION_MODE: ${{ inputs.mode }}
+          APPLE_DEFERRED: ${{ inputs.defer_apple && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          [ "$VALIDATION_MODE" = ordinary ] && [ "$APPLE_DEFERRED" = false ] || {
+            echo '::error::Simulator opt-in requires ordinary validation without Apple deferral'; exit 1; }
+      - name: Validate manual Apple deferral scope
+        if: github.event_name == 'workflow_dispatch' && inputs.defer_apple
+        shell: bash
+        env:
+          VALIDATION_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # Reuse the existing no-upload/light-build and tag-only publication
+          # guards below. Deferral cannot enter a tag publication DAG.
+          case "$VALIDATION_REF" in
+            refs/heads/?*) ;;
+            *) echo '::error::Apple deferral is validation-only on an explicit branch'; exit 1 ;;
+          esac
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -50,6 +104,20 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '26'
+
+      # tomllib is standard-library only on Python 3.11+; never inherit runner defaults.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Verify Python and Cargo configuration parser
+        run: |
+          python3 - <<'PYTHON'
+          import sys, tomllib
+          print('Apple evidence Python:', sys.version, sys.executable)
+          print('Cargo configuration parser:', tomllib.__file__)
+          if sys.version_info[:2] != (3, 12) or tomllib.loads('[profile.release]\nopt-level=3')['profile']['release']['opt-level'] != 3:
+              raise SystemExit('Python 3.12 with working standard-library tomllib is required')
+          PYTHON
 
       - name: Install SquashFS fixture tools
         run: |
@@ -75,8 +143,24 @@ jobs:
           PUSH_HEAD: ${{ github.sha }}
           DISPATCH_REF: ${{ github.ref }}
           DISPATCH_SHA: ${{ github.sha }}
+          POLARIS_NATIVE_PAYLOAD_VALIDATION: ${{ inputs.mode == 'native-payload' && '1' || '0' }}
+          POLARIS_APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}
         run: |
           set -euo pipefail
+          # Technical payload mode is explicit, branch-only and never publishing.
+          if [ "$POLARIS_NATIVE_PAYLOAD_VALIDATION" = 1 ]; then
+            node --input-type=module -e 'import {validationContext} from "./scripts/desktop-core/validation-origin.mjs"; validationContext(process.env.DISPATCH_SHA)'
+            {
+              echo 'kernel=false'
+              echo 'platforms=[]'
+              echo 'preflight=false'
+              echo 'has_package=false'
+              echo 'android=false'
+              echo 'apple=false'
+              echo 'unregistered='
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           base=''
           head=''
           case "$EVENT_NAME" in
@@ -99,15 +183,23 @@ jobs:
           esac
 
           result="$RUNNER_TEMP/release-impact.json"
+          apple_result="$RUNNER_TEMP/apple-impact.txt"
           if [ -n "$base" ] && [ -n "$head" ] \
             && git cat-file -e "${base}^{commit}" 2>/dev/null \
             && git cat-file -e "${head}^{commit}" 2>/dev/null; then
             git diff --name-only -z "$base" "$head" | node scripts/classify-ci-impact.mjs > "$result"
+            git diff --name-only -z "$base" "$head" | node scripts/apple-ci-impact.mjs > "$apple_result"
           else
             echo "无法取得可靠 diff，故障关闭为内核门 + 四平台。"
             node scripts/classify-ci-impact.mjs --full > "$result"
+            node scripts/apple-ci-impact.mjs --full < /dev/null > "$apple_result"
           fi
 
+          # Explicit simulator opt-in selects the Apple leg even for an empty
+          # path diff; requested validation cannot silently disappear.
+          if [ "${POLARIS_APPLE_INCLUDE_SIMULATOR:-false}" = true ]; then
+            printf 'true\n' > "$apple_result"
+          fi
           jq . "$result"
           {
             echo "kernel=$(jq -r '.kernel' "$result")"
@@ -115,23 +207,58 @@ jobs:
             echo "preflight=$(jq -r '.preflight' "$result")"
             echo "has_package=$(jq -r '.hasPackage' "$result")"
             echo "android=$(jq -r '.android' "$result")"
+            echo "apple=$(cat "$apple_result")"
             echo "unregistered=$(jq -r '.unregisteredScopes | join(" ")' "$result")"
           } >> "$GITHUB_OUTPUT"
 
   desktop_core:
     name: four native source producers
     needs: classify
-    if: needs.classify.outputs.preflight == 'true'
+    if: needs.classify.outputs.preflight == 'true' || needs.classify.outputs.native_validation == 'true'
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/desktop-core.yml
     with:
+      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       candidate: ${{ needs.classify.outputs.candidate }}
+      native_validation: ${{ needs.classify.outputs.native_validation == 'true' }}
+
+  native_payload:
+    name: reviewed Linux Windows native final payload
+    needs: [classify, desktop_core]
+    if: needs.classify.outputs.native_validation == 'true'
+    permissions:
+      contents: write # reusable publishing DAG declaration; branch guard keeps it unreachable
+      actions: read # ceiling for nested desktop-core assembler; no new write grant
+    uses: ./.github/workflows/package.yml
+    with:
+      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
+      platforms: '["linux","windows"]'
+      skip_quality_gates: true
+      run_kernel_gates: true
+      upload_artifacts: true
+      light_build: false
+      native_validation: true
+      core_candidate: ${{ needs.classify.outputs.candidate }}
+      core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}
+    secrets: inherit
 
   preflight:
     name: static packaging + bundled core gate
     needs: [classify, desktop_core]
     if: needs.classify.outputs.preflight == 'true'
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    outputs:
+      core_wire_input_artifact: ${{ steps.wire-inputs.outputs.artifact_name }}
+      core_wire_input_artifact_id: ${{ steps.wire-upload.outputs.artifact-id }}
+      core_wire_input_artifact_digest: ${{ steps.wire-upload.outputs.artifact-digest }}
     steps:
+      - name: Set absolute release-consumer job deadline
+        shell: bash
+        run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "POLARIS_RELEASE_JOB_DEADLINE_MS=" + (Date.now() + 119 * 60000) + "\n")'
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.classify.outputs.candidate }}
@@ -141,10 +268,10 @@ jobs:
         with:
           node-version: '26'
 
-      - name: Read Windows core toolchain pin
+      - name: Read pinned source Go version
         id: core-go
         shell: bash
-        run: node -e 'console.log("version=" + require("./src-tauri/core-manifest.json").windowsBuild.goVersion)' >> "$GITHUB_OUTPUT"
+        run: node --input-type=module -e 'import { readFileSync } from "node:fs"; import { desktopSourceGoVersion } from "./scripts/desktop-core/source-graph.mjs"; console.log("version=" + desktopSourceGoVersion(process.cwd(), JSON.parse(readFileSync("src-tauri/core-manifest.json", "utf8"))))' >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
         with:
@@ -159,6 +286,7 @@ jobs:
 
       - name: Fetch sing-box core
         env:
+          POLARIS_RELEASE_API_TOKEN: ${{ github.token }}
           CORE_CANDIDATE: ${{ needs.classify.outputs.candidate }}
           CORE_BUNDLE: ${{ runner.temp }}/desktop-core-bundle
         run: node scripts/fetch-core.mjs --bundle-dir="$CORE_BUNDLE" --candidate="$CORE_CANDIDATE"
@@ -189,11 +317,14 @@ jobs:
         run: node scripts/fetch-protoc.mjs
 
       # 只读四平台 core descriptor，不启动 sing-box；REQUIRE 仅作用于本步。
+      # 判据与宿主无关，全 workflow 跑一次即可：package.yml 那侧自 2026-10-07 起也只在它的
+      # `core_wire` job 里跑一次（不再每条打包腿各跑一遍）。本步保留，覆盖「命中内核但没有
+      # 任何打包腿被选中」的情形，并且排在打包之前先给出归因更窄的失败。
       - name: Bundled core gRPC wire contract (all platforms)
         if: needs.classify.outputs.kernel == 'true'
         env:
           POLARIS_REQUIRE_KERNEL_GATE: '1'
-        run: cargo test -p polaris-singbox-grpc --test bundled_core_wire vendored_proto_matches_every_bundled_core -- --exact
+        run: node scripts/desktop-core/wire-input-handoff.mjs wire --bundle-dir="$RUNNER_TEMP/preflight-wire-result.json" --candidate="${{ needs.classify.outputs.candidate }}"
 
       # release-risk 的真核门只在 Ubuntu 跑：只需 Linux SO；两个 go.mod 依赖仍由脚本交叉校验。
       - name: Fetch cronet library (Linux)
@@ -207,9 +338,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p polaris-config-engine --test core_dep_fingerprint
-          cargo test -p polaris-config-engine --test core_schema_surface
-          cargo test -p polaris-config-engine --test core_build_matrix
+          # Metadata inspection only, distinct from the native C API/final-payload proof.
+          # Retain the actual consumed core binding before the first runtime probe.
+          mkdir -p native-payload-evidence
+          node scripts/native-payload-input.mjs linux "$PWD/resources/linux/sing-box" "$PWD/resources/linux/libcronet.so" > native-payload-evidence/runtime-input-linux.json
+          node -e 'const i=JSON.parse(require("node:fs").readFileSync("native-payload-evidence/runtime-input-linux.json")); console.log("WG_RUNTIME_CORE_INPUT="+JSON.stringify({core:i.core,sourceCommit:i.producer?.sourceCommit,sourceTree:i.producer?.sourceTree,scope:"actual metadata binding; no runtime/device acceptance"}))'
+          cargo test -p polaris-config-engine \
+            --test core_dep_fingerprint \
+            --test core_schema_surface \
+            --test core_build_matrix
           cargo test -p polaris-config-engine --test kernel_accepts_outbounds
           cargo test -p polaris-config-engine --test kernel_accepts_full_config
           cargo test -p polaris-mesh --test tailscale_login_kernel_check
@@ -221,6 +358,30 @@ jobs:
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_subscription_protocol_parity_round_trips_through_the_bundled_core -- --exact
           cargo test -p polaris-net-stack --lib singbox_import::tests::remote_openvpn_static_key_mode_omits_tls_and_checks_with_core -- --exact
 
+      # Carry checked resources within this exact candidate/run/attempt. The
+      # downstream core_wire verifies the exact checked input and successful
+      # wire command/tool binding, without repeating HTTP or the wire test. Other Package entry points remain independent.
+      - name: Prepare current-attempt wire inputs
+        id: wire-inputs
+        if: needs.classify.outputs.has_package == 'true'
+        shell: bash
+        env:
+          CORE_CANDIDATE: ${{ needs.classify.outputs.candidate }}
+          WIRE_INPUTS: ${{ runner.temp }}/core-wire-inputs
+          WIRE_RESULT_PATH: ${{ needs.classify.outputs.kernel == 'true' && format('{0}/preflight-wire-result.json', runner.temp) || '' }}
+        run: node scripts/desktop-core/wire-input-handoff.mjs create --bundle-dir="$WIRE_INPUTS" --candidate="$CORE_CANDIDATE" --wire-result="$WIRE_RESULT_PATH"
+
+      - name: Upload current-attempt wire inputs
+        id: wire-upload
+        if: steps.wire-inputs.outputs.artifact_name != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.wire-inputs.outputs.artifact_name }}
+          path: ${{ runner.temp }}/core-wire-inputs
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   package:
     name: package selected platforms
     needs: [classify, preflight, desktop_core]
@@ -230,14 +391,24 @@ jobs:
     # 权限只给这一个复用 job；被调 workflow 的构建 job 仍由其顶层 permissions 收窄为 contents: read。
     permissions:
       contents: write
+      actions: read
     uses: ./.github/workflows/package.yml
     with:
+      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
       platforms: ${{ needs.classify.outputs.platforms }}
       skip_quality_gates: true
       run_kernel_gates: false
       upload_artifacts: false
+      # 轻量构型（不做 fat LTO、并行 codegen）：风险门验的是「打包链通不通、包里齐不齐」，
+      # 不是发行二进制的体积。产物不是可分发物；与 `upload_artifacts: false` 必须成对出现
+      # （package.yml 的 `Select installer build weight` 步对「轻量 + 上传」当场红）。
+      # 风险门因此**不再验** fat LTO 链接本身，那只在 tag / 手动全量的发行构建上暴露。
+      light_build: true
       core_candidate: ${{ needs.classify.outputs.candidate }}
       core_bundle_artifact: ${{ needs.desktop_core.outputs.artifact_name }}
+      core_wire_input_artifact: ${{ needs.preflight.outputs.core_wire_input_artifact }}
+      core_wire_input_artifact_id: ${{ needs.preflight.outputs.core_wire_input_artifact_id }}
+      core_wire_input_artifact_digest: ${{ needs.preflight.outputs.core_wire_input_artifact_digest }}
     secrets: inherit
 
   # ══ Android release-profile 产物腿 ══
@@ -256,14 +427,38 @@ jobs:
     permissions:
       contents: write
     uses: ./.github/workflows/android.yml
+    with:
+      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
+      # 轻量构型（Rust 侧不做 fat LTO、并行 codegen），与上面打包腿同一开关、同一取值。本腿验的是
+      # R8 证据 / 资源 / 原生库 / 16 KiB，没有一条取决于 Rust 的优化强度（逐条核对写在 android.yml
+      # 的 `release_check` 头注）。不传 `publish_release`：轻量 + 发布在被调方当场红。
+      # 风险门因此**不再验** Android 上的 fat LTO 链接本身，那只在 tag 的签名发布腿与手动 dispatch
+      # android.yml（发行构型）上暴露。
+      light_build: true
+
+  apple:
+    name: apple unsigned App and PacketTunnel gate
+    needs: classify
+    if: needs.classify.outputs.apple == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.defer_apple)
+    permissions:
+      contents: read
+      actions: read # Only Apple resolver/sealer jobs consume Actions metadata and original artifacts.
+    uses: ./.github/workflows/apple.yml
+    with:
+      allow_merge_reuse: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.classify.outputs.native_validation != 'true' }}
+      preserve_run: ${{ inputs.preserve_run || github.event.inputs.preserve_run == 'true' }}
+      candidate: ${{ needs.classify.outputs.candidate }}
+      include_simulator: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator }}
 
   gate:
     name: release risk gate
-    needs: [classify, desktop_core, preflight, package, android, pc_runtime_release_policy]
+    needs: [classify, desktop_core, preflight, package, android, apple, native_payload, pc_runtime_release_policy]
     if: always()
     runs-on: ubuntu-22.04
     env:
       CLASSIFY_RESULT: ${{ needs.classify.result }}
+      NATIVE_VALIDATION_REQUIRED: ${{ needs.classify.outputs.native_validation }}
+      NATIVE_VALIDATION_RESULT: ${{ needs.native_payload.result }}
       PC_RUNTIME_POLICY_RESULT: ${{ needs.pc_runtime_release_policy.result }}
       DESKTOP_CORE_REQUIRED: ${{ needs.classify.outputs.preflight }}
       DESKTOP_CORE_RESULT: ${{ needs.desktop_core.result }}
@@ -273,16 +468,29 @@ jobs:
       PACKAGE_RESULT: ${{ needs.package.result }}
       ANDROID_REQUIRED: ${{ needs.classify.outputs.android }}
       ANDROID_RESULT: ${{ needs.android.result }}
+      APPLE_REQUIRED: ${{ needs.classify.outputs.apple }}
+      APPLE_RESULT: ${{ needs.apple.result }}
+      APPLE_EVIDENCE_MODE: ${{ needs.apple.outputs.evidence_mode }}
+      APPLE_DEFERRED: ${{ github.event_name == 'workflow_dispatch' && inputs.defer_apple && 'true' || 'false' }}
+      APPLE_INCLUDE_SIMULATOR: ${{ github.event_name == 'workflow_dispatch' && inputs.apple_include_simulator && 'true' || 'false' }}
       UNREGISTERED: ${{ needs.classify.outputs.unregistered }}
     steps:
       - name: Require every selected release-risk leg
         shell: bash
         run: |
           set -euo pipefail
+          if [ "${APPLE_DEFERRED:-false}" = true ]; then
+            echo '::warning::APPLE_VALIDATION=NOT_VALIDATED; explicit temporary deferral, no Apple workflow/artifact import or publication'
+            printf '%s\n' 'Apple: **NOT_VALIDATED** (explicit temporary deferral).' 'Non-Apple checks still run; this is not complete candidate acceptance or publication clearance.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
           [ "$CLASSIFY_RESULT" = success ] || {
             echo "::error::影响分类失败：$CLASSIFY_RESULT"; exit 1; }
           [ "$PC_RUNTIME_POLICY_RESULT" = success ] || {
             echo "::error::PC runtime 发布阻断策略未通过：$PC_RUNTIME_POLICY_RESULT"; exit 1; }
+          if [ "$NATIVE_VALIDATION_REQUIRED" = true ]; then
+            [ "$DESKTOP_CORE_RESULT" = success ] && [ "$NATIVE_VALIDATION_RESULT" = success ] || {
+              echo '::error::native source/actual final payload proof did not pass'; exit 1; }
+          fi
           # 未登记的影响面（落在 crates/ 或 src-tauri/ 内、两张登记表都查不到的 scope）当场红并点名。
           # 为什么这条门开在这里，而不是只靠 ui.yml 的 vitest 完备性门：
           #   1) 独立性 —— ui.yml 挂了、被 skip、或 required check 集合被改，那条门就没牙；
@@ -310,4 +518,28 @@ jobs:
             echo "::error::Android APK 腿未通过：$ANDROID_RESULT"
             exit 1
           fi
-          echo "发布风险门通过：desktop_core=$DESKTOP_CORE_RESULT preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT"
+          if [ "${APPLE_DEFERRED:-false}" = true ]; then
+            echo 'Non-Apple selected legs passed; Apple remains NOT_VALIDATED. Full release risk gate is not passed.'
+            exit 1
+          fi
+          if [ "$APPLE_REQUIRED" = true ] && [ "$APPLE_RESULT" != success ]; then
+            echo "::error::Apple App/PacketTunnel 腿未通过：$APPLE_RESULT"
+            exit 1
+          fi
+          if [ "$APPLE_REQUIRED" = true ]; then
+            case "${APPLE_EVIDENCE_MODE:-}" in
+              reused)
+                [ "${APPLE_INCLUDE_SIMULATOR:-false}" = false ] || {
+                  echo '::error::Simulator validation cannot reuse device-only Apple evidence'; exit 1; }
+                printf '%s\n' 'Apple device-arm64: reused verified same-tree PR unsigned App + PacketTunnel compile/link evidence; no new compilation in this run.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}" ;;
+              rebuilt)
+                printf '%s\n' 'Apple device-arm64: unsigned App + PacketTunnel compile/link rebuilt and passed in this run.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}" ;;
+              *) echo '::error::Apple success lacks a verified evidence mode'; exit 1 ;;
+            esac
+            if [ "${APPLE_INCLUDE_SIMULATOR:-false}" = true ]; then
+              printf '%s\n' 'Apple sim-arm64: unsigned App + PacketTunnel compile/link passed (requested).' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            else
+              printf '%s\n' 'Apple sim-arm64: not requested.' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            fi
+          fi
+          echo "发布风险门通过：desktop_core=$DESKTOP_CORE_RESULT preflight=$PREFLIGHT_RESULT package=$PACKAGE_RESULT android=$ANDROID_RESULT apple=$APPLE_RESULT"

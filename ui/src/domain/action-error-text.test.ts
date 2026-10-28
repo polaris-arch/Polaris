@@ -9,6 +9,7 @@ const t = (key: string) => `translated:${key}`;
 
 describe('structured action error text', () => {
   it('stable helper code wins over any diagnostic', () => {
+    expect(helperActionErrorText('bundleMismatch', t)).toBe('translated:helper.actionError.bundleMismatch');
     expect(helperActionErrorText('missingAsset', t)).toBe('translated:helper.actionError.missingAsset');
     expect(helperActionErrorText('authorizationUnavailable', t)).toBe(
       'translated:helper.actionError.authorizationUnavailable'
@@ -16,6 +17,10 @@ describe('structured action error text', () => {
     expect(helperActionErrorText('proxyRunning', t)).toBe(
       'translated:helper.actionError.proxyRunning'
     );
+  });
+
+  it('partial cleanup stays separate from success or cancellation', () => {
+    expect(helperActionErrorText('partialCleanup', t)).toBe('translated:helper.actionError.partialCleanup');
   });
 
   it('unknown or future backup codes use a safe localized fallback', () => {
@@ -29,4 +34,8 @@ describe('structured action error text', () => {
     );
     expect(serverSwitchErrorText('futureCode', t)).toBe('translated:home.switchError');
   });
+});
+
+it('maps shared dependency conflicts to actionable localized backup copy', () => {
+  expect(backupErrorText('sharedDependencyConflict', t)).toBe('translated:backupImport.error.sharedDependencyConflict');
 });

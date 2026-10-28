@@ -517,6 +517,7 @@ export async function cssChain(ctx: CtxName): Promise<{ file: string; css: strin
 // ════════════════════════════════════════════════════════════════════════════
 
 interface Conn {
+  owned: Owned;
   child: ChildProcess;
   ws: WebSocket;
   dir: string;
@@ -570,6 +571,9 @@ export interface Owned {
   pid: number | undefined;
   dir: string;
   closed: boolean;
+  /** Keep the actual child handle: a PID alone can be reused after exit. */
+  child?: ChildProcess;
+  state?: 'not-started' | 'starting' | 'running' | 'exited' | 'failed';
 }
 const OWNED: Owned[] = [];
 
@@ -584,47 +588,99 @@ const OWNED: Owned[] = [];
  * （browser / zygote / gpu / network / renderer …），根退了子进程一般跟着退，但「根退了而子进程还在」
  * 这一档上一版是瞎的。现在按 profile 扫全树 —— 报出来的数就是宿主上真的还剩几个。
  */
-function pidsUnder(dir: string): number[] {
-  if (!existsSync('/proc')) return [];
-  const out: number[] = [];
-  for (const entry of readdirSync('/proc')) {
+type ProcessState = 'running' | 'gone' | 'unknown';
+type ProfileProcesses = { pids: number[]; complete: boolean };
+
+/** Injectable read-only observations for deterministic non-/proc regression cases. */
+export interface OracleProcessProbe {
+  profileProcesses: (dir: string) => ProfileProcesses | null;
+  pidState: (pid: number) => ProcessState;
+}
+
+function pidsUnder(dir: string): ProfileProcesses | null {
+  if (!existsSync('/proc')) return null; // absence is not evidence of exit
+  const pids: number[] = [];
+  let entries: string[];
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return { pids, complete: false };
+  }
+  let complete = true;
+  for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     try {
-      if (readFileSync(`/proc/${entry}/cmdline`, 'utf8').includes(dir)) out.push(Number(entry));
-    } catch {
-      /* 进程刚退 / 没权限 —— 都算不在 */
+      if (readFileSync(`/proc/${entry}/cmdline`, 'utf8').includes(dir)) pids.push(Number(entry));
+    } catch (error) {
+      // Vanished processes are fine; permission/I/O failures do not prove exit.
+      if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) complete = false;
     }
   }
-  return out.sort((a, b) => a - b);
+  return { pids: pids.sort((a, b) => a - b), complete };
 }
 
-/** 没有 `/proc` 的平台退化成存在性探针（信号 0 不投递，只做权限/存在检查）。 */
-function stillRunning(o: Owned): boolean {
-  if (existsSync('/proc')) return pidsUnder(o.dir).length > 0;
-  if (o.pid === undefined) return false;
-  try {
-    process.kill(o.pid, 0);
-    return true;
-  } catch {
-    return false;
+const PROCESS_PROBE: OracleProcessProbe = {
+  profileProcesses: pidsUnder,
+  pidState: (pid) => {
+    try {
+      process.kill(pid, 0); // existence/permission probe only; never deliver a signal
+      return 'running';
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ESRCH' ? 'gone' : 'unknown';
+    }
+  },
+};
+
+function rootProcessState(o: Owned, probe: OracleProcessProbe): ProcessState {
+  if (o.child !== undefined) {
+    if (o.child.exitCode != null || o.child.signalCode != null) return 'gone';
+    if (o.state === 'exited' || (o.state === 'failed' && o.child.pid === undefined)) return 'gone';
+    // The real ChildProcess owns the identity even if its PID has since been reused.
+    return o.child.pid === undefined ? 'unknown' : 'running';
   }
+  if (o.state === 'not-started' || o.state === 'failed' || o.state === 'exited') return 'gone';
+  return o.pid === undefined ? 'unknown' : probe.pidState(o.pid);
 }
 
-/** 本次运行启动过的浏览器 / 还没清掉的 profile。`liveBrowsers` 是**逐进程**的，不是逐实例的。 */
-export function oracleHygiene(): {
+function inspectOwned(o: Owned, probe: OracleProcessProbe): { state: ProcessState; pids: number[] } {
+  const root = rootProcessState(o, probe);
+  const tree = probe.profileProcesses(o.dir);
+  if (tree === null) return { state: root, pids: root === 'running' && o.pid !== undefined ? [o.pid] : [] };
+  if (tree.pids.length > 0) return { state: 'running', pids: tree.pids };
+  // On Linux a root exit never substitutes for the full profile-tree check.
+  if (!tree.complete) return { state: root === 'running' ? 'running' : 'unknown', pids: [] };
+  return { state: root, pids: [] };
+}
+
+export function ownedProcessState(o: Owned, probe: OracleProcessProbe = PROCESS_PROBE): ProcessState {
+  return inspectOwned(o, probe).state;
+}
+
+export interface OracleHygiene {
   started: number;
   liveBrowsers: { pid: number | undefined; dir: string }[];
   leftProfiles: string[];
-} {
-  const live: { pid: number | undefined; dir: string }[] = [];
-  for (const o of OWNED) {
-    if (existsSync('/proc')) for (const pid of pidsUnder(o.dir)) live.push({ pid, dir: o.dir });
-    else if (stillRunning(o)) live.push({ pid: o.pid, dir: o.dir });
+  unconfirmedBrowsers?: { pid: number | undefined; dir: string }[];
+}
+
+/** 本次运行启动过的浏览器 / 未证退出的实例 / 还没清掉的 profile。 */
+export function oracleHygiene(
+  owned: readonly Owned[] = OWNED,
+  probe: OracleProcessProbe = PROCESS_PROBE,
+): OracleHygiene {
+  const live: OracleHygiene['liveBrowsers'] = [];
+  const unconfirmed: NonNullable<OracleHygiene['unconfirmedBrowsers']> = [];
+  for (const o of owned) {
+    const observation = inspectOwned(o, probe);
+    for (const pid of observation.pids) live.push({ pid, dir: o.dir });
+    if (observation.state === 'running' && observation.pids.length === 0) live.push({ pid: o.pid, dir: o.dir });
+    if (observation.state === 'unknown') unconfirmed.push({ pid: o.pid, dir: o.dir });
   }
   return {
-    started: OWNED.length,
+    started: owned.length,
     liveBrowsers: live,
-    leftProfiles: OWNED.filter((o) => existsSync(o.dir)).map((o) => o.dir),
+    unconfirmedBrowsers: unconfirmed,
+    leftProfiles: owned.filter((o) => existsSync(o.dir)).map((o) => o.dir),
   };
 }
 
@@ -633,10 +689,11 @@ export function oracleHygiene(): {
  * `h` 可传入合成快照 —— 让「检漏器本身有没有牙」这条自己有正向对照（`css-oracle.test.ts` ⑧）。
  */
 export function assertNoOracleLeak(h = oracleHygiene()): void {
-  if (h.liveBrowsers.length === 0 && h.leftProfiles.length === 0) return;
+  if (h.liveBrowsers.length === 0 && h.leftProfiles.length === 0 && !h.unconfirmedBrowsers?.length) return;
   throw new Error(
     `CSS 裁判收尾没清干净（本次启动 ${h.started} 个）：\n` +
       h.liveBrowsers.map((b) => `    还活着：pid=${b.pid} profile=${b.dir}`).join('\n') +
+      (h.unconfirmedBrowsers ?? []).map((b) => `\n    未证退出：pid=${b.pid} profile=${b.dir}`).join('') +
       (h.liveBrowsers.length > 0 && h.leftProfiles.length > 0 ? '\n' : '') +
       h.leftProfiles.map((d) => `    profile 还在：${d}`).join('\n') +
       '\n本模块任何路径都不 kill 进程 —— 请退不掉就必须报出来，' +
@@ -680,13 +737,17 @@ export function browserWsUrl(dir: string): string | null {
   return ep === null ? null : `ws://127.0.0.1:${ep.port}${ep.path}`;
 }
 
-/** 轮询到该 profile 底下一个进程都不剩，或超时。**只读 `/proc`，不发信号**。 */
-async function waitGone(dir: string, timeoutMs: number): Promise<boolean> {
+/** Only positive exit evidence permits cleanup. Unknown observations wait or time out. */
+export async function waitGone(
+  owned: Owned,
+  timeoutMs: number,
+  probe: OracleProcessProbe = PROCESS_PROBE,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    if (pidsUnder(dir).length === 0) return true;
-    if (Date.now() > deadline) return false;
-    await sleep(50);
+    if (ownedProcessState(owned, probe) === 'gone') return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(Math.min(50, Math.max(0, deadline - Date.now())));
   }
 }
 
@@ -697,8 +758,8 @@ async function waitGone(dir: string, timeoutMs: number): Promise<boolean> {
  * 就抛了」这一档（端口文件半截、握手失败、`Target.createTarget` 报错…）留下的浏览器，模块自己
  * 永远回收不了。请退成功返回 `true`。全程不发信号。
  */
-async function requestExitViaProfile(dir: string): Promise<boolean> {
-  const url = browserWsUrl(dir);
+async function requestExitViaProfile(owned: Owned): Promise<boolean> {
+  const url = browserWsUrl(owned.dir);
   if (url === null) return false;
   let ws: WebSocket;
   try {
@@ -706,18 +767,19 @@ async function requestExitViaProfile(dir: string): Promise<boolean> {
   } catch {
     return false;
   }
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await new Promise<void>((res, rej) => {
       ws.onopen = () => res();
       ws.onerror = () => rej(new Error('重连 CDP 失败'));
-      setTimeout(() => rej(new Error('重连 CDP 超时')), 10_000);
+      timer = setTimeout(() => rej(new Error('重连 CDP 超时')), 10_000);
     });
     ws.send(CLOSE_FRAME);
-    await waitGone(dir, 10_000);
-    return true;
+    return await waitGone(owned, 10_000);
   } catch {
     return false;
   } finally {
+    if (timer !== undefined) clearTimeout(timer);
     try {
       ws.close();
     } catch {
@@ -731,32 +793,44 @@ async function requestExitViaProfile(dir: string): Promise<boolean> {
  * 导出是为了让「启动抛出时 profile 会被清掉」与「没有 ws 也请退得掉」两半各自有门
  * （`css-oracle.test.ts` ⑧ / ⑨）。**任何路径都不 kill 进程。**
  */
-export async function abandon(o: Owned, child: ChildProcess | undefined, ws: WebSocket | undefined): Promise<void> {
-  const alive = child === undefined ? pidsUnder(o.dir).length > 0 : child.exitCode === null;
-  if (alive) {
-    const exited = child === undefined ? null : new Promise<void>((res) => child.once('exit', () => res()));
-    let sent = false;
-    if (ws !== undefined && ws.readyState === ws.OPEN) {
-      try {
-        ws.send(CLOSE_FRAME);
-        sent = true;
-      } catch {
-        /* 连接已断 —— 落到下面的重连 */
-      }
-    }
-    // 没有 ws（或 ws 已断）⇒ 按 profile 里的端口重连一次再请退（第六轮 A2）。
-    if (!sent) sent = await requestExitViaProfile(o.dir);
-    if (sent) await Promise.race([exited ?? waitGone(o.dir, 10_000), sleep(10_000)]);
-  }
+export async function abandon(
+  o: Owned,
+  child: ChildProcess | undefined,
+  ws: WebSocket | undefined,
+  options: {
+    probe?: OracleProcessProbe;
+    requestExit?: (owned: Owned) => Promise<boolean>;
+    timeoutMs?: number;
+  } = {},
+): Promise<void> {
+  o.child ??= child;
+  const probe = options.probe ?? PROCESS_PROBE;
+  const requestExit = options.requestExit ?? requestExitViaProfile;
+  const timeoutMs = options.timeoutMs ?? 15_000;
   try {
-    ws?.close();
-  } catch {
-    /* 已断 */
+    if (ownedProcessState(o, probe) !== 'gone') {
+      let sent = false;
+      if (ws !== undefined && ws.readyState === ws.OPEN) {
+        try {
+          ws.send(CLOSE_FRAME);
+          sent = true;
+        } catch {
+          /* disconnected: retry using this owned profile's CDP endpoint */
+        }
+      }
+      if (sent) await waitGone(o, Math.min(timeoutMs, 10_000), probe);
+      if (ownedProcessState(o, probe) !== 'gone') await requestExit(o);
+    }
+  } finally {
+    try {
+      ws?.close();
+    } catch {
+      /* 已断 */
+    }
   }
-  // 🔴 删 profile 之前**等整棵进程树散干净**，不是瞄一眼就下结论。子进程比直接子进程晚退几十毫秒
-  // 是常态（并行跑时更明显），瞄一眼判成「还活着」就跳过删除，紧接着的自查却看到「进程没了、
-  // 目录还在」⇒ 报一次假漏。等，或者等到超时后如实留给自查点名。
-  if (await waitGone(o.dir, 15_000)) {
+  // Both normal shutdown and failed startup use this same exit gate. An absent
+  // /proc, disconnected CDP, rejected close, or permission error is not an exit.
+  if (await waitGone(o, timeoutMs, probe)) {
     rmSync(o.dir, { recursive: true, force: true });
     o.closed = true;
   }
@@ -794,12 +868,26 @@ export interface SpawnedBrowser {
  */
 export function spawnOwnedBrowser(): SpawnedBrowser {
   const dir = mkdtempSync('/var/tmp/polaris-css-oracle-');
-  const owned: Owned = { pid: undefined, dir, closed: false };
+  const owned: Owned = { pid: undefined, dir, closed: false, state: 'starting' };
   OWNED.push(owned);
-  const child = spawn(CHROME_BIN, [...CHROME_ARGS, `--user-data-dir=${dir}`, 'about:blank'], {
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
+  let child: ChildProcess;
+  try {
+    child = spawn(CHROME_BIN, [...CHROME_ARGS, `--user-data-dir=${dir}`, 'about:blank'], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+  } catch (error) {
+    owned.state = 'failed'; // synchronous spawn rejection: no child was created
+    rmSync(dir, { recursive: true, force: true });
+    owned.closed = true;
+    throw error;
+  }
+  owned.child = child;
   owned.pid = child.pid;
+  child.once('spawn', () => { owned.state = 'running'; });
+  child.once('exit', () => { owned.state = 'exited'; });
+  child.once('error', () => {
+    if (child.pid === undefined) owned.state = 'failed';
+  });
   const stderr: string[] = [];
   child.stderr?.on('data', (b: Buffer) => {
     stderr.push(String(b));
@@ -825,7 +913,7 @@ export async function waitForDevToolsEndpoint(
       const ep = parseDevToolsEndpoint(readFileSync(portFile, 'utf8'));
       if (ep !== null) return ep;
     }
-    if (b.child.exitCode !== null)
+    if (b.child.exitCode !== null || b.child.signalCode != null || b.owned.state === 'failed')
       throw new Error(`Chrome 起不来（退出码 ${b.child.exitCode}）：\n${b.stderr.join('')}`);
     if (Date.now() > deadline)
       throw new Error(`等 DevToolsActivePort 写全超时：\n${b.stderr.join('')}`);
@@ -884,7 +972,7 @@ async function launchInto(spawned: SpawnedBrowser, keepWs: (w: WebSocket) => voi
   // 子进程句柄不再钉住事件循环：收尾仍然只走 `Browser.close`（本模块任何路径都不 kill），
   // 但万一它退得慢，测试进程不必陪着它一起吊死。
   child.unref();
-  return { child, ws, dir, send };
+  return { owned, child, ws, dir, send };
 }
 
 async function conn(): Promise<Conn> {
@@ -945,29 +1033,11 @@ export async function closeOracle(): Promise<void> {
   CONN = null;
   OPENING = null;
   if (c !== null) {
-    const owned = OWNED.find((o) => o.dir === c.dir);
-    const gone = new Promise<void>((res) => c.child.once('exit', () => res()));
-    if (c.ws.readyState === c.ws.OPEN) {
-      // **不等应答**：`Browser.close` 的回包常常随连接一起消失。真正的完成信号是子进程退出。
-      void c.send('Browser.close').catch(() => undefined);
-      await Promise.race([gone, sleep(10_000)]);
-    }
-    try {
-      c.ws.close();
-    } catch {
-      /* 已断 */
-    }
-    // ws 已经断了（或请退没起效）而进程还在 ⇒ 按 profile 里的端口重连一次再请退（第六轮 A2）。
-    if (pidsUnder(c.dir).length > 0) await requestExitViaProfile(c.dir);
-    // 2. 确认退干净了再删 profile —— 还活着就把它的 profile 删掉，等于给一个活进程拆家。
-    //    **等整棵树散干净**再判（子进程比直接子进程晚退是常态，瞄一眼会判出一次假漏）。
-    if (await waitGone(c.dir, 15_000)) {
-      rmSync(c.dir, { recursive: true, force: true });
-      if (owned !== undefined) owned.closed = true;
-    }
+    // Share failure-path cleanup, including non-/proc child ownership and CDP retry.
+    await abandon(c.owned, c.child, c.ws);
     // 3. 「清干净了」也要有输出，否则它与「悄悄漏一个」在日志上长得一模一样。
     const h = oracleHygiene();
-    if (h.liveBrowsers.length === 0 && h.leftProfiles.length === 0)
+    if (h.liveBrowsers.length === 0 && h.leftProfiles.length === 0 && !h.unconfirmedBrowsers?.length)
       console.log(`[css-oracle] 收尾自查：本次启动 ${h.started} 个浏览器，已全部退出、profile 已删。`);
   }
   assertNoOracleLeak();
@@ -1049,7 +1119,7 @@ export const effectiveMedia = (media?: Readonly<Record<string, string>>): Record
  */
 export const SAMPLED_FACE = Object.freeze({
   /** `Emulation.setDeviceMetricsOverride` 的取值，写成 `宽x高@dpr`。 */
-  viewport: Object.freeze(['1280x800@1', '320x740@1', '390x844@1', '980x740@1']),
+  viewport: Object.freeze(['1280x800@1', '320x740@1', '390x844@1', '760x844@1', '980x740@1', '1100x844@1']),
   /** `Emulation.setEmulatedMedia` 的特性 → 取值集。**未列出的特性一律不覆写、也不许被问到颜色**。 */
   media: Object.freeze({
     'prefers-color-scheme': Object.freeze(['light', 'dark']),
@@ -1059,7 +1129,10 @@ export const SAMPLED_FACE = Object.freeze({
   /** `<html>` 上的属性 → 取值集（`lang` / `dir` 来自宿主 `.html`，其余来自调用点）。 */
   rootAttrs: Object.freeze({
     lang: Object.freeze(['en-US']),
-    dir: Object.freeze(['ltr']),
+    dir: Object.freeze(['ltr', 'rtl']),
+    style: Object.freeze(['font-size:16px', 'font-size:24px']),
+    'data-mobile-os': Object.freeze(['ios']),
+    'data-ios-horizontal-size-class': Object.freeze(['regular']),
     'data-theme': Object.freeze(['dark', 'light']),
     'data-os': Object.freeze(['win', 'lin', 'mac']),
   }) as Readonly<Record<string, readonly string[]>>,
@@ -1312,7 +1385,12 @@ export interface SampledPoint {
   bodyAttrs: Record<string, string>;
 }
 
+let coldMeasureReported = false;
+
 async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Measured> {
+  const reportCold = !coldMeasureReported;
+  coldMeasureReported = true;
+  const began = performance.now();
   if ((input.ctx === undefined) === (input.css === undefined))
     throw new Error('裁判必须显式给 `ctx`（desktop/mobile/tray/popup）**或** `css`（内存链），二选一。');
   if (asks.length === 0) throw new Error('一条都没问 —— 空判据。');
@@ -1323,8 +1401,9 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
     input.css !== undefined
       ? input.css.map((css, i) => ({ file: `<memory>#${i}`, css }))
       : await cssChain(input.ctx);
-
+  const cssReady = performance.now();
   const c = await conn();
+  const connected = performance.now();
   const vp = {
     width: input.viewport?.width ?? DEFAULT_VIEWPORT.width,
     height: input.viewport?.height ?? DEFAULT_VIEWPORT.height,
@@ -1386,6 +1465,7 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
   })()`;
   const html = buildDocument(input, chain);
   const { targetId } = (await c.send('Target.createTarget', { url: 'about:blank' })) as { targetId: string };
+  const targetReady = performance.now();
   let raw: RawResult;
   try {
     const { sessionId } = (await c.send('Target.attachToTarget', { targetId, flatten: true })) as { sessionId: string };
@@ -1411,7 +1491,15 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
     raw = JSON.parse(String(evaluated.result?.value)) as RawResult;
   } finally {
     // This request alone owns the page. Browser shutdown still drains every in-flight measure.
+    const closeBegan = performance.now();
     const closed = await c.send('Target.closeTarget', { targetId });
+    if (reportCold) console.log('[css-oracle] cold measure stages (ms):', {
+      css: Math.round(cssReady - began),
+      connection: Math.round(connected - cssReady),
+      target: Math.round(targetReady - connected),
+      measurement: Math.round(closeBegan - targetReady),
+      close: Math.round(performance.now() - closeBegan),
+    });
     if (closed.success !== true) throw new Error('CSS 裁判没有关闭本次度量的页面。');
   }
 

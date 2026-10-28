@@ -53,8 +53,6 @@ use crate::runtime::proxy::ProxyStatus;
 use polaris_singbox_grpc::{
     daemon, Endpoint, ReconnectConfig, ReconnectingStream, SingBoxApiClient,
 };
-#[cfg(not(target_os = "android"))]
-use serde_json::Value;
 
 use crate::runtime::config::ConfigManager;
 
@@ -168,21 +166,15 @@ pub(super) fn stream_label(port: u16) -> String {
 // 桌面腿：daemon gRPC
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// currentConfig.clashApiSecret（对齐 proxy.rs `management_api()` 的读法）。
+/// 管理 API 的 secret。取法的单点在 [`current_clash_api_secret`]，这里只委托。
 ///
 /// **整个函数 `cfg(not(android))`**：Android 的数据面不经过管理 API，也就没有 secret 可读。
-/// 留一个恒返空串的跨平台版本，等于给「Android 也在读管理 API」留了一处看起来无害的接线。
+/// 留一个跨平台版本，等于给「Android 也在读管理 API」留了一处看起来无害的接线。
+///
+/// [`current_clash_api_secret`]: crate::runtime::management_api::current_clash_api_secret
 #[cfg(not(target_os = "android"))]
 fn read_clash_secret(config: &ConfigManager) -> String {
-    config
-        .current()
-        .ok()
-        .and_then(|c| {
-            c.get("clashApiSecret")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
+    crate::runtime::management_api::current_clash_api_secret(config)
 }
 
 /// 连接事件长驻流（平台各自的传输，同一种帧）。

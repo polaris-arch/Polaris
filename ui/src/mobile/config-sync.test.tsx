@@ -29,6 +29,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { parse } from '@babel/parser';
 import { fileURLToPath } from 'node:url';
 import type { UserConfig } from '@/contracts/types';
 
@@ -71,7 +72,7 @@ vi.mock('@/ipc', () => ({
   api: {
     config: {
       get: () => getMock(),
-      onChanged: (cb: () => void) => onChangedMock(cb),
+      onChangedReady: async (cb: () => void) => onChangedMock(cb),
       setStagedPending: (pending: boolean) => setStagedPendingMock(pending),
     },
     window: { takeCleanExitFlag: () => takeCleanExitFlagMock() },
@@ -93,7 +94,7 @@ vi.mock('@/ipc', () => ({
 vi.mock('@/ipc/api-client', () => ({
   configApi: {
     get: () => getMock(),
-    onChanged: (cb: () => void) => onChangedMock(cb),
+    onChangedReady: async (cb: () => void) => onChangedMock(cb),
     patch: async (patch: Partial<UserConfig>) => ({ ...disk, ...patch }),
   },
   windowApi: { startupConfigFlags: () => startupConfigFlagsMock() },
@@ -202,11 +203,12 @@ describe('② 外部改动收敛：广播一到，store 追到盘上的新值', 
     off();
   });
 
-  it('订阅确实登记了一个**零形参**回调（无载荷信号，读它只会拿到 {}）', () => {
+  it('订阅确实登记了一个**零形参**回调（无载荷信号，读它只会拿到 {}）', async () => {
     const off = startConfigSync();
     expect(onChangedMock).toHaveBeenCalledTimes(1);
     expect(onChangedMock.mock.calls[0][0].length).toBe(0);
     off();
+    await vi.waitFor(() => expect(offSpy).toHaveBeenCalledTimes(1));
   });
 });
 
@@ -316,7 +318,7 @@ describe('⑥ hook 把 startConfigSync 交给了 useEffect，且依赖为空', (
   const CODE = strip(SRC).replace(/\s+/g, '');
 
   it('⓪ 取材面自检：源码非空、剥离器认得注释里的假形态', () => {
-    expect(SRC.length).toBeGreaterThan(2000);
+    expect(SRC.length).toBeGreaterThan(200);
     expect(CODE).toContain('exportfunctionstartConfigSync');
     expect(CODE).toContain('exportfunctionuseMobileConfigSync');
     // 注释里的同款形态不得被算进取材面（否则删掉真代码也能靠头注喂饱本判据）。
@@ -329,14 +331,72 @@ describe('⑥ hook 把 startConfigSync 交给了 useEffect，且依赖为空', (
     expect(CODE).toContain('useEffect(startConfigSync,[])');
   });
 
-  it('首拉不带 force、广播重拉必须带 force（非 force 会被在飞的那次单飞合并）', () => {
-    expect(CODE).toContain('loadConfig()');
-    expect(CODE).toContain('loadConfig(true)');
+  type Node = { type: string; [key: string]: unknown };
+  const node = (value: unknown): value is Node => typeof value === 'object' && value !== null
+    && 'type' in value && typeof value.type === 'string';
+  const id = (value: unknown, name: string): boolean => node(value) && value.type === 'Identifier' && value.name === name;
+  const literal = (value: unknown, text: string): boolean => node(value) && value.type === 'StringLiteral' && value.value === text;
+  /** Deliberately bounded: the exported root must return the real imported lease directly.
+   * A comment, shadowed import, discarded cleanup, or tray lease cannot satisfy this contract.
+   */
+  function ownsMainLease(source: string): boolean {
+    const ast = parse(source, { sourceType: 'module', plugins: ['typescript'] });
+    const body: Node[] = ast.program.body as unknown as Node[];
+    const imports = body.filter(item => item.type === 'ImportDeclaration' && literal(item.source, '@/store/app-store'));
+    const imported = imports.flatMap(item => Array.isArray(item.specifiers) ? item.specifiers.filter(node) : [])
+      .filter(item => item.type === 'ImportSpecifier' && id(item.imported, 'acquireConfigSync') && id(item.local, 'acquireConfigSync'));
+    const exports = body.filter(item => item.type === 'ExportNamedDeclaration' && node(item.declaration))
+      .map(item => item.declaration).filter(node);
+    const hooks = exports.filter(item => item.type === 'FunctionDeclaration' && id(item.id, 'useMobileConfigSync'));
+    const effects = body.filter(item => item.type === 'ImportDeclaration' && literal(item.source, 'react'))
+      .flatMap(item => Array.isArray(item.specifiers) ? item.specifiers.filter(node) : [])
+      .filter(item => item.type === 'ImportSpecifier' && id(item.imported, 'useEffect') && id(item.local, 'useEffect'));
+    if (effects.length !== 1 || hooks.length !== 1) return false;
+    const hook = hooks[0];
+    if (!Array.isArray(hook.params) || hook.params.length || !node(hook.body) || !Array.isArray(hook.body.body)
+      || hook.body.body.length !== 1) return false;
+    const statement = hook.body.body[0];
+    if (!node(statement) || statement.type !== 'ExpressionStatement' || !node(statement.expression)) return false;
+    const effect = statement.expression;
+    if (effect.type !== 'CallExpression' || !id(effect.callee, 'useEffect') || !Array.isArray(effect.arguments)
+      || effect.arguments.length !== 2 || !id(effect.arguments[0], 'startConfigSync')
+      || !node(effect.arguments[1]) || effect.arguments[1].type !== 'ArrayExpression'
+      || !Array.isArray(effect.arguments[1].elements) || effect.arguments[1].elements.length) return false;
+    const starts = exports.filter(item => item.type === 'FunctionDeclaration' && id(item.id, 'startConfigSync'));
+    if (imported.length !== 1 || starts.length !== 1) return false;
+    const start = starts[0];
+    if (!Array.isArray(start.params) || start.params.length || !node(start.body) || !Array.isArray(start.body.body)) return false;
+    const statements = start.body.body;
+    if (statements.length !== 1 || !node(statements[0]) || statements[0].type !== 'ReturnStatement') return false;
+    const call = statements[0].argument;
+    if (!node(call) || call.type !== 'CallExpression' || !id(call.callee, 'acquireConfigSync')
+      || !Array.isArray(call.arguments) || call.arguments.length !== 1) return false;
+    const options = call.arguments[0];
+    if (!node(options) || options.type !== 'ObjectExpression' || !Array.isArray(options.properties)
+      || options.properties.length !== 1) return false;
+    const scope = options.properties[0];
+    return node(scope) && scope.type === 'ObjectProperty' && scope.computed === false
+      && id(scope.key, 'scope') && literal(scope.value, 'main');
+  }
+
+  it('main lease AST contract rejects wrong scope, missing import and discarded cleanup', () => {
+    const good = "import { useEffect } from 'react'; export function useMobileConfigSync() { useEffect(startConfigSync, []); } import { acquireConfigSync } from '@/store/app-store'; export function startConfigSync() { return acquireConfigSync({scope:'main'}); }";
+    expect(ownsMainLease(good)).toBe(true);
+    expect(ownsMainLease(good.replace('useEffect(startConfigSync, [])', 'useEffect(() => {}, [])'))).toBe(false);
+    expect(ownsMainLease(good.replace('useEffect(startConfigSync, [])', 'useEffect(startConfigSync, [changing])'))).toBe(false);
+    expect(ownsMainLease(good.replace("from 'react'", "from './fake-react'"))).toBe(false);
+    expect(ownsMainLease(good.replace("scope:'main'", "scope:'tray'"))).toBe(false);
+    expect(ownsMainLease(good.replace("'@/store/app-store'", "'./fake'"))).toBe(false);
+    expect(ownsMainLease(good.replace('return acquire', 'acquire'))).toBe(false);
+    expect(ownsMainLease(good.replace("return acquireConfigSync({scope:'main'});", "/* return acquireConfigSync({scope:'main'}); */ return () => {};"))).toBe(false);
+    expect(ownsMainLease(good.replace('startConfigSync()', 'startConfigSync(acquireConfigSync)'))).toBe(false);
+    expect(ownsMainLease(good.replace("return acquireConfigSync({scope:'main'});", "const acquireConfigSync = fake; return acquireConfigSync({scope:'main'});"))).toBe(false);
   });
 
-  it('`.onChanged(` 恰好一处，且实参是零形参箭头（本文件不在 Rust 侧那张消费方表内，自守）', () => {
-    const sites = [...CODE.matchAll(/\.onChanged\(/g)];
-    expect(sites.length).toBe(1);
-    expect(CODE.slice(sites[0].index)).toMatch(/^\.onChanged\(\(\)=>/);
+  it('mobile root acquires the same main-scope feed and returns its cleanup', () => {
+    expect(ownsMainLease(SRC)).toBe(true);
+    expect(CODE).not.toContain('.onChanged(');
+    expect(CODE).not.toContain('.onChangedReady(');
+    expect(CODE).not.toContain('config.get(');
   });
 });

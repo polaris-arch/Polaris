@@ -10,6 +10,7 @@
 <root>.network_namespaces
 <root>.ntp
 <root>.outbounds
+<root>.polaris_windows_directory
 <root>.route
 <root>.services
 ACMEExternalAccountOptions.key_id
@@ -153,6 +154,30 @@ DNS.rules
 DNS.servers
 DNS.strategy
 DNS.timeout
+DNSLogicalRuleAction.action
+DNSLogicalRuleAction.action = ["evaluate"]
+DNSLogicalRuleAction.action = ["predefined"]
+DNSLogicalRuleAction.action = ["reject"]
+DNSLogicalRuleAction.action = ["respond"]
+DNSLogicalRuleAction.action = ["route"]
+DNSLogicalRuleAction.action = ["route-options"]
+DNSLogicalRuleAction.answer
+DNSLogicalRuleAction.client_subnet
+DNSLogicalRuleAction.disable_cache
+DNSLogicalRuleAction.disable_optimistic_cache
+DNSLogicalRuleAction.extra
+DNSLogicalRuleAction.method
+DNSLogicalRuleAction.method = ["","default","drop","reply"]
+DNSLogicalRuleAction.no_drop
+DNSLogicalRuleAction.ns
+DNSLogicalRuleAction.race
+DNSLogicalRuleAction.rcode
+DNSLogicalRuleAction.remove_client_subnet
+DNSLogicalRuleAction.rewrite_ttl
+DNSLogicalRuleAction.server
+DNSLogicalRuleAction.speculative
+DNSLogicalRuleAction.tag
+DNSLogicalRuleAction.timeout
 DNSRule.auth_user
 DNSRule.clash_mode
 DNSRule.default_interface_address
@@ -190,10 +215,14 @@ DNSRule.protocol = ["bittorrent","dns","dtls","http","ntp","quic","rdp","ssh","s
 DNSRule.query_client_subnet
 DNSRule.query_dnssec
 DNSRule.query_type
+DNSRule.resolver_policy
 DNSRule.response_answer
+DNSRule.response_class
+DNSRule.response_class = ["empty","hit"]
 DNSRule.response_extra
 DNSRule.response_ns
 DNSRule.response_rcode
+DNSRule.response_reject_ip_cidr
 DNSRule.rule_set
 DNSRule.rule_set_ip_cidr_match_source
 DNSRule.source_hostname
@@ -220,8 +249,11 @@ DNSRuleAction.client_subnet
 DNSRuleAction.disable_cache
 DNSRuleAction.disable_optimistic_cache
 DNSRuleAction.extra
+DNSRuleAction.fallback_rcode
 DNSRuleAction.method
 DNSRuleAction.method = ["","default","drop","reply"]
+DNSRuleAction.mode
+DNSRuleAction.mode = ["defer","fallback","immediate"]
 DNSRuleAction.no_drop
 DNSRuleAction.ns
 DNSRuleAction.race
@@ -543,8 +575,13 @@ DialerOptions.udp_fragment
 DomainResolver.client_subnet
 DomainResolver.disable_cache
 DomainResolver.disable_optimistic_cache
+DomainResolver.mode
+DomainResolver.mode = [""]
+DomainResolver.mode = ["rules"]
+DomainResolver.policy
 DomainResolver.rewrite_ttl
 DomainResolver.server
+DomainResolver.server = [""]
 DomainResolver.strategy
 DomainResolver.timeout
 Endpoint[masque-client].advertise_routes
@@ -1980,7 +2017,7 @@ OutboundTLSOptions.spoof_method = ["wrong-ack","wrong-checksum","wrong-md5","wro
 OutboundTLSOptions.utls
 OutboundUTLSOptions.enabled
 OutboundUTLSOptions.fingerprint
-OutboundUTLSOptions.fingerprint = ["360","android","chrome","chrome_padding_psk_shuffle","chrome_pq","chrome_pq_psk","chrome_psk","chrome_psk_shuffle","edge","firefox","ios","qq","random","randomized","safari"]
+OutboundUTLSOptions.fingerprint = ["360","android","chrome","chrome_133","chrome_155","chrome_padding_psk_shuffle","chrome_pq","chrome_pq_psk","chrome_psk","chrome_psk_shuffle","edge","firefox","firefox_120","firefox_148","ios","qq","random","randomized","safari","safari_16_0","safari_26_3"]
 Outbound[anytls].bind_address_no_port
 Outbound[anytls].bind_interface
 Outbound[anytls].client_metadata
@@ -3038,6 +3075,10 @@ VLESSUser.uuid
 VMessUser.alterId
 VMessUser.name
 VMessUser.uuid
+WindowsDirectoryOptions.expected_source
+WindowsDirectoryOptions.root
+WindowsDirectoryOptions.run_nonce
+WindowsDirectoryOptions.version
 WireGuardPeer.address
 WireGuardPeer.allowed_ips
 WireGuardPeer.persistent_keepalive_interval

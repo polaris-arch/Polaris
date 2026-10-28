@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { MeshRouteReport } from '@/contracts/mesh-route-report';
-import type { ServerConfig } from '@/contracts/types';
+import type { ServerConfig, UserConfig } from '@/contracts/types';
+import { DEMO_CONFIG } from '../../../../harness-fixture';
 import { meshRouteEvidenceRows } from '@/domain/mesh-route-evidence';
 import { createLatestReportLoader, type ReportLoadState } from './latest-report-loader';
 
@@ -196,4 +197,36 @@ describe('P1 route evidence is a bounded report, not a live ownership claim', ()
     });
     expect(published).toHaveLength(3);
   });
+});
+
+
+it('cross-platform mesh warnings are computed-visible without exposing Linux-only warnings', async () => {
+  const { cssChain, measure } = await import('@/styles/css-oracle.test-support');
+  const css = (await cssChain('desktop')).map(item => item.css);
+  const report = clone();
+  report.snapshot.snapshotStale = true;
+  for (const os of ['win', 'mac', 'lin']) {
+    const actual = await measure({ css, html: render(report) + '<div class="plat-warn control-linux-only">Linux only</div>', rootAttrs: { 'data-os': os } }, [
+      { select: '.mesh-route-warning', props: ['display', 'visibility'], many: 'all' },
+      { select: '.control-linux-only', props: ['display'] },
+    ]);
+    expect(actual.count('.mesh-route-warning')).toBeGreaterThan(0);
+    expect(actual.getAll('.mesh-route-warning', 'display').every(display => display !== 'none')).toBe(true);
+    expect(actual.rectAll('.mesh-route-warning').every(rect => rect.height > 0)).toBe(true);
+    expect(actual.get('.control-linux-only', 'display')).toBe(os === 'lin' ? 'flex' : 'none');
+  }
+}, 30_000);
+
+it('TUN preview identity changes for mesh routes, real server input and observed generation only', async () => {
+  const { tunPreviewIdentity } = await import('./SettingsTun');
+  const config: UserConfig = {
+    ...DEMO_CONFIG,
+    servers: [{ id: 'mesh', name: 'Mesh', protocol: 'openvpn-client', address: 'mesh.fixture.invalid', port: 1194, meshRoutes: ['10.1.0.0/16'] }],
+  };
+  const key = tunPreviewIdentity(config, '["100.64.0.1"]', 'running:1');
+  expect(tunPreviewIdentity({ ...config, language: 'fa' }, '["100.64.0.1"]', 'running:1')).toBe(key);
+  expect(tunPreviewIdentity({ ...config, servers: (config.servers ?? []).map(server => ({ ...server, meshRoutes: ['10.2.0.0/16'] })) }, '["100.64.0.1"]', 'running:1')).not.toBe(key);
+  expect(tunPreviewIdentity(config, '["100.64.0.2"]', 'running:1')).not.toBe(key);
+  expect(tunPreviewIdentity(config, '["100.64.0.1"]', 'running:2')).not.toBe(key);
+  expect(settingsTunSource).toContain('tunPreviewIdentity(savedConfig, observationKey, previewGeneration)');
 });

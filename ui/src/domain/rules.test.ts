@@ -23,6 +23,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
+  isValidIpCidr,
   RULE_TYPE_IDS,
   RULE_TYPES,
   RULE_CATEGORY_ORDER,
@@ -290,4 +291,15 @@ describe('ruleSubjectForValue：显示名 → 可写进规则的观测对象', (
       expect(ruleSubjectForValue(v), `${v} 不该判出对象`).toBeNull();
     }
   });
+});
+
+it('embedded IPv4 is only legal at the textual IPv6 tail', () => {
+  for (const value of ['192.0.2.1::/64', '1:192.0.2.1::/64', '::192.0.2.1:1/64',
+    '1:2:3:4:5:6::192.0.2.1/128', '1:2:3:4:5:192.0.2.1/128']) {
+    expect(isValidIpCidr(value), value).toBe(false);
+  }
+  for (const value of ['::192.0.2.1/128', '::ffff:192.0.2.1/128',
+    '1:2:3:4:5::192.0.2.1/128', '1:2:3:4:5:6:192.0.2.1/128']) {
+    expect(isValidIpCidr(value), value).toBe(true);
+  }
 });

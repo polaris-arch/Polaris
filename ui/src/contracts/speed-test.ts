@@ -34,8 +34,107 @@ export type SpeedTestOutcome = 'completed' | 'interrupted';
  * - `core_exited`：本机的测速临时核在测量途中自己退出了。下一步是**看日志页 `sing-box` 来源里
  *   那段 `speedtest-core` 的行**（后端已把临时核的 stdout/stderr 排空进日志）。
  * - `core_unresponsive`：核还活着但已不再接受连接（连败满一窗后复探失败）。同上。
+ * - `cancelled`：本轮经取消句柄被取消。未测的节点缺席，可续测。
+ * - `preempted`：本轮被更高优先级的测速抢占。同上。
  */
-export type SpeedTestInterruptReason = 'superseded' | 'core_exited' | 'core_unresponsive';
+export type SpeedTestInterruptReason =
+  | 'superseded'
+  | 'core_exited'
+  | 'core_unresponsive'
+  | 'cancelled'
+  | 'preempted';
+
+/** 单节点失败时所处的阶段：热切、建隧道、预热（第一次 GET）、计时（第二次 GET）。 */
+export type SpeedTestFailurePhase = 'select' | 'connect' | 'warmup' | 'measure';
+
+/** 单节点失败的成因。`rejected` = 热切没成功，或预热后的连接不可复用。 */
+export type SpeedTestFailureKind = 'timeout' | 'transport' | 'http_status' | 'rejected';
+
+/** 「真的测了，没有通过」的阶段与成因（`latency === -1` 时随结果事件带出）。 */
+export interface SpeedTestFailure {
+  phase: SpeedTestFailurePhase;
+  kind: SpeedTestFailureKind;
+  /** 仅 `kind === 'http_status'` 时有。 */
+  httpStatus?: number;
+}
+
+/** 承载这次测量的核。`temp` 即「未连接测量」，不带世代。 */
+export type SpeedTestInstance =
+  | { kind: 'main'; generation: number; startTime: number | null }
+  | { kind: 'temp' };
+
+/**
+ * 逐节点结果的身份块（后端 `commands/speedtest.rs::ResultIdentity`）。与 `measurementContext` 并存。
+ *
+ * 值为 `null` 的字段语义是「未知 / 不适用」，不是「未变」：`networkEpoch` 在移动端恒为 `null`。
+ */
+export interface SpeedTestResultIdentity {
+  /** 运行号，十进制字符串，与顶层 `runId` 同一序列。 */
+  run: string;
+  /** 本轮内的事件序号（结果、进度、终态共用一个计数，严格递增）。 */
+  seq: number;
+  origin: 'manual' | 'failover' | 'schedule' | 'companion';
+  /** 调用方自带的不透明标签，原样回显。 */
+  scope: string | null;
+  /**
+   * `candidate` = 只测指定节点；`system` = 经本机代理入站，走用户的完整路由与 DNS；
+   * `selected` = 钉到当前选中的出口、不经用户规则（没有 `mixed-in` 入站的平台上的回退测量与出口伴测）。
+   */
+  path: 'candidate' | 'system' | 'selected';
+  metric: 'warm_ttfb_v1';
+  /** 测速 URL 的 sha256（不出原文）。 */
+  urlDigest: string;
+  /** `disconnected` = 经停止态临时核测得（未连接测量）。 */
+  context: 'connected' | 'disconnected';
+  instance: SpeedTestInstance;
+  configDigest: string | null;
+  /** Hash of observed CLI/JNI, or containing PacketTunnel executable; absent on historical receipts. */
+  coreBinarySha256?: string | null;
+  nodeFingerprint: string | null;
+  networkEpoch: number | null;
+  /** 后端出结果那一刻的 Unix 毫秒。 */
+  measuredAt: number;
+}
+
+/**
+ * 这条测量连接在内核里实际受的路由策略：`slot_pin` 钉到探针槽，`node_pin` 钉到临时核里的节点，
+ * `selected_pin` 钉到当前选中的出口，`user_route` 不钉、走用户的全部规则。
+ */
+export type SpeedTestRoutePolicy = 'slot_pin' | 'node_pin' | 'selected_pin' | 'user_route';
+
+/**
+ * 读回的结论：`confirmed` 承载出站就是请求的节点；`mismatch` 不是；`unverified` 限时内没读到；
+ * `static` 由配置结构保证、没有运行期对账（临时核）；`observed` 没有指定节点、读到了实际承载者。
+ */
+export type SpeedTestBindingVerdict = 'confirmed' | 'mismatch' | 'unverified' | 'static' | 'observed';
+
+/**
+ * 逐节点结果的 `binding` 块（后端 `commands/speedtest.rs::Binding`）：请求的是谁、实际由谁承载。
+ * 全部字段可选。读回只到叶子出站为止：它内部的前置链、实际拨到的远端地址、拨号成败与 DNS 路径都读不到。
+ */
+export interface SpeedTestResultBinding {
+  policy?: SpeedTestRoutePolicy;
+  /** 请求的节点在运行核里的 tag；没有指定节点的测量没有这一项。 */
+  requestedTag?: string;
+  requestedKind?: 'outbound' | 'endpoint';
+  /** 读回关闭时没有这一项及其后各项。 */
+  verdict?: SpeedTestBindingVerdict;
+  /** 结论的依据：内核的连接记录、生成配置的结构，或没有依据。 */
+  source?: 'connection' | 'config' | 'none';
+  /** 实际承载这条连接的叶子出站。 */
+  carriedBy?: { tag: string; type: string };
+  /** 出站链，从叶子到路由选中的出站。 */
+  chain?: string[];
+  /** 命中的路由规则描述；没有命中任何规则时为空串。 */
+  rule?: string;
+  /** 这条规则在用户配置里的名字（起核时的映射里有才带）。 */
+  ruleName?: string;
+  /** 承载出站自带的前置出站 tag。来自生成配置，不是读回。 */
+  staticDetour?: string;
+  /** 目的地址与嗅探域名的 sha256（不出原文）。 */
+  destinationDigest?: string;
+  domainDigest?: string;
+}
 
 /** Emitted by the ready producer, before target measurement starts. */
 export interface SpeedTestMeasurementContext {
@@ -47,6 +146,8 @@ export interface SpeedTestMeasurementContext {
 
 export interface SpeedTestCountProgress {
   runId?: string;
+  /** 本轮内的事件序号；旧后端没有。 */
+  seq?: number;
   tested: number;
   ok: number;
   total: number;
@@ -58,9 +159,14 @@ export type SpeedTestProgressPayload = SpeedTestCountProgress
   | { runId: string; phase: 'measuring'; measurementContext: SpeedTestMeasurementContext };
 
 export interface SpeedTestResultPayload {
+  /** 只有手动发起的前台运行才带；被动结果（出口伴测等）的运行号在 `identity.run`。 */
   runId?: string;
   serverId: string;
   latency: number;
+  status?: 'ok' | 'failed';
+  failure?: SpeedTestFailure;
+  identity?: SpeedTestResultIdentity;
+  binding?: SpeedTestResultBinding;
   measurementContext?: SpeedTestMeasurementContext | null;
 }
 
@@ -104,6 +210,8 @@ export interface SpeedTestInvokeResult {
  */
 export interface SpeedTestDonePayload {
   runId?: string;
+  /** 本轮最后一个事件序号；旧后端没有。 */
+  seq?: number;
   measurementContext?: SpeedTestMeasurementContext | null;
   outcome: SpeedTestOutcome;
   /** 已出值的节点数（含真实 -1）。 */
@@ -119,4 +227,76 @@ export interface SpeedTestDonePayload {
    * 「本轮没有成因」在前端长得一样。`interrupted` 时后端保证有值。
    */
   reason?: SpeedTestInterruptReason;
+}
+
+/** 周期测速设置项的取值范围与缺省值。由后端给出：并发上限随平台不同，界面不自己写死。 */
+export interface SpeedTestScheduleLimits {
+  concurrencyMin: number;
+  /** 本设备的并发上限。 */
+  concurrencyMax: number;
+  intervalMinutesMin: number;
+  intervalMinutesMax: number;
+  intervalMinutesDefault: number;
+  /** 全局总开关的缺省值。 */
+  enabledDefault: boolean;
+  /** 每订阅「周期测速」开关的缺省值。 */
+  subscriptionDefault: boolean;
+  meteredPolicyDefault: 'reduced' | 'pause' | 'normal';
+}
+
+/** 计划里一个订阅的状态。计划没建起来时只有 `periodMinutes` 与 `blockedBy`。 */
+export interface SpeedTestScheduleSubscription {
+  periodMinutes: number;
+  /**
+   * 订阅里开着、却没有进计划的原因（与顶层 `reason` 同一组取值）：`userDisabled` 是被全局总开关
+   * 关闭，`platformNotEnabled` 是本平台未启用，`coreNotRunning` 是代理未运行。
+   */
+  blockedBy?: string;
+  /** 最近一次覆盖该订阅全部可测节点、且以完成收尾的一轮的结束时刻（Unix 毫秒）。 */
+  lastFullRoundAt?: number | null;
+  lastRound?: {
+    run: string;
+    startedAt: number;
+    endedAt: number;
+    ok: number;
+    failed: number;
+    unmeasured: number;
+    skipped: Record<string, number>;
+  } | null;
+  /** 最近一次到期而未执行的时刻与原因。 */
+  lastSkip?: { at: number; reason: string; holder?: string; skipped?: Record<string, number> } | null;
+  nextDueAt?: number;
+  periodTooShort?: boolean;
+  /** 读时投影：距上次完整轮次已超过周期的 3 倍。 */
+  overdue?: boolean;
+}
+
+/**
+ * 周期测速的计划状态（`speed_test_schedule_status` 的返回，也是 `event:speedTestSchedule` 的载荷；
+ * 单一真值在后端 `runtime/measurement_scheduler.rs`）。
+ */
+export interface SpeedTestScheduleStatus {
+  state: 'disabled' | 'waiting' | 'running' | 'paused';
+  /**
+   * `disabled` 时：`switchedOff` / `userDisabled` / `platformNotEnabled` / `coreNotRunning` /
+   * `noSubscription`；`paused` 时：`background` / `metered` / `powerSave`；其余为 `null`。
+   */
+  reason: string | null;
+  subscriptions?: Record<string, SpeedTestScheduleSubscription>;
+  /** 上一轮开始时的并发，以及那一轮内是否因本机侧报错减半过。 */
+  concurrency?: { width: number; halved: boolean } | null;
+  /** 当前网络的计费状态。`unavailable` 是「识别不了」，按照常处理，不等于非计费。 */
+  metered?: 'metered' | 'unmetered' | 'unavailable';
+  /** 生效的计费网络策略。`metered` 为 `metered` 且本项为 `reduced` 即正在降频（周期乘 4）。 */
+  meteredPolicy?: 'reduced' | 'pause' | 'normal';
+  /** Actual multiplier from the scheduler; never inferred from elapsed wall time. */
+  periodFactor?: number;
+  lastTickAt?: number;
+  /** 原调度器前台恢复及有界轮次记录，供静默窗口核对。 */
+  foregroundReturnAt?: number | null;
+  roundTraceSerial?: number;
+  roundStarts?: { serial: number; startedAt: number; endedAt: number }[];
+  /** 读时投影：代理在运行、应用在前台，而调度器很久没有走过一拍。 */
+  stalled: boolean;
+  limits?: SpeedTestScheduleLimits;
 }

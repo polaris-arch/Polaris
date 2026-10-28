@@ -2,3 +2,6 @@ xcuserdata/
 build/
 Externals/
 Frameworks/
+
+# Actual Tauri iOS resources materialized before formal link-input freeze.
+assets/

@@ -237,21 +237,37 @@ impl DirectStopObservation {
             .unwrap_or(StopView::Obsolete)
     }
 
+    /// Classify a sampled custody view. Worker completion may race the sample;
+    /// after observing its release-published exit, read custody again before
+    /// declaring it lost. Completion alone is never a proof of reaping.
+    pub(in crate::runtime::proxy) fn wait_outcome_for_view(
+        &self,
+        mut view: StopView,
+    ) -> Option<StopWaitOutcome> {
+        let worker_gone =
+            matches!(view, StopView::Armed | StopView::KillRequested) && !self.worker_alive();
+        if worker_gone {
+            view = self.view();
+        }
+        match view {
+            StopView::Reaped | StopView::BirthClosed => Some(StopWaitOutcome::Reaped),
+            StopView::RetainedFailure => Some(StopWaitOutcome::RetainedFailure),
+            StopView::Obsolete => Some(StopWaitOutcome::Obsolete),
+            StopView::Armed | StopView::KillRequested if worker_gone => {
+                Some(StopWaitOutcome::WorkerGone)
+            }
+            StopView::Armed | StopView::KillRequested => None,
+        }
+    }
+
     /// An observer timeout reports Pending; it never aborts the worker.
     pub(in crate::runtime::proxy) async fn wait_for(&self, timeout: Duration) -> StopWaitOutcome {
         let wait = async {
             loop {
-                match self.view() {
-                    StopView::Reaped | StopView::BirthClosed => return StopWaitOutcome::Reaped,
-                    StopView::RetainedFailure => return StopWaitOutcome::RetainedFailure,
-                    StopView::Obsolete => return StopWaitOutcome::Obsolete,
-                    StopView::Armed | StopView::KillRequested if !self.worker_alive() => {
-                        return StopWaitOutcome::WorkerGone;
-                    }
-                    StopView::Armed | StopView::KillRequested => {
-                        tokio::time::sleep(POLL_INTERVAL).await;
-                    }
+                if let Some(outcome) = self.wait_outcome_for_view(self.view()) {
+                    return outcome;
                 }
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
         };
         tokio::time::timeout(timeout, wait)

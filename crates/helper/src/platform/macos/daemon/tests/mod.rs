@@ -1,42 +1,29 @@
 use super::*;
-
 fn argv(args: &[&str]) -> std::vec::IntoIter<String> {
-    let mut v = vec!["polaris-helper".to_owned()];
-    v.extend(args.iter().map(|s| (*s).to_owned()));
-    v.into_iter()
+    std::iter::once("polaris-helper".to_owned())
+        .chain(args.iter().map(|value| (*value).to_owned()))
+        .collect::<Vec<_>>()
+        .into_iter()
 }
-
 #[test]
-fn parse_args_all_flags() {
+fn machine_roots_parse_both_flag_forms() {
     let cfg = parse_args(argv(&[
-        "--singbox",
-        "/opt/sing-box",
-        "--confdir",
-        "/etc/polaris/conf",
         "--support",
         "/Library/Application Support/Polaris",
-        "--coredir",
-        "/usr/local/lib/polaris/core",
+        "--coredir=/opt/polaris/core",
     ]));
-    assert_eq!(cfg.singbox_bin, "/opt/sing-box");
-    assert_eq!(cfg.conf_dir, "/etc/polaris/conf");
     assert_eq!(cfg.support_dir, "/Library/Application Support/Polaris");
-    assert_eq!(cfg.core_dir, "/usr/local/lib/polaris/core");
+    assert_eq!(cfg.core_dir, "/opt/polaris/core");
+    let cfg = parse_args(argv(&[]));
+    assert_eq!(cfg.core_dir, format!("{DEFAULT_SUPPORT_DIR}/core"));
 }
-
 #[test]
-fn parse_args_support_defaults() {
-    // 缺 --support → Go 默认值（品牌改名 上游→Polaris）。
-    let cfg = parse_args(argv(&["--singbox", "/opt/sb"]));
-    assert_eq!(cfg.support_dir, "/Library/Application Support/Polaris");
-    assert_eq!(cfg.singbox_bin, "/opt/sb");
-    assert_eq!(cfg.conf_dir, "");
-    assert_eq!(cfg.core_dir, "");
-}
-
-#[test]
-fn parse_args_eq_form() {
-    let cfg = parse_args(argv(&["--singbox=/a/b", "--coredir=/c/d"]));
-    assert_eq!(cfg.singbox_bin, "/a/b");
-    assert_eq!(cfg.core_dir, "/c/d");
+fn daemon_rejects_retired_machine_user_and_flat_core_flags_without_serving() {
+    for flag in [
+        "--singbox=/opt/sb",
+        "--confdir=/Users/A/Polaris",
+        "--unknown=x",
+    ] {
+        assert_eq!(daemon_main(argv(&[flag])), std::process::ExitCode::FAILURE);
+    }
 }

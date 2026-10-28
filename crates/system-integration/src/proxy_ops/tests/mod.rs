@@ -3211,12 +3211,11 @@ fn impl_win_native_access_denied_code_aborts_without_retry() {
 
 #[test]
 fn impl_win_native_writer_notifies_after_clear_and_restore() {
-    let writer = Arc::new(RecordingWindowsRegistryWriter {
-        calls: std::sync::atomic::AtomicUsize::new(0),
-        notifications: std::sync::atomic::AtomicUsize::new(0),
-        fail: false,
-        notify_fail: false,
-    });
+    let writer = Arc::new(ExactWindowsWriter::new(WindowsProxyRegistrySnapshot {
+        proxy_server: WindowsRegistryStringValue::PresentValue("http=127.0.0.1:8080".into()),
+        proxy_override: WindowsRegistryStringValue::Absent,
+        proxy_enable: WindowsRegistryDwordValue::PresentValue(1),
+    }));
     let ops = ops_for(Platform::Win, MockRunner::default())
         .with_windows_registry_writer(writer.clone(), true);
     ops.clear_proxy().unwrap();
@@ -3228,7 +3227,16 @@ fn impl_win_native_writer_notifies_after_clear_and_restore() {
         bypass_domains: None,
     })
     .unwrap();
-    assert_eq!(writer.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(
+        writer.restores.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert!(ops
+        .runner
+        .calls
+        .borrow()
+        .iter()
+        .all(|cmd| cmd.program.ends_with("netsh.exe")));
     assert_eq!(
         writer
             .notifications
@@ -4515,7 +4523,20 @@ fn points_to_us_unit() {
         ..Default::default()
     };
     assert!(points_to_us(Some(&st), "127.0.0.1:8080"));
-    assert!(points_to_us(Some(&st), "127.0.0.1:1080")); // host 匹配
+    assert!(!points_to_us(Some(&st), "127.0.0.1:1080"));
+    let replaced_web = SystemProxyStatus {
+        http_proxy: Some("127.0.0.1:7890".into()),
+        https_proxy: Some("127.0.0.1:8080".into()),
+        socks_proxy: Some("127.0.0.1:1080".into()),
+        ..st.clone()
+    };
+    assert!(!points_to_us(Some(&replaced_web), "127.0.0.1:8080"));
+    let socks_only = SystemProxyStatus {
+        enabled: true,
+        socks_proxy: Some("127.0.0.1:1080".into()),
+        ..Default::default()
+    };
+    assert!(points_to_us(Some(&socks_only), "127.0.0.1:8080"));
     assert!(!points_to_us(Some(&st), "10.0.0.1:8080"));
     assert!(!points_to_us(None, "127.0.0.1:8080"));
     // 关着的代理不算指向我们。

@@ -58,9 +58,10 @@ function CatalogIcon() {
   );
 }
 
-export function ResCatalogDialog() {
+export function ResCatalogDialog({ instanceId }: { instanceId: string }) {
   const { t } = useTranslation();
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((s) => s.closeInstance);
+  const close = () => closeInstance(instanceId);
 
   const [tab, setTab] = useState<CatTab>('builtin');
   const [builtin, setBuiltin] = useState<RuleResourceCatalogItem[] | null>(null);

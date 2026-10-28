@@ -4,7 +4,7 @@
 //! 同步且可能执行系统命令，因此全部在这里统一隔离到 `spawn_blocking`；[`ProxyRuntime`] 只保留
 //! 生命周期世代校验、错误事件投影和公开 facade。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use polaris_config_engine::user_config::app_config::UserConfig;
@@ -34,7 +34,8 @@ pub(crate) trait SystemProxyClearer: Send {
     /// 把 OS 系统代理指向本地 mixed 入站。
     fn enable_system_proxy(&mut self, req: &ProxyEnableRequest) -> Result<(), String>;
 
-    /// 上次会话遗留 marker 时恢复代理并清 marker；无 marker 返回 `Ok(false)`。
+    /// 恢复本应用 marker 持有的代理；无 marker 返回 `Ok(false)`，失败显式返回 Err。
+    /// 启动自愈与退出确认共用此释放状态机；不能用 best-effort bool 代替退出确认。
     fn recover_from_marker(&mut self) -> Result<bool, String>;
 }
 
@@ -66,6 +67,7 @@ where
 pub(super) struct SystemProxyTakeover {
     controller: Arc<Mutex<Box<dyn SystemProxyClearer>>>,
     residual_warned: AtomicBool,
+    session_epoch: Arc<AtomicU64>,
 }
 
 impl SystemProxyTakeover {
@@ -73,6 +75,7 @@ impl SystemProxyTakeover {
         Self {
             controller: Arc::new(Mutex::new(controller)),
             residual_warned: AtomicBool::new(false),
+            session_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -103,33 +106,35 @@ impl SystemProxyTakeover {
         }
     }
 
-    /// 启动期 marker 恢复。返回是否真恢复过上次会话残留。
-    async fn recover(&self) -> bool {
+    /// Result 保留 OS 恢复、marker 持久化、锁与 blocking 任务的全部失败。
+    async fn restore_owned(
+        &self,
+        blocking_lease: Option<LegacyStartLease>,
+    ) -> Result<bool, String> {
         let controller = Arc::clone(&self.controller);
-        let outcome = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
+            let _blocking_lease = blocking_lease;
             controller
                 .lock()
-                .map(|mut guard| guard.recover_from_marker())
-                .unwrap_or_else(|error| {
-                    log::error!("system proxy controller 锁中毒: {error} → 跳过启动期系统代理恢复");
-                    Err("system proxy controller 锁中毒".to_string())
-                })
+                .map_err(|_| "system proxy controller 锁中毒".to_string())?
+                .recover_from_marker()
         })
-        .await;
-        match outcome {
-            Ok(Ok(true)) => {
+        .await
+        .map_err(|error| format!("系统代理恢复任务失败: {error}"))?
+    }
+
+    /// 启动期 marker 恢复；此调用者仍按既有规则告警并保留 marker 供重试。
+    async fn recover(&self) -> bool {
+        match self.restore_owned(None).await {
+            Ok(true) => {
                 log::info!(
                     "启动期检测到上次未清的系统代理 marker（上次崩溃/强杀）→ 已清残留（维度7 #8）"
                 );
                 true
             }
-            Ok(Ok(false)) => false,
-            Ok(Err(error)) => {
-                log::error!("启动期系统代理恢复失败，marker 已保留供重试：{error}");
-                false
-            }
+            Ok(false) => false,
             Err(error) => {
-                log::error!("启动期系统代理恢复 spawn_blocking join 失败: {error}");
+                log::error!("启动期系统代理恢复失败，marker 已保留供重试：{error}");
                 false
             }
         }
@@ -142,15 +147,19 @@ impl SystemProxyTakeover {
         blocking_lease: Option<LegacyStartLease>,
     ) -> Result<Result<(), String>, tokio::task::JoinError> {
         let controller = Arc::clone(&self.controller);
+        let session = self.session_epoch.clone();
+        // Capture before queueing: a delayed enable from before a query cannot write
+        // after cancellation reopens admission, even if its port is still the same.
+        let ticket = session.load(Ordering::SeqCst);
         tokio::task::spawn_blocking(move || {
             let _blocking_lease = blocking_lease;
-            controller
+            let mut guard = controller
                 .lock()
-                .map(|mut guard| guard.enable_system_proxy(&request))
-                .unwrap_or_else(|error| {
-                    log::error!("system proxy controller 锁中毒: {error} → 跳过系统代理启用");
-                    Err("system proxy controller 锁中毒".to_string())
-                })
+                .map_err(|_| "system proxy controller 锁中毒".to_string())?;
+            if ticket & 1 != 0 || session.load(Ordering::SeqCst) != ticket {
+                return Err("Windows 结束会话期间系统代理接管已暂停".into());
+            }
+            guard.enable_system_proxy(&request)
         })
         .await
     }
@@ -168,6 +177,39 @@ impl SystemProxyTakeover {
                 })
         })
         .await
+    }
+
+    pub(super) fn session_query_active(&self) -> bool {
+        self.session_epoch.load(Ordering::SeqCst) & 1 != 0
+    }
+
+    #[cfg(any(windows, test))]
+    fn begin_session_query(&self) -> u64 {
+        let mut previous = self.session_epoch.load(Ordering::SeqCst);
+        loop {
+            let next = previous.wrapping_add(if previous & 1 == 0 { 1 } else { 2 });
+            match self.session_epoch.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next,
+                Err(current) => previous = current,
+            }
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn cancel_session_query(&self, epoch: u64) -> bool {
+        self.session_epoch
+            .compare_exchange(
+                epoch,
+                epoch.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
     fn residual_warning_claimed(&self) -> bool {
@@ -237,6 +279,65 @@ impl ProxyRuntime {
     pub async fn clear_system_proxy(&self) -> bool {
         let blocking_lease = self.config.retain_active_legacy_start_lease();
         self.system_proxy.clear(blocking_lease).await
+    }
+
+    /// 退出收据只在原有 marker 释放状态机确认成功后产生；无需恢复亦是确认结果。
+    /// 失败保留 marker、运行时与关闭的 admission，允许退出准备重试。
+    pub(crate) async fn restore_system_proxy_for_exit(&self) -> Result<(), String> {
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        self.system_proxy
+            .restore_owned(blocking_lease)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("系统代理恢复未确认，不能完成退出: {error}"))
+    }
+
+    /// Reversible system-proxy gate, independent of permanent core exit admission.
+    #[cfg(any(windows, test))]
+    pub(crate) fn begin_windows_session_query(&self) -> Result<u64, String> {
+        let _admission = self
+            .desktop_shutdown
+            .try_lock()
+            .map_err(|_| "proxy shutdown admission busy or poisoned".to_string())?;
+        let epoch = self.system_proxy.begin_session_query();
+        #[cfg(all(windows, not(test)))]
+        polaris_system_integration::windows_session::begin_query();
+        Ok(epoch)
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn cancel_windows_session_query(&self, epoch: u64) -> bool {
+        // Keep the local cache/optional-command flag and proxy generation together:
+        // a late cancellation must not reopen a newer native session query.
+        let Ok(_admission) = self.desktop_shutdown.lock() else {
+            log::error!("session cancellation admission poisoned; keeping it closed");
+            return false;
+        };
+        let reopened = self.system_proxy.cancel_session_query(epoch);
+        #[cfg(all(windows, not(test)))]
+        if reopened {
+            polaris_system_integration::windows_session::cancel_query();
+        }
+        reopened
+    }
+
+    /// Rejecting QUERY must not synchronously wait for the cancellation lock.
+    /// Keep the gate closed until the worker applies the matching epoch CAS.
+    #[cfg(any(windows, test))]
+    pub(crate) fn defer_windows_session_query_cancel(
+        self: &Arc<Self>,
+        epoch: u64,
+        completed: impl FnOnce(bool) + Send + 'static,
+    ) -> tauri::async_runtime::JoinHandle<()> {
+        let proxy = self.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            completed(proxy.cancel_windows_session_query(epoch));
+        })
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn windows_session_query_is_current(&self, epoch: u64) -> bool {
+        self.system_proxy.session_epoch.load(Ordering::SeqCst) == epoch
     }
 
     /// 启动期恢复系统代理 marker，并在同一启动汇流点恢复系统 DNS marker。

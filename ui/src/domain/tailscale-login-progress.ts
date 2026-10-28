@@ -74,6 +74,7 @@ const REASON_KEYS: Record<string, string> = {
   credentialCommitUnknown: 'ts.reasonCredentialCommit',
   saveFailed: 'ts.reasonSave', configurationRefreshFailed: 'ts.reasonRefresh',
   tooManyLogins: 'ts.reasonTooManyLogins', invalidAuthUrl: 'ts.reasonInvalidAuthUrl',
+  staleLoginCoreAlive: 'ts.reasonStaleLoginCore',
 };
 
 export function loginFailureReasonKey(reason: string | null | undefined): string {

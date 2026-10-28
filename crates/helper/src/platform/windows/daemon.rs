@@ -33,10 +33,6 @@
 /// 便于在 Linux CI 上单测 flag 解析（本模块以 `cfg(any(target_os="windows", test))` 编入）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WinArgs {
-    /// 锁定的 sing-box 二进制路径（`--singbox`）。
-    pub singbox_bin: String,
-    /// 允许的配置文件目录（`--confdir`）。
-    pub conf_dir: String,
     /// support 目录（`--support`，helper.token 落此；受保护内核目录 `<support>\core` 由它派生）。
     pub support_dir: String,
     /// 前台 console 模式（`--console`；否则 SCM 服务）。
@@ -49,8 +45,6 @@ pub struct WinArgs {
 pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> WinArgs {
     let m = crate::cli::parse_flags(argv, &["console"]);
     WinArgs {
-        singbox_bin: m.get("singbox").cloned().unwrap_or_default(),
-        conf_dir: m.get("confdir").cloned().unwrap_or_default(),
         support_dir: m
             .get("support")
             .cloned()
@@ -65,7 +59,12 @@ pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> WinArgs {
 /// 生产 Windows 二进制走 [`run`]。
 #[must_use]
 pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> std::process::ExitCode {
-    let args = parse_args(argv);
+    let argv: Vec<_> = argv.collect();
+    if let Err(error) = crate::cli::validate_flags(&argv, &["support"], &["console"]) {
+        eprintln!("polaris-helper: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let args = parse_args(argv.into_iter());
     #[cfg(target_os = "windows")]
     {
         run(args)
@@ -92,8 +91,6 @@ fn run(args: WinArgs) -> std::process::ExitCode {
     }
 
     let cfg = ServiceConfig {
-        singbox_bin: args.singbox_bin,
-        conf_dir: args.conf_dir,
         support_dir: args.support_dir,
     };
 

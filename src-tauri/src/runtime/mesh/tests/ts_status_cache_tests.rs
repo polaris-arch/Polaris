@@ -39,11 +39,13 @@ async fn logout_rejects_path_escape_without_touching_sibling_directory() {
         .logout_tailscale_safely("../victim", &|| false, None)
         .await
         .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(victim.join("sentinel").exists());
+    // Directory admission rejects malformed identities before any state access.
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(std::fs::read(victim.join("sentinel")).unwrap(), b"keep");
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[cfg(not(any(target_os = "ios", windows)))]
 #[tokio::test]
 async fn explicit_node_deletion_removes_only_the_valid_managed_state_directory() {
     let root = temp_dir("logout-valid");
@@ -77,8 +79,12 @@ async fn logout_rejects_a_state_root_symlink_escape() {
         .logout_tailscale_safely("srv-1", &|| false, None)
         .await
         .unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    assert!(victim_state.join("sentinel").exists());
+    // NOFOLLOW | DIRECTORY rejects the state-root alias before retirement.
+    assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+    assert_eq!(
+        std::fs::read(victim_state.join("sentinel")).unwrap(),
+        b"keep"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -173,6 +179,36 @@ fn auth_sealed() -> Vec<u8> {
     )
 }
 
+// Authentication projection operates on a pre-existing legacy FileStore. A
+// planned isolated directory without the kernel's domain/stamp is not authority.
+fn legacy_auth_fixture(root: &std::path::Path, id: &str) -> (MeshRuntime, std::path::PathBuf) {
+    let config = root.join("config");
+    let legacy = config.join("tailscale").join(id);
+    std::fs::create_dir_all(&legacy).unwrap();
+    let mesh = MeshRuntime::new(config);
+    assert_eq!(mesh.tailscale_state_dir(id).unwrap(), legacy);
+    (mesh, legacy)
+}
+
+#[cfg(any(target_os = "ios", windows))]
+#[tokio::test]
+async fn whole_directory_deletion_without_bound_custody_preserves_legacy_state() {
+    let root = temp_dir("logout-unbound-directory");
+    let (mesh, state) = legacy_auth_fixture(&root, "srv-1");
+    std::fs::write(state.join("tailscaled.state"), b"state").unwrap();
+    std::fs::write(state.join("sentinel"), b"user data").unwrap();
+    let gate = mesh.tailscale_state_gate().await;
+    let error = mesh
+        .tailscale_logout_under_gate("srv-1", &gate, false)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        std::fs::read(state.join("tailscaled.state")).unwrap(),
+        b"state"
+    );
+    assert_eq!(std::fs::read(state.join("sentinel")).unwrap(), b"user data");
+}
+
 fn auth_expected() -> Vec<u8> {
     polaris_source_probe::repo_bytes_in(
         env!("CARGO_MANIFEST_DIR"),
@@ -183,8 +219,7 @@ fn auth_expected() -> Vec<u8> {
 #[tokio::test]
 async fn logout_projects_only_active_auth_and_repeat_preserves_exact_bytes() {
     let root = temp_dir("logout-auth-only");
-    let mesh = MeshRuntime::new(root.join("config"));
-    let state = mesh.tailscale_state_dir("srv-1").unwrap();
+    let (mesh, state) = legacy_auth_fixture(&root, "srv-1");
     std::fs::create_dir_all(state.join("taildrop")).unwrap();
     let file = state.join("tailscaled.state");
     std::fs::write(&file, auth_sealed()).unwrap();
@@ -234,8 +269,7 @@ async fn logout_projects_only_active_auth_and_repeat_preserves_exact_bytes() {
 #[tokio::test]
 async fn bound_auth_projection_rejects_changed_revision_without_mutation() {
     let root = temp_dir("logout-auth-revision");
-    let mesh = MeshRuntime::new(root.join("config"));
-    let state = mesh.tailscale_state_dir("srv-1").unwrap();
+    let (mesh, state) = legacy_auth_fixture(&root, "srv-1");
     std::fs::create_dir_all(&state).unwrap();
     let file = state.join("tailscaled.state");
     std::fs::write(&file, auth_sealed()).unwrap();
@@ -282,8 +316,7 @@ async fn bound_auth_projection_rejects_changed_revision_without_mutation() {
 async fn sealed_unbound_auth_allows_only_retired_exact_bytes_and_revision() {
     use polaris_mesh::tailscale_state::AuthProjectionProvenance::CurrentFileReferences;
     let root = temp_dir("logout-auth-unbound");
-    let mesh = MeshRuntime::new(root.join("config"));
-    let state = mesh.tailscale_state_dir("srv-1").unwrap();
+    let (mesh, state) = legacy_auth_fixture(&root, "srv-1");
     std::fs::create_dir_all(&state).unwrap();
     let file = state.join("tailscaled.state");
     std::fs::write(&file, auth_sealed()).unwrap();
@@ -353,4 +386,28 @@ async fn sealed_unbound_auth_allows_only_retired_exact_bytes_and_revision() {
         )
         .is_err());
     assert_eq!(std::fs::read(&file).unwrap(), changed);
+}
+
+#[test]
+fn status_cache_never_manufactures_main_core_custody_proof() {
+    let dir = temp_dir("hold-proof");
+    let mesh = MeshRuntime::new(dir.to_path_buf());
+    for connected in [false, true] {
+        assert!(mesh
+            .tailscale_status_snapshot(connected)
+            .main_core_hold
+            .is_none());
+        mesh.update_ts_status(vec![]);
+        assert!(mesh
+            .tailscale_status_snapshot(connected)
+            .main_core_hold
+            .is_none());
+        mesh.update_ts_status(vec![event("ts1", true)]);
+        let snapshot = mesh.tailscale_status_snapshot(connected);
+        assert!(snapshot.main_core_hold.is_none());
+        assert!(serde_json::to_value(snapshot)
+            .unwrap()
+            .get("mainCoreHold")
+            .is_none());
+    }
 }

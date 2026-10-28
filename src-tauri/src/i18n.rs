@@ -339,6 +339,12 @@ pub fn t(lang: Lang, key: &str) -> String {
 /// 本模块内每一条 `pub const` 都被 `every_declared_key_resolves_in_all_five_locales` 逐个查表
 /// 验证（五语种齐备），反向由 `every_native_key_in_locale_is_declared_here` 查死键。
 pub mod key {
+    #[cfg(windows)]
+    pub const NATIVE_SESSION_PROXY_PENDING: &str = "native.sessionProxyPending";
+    #[cfg(windows)]
+    pub const NATIVE_SESSION_CANCELLED: &str = "native.sessionCancelled";
+    #[cfg(windows)]
+    pub const NATIVE_SESSION_CANCEL_FAILED: &str = "native.sessionCancelFailed";
     pub const NATIVE_EXIT_BLOCKED: &str = "native.exitBlocked";
     // ── 托盘原生菜单（与浮层共用）──
     /// 「连接代理」。
@@ -434,8 +440,6 @@ pub mod key {
     pub const NATIVE_CONFIG_PICK_TITLE: &str = "native.configPickTitle";
     /// 配置文件过滤器显示名。
     pub const NATIVE_CONFIG_FILE_TYPE: &str = "native.configFileType";
-    /// 手动替换内核：打开框标题。
-    pub const NATIVE_CORE_PICK_TITLE: &str = "native.corePickTitle";
     /// 「所有文件」过滤器显示名。
     pub const NATIVE_ALL_FILES: &str = "native.allFiles";
     /// Taildrop 取件：保存框标题。

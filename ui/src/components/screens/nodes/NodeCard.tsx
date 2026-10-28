@@ -1,3 +1,4 @@
+import { MeasurementLabel } from '@/mobile/MeasurementLabel';
 /**
  * NodeCard —— 节点卡片（1:1 提取自原型 polaris-prototype.html L1845 等 .nd-card
  * + enhanceNodeCards() L4407-4424 的运行期增强：状态点/水印/复选框）。
@@ -42,6 +43,7 @@ import { protocolLabel, transferSummary, type NodeUseVia } from './nodes-logic';
 
 export interface NodeCardProps {
   server: ServerConfig;
+  sourceLabel?: string;
   /** 当前出口（选中节点）。 */
   isCurrent?: boolean;
   /** 组网出口节点（显示「出口」标记）。 */
@@ -73,7 +75,7 @@ export interface NodeCardProps {
    * `undefined` = 正常。空串 = 被剔但后端没给原因（仍要置灰，tooltip 走兜底文案）。
    *
    * 对齐 上游 `server-card.tsx:103-104`：**只把名称降透明度 + 挂 tooltip，不禁用点击**——
-   * 剔除是会话内语义（每次启动重判、换核可能复活），锁死交互反而让用户没法改配置来修它。
+   * 剔除是会话内语义（每次启动重判、内核随应用升级后可能复活），锁死交互反而让用户没法改配置来修它。
    */
   invalidReason?: string;
   /**
@@ -128,6 +130,7 @@ export interface NodeCardProps {
 
 function NodeCardView({
   server,
+  sourceLabel,
   isCurrent,
   isExit,
   lanOnly,
@@ -236,12 +239,13 @@ function NodeCardView({
             .filter(Boolean).join('\n')}
         >
           {server.name}
+          {sourceLabel && <small data-node-source=""> · {sourceLabel}</small>}
         </div>
         {/* 不可测时把原因也挂在延迟位上（而非只挂在按钮上）：延迟位不是 `disabled`，鼠标与键盘
             都碰得到，是这条解释最可靠的落点。按钮那处见下方注释。 */}
-        {latText && (
+        {(testable || latText) && (
           <span className={cn('nd-lat', level)} data-tip={latencyTip}>
-            {latText}
+            {testable ? <MeasurementLabel serverId={server.id} displayedServer={server} /> : latText}
           </span>
         )}
       </div>

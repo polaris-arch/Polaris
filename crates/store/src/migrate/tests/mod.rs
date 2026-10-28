@@ -12,6 +12,65 @@ fn base_config() -> Value {
 }
 
 #[test]
+fn real_query_fallback_migration_preserves_legacy_behavior_in_every_mode() {
+    for mode in ["global", "smart", "direct"] {
+        for schema in [1, 2, 3, 4] {
+            let mut value = crate::default_config();
+            value["proxyMode"] = json!(mode);
+            value["configSchemaVersion"] = json!(schema);
+            value["dnsDefaults"]
+                .as_object_mut()
+                .unwrap()
+                .remove("realQueryFallbackAction");
+            assert!(migrate_all(&mut value).changed);
+            assert_eq!(
+                value["dnsDefaults"]["realQueryFallbackAction"],
+                json!({"type":"server","serverId":"builtin-domestic"}),
+                "mode={mode}, schema={schema}"
+            );
+            assert_eq!(value["configSchemaVersion"], 4);
+            let once = value.clone();
+            assert!(!migrate_all(&mut value).changed);
+            assert_eq!(value, once);
+        }
+    }
+}
+
+#[test]
+fn real_query_fallback_migration_never_overwrites_explicit_values() {
+    for action in [
+        json!({"type":"server","serverId":"builtin-remote"}),
+        json!({"type":"server","serverId":"custom-resolver"}),
+        json!({"type":"reject","method":"default"}),
+        json!({"type":"reject","method":"drop"}),
+        // Migration must preserve even a future value; validation owns rejection.
+        json!({"type":"future-action"}),
+    ] {
+        for schema in [1, 4] {
+            let mut value = crate::default_config();
+            value["configSchemaVersion"] = json!(schema);
+            value["dnsDefaults"]["realQueryFallbackAction"] = action.clone();
+            migrate_all(&mut value);
+            assert_eq!(value["dnsDefaults"]["realQueryFallbackAction"], action);
+            let once = value.clone();
+            assert!(!migrate_real_query_fallback_action(&mut value));
+            assert_eq!(value, once);
+        }
+    }
+}
+
+#[test]
+fn real_query_fallback_migration_materializes_missing_defaults() {
+    let mut value = json!({});
+    assert!(migrate_real_query_fallback_action(&mut value));
+    assert_eq!(
+        value["dnsDefaults"]["realQueryFallbackAction"],
+        json!({"type":"server","serverId":"builtin-domestic"})
+    );
+    assert!(!migrate_real_query_fallback_action(&mut value));
+}
+
+#[test]
 fn migrate_legacy_domain_rule_produces_new_rules() {
     let mut v = base_config();
     v["customRules"] = json!([

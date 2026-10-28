@@ -71,3 +71,16 @@ describe('WARP registration, save and readback', () => {
     expect(() => build(a)).toThrow('WARP_REGISTRATION_INCOMPLETE');
   });
 });
+
+
+it('mobile workers validation uses the desktop predicate before registration or edit requests', async () => {
+  const { workersInputInvalid } = await import('./wg-logic');
+  for (const value of [-1, 1.5, 4294967296, 'invalid']) expect(workersInputInvalid(value)).toBe(true);
+  for (const value of [undefined, '', 0, 1, 4, 4294967295]) expect(workersInputInvalid(value)).toBe(false);
+  const mobile = readFileSync(new URL('../../mobile/forms/WarpPanel.tsx', import.meta.url), 'utf8');
+  const guard = mobile.indexOf('if (workersInputInvalid(draft.workers))');
+  expect(guard).toBeGreaterThan(0);
+  expect(guard).toBeLessThan(mobile.indexOf('const r = await api.server.applyWarpLicense'));
+  expect(guard).toBeLessThan(mobile.indexOf('const registered = await registerWarpIfSlotFree'));
+  expect(mobile).toContain('workersInputInvalid(draft.workers) && <p className="m-form-err" role="alert">');
+});

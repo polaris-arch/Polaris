@@ -450,3 +450,11 @@ export function transferSummary(server: ServerConfig): string {
   if (server.security) parts.push(server.security);
   return parts.length > 0 ? parts.join(' · ') : '';
 }
+
+/** Source ownership protects managed nodes in All as well as group tabs. The
+ * saved counterpart also protects an effective edit that removed its owner. */
+export function selectedDeletableIds(visible: readonly ServerConfig[], selected: ReadonlySet<string>,
+  saved: readonly ServerConfig[] = []): string[] {
+  const protectedIds = new Set(saved.filter(server => !!server.subscriptionId).map(server => server.id));
+  return visible.filter(server => selected.has(server.id) && !server.subscriptionId && !protectedIds.has(server.id)).map(server => server.id);
+}

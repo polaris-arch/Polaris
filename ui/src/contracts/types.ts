@@ -1,3 +1,4 @@
+import type { SelectionIntent } from './auto-select';
 import type {
   NaiveSettings,
   Hysteria2Settings,
@@ -217,6 +218,8 @@ export type UdpNatType = 'fullCone' | 'restrictedCone' | 'portRestrictedCone';
 // 订阅配置
 // ============================================================================
 
+export type SpeedTestMeteredPolicy = 'reduced' | 'pause' | 'normal';
+
 export interface SubscriptionConfig {
   id: string;
   name: string;
@@ -239,6 +242,10 @@ export interface SubscriptionConfig {
   updateViaProxy?: boolean;
   /** 订阅节点的代理内核物理出口网卡；缺省继承全局代理出口。 */
   proxyBindInterface?: string;
+  /** 是否对该订阅的节点按周期测速。缺省值由后端给出（计划状态的 `limits.subscriptionDefault`）。 */
+  periodicSpeedTest?: boolean;
+  /** 该订阅的测速周期（分钟）。缺省即后端的缺省周期；范围同见计划状态的 `limits`。 */
+  speedTestIntervalMinutes?: number;
   // 订阅流量/到期信息（从 Subscription-UserInfo header 解析）
   userInfo?: {
     upload?: number; // 已上传字节
@@ -446,7 +453,7 @@ export interface DnsConfig {
   // 迁移后不再写入，新逻辑读 nodeResolverPool/nodeResolverSingle。旧配置无此字段 → 视为 'auto'。
   nodeDomainResolver?: 'auto' | 'dnspod' | 'system';
   // 节点域名解析容错（issue #147，原「resolve-ahead 前置烧 IP」重定义）：缺省/true=开（默认）。
-  // 开 → domain_resolver 指本地 race server（dns-node-race）：多上游 DoH 并发 race（最快非空 wins），多 A 透传给内核 DialSerial 逐个重试。
+  // 开 → domain_resolver 指内核隔离的 node-bootstrap 策略；先加密 Tier1，必要时 Tier2，最快干净地址胜出。
   // 关 → domain_resolver 按 nodeResolverSingle 指【单上游】（逃生阀，退回单点）。与上游选择正交（设计 §9.1）。旧配置无 → 视为开。
   resolveNodeDomainsAhead?: boolean;
   // race【on】勾选的上游 id 列表（内置 'ali'|'dnspod'|'system' + 自定义 id）。Tier1(ali/dnspod/自定义DoH)抢跑、上限 3；
@@ -473,7 +480,7 @@ export interface DnsConfig {
 }
 
 // issue #147：自定义节点解析上游（强制纯 IP，DoH/DoT/UDP）。spec 经 shared/dns.parseDnsServerSpec 校验
-// （isDomain=true 拒绝，保证零 bootstrap + route 直连放行确定）。详见 docs/design/issue147-node-dns-race-resolver.md §9.1。
+// （isDomain=true 拒绝，保证候选连接无递归 bootstrap）。详见 docs/design/issue147-node-dns-race-resolver.md §9.1。
 export interface CustomDnsUpstream {
   id: string; // 稳定 id，供 DnsConfig.nodeResolverPool / nodeResolverSingle 引用
   spec: string; // 'https://223.5.5.5/dns-query'(DoH) | 'tls://<IP>:853'(DoT) | '<IP>'(裸 IP=UDP:53)
@@ -537,8 +544,22 @@ export interface PendingNodeChanges {
  * `errorCode`/`message` 仅 `failed` 时出现；`errorCode` 可能缺失（后端「无可诚实断言的分类」那一类），
  * 但 `message` 恒在 —— 没有它，条只能显示一个说不清的红。
  */
+export interface ExpectedMainCoreStop {
+  expectedMainGeneration: number;
+  expectedSelectedServerId: string | null;
+  expectedSelectionIntentGeneration: number;
+}
+
+export type ExpectedMainCoreStopResult =
+  | { kind: 'stopped'; expectedMainGeneration: number; stopMainGeneration: number }
+  | { kind: 'changed' };
+
 export interface ProxyLifecycleEvent {
   phase: 'ready' | 'stopped' | 'failed';
+  kind: 'start' | 'stop' | 'restart' | 'unknown';
+  mainGeneration: number;
+  terminal: boolean;
+  applyId?: number;
   errorCode?: string;
   message?: string;
 }
@@ -580,6 +601,9 @@ export interface UserConfig {
   // `st.mru`）。由 server_switch 写入（src-tauri/src/commands/server.rs push_recent_server_id）；
   // undefined=旧配置/从未切换过，视作空历史。
   recentServerIds?: string[];
+  // 选择意图：缺席即手动；自动选择时由后端置上（`auto_select_enable`），点任一节点时由后端清掉。
+  // 界面只读：全量保存与补丁带上的值一律被后端以盘上为准覆盖。`selectedServerId` 始终是实际出口。
+  selectionIntent?: SelectionIntent;
 
   // 代理模式
   proxyMode: ProxyMode;
@@ -613,6 +637,8 @@ export interface UserConfig {
     directServerId: string;
     proxyServerId: string;
     unmatchedAction?: DnsPolicyAction;
+    /** Default FakeIP non-A/AAAA queries only; server or reject. Missing = legacy domestic DNS. */
+    realQueryFallbackAction?: DnsPolicyAction;
     connectionResolution?: 'preserveDomain' | 'dnsRules';
   };
   /** @deprecated schema v4 起迁入 dnsDefaults.connectionResolution，仅兼容旧配置读取。 */
@@ -736,6 +762,7 @@ export interface UserConfig {
   // 原 systemProxyBypass 已并入此字段（单一清单，杜绝两处重复）。
   bypassLANList?: string[];
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
+  utlsPolicy?: string; // follow (legacy default), default, or a supported core profile
   tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
   // WebRTC 防泄露（仅 TUN 模式生效）：off=关；proxy=对 STUN 经协议嗅探强制走代理（srflx=代理 IP，WebRTC 正常）；
   // block=reject STUN（断 P2P、零公网 IP 泄露）。默认 undefined=off（零行为变化）。系统代理模式拦不住（浏览器 WebRTC
@@ -744,6 +771,12 @@ export interface UserConfig {
   // 节点测速端点 URL（经各节点代理 GET 量 TTFB）。默认 generate_204（见 contracts/speed-test）；用户可自配，兼容 http/https。
   // 非法值由 SpeedTestService 经 resolveSpeedTestTarget 回落默认，不阻断测速。
   speedTestUrl?: string;
+  /** 周期测速的全局总开关。关掉后任何订阅都不建周期计划；手动测速与故障切换不受影响。 */
+  periodicSpeedTestEnabled?: boolean;
+  /** 测速并发：缺省或 `'auto'` 为自动，否则是 4 到本设备上限的整数（上限随平台不同，由后端给出）。 */
+  speedTestConcurrency?: 'auto' | number;
+  /** 计费网络下的周期测速：降频（周期乘 4）/ 暂停 / 照常。缺省由后端给出。 */
+  speedTestMeteredPolicy?: SpeedTestMeteredPolicy;
   // fake-ip-filter 默认清单（NTP/STUN/Captive 等在 FakeIP 下会坏的域名 → 真实解析）。默认开（undefined/true=开），仅 false=关。
   fakeIpFilter?: boolean;
   // FakeIP 例外域名清单（用户可编辑）：undefined=用内置默认（DEFAULT_FAKEIP_FILTER_DOMAINS，与历史字节一致）；
@@ -753,30 +786,10 @@ export interface UserConfig {
   blockBrowserDoh?: boolean;
   /** 被拦的 DoH 端点域名清单（domain_suffix 语义）。未编辑=undefined → 用内置起点。 */
   browserDohList?: string[];
-  // 核心更新：仅在配置生成器已验证的 sing-box minor 版本带内自动更新（默认 true）。关闭后允许自动
-  // 更新跨越 minor（如 1.13→1.14），但跨 minor 的 schema 变更可能导致配置不兼容、需手动处理。
-  restrictCoreUpdateToCompatibleMinor?: boolean;
-  // 内核自动更新总开关（默认 false；读取端 === true 判定，不进 createDefaultConfig）。开启后调度器周期检查、
-  // 仅在「同 major.minor 兼容版本带内」（如 1.13.x→1.13.y）自动下载+预检+落位；跨 minor 一律不自动，仅提示。
-  // 落位永远只在代理进程不存在时发生（运行中暂存 staged，延到停止/启动/用户点立即应用），绝不静默断流。
-  autoUpdateCore?: boolean;
-  /**
-   * sing-box 内核更新通道。缺省 / 非法值均按 `'stable'`（= 本字段引入前写死的行为）。
-   *
-   * `'prerelease'` 才把 GitHub 上 `prerelease=true` 的 release（sing-box 的 alpha/beta/rc）纳入候选。
-   * **不按 alpha/beta/rc 再细分**：GitHub 只给一个布尔，档次仅存在于 tag 文本里，靠字符串猜档
-   * 会在上游改命名的那天静默失效。
-   *
-   * 与 `restrictCoreUpdateToCompatibleMinor` **正交**：本字段决定「看不看预发布」，那个决定
-   * 「跨不跨 minor」。开了预发布不会顺带放开跨带闸。
-   */
-  coreUpdateChannel?: 'stable' | 'prerelease';
   /** Polaris 应用更新通道；缺省稳定版，`prerelease` 才纳入 GitHub 预发布。 */
   appUpdateChannel?: 'stable' | 'prerelease';
-  // **App**（非内核）更新的自动下载开关（默认 false；读取端 === true 判定）。开启后「检查到新版本」应在后台
-  // 自动 update_download，就绪后提示安装。与 `autoUpdateCore` 是两件事：那个管 sing-box 内核二进制的换核，
-  // 这个管 Polaris 自身安装包的下载 —— 此前 UI 把「发现新版本时自动下载」错绑到 autoUpdateCore，
-  // 用户拨的是内核开关却以为在管 App 下载（语义错位，本批拆开）。
+  // 应用更新的自动下载开关（默认 false；读取端 === true 判定）。开启后「检查到新版本」应在后台
+  // 自动 update_download，就绪后提示安装。
   // 后端由 startup_tasks::should_auto_download_update 读取，并在自动检查命中新版本后启动后台下载。
   autoDownloadUpdate?: boolean;
   /** @deprecated 已迁移至 customRules（processName+direct）；仅保留兼容旧配置，ConfigManager 启动时清空迁移。 */

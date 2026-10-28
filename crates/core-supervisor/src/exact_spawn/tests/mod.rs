@@ -69,7 +69,19 @@ fn protected_images_are_sealed_and_profile_specific() {
     assert!(inputs.config.write_all(b"changed").is_err());
     assert!(inputs.config.set_len(0).is_err());
     assert_eq!(
-        inputs.validate_protection(LinuxInputProfile::B609PlainTcpCheckV1),
+        inputs.validate_protection(LinuxInputProfile::B609),
+        Err(PrepareError::Unsupported)
+    );
+    assert_eq!(
+        inputs.validate_protection(LinuxInputProfile::FE182),
+        Err(PrepareError::Unsupported)
+    );
+    assert_eq!(
+        inputs.validate_protection(LinuxInputProfile::C002),
+        Err(PrepareError::Unsupported)
+    );
+    assert_eq!(
+        inputs.validate_protection(LinuxInputProfile::A4D085),
         Err(PrepareError::Unsupported)
     );
     for file in [&inputs.binary, &inputs.config] {
@@ -121,16 +133,79 @@ fn reject_scripts_rules_empty_and_oversized_inputs() {
         ),
         Err(PrepareError::Unsupported)
     ));
-    assert!(matches!(
-        prepare_linux_protected_inputs(
-            binary,
-            b"{}".to_vec(),
-            &[],
-            LinuxInputProfile::B609PlainTcpCheckV1,
-            vec![]
-        ),
-        Err(PrepareError::BinaryMismatch)
-    ));
+    for profile in [
+        LinuxInputProfile::B609,
+        LinuxInputProfile::FE182,
+        LinuxInputProfile::C002,
+        LinuxInputProfile::A4D085,
+    ] {
+        assert!(matches!(
+            prepare_linux_protected_inputs(binary.clone(), b"{}".to_vec(), &[], profile, vec![]),
+            Err(PrepareError::BinaryMismatch)
+        ));
+    }
+}
+
+#[test]
+fn historical_and_native_dns_check_pins_remain_distinct() {
+    assert_eq!(
+        PINNED_B609_LINUX_X86_64_SHA256,
+        "64f6d8613f9c7d42ef9a8e90dd9fca7290f176c5b482714915c04353911559c0"
+    );
+    assert_eq!(
+        PINNED_FE182_LINUX_X86_64_SHA256,
+        "7420d9777154754b9182a4269d12348544d925269b700a4f34a29647a4155399"
+    );
+    assert_ne!(
+        PINNED_B609_LINUX_X86_64_SHA256,
+        PINNED_FE182_LINUX_X86_64_SHA256
+    );
+    assert_ne!(LinuxInputProfile::B609, LinuxInputProfile::FE182);
+    for profile in [LinuxInputProfile::B609, LinuxInputProfile::FE182] {
+        let LinuxInputProfile::PlainTcpCheckV1(identity) = profile else {
+            panic!("reviewed identities must share the fixed PlainTcpCheckV1 semantics");
+        };
+        assert!([
+            PINNED_B609_LINUX_X86_64_SHA256,
+            PINNED_FE182_LINUX_X86_64_SHA256,
+        ]
+        .contains(&identity.binary_sha256));
+    }
+    assert_eq!(MAX_BINARY_BYTES, 96 * 1024 * 1024);
+    assert_eq!(MAX_CONFIG_BYTES, 8 * 1024 * 1024);
+}
+
+#[test]
+fn final_c002_is_a_distinct_private_identity_for_the_same_check_semantics() {
+    let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::C002 else {
+        panic!("c002 must use the fixed PlainTcpCheckV1 semantics");
+    };
+    assert_eq!(
+        identity.binary_sha256,
+        "b754ac8223b27f4c20b40ced82d9ad5d58fee8fb4c5bfa48c38566e805c570ae"
+    );
+    assert_ne!(identity.binary_sha256, PINNED_B609_LINUX_X86_64_SHA256);
+    assert_ne!(identity.binary_sha256, PINNED_FE182_LINUX_X86_64_SHA256);
+    assert_ne!(LinuxInputProfile::C002, LinuxInputProfile::B609);
+    assert_ne!(LinuxInputProfile::C002, LinuxInputProfile::FE182);
+}
+
+#[test]
+fn publisher_repack_keeps_one_check_semantics_and_distinct_actual_bytes() {
+    let LinuxInputProfile::PlainTcpCheckV1(identity) = LinuxInputProfile::A4D085 else {
+        panic!("a4d085 must use the fixed PlainTcpCheckV1 semantics");
+    };
+    assert_eq!(
+        identity.binary_sha256,
+        "2a7495faeb18d2666dfcc77f678057c35cc7a7bb36b03a8a16ff9ac6249b4db8"
+    );
+    for historical in [
+        LinuxInputProfile::B609,
+        LinuxInputProfile::FE182,
+        LinuxInputProfile::C002,
+    ] {
+        assert_ne!(LinuxInputProfile::A4D085, historical);
+    }
 }
 
 #[tokio::test]

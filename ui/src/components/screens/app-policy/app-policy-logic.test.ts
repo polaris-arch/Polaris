@@ -85,3 +85,37 @@ describe('sortAppCategories', () => {
     expect(new Set(sorted.map((c) => c.key))).toEqual(new Set(CATS.map((c) => c.key)));
   });
 });
+
+
+it('explicit policy selection enables the new rule; disabled rules remain distinguishable for display', async () => {
+  const { appRuleForPick, appRuleDisabled } = await import('./app-policy-logic');
+  for (const pick of ['follow', 'direct', 'block', 'proxy'] as const) {
+    const rule = appRuleForPick('app', pick, 'node');
+    expect(rule.enabled).toBe(true);
+    expect(appRuleDisabled(rule)).toBe(false);
+    expect(appRuleDisabled({ ...rule, enabled: false })).toBe(true);
+  }
+  expect(appRuleDisabled(undefined)).toBe(false);
+});
+
+it('disabled app hover cards do not advertise their saved direct/block policy as active', async () => {
+  const { createElement } = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const { AppRuleHoverCardContent } = await import('@/components/hover-cards/AppRuleHoverCard');
+  const { customToPreset } = await import('@/domain/app-rules-preset');
+  const preset = customToPreset({ id: 'sample', name: 'Sample', emoji: '🧩', geositeTags: [], category: 'tools' });
+  for (const action of ['direct', 'block'] as const) {
+    const html = renderToStaticMarkup(createElement(AppRuleHoverCardContent, {
+      preset, rule: { appId: 'sample', action, enabled: false }, isCustom: true,
+    }));
+    expect(html).not.toContain(`act-${action}`);
+    expect(html).toContain('class="pill"');
+  }
+});
+
+it('the master switch uses native keyboard activation rather than a pointer-only span', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./AppPolicyScreen.tsx', import.meta.url), 'utf8');
+  expect(source).toMatch(/<button\s+type="button"[\s\S]*?role="switch"[\s\S]*?aria-label=\{t\('appPolicy.masterTip'\)\}/);
+  expect(source).not.toMatch(/<span[^>]*role="switch"/);
+});

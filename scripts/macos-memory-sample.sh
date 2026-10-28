@@ -89,26 +89,48 @@ process_alive() {
   fi
 }
 
-footprint_field() {
+# Capture both fields from one observation of this PID. A tool failure or a
+# missing/malformed field is unknown, never a measured zero. "-" denotes an
+# explicitly absent target and retains the existing zero placeholder.
+footprint_fields() {
   sample_pid=$1
-  sample_field=$2
-  if [ "$sample_pid" = "-" ] || ! kill -0 "$sample_pid" 2>/dev/null; then
-    echo 0
+  if [ "$sample_pid" = "-" ]; then
+    echo '0,0'
     return
   fi
-  footprint -f bytes --noCategories -p "$sample_pid" 2>/dev/null |
-    awk -v field="$sample_field" '$1 == field ":" { print $2; found=1; exit } END { if (!found) print 0 }'
+  if ! kill -0 "$sample_pid" 2>/dev/null; then
+    echo 'unknown,unknown'
+    return
+  fi
+  if footprint_output=$(footprint -f bytes --noCategories -p "$sample_pid" 2>/dev/null); then
+    printf '%s\n' "$footprint_output" | awk '
+      BEGIN { phys="unknown"; peak="unknown" }
+      $1 == "phys_footprint:" && $2 ~ /^[0-9]+$/ { phys=$2 }
+      $1 == "phys_footprint_peak:" && $2 ~ /^[0-9]+$/ { peak=$2 }
+      END { print phys "," peak }'
+  else
+    echo 'unknown,unknown'
+  fi
 }
 
 rss_bytes() {
   sample_pid=$1
-  if [ "$sample_pid" = "-" ] || ! kill -0 "$sample_pid" 2>/dev/null; then
+  if [ "$sample_pid" = "-" ]; then
     echo 0
     return
   fi
-  rss_kib=$(ps -o rss= -p "$sample_pid" 2>/dev/null |
-    awk 'NR == 1 && $1 ~ /^[0-9]+$/ { print $1; found=1 } END { if (!found) print 0 }')
-  echo $((rss_kib * 1024))
+  if ! kill -0 "$sample_pid" 2>/dev/null; then
+    echo unknown
+    return
+  fi
+  if rss_output=$(ps -o rss= -p "$sample_pid" 2>/dev/null); then
+    # Keep failed/malformed sampling distinct from an observed numeric zero.
+    printf '%s\n' "$rss_output" | awk '
+      NR == 1 && NF == 1 && $1 ~ /^[0-9]+$/ { printf "%.0f\n", $1 * 1024; found=1 }
+      END { if (!found) print "unknown" }'
+  else
+    echo unknown
+  fi
 }
 
 echo "timestamp_utc,stage,app_pid,app_alive,app_phys_bytes,app_peak_bytes,app_rss_bytes,web_pid,web_alive,web_phys_bytes,web_peak_bytes,web_rss_bytes,core_pid,core_alive" > "$output_csv"
@@ -122,11 +144,17 @@ while :; do
   app_alive=$(process_alive "$app_pid")
   web_alive=$(process_alive "$web_pid")
   core_alive=$(core_process_alive "$core_pid")
-  app_phys=$(footprint_field "$app_pid" phys_footprint)
-  app_peak=$(footprint_field "$app_pid" phys_footprint_peak)
+  app_footprint=$(footprint_fields "$app_pid")
+  app_phys=${app_footprint%,*}
+  app_peak=${app_footprint#*,}
   app_rss=$(rss_bytes "$app_pid")
-  web_phys=$(footprint_field "$web_pid" phys_footprint)
-  web_peak=$(footprint_field "$web_pid" phys_footprint_peak)
+  if [ "$web_pid" = "$app_pid" ]; then
+    web_footprint=$app_footprint
+  else
+    web_footprint=$(footprint_fields "$web_pid")
+  fi
+  web_phys=${web_footprint%,*}
+  web_peak=${web_footprint#*,}
   web_rss=$(rss_bytes "$web_pid")
   printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$stage" "$app_pid" "$app_alive" \

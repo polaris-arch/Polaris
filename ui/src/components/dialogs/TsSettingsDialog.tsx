@@ -27,7 +27,7 @@
  * R1：`key` 绑 TS 节点 id（见导出包装）+ useState 同步初始化。
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { tsLoginErrorReason } from './ts-login-server';
@@ -64,6 +64,8 @@ import { useStagingActive } from '@/store/use-staging-active';
 import { splitStagedOnly, stagedOnlyIds } from '@/lib/staged-config';
 import { editRoute } from '@/lib/staged-config';
 import { useDialogStore } from './dialog-store';
+import { confirmStopThenTsLogout } from './ts-logout-confirm';
+import { isMainCoreLogoutError } from './ts-logout-flow';
 import { INVALID_NODE_REASON_KEY } from '@/domain/invalid-node-reason';
 import { groupTsFields } from './mesh-form-layout';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
@@ -87,10 +89,11 @@ function TsSetIcon() {
 /* 字段表住在 `./ts-spec`（零 React 纯数据，两个客户端共用；拆分理由见那份文件头注）。
    桌面「多 VPN 兼容」批新加的 `ON_DEMAND_FIELD` 已随 `TS_ADV_SPEC` 搬进那份文件。 */
 
-function TsSettingsForm({ node }: { node?: ServerConfig }) {
+function TsSettingsForm({ instanceId, node }: { instanceId: string; node?: ServerConfig }) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((state) => state.closeInstance);
+  const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   const loadConfig = useAppStore((s) => s.loadConfig);
   const stagingEnabled = useStagingActive();
   const stage = useStagedConfigStore((s) => s.stage);
@@ -212,7 +215,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
       close();
       return;
     }
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('ts.discardTitle'),
@@ -220,7 +223,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
         confirmLabel: t('ts.discard'),
         danger: true,
         onConfirm: () => {
-          close();
+          closeInstance(confirmId);
           close();
         },
       },
@@ -342,9 +345,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
       );
       return;
     }
-    setBusy(true);
-    try {
-      await api.server.tailscaleLogout(node.id);
+    const loggedOut = () => {
       const store = useAppStore.getState();
       store.setTailscaleLoginState(node.id, false);
       store.setTailscaleAuthUrl(node.id, null);
@@ -352,7 +353,16 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
       store.clearTailscaleStatus(node.id);
       void loadConfig(true);
       close();
+    };
+    setBusy(true);
+    try {
+      await api.server.tailscaleLogout(node.id);
+      loggedOut();
     } catch (e) {
+      if (isMainCoreLogoutError(e)) {
+        await confirmStopThenTsLogout(node.id, t, loggedOut);
+        return;
+      }
       // 登出不是保存 —— 标题取 NodesScreen:696 同一操作已在用的那个键，别套 `common.saveFailed`。
       console.error('[TsSettingsDialog] logout failed:', e);
       const reason = tsLoginErrorReason(e);
@@ -486,7 +496,7 @@ function TsSettingsForm({ node }: { node?: ServerConfig }) {
   );
 }
 
-export function TsSettingsDialog({ serverId }: { serverId: string }) {
+export function TsSettingsDialog({ instanceId, serverId }: { instanceId: string; serverId: string }) {
   // 展示面：本弹窗的提交腿走暂存（:202），编辑基准必须同源，否则第二次编辑从盘上的旧值起算。
   // 按 id 精确取——Tailscale 不再是单例（多节点时 `.find(protocol==='tailscale')` 会取到任意一个，
   // 不一定是调用方（`node-edit-routing.ts` / `MeshJoinDialog`）想编辑的那个）。取不到（节点已被删 /
@@ -496,7 +506,7 @@ export function TsSettingsDialog({ serverId }: { serverId: string }) {
   // （`meshSingletonConflict` 只剩 WARP 支），按协议取「任意一个」会让编辑第二个节点
   // 打开/写坏第一个（同 `node-edit-routing.ts` 记的那条缺陷）。
   const node = servers.find((s) => s.id === serverId);
-  return <TsSettingsForm key={node?.id ?? 'none'} node={node} />;
+  return <TsSettingsForm key={node?.id ?? 'none'} instanceId={instanceId} node={node} />;
 }
 
 export default TsSettingsDialog;

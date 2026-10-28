@@ -35,6 +35,8 @@ import { useDialogStore } from './dialog-store';
 import { isSubscriptionUrl } from './sub-url';
 import { useSubscriptionCreateDialogOperation } from './use-subscription-create-dialog-operation';
 import { Fold } from '@/components/Fold';
+import { PeriodicGlobalOffHint } from './PeriodicGlobalOffHint';
+import { usePeriodicSpeedTestFields } from '@/hooks/use-periodic-speed-test-fields';
 import { InfoIcon } from '@/components/InfoIcon';
 import { Csel, type CselOption } from './Csel';
 import { buildNetworkInterfaceChoices, useNetworkInterfaces } from '@/hooks/use-network-interfaces';
@@ -87,6 +89,7 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
   // per-sub「经代理更新」覆盖（默认关）：写回 SubscriptionConfig.updateViaProxy。
   const [viaProxy, setViaProxy] = useState(base?.updateViaProxy ?? false);
   const [proxyBindInterface, setProxyBindInterface] = useState(base?.proxyBindInterface ?? '');
+  const periodic = usePeriodicSpeedTestFields(base);
   const interfaces = useNetworkInterfaces();
   const interfaceOptions: CselOption[] = buildNetworkInterfaceChoices(
     interfaces.items,
@@ -122,6 +125,15 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
   });
   const autoUpdateNoticeKey = subAutoUpdateNoticeKey(autoUpdateMode);
   const autoUpdateNotice = autoUpdateNoticeKey === '' ? '' : t(autoUpdateNoticeKey, { h: intervalHours });
+
+  // 周期的取值范围由后端给出；还没拿到时不显示范围。
+  const intervalRange = periodic.limits
+    ? t('sub.speedTestIntervalRange', {
+        min: periodic.limits.intervalMinutesMin,
+        max: periodic.limits.intervalMinutesMax,
+        default: periodic.limits.intervalMinutesDefault,
+      })
+    : undefined;
 
   const touch = () => {
     setDirty(true);
@@ -204,7 +216,8 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
     const urlBad = !isSubscriptionUrl(url);
     setErrName(nameEmpty);
     setErrUrl(urlBad);
-    if (nameEmpty || urlBad) return;
+    const periodicFields = periodic.commit();
+    if (nameEmpty || urlBad || periodicFields === null) return;
 
     setSubmitting(true);
     try {
@@ -217,6 +230,7 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
           userAgent: ua.trim() || undefined,
           updateViaProxy: viaProxy,
           proxyBindInterface: proxyBindInterface || undefined,
+          ...periodicFields,
         };
         // 编辑：仅写 config（对齐 上游 updateSubscription——edit 不自动拉取）+ 成功 toast。
         await api.subscription.update(next);
@@ -231,6 +245,7 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
           userAgent: ua.trim() || undefined,
           updateViaProxy: viaProxy,
           proxyBindInterface: proxyBindInterface || undefined,
+          ...periodicFields,
         });
       }
     } catch (e) {
@@ -400,6 +415,55 @@ function SubForm({ instanceId, base, focus, onAdded }: SubFormProps) {
           />
           {interfaces.failed && <div className="err-line">{t('settings.network.interfaceListFailed')}</div>}
         </div>
+
+        {/* 周期测速：每订阅一个开关，周期输入框跟着它。全局总开关关着时开关照常可拨、照常保存，
+            只是多一行说明与就地打开全局开关的按钮。 */}
+        <div className="fld swt-row" style={{ marginTop: 14 }}>
+          <div className="swt-tx">
+            <span className="swt-label">
+              <b>{t('sub.periodicSpeedTest')}</b>
+              <InfoIcon tip={t('sub.periodicSpeedTestHint')} />
+            </span>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={periodic.checked}
+            aria-label={t('sub.periodicSpeedTest')}
+            className={`swt${periodic.checked ? ' on' : ''}`}
+            onClick={() => {
+              periodic.toggle();
+              touch();
+            }}
+          />
+        </div>
+        {periodic.showGlobalOff && (
+          <PeriodicGlobalOffHint busy={periodic.enablingGlobal} onEnable={periodic.enableGlobal} />
+        )}
+        {periodic.checked && (
+          <div className="fld" style={{ marginTop: 14 }}>
+            <label className="fld-l fld-l-info" htmlFor="sub-speed-interval">
+              <span>{t('sub.speedTestInterval')}</span>
+              <span className="fld-opt"> {t('common.optional')}</span>
+              <InfoIcon tip={intervalRange ? `${intervalRange} ${t('sub.speedTestIntervalHint')}` : t('sub.speedTestIntervalHint')} />
+            </label>
+            <input
+              id="sub-speed-interval"
+              className="input"
+              inputMode="numeric"
+              value={periodic.interval}
+              aria-invalid={periodic.intervalInvalid || undefined}
+              onChange={(e) => {
+                periodic.setInterval(e.target.value);
+                touch();
+              }}
+              placeholder={periodic.limits ? String(periodic.limits.intervalMinutesDefault) : undefined}
+            />
+            {periodic.intervalInvalid && (
+              <div className="err-line">{intervalRange ?? t('sub.speedTestIntervalInvalid')}</div>
+            )}
+          </div>
+        )}
       </Fold>
 
       {previewMsg && (

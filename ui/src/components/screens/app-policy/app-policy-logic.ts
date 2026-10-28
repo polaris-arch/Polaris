@@ -44,3 +44,59 @@ export function sortAppCategories<T extends LabeledCategory>(
     return compareLabel(a.label, b.label, locale);
   });
 }
+
+import type { AppRule } from '@/contracts/types';
+
+/** 四个档位。`proxy` = 指定节点（必须带 `targetServerId`），`follow` = 跟随全局。 */
+export type AppPolicyWritablePick = 'follow' | 'direct' | 'block' | 'proxy';
+
+/**
+ * 档位白名单。面板给出的四档都在其中；它今天守的是「档位串合法」这一格（见文件头注末节）。
+ */
+export const APP_POLICY_WRITABLE: ReadonlySet<string> = new Set<AppPolicyWritablePick>([
+  'follow',
+  'direct',
+  'block',
+  'proxy',
+]);
+
+export function isAppPolicyWritable(pick: string): pick is AppPolicyWritablePick {
+  return APP_POLICY_WRITABLE.has(pick);
+}
+
+/**
+ * 一次选档落成的 `AppRule`。与桌面 `AppPolicyScreen.tsx:259 setAppPolicy` 逐字段同义，
+ * 两处**刻意**的差别各自有理由：
+ *
+ *  ① `follow` 落成 `{ action: 'proxy', 不带 targetServerId }` —— 桌面快选「默认代理」的落盘形态，
+ *     两端 `appPolicyView` 都把它显示成「跟随全局」。它不是「没有规则」：显式写一条
+ *     跟随全局的规则，才能把一条已存在的 `direct` 从 `exclude_package` 里拿掉。
+ *
+ *  ② **`enabled` 恒 `true`**，不沿用 `existing?.enabled ?? true`。移动端**没有**逐条启停应用规则的
+ *     控件（桌面在卡片上有），沿用一条 `enabled:false` 的旧规则会让用户看见档位变了、而
+ *     `inbounds.rs:717` 的 `filter(|r| r.enabled && …)` 把它整条滤掉 —— 又一颗「拨了不生效」的控件。
+ *     这是**扩大**了一次用户显式动作的效果，故写在这里，不是顺手。
+ *
+ * ⚠️ **`targetServerId` 只在 `proxy` 档且真的给了节点时才写**（连 `undefined` 都不写）：
+ * `AppRule` 的这一格是可选的，Rust 侧 `rule.rs:293` 带 `skip_serializing_if = "Option::is_none"`。
+ * 写成 `targetServerId: undefined` 会让 `JSON.stringify` 的结果与夹具在**深比较**上分叉。
+ * 反过来，`proxy` 档**没给**节点 id 时落成的就是 `follow` 那条形态 —— 那正是它的语义
+ * （「代理但没指定去哪」= 跟随全局），不是一个需要报错的非法输入。
+ */
+export function appRuleForPick(
+  appId: string,
+  pick: AppPolicyWritablePick,
+  targetServerId?: string,
+): AppRule {
+  if (pick === 'direct') return { appId, action: 'direct', enabled: true };
+  if (pick === 'block') return { appId, action: 'block', enabled: true };
+  if (pick === 'proxy' && targetServerId !== undefined && targetServerId !== '') {
+    return { appId, action: 'proxy', enabled: true, targetServerId };
+  }
+  return { appId, action: 'proxy', enabled: true };
+}
+
+/** An explicit disabled rule must never advertise its configured action as active. */
+export function appRuleDisabled(rule: AppRule | undefined): boolean {
+  return rule?.enabled === false;
+}

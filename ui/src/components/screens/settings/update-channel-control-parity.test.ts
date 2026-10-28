@@ -7,15 +7,12 @@ function source(name: string): string {
 }
 
 describe('update channel controls stay visually consistent', () => {
-  it('uses the shared Select control for both app and core channels', () => {
+  it('uses the shared Select control for the app channel', () => {
     const app = source('./AppUpdateCard.tsx');
-    const core = source('./CoreUpdateCard.tsx');
 
     expect(app).toContain('<Select');
-    expect(core).toContain('<Select');
     expect(app).not.toContain('<Segmented');
     expect(app).toContain('style={{ width: 132 }}');
-    expect(core).toContain('style={{ width: 132 }}');
   });
 
   it('marks the current-version re-download as a warning without adding an install confirmation', () => {

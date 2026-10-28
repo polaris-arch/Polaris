@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use polaris_mesh::tailscale_state::{state_exists, tailscale_state_dir, TailscaleStateFs};
+use polaris_mesh::tailscale_state::TailscaleStateFs;
+#[cfg(not(any(target_os = "ios", windows)))]
+use polaris_mesh::tailscale_state::{state_exists, tailscale_state_dir};
 use polaris_mesh::warp::{
     enqueue_pending_deregister, plan_deregister_drain, DeregisterResult, DrainAction,
     DrainPlanItem, PendingDeregisterEntry,
@@ -205,12 +207,16 @@ impl MeshRuntime {
         let manager = MeshExitRouteManager::new(op, LogExitRouteLog, Platform::current());
         // 取消令牌由状态机自持，此处取同一个 Arc 的锁外句柄（不是第二份状态）。
         let exit_route_cancel = manager.cancel_handle();
+        // A login core left by a killed host process still writes its node's state directory.
+        let login_registry = LoginCoreRegistry::production().with_stale_login_sweeper(Arc::new(
+            crate::runtime::tailscale_login_core::ProcessStaleLoginSweeper::new(config_dir.clone()),
+        ));
         Self {
             config_dir,
             warp_queue_path,
             warp_queue_lock: Mutex::new(()),
             warp_queue_changed: tokio::sync::Notify::new(),
-            login_registry: LoginCoreRegistry::production(),
+            login_registry,
             exit_route: AsyncMutex::new(manager),
             exit_route_cancel,
             #[cfg(test)]
@@ -322,6 +328,7 @@ impl MeshRuntime {
         TailscaleStatusSnapshot {
             connected,
             statuses,
+            main_core_hold: None, // STATUS cache alone cannot attest main-core custody.
         }
     }
 
@@ -368,8 +375,25 @@ impl MeshRuntime {
             .cloned()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn directory_in_use(&self, id: &str, main_alive: bool) -> bool {
+        self.login_registry.state_in_use(id, main_alive)
+    }
+
     /// 某节点 tailscale state 目录（`<config_dir>/tailscale/<server_id>`）。
     pub fn tailscale_state_dir(&self, server_id: &str) -> std::io::Result<PathBuf> {
+        #[cfg(target_os = "ios")]
+        {
+            crate::runtime::tailscale_directory::DirectoryLease::actual_directory(
+                &self.config_dir,
+                server_id,
+            )
+        }
+        #[cfg(windows)]
+        {
+            crate::runtime::windows_directory::actual_directory(&self.config_dir, server_id)
+        }
+        #[cfg(not(any(target_os = "ios", windows)))]
         tailscale_state_dir(&self.config_dir, server_id).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
         })
@@ -383,7 +407,32 @@ impl MeshRuntime {
         let fs = StdTailscaleFs;
         let mut out = std::collections::HashMap::new();
         for id in server_ids {
-            out.insert(id.clone(), state_exists(&fs, &self.config_dir, id));
+            #[cfg(target_os = "ios")]
+            let exists = crate::runtime::tailscale_directory::DirectoryLease::acquire(
+                &self.config_dir,
+                id,
+                false,
+            )
+            .ok()
+            .and_then(|lease| fs.read_dir_names(&lease.directory_path()))
+            .is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|name| name != ".polaris-directory-incarnation")
+            });
+            #[cfg(windows)]
+            let exists = self
+                .tailscale_state_dir(id)
+                .ok()
+                .and_then(|path| fs.read_dir_names(&path))
+                .is_some_and(|names| {
+                    names
+                        .iter()
+                        .any(|name| name != ".polaris-directory-incarnation")
+                });
+            #[cfg(not(any(target_os = "ios", windows)))]
+            let exists = state_exists(&fs, &self.config_dir, id);
+            out.insert(id.clone(), exists);
         }
         out
     }
@@ -395,6 +444,12 @@ impl MeshRuntime {
         _gate: &tokio::sync::MutexGuard<'_, ()>,
         main_alive: bool,
     ) -> std::io::Result<()> {
+        if cfg!(any(target_os = "ios", windows)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "CleanupUnknown: whole-directory deletion requires bound intent and custody",
+            ));
+        }
         if self.login_registry.state_in_use(server_id, main_alive) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -434,6 +489,25 @@ impl MeshRuntime {
         provenance: polaris_mesh::tailscale_state::AuthProjectionProvenance<'_>,
         sealed_revision: Option<&str>,
     ) -> std::io::Result<()> {
+        self.tailscale_retire_auth_at_directory_under_gate(
+            server_id,
+            gate,
+            keep,
+            provenance,
+            sealed_revision,
+            None,
+        )
+    }
+
+    pub(crate) fn tailscale_retire_auth_at_directory_under_gate(
+        &self,
+        server_id: &str,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        keep: Option<&Arc<crate::runtime::tailscale_login_core::Attempt>>,
+        provenance: polaris_mesh::tailscale_state::AuthProjectionProvenance<'_>,
+        sealed_revision: Option<&str>,
+        sealed_directory: Option<&str>,
+    ) -> std::io::Result<()> {
         use polaris_store::fs::{durable_atomic_write, random_tmp_suffix};
         use std::io::Read;
         const MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -443,11 +517,39 @@ impl MeshRuntime {
                 "Tailscale authentication state is unknown",
             )
         };
+        #[cfg(target_os = "ios")]
+        if sealed_directory.is_none() {
+            return Err(unknown());
+        }
         self.login_registry
             .assert_auth_state_available(server_id, gate, keep)
             .map_err(std::io::Error::other)?;
+        #[cfg(unix)]
+        let _directory_lease = crate::runtime::tailscale_directory::DirectoryLease::acquire(
+            &self.config_dir,
+            server_id,
+            false,
+        )?;
+        #[cfg(unix)]
+        let directory = _directory_lease.directory_path();
+        #[cfg(windows)]
+        let _windows_auth_lease =
+            crate::runtime::windows_directory::auth_lease(&self.config_dir, server_id)?;
+        #[cfg(not(unix))]
         let directory = self.tailscale_state_dir(server_id)?;
-        let state_root = self.config_dir.join("tailscale");
+        #[cfg(any(target_os = "ios", target_os = "android", test))]
+        if let Some(expected) = sealed_directory {
+            let actual = crate::runtime::tailscale_login_core::canonical_tailscale_claim_directory(
+                &directory,
+            )
+            .map_err(std::io::Error::other)?;
+            if actual != Path::new(expected) {
+                return Err(unknown());
+            }
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android", test)))]
+        let _ = sealed_directory;
+        let state_root = directory.parent().ok_or_else(unknown)?.to_path_buf();
         for path in [&state_root, &directory] {
             let metadata = std::fs::symlink_metadata(path)?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -518,6 +620,39 @@ impl MeshRuntime {
             durable_atomic_write(&path, text, &random_tmp_suffix()).map_err(|_| unknown())?;
         }
         Ok(())
+    }
+
+    #[cfg(all(target_os = "ios", unix))]
+    pub(crate) fn delete_original_tailscale_directory_under_gate(
+        &self,
+        intent: &polaris_mesh::tailscale_state::directory_retirement::DirectoryDeletionIntent,
+        receipt: Option<&tauri_plugin_polaris_ios::TailscaleDirectoryRetirementReceipt>,
+        _gate: &tokio::sync::MutexGuard<'_, ()>,
+        main_alive: bool,
+        current: &serde_json::Value,
+    ) -> std::io::Result<crate::runtime::tailscale_directory::DirectoryLease> {
+        if self
+            .login_registry
+            .state_in_use(&intent.server_id, main_alive)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Tailscale state is in use",
+            ));
+        }
+        match receipt {
+            Some(receipt) => crate::runtime::tailscale_directory::commit_original_directory(
+                &self.config_dir,
+                intent,
+                receipt,
+                current,
+            ),
+            None => crate::runtime::tailscale_directory::resume_committed_directory(
+                &self.config_dir,
+                intent,
+                current,
+            ),
+        }
     }
 
     /// PC/Android closure may find no FileStore at all. This is a scoped no-write
@@ -660,14 +795,13 @@ impl MeshRuntime {
     fn save_warp_queue(&self, queue: &[PendingDeregisterEntry]) -> Result<(), String> {
         let text =
             serde_json::to_string(queue).map_err(|e| format!("warp 待注销队列序列化失败: {e}"))?;
-        let tmp = self.warp_queue_path.with_extension("json.tmp");
-        std::fs::write(&tmp, text.as_bytes())
-            .map_err(|e| format!("warp 待注销队列写临时文件失败: {e}"))?;
-        if let Err(e) = std::fs::rename(&tmp, &self.warp_queue_path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("warp 待注销队列 rename 失败: {e}"));
-        }
-        Ok(())
+        polaris_store::fs::durable_atomic_write(
+            &self.warp_queue_path,
+            &text,
+            &polaris_store::fs::random_tmp_suffix(),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("warp 待注销队列持久写入失败: {error}"))
     }
 
     /// WARP 节点删除时把远端自删凭据入待注销队列（防孤儿设备计费）。上游 `enqueuePendingDeregister`。
@@ -877,6 +1011,13 @@ impl MeshRuntime {
             .await
     }
 
+    /// Capture before taking tailscale_state_gate; this uses that original gate once.
+    pub(crate) async fn pc_login_producer_view(
+        &self,
+    ) -> Result<crate::runtime::tailscale_login_core::LoginProducerCapture<'_>, String> {
+        self.login_registry.pc_producer_view().await
+    }
+
     pub async fn tailscale_state_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.login_registry.state_gate().await
     }
@@ -921,6 +1062,18 @@ impl MeshRuntime {
         gate: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<Vec<(String, String, String)>, String> {
         self.login_registry.main_scope_if_token(token, gate)
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn bind_tailscale_main_actual_scope(
+        &self,
+        token: &crate::runtime::tailscale_login_core::MainBirthToken,
+        gate: &tokio::sync::MutexGuard<'_, ()>,
+        digest: &str,
+        runs: &[tauri_plugin_polaris_ios::TailscaleStoreRetirementInstance],
+    ) -> Result<(), String> {
+        self.login_registry
+            .bind_main_actual_scope(token, gate, &self.config_dir, digest, runs)
     }
 
     #[cfg(test)]
@@ -1574,12 +1727,16 @@ fn is_utun_name(n: &str) -> bool {
 /// `ifconfig`（全量）输出 → 每张 utun 接口的 inet(v4) 地址表（保序）。上游 `probeMacosTailnetIface` 解析段。纯函数。
 fn parse_ifconfig_ifaces(stdout: &str) -> Vec<(String, Vec<String>)> {
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut active = None;
     for line in stdout.lines() {
-        if let Some(name) = utun_header_name(line) {
-            out.push((name, Vec::new()));
-        } else if let Some((_, ips)) = out.last_mut() {
+        if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+            active = utun_header_name(line).map(|name| {
+                out.push((name, Vec::new()));
+                out.len() - 1
+            });
+        } else if let Some(index) = active {
             if let Some(ip) = inet_v4_addr(line) {
-                ips.push(ip);
+                out[index].1.push(ip);
             }
         }
     }
@@ -1722,3 +1879,7 @@ impl ExitRouteLog for LogExitRouteLog {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "mesh/audit_tests.rs"]
+mod audit_tests;

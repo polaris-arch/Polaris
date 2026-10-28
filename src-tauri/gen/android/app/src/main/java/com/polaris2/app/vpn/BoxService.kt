@@ -168,8 +168,17 @@ class BoxService(
         }
         // 先立前台通知：startForeground 的 5 秒窗口从 onStartCommand 起算，而内核起来要秒级。
         try {
-            notification.show(ServiceState.Starting, PROFILE_NAME)
-            registerStopReceiver()
+            synchronized(this) {
+                // Stop may win after admission but before foreground publication. Do not
+                // let that revoked start open an epoch newer than its queued close.
+                if (!isStarting(attempt) || !MainKernelAttemptRegistry.isCurrent(attempt)) {
+                    attempt.skipPreparation()
+                    service.stopSelfResult(startId)
+                    return Service.START_NOT_STICKY
+                }
+                notification.show(ServiceState.Starting, PROFILE_NAME)
+                registerStopReceiver()
+            }
             // A Stop broadcast sent before receiver registration has no target.
             // Recheck the bridge after registration and take over that pending Stop.
             if (VpnBridge.isStopping() || !isStarting(attempt)) {
@@ -580,11 +589,12 @@ class BoxService(
         StatsBridge.closeAll()
         unregisterStopReceiver()
         if (firstStop) {
+            val notificationEpoch = notification.invalidateForStop()
             mainHandler.post {
                 synchronized(this) {
                     if (MainKernelAttemptRegistry.isCurrent(attempt) ||
                         (mainAttempt == null && state == ServiceState.Stopped && MainKernelAttemptRegistry.isVacant())) {
-                        notification.close()
+                        notification.close(notificationEpoch)
                     }
                 }
             }

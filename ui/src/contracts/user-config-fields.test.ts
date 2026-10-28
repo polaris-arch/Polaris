@@ -161,3 +161,9 @@ describe('W-0 豁免谓词', () => {
     expect(isStagedExempt('servers')).toBe(false);
   });
 });
+
+
+it('global uTLS participates in staged generation rather than being a UI preference', () => {
+  expect(isCoreConfigKey('utlsPolicy')).toBe(true);
+  expect(isStagedExempt('utlsPolicy')).toBe(false);
+});

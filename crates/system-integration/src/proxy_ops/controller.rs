@@ -433,6 +433,10 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                 None => self.ops.clear_proxy()?,
             }
             *restored_os = true;
+        } else {
+            // A previous native restore may have succeeded before its consumer
+            // notification failed. Preserve retry authority until notification settles.
+            self.ops.confirm_proxy_settings_changed()?;
         }
         self.clear_legacy_marker(&marker)?;
         self.original = None;
@@ -474,6 +478,7 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
                 let current = self.ops.capture_transaction_snapshot()?;
                 match self.ops.snapshot_relation(applied, original, &current) {
                     ProxySnapshotRelation::Exact => {
+                        self.ops.confirm_proxy_settings_changed()?;
                         self.advance_current_phase(
                             txn_id,
                             ProxyMarkerPhase::Restoring,
@@ -580,11 +585,10 @@ impl<Ops: SystemProxyOps, Fs: MarkerFs> SystemProxyController<Ops, Fs> {
     }
 }
 
-/// 当前系统代理是否仍指向 marker 记录的我们（`host:port` 精确匹配，或 `host` 匹配）。
-///
-/// **为什么也认 host 匹配**：mac 的 socks 端口与 http 端口不同（`socks_port` ≠ `http_port`），
-/// 而 marker 只记 `address:http_port` → 仅按 `host:port` 精确匹配会漏判 socks 腿的残留。
-/// 与启动期 marker 恢复同口径（上游 `ensureSystemProxyCleared` 的 `pointsToUs`）。
+/// Legacy web endpoints must match host AND port. A differing web endpoint
+/// is a foreign change, even when another protocol still points to us.
+/// The old marker lacks a SOCKS port: host-only compatibility is confined to
+/// that protocol; it never authorizes a different HTTP/HTTPS port.
 pub(super) fn points_to_us(status: Option<&SystemProxyStatus>, marker_host_port: &str) -> bool {
     let Some(status) = status else {
         return false;
@@ -592,18 +596,21 @@ pub(super) fn points_to_us(status: Option<&SystemProxyStatus>, marker_host_port:
     if !status.enabled {
         return false;
     }
-    let marker_host = marker_host_port
-        .split(':')
-        .next()
-        .unwrap_or(marker_host_port);
-    let hit = |p: &Option<String>| -> bool {
-        match p {
-            Some(proxy) => {
-                proxy == marker_host_port
-                    || proxy.split(':').next().unwrap_or(proxy.as_str()) == marker_host
-            }
-            None => false,
-        }
-    };
-    hit(&status.http_proxy) || hit(&status.https_proxy) || hit(&status.socks_proxy)
+    let web = [&status.http_proxy, &status.https_proxy];
+    if web
+        .iter()
+        .any(|endpoint| endpoint.as_deref().is_some_and(|p| p != marker_host_port))
+    {
+        return false;
+    }
+    let marker_host = marker_host_port.rsplit_once(':').map(|(host, _)| host);
+    let socks = status.socks_proxy.as_deref().is_some_and(|proxy| {
+        marker_host.is_some() && proxy.rsplit_once(':').map(|(host, _)| host) == marker_host
+    });
+    if status.socks_proxy.is_some() && !socks {
+        return false;
+    }
+    web.iter()
+        .any(|endpoint| endpoint.as_deref() == Some(marker_host_port))
+        || socks
 }

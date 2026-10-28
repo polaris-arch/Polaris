@@ -1,3 +1,4 @@
+import { seedMeasurementFixture } from '@/store/measurement-fixture.test-support';
 /**
  * 节点屏渲染预算门 —— 守住「测速逐节点回包时，只有回包的那一张卡重渲」以及「分批只切渲染尾」。
  *
@@ -36,7 +37,8 @@ import { DEMO_CONFIG } from '../../../../harness-fixture';
 import { SCROLL_BATCH_PAGE } from '@/lib/use-scroll-batch';
 import { sortServersByLatency } from '@/domain/server-latency-sort';
 import { speedTestableIds } from '@/domain/endpoint-routes';
-import { EMPTY_LATENCY_MAP, latencySortSelector } from './nodes-logic';
+import { EMPTY_LATENCY_MAP, latencySortSelector, selectedVisibleIds, speedTestIdsForSelection } from './nodes-logic';
+import type { TFunction } from 'i18next';
 import { useLatencyStore } from '@/store/use-latency-store';
 
 // 预热：下方各用例用 dynamic import 懒加载重组件图（NodesScreen 一支数百模块），Vite 冷转换
@@ -49,8 +51,8 @@ await import('./NodesScreen');
 await import('../home/NodeMenu');
 
 /** t() 桩：返回 key 本身（同 `initial-tab-first-frame.test.tsx`）——断言落在结构上，与语种解耦。 */
-vi.mock('react-i18next', () => ({
-  initReactI18next: { type: '3rdParty', init: () => {} },
+vi.mock('react-i18next', async (importOriginal) => ({
+  ...await importOriginal<typeof import('react-i18next')>(),
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'zh-CN' } }),
 }));
 
@@ -59,6 +61,10 @@ vi.mock('react-i18next', () => ({
   documentElement: { dir: '', lang: '', getAttribute: () => null, setAttribute: () => {} },
   body: { nodeType: 1 },
 };
+
+await (await import('@/i18n')).i18nReady;
+const { useNodeActions } = await import('./use-node-actions');
+const { NodesBatchBar } = await import('./NodesBatchBar');
 
 const read = (rel: string): string =>
   readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
@@ -187,15 +193,15 @@ describe('自曝 · 扫描面还在', () => {
 });
 
 /* ════════════════════════════════════════════════════════════════════════════
- * 不变量① 及时性 —— 回包必须立刻到达那张卡，且不许靠 timer / 节流 / 合批把它推迟
+ * 不变量① 及时性 —— 已验证账本投影必须同步到达那张卡，且不许靠 timer / 节流 / 合批把它推迟
  * ════════════════════════════════════════════════════════════════════════════ */
 
 describe('不变量① · 延迟回包的及时性', () => {
-  it('store 提交是**同步**通知的：回包写入即可读，中间没有异步跳板', () => {
+  it('store 提交是**同步**通知的：同版账本投影提交即可读，中间没有异步跳板', () => {
     useLatencyStore.setState({ latencyMap: {}, testedAt: {} });
     const seen: (number | null | undefined)[] = [];
     const unsub = useLatencyStore.subscribe((s) => seen.push(s.latencyMap['n1']));
-    useLatencyStore.getState().applyLatencyResult('n1', 42);
+    seedMeasurementFixture({ 'n1': 42 });
     // 同一个 tick 里就已经通知过了 —— 若有人在写入路径上加 setTimeout/节流/合批，这里恒为空。
     expect(seen).toEqual([42]);
     expect(useLatencyStore.getState().latencyMap.n1).toBe(42);
@@ -206,9 +212,9 @@ describe('不变量① · 延迟回包的及时性', () => {
     useLatencyStore.setState({ latencyMap: {}, testedAt: {} });
     // 这两条正是 `NodeCard` 里 `(s) => s.latencyMap[server.id]` 的取值语义。
     const readOf = (id: string) => useLatencyStore.getState().latencyMap[id];
-    useLatencyStore.getState().applyLatencyResult('n1', 100);
+    seedMeasurementFixture({ 'n1': 100 });
     const otherBefore = readOf('n2');
-    useLatencyStore.getState().applyLatencyResult('n1', 55);
+    seedMeasurementFixture({ 'n1': 55 });
     expect(readOf('n1')).toBe(55); // 本卡：值变了 ⇒ 该卡重渲
     expect(readOf('n2')).toBe(otherBefore); // 邻卡：判等 ⇒ 不重渲
     expect(Object.is(readOf('n2'), otherBefore)).toBe(true);
@@ -225,10 +231,10 @@ describe('不变量① · 延迟回包的及时性', () => {
       sortServersByLatency(list, (id) => useLatencyStore.getState().latencyMap[id], 'asc').map(
         (s) => s.id
       );
-    useLatencyStore.getState().applyLatencyResults({ a: 300, b: 200, c: 100 });
+    seedMeasurementFixture({ a: 300, b: 200, c: 100 });
     expect(order()).toEqual(['c', 'b', 'a']);
     // 单个节点回包 → 下一次求值立刻反映新顺序，不等任何计时器。
-    useLatencyStore.getState().applyLatencyResult('a', 10);
+    seedMeasurementFixture({ 'a': 10 });
     expect(order()).toEqual(['a', 'c', 'b']);
   });
 
@@ -321,7 +327,7 @@ describe('门 2 · 非延迟排序时选择器返回稳定引用', () => {
   });
 
   it('选择器**每次渲染都会被重建**，跨实例也必须返回同一引用', () => {
-    // 调用点写的是 `useLatencyStore(latencySortSelector(sortKey === 'lat'))` —— 每渲染一次就是一个
+    // 调用点写的是 `useQualifiedLatencies(activeGroup?.servers ?? [], sortKey === 'lat')` —— 每渲染一次就是一个
     // 新的选择器函数。稳定性只能来自模块级常量，不能来自 useMemo/闭包缓存。
     const a = latencySortSelector(false);
     const b = latencySortSelector(false);
@@ -340,7 +346,7 @@ describe('门 2 · 非延迟排序时选择器返回稳定引用', () => {
   });
 
   it('父层确实按 sortKey 条件订阅，且不得退回无条件订整表', () => {
-    expect(WINDOW).toContain("useLatencyStore(latencySortSelector(sortKey === 'lat'))");
+    expect(WINDOW).toContain("useQualifiedLatencies(activeGroup?.servers ?? [], sortKey === 'lat')");
     // 原状形态：`const latencies = useLatencyStore((s) => s.latencyMap);`
     expect(SPLIT_ALL + WINDOW, '父层又无条件订整张延迟表了').not.toMatch(
       /useLatencyStore\(\s*\(s\)\s*=>\s*s\.latencyMap\s*\)/
@@ -361,11 +367,109 @@ describe('门 2 · 非延迟排序时选择器返回稳定引用', () => {
  * 不变量② 检索真值 —— 分批只切渲染尾
  * ════════════════════════════════════════════════════════════════════════════ */
 
+/** Mount the actual hook with React's server renderer, then invoke its real event handler.
+ * The setter mirrors React's functional update contract; no duplicate selection algorithm lives here.
+ */
+function nodeActionHarness(visibleServers: ServerConfig[], initial: Set<string>) {
+  let selected = initial;
+  let actions: ReturnType<typeof useNodeActions> | undefined;
+  function Harness() {
+    actions = useNodeActions({
+      servers: visibleServers, visibleServers, selectedIds: initial,
+      setSelectedIds: update => { selected = typeof update === 'function' ? update(selected) : update; },
+      t: ((key: string) => key) as TFunction,
+      stagingEnabled: false, stage: () => {}, openDialog: () => {},
+    });
+    return null;
+  }
+  renderToStaticMarkup(<Harness />);
+  if (!actions) throw new Error('NODE_ACTION_HARNESS_NOT_RENDERED');
+  return { actions, selection: () => selected };
+}
+function renderBatchSelection(visibleServers: ServerConfig[], selectedIds: Set<string>): string {
+  return renderToStaticMarkup(<NodesBatchBar
+    t={((key: string) => key) as TFunction}
+    visibleServers={visibleServers} selectedIds={selectedIds}
+    selectAll={() => {}} testSelected={() => {}} testing={false} isSubTab={false}
+    copyLinksBatch={() => {}} confirmArmed={null} exitBatch={() => {}}
+    nodeDeletion={{ deleteBatch: () => {} } as Parameters<typeof NodesBatchBar>[0]['nodeDeletion']}
+  />);
+}
+
+describe('selection behavior uses the full filtered set and preserves hidden selections', () => {
+  it('selects beyond the render window without losing or mutating hidden selections', () => {
+    const visible = makeServers(SCROLL_BATCH_PAGE * 2 + 7);
+    const original = new Set(['hidden-selected']);
+    const harness = nodeActionHarness(visible, original);
+    harness.actions.selectAll();
+    expect(harness.selection()).toEqual(new Set(['hidden-selected', ...visible.map(server => server.id)]));
+    expect(harness.selection()).not.toBe(original);
+    expect(original).toEqual(new Set(['hidden-selected']));
+    expect(selectedVisibleIds(visible, harness.selection())).toHaveLength(visible.length);
+    expect(renderBatchSelection(visible, harness.selection())).toContain('aria-checked="true"');
+    expect(renderBatchSelection(visible, harness.selection())).toContain(`<span class="mono">${visible.length}</span>`);
+  });
+
+  it('deselects only visible IDs when every visible ID is already selected', () => {
+    const visible = makeServers(SCROLL_BATCH_PAGE + 3);
+    const initial = new Set(['hidden-selected', ...visible.map(server => server.id)]);
+    const harness = nodeActionHarness(visible, initial);
+    harness.actions.selectAll();
+    expect(harness.selection()).toEqual(new Set(['hidden-selected']));
+    expect(initial.size).toBe(visible.length + 1);
+  });
+
+  it('equal counts with different identities are not all-selected; selecting fills the missing IDs', () => {
+    const visible = makeServers(2);
+    const initial = new Set(['hidden-selected', visible[0].id]);
+    expect(initial.size).toBe(visible.length);
+    expect(renderBatchSelection(visible, initial)).toContain('aria-checked="false"');
+    const harness = nodeActionHarness(visible, initial);
+    harness.actions.selectAll();
+    expect(harness.selection()).toEqual(new Set(['hidden-selected', ...visible.map(server => server.id)]));
+  });
+
+  it('an empty visible set is never all-selected and does not clear hidden selection', () => {
+    for (const selected of [new Set<string>(), new Set(['hidden-selected'])]) {
+      expect(renderBatchSelection([], selected)).toContain('aria-checked="false"');
+      const harness = nodeActionHarness([], selected);
+      harness.actions.selectAll();
+      expect(harness.selection()).toEqual(selected);
+    }
+  });
+
+  it('batch speed-test and actual copy handler target visible ∩ selected, including below the first page', async () => {
+    const visible = makeServers(SCROLL_BATCH_PAGE + 7);
+    const chosen = [visible[0], visible[visible.length - 1]];
+    const selected = new Set(['hidden-selected', ...chosen.map(server => server.id)]);
+    expect(speedTestIdsForSelection(visible, selected, { mainCorePool: true }))
+      .toEqual(chosen.map(server => server.id));
+    const { api } = await import('@/ipc');
+    const { toast } = await import('@/lib/error-handler');
+    const generate = vi.spyOn(api.server, 'generateUrl').mockImplementation(async server => `test://${server.id}`);
+    const success = vi.spyOn(toast, 'success').mockImplementation(() => {});
+    const writeText = vi.fn(async (_text: string) => {});
+    const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { clipboard: { writeText } } });
+    try {
+      await nodeActionHarness(visible, selected).actions.copyLinksBatch();
+      expect(generate.mock.calls.map(([server]) => server.id)).toEqual(chosen.map(server => server.id));
+      expect(writeText).toHaveBeenCalledExactlyOnceWith(chosen.map(server => `test://${server.id}`).join('\n'));
+    } finally {
+      generate.mockRestore();
+      success.mockRestore();
+      if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor);
+      else Reflect.deleteProperty(globalThis, 'navigator');
+    }
+  });
+});
+
 describe('不变量② · 分批只切渲染尾，检索/全选/测速仍对全集生效', () => {
   it('全选读的是 `visibleServers`（过滤后总数），不是切片', () => {
     // selectAll 已随 5B 拆分外提到 `use-node-actions.ts`（同 WINDOW 的道理，取材面须跟着走）。
     const body = callbackBody(ACTIONS, 'selectAll');
-    expect(body).toContain('visibleServers.map((s) => s.id)');
+    expect(body).toContain('for (const server of visibleServers)');
+    expect(body).toContain('new Set(previous)');
     expect(body, '全选读到切片了 ⇒ 「全选」只选得到屏幕上画出来的那批').not.toContain(
       'renderedServers'
     );
@@ -380,7 +484,8 @@ describe('不变量② · 分批只切渲染尾，检索/全选/测速仍对全�
   it('批选条（全选复选框 / 批选测速 / 批量复制）三处也都读完整集', () => {
     // 全选复选框的 JSX 已随批选条一起搬进 `NodesBatchBar.tsx`；批量复制 `copyLinksBatch` 已随
     // 单节点动作一起搬进 `use-node-actions.ts`（同上，取材面须跟着落点走）。
-    expect(BATCHBAR).toMatch(/aria-checked=\{selectedIds\.size === visibleServers\.length/);
+    expect(BATCHBAR).toMatch(/aria-checked=\{visibleServers\.length > 0 && visibleServers\.every\(/);
+    expect(BATCHBAR).toContain('selectedVisibleIds(visibleServers, selectedIds).length');
     expect(callbackBody(SPEEDTEST, 'testSelected')).toContain('speedTestIdsForSelection(');
     expect(callbackBody(SPEEDTEST, 'testSelected')).toContain('visibleServers');
     // copyLinksBatch 的依赖数组写在同一行收尾（`}, [...]);`），不是 callbackBody 认的多行收尾形态，

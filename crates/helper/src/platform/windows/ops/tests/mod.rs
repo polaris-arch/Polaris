@@ -41,3 +41,44 @@ fn mock_net_table_listen_pids_filters_target_port() {
     assert_eq!(ops.listen_pids_for_port(9090).unwrap(), vec![100, 200]);
     assert!(ops.listen_pids_for_port(9999).unwrap().is_empty());
 }
+#[test]
+fn dns_admission_holds_the_shutdown_lock_only_during_spawn() {
+    let admission = super::DnsFlushAdmission::default();
+    let value = admission
+        .launch(|| {
+            assert!(matches!(
+                admission.0.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            Ok(7)
+        })
+        .unwrap();
+    assert_eq!(value, 7);
+    assert!(admission.0.try_lock().is_ok());
+    admission.close().unwrap();
+    let called = std::cell::Cell::new(false);
+    assert!(admission
+        .launch(|| {
+            called.set(true);
+            Ok(())
+        })
+        .is_err());
+    assert!(!called.get());
+}
+
+#[test]
+fn poisoned_dns_admission_rejects_spawn_and_still_closes() {
+    let admission = super::DnsFlushAdmission::default();
+    let _ = std::panic::catch_unwind(|| {
+        let _: Result<(), String> = admission.launch(|| panic!("injected spawn panic"));
+    });
+    assert!(admission.close().is_err());
+    let called = std::cell::Cell::new(false);
+    assert!(admission
+        .launch(|| {
+            called.set(true);
+            Ok(())
+        })
+        .is_err());
+    assert!(!called.get());
+}

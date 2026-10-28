@@ -86,7 +86,7 @@ export function MeshRouteEvidenceBlock({
             {meshText(`scope.${report.snapshot.scope}`)} · {meshText(`configSource.${report.snapshot.configSource}`)} ·{' '}
             {meshText(`load.${report.snapshot.loadEvidence}`)}
           </div>
-          {report.snapshot.snapshotStale && <div className="plat-warn">{meshText('stale')}</div>}
+          {report.snapshot.snapshotStale && <div className="plat-warn mesh-route-warning">{meshText('stale')}</div>}
           <div className="card-sub">{meshText('sampledAt')}: {sampledAt(report.snapshot.sampledAtMs) ?? meshText('notRecorded')}</div>
           <div className="card-sub">
             {meshText('dnsOwner')}: {report.snapshot.dnsOwnerServerId
@@ -106,10 +106,10 @@ export function MeshRouteEvidenceBlock({
             {meshText('candidateCount')}: {report.snapshot.candidates.length} / {report.totalCandidateCount}
           </div>
           {report.snapshot.candidates.length !== report.totalCandidateCount && (
-            <div className="plat-warn">{meshText('candidateIncomplete')}</div>
+            <div className="plat-warn mesh-route-warning">{meshText('candidateIncomplete')}</div>
           )}
           {report.unknownReasons.length > 0 && (
-            <div className="plat-warn">{meshText('reportUnknown')}: {' '}
+            <div className="plat-warn mesh-route-warning">{meshText('reportUnknown')}: {' '}
               {[...new Set(report.unknownReasons)].map((reason) => meshText(unknownKey(reason))).join(' · ')}
             </div>
           )}

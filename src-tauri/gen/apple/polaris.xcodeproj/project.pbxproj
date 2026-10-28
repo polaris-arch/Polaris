@@ -61,8 +61,8 @@
 		041F14B2EFC7C39E0A1F399E /* platform_contracts.rs */ = {isa = PBXFileReference; path = platform_contracts.rs; sourceTree = "<group>"; };
 		0470208751411CE4860AFB1B /* polaris_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = polaris_iOS.entitlements; sourceTree = "<group>"; };
 		08061DA3FB3F232567A4AF0E /* update_install.rs */ = {isa = PBXFileReference; path = update_install.rs; sourceTree = "<group>"; };
-		08F3DE0F2BA99B2AB81BEBA8 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		09282376E0394C67D4B934CC /* mock_runtime_app_isolation.rs */ = {isa = PBXFileReference; path = mock_runtime_app_isolation.rs; sourceTree = "<group>"; };
+		099E64531BCECF4361B1F8C9 /* core_info.rs */ = {isa = PBXFileReference; path = core_info.rs; sourceTree = "<group>"; };
 		09A20235A4F0E2BAF7C55E28 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		0A9D1DE5BE016FCA8CDCA854 /* network_profile.rs */ = {isa = PBXFileReference; path = network_profile.rs; sourceTree = "<group>"; };
 		0CA7AA900CC100C71D04085E /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
@@ -93,7 +93,6 @@
 		1D6F3A5D5AD48471D05471D9 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		1E7B6CD8C39F832307BF66AE /* rule_resource_scheduler.rs */ = {isa = PBXFileReference; path = rule_resource_scheduler.rs; sourceTree = "<group>"; };
 		1F4809182B35D1967B9872D1 /* projection.rs */ = {isa = PBXFileReference; path = projection.rs; sourceTree = "<group>"; };
-		1FFD3A4ACA15B0420A332D81 /* core_update.rs */ = {isa = PBXFileReference; path = core_update.rs; sourceTree = "<group>"; };
 		2098FD29DA06514572BF0656 /* speedtest_tunnel.rs */ = {isa = PBXFileReference; path = speedtest_tunnel.rs; sourceTree = "<group>"; };
 		2168126201630BA43BAD7A84 /* privacy_store_tests.rs */ = {isa = PBXFileReference; path = privacy_store_tests.rs; sourceTree = "<group>"; };
 		21BDB4EA9AA06900AE3C09A7 /* unlock_refresh.rs */ = {isa = PBXFileReference; path = unlock_refresh.rs; sourceTree = "<group>"; };
@@ -147,7 +146,6 @@
 		4AA8B2A28667585196D22A12 /* logs.rs */ = {isa = PBXFileReference; path = logs.rs; sourceTree = "<group>"; };
 		4BC81E0516CF5726E2BCA158 /* libresolv.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libresolv.tbd; path = usr/lib/libresolv.tbd; sourceTree = SDKROOT; };
 		4C376091BD9654640F74CAD7 /* network_monitor.rs */ = {isa = PBXFileReference; path = network_monitor.rs; sourceTree = "<group>"; };
-		4CF7F587828074A8CB927ECA /* core_update_scheduler.rs */ = {isa = PBXFileReference; path = core_update_scheduler.rs; sourceTree = "<group>"; };
 		4D44AF8E5BE969BD7AE239BE /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		4DDB91F18A7B1AE178BC54F4 /* route_replan.rs */ = {isa = PBXFileReference; path = route_replan.rs; sourceTree = "<group>"; };
 		4E04A0AD183917807D29399A /* ts_status_cache_tests.rs */ = {isa = PBXFileReference; path = ts_status_cache_tests.rs; sourceTree = "<group>"; };
@@ -207,7 +205,6 @@
 		74F2937959D3F8AF0012A022 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		75696822B79A2E6A65695D3C /* ts_exit.rs */ = {isa = PBXFileReference; path = ts_exit.rs; sourceTree = "<group>"; };
 		756CEF8A3E7D72DAC38DE5F7 /* tray.rs */ = {isa = PBXFileReference; path = tray.rs; sourceTree = "<group>"; };
-		766BF1F60364BE5A1612EC8C /* core_validation.rs */ = {isa = PBXFileReference; path = core_validation.rs; sourceTree = "<group>"; };
 		76790814F29EC574EABCB892 /* csp_contract.rs */ = {isa = PBXFileReference; path = csp_contract.rs; sourceTree = "<group>"; };
 		7765F4772EE8B27F3C66FAA5 /* stats.rs */ = {isa = PBXFileReference; path = stats.rs; sourceTree = "<group>"; };
 		77C7D4A7C31B454A0A3129FA /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
@@ -236,7 +233,6 @@
 		95D4B2374716D8056091EECB /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		968224D97B484AC16454A5CD /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		98ECD8E52E31A772737CDD8F /* geo_seed.rs */ = {isa = PBXFileReference; path = geo_seed.rs; sourceTree = "<group>"; };
-		9A0087701DF7CD64822810AE /* dns_race.rs */ = {isa = PBXFileReference; path = dns_race.rs; sourceTree = "<group>"; };
 		9B446B732FCF81A3DE42856C /* vpn.rs */ = {isa = PBXFileReference; path = vpn.rs; sourceTree = "<group>"; };
 		9B8712ABC7FED8AD4F86BC54 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		9F023779C038B32C0445CAB5 /* node_fingerprints.rs */ = {isa = PBXFileReference; path = node_fingerprints.rs; sourceTree = "<group>"; };
@@ -270,7 +266,6 @@
 		B6480A1A0DFB03459301C60D /* idle_lightweight.rs */ = {isa = PBXFileReference; path = idle_lightweight.rs; sourceTree = "<group>"; };
 		B709468CD22E61DFE28F92F9 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		B8DB68C18CBD81EFFC3968B4 /* warp_tests.rs */ = {isa = PBXFileReference; path = warp_tests.rs; sourceTree = "<group>"; };
-		B904870EC4BF081897402B82 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		BAA6AA9B64C0B57BCF802998 /* app_update_policy.rs */ = {isa = PBXFileReference; path = app_update_policy.rs; sourceTree = "<group>"; };
 		BB89F763F21C38EAD57AB1C9 /* autosave_name_gate.rs */ = {isa = PBXFileReference; path = autosave_name_gate.rs; sourceTree = "<group>"; };
 		BBABF3261001BD4ADD81AB32 /* events.rs */ = {isa = PBXFileReference; path = events.rs; sourceTree = "<group>"; };
@@ -304,13 +299,11 @@
 		CC2EB4036F960E38873C0450 /* subscription_transport.rs */ = {isa = PBXFileReference; path = subscription_transport.rs; sourceTree = "<group>"; };
 		CC5BEE2170940EFC04DABA1D /* unlock.rs */ = {isa = PBXFileReference; path = unlock.rs; sourceTree = "<group>"; };
 		CE0A76E6E5BBFC23A2070E21 /* pending_changes.rs */ = {isa = PBXFileReference; path = pending_changes.rs; sourceTree = "<group>"; };
-		CF1E53A87BE902CF3886D2B6 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		CF27E2111C0FBACD25301ACF /* lifecycle.rs */ = {isa = PBXFileReference; path = lifecycle.rs; sourceTree = "<group>"; };
 		CFB56F5221C35020B1A6DCFB /* backup.rs */ = {isa = PBXFileReference; path = backup.rs; sourceTree = "<group>"; };
 		D07882C4AA9B1351C4F06D9D /* network_monitor.rs */ = {isa = PBXFileReference; path = network_monitor.rs; sourceTree = "<group>"; };
 		D0C967C26A7DFDFAE556C25E /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		D18A6FB04BB8C855A82D6509 /* update_popup.rs */ = {isa = PBXFileReference; path = update_popup.rs; sourceTree = "<group>"; };
-		D2AADF004A65A408CE64145E /* core_swap.rs */ = {isa = PBXFileReference; path = core_swap.rs; sourceTree = "<group>"; };
 		D42436871D34FB35130FEAAE /* config.rs */ = {isa = PBXFileReference; path = config.rs; sourceTree = "<group>"; };
 		D54F0D7AD75D14F7EBDBDBE2 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		D73011AF9AD6DD44B21800AE /* gh_proxy_tests.rs */ = {isa = PBXFileReference; path = gh_proxy_tests.rs; sourceTree = "<group>"; };
@@ -341,10 +334,8 @@
 		F19B4A478D864D33BA877114 /* app_language.rs */ = {isa = PBXFileReference; path = app_language.rs; sourceTree = "<group>"; };
 		F1A9898F0BA7182C054F1965 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
 		F224D739BF8A09BFDE0B3363 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
-		F3821C53264094F19F2FE385 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		F4C35681FA358C40E9E55019 /* probe_diagnostic_tests.rs */ = {isa = PBXFileReference; path = probe_diagnostic_tests.rs; sourceTree = "<group>"; };
 		F627B7283B00ED8B027DF3AF /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
-		F8B6536A03BF20A3EBF5945C /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		F9AFD052071C55C84D7583B8 /* startup.rs */ = {isa = PBXFileReference; path = startup.rs; sourceTree = "<group>"; };
 		FAC14DB371C6EA95F63F7462 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		FC3FE2CED12E685E748C9E1B /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
@@ -387,14 +378,6 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		0143BB54EBCB77647BE7D221 /* core_update */ = {
-			isa = PBXGroup;
-			children = (
-				D1516C4B5968356EE9F1F2E8 /* tests */,
-			);
-			path = core_update;
-			sourceTree = "<group>";
-		};
 		01C48D3642270820FB8F26B7 /* tests */ = {
 			isa = PBXGroup;
 			children = (
@@ -628,14 +611,6 @@
 			path = icon_cache;
 			sourceTree = "<group>";
 		};
-		3433C206326AFE6C2ED4992A /* tests */ = {
-			isa = PBXGroup;
-			children = (
-				08F3DE0F2BA99B2AB81BEBA8 /* mod.rs */,
-			);
-			path = tests;
-			sourceTree = "<group>";
-		};
 		34E98EBF42A117DA32DF5015 /* tests */ = {
 			isa = PBXGroup;
 			children = (
@@ -677,11 +652,10 @@
 			children = (
 				BAA6AA9B64C0B57BCF802998 /* app_update_policy.rs */,
 				B37C3838AAE4B8654760E916 /* app_update.rs */,
-				1FFD3A4ACA15B0420A332D81 /* core_update.rs */,
+				099E64531BCECF4361B1F8C9 /* core_info.rs */,
 				B47A4470AA4964D3D8B58575 /* shared.rs */,
 				561DD2C4C3F53E29C7FE9528 /* uninstall.rs */,
 				9C8FDD888E4935559F760324 /* app_update_policy */,
-				0143BB54EBCB77647BE7D221 /* core_update */,
 				8FE7EAAF0157659AEA734A44 /* tests */,
 			);
 			path = updater;
@@ -837,14 +811,7 @@
 			path = env_trust;
 			sourceTree = "<group>";
 		};
-		57F50D39FBE30560114EEC7F /* tests */ = {
-			isa = PBXGroup;
-			children = (
-				CF1E53A87BE902CF3886D2B6 /* mod.rs */,
-			);
-			path = tests;
-			sourceTree = "<group>";
-		};
+
 		59FCFF82E539DDE91CDD03E6 /* tests */ = {
 			isa = PBXGroup;
 			children = (
@@ -947,7 +914,6 @@
 				8F981B0A14AEEE83F5CF446F /* connection_flush.rs */,
 				28F253494B97082E4A7FA653 /* core_binary.rs */,
 				0D812C372843D859649AFE33 /* core_log.rs */,
-				9A0087701DF7CD64822810AE /* dns_race.rs */,
 				50492450DCC9E2CD895E4F20 /* dns_takeover.rs */,
 				0E6AE20F3D7948B7059429DC /* hot_switch.rs */,
 				0EFF1C7514E0A15042CDC1A9 /* lifecycle.rs */,
@@ -970,7 +936,6 @@
 				16B2AA5CC97433CC6BE51C74 /* tunnel_conflict.rs */,
 				3D2A81774B5052055B0271E0 /* unlock_refresh.rs */,
 				F345CAA7B0168841CD61B66C /* android_bridge */,
-				6BB641B30BD6453A7CC3005E /* dns_race */,
 				B878A51F49BFDC85D759FA92 /* network_canary */,
 				A4B190EAD24539D7C9E708FE /* network_settle */,
 				83FF986150B47CEB8F3A776E /* selector_reconcile */,
@@ -1013,14 +978,7 @@
 			path = tests;
 			sourceTree = "<group>";
 		};
-		6BB641B30BD6453A7CC3005E /* dns_race */ = {
-			isa = PBXGroup;
-			children = (
-				57F50D39FBE30560114EEC7F /* tests */,
-			);
-			path = dns_race;
-			sourceTree = "<group>";
-		};
+
 		6D4A1DF859AFC236181E06D5 /* tests */ = {
 			isa = PBXGroup;
 			children = (
@@ -1050,14 +1008,6 @@
 			children = (
 				73E3CDBD110C96D6E26DD891 /* mod.rs */,
 				56C006FB788E761519568E00 /* real_core_tests.rs */,
-			);
-			path = tests;
-			sourceTree = "<group>";
-		};
-		74667726D975A26D2EE82FDE /* tests */ = {
-			isa = PBXGroup;
-			children = (
-				F3821C53264094F19F2FE385 /* mod.rs */,
 			);
 			path = tests;
 			sourceTree = "<group>";
@@ -1298,14 +1248,6 @@
 			path = picked_file;
 			sourceTree = "<group>";
 		};
-		A1C00BB3CFA6E79023B0D2D4 /* tests */ = {
-			isa = PBXGroup;
-			children = (
-				F8B6536A03BF20A3EBF5945C /* mod.rs */,
-			);
-			path = tests;
-			sourceTree = "<group>";
-		};
 		A428E251C6108560418262D6 /* tests */ = {
 			isa = PBXGroup;
 			children = (
@@ -1515,14 +1457,6 @@
 			path = tests;
 			sourceTree = "<group>";
 		};
-		BFA946BAADC7E1E6490A4920 /* core_swap */ = {
-			isa = PBXGroup;
-			children = (
-				A1C00BB3CFA6E79023B0D2D4 /* tests */,
-			);
-			path = core_swap;
-			sourceTree = "<group>";
-		};
 		C0D23239A785BECAB7939558 /* misc */ = {
 			isa = PBXGroup;
 			children = (
@@ -1538,14 +1472,6 @@
 				2D2EFADDFD8942BE0CB28984 /* logs */,
 			);
 			path = misc;
-			sourceTree = "<group>";
-		};
-		C18FC451E32D0CCDD9617A4F /* core_validation */ = {
-			isa = PBXGroup;
-			children = (
-				74667726D975A26D2EE82FDE /* tests */,
-			);
-			path = core_validation;
 			sourceTree = "<group>";
 		};
 		C216A5C027F7434097960823 /* subscription_parse */ = {
@@ -1669,14 +1595,6 @@
 			path = tests;
 			sourceTree = "<group>";
 		};
-		D1516C4B5968356EE9F1F2E8 /* tests */ = {
-			isa = PBXGroup;
-			children = (
-				B904870EC4BF081897402B82 /* mod.rs */,
-			);
-			path = tests;
-			sourceTree = "<group>";
-		};
 		D2201FC2F4550C9B5B43F074 /* tests */ = {
 			isa = PBXGroup;
 			children = (
@@ -1699,14 +1617,6 @@
 				432D71C2A7CD6772378C7824 /* mod.rs */,
 			);
 			path = tests;
-			sourceTree = "<group>";
-		};
-		D8D77C8C2F910143B244A226 /* core_update_scheduler */ = {
-			isa = PBXGroup;
-			children = (
-				3433C206326AFE6C2ED4992A /* tests */,
-			);
-			path = core_update_scheduler;
 			sourceTree = "<group>";
 		};
 		D97D3319607750763667D2C4 /* tests */ = {
@@ -1820,9 +1730,6 @@
 				D42436871D34FB35130FEAAE /* config.rs */,
 				5B6E0F57970EB8E4DF310DD7 /* core_paths.rs */,
 				EDC1F2E6306CB9FF7BCD5C33 /* core_promote.rs */,
-				D2AADF004A65A408CE64145E /* core_swap.rs */,
-				4CF7F587828074A8CB927ECA /* core_update_scheduler.rs */,
-				766BF1F60364BE5A1612EC8C /* core_validation.rs */,
 				44D1706EFB61A366639B56FC /* env_trust.rs */,
 				98ECD8E52E31A772737CDD8F /* geo_seed.rs */,
 				C0CE30D51EBD323FB2D9A779 /* helper.rs */,
@@ -1858,9 +1765,6 @@
 				7E0C056A3DBA3649EF130B5A /* config */,
 				5FAFC9BDA808BC828BCEF131 /* core_paths */,
 				EE7D5AB48DFADDB874EDADE7 /* core_promote */,
-				BFA946BAADC7E1E6490A4920 /* core_swap */,
-				D8D77C8C2F910143B244A226 /* core_update_scheduler */,
-				C18FC451E32D0CCDD9617A4F /* core_validation */,
 				54E23D24CB437B4A0E8C9F51 /* env_trust */,
 				4B495E655272CCF6E5B3B90E /* geo_seed */,
 				28AAF03A09BFB280BF4A935E /* helper */,
@@ -2028,6 +1932,7 @@
 				B395AB4CF19394B13456AAB7 /* Verify iOS Core */,
 				96276B9221C4C6E0F0973B08 /* Sources */,
 				1B94AE1CA1BAC15E15C09099 /* Frameworks */,
+				6BA4F5A019704F91829A51D3 /* Verify TLS Capability Link */,
 			);
 			buildRules = (
 			);
@@ -2099,12 +2004,11 @@
 			outputFileListPaths = (
 			);
 			outputPaths = (
-				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
 				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; \"$SRCROOT/../../../ui/node_modules/.bin/tauri\" ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}";
+			shellScript = "if [ \"${POLARIS_FORMAL_APP_BUILD:-0}\" = 1 ]; then\n  python3 \"$SRCROOT/../../../scripts/mobile-core/apple_rust.py\" verify\nelse\n  export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"\n  \"$SRCROOT/../../../ui/node_modules/.bin/tauri\" ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}\nfi\n";
 		};
 		B395AB4CF19394B13456AAB7 /* Verify iOS Core */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -2120,10 +2024,24 @@
 			outputFileListPaths = (
 			);
 			outputPaths = (
+				"$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args",
+				"$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "python3 \"$SRCROOT/../../../scripts/ios-libbox.py\" verify --component-for-link \\\n  --generation-root \"${POLARIS_LIBBOX_GENERATION_ROOT:?approved immutable Libbox generation required}\" \\\n  --output-fingerprint \"${POLARIS_LIBBOX_OUTPUT_FINGERPRINT:?approved component fingerprint required}\" \\\n  --receipt-sha256 \"${POLARIS_LIBBOX_RECEIPT_SHA256:?approved receipt SHA256 required}\" \\\n  --build-policy \"${POLARIS_LIBBOX_BUILD_POLICY:?approved M1 policy required}\" \\\n  --build-policy-sha256 \"${POLARIS_LIBBOX_BUILD_POLICY_SHA256:?approved M1 policy SHA256 required}\" \\\n  --tools \"${POLARIS_LIBBOX_TOOLS:?approved tools required}\" \\\n  --tools-sha256 \"${POLARIS_LIBBOX_TOOLS_SHA256:?approved tools SHA256 required}\"\n";
+			shellScript = "set -e\npython3 \"$SRCROOT/../../../scripts/mobile-core/consume.py\" verify-link \\\n  --link-input \"${POLARIS_MOBILE_LINK_INPUT:?fixed formal mobile link context required}\" \\\n  --link-input-sha256 \"${POLARIS_MOBILE_LINK_INPUT_SHA256:?actual link context SHA256 required}\" \\\n  --scratch \"${POLARIS_MOBILE_SCRATCH:?fixed source verifier scratch required}\"\npython3 \"$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py\" install\n";
+		};
+		6BA4F5A019704F91829A51D3 /* Verify TLS Capability Link */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = ("$(TARGET_BUILD_DIR)/$(EXECUTABLE_PATH)", "$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.json",);
+			name = "Verify TLS Capability Link";
+			outputPaths = ();
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "python3 \"$SRCROOT/../../../scripts/mobile-core/apple_tls_fingerprint.py\" verify-installed\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -2180,12 +2098,12 @@
 					"@executable_path/Frameworks",
 				);
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
-				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = com.polaris.app;
 				PRODUCT_NAME = "Polaris";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
+				"VALID_ARCHS[sdk=iphonesimulator*]" = arm64;
 			};
 			name = debug;
 		};
@@ -2257,13 +2175,21 @@
 		BE511D40453904F4CF76CE66 /* debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = (
+					arm64,
+				);
+				VALID_ARCHS = arm64;
+				"VALID_ARCHS[sdk=iphonesimulator*]" = arm64;
 				APPLICATION_EXTENSION_API_ONLY = YES;
+				LD_GENERATE_MAP_FILE = YES;
+				LD_MAP_FILE_PATH = "$(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt";
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
 				ENABLE_BITCODE = NO;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(POLARIS_LIBBOX_GENERATION_ROOT)",
 				);
+				OTHER_LDFLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args",);
 				INFOPLIST_FILE = PacketTunnel/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -2281,13 +2207,21 @@
 		DE54A0F0E14E3A71E2B7BBEA /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = (
+					arm64,
+				);
+				VALID_ARCHS = arm64;
+				"VALID_ARCHS[sdk=iphonesimulator*]" = arm64;
 				APPLICATION_EXTENSION_API_ONLY = YES;
+				LD_GENERATE_MAP_FILE = YES;
+				LD_MAP_FILE_PATH = "$(TARGET_TEMP_DIR)/PolarisPacketTunnel-LinkMap.txt";
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
 				ENABLE_BITCODE = NO;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(POLARIS_LIBBOX_GENERATION_ROOT)",
 				);
+				OTHER_LDFLAGS = ("$(inherited)", "@$(DERIVED_FILE_DIR)/PolarisTLSFingerprintLinker.args",);
 				INFOPLIST_FILE = PacketTunnel/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -2382,12 +2316,12 @@
 					"@executable_path/Frameworks",
 				);
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
-				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = com.polaris.app;
 				PRODUCT_NAME = "Polaris";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
+				"VALID_ARCHS[sdk=iphonesimulator*]" = arm64;
 			};
 			name = release;
 		};

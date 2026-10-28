@@ -12,7 +12,7 @@
 //! - `mesh`：mesh 节点（tailscale + warp 状态）
 //! - [`unlock`]：解锁检测（unlock:run/get）
 //! - [`speedtest`]：测速（server:speedTest）
-//! - [`updater`]：App / 内核更新（update:* / core-update:*）
+//! - [`updater`]：App 更新与内核信息（update:* / core_get_version_info）
 //! - [`window`]：窗口控制（window:minimize/maximizeToggle/close + app 排序）
 //! - [`misc`]：杂项（logs/version/shell/backup/diagnostic/autostart/ipinfo/singbox-dashboard）
 //!
@@ -496,6 +496,8 @@ pub(crate) mod guard_scan {
 }
 
 pub mod android_batch_qa;
+pub mod android_transient_close_qa;
+pub mod coexistence_snapshot;
 pub mod config;
 pub mod helper;
 pub mod icon;
@@ -516,6 +518,10 @@ pub mod vpn;
 pub mod window;
 
 pub use android_batch_qa::*;
+pub use android_transient_close_qa::*;
+pub use coexistence_snapshot::{
+    coex_readonly_snapshot, coex_runtime_get_state, coex_runtime_refresh,
+};
 pub use config::*;
 pub use helper::*;
 pub use icon::*;

@@ -1,11 +1,15 @@
+import { requestIOSMeasurementConsent, requiresMeasurementConsent } from './MeasurementStartNotice';
 import { create } from 'zustand';
 import { api } from '@/ipc';
 import { isSpeedTestCountProgress, type SpeedTestDonePayload, type SpeedTestInvokeResult, type SpeedTestMeasurementContext, type SpeedTestProgressPayload, type SpeedTestResultPayload } from '@/contracts/speed-test';
-import { useLatencyStore } from '@/store/use-latency-store';
+import { useLatencyStore, subscribeLatencyEvents, refreshMeasurementLedger } from '@/store/use-latency-store';
 import { getEffectiveConfig, useAppStore } from '@/store/app-store';
 
 export type MobileSpeedTestPhase = 'preparingConnection' | 'waitingForReady' | 'running' | 'waiting' | 'completed' | 'interrupted' | 'failed';
-type LatencyGuard = (context?: SpeedTestMeasurementContext | null) => boolean | Promise<boolean>;
+type LatencyGuard = ((context?: SpeedTestMeasurementContext | null) => boolean | Promise<boolean>) & {
+  /** Synchronous intent fence checked again at the actual commit, after every await. */
+  isCurrent?: (context?: SpeedTestMeasurementContext | null) => boolean;
+};
 export interface MobileSpeedTestTask {
   runId: string;
   phase: MobileSpeedTestPhase;
@@ -132,15 +136,62 @@ export const useMobileSpeedTestStore = create<State>((set, get) => ({
   },
 }));
 
-async function verifyMeasurementContext(context: SpeedTestMeasurementContext): Promise<boolean> {
+// getEffectiveConfig already memoizes (raw config, staged entries). Weak keys retain
+// complete projections only while their immutable source snapshots remain reachable.
+const configProjections = new WeakMap<object, string>();
+function configProjection(): string {
+  const config = getEffectiveConfig();
+  if (config === null) return 'null';
+  let projection = configProjections.get(config);
+  if (projection === undefined) {
+    projection = JSON.stringify(config);
+    configProjections.set(config, projection);
+  }
+  return projection;
+}
+const serverMembership = new WeakMap<object, ReadonlySet<string>>();
+function configuredIds(): ReadonlySet<string> {
+  const servers = useAppStore.getState().servers;
+  let ids = serverMembership.get(servers);
+  if (!ids) {
+    ids = new Set(servers.map(server => server.id));
+    serverMembership.set(servers, ids);
+  }
+  return ids;
+}
+
+const measurementIdentity = (context: SpeedTestMeasurementContext): string => JSON.stringify([
+  context.runId, context.requestId, context.mainGeneration, context.startTime,
+]);
+type ProxyStatus = Awaited<ReturnType<typeof api.proxy.getStatus>>;
+const statusFlights = new WeakMap<object, Map<string, Promise<ProxyStatus>>>();
+/** Share only a raw in-flight read within one captured intent and full producer identity. */
+function readMeasurementStatus(context: SpeedTestMeasurementContext, intent: object): Promise<ProxyStatus> {
+  const flights = statusFlights.get(intent) ?? new Map<string, Promise<ProxyStatus>>();
+  statusFlights.set(intent, flights);
+  const key = measurementIdentity(context);
+  const existing = flights.get(key);
+  if (existing) return existing;
+  const pending = Promise.resolve().then(() => api.proxy.getStatus());
+  flights.set(key, pending);
+  const clear = () => {
+    // A settled old flight cannot remove a later retry or another identity's read.
+    if (flights.get(key) === pending) flights.delete(key);
+  };
+  void pending.then(clear, clear);
+  return pending;
+}
+function statusMatches(context: SpeedTestMeasurementContext, status = useAppStore.getState().proxyStatus): boolean {
+  return status?.running === true && status.mainGeneration === context.mainGeneration
+    && (status.startTime ?? null) === context.startTime;
+}
+async function verifyMeasurementContext(context: SpeedTestMeasurementContext, intent: object): Promise<boolean> {
   const before = useAppStore.getState().proxyStatus;
   try {
-    const status = await api.proxy.getStatus();
+    const status = await readMeasurementStatus(context, intent);
     const current = useAppStore.getState().proxyStatus;
-    if (current !== before && (!current?.running || current.mainGeneration !== context.mainGeneration
-      || (current.startTime ?? null) !== context.startTime)) return false;
-    if (!status.running || status.mainGeneration !== context.mainGeneration
-      || (status.startTime ?? null) !== context.startTime) return false;
+    if (current !== before && !statusMatches(context, current)) return false;
+    if (!statusMatches(context, status)) return false;
     useAppStore.setState({ proxyStatus: status });
     return true;
   } catch {
@@ -150,7 +201,8 @@ async function verifyMeasurementContext(context: SpeedTestMeasurementContext): P
 
 /** Capture user intent now; the connection identity comes only from the later ready producer. */
 function latencyGuard(ids: readonly string[], kind: PendingRequest['kind'], extra?: LatencyGuard): LatencyGuard {
-  const config = JSON.stringify(getEffectiveConfig());
+  const config = configProjection();
+  const requestedIds = [...ids];
   const selectedId = useAppStore.getState().selectedServerId;
   const connection = () => {
     const status = useAppStore.getState().proxyStatus;
@@ -158,19 +210,25 @@ function latencyGuard(ids: readonly string[], kind: PendingRequest['kind'], extr
   };
   const legacyConnection = connection();
   const sameSelection = () => useAppStore.getState().selectedServerId === selectedId;
-  const stillConfigured = () => JSON.stringify(getEffectiveConfig()) === config
-    && ids.every(id => useAppStore.getState().servers.some(server => server.id === id));
-  return async context => {
+  const intentMatches = (context?: SpeedTestMeasurementContext | null): boolean => {
     if (context) {
-      if (!sameSelection() || !stillConfigured() || !await verifyMeasurementContext(context)) return false;
-      if (!sameSelection() || !stillConfigured()) return false;
-    } else if (typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios') {
-      return false;
-    } else if (kind === 'current' && (!sameSelection() || connection() !== legacyConnection)) {
-      return false;
+      return sameSelection() && configProjection() === config
+        && requestedIds.every(id => configuredIds().has(id));
     }
-    return extra ? extra(context) : true;
+    if (typeof document !== 'undefined' && document.documentElement.dataset.mobileOs === 'ios') return false;
+    return kind !== 'current' || (sameSelection() && connection() === legacyConnection);
   };
+  const guard: LatencyGuard = async context => {
+    if (!intentMatches(context)) return false;
+    if (context && !await verifyMeasurementContext(context, guard)) return false;
+    if (!intentMatches(context)) return false;
+    // Every waiter invokes the caller's guard, including asynchronous route guards.
+    // Its conclusion is never part of the shared raw-status flight.
+    if (extra && !await extra(context)) return false;
+    return intentMatches(context) && (!context || statusMatches(context));
+  };
+  guard.isCurrent = intentMatches;
+  return guard;
 }
 
 /** Store received results separately from applied latency; a later receipt can fill an earlier withheld write. */
@@ -179,10 +237,21 @@ async function applyTaskLatency(runId: string, results: Record<string, number>):
   if (!before || before.runId !== runId) return;
   if (!Object.entries(results).some(([id, value]) => before.results[id] === value && before.appliedResults[id] !== value)) return;
   const context = before.measurementContext;
+  const identity = context ? measurementIdentity(context) : null;
+  // Unsolicited producer tasks have no captured request guard. Keep their read
+  // local to this task snapshot and fence the full current intent at commit.
+  const config = context && !before.acceptLatency ? configProjection() : null;
+  const selectedId = useAppStore.getState().selectedServerId;
   const allowed = before.acceptLatency ? await before.acceptLatency(context)
-    : context ? await verifyMeasurementContext(context) : true;
+    : context ? await verifyMeasurementContext(context, before) : true;
   const task = useMobileSpeedTestStore.getState().task;
-  if (!allowed || !task || task.runId !== runId || task.measurementContext !== context) return;
+  if (!allowed || !task || task.runId !== runId || task.measurementContext !== context
+    || task.acceptLatency !== before.acceptLatency) return;
+  if (context && (measurementIdentity(context) !== identity || !statusMatches(context))) return;
+  if (before.acceptLatency?.isCurrent && !before.acceptLatency.isCurrent(context)) return;
+  if (context && !before.acceptLatency && (configProjection() !== config
+    || useAppStore.getState().selectedServerId !== selectedId
+    || !Object.keys(results).every(id => configuredIds().has(id)))) return;
   const missing = Object.fromEntries(Object.entries(results).filter(([id, value]) =>
     task.results[id] === value && task.appliedResults[id] !== value));
   if (Object.keys(missing).length === 0) return;
@@ -200,6 +269,7 @@ export function subscribeMobileSpeedTestProgress(): () => void {
     timer = setTimeout(() => useMobileSpeedTestStore.getState().waiting(task.runId), 20_000);
   };
   const offs = [
+    subscribeLatencyEvents(),
     api.server.onSpeedTestProgress(event => {
       const before = useMobileSpeedTestStore.getState().task;
       useMobileSpeedTestStore.getState().progress(event);
@@ -234,7 +304,11 @@ export function subscribeMobileSpeedTestProgress(): () => void {
 }
 
 /** One local request lock across screens; a late invocation cannot replace an observed newer run. */
-export async function runMobileSpeedTest(ids: readonly string[], kind: PendingRequest['kind'], acceptLatency?: LatencyGuard): Promise<SpeedTestInvokeResult | null> {
+export async function runMobileSpeedTest(ids: readonly string[], kind: PendingRequest['kind'], acceptLatency?: LatencyGuard, consentGranted = false): Promise<SpeedTestInvokeResult | null> {
+  const requestedConfig = configProjection();
+  const requestedSelection = useAppStore.getState().selectedServerId;
+  if (!consentGranted && requiresMeasurementConsent() && !await requestIOSMeasurementConsent()) return null;
+  if (configProjection() !== requestedConfig || useAppStore.getState().selectedServerId !== requestedSelection) return null;
   const token = useMobileSpeedTestStore.getState().begin(ids, kind, latencyGuard(ids, kind, acceptLatency));
   if (token === null) return null;
   try {
@@ -248,6 +322,8 @@ export async function runMobileSpeedTest(ids: readonly string[], kind: PendingRe
   } catch (cause) {
     useMobileSpeedTestStore.getState().settle(token);
     throw cause;
+  } finally {
+    refreshMeasurementLedger();
   }
 }
 

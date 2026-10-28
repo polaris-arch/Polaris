@@ -845,7 +845,7 @@ impl StatsAggregator {
         // OOM 安全网：超硬上限按插入序（最旧、最可能是漏删死连接）驱逐。
         while self.conn_map.len() > self.max_conn_map_size {
             if let Some(first) = self.conn_map.keys().next().cloned() {
-                self.conn_map.swap_remove(&first);
+                self.conn_map.shift_remove(&first);
                 change.remove(first);
             } else {
                 break;
@@ -870,7 +870,7 @@ impl StatsAggregator {
         };
         match ev.kind {
             ConnectionEventType::Closed => {
-                self.conn_map.swap_remove(&id);
+                self.conn_map.shift_remove(&id);
                 change.remove(id);
             }
             ConnectionEventType::Update => {

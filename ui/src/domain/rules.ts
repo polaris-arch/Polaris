@@ -433,7 +433,7 @@ function isStrictIpv6(addr: string): boolean {
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
     if (i === groups.length - 1 && g.includes('.')) {
-      if (!isStrictIpv4(g)) return false; // 末段内嵌 IPv4（如 ::ffff:192.168.1.1）
+      if (!addr.endsWith(g) || !isStrictIpv4(g)) return false; // 末段内嵌 IPv4（如 ::ffff:192.168.1.1）
       ipv4Suffix = true;
     } else if (!/^[0-9a-fA-F]{1,4}$/.test(g)) {
       return false;

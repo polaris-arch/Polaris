@@ -1,3 +1,4 @@
+import { prepareRuleAppend } from '@/lib/use-rule-append';
 /** `RuleSubjectMenuItems`：连接页与拓扑共用的“把观测对象写入规则”菜单项；追加写入只保留这一条执行腿。 */
 import { useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -12,7 +13,6 @@ import { useStagingActive } from '@/store/use-staging-active';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
 import {
   analyzeRuleCoverage,
-  appendSubjectToRule,
   type RuleAppendTarget,
 } from '@/components/dialogs/rule-append';
 
@@ -59,8 +59,7 @@ export function RuleSubjectMenuItems({
   /** 追加到已有规则 —— 全仓唯一的 `api.rules.update` 追加调用点。 */
   const append = useCallback(
     async (target: RuleAppendTarget) => {
-      const base = rules.find((rule) => rule.id === target.ruleId) ?? null;
-      const next = base ? appendSubjectToRule(base, target, subject) : null;
+      const { base, next, stagingNow: stagingEnabled } = prepareRuleAppend(target, subject);
       if (!next) {
         if (target.block === 'contains') {
           toast.success(t('rules.subjectAlreadyInRule', { value: subject.value }));
@@ -80,7 +79,7 @@ export function RuleSubjectMenuItems({
             nextValue: next,
           });
         } else {
-          await api.rules.update(next, 'route');
+          await api.rules.update(next, 'route', base);
           void loadConfig(true);
         }
         toast.success(t('rules.appendDone', { value: subject.value, rule: label }));
@@ -88,7 +87,7 @@ export function RuleSubjectMenuItems({
         toast.error(t('rules.appendFail'));
       }
     },
-    [rules, subject, t, stagingEnabled, stage, loadConfig],
+    [subject, t, stagingEnabled, stage, loadConfig],
   );
 
   const pickExisting = (

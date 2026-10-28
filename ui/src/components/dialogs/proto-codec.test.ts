@@ -26,10 +26,12 @@ vi.mock('./Csel', async () => {
   };
 });
 import { protoCodec, ProtoCodecError } from './proto-codec';
+import { meshAllowsInternet } from '@/domain/endpoint-routes';
 import {
   PROTO_OPTIONS,
   ND_SPEC,
   allFields,
+  nodeFieldGroup,
   whenTls,
   whenHttpTls,
   whenReality,
@@ -517,7 +519,7 @@ describe('HIGH-1：toConfig 尊重 when 显隐 —— 隐藏字段不下发/清�
   it('#1 新建 vless（security=none 默认）→ 无 tlsSettings / realitySettings', () => {
     const draft = draftFromSpecs(allFields('vless'));
     expect(draft.sec).toBe('none'); // sec 选项首项
-    expect(draft.fp).toBe('chrome'); // fp 被 seed 成 O_FP 首项（phantom 源）
+    expect(draft.fp).toBe(''); // explicit unset preserves the legacy protocol default
     const out = protoCodec.vless.toConfig(draft, { ...META, protocol: 'vless' });
     expect(out.tlsSettings).toBeUndefined();
     expect(out.realitySettings).toBeUndefined();
@@ -838,6 +840,7 @@ describe('shadowsocks ShadowTLS 参数组（齐备才写，缺一不下发半成
       password: 'stls-pwd',
       sni: 'stls.example',
       fingerprint: 'firefox',
+      utlsMode: 'profile',
       port: 8443,
     });
     const back = protoCodec.shadowsocks.fromConfig(out);
@@ -1190,7 +1193,7 @@ describe('vmess / trojan：uTLS 指纹 + trojan ALPN', () => {
       const f = allFields(proto).find((x) => x.k === 'fp');
       const values = f && f.t === 'select' ? f.options.map(([v]) => v) : [];
       expect(values[0], `${proto} 的 fp 首档必须是「不启用」`).toBe('');
-      expect(values).toContain('chrome');
+      expect(values).toEqual(['', '@default', 'none']);
       // 新建路径（draftFromSpecs）不得把 chrome 当默认值 seed 进草稿。
       expect(draftFromSpecs(allFields(proto)).fp).toBe('');
       const out = protoCodec[proto].toConfig(
@@ -1199,11 +1202,11 @@ describe('vmess / trojan：uTLS 指纹 + trojan ALPN', () => {
       );
       expect(out.tlsSettings?.fingerprint).toBeUndefined();
     }
-    // 阴性对照：vless/anytls 的后端缺省就是 chrome，那两张表照旧以 chrome 起头（本条改动没波及它们）。
+    // vless/anytls 同样保留 unset intent；协议默认由后端决定，浏览器项来自实际能力。
     for (const proto of ['vless', 'anytls'] as const) {
       const f = allFields(proto).find((x) => x.k === 'fp');
       const values = f && f.t === 'select' ? f.options.map(([v]) => v) : [];
-      expect(values[0]).toBe('chrome');
+      expect(values).toEqual(['', '@default', 'none']);
     }
   });
 
@@ -3128,4 +3131,137 @@ it('openvpn-client：tls 子袋 ovpnTlsExtraJson 删键/清空不复活（tls �
   expect(cleared).not.toHaveProperty('server_name');
   expect(cleared).not.toHaveProperty('peer_fingerprint');
   expect(cleared?.certificate).toEqual(['CA']);
+});
+
+describe('edit-only codec fidelity: opaque credentials, argv and OpenVPN policy', () => {
+  for (const proto of ['socks', 'http', 'ssh', 'trojan', 'hysteria2', 'tuic', 'anytls', 'naive'] as const) {
+    for (const password of [' secret ', '\tsecret\n', '   ', '']) {
+      it(`${proto} keeps credential bytes when only the remark changes (${JSON.stringify(password)})`, () => {
+        const source: ServerConfig = proto === 'ssh'
+          ? { ...SAMPLES[proto], sshSettings: { ...SAMPLES[proto].sshSettings, password, privateKeyPassphrase: password } }
+          : { ...SAMPLES[proto], password };
+        const draft = protoCodec[proto].fromConfig(source);
+        const saved = protoCodec[proto].toConfig(draft, { ...source, name: 'new remark' });
+        const expected = password === '' ? undefined : password;
+        expect(saved.name).toBe('new remark');
+        if (proto === 'ssh') {
+          expect(saved.sshSettings?.password).toBe(expected);
+          expect(saved.sshSettings?.privateKeyPassphrase).toBe(expected);
+        } else expect(saved.password).toBe(expected);
+      });
+    }
+  }
+
+  it.each([
+    [['--quiet', '--x']],
+    [['--DataDirectory', '/tmp/tor data']],
+    [['', ' ', 'a"b', "it's", String.raw`C:\tor\data`, 'line\nbreak']],
+    [['$(touch /tmp/never-run)', '`id`', ';', '*']],
+  ])('keeps Tor argv boundaries through an edit-only save: %j', (args) => {
+    const source: ServerConfig = { ...SAMPLES.tor, torSettings: { extraArgs: args } };
+    const draft = protoCodec.tor.fromConfig(source);
+    const saved = protoCodec.tor.toConfig(draft, { ...source, name: 'new remark' });
+    expect(saved.torSettings?.extraArgs).toEqual(args);
+  });
+
+  it('parses quoted edits and refuses incomplete Tor argument text', () => {
+    expect(protoCodec.tor.toConfig({ torArgs: '--DataDirectory "/tmp/tor data" \'\' a\\ b' }, SAMPLES.tor)
+      .torSettings?.extraArgs).toEqual(['--DataDirectory', '/tmp/tor data', '', 'a b']);
+    for (const text of ['"unfinished', "'unfinished", 'trailing\\']) {
+      let error: unknown;
+      try { protoCodec.tor.toConfig({ torArgs: text }, SAMPLES.tor); } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(ProtoCodecError);
+      expect(error).toMatchObject({ code: 'torArgsInvalid', field: 'torArgs' });
+      expect((error as ProtoCodecError).detail).toBeUndefined();
+      expect(nodeFieldGroup('tor', (error as ProtoCodecError).field!)).toBe('advanced');
+    }
+  });
+
+  for (const redirect of [undefined, true, false]) {
+    it(`preserves OpenVPN redirect_gateway=${redirect} and selected mesh policy`, () => {
+      const source: ServerConfig = {
+        ...SAMPLES['openvpn-client'], meshRoutes: ['10.20.0.0/16'],
+        openvpnClientSettings: { ...SAMPLES['openvpn-client'].openvpnClientSettings, redirect_gateway: redirect },
+      };
+      const codec = protoCodec['openvpn-client'];
+      const draft = codec.fromConfig(source);
+      expect(draft.redirectGw).toBe(redirect !== false);
+      const saved = codec.toConfig(draft, { ...source, name: 'new remark' });
+      expect(saved.openvpnClientSettings?.redirect_gateway).toBe(redirect);
+      expect(saved.meshRoutes).toEqual(source.meshRoutes);
+      expect(meshAllowsInternet(saved)).toBe(meshAllowsInternet(source));
+      expect(codec.toConfig({ ...draft, redirectGw: false }, source).openvpnClientSettings?.redirect_gateway).toBe(false);
+    });
+  }
+});
+
+it('nested Shadowsocks and obfuscation credentials keep nonempty bytes', () => {
+  const password = ' secret ';
+  const ss: ServerConfig = {
+    ...SAMPLES.shadowsocks,
+    shadowsocksSettings: { ...SAMPLES.shadowsocks.shadowsocksSettings!, password },
+    shadowTlsSettings: { ...SAMPLES.shadowsocks.shadowTlsSettings!, password },
+  };
+  const saved = protoCodec.shadowsocks.toConfig(protoCodec.shadowsocks.fromConfig(ss), ss);
+  expect(saved.shadowsocksSettings?.password).toBe(password);
+  expect(saved.shadowTlsSettings?.password).toBe(password);
+  const hy2: ServerConfig = {
+    ...SAMPLES.hysteria2,
+    hysteria2Settings: { ...SAMPLES.hysteria2.hysteria2Settings, obfs: { type: 'salamander', password } },
+  };
+  expect(protoCodec.hysteria2.toConfig(protoCodec.hysteria2.fromConfig(hy2), hy2)
+    .hysteria2Settings?.obfs?.password).toBe(password);
+  const hy1: ServerConfig = {
+    ...SAMPLES.hysteria, hysteriaSettings: { ...SAMPLES.hysteria.hysteriaSettings, authStr: password, obfs: password },
+  };
+  const restored = protoCodec.hysteria.toConfig(protoCodec.hysteria.fromConfig(hy1), hy1);
+  expect(restored.hysteriaSettings?.authStr).toBe(password);
+  expect(restored.hysteriaSettings?.obfs).toBe(password);
+});
+
+it('edit-only ShadowTLS preserves imported whitespace-only credentials without relaxing the new-node gate', () => {
+  const source: ServerConfig = {
+    ...SAMPLES.shadowsocks,
+    shadowTlsSettings: { password: '   ', sni: 'stls.example' },
+  };
+  const draft = protoCodec.shadowsocks.fromConfig(source);
+  expect(protoCodec.shadowsocks.toConfig(draft, { ...source, name: 'new remark' })
+    .shadowTlsSettings?.password).toBe('   ');
+  expect(protoCodec.shadowsocks.toConfig(draft, { ...source, shadowTlsSettings: undefined })
+    .shadowTlsSettings).toBeUndefined();
+});
+
+
+it('headers with Object prototype names remain own arrays and round-trip duplicate values', () => {
+  const source = SAMPLES['masque-client'];
+  const draft = { ...protoCodec['masque-client'].fromConfig(source), headers: 'constructor: a\ntoString: b\n__proto__: c\nconstructor: d' };
+  const saved = protoCodec['masque-client'].toConfig(draft, source);
+  const headers = saved.masqueClientSettings!.headers!;
+  expect(Object.getPrototypeOf(headers)).toBeNull();
+  expect(Object.keys(headers)).toEqual(['constructor', 'toString', '__proto__']);
+  expect(headers.constructor).toEqual(['a', 'd']);
+  expect(headers.toString).toEqual(['b']);
+  expect(headers.__proto__).toEqual(['c']);
+  const roundTrip = protoCodec['masque-client'].fromConfig(saved);
+  expect(protoCodec['masque-client'].toConfig(roundTrip, saved).masqueClientSettings?.headers).toEqual(headers);
+});
+
+
+describe('explicit uTLS edit intent', () => {
+  for (const proto of ['vless', 'vmess', 'trojan', 'http', 'anytls'] as const) {
+    it(`${proto}: keeps default/disabled/profile on an unchanged edit`, () => {
+      for (const intent of [
+        { utlsMode: 'default' as const },
+        { utlsMode: 'disabled' as const, fingerprint: 'chrome' },
+        { utlsMode: 'profile' as const, fingerprint: 'firefox' },
+      ]) {
+        const base = { ...SAMPLES[proto], security: 'tls' as const, tlsSettings: { serverName: 'example.com', ...intent } };
+        const draft = protoCodec[proto].fromConfig(base);
+        const saved = protoCodec[proto].toConfig(draft, base);
+        expect(saved.tlsSettings?.utlsMode).toBe(intent.utlsMode);
+        expect(saved.tlsSettings?.fingerprint).toBe(intent.fingerprint);
+        expect(saved.security).toBe('tls');
+      }
+    });
+  }
 });

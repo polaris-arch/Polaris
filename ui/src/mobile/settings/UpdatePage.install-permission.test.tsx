@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { isValidElement, type ReactElement, type ReactNode } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { isValidElement, useEffect, type ReactElement, type ReactNode } from 'react';
 import type { MobileSettingsPageProps } from './settings-pages';
 
 // Run the real Install button handler in the existing node test environment.
@@ -8,7 +8,9 @@ const h = vi.hoisted(() => ({
   refs: [] as Array<{ current: unknown }>,
   stateIndex: 0,
   refIndex: 0,
-  cleanups: [] as Array<() => void>,
+  effectIndex: 0,
+  effects: [] as Array<{ deps: readonly unknown[] | undefined; cleanup?: () => void }>,
+  pendingEffects: [] as Array<() => void>,
   operations: [] as Promise<unknown>[],
 }));
 vi.mock('react', async (importOriginal) => {
@@ -23,9 +25,16 @@ vi.mock('react', async (importOriginal) => {
       }];
     },
     useRef: (initial: unknown) => h.refs[h.refIndex++] ??= { current: initial },
-    useEffect: (effect: () => (() => void) | void) => {
-      const cleanup = effect();
-      if (cleanup) h.cleanups.push(cleanup);
+    useEffect: (effect: () => (() => void) | void, deps?: readonly unknown[]) => {
+      const index = h.effectIndex++;
+      const previous = h.effects[index];
+      if (previous && deps && previous.deps && deps.length === previous.deps.length &&
+          deps.every((value, i) => Object.is(value, previous.deps![i]))) return;
+      h.pendingEffects.push(() => {
+        previous?.cleanup?.();
+        const cleanup = effect();
+        h.effects[index] = { deps: deps?.slice(), cleanup: cleanup || undefined };
+      });
     },
     useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
   };
@@ -51,20 +60,34 @@ function elements(node: ReactNode): ReactElement<{ children?: ReactNode; control
   return [node, ...elements(node.props.children), ...elements(node.props.control)];
 }
 
-function installClick(): void {
+function renderPage() {
   h.stateIndex = 0;
   h.refIndex = 0;
+  h.effectIndex = 0;
   const tree = UpdatePage({
     config: { appUpdateChannel: 'stable' },
     update: vi.fn(),
     commit: (_row: string, operation: Promise<unknown>) => { h.operations.push(operation); },
   } as unknown as MobileSettingsPageProps);
+  h.pendingEffects.splice(0).forEach((run) => run());
+  return tree;
+}
+
+function unmount(): void {
+  h.effects.forEach((slot) => slot.cleanup?.());
+  h.effects = [];
+  h.pendingEffects = [];
+}
+
+function installClick(): void {
+  const tree = renderPage();
   const button = elements(tree).find((e) => e.props.children === 'mobileSettings.update.installAction');
   expect(button).toBeDefined();
   button!.props.onClick!();
 }
 
 beforeEach(() => {
+  unmount();
   vi.clearAllMocks();
   h.states = [null, false, new Set(), {
     phase: 'downloaded', path: '/private/cache/polaris.apk', info: null,
@@ -73,11 +96,59 @@ beforeEach(() => {
   h.refs = [];
   h.stateIndex = 0;
   h.refIndex = 0;
-  h.cleanups = [];
+  h.effectIndex = 0;
+  h.effects = [];
+  h.pendingEffects = [];
   h.operations = [];
 });
 
+afterEach(unmount);
+
+describe('effect harness lifecycle', () => {
+  it('flushes after render, compares dependencies, and cleans up before replacement and unmount', () => {
+    const events: string[] = [];
+    const render = (dependency: string): void => {
+      h.effectIndex = 0;
+      useEffect(() => { events.push(`setup:${dependency}`); return () => { events.push(`cleanup:${dependency}`); }; }, [dependency]);
+      useEffect(() => { events.push('mount'); return () => { events.push('unmount'); }; }, []);
+      useEffect(() => { events.push('every'); });
+    };
+    render('first');
+    expect(events).toEqual([]);
+    h.pendingEffects.splice(0).forEach((run) => run());
+    expect(events).toEqual(['setup:first', 'mount', 'every']);
+    render('first');
+    h.pendingEffects.splice(0).forEach((run) => run());
+    expect(events).toEqual(['setup:first', 'mount', 'every', 'every']);
+    render('second');
+    h.pendingEffects.splice(0).forEach((run) => run());
+    expect(events.slice(-3)).toEqual(['cleanup:first', 'setup:second', 'every']);
+    unmount();
+    expect(events.slice(-2)).toEqual(['cleanup:second', 'unmount']);
+  });
+});
+
 describe('Android Install button permission sequencing', () => {
+  it('withdraws the old package intent when the downloaded package changes', async () => {
+    let grant!: (value: { granted: boolean }) => void;
+    vi.mocked(updateApi.requestInstallPermission).mockReturnValueOnce(new Promise((resolve) => { grant = resolve; }));
+    vi.mocked(updateApi.install).mockResolvedValue({ ok: true, awaitingSystemInstaller: true });
+    installClick();
+    h.states[3] = { ...(h.states[3] as Record<string, unknown>), path: '/private/cache/new.apk' };
+    renderPage(); // Commit the identity-change effect without a new install click.
+    grant({ granted: true });
+    await h.operations[0];
+    expect(updateApi.requestInstallPermission).toHaveBeenCalledTimes(1);
+    expect(updateApi.install).not.toHaveBeenCalled();
+    expect(h.states[4]).toBe(false);
+    expect(h.states[5]).toBe(false);
+    vi.mocked(updateApi.requestInstallPermission).mockResolvedValue({ granted: true });
+    installClick();
+    await h.operations[1];
+    expect(updateApi.requestInstallPermission).toHaveBeenCalledTimes(2);
+    expect(updateApi.install).toHaveBeenCalledExactlyOnceWith('/private/cache/new.apk');
+  });
+
   it('requests permission once, waits for it, and then hands off the captured package once', async () => {
     let grant!: (value: { granted: boolean }) => void;
     vi.mocked(updateApi.requestInstallPermission).mockReturnValue(new Promise((resolve) => { grant = resolve; }));
@@ -109,7 +180,7 @@ describe('Android Install button permission sequencing', () => {
     let grant!: (value: { granted: boolean }) => void;
     vi.mocked(updateApi.requestInstallPermission).mockReturnValue(new Promise((resolve) => { grant = resolve; }));
     installClick();
-    h.cleanups.forEach((cleanup) => cleanup());
+    unmount();
     grant({ granted: true });
     await h.operations[0];
     expect(updateApi.install).not.toHaveBeenCalled();

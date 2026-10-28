@@ -143,15 +143,100 @@ fn start_err_response(e: StartError) -> ApiResponse<()> {
 pub async fn proxy_stop(
     app: AppHandle,
     state: State<'_, AppRuntime>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<ApiResponse<Value>, ()> {
+    let expected = match request.body() {
+        tauri::ipc::InvokeBody::Json(args) => stop_expectation(args),
+        tauri::ipc::InvokeBody::Raw(_) => Err("proxy stop arguments must be an object"),
+    };
+    let expected = match expected {
+        Ok(expected) => expected,
+        Err(error) => {
+            return Ok(ApiResponse::err_with_code(
+                error,
+                "PROXY_STOP_EXPECTATION_INVALID",
+            ))
+        }
+    };
+    let proxy = state.proxy.clone();
+    if let Some(expected) = expected {
+        return Ok(match proxy.stop_expected(expected).await {
+            Ok(result) => {
+                if matches!(
+                    result,
+                    crate::runtime::proxy::ExpectedCoreStopResult::Stopped { .. }
+                ) {
+                    let _ = app.emit(EVENT_PROXY_STOPPED, json!({}));
+                }
+                ApiResponse::ok(json!(result))
+            }
+            Err(error) => ApiResponse::err(error),
+        });
+    }
+    let response = proxy_stop_unconditional(app, state).await?;
+    Ok(ApiResponse {
+        success: response.success,
+        data: None,
+        error: response.error,
+        code: response.code,
+    })
+}
+
+/// Native menu Stop/cancel has no IPC Request and keeps the unit response shared
+/// with native Start. The ordinary IPC branch uses this same stop/event route.
+pub(crate) async fn proxy_stop_unconditional(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
 ) -> Result<ApiResponse<()>, ()> {
     let proxy = state.proxy.clone();
     Ok(match proxy.stop().await {
         Ok(()) => {
             let _ = app.emit(EVENT_PROXY_STOPPED, json!({}));
-            ok_void()
+            ApiResponse {
+                success: true,
+                data: None,
+                error: None,
+                code: None,
+            }
         }
         Err(e) => ApiResponse::err(e),
     })
+}
+
+fn stop_expectation(
+    args: &Value,
+) -> Result<Option<crate::runtime::proxy::ExpectedCoreStopRequest>, &'static str> {
+    let args = args
+        .as_object()
+        .ok_or("proxy stop arguments must be an object")?;
+    let owned = [
+        "expectedMainGeneration",
+        "expectedSelectedServerId",
+        "expectedSelectionIntentGeneration",
+    ];
+    if !owned.iter().any(|name| args.contains_key(*name)) {
+        return Ok(None);
+    }
+    let generation = args
+        .get("expectedMainGeneration")
+        .and_then(Value::as_u64)
+        .filter(|v| *v > 0 && *v <= 9_007_199_254_740_991)
+        .ok_or("invalid expected main generation")?;
+    let selection = match args.get("expectedSelectedServerId") {
+        Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        _ => return Err("invalid expected selection"),
+    };
+    let intent = args
+        .get("expectedSelectionIntentGeneration")
+        .and_then(Value::as_u64)
+        .filter(|v| *v <= 9_007_199_254_740_991)
+        .ok_or("invalid expected selection intent")?;
+    Ok(Some(crate::runtime::proxy::ExpectedCoreStopRequest {
+        expected_main_generation: generation,
+        expected_selected_server_id: selection,
+        expected_selection_intent_generation: intent,
+    }))
 }
 
 /// 上游 `PROXY_GET_STATUS`：取代理运行状态。
@@ -161,7 +246,7 @@ pub async fn proxy_stop(
 )]
 #[tauri::command]
 pub fn proxy_get_status(state: State<'_, AppRuntime>) -> ApiResponse<ProxyStatus> {
-    ApiResponse::ok(state.proxy().status())
+    ApiResponse::from_result(state.proxy().status_with_owned_stop_context())
 }
 
 /// `PROXY_GET_PENDING_CHANGES`：待应用节点差集（config 相对运行核起核快照）。
@@ -188,9 +273,9 @@ pub async fn proxy_apply_pending_changes(
     state: State<'_, AppRuntime>,
 ) -> Result<ApiResponse<Value>, ()> {
     let proxy = state.proxy.clone();
-    let status = proxy.apply_pending().await;
+    let (status, apply_id) = proxy.apply_pending_owned().await;
     Ok(ApiResponse::ok(
-        json!({ "ok": status != "skipped", "status": status }),
+        json!({ "ok": status != "skipped", "status": status, "applyId": apply_id }),
     ))
 }
 
@@ -597,32 +682,6 @@ pub async fn kernel_probe_outbound(
     Ok(ApiResponse::ok(verdict))
 }
 
-/// 取管理 API 端点 `(port, secret)`；核未运行/端口未解析 → Err（命令据此回落 clean error，不发假 ok）。
-///
-/// `pub(crate)`：`commands/misc.rs` 的 `logs_runtime_level` 走同一条「连管理 API 读一下」的配方，
-/// 端点读法必须与此处**同源**——两份各读各的，迟早有一份忘了跟上 `clashApiSecret` 的取法。
-///
-/// 与 `runtime/proxy.rs::management_api()` / `runtime/stats/relay.rs::read_clash_secret` 同源读法
-/// （`management_api()` 私有、且其返回的 `GrpcManagementApi` 只暴露 `close_connection`、无 close-all
-/// —— close-all 在 `SingBoxApiClient` 上，故这里直接按同一配方建 h2c 客户端，不新增依赖）。
-pub(crate) fn management_endpoint(state: &AppRuntime) -> Result<(u16, String), String> {
-    let status = state.proxy().status();
-    if !status.running || status.clash_api_port == 0 {
-        return Err("核未运行".to_string());
-    }
-    let secret = state
-        .config()
-        .current()
-        .ok()
-        .and_then(|c| {
-            c.get("clashApiSecret")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    Ok((status.clash_api_port, secret))
-}
-
 /// 上游 `CONNECTIONS_CLOSE`：关单条连接（经管理 API gRPC `CloseConnection`，clash `DELETE /connections/{id}` 等价）。
 ///
 /// 核未运行 / gRPC 失败 → clean error（`ApiResponse::err`，前端 invoke 层 reject）；成功 → `{ ok: true }`。
@@ -632,9 +691,9 @@ pub async fn connections_close(
     state: State<'_, AppRuntime>,
     id: String,
 ) -> Result<ApiResponse<Value>, ()> {
-    let (port, secret) = match management_endpoint(&state) {
-        Ok(v) => v,
-        Err(e) => return Ok(ApiResponse::err(e)),
+    // 端点取法的单点是 `ProxyRuntime::management_endpoint`；核未运行或端口未解析 → clean error。
+    let Some((port, secret)) = state.proxy().management_endpoint() else {
+        return Ok(ApiResponse::err("核未运行"));
     };
     let client = match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await {
         Ok(c) => c,
@@ -657,9 +716,9 @@ pub async fn connections_close(
 /// 核未运行 / 建连或快照失败 → clean error；成功 → `{ ok: true, closed, failed }`（成功 / 单条失败条数；单条失败不中断其余，也不把整体判失败）。
 #[tauri::command]
 pub async fn connections_close_all(state: State<'_, AppRuntime>) -> Result<ApiResponse<Value>, ()> {
-    let (port, secret) = match management_endpoint(&state) {
-        Ok(v) => v,
-        Err(e) => return Ok(ApiResponse::err(e)),
+    // 端点取法的单点是 `ProxyRuntime::management_endpoint`；核未运行或端口未解析 → clean error。
+    let Some((port, secret)) = state.proxy().management_endpoint() else {
+        return Ok(ApiResponse::err("核未运行"));
     };
     let client = match SingBoxApiClient::connect(Endpoint::new("127.0.0.1", port), secret).await {
         Ok(c) => c,

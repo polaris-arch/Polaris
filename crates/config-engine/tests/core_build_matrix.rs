@@ -11,7 +11,7 @@
 //! | `with_utls` | `tls.utls` 指纹字段被拒 | `singbox/outbound.rs` |
 //! | `with_wireguard` / `with_tailscale` | 对应 endpoint 起不来 | `singbox/endpoint.rs` |
 //! | `with_naive_outbound` | naive 出站被拒 | `singbox/outbound.rs` |
-//! | `with_gvisor` | 1.15.0-alpha.7 起仅门控 sing-tun 已弃用的 `gvisor` / `mixed` TUN 栈（此前还门控 WireGuard 用户态栈与 tailscale endpoint，alpha.7 已解耦；windows 那份自 alpha.7 起不带） | 无（本仓不下发 `stack`） |
+//! | `with_gvisor` | 1.15.0-alpha.7 起仅门控 sing-tun 已弃用的 `gvisor` / `mixed` TUN 栈（此前还门控 WireGuard 用户态栈与 tailscale endpoint，alpha.7 已解耦；桌面 fork 四平台显式保留） | 无（本仓不下发 `stack`） |
 //! | `with_clash_api` | 面板 / 外部控制器整块失效 | `singbox/config.rs` |
 //!
 //! 关键在于**这件事是逐平台的**：官方发布矩阵完全可能只在某一个 GOOS 上改 tag 集。
@@ -329,4 +329,19 @@ fn ci_step_still_wired() {
         "package.yml 里找不到 `--test core_build_matrix` —— 打包腿没在跑构建面矩阵门，\
          缺核时它会静静跳过而没人知道"
     );
+}
+
+/// 真实构建门应拒绝旧 Windows 无 gvisor 面；不启动核。
+#[test]
+fn windows_requires_gvisor_without_changing_native_build_face() {
+    let win = CORE_MATRIX.iter().find(|c| c.key == "win").unwrap();
+    assert_eq!((win.goos, win.goarch, win.cgo), ("windows", "amd64", "0"));
+    let mut old = win.expected_tags();
+    assert!(old.remove("with_gvisor"));
+    assert_ne!(
+        old,
+        win.expected_tags(),
+        "旧 Windows 无 gvisor 产物不得通过新矩阵"
+    );
+    assert!(old.contains("with_purego"));
 }

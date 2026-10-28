@@ -34,12 +34,21 @@
 //   把裁判的取材面污染成恒非空。
 
 import com.android.build.api.dsl.ApplicationExtension
+import com.android.build.api.variant.ApplicationAndroidComponentsExtension
+import org.gradle.api.provider.Provider
 
 val androidExtension = extensions.getByType(ApplicationExtension::class.java)
+val androidComponentsExtension = extensions.getByType(ApplicationAndroidComponentsExtension::class.java)
+val releaseJniExcludes = sortedMapOf<String, Provider<Set<String>>>()
+androidComponentsExtension.onVariants(androidComponentsExtension.selector().withBuildType("release")) { variant ->
+    releaseJniExcludes[variant.name] = variant.packaging.jniLibs.excludes
+}
 
 tasks.register("printPolarisReleaseFacts") {
     // 配置期取值、执行期只打印：取的就是 AGP 此刻手里那份清单本身。
+    val releaseType = androidExtension.buildTypes.getByName("release")
     val releaseProguardFiles = androidExtension.buildTypes.getByName("release").proguardFiles.toList()
+    val releaseShrinkResources = releaseType.isShrinkResources
     // ── R8 的输入集是**三处的并集**（2026-09-06 终止轮 R2）────────────────────────────
     // AGP 把 `defaultConfig` / 选中的 `productFlavor` / `buildType` 三处的 proguardFiles
     // 合起来喂给 R8（AGP 口径；本仓没在 R8 输入那一层实测过），而上面那一行只取到第三处。
@@ -64,6 +73,10 @@ tasks.register("printPolarisReleaseFacts") {
         .sorted()
     val hatchOpen = project.extra["releaseFactHatchOpen"]
     doLast {
+        println("POLARIS_FACT\treleaseShrinkResources\t$releaseShrinkResources")
+        releaseJniExcludes.forEach { (variant, excludes) ->
+            println("POLARIS_FACT\treleaseJniExcludes\t$variant\t${excludes.get().sorted().joinToString(",")}")
+        }
         releaseProguardFiles.forEach { f ->
             println("POLARIS_FACT\tproguardFile\t${f.absolutePath}\t${if (f.isFile) f.length() else -1L}")
         }

@@ -1164,3 +1164,102 @@ async fn ts_status_frame_drives_the_exit_block_reconcile() {
         "STATUS 帧尾必须跑翻转对账，否则推侧整条腿是死代码（拉侧只在用户点检测那刻求值）"
     );
 }
+
+// TS-01: custody comes from the Ready applied instance, never from the status-frame cache.
+fn seed_main_core_hold(rt: &Arc<ProxyRuntime>, config: Value, ids: &[&str]) -> u64 {
+    let generation = rt.bump_generation();
+    *rt.startup_snapshot.write().unwrap() = Some(config);
+    *rt.switch_snapshot.write().unwrap() = Some(SwitchSnapshot {
+        id_to_tag: ids
+            .iter()
+            .map(|id| ((*id).to_owned(), format!("tag-{id}")))
+            .collect(),
+        ..Default::default()
+    });
+    *rt.status.write().unwrap() = ProxyStatus {
+        running: true,
+        main_generation: generation,
+        start_time: Some(1),
+        ..Default::default()
+    };
+    generation
+}
+
+#[test]
+fn main_core_hold_proves_empty_applied_set_without_any_status_frame() {
+    let (rt, _dir) = test_runtime();
+    let generation = seed_main_core_hold(&rt, polaris_store::default_config(), &[]);
+    assert!(rt.mesh.tailscale_status_snapshot(true).statuses.is_empty());
+    let proof = rt
+        .tailscale_main_core_hold()
+        .expect("Ready no-endpoint proof");
+    assert_eq!(proof.main_generation, generation);
+    assert!(proof.server_ids.is_empty());
+    // Saving D with a new TS node does not apply it to the running instance.
+    rt.config.save_full(&ts_exit_config(None)).unwrap();
+    assert_eq!(rt.tailscale_main_core_hold(), Some(proof));
+}
+
+#[test]
+fn main_core_hold_uses_effective_mapping_and_ignores_unapplied_disk_removal() {
+    let (rt, _dir) = test_runtime();
+    seed_main_core_hold(&rt, ts_exit_config(None), &["ts1"]);
+    let proof = rt.tailscale_main_core_hold().unwrap();
+    assert_eq!(proof.server_ids, vec!["ts1"]);
+    rt.config
+        .save_full(&polaris_store::default_config())
+        .unwrap();
+    assert_eq!(rt.tailscale_main_core_hold(), Some(proof));
+    // A protocol filtered out of the actual startup must not be reported as held.
+    rt.switch_snapshot
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .id_to_tag
+        .clear();
+    assert!(rt.tailscale_main_core_hold().unwrap().server_ids.is_empty());
+}
+
+#[test]
+fn main_core_hold_fails_closed_for_incomplete_or_replaced_ready_evidence() {
+    let (rt, _dir) = test_runtime();
+    assert!(rt.tailscale_main_core_hold().is_none());
+    seed_main_core_hold(&rt, ts_exit_config(None), &["ts1"]);
+    rt.start_inflight.store(1, Ordering::SeqCst);
+    assert!(rt.tailscale_main_core_hold().is_none());
+    rt.start_inflight.store(0, Ordering::SeqCst);
+    rt.gate.begin();
+    assert!(rt.tailscale_main_core_hold().is_none());
+    let _ = rt.gate.end(LifecycleKind::Start);
+    assert!(rt.tailscale_main_core_hold().is_some());
+    // A Stop/Start claim changes the gate before the old Ready status/snapshots clear.
+    rt.bump_generation();
+    assert!(rt.tailscale_main_core_hold().is_none());
+    seed_main_core_hold(&rt, ts_exit_config(None), &["ts1"]);
+    rt.status.write().unwrap().running = false; // crash/error without a claim
+    assert!(rt.tailscale_main_core_hold().is_none());
+    seed_main_core_hold(&rt, ts_exit_config(None), &["ts1"]);
+    *rt.startup_snapshot.write().unwrap() = Some(serde_json::json!("invalid"));
+    assert!(rt.tailscale_main_core_hold().is_none());
+    seed_main_core_hold(&rt, ts_exit_config(None), &["unknown-applied-id"]);
+    assert!(rt.tailscale_main_core_hold().is_none());
+    *rt.switch_snapshot.write().unwrap() = None;
+    assert!(rt.tailscale_main_core_hold().is_none());
+    seed_main_core_hold(&rt, ts_exit_config(None), &["ts1"]);
+    *rt.startup_snapshot.write().unwrap() = None;
+    assert!(rt.tailscale_main_core_hold().is_none());
+}
+
+#[test]
+fn main_core_hold_poisoned_snapshot_lock_is_unknown() {
+    let (rt, _dir) = test_runtime();
+    seed_main_core_hold(&rt, ts_exit_config(None), &["ts1"]);
+    let other = Arc::clone(&rt);
+    let _ = std::thread::spawn(move || {
+        let _guard = other.startup_snapshot.write().unwrap();
+        panic!("poison fixture snapshot");
+    })
+    .join();
+    assert!(rt.tailscale_main_core_hold().is_none());
+}

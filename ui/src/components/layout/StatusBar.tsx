@@ -1,3 +1,4 @@
+import { MeasurementLabel } from '@/mobile/MeasurementLabel';
 /**
  * StatusBar —— 主内容区底部状态栏（原型 .statusbar L544-558，markup L2430-2438）。
  *
@@ -111,11 +112,11 @@ export default function StatusBar() {
    *  「按 id 取」天然覆盖，无需额外清理。勿改回组件内的测速结果私有订阅：那样本条会随
    *  状态栏所在布局重挂而丢，且与三屏各存一份是同一个病（见 store/use-latency-store.ts）。 */
   const latencyMs = useLatencyStore((s) =>
-    selectedServerId ? s.latencyMap[selectedServerId] : undefined
+    selectedServerId ? s.currentProjections[selectedServerId]?.state === 'failed' ? null : s.currentProjections[selectedServerId]?.latency : undefined
   );
   /** 该延迟的落库时刻（契约「陈旧>30min 半透明」的数据基础，见 use-latency-store）。 */
   const latencyTestedAt = useLatencyStore((s) =>
-    selectedServerId ? s.testedAt[selectedServerId] : undefined
+    selectedServerId ? s.currentProjections[selectedServerId]?.measuredAt : undefined
   );
 
   /* ── 上下行速率 + 连接数：订阅 stats topic ──
@@ -218,7 +219,7 @@ export default function StatusBar() {
         style={latencyStale ? { opacity: 0.45 } : undefined}
         data-tip={latencyStale ? t('home.latencyStaleHint') : undefined}
       >
-        {latency}
+        {showLatency && selectedServerId ? <MeasurementLabel serverId={selectedServerId} purpose="current" /> : latency}
       </span>
 
       {/* 速率/连接数**仅连接态**显示（契约「状态栏」：`实时速率/连接数(仅连接态)`）。断开时这两个数

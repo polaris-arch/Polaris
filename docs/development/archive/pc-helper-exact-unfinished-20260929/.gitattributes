@@ -1,3 +1,0 @@
-# Preserve the original unified diff's intentional context-line spaces.
-# Check whitespace in the archived source, not in this exact patch container.
-tracked.patch -whitespace

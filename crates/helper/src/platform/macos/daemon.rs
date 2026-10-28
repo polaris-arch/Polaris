@@ -40,12 +40,12 @@ const DEFAULT_SUPPORT_DIR: &str = "/Library/Application Support/Polaris";
 pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> MacConfig {
     let m = crate::cli::parse_flags(argv, &[]);
     MacConfig::new(
-        m.get("singbox").cloned().unwrap_or_default(),
-        m.get("confdir").cloned().unwrap_or_default(),
         m.get("support")
             .cloned()
             .unwrap_or_else(|| DEFAULT_SUPPORT_DIR.to_owned()),
-        m.get("coredir").cloned().unwrap_or_default(),
+        m.get("coredir")
+            .cloned()
+            .unwrap_or_else(|| format!("{DEFAULT_SUPPORT_DIR}/core")),
     )
 }
 
@@ -55,7 +55,12 @@ pub fn parse_args<I: Iterator<Item = String>>(argv: I) -> MacConfig {
 /// 生产 mac 二进制走 [`run`]。
 #[must_use]
 pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> std::process::ExitCode {
-    let cfg = parse_args(argv);
+    let argv: Vec<_> = argv.collect();
+    if let Err(error) = crate::cli::validate_flags(&argv, &["support", "coredir"], &[]) {
+        eprintln!("polaris-helper: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let cfg = parse_args(argv.into_iter());
     #[cfg(target_os = "macos")]
     {
         run(&cfg)
@@ -71,6 +76,14 @@ pub fn daemon_main<I: Iterator<Item = String>>(argv: I) -> std::process::ExitCod
 #[cfg(target_os = "macos")]
 fn run(cfg: &MacConfig) -> std::process::ExitCode {
     use crate::platform::macos::server::{serve, DaemonServices};
+    if let Ok(store) = crate::core_store::CoreStore::open(
+        std::path::Path::new(&cfg.core_dir),
+        crate::core_store::OwnerPolicy::privileged(),
+    ) {
+        if let Err(error) = store.retire_flat_layout() {
+            log::warn!("legacy flat retirement retained: {error}");
+        }
+    }
 
     // 生产服务 bundle（token/runner/config + child 记账 + command_mu）—— accept 循环与信号收割器共享
     // 同一 child 状态（`Arc`），使收割器能在退出前对 child sing-box 走精确 terminateChild 分支。

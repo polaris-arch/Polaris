@@ -49,7 +49,8 @@
  *    那个 effect ⇒ 不在这里落，选浅色要重启才看得见。
  */
 
-import type { ReactElement } from 'react';
+import { type ReactElement } from 'react';
+import { commitThemeChoice, commitLanguageChoice } from './committed-appearance';
 import { useTranslation } from 'react-i18next';
 import type { UserConfig } from '@/contracts/types';
 import { syncLanguageChoice } from '@/i18n';
@@ -68,15 +69,15 @@ export function DisplayPage({ config, update, commit }: MobileSettingsPageProps)
   const { t } = useTranslation();
   const language = config.language === 'auto' || !config.language ? 'system' : config.language;
   const theme = config.uiTheme ?? 'system';
-
   function pickTheme(next: UserConfig['uiTheme']): void {
-    commit('theme', update({ uiTheme: next }));
-    if (typeof document !== 'undefined') {
-      document.documentElement.setAttribute(
-        'data-theme',
-        resolveTheme({ uiTheme: next, seed: readInitialThemeSeed(), systemDark: systemDark() }),
-      );
-    }
+    commit('theme', commitThemeChoice(update({ uiTheme: next }), () => {
+      if (typeof document !== 'undefined') {
+        document.documentElement.setAttribute(
+          'data-theme',
+          resolveTheme({ uiTheme: next, seed: readInitialThemeSeed(), systemDark: systemDark() }),
+        );
+      }
+    }));
   }
 
   return (
@@ -94,8 +95,9 @@ export function DisplayPage({ config, update, commit }: MobileSettingsPageProps)
               ariaLabel={t('settings.appearance.language')}
               onChange={(v) => {
                 const choice = v === 'system' ? 'auto' : v;
-                commit('language', update({ language: choice }));
-                syncLanguageChoice(choice);
+                commit('language', commitLanguageChoice(update({ language: choice }), () => {
+                  syncLanguageChoice(choice);
+                }));
               }}
             >
               {/* 语言名一律用该语言自己的写法（endonym），与桌面同一条理由：界面正显示着一门你看不懂

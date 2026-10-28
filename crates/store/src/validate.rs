@@ -318,6 +318,22 @@ pub fn validate_config(value: &mut Value) -> Result<(), crate::StoreError> {
 /// 规则 `networkProfileId` 指向不存在的场景**不在这里拦**：删场景、导入缺场景的备份都合法，
 /// 生成侧 fail-closed；只在规则 IPC 写入时拦（`commands::rules` 的 `RULE_INVALID`）。
 pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
+    for cidr in value
+        .get("bypassLANList")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if cidr.contains('/')
+            && polaris_config_engine::user_config::cidr::normalize_cidr(cidr).is_none()
+        {
+            return Err(crate::StoreError::validation(format!(
+                "invalid bypassLANList CIDR: {cidr}"
+            )));
+        }
+    }
+
     validate_raw_mesh_inbound_policies(value)?;
     use polaris_config_engine::user_config::{is_valid_search_domain, BUILTIN_NETENV_DHCP_ID};
     for key in ["dnsServers", "dnsServerGroups", "networkProfiles"] {
@@ -366,6 +382,77 @@ pub fn validate_for_save(value: &Value) -> Result<(), crate::StoreError> {
                 "networkProfiles[{id}].match.searchDomains: invalid domain \"{bad}\""
             )));
         }
+    }
+    validate_real_query_fallback_reference(value)?;
+    Ok(())
+}
+
+/// An explicitly supplied fallback must survive sanitization unchanged. Checking
+/// the complete defaults object also prevents a malformed sibling from causing the
+/// sanitizer to discard an otherwise valid fallback together with dnsDefaults.
+fn real_query_fallback_action(
+    value: &Value,
+) -> Result<Option<polaris_config_engine::user_config::DnsPolicyAction>, crate::StoreError> {
+    use polaris_config_engine::user_config::DnsPolicyDefaults;
+    let Some(defaults) = value.get("dnsDefaults") else {
+        return Ok(None);
+    };
+    if defaults
+        .get("realQueryFallbackAction")
+        .is_none_or(Value::is_null)
+    {
+        return Ok(None);
+    }
+    let defaults: DnsPolicyDefaults = serde_json::from_value(defaults.clone()).map_err(|_| {
+        crate::StoreError::validation("dnsDefaults.realQueryFallbackAction: invalid DNS defaults")
+    })?;
+    let action = defaults.real_query_fallback_action;
+    if action
+        .as_ref()
+        .is_some_and(|action| !action.is_valid_real_query_fallback())
+    {
+        return Err(crate::StoreError::validation(
+            "dnsDefaults.realQueryFallbackAction must be server or reject",
+        ));
+    }
+    Ok(action)
+}
+
+pub(crate) fn validate_raw_real_query_fallback_action(
+    value: &Value,
+) -> Result<(), crate::StoreError> {
+    real_query_fallback_action(value).map(|_| ())
+}
+
+fn validate_real_query_fallback_reference(value: &Value) -> Result<(), crate::StoreError> {
+    use polaris_config_engine::user_config::{
+        DnsPolicyAction, DnsServerKind, DnsServerResource, BUILTIN_NETENV_DHCP_ID,
+    };
+    let Some(DnsPolicyAction::Server { server_id }) = real_query_fallback_action(value)? else {
+        return Ok(());
+    };
+    // The reserved DHCP transport is generated on demand, not stored in dnsServers.
+    if server_id == BUILTIN_NETENV_DHCP_ID {
+        return Ok(());
+    }
+    let exists = !server_id.trim().is_empty()
+        && value
+            .get("dnsServers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|resource| {
+                serde_json::from_value::<DnsServerResource>(resource.clone()).ok()
+            })
+            .any(|resource| {
+                resource.id == server_id
+                    && resource.enabled
+                    && resource.kind != DnsServerKind::Hosts
+            });
+    if !exists {
+        return Err(crate::StoreError::validation(format!(
+            "dnsDefaults.realQueryFallbackAction: DNS server \"{server_id}\" is missing, disabled, or hosts-only"
+        )));
     }
     Ok(())
 }

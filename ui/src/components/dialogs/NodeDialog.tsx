@@ -1,3 +1,4 @@
+import { realityUtlsError } from '@/domain/utls';
 /**
  * NodeDialog —— 节点添加/编辑弹窗（8 协议动态表单，原型 #node-dialog :2513-2547）。
  *
@@ -20,7 +21,7 @@
  * 脏态取消 → 嵌套 confirm（放弃更改，复用 D1 ConfirmDialog）。
  */
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import { useAppStore, useEffectiveConfig, useEffectiveServers } from '@/store/app-store';
@@ -131,8 +132,12 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
   // Tailcat 客户端公钥（D5）：只是展示态，由后端从私钥推导；私钥一改就作废，不落盘、不进日志。
   const [tcPublicKey, setTcPublicKey] = useState('');
   const [tcKeyBusy, setTcKeyBusy] = useState(false);
+  const keyRevision = useRef(0);
+  useEffect(() => () => { keyRevision.current += 1; }, []);
 
   const setField = (k: string, v: FormValue) => {
+    keyRevision.current += 1;
+    setTcKeyBusy(false);
     setDraft((d) => ({ ...d, [k]: v }));
     setDirty(true);
     if (revealGroup) setRevealGroup(null);
@@ -143,6 +148,8 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
   };
 
   const changeProto = (next: NodeProto) => {
+    keyRevision.current += 1;
+    setTcKeyBusy(false);
     setProto(next);
     setMeshPolicy(undefined);
     // 换协议：公共字段（名/址/端口/detour）保留在各自 state；协议特定字段重置为新协议默认。
@@ -197,15 +204,20 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
    */
   const runTailcatKeypair = async () => {
     const current = typeof draft.privateKey === 'string' ? draft.privateKey.trim() : '';
+    const revision = ++keyRevision.current;
     setTcKeyBusy(true);
     try {
       const r = await api.server.tailcatKeypair(current || undefined);
-      if (!current) setField('privateKey', r.privateKey);
+      if (keyRevision.current !== revision) return;
+      if (!current) {
+        setDraft((value) => ({ ...value, privateKey: r.privateKey }));
+        setDirty(true);
+      }
       setTcPublicKey(r.publicKey);
     } catch (e) {
-      toast.error(t('node.tcKeyFailed'), e instanceof Error ? e.message : undefined);
+      if (keyRevision.current === revision) toast.error(t('node.tcKeyFailed'), e instanceof Error ? e.message : undefined);
     } finally {
-      setTcKeyBusy(false);
+      if (keyRevision.current === revision) setTcKeyBusy(false);
     }
   };
 
@@ -308,6 +320,13 @@ function NodeForm({ instanceId, base, isEdit, servers, initialProto }: NodeFormP
       const codecBase =
         base && base.protocol === proto ? { ...base, ...meta } : meta;
       const full = protoCodec[proto].toConfig(draft, codecBase);
+      const utlsError = realityUtlsError(full);
+      if (utlsError) {
+        setFormTab('connection');
+        toast.error(t('common.saveFailed'), t(utlsError));
+        return;
+      }
+
       if (isMeshTunnelNodeProtocol(proto)) applyMeshInboundPolicy(full, policy);
       if (base?.subscriptionId || !bindInterface) delete full.bindInterface;
       else full.bindInterface = bindInterface;

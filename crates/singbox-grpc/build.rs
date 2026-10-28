@@ -7,10 +7,11 @@
 
 include!("proto_wire_check.rs");
 include!("android_wire_check.rs");
+include!("apple_wire_check.rs");
 
 // 符号表与 vendored proto 原文均取自 `proto_wire_check`（此前 build.rs / tests 各存一份，
 // 两处注释都写着「一处漏加，另一处就白守」；运行期换核检查要用第三次，故下沉共用）。
-use proto_wire_check::{CHECKED_SYMBOLS, PROTO_SRC};
+use proto_wire_check::WireVerdict;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_proto_matches_bundled_core();
@@ -21,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/started_service.proto");
     println!("cargo:rerun-if-changed=proto_wire_check.rs");
     println!("cargo:rerun-if-changed=android_wire_check.rs");
+    println!("cargo:rerun-if-changed=apple_wire_check.rs");
     Ok(())
 }
 
@@ -66,6 +68,19 @@ fn assert_proto_matches_bundled_core() {
     // AAR's JNI library. Its actual descriptor must satisfy the same wire table.
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+        println!("cargo:rerun-if-env-changed=POLARIS_APPLE_WIRE_ARCHIVE");
+        if std::env::var("PROFILE").as_deref() == Ok("release") {
+            let archive = std::path::PathBuf::from(
+                std::env::var_os("POLARIS_APPLE_WIRE_ARCHIVE")
+                    .expect("iOS Release wire guard requires the actual admitted static slice"),
+            );
+            println!("cargo:rerun-if-changed={}", archive.display());
+            apple_wire_check::check_apple_archive(&archive)
+                .unwrap_or_else(|report| panic!("iOS Release wire guard refused: {report}"));
+        }
+        return;
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
         let aar = proto_wire_check::repo_root().join("src-tauri/gen/android/app/libs/libbox.aar");
         println!("cargo:rerun-if-changed={}", aar.display());
@@ -123,12 +138,21 @@ fn assert_proto_matches_bundled_core() {
     }
 
     for (_, core) in &survey.present {
-        for (kind, name) in CHECKED_SYMBOLS {
-            if let Err(report) =
-                proto_wire_check::check_core_against_proto(core, PROTO_SRC, *kind, name)
-            {
-                panic!("{report}");
-            }
+        let bytes = std::fs::read(core)
+            .unwrap_or_else(|error| panic!("读不到随包核 {}：{error}", core.display()));
+        // Unlike optional runtime replacement, packaging must fail closed when
+        // evidence is missing. Parse each core once for the entire shared table.
+        match proto_wire_check::verdict_for_core_bytes(&bytes) {
+            WireVerdict::Match => {}
+            WireVerdict::Mismatch(report) => panic!(
+                "vendored proto 与随包内核的 wire 契约不一致：{}\n{report}\n\
+                 修复：以随包核的 descriptor 为准改 crates/singbox-grpc/proto/started_service.proto",
+                core.display()
+            ),
+            WireVerdict::Unobservable(report) => panic!(
+                "无法验证随包内核 wire 契约，拒绝出包：{}：{report}",
+                core.display()
+            ),
         }
     }
 }

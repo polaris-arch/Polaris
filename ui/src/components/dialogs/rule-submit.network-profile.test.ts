@@ -13,6 +13,7 @@ import type { TFunction } from 'i18next';
 import type { Rule } from '@/contracts/types';
 import type { StagedEntry } from '@/lib/staged-config';
 import { submitRule, type RuleSubmitArgs } from './rule-submit';
+import { formatConditionValues } from './rule-cond';
 
 /**
  * RuleDialog「生效网络」的写侧（spec §8.3「RuleDialog 生效网络读写」）：走暂存腿（零 IPC），
@@ -171,5 +172,24 @@ describe('新建带场景的规则插到最前（spec §3.4-4，不改排序协�
     const close = vi.fn();
     await submitRule(args({ networkProfileId: 'np-corp', planeOrder, stagingEnabled: false, close }).a);
     expect(close).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('submitRule typed regex values', () => {
+  it.each(['route', 'dns'] as const)('submits and re-edits comma-bearing expressions without splitting in %s', async (initialPlane) => {
+    const values = ['^[a,b]\\.example$', '^a{1,3}\\.example$', '^\\D+$'];
+    const create = args({ initialPlane, conds: [{ t: 'domainRegex', v: values.join('\n') }] });
+    await submitRule(create.a);
+    const saved = create.staged[0].nextValue as Rule;
+    expect(saved.values).toEqual(values);
+    const edit = args({ initialPlane, isEdit: true, base: saved, conds: [{ t: 'domainRegex', v: formatConditionValues(saved.type, saved.values) }] });
+    await submitRule(edit.a);
+    expect((edit.staged[0].nextValue as Rule).values).toEqual(values);
+  });
+  it('keeps ordinary domain comma and newline behavior', async () => {
+    const create = args({ conds: [{ t: 'domain', v: 'A.example, b.example\nc.example' }] });
+    await submitRule(create.a);
+    expect((create.staged[0].nextValue as Rule).values).toEqual(['A.example', 'b.example', 'c.example']);
   });
 });

@@ -1,3 +1,4 @@
+import { useTlsFingerprints } from '@/hooks/use-tls-fingerprints';
 /**
  * SettingsNetwork —— 网络子页（原型 [data-sec="network"] L2119-2169）。
  *
@@ -14,8 +15,11 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
+import { globalUtlsOptions, tlsFingerprintStatus } from '@/domain/utls';
 import { useTranslation } from 'react-i18next';
-import type { UserConfig } from '@/contracts/types';
+import type { SpeedTestMeteredPolicy, UserConfig } from '@/contracts/types';
+import { globalPeriodicSpeedTestEnabled, parseConcurrency } from '@/domain/periodic-speed-test';
+import { useSpeedTestSchedule } from '@/hooks/use-speed-test-schedule';
 import { injectedList } from '@/domain/effective-config';
 import { appApi, proxyApi } from '@/ipc/api-client';
 import { toast } from '@/lib/error-handler';
@@ -126,6 +130,7 @@ function generateSecret(): string {
 }
 
 export default function SettingsNetwork({ config, update }: SettingsNetworkProps) {
+  const tlsFingerprints = useTlsFingerprints();
   // i18n 实例：面板窗口的语言由 `open_singbox_dashboard(locale)` 预写，需当前语言码。
   const { t, i18n } = useTranslation();
   const openDialog = useDialogStore((state) => state.open);
@@ -233,6 +238,22 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
     setSpeedUrlDraft(v);
     if (next === (config.speedTestUrl ?? undefined)) return;
     void update({ speedTestUrl: next });
+  }
+  /* 周期测速的三个全局项。取值范围与缺省值由后端给出（并发上限随平台不同），不在前端另写一份：
+     拿到之前计费策略不高亮任何一档、并发不显示上限。并发与端口同款：草稿 + 失焦提交，非法标红且不落盘。 */
+  const speedLimits = useSpeedTestSchedule()?.limits;
+  const savedConcurrency =
+    typeof config.speedTestConcurrency === 'number' ? config.speedTestConcurrency : undefined;
+  const [concurrencyDraft, setConcurrencyDraft] = useState(String(savedConcurrency ?? ''));
+  const [concurrencyErr, setConcurrencyErr] = useState(false);
+  useEffect(() => {
+    setConcurrencyDraft(String(savedConcurrency ?? ''));
+  }, [savedConcurrency]);
+  function commitConcurrency() {
+    const next = parseConcurrency(concurrencyDraft, speedLimits);
+    setConcurrencyErr(next === null);
+    if (next === null || next === savedConcurrency) return;
+    void update({ speedTestConcurrency: next });
   }
   // WebRTC 防泄露仅 TUN 模式生效（原型 .webrtc-row.disabled，纯 CSS 靠 disabled 类门控）
   const webrtcDisabled = config.proxyModeType !== 'tun';
@@ -484,6 +505,17 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             ]}
           />
         </SetRow>
+        <SetRow label={t('settings.utls.label')} tip={t('settings.utls.description')} desc={tlsFingerprintStatus(tlsFingerprints, t)}>
+          <Select
+            value={config.utlsPolicy ?? 'follow'}
+            aria-label={t('settings.utls.label')}
+            onChange={(event) => void update({ utlsPolicy: event.currentTarget.value })}
+          >
+            {globalUtlsOptions(config.utlsPolicy, tlsFingerprints).map(([value, label]) => (
+              <option key={value} value={value}>{value === 'follow' || value === 'default' ? t(label) : label}</option>
+            ))}
+          </Select>
+        </SetRow>
         <SetRow
           label={t('settings.advanced.tlsFragment')}
           tip={t('settings.advanced.tlsFragmentDesc')}
@@ -566,6 +598,71 @@ export default function SettingsNetwork({ config, update }: SettingsNetworkProps
             aria-label={t('settings.network.speedTestUrl')}
           />
           {speedUrlErr && <div className="err-line">{t('settings.network.speedTestUrlInvalid')}</div>}
+        </SetRow>
+        <SetRow
+          label={t('settings.network.periodicSpeedTest')}
+          tip={t('settings.network.periodicSpeedTestDesc')}
+        >
+          <Switch
+            checked={globalPeriodicSpeedTestEnabled(config.periodicSpeedTestEnabled, speedLimits)}
+            onChange={(v) => void update({ periodicSpeedTestEnabled: v })}
+            aria-label={t('settings.network.periodicSpeedTest')}
+          />
+        </SetRow>
+        <SetRow
+          label={t('settings.network.meteredPolicy')}
+          tip={t('settings.network.meteredPolicyDesc')}
+        >
+          <Segmented<SpeedTestMeteredPolicy>
+            id="speed-test-metered-seg"
+            ariaLabel={t('settings.network.meteredPolicy')}
+            value={(config.speedTestMeteredPolicy ?? speedLimits?.meteredPolicyDefault ?? '') as SpeedTestMeteredPolicy}
+            onChange={(v) => void update({ speedTestMeteredPolicy: v })}
+            options={[
+              { value: 'reduced', label: t('settings.network.meteredReduced') },
+              { value: 'pause', label: t('settings.network.meteredPause') },
+              { value: 'normal', label: t('settings.network.meteredNormal') },
+            ]}
+          />
+        </SetRow>
+        <SetRow
+          label={t('settings.network.speedTestConcurrency')}
+          tip={t('settings.network.speedTestConcurrencyDesc')}
+          desc={
+            speedLimits
+              ? t('settings.network.speedTestConcurrencyMax', { max: speedLimits.concurrencyMax })
+              : undefined
+          }
+          align="start"
+          ctrlStyle={{ minWidth: 120, display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'stretch' }}
+        >
+          <TextInput
+            id="speed-test-concurrency-input"
+            inputMode="numeric"
+            value={concurrencyDraft}
+            placeholder={t('settings.network.speedTestConcurrencyAuto')}
+            onChange={(e) => {
+              setConcurrencyDraft(e.currentTarget.value);
+              if (concurrencyErr) setConcurrencyErr(false);
+            }}
+            onBlur={commitConcurrency}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') e.currentTarget.blur();
+            }}
+            aria-invalid={concurrencyErr || undefined}
+            style={concurrencyErr ? { borderColor: 'hsl(var(--err))' } : undefined}
+            aria-label={t('settings.network.speedTestConcurrency')}
+          />
+          {concurrencyErr && (
+            <div className="err-line">
+              {speedLimits
+                ? t('settings.network.speedTestConcurrencyInvalid', {
+                    min: speedLimits.concurrencyMin,
+                    max: speedLimits.concurrencyMax,
+                  })
+                : t('sub.speedTestIntervalInvalid')}
+            </div>
+          )}
         </SetRow>
       </SetBlock>
 

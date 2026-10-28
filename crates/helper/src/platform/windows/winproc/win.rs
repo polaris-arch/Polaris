@@ -13,11 +13,9 @@ use crate::platform::windows::logic::{
 };
 use crate::platform::windows::ops::NativeChildPoll;
 use crate::platform::windows::ops::{CoreStart, ManagedIdentity, NetTableOps, ProcOps};
-use crate::platform::windows::selfuninstall::self_uninstall_cmd_line;
 use polaris_helper_proto::{HelperBirthTarget, HelperBirthToken};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
@@ -32,7 +30,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::GetExtendedTcpTable;
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, GetNamedSecurityInfoW, GetSecurityInfo, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
@@ -66,10 +64,9 @@ use windows_sys::Win32::System::Registry::{
     REG_DWORD, REG_OPTION_NON_VOLATILE,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
-    TerminateProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-    DETACHED_PROCESS, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
-    PROCESS_TERMINATE, STARTUPINFOW,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
 };
 
 /// IPv4 TCP owner PID 行（`winproc.go:259-266` `MIB_TCPROW_OWNER_PID`）。
@@ -100,14 +97,6 @@ struct MibTcp6RowOwnerPid {
 
 /// STILL_ACTIVE（`winproc.go:141`，GetExitCodeProcess 的活跃码 = 259）。
 const STILL_ACTIVE_CODE: u32 = 259;
-
-/// 钉住 [`crate::platform::windows::logic::CREATE_NO_WINDOW`] 里硬编码的位值 == `windows-sys` 常量。
-///
-/// 同 `service::win` 对 `logic::pipe_open_mode` 的断言：纯逻辑层要在 Linux 上可单测，就不能引
-/// `windows-sys`；镜像值与真值的一致性交给这条 windows-only 编译期断言，两边一动即编不过。
-const _: () = {
-    assert!(crate::platform::windows::logic::CREATE_NO_WINDOW == CREATE_NO_WINDOW);
-};
 
 /// 受管核的进程句柄与随之读到的身份（D2/D3）。
 ///
@@ -317,6 +306,20 @@ impl WinProcOps {
                 "previous managed HANDLE custody still retained",
             ));
         }
+        // SCM inherits machine-owned environment. Pass only the system roots
+        // and trusted executable directories; never inherit DLL/path overrides.
+        let system_root = std::env::var_os("SystemRoot")
+            .ok_or_else(|| std::io::Error::other("native SystemRoot unavailable"))?;
+        let system_root = std::path::PathBuf::from(system_root);
+        if !system_root.is_absolute() {
+            return Err(std::io::Error::other("invalid native SystemRoot"));
+        }
+        let core_directory = std::path::Path::new(singbox_bin)
+            .parent()
+            .ok_or_else(|| std::io::Error::other("missing core directory"))?;
+        let path =
+            std::env::join_paths([core_directory.to_path_buf(), system_root.join("System32")])
+                .map_err(std::io::Error::other)?;
         // winproc.go:21-49 startSingbox + winproc.go:414-427 enableIPForwarding。
         let total_started = Instant::now();
         let forwarding_started = Instant::now();
@@ -327,6 +330,9 @@ impl WinProcOps {
         // B3/W26：改用 std Command 的 pipe，不再把 child 直接绑到一个永不重开的 append handle。
         // shared writer 在已预开的 current/.1 对象之间 copy/truncate，形成跨平台硬上限。
         let mut cmd = std::process::Command::new(singbox_bin);
+        cmd.env_clear()
+            .env("SystemRoot", &system_root)
+            .env("PATH", path);
         cmd.args(["run", "-c", cfg])
             .stdin(std::process::Stdio::null());
         if !log_path.is_empty() {
@@ -797,113 +803,18 @@ impl ProcOps for WinProcOps {
         });
     }
 
-    fn spawn_self_uninstall(&self, service_name: &str, support_dir: &str) {
-        // winproc.go:233-245 spawnSelfUninstall：CreateProcessW(cmd.exe, CmdLine 原样下发,
-        // DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP)。旁路须比 helper 活得久（不 assignToJob、继承 SYSTEM token）。
-        let cmd_line = self_uninstall_cmd_line(service_name, support_dir);
-        let cmd_exe = std::env::var_os("ComSpec").unwrap_or_else(|| {
-            let root =
-                std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from("C:\\Windows"));
-            // clippy useless_conversion：root 已是 OsString，无需再 OsString::from。
-            let mut p = root;
-            p.push("\\System32\\cmd.exe");
-            p
-        });
-        let app_w = wide_null(&cmd_exe);
-        let mut cmd_w = wide_null(OsString::from(cmd_line));
-        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
-        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: CreateProcessW(cmd.exe, CmdLine 原样)。DETACHED_PROCESS → 无 console、不随 helper 退出被收。
-        // CREATE_NEW_PROCESS_GROUP → 旁路独立进程组。不 assignToJob → 不受 KILL_ON_JOB_CLOSE 连坐。
-        // 继承 helper 的 SYSTEM token（子进程默认继承父 token）→ 有权 sc delete / 删 ProgramData。
-        // lpApplicationName 用绝对 cmd.exe 路径（不依赖 SYSTEM 服务的 %PATH%）。
-        let ok = unsafe {
-            CreateProcessW(
-                app_w.as_ptr(),
-                cmd_w.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                FALSE,
-                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                std::ptr::null(),
-                std::ptr::null(),
-                &si,
-                &mut pi,
-            )
-        };
-        if ok != 0 {
-            // SAFETY: 关句柄（不 Wait —— 旁路须比 helper 活得久，Go: 不 Wait，winproc.go:244）。
-            unsafe {
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-            }
-        }
-        // best-effort：失败只记 log（Go: _ = c.Start()）。
-        log::warn!("spawn_self_uninstall completed (ok={ok})");
+    fn spawn_self_uninstall(&self) -> Result<(), String> {
+        Err("native-cleaner-uac-required; use bundled cleaner UAC fallback".to_owned())
     }
 
-    fn flush_dns(&self) -> Result<(), String> {
-        // D4：SYSTEM 下跑 ipconfig /flushdns。命令构造与结果判据都在 `logic`（Linux 可测），
-        // 本腿只负责执行 + 自捕两条流。**不能用共用的 `system-integration::exec`**：它只把 stderr
-        // 带进错误串，而 ipconfig 的失败文字在 stdout —— 那份全局格式被按串解析的消费方依赖，
-        // 改它射程远大于收益，故此处局部自捕。
-        let cmd = crate::platform::windows::logic::flush_dns_command(
-            std::env::var("SystemRoot").ok().as_deref(),
-        );
-        let mut child = std::process::Command::new(&cmd.program)
-            .args(&cmd.args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .creation_flags(cmd.creation_flags)
-            .spawn()
-            .map_err(|e| format!("{} 启动失败: {e}", cmd.program))?;
-        // 两条流各起一个读线程，**先于任何等待**（本仓纪律：先排空再等 —— 反过来就是子进程写满
-        // 管道等父进程读、父进程等子进程退出那个死锁）。此前这里是 `.output()`：排空是对的，
-        // 但它**没有上界** —— ipconfig 卡在 DNS Client 服务上时，这条连接线程与它占的那个管道实例
-        // 被一起扣到 ipconfig 自己返回为止（取值理由见 `logic::FLUSH_DNS_TIMEOUT_MS`）。
-        let mut out_pipe = child.stdout.take();
-        let mut err_pipe = child.stderr.take();
-        let out_reader = std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(pipe) = out_pipe.as_mut() {
-                let _ = pipe.read_to_string(&mut text);
-            }
-            text
-        });
-        let err_reader = std::thread::spawn(move || {
-            let mut text = String::new();
-            if let Some(pipe) = err_pipe.as_mut() {
-                let _ = pipe.read_to_string(&mut text);
-            }
-            text
-        });
-        // 有界等待**进程句柄**；到点硬杀 —— 杀掉之后两条管道立刻 EOF，两个读线程随即收工，
-        // 故超时腿既不泄漏线程也不留孤儿。
-        // SAFETY: 句柄由 `child` 持有，本调用期间必然有效；WaitForSingleObject 只读它、不关它。
-        let timed_out = unsafe {
-            WaitForSingleObject(
-                child.as_raw_handle().cast(),
-                crate::platform::windows::logic::FLUSH_DNS_TIMEOUT_MS,
-            )
-        } != WAIT_OBJECT_0;
-        if timed_out {
-            let _ = child.kill();
-        }
-        let status = child.wait();
-        let stdout = out_reader.join().unwrap_or_default();
-        let stderr = err_reader.join().unwrap_or_default();
-        if timed_out {
-            return Err(crate::platform::windows::logic::flush_dns_timeout_error(
-                crate::platform::windows::logic::FLUSH_DNS_TIMEOUT_MS,
-            ));
-        }
-        crate::platform::windows::logic::flush_dns_result(
-            status.ok().and_then(|s| s.code()),
-            &stdout,
-            &stderr,
-        )
+    fn flush_dns(
+        &self,
+        admission: &crate::platform::windows::ops::DnsFlushAdmission,
+    ) -> Result<(), String> {
+        let pending = admission.launch(polaris_system_integration::windows_dns::begin_flush)?;
+        pending.wait(std::time::Duration::from_millis(u64::from(
+            crate::platform::windows::logic::FLUSH_DNS_TIMEOUT_MS,
+        )))
     }
 
     fn enable_ip_forwarding(&self) {
@@ -1671,7 +1582,131 @@ fn sid_to_string(psid: PSID) -> Option<String> {
     Some(s)
 }
 
+/// Source ownership is read from the exact held file HANDLE, not a second path lookup.
+#[allow(
+    unsafe_code,
+    reason = "read-only security descriptor of one held file object"
+)]
+pub fn file_security(file: &File) -> std::io::Result<ObjectSecurity> {
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: File owns the queried HANDLE; output pointers live until LocalFree.
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle().cast(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result as i32));
+    }
+    if descriptor.is_null() {
+        return Err(std::io::Error::other("held object security unavailable"));
+    }
+    let value = parse_object_security("held-object", owner, dacl);
+    // SAFETY: successful GetSecurityInfo returned one LocalAlloc allocation.
+    unsafe { LocalFree(descriptor) };
+    Ok(value)
+}
+
+pub fn file_owner(file: &File) -> std::io::Result<String> {
+    file_security(file)?
+        .owner_sid
+        .ok_or_else(|| std::io::Error::other("source file owner unavailable"))
+}
+
 /// 宽字符串辅助：OsStr → null 终止 UTF-16（供 windows-sys API）。
+/// Seal an administrator-created object before it enters the store namespace.
+/// Parent must already be protected; never use this to repair arbitrary user paths.
+#[allow(
+    unsafe_code,
+    reason = "native ACL for new administrator-owned store objects"
+)]
+pub fn seal_store_object(path: &Path, readable: bool) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other("cannot seal reparse object"));
+    }
+    let inheritance = if meta.is_dir() { "OICI" } else { "" };
+    let users = if readable {
+        format!("(A;{inheritance};FRFX;;;BU)")
+    } else {
+        String::new()
+    };
+    let sddl = wide_null(format!(
+        "O:BAD:P(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA){users}"
+    ));
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: terminated SDDL and a live descriptor output; revision 1.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut owner = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut defaulted = 0;
+        let mut present = 0;
+        // SAFETY: the successful conversion owns this descriptor until LocalFree;
+        // all output pointers refer to native-size live variables.
+        if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) } == 0
+            || unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            } == 0
+            || owner.is_null()
+            || dacl.is_null()
+            || present == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let name = wide_null(path);
+        // SAFETY: protected parent prevents unprivileged name replacement. Owner
+        // and DACL borrow the still-live converted descriptor; no SACL is changed.
+        let code = unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner,
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(code as i32))
+        }
+    })();
+    // SAFETY: descriptor was allocated by successful conversion, released once.
+    unsafe { LocalFree(descriptor) };
+    result
+}
+
 fn wide_null(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }

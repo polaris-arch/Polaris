@@ -151,6 +151,39 @@ fn pinned_log_path_rejects_directory_owned_by_another_uid() {
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
+/// The production spawner has no shared-filesystem precondition: its first
+/// refusal is the per-request log directory check, which fails here before any
+/// fork, so no child or slot is created.
+#[test]
+fn production_spawn_reaches_log_pinning_without_a_deployment_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let uid = nix::unistd::getuid().as_raw();
+    let wrong_uid = uid.checked_add(1).unwrap_or(uid.saturating_sub(1));
+    let state = Arc::new(Mutex::new(HandlerState::new()));
+    let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
+    let request = SpawnCoreRequest {
+        birth: None,
+        binary: dir.path().join("sing-box"),
+        config: dir.path().join("cfg.json"),
+        log: Some(dir.path().join("core.log")),
+        fwd: false,
+        parent_pid: None,
+        uid: wrong_uid,
+        gid: wrong_uid,
+        groups: Vec::new(),
+    };
+    let Err(SpawnError::Spawn { detail }) = spawner.spawn(&request) else {
+        panic!("a log directory owned by another uid must refuse the spawn");
+    };
+    assert!(detail.starts_with("secure log path: "), "got {detail}");
+    assert!(
+        detail.contains("not owned by the authenticated uid"),
+        "got {detail}"
+    );
+    assert!(spawner.slots.lock().unwrap().is_empty());
+    assert!(state.lock().unwrap().child.is_none());
+}
+
 #[test]
 fn ss_lookup_returns_none_when_ss_missing() {
     // ss 可能未装（best-effort，Go 同样容忍）。
@@ -275,10 +308,10 @@ fn reap_group_wait_returns_immediately_when_empty() {
 }
 
 #[test]
-fn forward_fn_points_to_set_forward_prod() {
-    // 验证闭包指针 = set_forward_prod（不 panic 即接线正确）。
-    let f = forward_fn();
-    f(false); // best-effort 写 /proc（非 root 静默失败）
+fn forward_fn_satisfies_injection_contract_without_host_writes() {
+    // Check the HandlerDeps callback contract without invoking the host writer.
+    let forward: fn(bool) = forward_fn();
+    let _: &(dyn Fn(bool) + Send + Sync) = &forward;
 }
 
 /// 静态断言：ServerError 实现了 std::error::Error + Display。
@@ -877,6 +910,7 @@ fn production_stop_poll_is_pending_until_native_reaper_clears_birth() {
     let slot = ChildSlot::from_child(child, handle.clone());
     let state = Arc::new(Mutex::new(HandlerState {
         child: Some(ManagedChild::Stopping(handle.clone())),
+        ..HandlerState::new()
     }));
     let spawner = AmbientCapsSpawner::new(Arc::clone(&state));
     spawner.slots.lock().unwrap().push(Arc::clone(&slot));
@@ -989,5 +1023,105 @@ async fn dispatch_permits_are_returned_when_the_connection_finishes() {
         }
         assert!(attempt < 99, "许可始终未归还：闸门被一次用满就永久关死");
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[test]
+fn reaped_birth_keeps_dns_responsibility_until_native_revert_succeeds() {
+    struct Dns(bool);
+    impl crate::platform::linux::resolved_dns::ResolvedDnsOps for Dns {
+        fn takeover(&self, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn revert(&self, name: &str) -> Result<(), String> {
+            assert_eq!(name, polaris_helper_proto::linux_dns::TUN_INTERFACE_NAME);
+            if self.0 {
+                Ok(())
+            } else {
+                Err("native revert failed".into())
+            }
+        }
+    }
+    for (success, upper_retired) in [(false, false), (true, false), (false, true), (true, true)] {
+        let slot = ChildSlot::new(712);
+        let state = Arc::new(Mutex::new(HandlerState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.child = Some(ManagedChild::Running(slot.handle.clone()));
+            state.dns_owner = Some(1000);
+            state.dns_birth = Some(slot.handle.clone());
+            if upper_retired {
+                state.retire_birth(&slot.handle);
+            }
+        }
+        slot.mark_exited();
+        let LocalReapFact::Reaped(proof) = slot.reap_fact() else {
+            panic!("expected native wait");
+        };
+        clear_reaped_birth_with_dns(
+            &proof,
+            &state,
+            &Arc::new(Mutex::new(vec![slot])),
+            &Arc::new(Mutex::new(VecDeque::new())),
+            &Dns(success),
+        );
+        let state = state.lock().unwrap();
+        assert!(state.child.is_none());
+        assert!(!state.dns_busy);
+        assert_eq!(state.dns_owner, if success { None } else { Some(1000) });
+        assert_eq!(state.dns_birth.is_some(), !success);
+        assert_eq!(state.dns_cleanup_pending, !success);
+    }
+}
+
+#[test]
+fn reaper_hands_busy_dns_to_completion_and_never_reverts_another_birth() {
+    struct Dns(std::sync::atomic::AtomicUsize);
+    impl crate::platform::linux::resolved_dns::ResolvedDnsOps for Dns {
+        fn takeover(&self, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn revert(&self, _: &str) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    for same_birth in [true, false] {
+        let old = ChildSlot::new(712);
+        let next = ChildSlot::new(712); // numeric PID reuse is not physical identity
+        let state = Arc::new(Mutex::new(HandlerState::new()));
+        {
+            let mut state = state.lock().unwrap();
+            state.child = Some(ManagedChild::Running(next.handle.clone()));
+            state.dns_owner = Some(1000);
+            state.dns_birth = Some(if same_birth {
+                old.handle.clone()
+            } else {
+                next.handle.clone()
+            });
+            state.dns_busy = same_birth;
+        }
+        old.mark_exited();
+        let LocalReapFact::Reaped(proof) = old.reap_fact() else {
+            panic!("missing native proof")
+        };
+        let dns = Dns(std::sync::atomic::AtomicUsize::new(0));
+        clear_reaped_birth_with_dns(
+            &proof,
+            &state,
+            &Arc::new(Mutex::new(vec![old, Arc::clone(&next)])),
+            &Arc::new(Mutex::new(VecDeque::new())),
+            &dns,
+        );
+        let state = state.lock().unwrap();
+        assert!(state
+            .child
+            .as_ref()
+            .unwrap()
+            .handle()
+            .same_birth(&next.handle));
+        assert_eq!(state.dns_owner, Some(1000));
+        assert_eq!(state.dns_cleanup_pending, same_birth);
+        assert_eq!(dns.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

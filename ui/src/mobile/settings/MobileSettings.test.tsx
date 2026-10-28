@@ -51,7 +51,8 @@ import {
 } from '@/components/screens/settings/settings-dns-logic';
 import zhCN from '@/i18n/locales/zh-CN.json';
 
-import { maskRustComments } from '@/contracts/rust-source.test-support';
+import { crateRootSource, maskRustComments } from '@/contracts/rust-source.test-support';
+import { IPC_CHANNELS } from '@/domain/ipc-channels';
 import { AboutPage, narrowVersionInfo } from './AboutPage';
 import { BackupPage } from './BackupPage';
 import { DisplayPage } from './DisplayPage';
@@ -311,6 +312,14 @@ const DNS_V2_TOP: Record<string, unknown> = {
   ],
 };
 
+const DNS_V2_FAKEIP_TOP: Record<string, unknown> = {
+  ...DNS_V2_TOP,
+  dnsDefaults: {
+    ...(DNS_V2_TOP.dnsDefaults as object),
+    unmatchedAction: { type: 'fakeIp' },
+  },
+};
+
 /** 逐页 markup（模块级求值一次；任何一页渲染抛错都会在这里当场炸，不会退化成空跑）。 */
 const MARKUP: Record<MobileSettingsPageId, string> = {} as Record<MobileSettingsPageId, string>;
 let ROOT_MARKUP = '';
@@ -349,6 +358,13 @@ function rows(markup: string): { id: string; chunk: string }[] {
   }));
 }
 
+/** Shared row lookup for all rendered-settings suites; absence must fail the assertion. */
+function rowOf(markup: string, id: string): string {
+  const row = rows(markup).find((r) => r.id === id);
+  expect(row, `markup 里没有行 \`${id}\` —— 判据面塌了`).toBeDefined();
+  return row?.chunk ?? '';
+}
+
 /** 带 `role="switch"` 的行 id（顺序即 DOM 顺序）。 */
 function switchRows(markup: string): string[] {
   return rows(markup)
@@ -375,9 +391,11 @@ const EXPECTED_SWITCHES: Record<MobileSettingsPageId, readonly string[]> = {
     'interrupt-on-switch',
     'restart-on-node-change',
     'main-session-via-proxy',
+    // 周期测速的全局总开关（2026-10-08）：五个平台同一项，执行侧是后端的周期测速调度器。
+    'periodic-speed-test',
   ],
   // race 档在夹具里是「单上游」⇒ 竞速池那三颗不渲染（⑫ 另有一份 race 开着的夹具逐值对拍）。
-  dns: ['fake-ip', 'takeover-system-dns', 'optimistic-cache', 'fakeip-filter', 'block-browser-doh'],
+  dns: ['fake-ip', 'optimistic-cache', 'fakeip-filter', 'block-browser-doh'],
   // `tun-bypass-lan` 2026-09-25（A6）落地：「绕过局域网」在 Android 上有了消费方（`inbounds.rs` 的
   // android 臂在开关开着时发清单网段子集）。此前它登记为 platform-absent，依据只覆盖回环前缀。
   tun: ['tun-auto-route', 'tun-ipv6', 'tun-bypass-lan'],
@@ -1499,7 +1517,7 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
    * 桌面把这些解释挂在 `InfoIcon` 的 `tip` 上，触屏没有 hover。机制详情已改为可点 i，关键说明仍常驻。逐条登记它落在**哪一页**，
    * 断言那句话真的出现在那一页的 DOM 里。**这是一份计数，不是印象**（§4.12 的验收口径）。
    */
-  const RESIDENT: readonly [MobileSettingsPageId, string][] = [
+  const EXPLANATION_BASELINE: readonly [MobileSettingsPageId, string][] = [
     ['general', 'settings.general.autoConnectDesc'],
     ['general', 'settings.general.autoCheckUpdateDesc'],
     ['general', 'mobileHelp.disableLogs'],
@@ -1532,8 +1550,67 @@ describe('⑧ 只靠悬浮提示承载的解释都换成了常驻通道（§4.12
     ['update', 'mobileSettings.update.ruleResourceAutoDesc'],
   ];
 
-  it('自检：登记表有量级（表被清空会让下面那条恒绿）', () => {
-    expect(RESIDENT.length).toBeGreaterThanOrEqual(30);
+  type ExplanationResponsibility = {
+    page: MobileSettingsPageId;
+    key: string;
+    disposition: 'resident' | 'desktop-only';
+    reason?: string;
+  };
+  // This is the single authorized exclusion, not an extensible escape hatch.
+  const TAKEOVER_KEY = 'settings.dns.takeoverSystemDnsDesc';
+  const TAKEOVER_REASON = 'POL-U24: mobile VPN service owns DNS; desktop OS DNS takeover is not a mobile control';
+  const RESPONSIBILITIES: readonly ExplanationResponsibility[] = EXPLANATION_BASELINE.map<ExplanationResponsibility>(([page, key]) =>
+    page === 'dns' && key === TAKEOVER_KEY
+      ? { page, key, disposition: 'desktop-only', reason: TAKEOVER_REASON }
+      : { page, key, disposition: 'resident' },
+  );
+  const identity = ({ page, key }: Pick<ExplanationResponsibility, 'page' | 'key'>): string => `${page}:${key}`;
+
+  function responsibilityErrors(entries: readonly ExplanationResponsibility[]): string[] {
+    const errors: string[] = [];
+    const expected = EXPLANATION_BASELINE.map(([page, key]) => identity({ page, key })).sort();
+    const actual = entries.map(identity).sort();
+    if (EXPLANATION_BASELINE.length !== 30 || new Set(expected).size !== 30) errors.push('baseline must contain 30 unique responsibilities');
+    if (entries.length !== 30 || new Set(actual).size !== 30) errors.push('responsibilities must be complete and unique');
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) errors.push('responsibility identities differ from the frozen baseline');
+    const residents = entries.filter((entry) => entry.disposition === 'resident');
+    const excluded = entries.filter((entry) => entry.disposition === 'desktop-only');
+    if (residents.length !== 29 || excluded.length !== 1 || residents.length + excluded.length !== entries.length) {
+      errors.push('required partition is 29 resident plus one desktop-only');
+    }
+    if (residents.some((entry) => entry.reason !== undefined)) errors.push('resident entries must not carry exclusion reasons');
+    const allowed = excluded[0];
+    if (!allowed || allowed.page !== 'dns' || allowed.key !== TAKEOVER_KEY || allowed.reason !== TAKEOVER_REASON) {
+      errors.push('only the exact POL-U24 takeover exclusion is authorized');
+    }
+    return errors;
+  }
+
+  const RESIDENT: readonly [MobileSettingsPageId, string][] = RESPONSIBILITIES
+    .filter((entry) => entry.disposition === 'resident')
+    .map<[MobileSettingsPageId, string]>(({ page, key }) => [page, key]);
+
+  it('30项说明责任完整且唯一：29项常驻 + 唯一POL-U24桌面排除', () => {
+    expect(responsibilityErrors(RESPONSIBILITIES)).toEqual([]);
+  });
+
+  it('责任清册负控：删项、重复凑数、扩大或挪用排除、丢理由都不能通过', () => {
+    expect(responsibilityErrors([])).not.toEqual([]);
+    for (const resident of RESPONSIBILITIES.filter((entry) => entry.disposition === 'resident')) {
+      expect(responsibilityErrors(RESPONSIBILITIES.filter((entry) => entry !== resident)), identity(resident)).not.toEqual([]);
+      const other = RESPONSIBILITIES.find((entry) => entry.disposition === 'resident' && entry !== resident)!;
+      expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry === resident ? other : entry)), 'duplicate cannot replace a missing responsibility').not.toEqual([]);
+      expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry === resident
+        ? { ...entry, disposition: 'desktop-only', reason: TAKEOVER_REASON } : entry)), 'cannot enlarge the exclusion').not.toEqual([]);
+      expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry === resident
+        ? { ...entry, disposition: 'desktop-only', reason: TAKEOVER_REASON }
+        : entry.disposition === 'desktop-only' ? { ...entry, disposition: 'resident', reason: undefined } : entry)), 'cannot swap the exclusion while keeping 29+1').not.toEqual([]);
+    }
+    expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry.disposition === 'desktop-only'
+      ? { ...entry, reason: undefined } : entry))).not.toEqual([]);
+    expect(responsibilityErrors(RESPONSIBILITIES.map<ExplanationResponsibility>((entry) => entry.disposition === 'desktop-only'
+      ? { ...entry, reason: 'unsupported' } : entry))).not.toEqual([]);
+    expect(responsibilityErrors(RESPONSIBILITIES.filter((entry) => entry.disposition !== 'desktop-only'))).not.toEqual([]);
   });
 
   it('逐条都落在了对应页面的 DOM 上', () => {
@@ -1713,9 +1790,13 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       'direct-interface',
       'proxy-interface',
       'speed-test-url',
+      'periodic-speed-test',
+      'speed-test-metered-policy',
+      'speed-test-concurrency',
       'block-quic',
       'webrtc-leak',
       'tls-fragment',
+      'utls-policy',
       'auto-switch-node',
       'mesh-login-fallback',
       'interrupt-on-switch',
@@ -1728,7 +1809,6 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       'remote-dns',
       'domestic-dns',
       'dns-timeout',
-      'takeover-system-dns',
       'optimistic-cache',
       'race-strategy',
       'node-resolver-single',
@@ -1748,6 +1828,7 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
       // ⚠️ 两行都只在 v2 夹具下渲染（`DNS_V2_TOP`），`dns-default-fallback` 还要 `hostsFirst` 那一档。
       'dns-default-action',
       'dns-default-fallback',
+      'dns-real-query-fallback',
     ],
     // `tun-inbound-exclude` = 连入来源排除的网段清单（2026-09-06 接线）。它与本页其余行一样
     // 走 `commit(rowId, update(...))`，故失败回显与它们同一条通道。
@@ -1843,27 +1924,148 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
     }
   });
 
-  it('每一处 `update(` 都挂在 `commit(` 上（不许有裸写：写失败会静默）', () => {
-    for (const page of WRITING_PAGES) {
-      const src = stripComments(readFileSync(join(HERE, `${pageFile(page)}`), 'utf8'));
-      const calls = [...src.matchAll(/\bupdate\(/g)];
-      expect(calls.length, `${page} 页一个写调用都没解析到 —— 判据面塌了`).toBeGreaterThan(0);
-      for (const m of calls) {
-        const before = src.slice(Math.max(0, (m.index ?? 0) - 140), m.index);
-        // 两种合法形态：① 直接是 `commit(…, update(…))` 的实参；
-        // ② `(v) => update({ … })` 这个**闭包**，它被交给同文件里的 `toggleRow`，由那一处统一 commit。
-        const wrapped = /commit\(\s*(?:'[a-z0-9-]+'|[A-Za-z]\w*)\s*,\s*$/.test(before);
-        const thunk = /\(v\)\s*=>\s*$/.test(before) && src.includes('commit(id, patch(v))');
-        // ③ 「先写执行侧、成功后落配置」的链：`commit('<id>', xxxApi.set(v).then(() => update(…)))` ——
-        // 整条链是 commit 的实参，任一步 reject 都落到同一行红字（`auto-start` 那一行，⑤b）。
-        const chained =
-          /commit\(\s*'[a-z0-9-]+'\s*,\s*[A-Za-z]\w*(?:\.\w+)*\([^()]*\)\.then\(\(\)\s*=>\s*$/.test(before);
-        expect(
-          wrapped || thunk || chained,
-          `${page} 页有一处 \`update(\` 没有接失败回显（片段：…${before.slice(-50)}update( ）`,
-        ).toBe(true);
+  /** Follow actual promise-expression edges, never a nearby occurrence of commit. */
+  function unguardedUpdates(file: string, source: string): string[] {
+    const sf = ts.parseSourceFile(file, source);
+    const calls: ts.CallExpression[] = [];
+    const functions: ts.FunctionDeclaration[] = [];
+    const wrappers = new Set<string>();
+    const walk = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) calls.push(node);
+      if (ts.isFunctionDeclaration(node)) functions.push(node);
+      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) &&
+          node.moduleSpecifier.text === './committed-appearance') {
+        const bindings = node.importClause?.namedBindings;
+        if (bindings && ts.isNamedImports(bindings)) {
+          for (const binding of bindings.elements) {
+            const imported = (binding.propertyName ?? binding.name).text;
+            if (imported === 'commitThemeChoice' || imported === 'commitLanguageChoice') wrappers.add(binding.name.text);
+          }
+        }
+      }
+      ts.forEachChild(node, walk);
+    };
+    walk(sf);
+    const named = (node: ts.Node | undefined, name: string): boolean =>
+      node !== undefined && ts.isIdentifier(node) && node.text === name;
+    const covered = new Set<ts.CallExpression>();
+    const follow = (node: ts.Node | undefined): void => {
+      if (!node) return;
+      if (ts.isParenthesizedExpression(node)) { follow(node.expression); return; }
+      if (!ts.isCallExpression(node)) return;
+      if (named(node.expression, 'update')) { covered.add(node); return; }
+      // Only the imported rejection-preserving ordering helpers qualify.
+      if (ts.isIdentifier(node.expression) && wrappers.has(node.expression.text) && node.arguments.length === 2) {
+        follow(node.arguments[0]);
+        return;
+      }
+      // finally preserves the receiver's rejection; it cannot recover it.
+      if (ts.isPropertyAccessExpression(node.expression) && named(node.expression.name, 'finally') &&
+          node.arguments.length === 1) {
+        follow(node.expression.expression);
+        return;
+      }
+      // A success-only .then returns its expression-bodied callback's promise.
+      // A rejection callback / .catch is deliberately not accepted.
+      if (ts.isPropertyAccessExpression(node.expression) && named(node.expression.name, 'then') &&
+          node.arguments.length === 1) {
+        follow(node.expression.expression);
+        const callback = node.arguments[0];
+        if (ts.isArrowFunction(callback) && !ts.isBlock(callback.body)) follow(callback.body);
+      }
+    };
+    for (const call of calls) {
+      if (named(call.expression, 'commit') && call.arguments.length >= 2) follow(call.arguments[1]);
+    }
+    // toggleRow's fifth argument is a deferred write. Verify the relay's exact
+    // parameter-to-commit edge before accepting expression-bodied callbacks.
+    const toggle = functions.find((fn) => named(fn.name, 'toggleRow'));
+    let toggleRelays = false;
+    if (toggle?.body && named(toggle.parameters[0]?.name, 'id') && named(toggle.parameters[4]?.name, 'patch')) {
+      const checkRelay = (node: ts.Node): void => {
+        if (ts.isCallExpression(node) && named(node.expression, 'commit') && named(node.arguments[0], 'id')) {
+          const write = node.arguments[1];
+          if (write && ts.isCallExpression(write) && named(write.expression, 'patch') &&
+              write.arguments.length === 1 && named(write.arguments[0], 'v')) toggleRelays = true;
+        }
+        ts.forEachChild(node, checkRelay);
+      };
+      checkRelay(toggle.body);
+    }
+    if (toggleRelays) {
+      for (const call of calls) {
+        if (!named(call.expression, 'toggleRow')) continue;
+        const callback = call.arguments[4];
+        if (callback && ts.isArrowFunction(callback) && !ts.isBlock(callback.body)) follow(callback.body);
       }
     }
+    const updates = calls.filter((call) => named(call.expression, 'update'));
+    expect(updates.length, `${file}: no update call parsed`).toBeGreaterThan(0);
+    return updates.filter((call) => !covered.has(call)).map((call) => source.slice(call.pos, call.end));
+  }
+
+  it('每一处 `update(` 都挂在 `commit(` 上（不许有裸写：写失败会静默）', () => {
+    for (const page of WRITING_PAGES) {
+      const file = join(HERE, pageFile(page));
+      expect(unguardedUpdates(file, readFileSync(file, 'utf8')), `${page} has unguarded writes`).toEqual([]);
+    }
+  });
+
+  it('write-chain AST controls reject detached writes, swallowed failures and lookalike helpers', () => {
+    const header = "import { commitThemeChoice, commitLanguageChoice } from './committed-appearance';\n";
+    const valid = [
+      "commit('theme', update({}));",
+      "commit('theme', commitThemeChoice(update({}), () => apply()));",
+      "commit('language', commitLanguageChoice(update({}), () => apply()));",
+      "commit('auto-start', api.set(true).then(() => update({})));",
+      "commit('auto-start', api.set(true).then(() => update({})).finally(() => refresh()));",
+    ];
+    valid.forEach((body, index) => expect(unguardedUpdates(`valid-write-${index}.tsx`, header + body)).toEqual([]));
+    const toggleRelay = "function toggleRow(id, label, desc, checked, patch) { return <Switch onChange={(v) => commit(id, patch(v))} />; } ";
+    const toggleWrite = "toggleRow('theme', '', '', true, (v) => update({ value: v }));";
+    expect(unguardedUpdates('valid-toggle-write.tsx', toggleRelay + toggleWrite)).toEqual([]);
+    expect(unguardedUpdates('swallowed-toggle-write.tsx', toggleRelay.replace('patch(v)', 'patch(v).catch(() => undefined)') + toggleWrite)).toHaveLength(1);
+    const invalid = [
+      "commit('theme', Promise.resolve()); update({});",
+      "commit('theme', commitThemeChoice(update({}).catch(() => undefined), () => apply()));",
+      "commit('theme', commitThemeChoice(update({}), () => apply()).catch(() => undefined));",
+      "commit('theme', unknownWrapper(update({})));",
+      "commit('theme', api.set(true).then(() => update({}), () => undefined));",
+      "const callback = () => update({}); commit('theme', unrelated());",
+      "toggleRow('theme', '', '', true, (v) => update({ value: v }));",
+    ];
+    invalid.forEach((body, index) => expect(unguardedUpdates(`invalid-write-${index}.tsx`, header + body)).toHaveLength(1));
+    expect(unguardedUpdates('lookalike-write.tsx', "function commitThemeChoice(p) { return p.catch(() => undefined); } commit('theme', commitThemeChoice(update({}), () => {}));")).toHaveLength(1);
+  });
+
+  it('appearance ordering helpers preserve write rejection for commit feedback', async () => {
+    const { createCommittedChoice } = await import('./committed-appearance');
+    const choose = createCommittedChoice();
+    const failure = new Error('write refused');
+    let applied = false;
+    await expect(choose(Promise.reject(failure), () => { applied = true; })).rejects.toBe(failure);
+    expect(applied).toBe(false);
+    await choose(Promise.resolve(), () => { applied = true; });
+    expect(applied).toBe(true);
+  });
+
+  function desktopTakeoverLeaks(markup: string, writeIds: readonly string[]): string[] {
+    const leaks: string[] = [];
+    if (markup.includes('data-setting="takeover-system-dns"')) leaks.push('control');
+    if (markup.includes(copy('settings.dns.takeoverSystemDnsDesc'))) leaks.push('explanation');
+    if (writeIds.includes('takeover-system-dns')) leaks.push('write-site');
+    return leaks;
+  }
+
+  it('mobile excludes desktop DNS takeover from controls, explanation and write sites', () => {
+    expect(desktopTakeoverLeaks(MARKUP.dns, siteIdsOf('dns'))).toEqual([]);
+  });
+
+  it('POL-U24 negative controls reject a returning desktop control, explanation or writer', () => {
+    expect(desktopTakeoverLeaks('<div data-setting="takeover-system-dns"></div>', [])).toEqual(['control']);
+    expect(desktopTakeoverLeaks(copy('settings.dns.takeoverSystemDnsDesc'), [])).toEqual(['explanation']);
+    expect(desktopTakeoverLeaks('', ['takeover-system-dns'])).toEqual(['write-site']);
+    expect(desktopTakeoverLeaks('<div data-setting="optimistic-cache"></div>', ['optimistic-cache'])).toEqual([]);
   });
 
   /*
@@ -1918,6 +2120,7 @@ describe('⑩ 写失败必须可见：每一个写操作都有行内回显（裁
           ? dnsMarkup({ resolveNodeDomainsAhead: true }, {}, injected)
             + dnsMarkup({}, { blockBrowserDoh: true }, injected)
             + dnsMarkup({}, DNS_V2_TOP, injected)
+            + dnsMarkup({}, DNS_V2_FAKEIP_TOP, injected)
           : '');
       // 去重：DNS 那两档共有的行会各出现一次，判的是**集合**恰等，不是出现次数。
       const shown = [
@@ -2061,12 +2264,6 @@ describe('⑪ 设置页不再读 `proxyModeType`：TUN 专属的行在错的值�
  * 免得「什么都没渲染出来」把断言骗过去。
  */
 describe('⑫ DNS：三块能力补齐，清单缺席带常驻理由（§3.3 规则 2）', () => {
-  const rowOf = (markup: string, id: string): string => {
-    const row = rows(markup).find((r) => r.id === id);
-    expect(row, `markup 里没有行 \`${id}\` —— 判据面塌了`).toBeDefined();
-    return row?.chunk ?? '';
-  };
-
   it('自检：另一份夹具真的渲染得出来，且 race 档确实被翻到了「竞速」', () => {
     const race = dnsMarkup({ resolveNodeDomainsAhead: true });
     expect(race.length).toBeGreaterThan(400);
@@ -2093,7 +2290,6 @@ describe('⑫ DNS：三块能力补齐，清单缺席带常驻理由（§3.3 规
     const race = dnsMarkup({ resolveNodeDomainsAhead: true });
     expect(switchRows(race)).toEqual([
       'fake-ip',
-      'takeover-system-dns',
       'optimistic-cache',
       'race-pool-ali',
       'race-pool-dnspod',
@@ -2570,13 +2766,7 @@ describe('⑫quater v2 默认 DNS 策略：两格真的改得动（批 17 接线
   let v2NoHosts = '';
   beforeAll(() => {
     v2 = dnsMarkup({}, DNS_V2_TOP);
-    v2NoHosts = dnsMarkup({}, {
-      ...DNS_V2_TOP,
-      dnsDefaults: {
-        ...(DNS_V2_TOP.dnsDefaults as object),
-        unmatchedAction: { type: 'fakeIp' },
-      },
-    });
+    v2NoHosts = dnsMarkup({}, DNS_V2_FAKEIP_TOP);
   });
 
   it('自检：v2 夹具真的翻到了那一档（翻不到 ⇒ 下面每条都是对空气说话）', () => {
@@ -2606,6 +2796,30 @@ describe('⑫quater v2 默认 DNS 策略：两格真的改得动（批 17 接线
     expect(v2NoHosts, '非 Hosts 档也画了兜底行').not.toContain('data-setting="dns-default-fallback"');
     // 正面对照：那一档主行还在（不是整块没渲染出来）。
     expect(v2NoHosts).toContain('data-setting="dns-default-action"');
+  });
+
+  it('FakeIP displays the compatible domestic real-query fallback and the saved server/reject choice', () => {
+    expect(v2).not.toContain('data-setting="dns-real-query-fallback"');
+    expect(MARKUP.dns).not.toContain('data-setting="dns-real-query-fallback"');
+    expect(rowOf(v2NoHosts, 'dns-real-query-fallback')).toContain(copy('settings.dns.builtinDomesticName'));
+    for (const [action, label] of [
+      [{ type: 'server', serverId: 'builtin-remote' }, 'settings.dns.builtinRemoteName'],
+      [{ type: 'reject', method: 'default' }, 'rules.dnsActionReject'],
+    ] as const) {
+      const html = dnsMarkup({}, {
+        ...DNS_V2_FAKEIP_TOP,
+        dnsDefaults: {
+          ...(DNS_V2_FAKEIP_TOP.dnsDefaults as object),
+          realQueryFallbackAction: action,
+        },
+      });
+      const row = rowOf(html, 'dns-real-query-fallback');
+      expect(row).toContain(copy(label));
+      expect(row).toContain(`aria-label="${copy('settings.dns.realQueryFallback')}"`);
+      expect(row).toContain('aria-haspopup="listbox"');
+    }
+    expect(src).toContain("commitRealQueryFallback('dns-real-query-fallback', next)");
+    expect(src).toContain('commit(rowId, update({ dnsDefaults: { ...defaults, realQueryFallbackAction } }))');
   });
 
   it('🔴 写腿真的落在 `dnsDefaults` 上，且 `dnsConfig` 那一半同写（只改一半 = 两份配置各说各话）', () => {
@@ -2677,9 +2891,9 @@ describe('⑫quater v2 默认 DNS 策略：两格真的改得动（批 17 接线
     const panels = src.split('<SelectSheetPanel').slice(1);
     const triggers = src.split('<SelectSheetTrigger').slice(1);
     // 切片自检：切不出块（或块数变了）时下面的 `some` 会恒假/恒真，先让它自曝。
-    expect(panels.length, '切不出两张面板 —— 切片面塌了，或多了一张没登记的').toBe(2);
-    expect(triggers.length, '切不出两颗触发器').toBe(2);
-    for (const key of ['action', 'fallback']) {
+    expect(panels.length, '切不出默认策略的三张面板').toBe(3);
+    expect(triggers.length, '切不出默认策略的三颗触发器').toBe(3);
+    for (const key of ['action', 'fallback', 'realQueryFallback']) {
       expect(
         triggers.some(
           (block) =>
@@ -3629,15 +3843,91 @@ describe('⑱ 应用更新：检查 + 显示 + 打开发布页（W-19 / W-20）'
         at('if include_current => match resolve_current_app_release('),
       '两条臂的守卫在 Android 上同时成立，顺序反了「重装当前版本」就没有对象了',
     ).toBe(true);
-    // 同一份源码里的第二条跨语言事实：内核腿在 Android 上**零网络**早退
-    //（`AssetPlatform` 多了一态之后，少这一条就会开始真的去打 SagerNet 的 releases API）。
-    const core = maskRustComments(
-      readFileSync(join(REPO, 'src-tauri/src/commands/updater/core_update.rs'), 'utf8'),
-    );
+  });
+
+  /*
+   * 第二条跨语言事实：应用内没有任何「更新 / 上传 / 回滚内核」的命令，Android 上也就不存在
+   * 「去查内核 release」这次请求。
+   *
+   * 前身的判据是「`core_update.rs` 这个文件不存在」—— 模块换个文件名回来仍绿。命令能不能被前端
+   * 调到，取决于两张表：Rust 侧 `generate_handler![]` 的注册集，与前端 `IPC_CHANNELS` 的值集。
+   * 故改为直接问这两张表：名字里带 `core` 这一节的命令，各自**恰好只有** `core_get_version_info`
+   * （只读的版本信息）。按「节」匹配而不是按 `core_` 前缀：`update_core_check` 这类把 `core`
+   * 放在中间的名字同样在射程内。
+   *
+   * 射程边界（如实登记）：一条名字里完全不带 `core` 的命令（如 `kernel_swap`）不在本条判据内。
+   */
+  it('🔴 跨语言：注册表与通道表里带 core 的命令恰好只有只读的 core_get_version_info', () => {
+    const CORE_SEGMENT = /(?:^|_)core(?:_|$)/;
+    const ALLOWED = ['core_get_version_info'];
+    // ⓪ 自检：谓词认得出前缀形态与中缀形态，也不误伤无关名字。
+    expect(CORE_SEGMENT.test('core_update_check')).toBe(true);
+    expect(CORE_SEGMENT.test('update_core_check')).toBe(true);
+    expect(CORE_SEGMENT.test('score_get')).toBe(false);
+
+    // Rust 侧：crate 根（main.rs + lib.rs）里那一块 `generate_handler![]`，注释先剥掉。
+    // 判定写成吃文本的函数：同一个函数既判真文件，也判下面那份「注入了一条内核命令」的反向对照。
+    const HANDLER_BLOCK = /\.invoke_handler\s*\(\s*tauri::generate_handler!\s*\[([\s\S]*?)\]\s*\)/;
+    const registeredCommands = (crateRoot: string): string[] | null => {
+      const block = HANDLER_BLOCK.exec(crateRoot)?.[1];
+      if (!block) return null;
+      return block
+        .split(',')
+        .map((entry) => entry.trim().replace(/^#\[[^\]]+\]\s*/, ''))
+        .filter(Boolean)
+        .map((entry) => entry.split('::').slice(-1)[0]!)
+        .filter((name) => /^[a-z][a-z0-9_]*$/.test(name));
+    };
+    const coreCommands = (names: string[]): string[] =>
+      names.filter((name) => CORE_SEGMENT.test(name)).sort();
+
+    const root = maskRustComments(crateRootSource('src-tauri/src'));
+    const registered = registeredCommands(root);
+    expect(registered, 'crate 根的 generate_handler![] 解析不到 —— 判据面塌了').not.toBeNull();
+    // 取材面自检：清单量级在、且确实读到了与内核无关的已知命令。
+    expect(registered!.length, '注册表只解析出零星几条 —— 解析器塌了').toBeGreaterThan(80);
+    for (const known of ['update_check', 'update_download', 'config_get']) {
+      expect(registered, `注册表里读不到已知命令 \`${known}\` —— 取材面不对`).toContain(known);
+    }
     expect(
-      core.includes('Some(AssetPlatform::Android) | None => {'),
-      '内核更新检查在 Android 上不再早退 —— 那是一次纯浪费的网络请求，结果恒为「没有适配资产」',
-    ).toBe(true);
+      coreCommands(registered!),
+      'Rust 注册表里出现了 core_get_version_info 之外的内核命令 —— 应用内又有了动内核的入口；' +
+        '若它是「检查内核更新」，Android 上那条零网络早退必须一并恢复并重新钉住',
+    ).toEqual(ALLOWED);
+
+    // 反向对照（常驻）：往**真文件的文本**里多注册一条内核命令，同一个判定必须不再等于期望集合。
+    // 三种写法各注入一次：裸名、带模块路径、`core` 在中间。真文件本身不动。
+    const inject = (entry: string): string =>
+      root.replace(HANDLER_BLOCK, (whole: string, block: string) =>
+        whole.replace(block, () => `\n${entry},${block}`),
+      );
+    for (const [entry, name] of [
+      ['core_anything', 'core_anything'],
+      ['commands::updater::core_anything', 'core_anything'],
+      ['commands::update_core_check', 'update_core_check'],
+    ] as const) {
+      const mutated = inject(entry);
+      expect(mutated, `注入 \`${entry}\` 没有改动文本 —— 反向对照是空跑`).not.toBe(root);
+      const seen = registeredCommands(mutated);
+      expect(seen, `注入 \`${entry}\` 后注册表解析不到`).not.toBeNull();
+      expect(seen!.length, `注入 \`${entry}\` 后条数应恰好多一条`).toBe(registered!.length + 1);
+      expect(
+        coreCommands(seen!),
+        `注册表多了一条 \`${entry}\`，判定却没有察觉 —— Rust 这一侧的判据没有牙`,
+      ).toEqual([...ALLOWED, name].sort());
+      expect(coreCommands(seen!)).not.toEqual(ALLOWED);
+    }
+
+    // 前端侧：`IPC_CHANNELS` 的值集（渲染端能发出去的全部命令名）。
+    const channels = Object.values(IPC_CHANNELS) as string[];
+    expect(channels.length, 'IPC_CHANNELS 读到的值太少 —— 取材面不对').toBeGreaterThan(100);
+    for (const known of ['update_check', 'update_download', 'config_get']) {
+      expect(channels, `IPC_CHANNELS 里读不到已知命令 \`${known}\``).toContain(known);
+    }
+    expect(
+      channels.filter((name) => CORE_SEGMENT.test(name)).sort(),
+      'IPC_CHANNELS 里出现了 core_get_version_info 之外的内核命令',
+    ).toEqual(ALLOWED);
   });
 
   /** 收尾：本组除了那条正向对照，一次都没碰过真的 `updateApi.check`（见探针那段头注）。 */

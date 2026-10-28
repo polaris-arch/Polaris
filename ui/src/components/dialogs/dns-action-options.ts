@@ -99,6 +99,33 @@ export function dnsDefaultFallbackChoice(defaults: DnsDefaults): string {
     : direct;
 }
 
+/** The fallback is independent of traffic routing and the direct/proxy internal lookup roles. */
+export function dnsRealQueryFallbackChoice(defaults: Partial<DnsDefaults>): string {
+  return dnsActionChoice(defaults.realQueryFallbackAction) ?? 'server:builtin-domestic';
+}
+
+/** Restrict writes to real DNS servers or an explicit rejection, reusing the action codec. */
+export function dnsRealQueryFallbackFromChoice(choice: string): DnsPolicyAction | null {
+  if (choice !== 'reject' && !(choice.startsWith('server:') && choice.length > 7)) return null;
+  return dnsActionFromChoice(choice, 'server:builtin-domestic');
+}
+
+/** Both clients use the same restricted candidate set; preserve unavailable server references. */
+export function buildDnsRealQueryFallbackGroups(
+  args: Pick<BuildDnsActionGroupsArgs, 'servers' | 'nodes' | 't' | 'currentValue'>,
+): CselGroup[] {
+  return buildDnsActionGroups({
+    ...args,
+    currentValue: args.currentValue && dnsRealQueryFallbackFromChoice(args.currentValue)
+      ? args.currentValue
+      : undefined,
+    groups: [],
+    includeGroups: false,
+    includeHosts: false,
+    responses: ['reject'],
+  });
+}
+
 interface BuildDnsActionGroupsArgs {
   servers: readonly DnsServerResource[];
   groups: readonly DnsServerGroup[];
@@ -106,6 +133,7 @@ interface BuildDnsActionGroupsArgs {
   t: TFunction;
   currentValue?: string;
   includeHosts?: boolean;
+  includeGroups?: boolean;
   responses?: readonly DnsResponseChoice[];
   /**
    * 列出内置解析器「当前网络 DHCP 下发的 DNS」（`builtin-netenv-dhcp` → 内核 `dns-netenv`，spec D5）。
@@ -249,6 +277,7 @@ export function buildDnsActionGroups({
   t,
   currentValue = '',
   includeHosts = true,
+  includeGroups = true,
   responses = ['fakeIp', 'reject', 'predefined'],
   includeNetenv = false,
   netenvStatus = null,
@@ -266,7 +295,7 @@ export function buildDnsActionGroups({
   if (includeNetenv) {
     networkOptions.push(netenvOption(t, netenvStatus, netenvReasonKeyOf));
   }
-  const groupOptions = groups.map((group) => resourceOption(
+  const groupOptions = (includeGroups ? groups : []).map((group) => resourceOption(
     `group:${group.id}`,
     group.name,
     dnsGroupDescription(group, servers, nodes, t),
@@ -288,7 +317,7 @@ export function buildDnsActionGroups({
   if (currentValue.startsWith('server:') && !networkOptions.some((option) => option.value === currentValue)) {
     networkOptions.push(missingOption(currentValue, 'server', t));
   }
-  if (currentValue.startsWith('group:') && !groupOptions.some((option) => option.value === currentValue)) {
+  if (includeGroups && currentValue.startsWith('group:') && !groupOptions.some((option) => option.value === currentValue)) {
     groupOptions.push(missingOption(currentValue, 'group', t));
   }
   if (includeHosts && currentValue.startsWith('hosts:') && !hostsOptions.some((option) => option.value === currentValue)) {

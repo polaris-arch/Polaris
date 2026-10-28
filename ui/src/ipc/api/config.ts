@@ -1,4 +1,4 @@
-import { invoke, invokeScalar, listen } from '../ipc-client';
+import { invoke, invokeScalar, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { UserConfig, StagedClassification, SaveOutcome } from '../../contracts/types';
 import type { TunExclusionPreview } from '../../contracts/tun-exclusion-preview';
@@ -80,6 +80,11 @@ export const configApi = {
     return invoke(IPC_CHANNELS.CONFIG_PATCH, { patch });
   },
 
+  /** 在后端最新配置写事务内切换接管并消费 FakeIP-TUN 一次性标志。 */
+  async setTakeover(mode: NonNullable<UserConfig['proxyModeType']>): Promise<{ config: UserConfig; corrected: boolean }> {
+    return invoke(IPC_CHANNELS.CONFIG_SET_TAKEOVER, { mode });
+  },
+
   /** 在后端最新配置上按实体主键原子 upsert/delete；同一数组的并发编辑不会整字段互相覆盖。 */
   async mutateEntities(
     mutations: readonly {
@@ -121,6 +126,11 @@ export const configApi = {
    * `{ key?, oldValue?, newValue? }` 是照搬 Electron 侧的形状，而 `newValue` 经脱敏、
    * 也没走 `config_get` 那侧的 bypassLANList 补齐 —— 直接拿来用是错的（见 `use-config.ts`）。
    */
+  /** Resolve only after native registration; callers then take their initial snapshot. */
+  onChangedReady(listener: () => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_CONFIG_CHANGED, listener);
+  },
+
   onChanged(listener: () => void): () => void {
     return listen(IPC_CHANNELS.EVENT_CONFIG_CHANGED, listener);
   },

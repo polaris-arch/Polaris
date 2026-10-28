@@ -341,7 +341,7 @@ impl EnvCondition {
         BTreeMap::from([(self.tag.clone(), self.values.clone())])
     }
 
-    /// 写到一条 DNS 规则上（DNS builder 只产出默认规则，没有 logical）。
+    /// 写到一条默认 DNS matcher 上；logical 调用方将它作为无动作的子条件。
     pub fn apply_to_dns_rule(&self, rule: &mut DnsRule) {
         match self.kind {
             EnvKind::ServerAddress => rule.dns_server_address = Some(self.map()),
@@ -575,6 +575,29 @@ pub fn dns_rule_uses_netenv(rule: &Rule, config: &UserConfig) -> bool {
         })
 }
 
+/// Default policy participates in the same dependency traversal as explicit rules.
+pub fn default_dns_uses_netenv(config: &UserConfig) -> bool {
+    config.config_schema_version.unwrap_or(0) >= 2
+        && config.dns_defaults.as_ref().is_some_and(|defaults| {
+            defaults.unmatched_action.as_ref().is_some_and(|action| {
+                action_refs_server(action, None, config, BUILTIN_NETENV_DHCP_ID)
+                    || (matches!(action, DnsPolicyAction::FakeIp)
+                        && defaults
+                            .real_query_fallback_action
+                            .as_ref()
+                            .is_some_and(|fallback| {
+                                fallback.is_valid_real_query_fallback()
+                                    && action_refs_server(
+                                        fallback,
+                                        None,
+                                        config,
+                                        BUILTIN_NETENV_DHCP_ID,
+                                    )
+                            }))
+            })
+        })
+}
+
 /// 本次是否需要生成 `dns-netenv`（spec §4.2「只在需要时生成」）：某条会生成的规则挂了解析为 dhcp 的
 /// 启用场景，或某条 DNS 规则的动作用到了 [`BUILTIN_NETENV_DHCP_ID`]——两者都以 dhcp transport 本机
 /// 本次可用为前提（不可用时那些规则整条剔除，生成它只会白绑一次 68）。否则一个字节都不变。
@@ -588,9 +611,10 @@ pub fn netenv_required(config: &UserConfig, facts: &ProbeFacts) -> bool {
         .filter(|r| dns_rule_is_candidate(r))
         .collect();
     let by_action = facts.dhcp_unavailable().is_none()
-        && dns_rules
-            .iter()
-            .any(|rule| dns_rule_uses_netenv(rule, config));
+        && (default_dns_uses_netenv(config)
+            || dns_rules
+                .iter()
+                .any(|rule| dns_rule_uses_netenv(rule, config)));
     if by_action {
         return true;
     }
@@ -678,6 +702,22 @@ fn route_rule_bad_ref(servers: &[DnsServer], rule: &RouteRule) -> Option<EnvRefE
     })
 }
 
+fn dns_rule_bad_ref(servers: &[DnsServer], rule: &DnsRule) -> Option<EnvRefError> {
+    first_bad_ref(
+        servers,
+        env_tags(
+            rule.dns_server_address.as_ref(),
+            rule.dns_search_domain.as_ref(),
+        ),
+    )
+    .or_else(|| {
+        rule.rules
+            .iter()
+            .flatten()
+            .find_map(|child| dns_rule_bad_ref(servers, child))
+    })
+}
+
 /// 生成末尾的后置剪枝（第二道防线）：遍历 `route.rules`（递归进 logical）与 `dns.rules`，任何环境项
 /// 引用不合格 ⇒ 剔除**整条顶层规则**。看的是最终 JSON，与哪条 builder 路径产出无关，兜住将来新增的规则腿。
 pub fn prune_invalid_env_condition_refs(cfg: &mut SingBoxConfig) -> Vec<PrunedEnvRule> {
@@ -705,20 +745,12 @@ pub fn prune_invalid_env_condition_refs(cfg: &mut SingBoxConfig) -> Vec<PrunedEn
             });
     }
     if let Some(rules) = cfg.dns.as_mut().and_then(|dns| dns.rules.as_mut()) {
-        rules.retain(|rule| {
-            match first_bad_ref(
-                &servers,
-                env_tags(
-                    rule.dns_server_address.as_ref(),
-                    rule.dns_search_domain.as_ref(),
-                ),
-            ) {
-                Some(err) => {
-                    record(err);
-                    false
-                }
-                None => true,
+        rules.retain(|rule| match dns_rule_bad_ref(&servers, rule) {
+            Some(err) => {
+                record(err);
+                false
             }
+            None => true,
         });
     }
     pruned

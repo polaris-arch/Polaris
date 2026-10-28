@@ -14,3 +14,6 @@ fn liveness_only_treats_explicit_absence_as_dead() {
     );
     assert_eq!(liveness_from_probe(None, Some(0)), Liveness::Dead);
 }
+
+// Strict controlled-test observations share the existing Windows FFI boundary.
+pub(crate) mod controlled_test_observation;

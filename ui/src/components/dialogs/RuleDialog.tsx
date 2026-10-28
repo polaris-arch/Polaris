@@ -1,3 +1,5 @@
+import { configCanonicalText } from '@/lib/staged-config';
+import { formatConditionValues } from './rule-cond';
 /**
  * RuleDialog —— 自定义规则增删改弹窗（第二复杂表单，原型 #rule-dialog :2722）。
  *
@@ -20,7 +22,7 @@
  * 无「挂载后 reset」路径；Csel 受控无懒挂 Portal。脏态取消 → 嵌套 ConfirmDialog（复用 D1）。
  */
 
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/lib/error-handler';
 import {
@@ -88,6 +90,7 @@ function nodePlatformFromDataOs(): NodeJS.Platform | undefined {
 }
 
 interface RuleFormProps {
+  instanceId: string;
   base?: Rule;
   isEdit: boolean;
   preset?: RulePreset;
@@ -99,10 +102,11 @@ interface RuleFormProps {
 /** footer 左侧「删除此规则」的原地二次确认 key（原型 :4095 `rule-del-dlg`）。 */
 const RULE_DEL_KEY = 'rule-del-dlg';
 
-function RuleForm({ base, isEdit, preset, initialPlane = 'route', planeRuleIds = [] }: RuleFormProps) {
+function RuleForm({ instanceId, base, isEdit, preset, initialPlane = 'route', planeRuleIds = [] }: RuleFormProps) {
   const { t } = useTranslation();
   const open = useDialogStore((s) => s.open);
-  const close = useDialogStore((s) => s.close);
+  const closeInstance = useDialogStore((state) => state.closeInstance);
+  const close = useCallback(() => closeInstance(instanceId), [closeInstance, instanceId]);
   /** 「前往规则资源」用（同 AppAddDialog:78,82 的既有做法：跳屏 + 收掉整条弹窗栈）。 */
   const closeAll = useDialogStore((s) => s.closeAll);
   const navigate = useNavStore((s) => s.navigate);
@@ -139,7 +143,7 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route', planeRuleIds =
   // 同步初始化（R1）：编辑态从 base 预填，入口 preset 显式携带类型和值，新建默认单条件。
   const [conds, setConds] = useState<Cond[]>(() => {
     if (base) {
-      const cs = ruleConditions(base).map((c) => ({ t: c.type, v: c.values.join(', ') }));
+      const cs = ruleConditions(base).map((c) => ({ t: c.type, v: formatConditionValues(c.type, c.values) }));
       return cs.length ? cs : [{ t: DEFAULT_RULE_TYPE, v: '' }];
     }
     return [{ t: preset?.type ?? DEFAULT_RULE_TYPE, v: preset?.value ?? '' }];
@@ -267,7 +271,7 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route', planeRuleIds =
       close();
       return;
     }
-    open({
+    const confirmId = open({
       kind: 'confirm',
       payload: {
         title: t('rules.discardTitle'),
@@ -275,8 +279,8 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route', planeRuleIds =
         confirmLabel: t('rules.discard'),
         danger: true,
         onConfirm: () => {
-          close(); // pop confirm
-          close(); // pop 本弹窗
+          closeInstance(confirmId);
+          close();
         },
       },
     });
@@ -288,9 +292,10 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route', planeRuleIds =
    * 三条腿（撤销条目 / 暂存删除条目 / 直落盘）全在 `useRuleDelete` 里，与列表行内那颗垃圾桶共用；
    * 本处只留两件弹窗自己的事：成功即关窗、失败发一条右下角 toast（不关窗，让用户看得见原因）。
    */
+  const deleteIntentKey = `${RULE_DEL_KEY}:${initialPlane}:${configCanonicalText(base ?? null)}`;
   const requestDelete = () => {
     if (!base) return;
-    confirmTwice(RULE_DEL_KEY, () => {
+    confirmTwice(deleteIntentKey, () => {
       void (async () => {
         try {
           await deleteRule(base);
@@ -344,11 +349,11 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route', planeRuleIds =
           {isEdit && (
             <button
               type="button"
-              className={cn('btn ghost', armed === RULE_DEL_KEY && 'confirming')}
+              className={cn('btn ghost', armed === deleteIntentKey && 'confirming')}
               style={{ marginRight: 'auto', color: 'hsl(var(--err))', borderColor: 'hsl(var(--err)/0.3)' }}
               onClick={requestDelete}
             >
-              {armed === RULE_DEL_KEY
+              {armed === deleteIntentKey
                 ? t('rules.deleteConfirmAgain')
                 : t('rules.delete')}
             </button>
@@ -536,10 +541,12 @@ function RuleForm({ base, isEdit, preset, initialPlane = 'route', planeRuleIds =
 }
 
 export function RuleDialog({
+  instanceId,
   ruleId,
   preset,
   initialPlane,
 }: {
+  instanceId: string;
   ruleId?: string;
   preset?: RulePreset;
   initialPlane?: 'route' | 'dns';
@@ -552,6 +559,7 @@ export function RuleDialog({
   const formKey = `${plane}:${ruleId ?? `new:${preset?.type ?? ''}:${preset?.value ?? ''}`}`;
   return (
     <RuleForm
+      instanceId={instanceId}
       key={formKey}
       base={base}
       isEdit={base != null}

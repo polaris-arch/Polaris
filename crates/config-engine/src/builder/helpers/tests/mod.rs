@@ -210,7 +210,7 @@ fn geo_categories_skip_disabled_app_rule() {
 
 #[test]
 fn node_resolver_race_on() {
-    // race on（resolve !== false）→ dns-node-race，无论 single/ctx。
+    // Server-tag helper retains explicit bootstrap; native node policy is bound by outbounds.
     let tag = get_node_resolver_tag(
         Some(true),
         Some("ali"),
@@ -218,7 +218,7 @@ fn node_resolver_race_on() {
         "systemProxy",
         NodeResolverCtx::Dial,
     );
-    assert_eq!(tag, "dns-node-race");
+    assert_eq!(tag, "dns-bootstrap");
     let tag = get_node_resolver_tag(None, None, None, "tun", NodeResolverCtx::Rule);
     assert_eq!(tag, "dns-domestic"); // DNS rule 已迁到原生路径
 }
@@ -322,3 +322,5 @@ fn custom_domestic_dns_ip() {
     assert!(get_custom_domestic_dns_endpoint(Some("https://doh.pub/dns-query")).is_none());
     assert!(get_custom_domestic_dns_endpoint(None).is_none());
 }
+
+mod audit_regressions;

@@ -4,21 +4,23 @@
  * 进度事件会被广播到每个窗口，因而这里同时持有状态机、订阅清理与安装期的包快照；呈现层只消费
  * 返回的状态和动作，不再复制任何状态迁移或跨 await 的一致性约束。
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   updateApi,
   versionApi,
-  type InstallAdvisory,
+  type DialogInstallAdvisory,
   type UpdateProgressManifest,
   type VersionInfo,
 } from '@/ipc/api-client';
+import { toast } from '@/lib/error-handler';
 import { useDialogStore } from '../../dialogs/dialog-store';
 import { markAppVersionSkipped } from '../../layout/app-update-banner';
 import {
   appDownloadIntegrity,
   appUpdateErrText,
-  isPortableZipUpdate,
+  formMismatchKey,
+  installFailureKey,
   wireUpdateProgress,
   type AppDownloadIntegrity,
 } from './settings-logic';
@@ -37,6 +39,7 @@ export type AppUpdateState =
   | 'error';
 
 interface InstallSubject {
+  completionUnverified?: boolean;
   path: string;
   info: UpdateProgressManifest | null;
   integrity: AppDownloadIntegrity;
@@ -54,9 +57,23 @@ export function useAppUpdate(includePrerelease: boolean) {
   const [errMsg, setErrMsg] = useState('');
   const [downloadedPath, setDownloadedPath] = useState<string | null>(null);
   const [downloadIntegrity, setDownloadIntegrity] = useState<AppDownloadIntegrity>('unknown');
+  // 安装调用在飞：状态给按钮置灰用，ref 给入口去重用（同一次渲染里的两次点击读到的是同一个
+  // 状态快照，只有 ref 拦得住第二次）。
+  const [installing, setInstalling] = useState(false);
+  const [manualCompletionUnverified, setManualCompletionUnverified] = useState(false);
+  const installInFlight = useRef(false);
+  const clearInFlight = useRef(false);
+  const [clearingPortable, setClearingPortable] = useState(false);
+  const [pendingPortable, setPendingPortable] = useState<VersionInfo['pendingPortableUpdate']>();
 
   useEffect(() => {
-    void versionApi.getInfo().then(setAppVersionInfo).catch(() => undefined);
+    void versionApi
+      .getInfo()
+      .then((info) => {
+        setAppVersionInfo(info);
+        setPendingPortable(info.pendingPortableUpdate);
+      })
+      .catch(() => undefined);
   }, []);
 
   // 订阅 + 挂载期快照回读。顺序、竞态否决与「两条路共用同一个 reducer」都在 `wireUpdateProgress`
@@ -81,6 +98,7 @@ export function useAppUpdate(includePrerelease: boolean) {
   }, []);
 
   async function checkUpdate() {
+    // Ordinary checks, including failures, never discard a manual handoff.
     setUs('checking');
     setDownloadIntegrity('unknown');
     try {
@@ -95,6 +113,25 @@ export function useAppUpdate(includePrerelease: boolean) {
       setUs('error');
       console.error('[update] check failed:', error);
       setErrMsg(updateErrText((error as { code?: string }).code, undefined, t));
+    }
+  }
+
+  async function discardPortableAndCheck() {
+    if (clearInFlight.current || installInFlight.current) return;
+    clearInFlight.current = true;
+    setClearingPortable(true);
+    try {
+      await updateApi.clearPortableHandoff();
+      // Clear local recovery only after the durable dismissal succeeded.
+      setPendingPortable(undefined);
+      setManualCompletionUnverified(false);
+      await checkUpdate();
+    } catch (error) {
+      // Keep the manual card/positions available for retry after a write failure.
+      toast.error(updateErrText((error as { code?: string }).code, undefined, t));
+    } finally {
+      clearInFlight.current = false;
+      setClearingPortable(false);
     }
   }
 
@@ -157,12 +194,29 @@ export function useAppUpdate(includePrerelease: boolean) {
     if (updateInfo) await downloadTarget(updateInfo);
   }
 
+  /** 卡片按钮的安装入口：调用在飞时不再发第二次（这一下可能停核并退出应用）。 */
+  async function startInstall(confirmed = false) {
+    if (installInFlight.current) return;
+    if (clearInFlight.current) return;
+    installInFlight.current = true;
+    setInstalling(true);
+    try {
+      await installUpdate(confirmed);
+    } finally {
+      installInFlight.current = false;
+      setInstalling(false);
+    }
+  }
+
   function settleInstall(next: 'manual' | 'error', message: string, subject: InstallSubject) {
     setUs(next);
+    setManualCompletionUnverified(Boolean(subject.completionUnverified));
     setUpdateInfo(subject.info);
     setDownloadedPath(subject.path);
     setDownloadIntegrity(subject.integrity);
     setErrMsg(message);
+    // 落到这两屏 = 安装调用已有结论，屏上的按钮不该还停在「在飞」。
+    setInstalling(false);
   }
 
   async function installUpdate(confirmed = false, subject?: InstallSubject) {
@@ -175,7 +229,21 @@ export function useAppUpdate(includePrerelease: boolean) {
     try {
       const result = await updateApi.install(subj.path, confirmed);
       if (result.needConfirm && result.advisory) {
-        const advisory = result.advisory as InstallAdvisory;
+        // Windows 便携版：没有安装程序，这一步不弹确认框，而是落到 `manual` 卡 —— 说明要留在屏上
+        // 供用户对照着做，卡上的按钮才带 `confirmed` 重调（后端此时才停核、打开文件夹并退出）。
+        // 必须排在通用确认框之前：那一支会按 advisory 名去取一组本条没有的标题/正文键。
+        if (result.advisory === 'portableManualReplace') {
+          settleInstall(
+            'manual',
+            (subj.completionUnverified ? t('settings.update.portableCompletionUnverified') + '\n' : '') + t('settings.update.portableManualReplace', {
+              path: subj.path,
+              dir: result.programDir ?? '',
+            }),
+            subj,
+          );
+          return;
+        }
+        const advisory: DialogInstallAdvisory = result.advisory;
         openDialog({
           kind: 'confirm',
           payload: {
@@ -191,21 +259,22 @@ export function useAppUpdate(includePrerelease: boolean) {
         return;
       }
       if (result.handedToSystem || result.reason === 'form-mismatch') {
-        if (isPortableZipUpdate(subj.path)) {
-          settleInstall(
-            'manual',
-            t('settings.update.portableManualReplace', { path: subj.path }),
-            subj,
-          );
-        } else {
-          settleInstall('error', t('settings.update.formMismatch'), subj);
-        }
+        settleInstall('error', t(formMismatchKey(result.handedToSystem)), subj);
       }
     } catch (error) {
       console.error('[update] install failed:', error);
-      settleInstall('error', t('settings.update.downloadInterrupted'), subj);
+      settleInstall('error', t(installFailureKey((error as { code?: string }).code)), subj);
     }
   }
+
+  // 恢复上次手动交接的位置；同版本修复是否已覆盖无法自动证明，必须保留未确认语义。走的就是
+  // 未确认的那次安装调用（后端此时只回告知、不碰代理），于是两个位置由同一条便携告知腿写到屏上，
+  // 程序目录取的是此刻的真值。只在卡片空闲时接手（在途的下载 / 已下完的包优先），接手一次即止。
+  useEffect(() => {
+    if (!pendingPortable || us !== 'idle') return;
+    setPendingPortable(undefined);
+    void installUpdate(false, { path: pendingPortable.archive, info: null, integrity: 'unknown', completionUnverified: pendingPortable.completionUnverified });
+  }, [pendingPortable, us]);
 
   return {
     appVersionInfo,
@@ -215,10 +284,14 @@ export function useAppUpdate(includePrerelease: boolean) {
     receivedBytes,
     errMsg,
     downloadIntegrity,
+    installing,
+    manualCompletionUnverified,
+    clearingPortable,
+    discardPortableAndCheck,
     checkUpdate,
     reinstallCurrent,
     skipVersion,
     downloadUpdate,
-    installUpdate,
+    installUpdate: startInstall,
   };
 }

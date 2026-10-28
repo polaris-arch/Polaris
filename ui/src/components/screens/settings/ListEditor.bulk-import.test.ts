@@ -57,3 +57,11 @@ describe('parseBulkEntries —— 真批量导入的解析与合并', () => {
     expect(out).not.toBe(existing);
   });
 });
+
+
+it('DNS bulk identity preserves URL path/query case without changing generic list semantics', async () => {
+  const { dnsUpstreamIdentity } = await import('./settings-dns-logic');
+  expect(parseBulkEntries('A\na', [])).toEqual(['A']);
+  const lines = ['https://DNS.EXAMPLE:443/A?X=Y', 'https://dns.example/A?X=Y', 'https://dns.example/a?X=Y', 'https://dns.example/A?X=y'];
+  expect(parseBulkEntries(lines.join('\n'), [], undefined, dnsUpstreamIdentity)).toEqual([lines[0], lines[2], lines[3]]);
+});

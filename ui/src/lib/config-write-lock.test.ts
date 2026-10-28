@@ -94,15 +94,15 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
   // 变异对照：把任一处的 `withConfigWriteLock(...)` 拆掉、只留裸调用 → 对应断言转红。
   it('五处都真的裹在 withConfigWriteLock 里', () => {
     const appStore = readFileSync(join(SRC, 'store/app-store.ts'), 'utf8');
-    expect(appStore).toContain('withConfigWriteLock(() => api.config.patch(patch))');
-    expect(appStore).toContain('withConfigWriteLock(() => api.config.mutateEntities(mutations))');
+    expect(stripComments(appStore)).toMatch(/withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*await api\.config\.patch\(patch\);\s*\}\)/);
+    expect(stripComments(appStore)).toMatch(/withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*await api\.config\.mutateEntities\(mutations\);\s*\}\)/);
     expect(appStore).toContain('withConfigWriteLock(async () => {\n      const receipt = await api.server.switch(serverId)');
     // performSave 是薄壳：整个函数体（**含开头读 entries**）都在临界区内。
     expect(readFileSync(join(SRC, 'store/staged-config-store.ts'), 'utf8')).toContain(
       'withConfigWriteLock(() => performSaveLocked(set, get))'
     );
-    expect(readFileSync(join(SRC, 'components/screens/settings/use-config.ts'), 'utf8')).toContain(
-      'withConfigWriteLock(() => configApi.patch(direct))'
+    expect(stripComments(readFileSync(join(SRC, 'components/screens/settings/use-config.ts'), 'utf8'))).toMatch(
+      /withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*return configApi\.patch\(direct\);\s*\}\)/
     );
   });
 
@@ -114,11 +114,35 @@ describe('接线：主窗里的配置事务必须都在闸门内', () => {
     expect((appStore.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(3);
     expect((stagedStore.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
     expect((settings.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
-    expect(filesWith('withConfigWriteLock(() =>', ['config-write-lock.ts'])).toEqual([
+    expect(filesWith('withConfigWriteLock(', ['config-write-lock.ts'])).toEqual([
       'components/screens/settings/use-config.ts',
+      'lib/auto-select-actions.ts',
       'store/app-store.ts',
       'store/staged-config-store.ts',
       'tray/TrayMenu.tsx',
     ]);
+    const tray = stripComments(readFileSync(join(SRC, 'tray/TrayMenu.tsx'), 'utf8'));
+    expect(tray).toContain('useAppStore.getState().saveConfig({ proxyMode: mode })');
+    // Takeover uses one backend latest-config transaction. Restoring a tray-owned
+    // patch would overwrite concurrent DNS edits; wrapping it in saveConfig would
+    // also split the atomic correction from the chosen mode.
+    const takeover = tray.slice(tray.indexOf('  const setTakeover ='), tray.indexOf('  const switchExit ='));
+    expect(takeover).toMatch(/const \{ corrected \} = await api\.config\.setTakeover\(modeType\);/);
+    expect(takeover).not.toMatch(/saveConfig\(|api\.config\.(?:patch|save)\(|withConfigWriteLock\(/);
+    expect((tray.match(/api\.config\.setTakeover\(/g) ?? []).length).toBe(1);
+    expect(tray).not.toContain('api.config.patch(');
+    // Only the dedicated server-switch/readback stays in Tray's local queue.
+    expect((tray.match(/withConfigWriteLock\((?:async )?\(\) =>/g) ?? []).length).toBe(1);
+  });
+
+  it('mutation entry is in the actual locked callback; moving it outside or nesting a lock fails', () => {
+    const lockedMutation = /withConfigWriteLock\(async \(\) => \{\s*beginConfigMutation\(\);\s*(?:await|return) (?:api\.config|configApi)\.(?:patch|mutateEntities)\([^;]*\);\s*\}\)/;
+    expect(lockedMutation.test('withConfigWriteLock(async () => { beginConfigMutation(); await api.config.patch(patch); })')).toBe(true);
+    expect(lockedMutation.test('beginConfigMutation(); withConfigWriteLock(async () => { await api.config.patch(patch); })')).toBe(false);
+    expect(lockedMutation.test('withConfigWriteLock(async () => { beginConfigMutation(); return withConfigWriteLock(() => api.config.patch(patch)); })')).toBe(false);
+    for (const file of ['store/app-store.ts', 'components/screens/settings/use-config.ts']) {
+      const source = stripComments(readFileSync(join(SRC, file), 'utf8'));
+      expect(source.match(new RegExp(lockedMutation.source, 'g'))?.length).toBe(file.startsWith('store/') ? 2 : 1);
+    }
   });
 });

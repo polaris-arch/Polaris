@@ -4,15 +4,18 @@ package com.polaris2.app.vpn
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ClipData
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import android.net.ConnectivityManager
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
@@ -41,6 +44,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 @InvokeArg
+class DeviceConditionsArgs {
+    var queryId: String? = null
+}
+
+@InvokeArg
 class TailscaleStoreArgs {
     lateinit var operation: String
     var binding: String? = null
@@ -62,6 +70,13 @@ class DebugBatchQaArgs {
     lateinit var action: String
     var sessionId: String? = null
     var plan: String? = null
+}
+
+@InvokeArg
+class DebugTransientCloseTimeoutArgs {
+    lateinit var targetKind: String
+    lateinit var instanceId: String
+    lateinit var targetToken: String
 }
 
 @InvokeArg
@@ -255,6 +270,36 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
         }.start()
     }
 
+    /**
+     * 周期测速每轮准入前查一次：活动网络是否计费、系统是否处于省电模式。只读，不改任何状态。
+     * VPN 自身声明为非计费并跟随底层网络，所以 `isActiveNetworkMetered` 反映的是底层网络。
+     */
+    @Command
+    fun deviceConditions(invoke: Invoke) {
+        val queryId = invoke.parseArgs(DeviceConditionsArgs::class.java).queryId
+        Thread {
+            runCatching {
+                val connectivity = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val power = activity.getSystemService(Context.POWER_SERVICE) as PowerManager
+                val observation = DefaultNetworkMonitor.networkObservation()
+                JSObject()
+                    .put("metered", connectivity.isActiveNetworkMetered)
+                    .put("powerSave", power.isPowerSaveMode)
+                    .put("queryId", queryId)
+                    .put("networkObservation", networkObservation(observation))
+            }
+                .onSuccess { invoke.resolve(it) }
+                .onFailure { invoke.reject("Android device conditions query failed", "DEVICE_CONDITIONS_FAILED") }
+        }.start()
+    }
+
+    private fun networkObservation(observation: DefaultNetworkObservationSnapshot): JSObject = JSObject()
+        .put("version", 1)
+        .put("sourceEpoch", observation.sourceEpoch)
+        .put("seq", observation.seq)
+        .put("currentKnown", observation.currentKnown)
+        .put("coverageGap", observation.coverageGap)
+
     private fun bindableInterface(row: BindableInterface): JSObject = JSObject()
         .put("name", row.name)
         .put("displayName", row.displayName)
@@ -309,6 +354,32 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
     fun transientSpeedtestStatus(invoke: Invoke) {
         val args = invoke.parseArgs(TransientSpeedtestInstanceArgs::class.java)
         invoke.resolve(JSObject().put("state", TransientSpeedtestHost.status(args.instanceId)))
+    }
+
+    @Command
+    fun debugTransientCloseTargets(invoke: Invoke) {
+        if (!BuildConfig.DEBUG) { invoke.reject("Debug transient close timeout is disabled"); return }
+        try {
+            val targets = JSArray()
+            for ((kind, id, token) in DebugTransientCloseTimeout.process.currentTargets()) {
+                targets.put(debugTransientCloseTarget(kind, id, token))
+            }
+            invoke.resolve(JSObject().put("targets", targets))
+        } catch (_: Throwable) { invoke.reject("Transient close timeout targets unavailable") }
+    }
+
+    private fun debugTransientCloseTarget(kind: String, id: String, token: String): JSObject {
+        return JSObject().put("targetKind", kind).put("instanceId", id).put("targetToken", token)
+    }
+
+    @Command
+    fun debugTransientCloseTimeout(invoke: Invoke) {
+        if (!BuildConfig.DEBUG) { invoke.reject("Debug transient close timeout is disabled"); return }
+        try {
+            val args = invoke.parseArgs(DebugTransientCloseTimeoutArgs::class.java)
+            DebugTransientCloseTimeout.process.arm(args.targetKind, args.instanceId, args.targetToken)
+            invoke.resolve(JSObject().put("state", "armedUntilProcessRestart"))
+        } catch (_: Throwable) { invoke.reject("Transient close timeout target unavailable; restart the App process if already armed") }
     }
 
     @Command
@@ -604,6 +675,53 @@ class PolarisVpnPlugin(private val activity: Activity) : Plugin(activity) {
      * **异常消息原样回传，绝不翻译或加前缀** —— Rust 侧 `parse_kernel_rejection` 的
      * `decode config: ` marker 就锚在这串的开头，加一个字都会把归因锚点破坏掉。
      */
+    /** Read the loaded libbox, including old AARs which lack this method. */
+    @Command
+    fun tlsFingerprintCapabilities(invoke: Invoke) {
+        Thread({
+            try {
+                LoadedLibboxIdentity.readAfterSetup(
+                    ready = { PolarisApplication.isSetupComplete },
+                    setup = { PolarisApplication.ensureSetup() },
+                    completed = { (activity as? com.polaris2.app.MainActivity)?.notifyLibboxReady() },
+                    read = {
+                        val library = java.io.File(activity.applicationInfo.nativeLibraryDir, "libbox.so").canonicalFile
+                        java.io.FileInputStream(library).use { input ->
+                            val stat = android.system.Os.fstat(input.fd)
+                            fun mappedIdentity(): Boolean = java.io.File("/proc/self/maps").useLines { lines ->
+                                lines.any { line ->
+                                    LoadedLibboxIdentity.matchesMapping(line, library.path, stat.st_ino, stat.st_dev)
+                                }
+                            }
+                            require(mappedIdentity()) { "Loaded libbox device/inode does not match the opened file" }
+                            fun digest(): String {
+                                input.channel.position(0)
+                                val hash = java.security.MessageDigest.getInstance("SHA-256")
+                                val buffer = ByteArray(65536)
+                                while (true) {
+                                    val count = input.read(buffer)
+                                    if (count < 0) break
+                                    hash.update(buffer, 0, count)
+                                }
+                                return hash.digest().joinToString("") { "%02x".format(it.toInt() and 255) }
+                            }
+                            val before = digest()
+                            val method = runCatching { Libbox::class.java.getMethod("tlsFingerprintCapabilities") }.getOrNull()
+                            val document = method?.invoke(null) as? String
+                            require((document?.toByteArray(Charsets.UTF_8)?.size ?: 0) <= 65536 && before == digest() && mappedIdentity() &&
+                                android.system.Os.fstat(input.fd).let { it.st_dev == stat.st_dev && it.st_ino == stat.st_ino && it.st_size == stat.st_size && it.st_mtime == stat.st_mtime && it.st_ctime == stat.st_ctime }) {
+                                "Loaded core identity changed or capability report exceeds budget"
+                            }
+                            invoke.resolve(JSObject().put("document", document ?: org.json.JSONObject.NULL).put("binarySha256", before))
+                        }
+                    },
+                )
+            } catch (error: Throwable) {
+                invoke.reject("Loaded libbox TLS capabilities unavailable: " + (error.cause?.message ?: error.message))
+            }
+        }, "polaris-tls-capabilities").start()
+    }
+
     @Command
     fun checkConfig(invoke: Invoke) {
         val cfg = invoke.parseArgs(CheckArgs::class.java).configContent

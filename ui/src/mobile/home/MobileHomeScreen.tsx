@@ -1,3 +1,7 @@
+import { prepareRuleAppend } from '@/lib/use-rule-append';
+import { useQualifiedLatencies } from '../use-qualified-latencies';
+import { requestIOSMeasurementConsent } from '../MeasurementStartNotice';
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * 移动端「首页」的**接线层**：读 store、订阅事件流、发 IPC，把结果整形成 `view-model.ts` 的 props。
  * 呈现层（`HomeScreenView`）不认识 store，也不认识 `api` —— 这条分界是门能真渲染本屏的前提。
@@ -71,7 +75,6 @@ import {
 import { ruleSubjectForValue, ruleTypeNameKey, type RuleSubject } from '@/domain/rules';
 import {
   analyzeRuleCoverage,
-  appendSubjectToRule,
   isShadowedTarget,
   matchAppendTargets,
   ruleAppendTargets,
@@ -158,7 +161,7 @@ export function MobileHomeScreen(): ReactElement {
   /** 连接/断开在飞（后端只投影 `starting`，「停止中」没有对应字段，由这里补）。 */
   const [connectBusy, setConnectBusy] = useState<'starting' | 'stopping' | null>(null);
   const [manualCheckBusy, setManualCheckBusy] = useState(false);
-  const checkRun = useRef({ generation: 0, busy: false, alive: true, requestId: null as string | null });
+  const checkRun = useRef({ generation: 0, busy: false, alive: true, backendRequested: false, requestId: null as string | null });
   const normalMainRequired = manualSpeedTestCaps(false).normalMainRequired === true;
   const runWrite = useMemo(() => createRunWrite(setWriteErrors, t), [t]);
 
@@ -177,7 +180,7 @@ export function MobileHomeScreen(): ReactElement {
   const beginUnlockCheck = useAppStore((s) => s.beginUnlockCheck);
   const applyUnlockSnapshot = useAppStore((s) => s.applyUnlockSnapshot);
   const setIpInfo = useAppStore((s) => s.setIpInfo);
-  const latencyMap = useLatencyStore((s) => s.latencyMap);
+  const latencyMap = useQualifiedLatencies(servers);
   const testedAt = useLatencyStore((s) => s.testedAt);
   const config = useEffectiveConfig();
   const { update } = useConfig();
@@ -206,7 +209,7 @@ export function MobileHomeScreen(): ReactElement {
       checkRun.current.generation += 1;
       checkRun.current.alive = false;
       const requestId = checkRun.current.requestId;
-      if (requestId) void runWrite('network-check', async () => {
+      if (requestId && checkRun.current.backendRequested) void runWrite('network-check', async () => {
         try {
           await unlockApi.cancelManualCheck(requestId);
         } catch {
@@ -310,6 +313,8 @@ export function MobileHomeScreen(): ReactElement {
     const code = resolveExitNodeFlagCode(proxyRunning, ipInfo?.proxy?.countryCode);
     return {
       kind: 'node',
+      serverId: currentServer.id,
+      displayedServer: currentServer,
       name: currentServer.name,
       protocolLabel: protocolLabelOf(currentServer.protocol),
       flagSrc: code === null ? null : (countryCodeToFlagAsset(code)?.src ?? null),
@@ -516,9 +521,14 @@ export function MobileHomeScreen(): ReactElement {
     const startedConfig = JSON.stringify(getEffectiveConfig());
     const requestId = normalMainRequired ? crypto.randomUUID() : null;
     checkRun.current.requestId = requestId;
+    checkRun.current.backendRequested = false;
     setManualCheckBusy(true);
     void runWrite('network-check', async () => {
       if (requestId) {
+        if (!await requestIOSMeasurementConsent()) return;
+        if (!checkRun.current.alive || checkRun.current.generation !== generation
+          || JSON.stringify(getEffectiveConfig()) !== startedConfig || useAppStore.getState().selectedServerId !== startedServerId) return;
+        checkRun.current.backendRequested = true;
         const result = await unlockApi.manualCheck(requestId, true);
         const previous = useAppStore.getState().proxyStatus;
         const current = await api.proxy.getStatus();
@@ -533,7 +543,7 @@ export function MobileHomeScreen(): ReactElement {
         if (result.unlock.data) applyUnlockSnapshot(result.unlock.data);
         state.setUnlock({ running: false });
         // The same explicit network action also refreshes the current RTT, after ready.
-        await latencyCheck.runCurrent();
+        await latencyCheck.runCurrent(true);
         const failures = [result.ipInfo.error && t('prerequisite.ipInfoFailed'),
           result.unlock.error && t('prerequisite.unlockFailed')].filter(Boolean);
         if (failures.length) throw new Error(failures.join(' '));
@@ -556,21 +566,26 @@ export function MobileHomeScreen(): ReactElement {
       if (ip.status === 'rejected') throw ip.reason;
       if (services.status === 'rejected') throw services.reason;
     }).finally(() => {
+      const requested = checkRun.current.backendRequested;
       checkRun.current.busy = false;
       checkRun.current.requestId = null;
-      if (requestId && checkRun.current.generation === generation) useAppStore.getState().setUnlock({ running: false });
+      checkRun.current.backendRequested = false;
+      if (requestId && requested && checkRun.current.generation === generation) useAppStore.getState().setUnlock({ running: false });
       if (checkRun.current.alive) setManualCheckBusy(false);
     });
   }, [runWrite, beginUnlockCheck, applyUnlockSnapshot, setIpInfo, normalMainRequired, latencyCheck, t]);
 
   const onUseAsExit = useCallback(
     (server: ServerConfig) => {
-      if (server.id === selectedServerId) {
+      // Only a known manual selection may skip the authoritative switch/readback.
+      const config = useAppStore.getState().config;
+      if (config && config.selectionIntent === undefined && server.id === config.selectedServerId) {
         setPickerOpen(false);
         return;
       }
       void runWrite('switch-node', async () => {
         const receipt = await switchServer(server.id);
+        if (!receipt) return;
         const feedback = mobileSwitchReceiptFeedback(receipt, server.name, t);
         if (feedback?.tone === 'success') toast.success(feedback.text);
         else if (feedback?.tone === 'warning') toast.warning(feedback.text);
@@ -581,7 +596,7 @@ export function MobileHomeScreen(): ReactElement {
         setPickerOpen(false);
       });
     },
-    [runWrite, switchServer, selectedServerId, t],
+    [runWrite, switchServer, t],
   );
 
   /** Sentinel exits use the same authoritative switch receipt as real nodes. */
@@ -589,12 +604,14 @@ export function MobileHomeScreen(): ReactElement {
     (kind: 'direct' | 'block') => {
       if (kind === 'block' && blockDisabledReason !== null) return;
       const id = kind === 'direct' ? DIRECT_SERVER_ID : BLOCK_SERVER_ID;
-      if (id === selectedServerId) {
+      const config = useAppStore.getState().config;
+      if (config && config.selectionIntent === undefined && id === config.selectedServerId) {
         setPickerOpen(false);
         return;
       }
       void runWrite('switch-node', async () => {
         const receipt = await switchServer(id);
+        if (!receipt) return;
         const label = t(kind === 'direct' ? 'home.routingDirect' : 'home.routingBlock');
         const feedback = mobileSwitchReceiptFeedback(receipt, label, t);
         if (feedback?.tone === 'success') toast.success(feedback.text);
@@ -605,7 +622,7 @@ export function MobileHomeScreen(): ReactElement {
         setPickerOpen(false);
       });
     },
-    [blockDisabledReason, selectedServerId, runWrite, switchServer, t],
+    [blockDisabledReason, runWrite, switchServer, t],
   );
 
   const onSetRouting = useCallback(
@@ -715,8 +732,7 @@ export function MobileHomeScreen(): ReactElement {
       const subject = ruleSubject;
       if (subject === null) return;
       void runWrite('rule-add', async () => {
-        const base = rules.find((rule) => rule.id === target.ruleId) ?? null;
-        const next = base === null ? null : appendSubjectToRule(base, target, subject);
+        const { base, next, stagingNow: stagingEnabled } = prepareRuleAppend(target, subject);
         if (next === null) throw new Error(t('rules.appendFail'));
         const label = next.remarks?.trim() || t(ruleTypeNameKey(next.type));
         if (editRoute('trafficRules', stagingEnabled) === 'staged') {
@@ -728,7 +744,7 @@ export function MobileHomeScreen(): ReactElement {
             nextValue: next,
           });
         } else {
-          await api.rules.update(next, 'route');
+          await api.rules.update(next, 'route', base);
           void loadConfig(true);
         }
       }).then(() => {
@@ -758,6 +774,7 @@ export function MobileHomeScreen(): ReactElement {
       onClosePicker={() => setPickerOpen(false)}
       pickerQuery={pickerQuery}
       onPickerQuery={setPickerQuery}
+      autoSelectControls={<SavedAutoSelectControls showStatus t={t} query={pickerQuery} />}
       pickRows={pickRows}
       pickerSubscriptions={config?.subscriptions ?? []}
       onUseAsExit={onUseAsExit}

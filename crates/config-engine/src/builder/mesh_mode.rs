@@ -111,7 +111,8 @@ fn guarded_route(mut rule: RouteRule, mode: &str) -> Option<RouteRule> {
 }
 
 fn guarded_dns(mut rule: DnsRule, mode: &str) -> Option<DnsRule> {
-    if rule.type_field.is_some() || rule.clash_mode.is_some() {
+    // Scoped node policies must be identical in both modes, never caller-mode guarded.
+    if rule.resolver_policy.is_some() || rule.type_field.is_some() || rule.clash_mode.is_some() {
         return None;
     }
     rule.clash_mode = Some(mode.to_owned());
@@ -315,7 +316,10 @@ pub fn try_compile(
         .unwrap_or_default()
         .iter()
         .chain(mesh_dns.rules.as_deref().unwrap_or_default())
-        .any(|rule| rule.action.as_deref() == Some("evaluate") || rule.match_response.is_some())
+        .any(|rule| {
+            rule.resolver_policy.is_none()
+                && (rule.action.as_deref() == Some("evaluate") || rule.match_response.is_some())
+        })
     {
         return false;
     }

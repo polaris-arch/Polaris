@@ -1,3 +1,8 @@
+import { MeasurementLabel } from '@/mobile/MeasurementLabel';
+import { useAppStore, acquireConfigSync, refreshConfig } from '@/store/app-store';
+import { autoSelectT } from './auto-select-labels';
+import { AutoSelectControls } from '@/mobile/AutoSelectControls';
+import { configReadGeneration } from '@/lib/config-read-generation';
 /**
  * 托盘自绘浮层 UI（原型 `.tray-menu` L2905-2963 移植）——**真实接线，无假 UI**。
  *
@@ -26,7 +31,6 @@ import type {
   ProxyErrorCode,
   ProxyMode,
   ProxyModeType,
-  SubscriptionConfig,
 } from '@/contracts/types';
 import {
   groupServersBySubscription,
@@ -64,7 +68,6 @@ import { flagCodeForName } from '@/components/screens/nodes/NdFlag';
 import { FlagImg } from '@/components/FlagImg';
 // FakeIP-TUN 待纠正快照消费（纯函数）：与 HomeScreen.applyIntercept 同源，切到 TUN 时把迁移冻结的
 // enableFakeIp:false 一次性回 true（见 fakeip-tun-entry.ts 头注）。跨目录只读引用，同 shared/format 先例。
-import { applyFakeIpTunEntry } from '@/components/screens/home/fakeip-tun-entry';
 // 降级态（核在跑但流量没经核）与主窗**同一个判定**：跨窗各写一套必然分叉，而分叉的形态就是
 // 「主窗琥珀说未生效、托盘绿点说已连接」。取数走 store 的一次性取数出口（浮层不常驻轮询）。
 import {
@@ -83,7 +86,7 @@ import {
   resolveTrayExitIp,
 } from './tray-node-select';
 import { applyTrayTheme } from './tray-theme';
-import { t, trayLang, refreshTrayLang, type TrayKey } from './labels';
+import { t, trayLang, refreshTrayLang, measurementT, type TrayKey } from './labels';
 import { trayStatusTone, TRAY_TONE_DOT_CLASS } from './tray-status-tone';
 import { revealSiblingGroup, useRevealAfterCommit } from '@/components/reveal';
 
@@ -108,8 +111,8 @@ declare global {
     __POLARIS_TRAY_GENERATION__?: number;
     /** macOS 非激活托盘窗的指针坐标桥；仅补 WebKit 丢掉的 hover，不参与点击/焦点。 */
     __POLARIS_NATIVE_HOVER__?: (clientX: number, clientY: number) => void;
-    /** 宿主每次展开浮层时经 eval 桥调（`tray/window.rs::show_ready_overlay`）：清高度锁并重量一次。 */
-    __POLARIS_TRAY_REMEASURE__?: () => void;
+    /** 既有宿主 eval 桥：所有调用重量；只有成功展开后的精确 show 原因恢复交互。 */
+    __POLARIS_TRAY_REMEASURE__?: (reason?: unknown) => void;
   }
 }
 
@@ -135,10 +138,28 @@ function applyNativeTrayHover(clientX: number, clientY: number): void {
 }
 
 export default function TrayMenu() {
-  const [config, setConfig] = useState<UserConfig | null>(null);
-  const [servers, setServers] = useState<ServerConfig[]>([]);
-  const [subscriptions, setSubscriptions] = useState<SubscriptionConfig[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // This WebView owns its own store/feed. Never hydrate main-window staged state here.
+  const config = useAppStore((state) => state.config);
+  const configRef = useRef<UserConfig | null>(config);
+  configRef.current = config;
+  const servers = config?.servers ?? [];
+  const subscriptions = config?.subscriptions ?? [];
+  const selectedId = config?.selectedServerId ?? null;
+  const mounted = useRef(false);
+  const trayLifecycle = useRef(0);
+  const hydrateGeneration = useRef(0);
+  const interactionEpoch = useRef(0);
+  const interactionActive = useRef(true);
+  const hydrationRequests = useRef(new Set<AbortController>());
+  const refreshOnShow = useRef<() => void>(() => {});
+  // A warm WebView stays mounted after native click-away. Retire work on the
+  // observable blur as well as explicit hide; a later show starts a new owner.
+  const retireInteraction = useCallback(() => {
+    interactionActive.current = false;
+    interactionEpoch.current++;
+    hydrateGeneration.current++;
+    hydrationRequests.current.forEach((controller) => controller.abort());
+  }, []);
   const [running, setRunning] = useState(false);
   // 后端 `ProxyStatus.starting`（读时投影）：`running:false` 期间也可能正在起核（重试预算内可达数十秒）。
   // 托盘每次弹出获焦即 hydrate → 打开浮层时拿到的是当次的真值。
@@ -233,9 +254,12 @@ export default function TrayMenu() {
   // 恰恰是为「不抢焦点」而生的 non-activating 宿主（`tray/platform.rs`），本文件已有多处为
   // WebKit 在非激活窗上丢事件打的补丁（`__POLARIS_NATIVE_HOVER__` 补的就是丢掉的 mousemove）——
   // 把「量不量」押在一个已知会丢的事件上，等于给这次修复留一条随机失效的腿。
-  // 复用既有 eval 桥形态，**不新开 IPC 通道**：这是一次单向、无载荷的通知，通道的全部成本都是净亏。
+  // 同桥也承接 screen-change。只有宿主成功 show 后的精确原因恢复交互；旧无参/未知原因仅重量。
   useLayoutEffect(() => {
-    window.__POLARIS_TRAY_REMEASURE__ = requestRemeasure;
+    window.__POLARIS_TRAY_REMEASURE__ = (reason) => {
+      requestRemeasure();
+      if (reason === 'show') refreshOnShow.current();
+    };
     return () => {
       delete window.__POLARIS_TRAY_REMEASURE__;
     };
@@ -252,94 +276,105 @@ export default function TrayMenu() {
     };
   }, []);
 
-  const hydrate = useCallback(async () => {
-    // 出口 IP 那腿要按连接态分叉取值（见下），而 status 的作用域收在上面那个 try 里 ⇒ 提一个本地变量。
-    // 读取失败时保持 false（= 未连接），与该 catch 的「保持空态」一致，绝不乐观假定已连接。
+  const hydrate = useCallback(async (refresh: 'initial' | 'fresh' | false = false) => {
+    if (!interactionActive.current) return;
+    const life = trayLifecycle.current;
+    const mine = ++hydrateGeneration.current;
+    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && mine === hydrateGeneration.current;
     let connected = false;
+    const controller = refresh ? new AbortController() : null;
+    if (controller) hydrationRequests.current.add(controller);
     try {
-      const [cfg, status] = await Promise.all([
-        api.config.get(),
+      const [, status] = await Promise.all([
+        refresh ? refreshConfig({ fresh: refresh === 'fresh', reason: refresh === 'fresh' ? 'tray-focus' : 'mount', signal: controller!.signal }) : Promise.resolve(),
         api.proxy.getStatus(),
       ]);
+      if (!current()) return;
+      const cfg = useAppStore.getState().config;
+      if (!cfg) return;
       connected = status.running;
-      setConfig(cfg);
-      setServers(cfg.servers ?? []);
-      setSubscriptions(cfg.subscriptions ?? []);
-      setSelectedId(cfg.selectedServerId);
       setRunning(status.running);
+      useAppStore.setState({ proxyStatus: status });
       setStarting(status.starting ?? false);
       setErrorCode(status.errorCode);
-      // 活态取一发 —— 只在**适用范围内**（核稳定运行 + 非 starting + systemProxy）才查，闸门与主窗共用同一个谓词
-      // （`isSystemProxyLiveApplicable`），退出适用范围立刻把结论丢回 `unknown`，别让陈旧的
-      // `not-effective` 悬着。查询失败折 `unknown` 而非 `not-effective`（读不到 ≠ 没生效）。
       if (isSystemProxyLiveApplicable(status.running, cfg.proxyModeType, status.starting)) {
-        setSystemProxyLive(await fetchSystemProxyLive());
+        const live = await fetchSystemProxyLive();
+        if (!current()) return;
+        setSystemProxyLive(live);
       } else {
         setSystemProxyLive('unknown');
       }
-      // A6：把桌面通知总开关同步进**本窗**的 JS 堆。托盘窗与主窗不共享模块实例 ⇒ `App.tsx` 里那次
-      // `setDesktopNotificationsEnabled` 只作用于主窗；缺这行，浮层发的通知会无视用户的关闭设置。
-      setDesktopNotificationsEnabled(cfg.desktopNotifications);
-      // A3：语言可能在主窗被改过（保温期内浮层模块不重载 → 必须显式重解析）。
-      setLang(refreshTrayLang());
-      // 主题按 config.uiTheme 精确校正（显式浅/深直接定；'system' 跟系统偏好）。记 ref 供
-      // 系统主题变化监听 / focus 同步校正复用同一 uiTheme（见下方两处 effect）。
-      uiThemeRef.current = cfg.uiTheme;
-      applyTrayTheme(cfg.uiTheme);
     } catch {
-      /* 读取失败：保持空态（未连接 / 无节点），不崩 */
+      if (!current()) return;
+      // Config/status failure preserves the last trustworthy state.
+      return;
+    } finally {
+      if (controller) hydrationRequests.current.delete(controller);
     }
     try {
       const snap = await api.ipInfo.peek();
-      // 出口 IP **不跨连接态回落**（判定收在 `resolveTrayExitIp`，与状态栏同口径 + vitest 直测）。
+      if (!current()) return;
       setIp(resolveTrayExitIp(connected, snap.proxy?.ip, snap.direct?.ip));
-    } catch {
-      /* ipInfo 不可用：不显 IP */
-    }
+    } catch { /* IP unavailable: preserve the current display. */ }
   }, []);
+  refreshOnShow.current = () => {
+    retireInteraction();
+    interactionActive.current = true;
+    applyTrayTheme(uiThemeRef.current);
+    setLang(refreshTrayLang());
+    setNotice('');
+    setUpdateResult(null);
+    setView('main');
+    focusMenu();
+    void hydrate('fresh');
+  };
 
-  // 挂载：hydrate + 订阅代理生命周期/配置变更 + 窗口 focus（每次浮层弹出即刷新）。
-  useEffect(() => {
-    void hydrate();
+  useLayoutEffect(() => {
+    mounted.current = true;
+    interactionActive.current = true;
+    const life = ++trayLifecycle.current;
+    const applyPublication = (cfg: UserConfig) => {
+      if (!mounted.current || life !== trayLifecycle.current) return;
+      configRef.current = cfg;
+      setDesktopNotificationsEnabled(cfg.desktopNotifications);
+      setLang(refreshTrayLang());
+      uiThemeRef.current = cfg.uiTheme;
+      applyTrayTheme(cfg.uiTheme);
+      void hydrate();
+    };
+    const offConfig = useAppStore.subscribe((state, previous) => {
+      if (state.config && state.config !== previous.config) applyPublication(state.config);
+    });
+    const releaseConfig = acquireConfigSync({ scope: 'tray' });
+    if (configRef.current) applyPublication(configRef.current);
+    void hydrate('initial');
     const offStarted = api.proxy.onStarted(() => {
       setRunning(true);
+      setSystemProxyLive('unknown');
+      setIp('');
       void hydrate();
     });
     const offStopped = api.proxy.onStopped(() => {
       setRunning(false);
-      setStarting(false); // 停/取消完成 → 起核腿必已退场
-      // 顺带回读一次快照：`errored` 的真值在 `ProxyStatus.errorCode` 里，本地推不出来
-      // （主动停会清掉它，崩溃则根本不发这个事件）—— 少了这次回读，状态点会停在旧的错误态。
+      setStarting(false);
+      setSystemProxyLive('unknown');
+      setIp('');
       void hydrate();
     });
-    // 回调必须零参（不得读 payload——事件已无载荷）：Rust 侧 `commands/config.rs` 的
-    // `config_changed_payload_tests` 把本文件 include_str! 进测试判据锁住这条形态，改成读参数的
-    // 形态会让 `cargo test -p polaris` 转红。
-    const offConfig = api.config.onChanged(() => void hydrate());
-    // 浮层每次弹出（获焦）先**同步**按已知 uiTheme 校正主题：保温期内 WebView 复用，隐藏期间系统可能切了明暗，
-    // show 首帧 DOM 还挂着旧 data-theme 会「闪一下旧主题」；同步先校正、再异步 hydrate 拉真值。
-    // 顺带把焦点落到第一个可操作项——像原生菜单一样「打开即可方向键导航」。
-    const onFocus = () => {
-      applyTrayTheme(uiThemeRef.current);
-      // A3 兜底腿：`configChanged` 万一没送达（浮层隐藏期间的投递、或语言只改了 localStorage 那一侧），
-      // 每次弹出获焦时同步重解析一次 —— 与主题校正同款「同步先校正、再异步 hydrate 拉真值」。
-      setLang(refreshTrayLang());
-      setNotice(''); // 上次弹出留下的提示不该跨次显示
-      setUpdateResult(null); // 检查结果只属于上次展开会话，不跨次残留
-      // 复位到主视图（原型 `openTray:4009` 的 `trayView(false)`）：同一代托盘窗在保温期内**复用不重建**，
-      // 上次停在「全部节点」二级视图，下次点托盘图标仍停在那里 —— 用户点图标要的是主视图。
-      setView('main');
-      focusMenu();
-      void hydrate();
-    };
+    const onFocus = () => refreshOnShow.current();
+    // The host's existing injected blur handler invokes tray_hide. Observe that
+    // same event; do not issue another hide or add a config/native protocol.
+    window.addEventListener('blur', retireInteraction);
     window.addEventListener('focus', onFocus);
     return () => {
-      offStarted();
-      offStopped();
-      offConfig();
+      mounted.current = false;
+      trayLifecycle.current++;
+      retireInteraction();
+      offStarted(); offStopped(); offConfig(); releaseConfig();
+      window.removeEventListener('blur', retireInteraction);
       window.removeEventListener('focus', onFocus);
     };
-  }, [hydrate]);
+  }, [hydrate, retireInteraction]);
 
   // ── 键盘操作（像内置菜单）──
   // ↑↓/Home/End 在可操作项间导航（`button:not([disabled])` 天然跳过分隔线/静态标签/置灰项；「全部节点」
@@ -350,6 +385,7 @@ export default function TrayMenu() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
+        retireInteraction();
         void invoke(IPC_CHANNELS.TRAY_HIDE).catch(() => {});
         return;
       }
@@ -371,7 +407,7 @@ export default function TrayMenu() {
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, []);
+  }, [retireInteraction]);
 
   // 切视图（main↔nodes）后焦点落回菜单容器（非按钮）：切视图由**点击**触发，聚焦按钮同样会打上
   // :focus-visible 焦点环（同 defect#2）。容器获焦下方向键仍从首项起步导航（见 focusMenu 注释）。
@@ -408,7 +444,7 @@ export default function TrayMenu() {
   // 同一件事的两个名字（同宽回落、只改基线时可能量不出尺寸变化），而它的成本只是一个 promise 回调。
   useEffect(() => armFontsReadyRemeasure(document, requestRemeasure), [requestRemeasure]);
 
-  useEffect(() => subscribeLatencyEvents(), []);
+  useEffect(() => subscribeLatencyEvents({ poll: false }), []);
 
   // 每次重排都重新收敛：主视图的每一次测量都写进锁，节点视图再长也只在卡片内部滚动，全部折叠也
   // 不会把整个自绘菜单缩成一截（那段时间回报的是最近一次主视图的值）。
@@ -445,7 +481,10 @@ export default function TrayMenu() {
     return () => ro.disconnect();
   }, [config, view, remeasureNonce]);
 
-  const hide = () => void invoke(IPC_CHANNELS.TRAY_HIDE).catch(() => {});
+  const hide = () => {
+    retireInteraction();
+    return void invoke(IPC_CHANNELS.TRAY_HIDE).catch(() => {});
+  };
 
   /**
    * W14：动作失败必须在浮层里可见。旧口径「错误经 proxy:error 事件在主窗呈现」在主窗关闭
@@ -455,6 +494,7 @@ export default function TrayMenu() {
    */
   const noticeActionFailure = (actionLabel: string, err: unknown) => {
     console.error('[TrayMenu] action failed:', actionLabel, err);
+    if (!mounted.current) return;
     setNotice(t('tray.actionFailed', { action: actionLabel, detail: t('tray.actionFailedDetail') }));
   };
 
@@ -503,22 +543,23 @@ export default function TrayMenu() {
   // 切模式同样**不关浮层**（原型 `:4240` `tray-mode` 无 `hidden=true`）—— 切完模式常接着切节点，
   // 每点一次就收起会逼用户反复唤出托盘。射程与原型逐条对齐：只有「选节点」关。
   const setMode = async (mode: ProxyMode) => {
+    const life = trayLifecycle.current, operation = interactionEpoch.current;
     if (mode === config?.proxyMode) return;
     try {
-      const saved = await withConfigWriteLock(() => api.config.patch({ proxyMode: mode }));
-      setConfig(saved);
+      await useAppStore.getState().saveConfig({ proxyMode: mode });
     } catch (err) {
-      noticeActionFailure(t('tray.groupMode'), err);
+      if (mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current) noticeActionFailure(t('tray.groupMode'), err);
       return; // 失败保持浮层开着（W14），成功才落到下面的正常路径
     }
   };
 
-  // 切接管方式（systemProxy/TUN/manual）：与 HomeScreen.applyIntercept 同源——先过 applyFakeIpTunEntry
-  // 消费「FakeIP-TUN 待纠正」快照，再把本动作涉及的字段作为一个原子 patch 落盘。
+  // 与首页复用后端最新配置事务；只发送用户选择的mode，不发送托盘旧DNS快照。
   // 直接落盘不弹「已连接会重启」确认（浮层无 dialog 层，对齐 上游 托盘 onChangeProxyModeType 的直切语义；
   // 已连接切换会瞬断当前连接，属托盘直切既定取舍）。
   const setTakeover = async (modeType: ProxyModeType) => {
-    if (!config || modeType === config.proxyModeType) {
+    const life = trayLifecycle.current, operation = interactionEpoch.current;
+    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
+    if (!config) {
       hide();
       return;
     }
@@ -528,14 +569,8 @@ export default function TrayMenu() {
       // 与主窗 `HomeScreen.applyIntercept` 的 notifyDesktop 那条腿）+ 浮层内 notice 行双管——
       // 托盘切换常在主窗关闭时发生，主窗那条 toast 此刻看不到；而浮层这行只在浮层还开着时有用。
       // 开关门控由 hydrate 里的 `setDesktopNotificationsEnabled` 负责（用户关了就静默不发）。
-      const { config: next, corrected } = applyFakeIpTunEntry({ ...config, proxyModeType: modeType });
-      const patch: Partial<UserConfig> = {
-        proxyModeType: next.proxyModeType,
-        dnsConfig: next.dnsConfig,
-      };
-      if (next.dnsDefaults !== undefined) patch.dnsDefaults = next.dnsDefaults;
-      const saved = await withConfigWriteLock(() => api.config.patch(patch));
-      setConfig(saved);
+      const { corrected } = await api.config.setTakeover(modeType);
+      if (!current()) return;
       if (corrected) {
         const title = t('tray.takeoverTun');
         const body = t('tray.fakeIpAutoEnabled');
@@ -544,20 +579,28 @@ export default function TrayMenu() {
         return; // 保持浮层打开，让 notice 有机会被看到
       }
     } catch (err) {
-      noticeActionFailure(t('tray.groupTakeover'), err);
+      if (current()) noticeActionFailure(t('tray.groupTakeover'), err);
       return; // 失败不关浮层（W14）；成功才 hide
     }
     hide();
   };
 
   const switchExit = async (id: string, node: string) => {
+    const life = trayLifecycle.current, operation = interactionEpoch.current;
+    const current = () => mounted.current && interactionActive.current && life === trayLifecycle.current && operation === interactionEpoch.current;
     try {
-      const { receipt, saved } = await withConfigWriteLock(async () => {
+      const { receipt, saved, readGeneration } = await withConfigWriteLock(async () => {
         const receipt = await api.server.switch(id);
-        return { receipt, saved: await api.config.get() };
+        const readGeneration = configReadGeneration.beginRead();
+        return { receipt, saved: await api.config.get(), readGeneration };
       });
-      setConfig(saved);
-      setSelectedId(saved.selectedServerId);
+      if (!configReadGeneration.isCurrent(readGeneration)) return;
+      // In tray scope acceptance publishes synchronously. Capture that NEW
+      // authority before yielding: publication invalidates the dedicated read.
+      const acceptance = useAppStore.getState().acceptSelectionConfig(saved);
+      const publicationGeneration = configReadGeneration.current();
+      await acceptance;
+      if (!current() || !configReadGeneration.isCurrent(publicationGeneration)) return;
       const feedback = traySwitchFeedback(receipt, node, t);
       setNotice(feedback.notice ?? '');
       if (feedback.close) {
@@ -565,7 +608,7 @@ export default function TrayMenu() {
         hide();
       }
     } catch (err) {
-      noticeActionFailure(node, err);
+      if (current()) noticeActionFailure(node, err);
     }
   };
 
@@ -794,11 +837,7 @@ export default function TrayMenu() {
       .filter((s): s is ServerConfig => !!s);
   }, [config?.recentServerIds, directSelected, blockSelected, selectedId, servers]);
 
-  const latText = (v: number | null | undefined): string => {
-    if (v === null) return t('tray.timeout');
-    if (v === undefined) return '';
-    return `${v} ms`;
-  };
+
 
   return (
     <>
@@ -883,7 +922,7 @@ export default function TrayMenu() {
                       <path d="M5 12l5 5 9-11" />
                     </svg>
                   ) : (
-                    <span className={`tray-lat ${latLevel(lat)}`}>{latText(lat)}</span>
+                    <span className={`tray-lat ${latLevel(lat)}`}><MeasurementLabel serverId={s.id} displayedServer={s} translate={measurementT} /></span>
                   )}
                 </button>
               );
@@ -933,7 +972,7 @@ export default function TrayMenu() {
             ))}
 
             {/* 接管方式（systemProxy/TUN/manual）——托盘内直切（审查 HIGH，对齐 上游 proxyModeTypeSubmenu）。
-                切换走 setTakeover（applyFakeIpTunEntry + config.save，与 HomeScreen.applyIntercept 同源）。 */}
+                切换走 setTakeover（后端最新配置事务，与 HomeScreen.applyIntercept 同源）。 */}
             <div className="tray-sep" />
             <div className="tray-group-h">{t('tray.groupTakeover')}</div>
             {TAKEOVERS.map((tk) => (
@@ -1119,6 +1158,9 @@ export default function TrayMenu() {
             <div className="tray-sep" />
 
             {/* W15：零节点时的空态——不给「菜单塌成一条」的错觉，保住与主视图同量级的高度 */}
+            <AutoSelectControls showStatus config={config} t={autoSelectT} getCurrentConfig={() => configRef.current} accept={async saved => {
+              await useAppStore.getState().acceptSelectionConfig(saved);
+            }} />
             {groups.length === 0 && <div className="tray-nodes-empty">{t('tray.noNode')}</div>}
 
             {/* 按分组列出（自建/组网/各订阅），组内可选按延迟排序（use-node-sort-store 持久偏好，
@@ -1174,7 +1216,7 @@ export default function TrayMenu() {
                               <path d="M5 12l5 5 9-11" />
                             </svg>
                           ) : (
-                            <span className={`tray-lat ${latLevel(lat)}`}>{latText(lat)}</span>
+                            <span className={`tray-lat ${latLevel(lat)}`}><MeasurementLabel serverId={s.id} displayedServer={s} translate={measurementT} /></span>
                           )}
                         </button>
                       );
