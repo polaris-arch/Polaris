@@ -20,16 +20,63 @@ test('plan rejects public/DNS peers, arbitrary extra fields, port and TTL drift'
   for (const bad of [{peers:['example.com']},{peers:['8.8.8.8']},{port:80},{ttlMillis:300001},{arbitraryPath:'/tmp/file'}]) assert.throws(() => validatePlan({...plan,...bad}));
 });
 test('authenticated health and zero matched remains observed no match with attribution unknown',() => {
-  const r=classifyObservations({tcp:{matched:0,health:2},udp:{matched:0,health:0}});
+  const r=classifyObservations({tcp:{matched:0,health:2,invalid:0,replay:0,bytes:0,sealed:false},udp:{matched:0,health:0,invalid:0,replay:0,bytes:0,sealed:false}});
   assert.equal(r.tcpWitness,'ObservedNoMatch'); assert.equal(r.coreIngressAttribution,'Unknown'); assert.equal(r.policyNegative,'NotObserved');
   assert.ok(!Object.values(r).includes('PolicyRejected'));
 });
 test('collector rejects fixture sources, old APK and late A receipt for B',async () => {
-  const report={schema:SCHEMA,source:'AppLive',apkSha256:'a'.repeat(64),expectedSourcePin:'b'.repeat(64),bootNonce:'c'.repeat(32),sessionId:'d'.repeat(32),nonce:'e'.repeat(48),tcp:{matched:1,health:0},udp:{matched:0,health:0}};
+  const report={schema:SCHEMA,source:'AppLive',apkSha256:'a'.repeat(64),expectedSourcePin:'b'.repeat(64),bootNonce:'c'.repeat(32),sessionId:'d'.repeat(32),nonce:'e'.repeat(48),tcp:{matched:1,health:0,invalid:0,replay:0,bytes:0,sealed:false},udp:{matched:0,health:0,invalid:0,replay:0,bytes:0,sealed:false}};
   const invoke=async () => ({success:true,data:JSON.stringify(report)});
-  const expected={apkSha256:report.apkSha256,sourcePin:report.expectedSourcePin};
+  const expected={apkSha256:report.apkSha256,sourcePin:report.expectedSourcePin,sessionId:report.sessionId,bootNonce:report.bootNonce,nonce:report.nonce};
   assert.equal((await collectDebugBatch(invoke,{action:'snapshot',sessionId:report.sessionId},expected)).executionGate,'ActualDeviceAndIndependentPeerNotObserved');
   await assert.rejects(collectDebugBatch(invoke,{action:'snapshot',sessionId:'f'.repeat(32)},expected));
-  await assert.rejects(collectDebugBatch(invoke,{action:'snapshot'},{...expected,apkSha256:'f'.repeat(64)}));
-  await assert.rejects(collectDebugBatch(async()=>({success:true,data:JSON.stringify({...report,source:'Fixture'})}),{action:'snapshot'},expected));
+  await assert.rejects(collectDebugBatch(invoke,{action:'snapshot',sessionId:report.sessionId},{...expected,apkSha256:'f'.repeat(64)}));
+  await assert.rejects(collectDebugBatch(async()=>({success:true,data:JSON.stringify({...report,source:'Fixture'})}),{action:'snapshot',sessionId:report.sessionId},expected));
+});
+test('collector rejects absent pins and invalid sessions before invoking bridge', async () => {
+  let calls=0;
+  const invoke=async()=>{ calls++; throw Error('must not invoke'); };
+  for (const expected of [{},{apkSha256:undefined,sourcePin:undefined},{apkSha256:'x',sourcePin:'b'.repeat(64)}]) {
+    await assert.rejects(collectDebugBatch(invoke,{action:'snapshot',sessionId:'d'.repeat(32)},expected));
+  }
+  const expected={apkSha256:'a'.repeat(64),sourcePin:'b'.repeat(64)};
+  for (const args of [{action:'snapshot'},{action:'snapshot',sessionId:3},{action:'prepare'},{action:'snapshot',sessionId:'d'.repeat(32),plan:'{}'}]) {
+    await assert.rejects(collectDebugBatch(invoke,args,expected));
+  }
+  assert.equal(calls,0);
+});
+test('numeric strings, booleans, absent, negative, fractional and overflowing counters cannot classify', () => {
+  for (const value of ['1',true,undefined,null,-1,0.5,NaN,Infinity,Number.MAX_SAFE_INTEGER+1]) {
+    for (const protocol of ['tcp','udp']) for (const counter of ['matched','health','invalid','replay','bytes']) {
+      const report={tcp:{matched:1,health:0,invalid:0,replay:0,bytes:0,sealed:false},udp:{matched:0,health:0,invalid:0,replay:0,bytes:0,sealed:false}};
+      report[protocol][counter]=value;
+      assert.throws(()=>classifyObservations(report));
+    }
+  }
+});
+test('malformed counters returned by mock bridge fail closed', async () => {
+  const report={schema:SCHEMA,source:'AppLive',apkSha256:'a'.repeat(64),expectedSourcePin:'b'.repeat(64),bootNonce:'c'.repeat(32),sessionId:'d'.repeat(32),nonce:'e'.repeat(48),tcp:{matched:'1',health:0,invalid:0,replay:0,bytes:0,sealed:false},udp:{matched:0,health:0,invalid:0,replay:0,bytes:0,sealed:false}};
+  await assert.rejects(collectDebugBatch(async()=>({success:true,data:JSON.stringify(report)}),
+    {action:'snapshot',sessionId:report.sessionId},{apkSha256:report.apkSha256,sourcePin:report.expectedSourcePin,sessionId:report.sessionId,bootNonce:report.bootNonce,nonce:report.nonce}));
+});
+
+test('actual snapshot and metadata serializers accept all six counter fields', async () => {
+  // DebugBatchQa.kt snapshotReport and metadataReport share this exact counter shape.
+  for (const sealed of [false, true]) {
+    const report={schema:SCHEMA,source:'AppLive',apkSha256:'a'.repeat(64),expectedSourcePin:'b'.repeat(64),bootNonce:'c'.repeat(32),sessionId:'d'.repeat(32),nonce:'e'.repeat(48),
+      tcp:{matched:1,health:2,invalid:3,replay:4,bytes:128,sealed},
+      udp:{matched:0,health:1,invalid:0,replay:0,bytes:64,sealed}};
+    const expected={apkSha256:report.apkSha256,sourcePin:report.expectedSourcePin,sessionId:report.sessionId,bootNonce:report.bootNonce,nonce:report.nonce};
+    const result=await collectDebugBatch(async()=>({success:true,data:JSON.stringify(report)}),
+      {action:sealed?'cleanupObserve':'snapshot',sessionId:report.sessionId},expected);
+    assert.equal(result.observations.tcpWitness,'ObservedPass');
+    assert.equal(result.executionGate,'ActualDeviceAndIndependentPeerNotObserved');
+    for (const invalid of [undefined,0,'false',null]) {
+      report.tcp.sealed=invalid;
+      assert.throws(()=>classifyObservations(report));
+    }
+    report.tcp.sealed=sealed;
+    delete report.tcp.bytes;
+    assert.throws(()=>classifyObservations(report));
+  }
 });

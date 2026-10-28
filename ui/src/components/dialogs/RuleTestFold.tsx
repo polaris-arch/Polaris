@@ -1,6 +1,5 @@
-import { useMemo } from 'react';
 import type { TFunction } from 'i18next';
-import { computeTestMatch, type Cond, type TestResult } from './rule-cond';
+import { type TestResult } from './rule-cond';
 import { revealOnToggle } from '@/components/reveal';
 
 function Chevron() {
@@ -11,11 +10,6 @@ function Chevron() {
   );
 }
 
-/** 测试匹配结果——客户端启发式即时反馈，从 `RuleForm` 外提，供状态与其消费的 JSX 共用。 */
-export function useRuleTestFold(conds: readonly Cond[], logic: 'and' | 'or', test: string): TestResult {
-  return useMemo(() => computeTestMatch(conds, logic, test), [conds, logic, test]);
-}
-
 interface RuleTestFoldProps {
   t: TFunction;
   test: string;
@@ -23,7 +17,7 @@ interface RuleTestFoldProps {
   testResult: TestResult;
 }
 
-/** 测试匹配（折叠，客户端启发式即时反馈）。 */
+/** 测试匹配（折叠；缺少上下文或不支持的表达式明确显示无法判断）。 */
 export function RuleTestFold({ t, test, setTest, testResult }: RuleTestFoldProps) {
   return (
     <div className="fld">

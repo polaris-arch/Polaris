@@ -164,7 +164,9 @@ fn preview_treats_renderer_via_proxy_as_preference_not_effective_fact() {
 /// 这正是本门存在的理由。
 #[test]
 fn changing_ua_drops_the_conditional_get_validators() {
-    let body = fn_body("pub fn subscription_update(");
+    let wrapper = fn_body("pub fn subscription_update(");
+    assert!(wrapper.contains("subscription_update_core(state.config(), subscription)"));
+    let body = fn_body("fn subscription_update_core(");
     let at = body
         .find("ua_changed(&arr[idx], &subscription)")
         .expect("变异锁：UA 变更未作废验证器 → 机场按 UA 下发变体时永远 304，新格式拿不到");
@@ -187,9 +189,17 @@ fn the_update_shell_cannot_return_without_a_terminal_frame() {
         shell.contains("terminal_progress_frame(&result)"),
         "变异锁：删掉终态帧 → 订阅信息栏永远挂在「更新中」，且失败无处可见"
     );
-    // 外壳里**一条早退都不许有**：有了就说明存在一条绕过终态帧的路径。
+    // Rejected overlap has not started progress and must not terminate the active owner.
+    let progress = shell
+        .find("let sink:")
+        .expect("admitted operation owns progress");
+    let admission = shell
+        .find("subscription_refresh.try_admit(subscription_id)")
+        .unwrap();
+    assert!(admission < progress);
+    // Once progress has started, every outcome must reach the owner's terminal frame.
     assert!(
-        !shell.contains("return"),
+        !shell[progress..].contains("return"),
         "变异锁：往外壳里塞早退 = 重新造出「某些结局不发终态帧」这个原始缺陷"
     );
     // 终态只有一个发射者：内层自己再发一份就会与外壳打架（顺序/内容都无从保证）。

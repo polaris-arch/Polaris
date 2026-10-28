@@ -13,10 +13,18 @@ pub struct InstallArgs {
     pub source: PathBuf,
     pub manifest: PathBuf,
     pub source_owner: Option<polaris_helper_proto::core_protocol::CallerIdentity>,
+    /// Migration preserves every previous payload; no repair-in-place or GC.
+    pub preserve_existing: bool,
 }
 
 impl InstallArgs {
     pub fn parse(args: &[String]) -> Result<Self, &'static str> {
+        let preserve_existing = args.last().map(String::as_str) == Some("--preserve-existing");
+        let args = if preserve_existing {
+            &args[..args.len() - 1]
+        } else {
+            args
+        };
         if !matches!(args.len(), 7 | 9) || args[0] != "core-install" {
             return Err("invalid core-install arguments");
         }
@@ -39,6 +47,7 @@ impl InstallArgs {
             }
         }
         let value = Self {
+            preserve_existing,
             root: root.ok_or("missing root")?,
             source: source.ok_or("missing source")?,
             manifest: manifest.ok_or("missing manifest")?,
@@ -136,8 +145,12 @@ fn install(args: &InstallArgs) -> io::Result<String> {
         }
         _ => None,
     };
-    store.install(&manifest, &args.source, source_uid, source_sid)?;
-    store.retain_latest_three(&[])?;
+    if args.preserve_existing {
+        store.install_preserving(&manifest, &args.source, source_uid, source_sid)?;
+    } else {
+        store.install(&manifest, &args.source, source_uid, source_sid)?;
+        store.retain_latest_three(&[])?;
+    }
     Ok(format!(
         "core-installed {} {}",
         manifest.id, manifest.core.version
@@ -218,6 +231,95 @@ fn privileged() -> io::Result<bool> {
 
 /// Return None for daemon argv. Administrative argv never falls through to daemon mode.
 pub fn run(args: &[String]) -> Option<std::process::ExitCode> {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = crate::mac_migration_guard::run(args) {
+        return Some(result);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if args.first().is_some_and(|verb| {
+        matches!(
+            verb.as_str(),
+            "migration-stop"
+                | "migration-recheck"
+                | "migration-candidate"
+                | "migration-rollback"
+                | "migration-uninstall-preflight-unchanged"
+        )
+    }) {
+        eprintln!("migration administration requires macOS");
+        return Some(std::process::ExitCode::FAILURE);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if matches!(
+        args.first().map(String::as_str),
+        Some("sync-install-path" | "validate-install-path")
+    ) {
+        let result = (|| {
+            if !privileged()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "administrator required",
+                ));
+            }
+            if args.len() != 3 || args[1] != "--path" {
+                return Err(invalid("invalid journal sync arguments"));
+            }
+            let path = Path::new(&args[2]);
+            let metadata = std::fs::symlink_metadata(path)?;
+            let held = crate::protected_install_path::ProtectedPath::open(path, metadata.is_dir())?;
+            if args[0] == "sync-install-path" {
+                held.file.sync_all()?;
+            }
+            held.unchanged()
+        })();
+        return Some(match result {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("installation sync: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        });
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if matches!(
+        args.first().map(String::as_str),
+        Some("snapshot-user" | "restore-user")
+    ) {
+        let result = (|| {
+            if !privileged()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "administrator required",
+                ));
+            }
+            if args.len() != 7
+                || args[1] != "--support"
+                || args[3] != "--identity"
+                || args[5] != "--backup"
+            {
+                return Err(invalid("invalid registration transaction arguments"));
+            }
+            let caller = crate::user_control::parse_identity(&args[4])
+                .ok_or_else(|| invalid("invalid user identity"))?;
+            let support = Path::new(&args[2]);
+            let backup = Path::new(&args[6]);
+            if !support.is_absolute() || !backup.is_absolute() {
+                return Err(invalid("absolute transaction paths required"));
+            }
+            if args[0] == "snapshot-user" {
+                crate::user_control::snapshot_registration(support, &caller, backup)
+            } else {
+                crate::user_control::restore_registration(support, &caller, backup)
+            }
+        })();
+        return Some(match result {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("registration transaction: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        });
+    }
     if args.first().map(String::as_str) == Some("register-user") {
         let result = (|| {
             if !privileged()? {

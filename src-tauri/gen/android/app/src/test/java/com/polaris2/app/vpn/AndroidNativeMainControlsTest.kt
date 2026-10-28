@@ -429,7 +429,7 @@ class AndroidNativeMainControlsTest {
         val closed = service.substringAfter("private fun onAttemptClosed(").substringBefore("private fun registerStopReceiver(")
         assertFalse(closed.contains("setError("))
         assertTrue(closed.contains("AndroidNativeMain.unknown(attempt)"))
-        assertTrue(closed.contains("VpnBridge.finishStop(\"android: 内核关闭失败\")"))
+        assertTrue(closed.contains("VpnBridge.finishStop(\"android: 内核关闭失败\", attempt)"))
         assertEquals(setOf("main.bridge", "main.system", "validation.checkConfig"), AndroidNativeCoverage.wiredProducers)
     }
 }

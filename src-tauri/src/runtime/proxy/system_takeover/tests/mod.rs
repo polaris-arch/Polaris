@@ -146,3 +146,76 @@ async fn enable_queued_before_query_cannot_write_after_cancellation_reopens_admi
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert!(takeover.cancel_session_query(current));
 }
+
+struct MutationCounter {
+    clears: Arc<AtomicU64>,
+    enables: Arc<AtomicU64>,
+}
+impl SystemProxyClearer for MutationCounter {
+    fn ensure_cleared(&mut self) -> bool {
+        self.clears.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+    fn detect_foreign_proxy(&self) -> Option<String> {
+        None
+    }
+    fn enable_system_proxy(&mut self, _: &ProxyEnableRequest) -> Result<(), String> {
+        self.enables.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn recover_from_marker(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+#[tokio::test]
+async fn cancelled_clear_waiter_cannot_clear_a_successor_marker() {
+    use polaris_core_supervisor::lifecycle_gate::LifecycleGate;
+    let clears = Arc::new(AtomicU64::new(0));
+    let enables = Arc::new(AtomicU64::new(0));
+    let takeover = SystemProxyTakeover::new(Box::new(MutationCounter {
+        clears: clears.clone(),
+        enables: enables.clone(),
+    }));
+    let gate = Arc::new(LifecycleGate::default());
+    let generation = gate.generation();
+    let observed_gate = gate.clone();
+    let controller = takeover.controller.clone();
+    let mut held = controller.lock().unwrap();
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let mut cleanup = Box::pin(takeover.clear_when(None, move || {
+        let current = observed_gate.try_generation() == Some(generation);
+        let _ = checked_tx.send(current);
+        current
+    }));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(cleanup.as_mut(), &mut cx).is_pending());
+    drop(cleanup); // spawn_blocking survives cancellation, while still behind controller lock.
+    gate.bump_generation();
+    // Model successor enable under the same controller mutex before the old worker obtains it.
+    held.enable_system_proxy(&ProxyEnableRequest {
+        address: "127.0.0.1".into(),
+        http_port: 7890,
+        socks_port: 7890,
+        bypass_list: vec![],
+    })
+    .unwrap();
+    drop(held);
+    assert!(!checked_rx.await.unwrap());
+    // Acquiring the controller again proves no lock was leaked; zero old mutation occurred.
+    drop(controller.lock().unwrap());
+    assert_eq!(enables.load(Ordering::SeqCst), 1);
+    assert_eq!(clears.load(Ordering::SeqCst), 0);
+    assert!(
+        !takeover.clear_when(None, || false).await,
+        "unknown must fail closed"
+    );
+    assert_eq!(clears.load(Ordering::SeqCst), 0);
+    let current = gate.generation();
+    assert!(
+        takeover
+            .clear_when(None, move || gate.try_generation() == Some(current))
+            .await
+    );
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
+}

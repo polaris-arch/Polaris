@@ -90,23 +90,23 @@ fn write_read_roundtrip_and_remove() {
     let path = Path::new("/data/privacy-lock.json");
     let h = hash_password("horse-correct", &SALT_A).unwrap();
     write(&fs, path, &h).unwrap();
-    assert!(has(&fs, path), "写后 has=true");
-    let got = read(&fs, path).expect("读回");
+    assert!(has(&fs, path).unwrap(), "写后 has=true");
+    let got = read(&fs, path).unwrap().expect("读回");
     assert_eq!(got, h, "读回结构须与写入一致");
     assert!(verify("horse-correct", &got), "读回后正确密码验过");
     assert!(!verify("nope", &got));
     remove(&fs, path).unwrap();
-    assert!(!has(&fs, path), "删除后 has=false");
-    assert!(read(&fs, path).is_none());
+    assert!(!has(&fs, path).unwrap(), "删除后 has=false");
+    assert!(read(&fs, path).unwrap().is_none());
 }
 
 #[test]
-fn read_corrupt_or_missing_is_none_fail_open() {
+fn read_distinguishes_missing_from_corrupt_fail_closed() {
     let p = Path::new("/data/privacy-lock.json");
     let fs = crate::MockFs::default().with(p, "{not json");
-    assert!(read(&fs, p).is_none(), "坏 JSON → None（fail-open）");
+    assert!(read(&fs, p).is_err(), "坏 JSON must not mean no password");
     assert!(
-        read(&fs, Path::new("/data/nope.json")).is_none(),
+        read(&fs, Path::new("/data/nope.json")).unwrap().is_none(),
         "缺失 → None"
     );
     // 结构合法但 algo 异类 → None。
@@ -114,7 +114,7 @@ fn read_corrupt_or_missing_is_none_fail_open() {
         p,
         r#"{"algo":"md5","salt":"aa","hash":"bb","params":{"N":16384,"r":8,"p":1,"keyLen":32}}"#,
     );
-    assert!(read(&fs2, p).is_none(), "algo 异类 → None");
+    assert!(read(&fs2, p).is_err(), "invalid algorithm is an error");
 }
 
 /// 0600 权限位（unix）：写盘经 StdFs → open(2) 即 0600，无 0644 携密窗口。用真实 tempdir（不碰用户真配置）。
@@ -135,7 +135,7 @@ fn write_sets_0600_perms_on_unix() {
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "隐私锁文件须 0600（仅属主读写）");
     // 读回校验（真实 FS 往返）。
-    assert!(verify("pw", &read(&StdFs, &path).unwrap()));
+    assert!(verify("pw", &read(&StdFs, &path).unwrap().unwrap()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -170,4 +170,35 @@ fn verify_malformed_unicode_salt_and_hash_fail_closed() {
     uppercase.hash.make_ascii_uppercase();
     assert!(verify("password", &uppercase));
     assert!(!verify("wrong", &uppercase));
+}
+
+#[test]
+fn credential_write_stages_before_replacing_the_record() {
+    let fs = crate::MockFs::default();
+    let path = Path::new("/data/privacy-lock.json");
+    let hash = hash_password("pw", &SALT_A).unwrap();
+    write(&fs, path, &hash).unwrap();
+    let operations = fs.operations();
+    let (from, to) = operations
+        .iter()
+        .find_map(|op| match op {
+            crate::FsOp::Rename(from, to) => Some((from, to)),
+            _ => None,
+        })
+        .expect("credential must be published by rename");
+    assert_ne!(from, path);
+    assert_eq!(to, path);
+    assert!(!operations
+        .iter()
+        .any(|op| matches!(op, crate::FsOp::Write(target, _) if target == path)));
+}
+
+#[test]
+fn untrusted_kdf_cost_is_rejected_before_allocation() {
+    let mut record = hash_password("pw", &SALT_A).unwrap();
+    record.params.key_len = u32::MAX;
+    assert!(!verify("pw", &record));
+    record.params = PARAMS;
+    record.params.n = 1 << 31;
+    assert!(!verify("pw", &record));
 }

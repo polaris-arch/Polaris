@@ -647,3 +647,24 @@ fn native_cache_command_has_its_own_strict_capability_name() {
     );
     assert_eq!(Request::FlushDns.command_name(), "flush-dns");
 }
+
+#[test]
+fn config_confinement_rejects_traversal_and_windows_aliases() {
+    let base = r"C:\registered";
+    for path in [
+        r"C:\registered\..\outside.json",
+        r"C:\registered\.\file.json",
+        r"C:\registered\sub\..\file.json",
+        r"C:\registered\file.json:stream",
+        r"C:\registered\sub.\file.json",
+        r"C:\registered\NUL.json",
+        r"C:\registered\COM1",
+        r"C:registered\file.json",
+        r"\\?\C:\registered\file.json",
+        r"\\server\share\file.json",
+        r"\registered\file.json",
+    ] {
+        assert!(!cfg_allowed(path, base), "accepted alias {path}");
+    }
+    assert!(cfg_allowed(r"C:\registered\配置.json", base));
+}

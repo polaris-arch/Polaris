@@ -27,7 +27,15 @@ fn administrative_arguments_are_exact_and_allow_a_root_sealed_manifest() {
         "--manifest",
         r"C:\stage\core-manifest.json",
     ]);
-    assert!(InstallArgs::parse(&valid).is_ok());
+    assert!(!InstallArgs::parse(&valid).unwrap().preserve_existing);
+    let mut preserve = valid.clone();
+    preserve.push("--preserve-existing".into());
+    assert!(InstallArgs::parse(&preserve).unwrap().preserve_existing);
+    preserve.push("--preserve-existing".into());
+    assert!(InstallArgs::parse(&preserve).is_err());
+    let mut valued = valid.clone();
+    valued.push("--preserve-existing=true".into());
+    assert!(InstallArgs::parse(&valued).is_err());
     let mut sealed = valid.clone();
     #[cfg(unix)]
     {
@@ -47,4 +55,20 @@ fn administrative_arguments_are_exact_and_allow_a_root_sealed_manifest() {
     let mut extra = valid;
     extra.push("--daemon".into());
     assert!(InstallArgs::parse(&extra).is_err());
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn unsupported_installer_verbs_never_fall_through_to_daemon_mode() {
+    for verb in [
+        "sync-install-path",
+        "validate-install-path",
+        "snapshot-user",
+        "restore-user",
+    ] {
+        assert_eq!(
+            run(&[verb.to_owned()]),
+            Some(std::process::ExitCode::FAILURE)
+        );
+    }
 }

@@ -4,6 +4,8 @@
 //! 实现按规则 CRUD、规则资源与图标图库分属各自 owner；共享依赖只留在这里，避免三份漂移。
 
 mod crud;
+mod preview;
+pub use preview::{rules_preview_regex, rules_validate_regex};
 pub(crate) mod icons;
 mod network_profiles;
 mod resources;

@@ -141,7 +141,7 @@ const O_NET: readonly (readonly [string, string])[] = [
   ['httpupgrade', 'HTTPUpgrade'],
   ['http', 'HTTP/2'],
 ];
-// Missing intent is a compatibility default, distinct from core default and disabled.
+// Missing intent uses the capability-aware Chrome default; explicit off remains distinct.
 const O_FP = NODE_UTLS_OPTIONS;
 const O_FP_OPT = NODE_UTLS_OPTIONS;
 
@@ -542,7 +542,7 @@ export const ND_SPEC: Record<NodeProto, NodeSpec> = {
       ...F_TRANSPORT,
       { t: 'select', k: 'sec', label: 'node.field.sec', options: [['none', 'None'], ['tls', 'TLS']] },
       { t: 'text', k: 'sni', label: 'node.field.sni', ph: 'example.com', when: whenTls },
-      // uTLS 指纹：后端对 vmess 的缺省是 `none`（不下发 utls 块），故用带空档的 O_FP_OPT，见其注释。
+      // 空档保留默认意图，不在持久化配置中伪造显式浏览器；运行默认按能力使用 Chrome。
       { t: 'select', k: 'fp', label: 'node.field.fp', options: O_FP_OPT, when: whenTls },
       { t: 'switch', k: 'insecure', label: 'node.field.insecure', hint: 'node.field.insecureHint', when: whenTls },
       ...F_TLS_ADV,

@@ -142,50 +142,43 @@ pub fn server_add(app: AppHandle, state: State<'_, AppRuntime>, server: Value) -
     }
 }
 
-/// `server:addBulk` 核心（注入 `ConfigManager`，便于真实 ConfigStore 驱动测试）：强制重生成 id +
-/// 剥离订阅归属 + 补时间戳，落盘，返回 `(新 config, 实际新增数)`。
-///
-/// `added` 须在**消费 `servers` 之前**快照——下方两分支（`for` / `init` move）都会吃掉 `servers`；
-/// 对齐 上游 `SERVER_ADD_BULK`（`server-handlers.ts`：`added = list.length`，入参全部入库、无逐项过滤）。
-/// 此前命令层硬编码 `"added":0` → 契约破（消费方若按 added 判成功恒见 0）。
+/// Batch import is atomic: validate every record before touching stored nodes.
+/// Successful imports retain the existing `{ added: input.len() }` contract; malformed
+/// input rejects the whole request, so the UI never celebrates silently discarded nodes.
 fn server_add_bulk_core(
     config: &ConfigManager,
     servers: Vec<Value>,
 ) -> Result<(Value, usize), String> {
-    let added = servers.len();
     let now = current_iso();
-    let (_, saved) = config
+    let servers: Vec<Value> = servers
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut server)| {
+            let obj = server
+                .as_object_mut()
+                .ok_or_else(|| format!("导入节点 {} 必须是对象", index + 1))?;
+            obj.insert("id".into(), json!(new_uuid()));
+            obj.remove("subscriptionId");
+            obj.remove("providerName");
+            obj.entry("createdAt").or_insert_with(|| json!(now));
+            obj.insert("updatedAt".into(), json!(now));
+            normalized_add_server(server)
+                .map_err(|error| format!("导入节点 {}：{error}", index + 1))
+        })
+        .collect::<Result<_, _>>()?;
+    let added = servers.len();
+    let (result, saved) = config
         .update(|cfg| {
-            if let Some(arr) = cfg.get_mut("servers").and_then(Value::as_array_mut) {
-                for mut s in servers {
-                    // 强制重生成 id（防撞）+ 剥离订阅归属（自建节点恒可编辑可删除）。
-                    s["id"] = json!(new_uuid());
-                    if let Some(obj) = s.as_object_mut() {
-                        obj.remove("subscriptionId");
-                        obj.remove("providerName");
-                    }
-                    s["createdAt"] = s.get("createdAt").cloned().unwrap_or_else(|| json!(now));
-                    s["updatedAt"] = json!(now);
-                    arr.push(s);
-                }
-            } else {
-                // servers 字段缺失/非数组 → 用 servers 入参（已补全 id/时间）初始化。
-                let mut init: Vec<Value> = servers;
-                for s in &mut init {
-                    s["id"] = json!(new_uuid());
-                    s["updatedAt"] = json!(now);
-                }
-                if let Some(obj) = cfg.as_object_mut() {
-                    obj.insert("servers".to_string(), Value::Array(init));
-                }
-            }
-            ConfigDecision::Write(())
+            let Some(arr) = cfg.get_mut("servers").and_then(Value::as_array_mut) else {
+                return ConfigDecision::Skip(Err("节点列表不可用".to_string()));
+            };
+            arr.extend(servers);
+            ConfigDecision::Write(Ok(()))
         })
         .map_err(|e| format!("{e}"))?;
-    Ok((
-        saved.expect("server_add_bulk 的 Write 腿必须返回已落盘配置"),
-        added,
-    ))
+    result?;
+    let saved = saved.ok_or_else(|| "节点列表不可用".to_string())?;
+    Ok((saved, added))
 }
 
 /// 上游 `SERVER_ADD_BULK`：批量新增自建节点（强制重生成 id + 剥离 subscriptionId/providerName）。
@@ -222,37 +215,44 @@ pub fn server_update(
     state: State<'_, AppRuntime>,
     server: Value,
 ) -> ApiResponse<()> {
-    let id = server.get("id").and_then(Value::as_str).map(str::to_string);
-    let id = match id {
-        Some(i) => i,
-        None => return ApiResponse::err("server.id required"),
-    };
-    match state.config().update(|cfg| {
-        let found = cfg
-            .get_mut("servers")
-            .and_then(Value::as_array_mut)
-            .and_then(|arr| {
-                arr.iter()
-                    .position(|s| s.get("id").and_then(Value::as_str) == Some(&id))
-                    .map(|idx| {
-                        arr[idx] = server;
-                    })
-            })
-            .is_some();
-        if found {
-            ConfigDecision::Write(Ok(()))
-        } else {
-            ConfigDecision::Skip(Err(format!("服务器不存在: {id}")))
-        }
-    }) {
-        Ok((Ok(()), Some(cfg))) => {
+    match server_update_core(state.config(), server) {
+        Ok(cfg) => {
             broadcast_config_changed(&app, &cfg);
             ok_void()
         }
-        Ok((Err(error), None)) => ApiResponse::err(error),
-        Ok(_) => unreachable!("server_update decision and persistence must agree"),
-        Err(e) => ApiResponse::err(format!("{e}")),
+        Err(error) => ApiResponse::err(error),
     }
+}
+
+/// Preserve the existing full-record update contract, but reject malformed records
+/// before the tolerant persistence sanitizer can turn an update into a deletion.
+fn server_update_core(config: &ConfigManager, server: Value) -> Result<Value, String> {
+    let id = server
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "server.id required".to_string())?
+        .to_string();
+    let server = normalized_add_server(server)?;
+    let (result, saved) = config
+        .update(|cfg| {
+            let found = cfg
+                .get_mut("servers")
+                .and_then(Value::as_array_mut)
+                .and_then(|servers| {
+                    servers
+                        .iter_mut()
+                        .find(|node| node["id"].as_str() == Some(&id))
+                });
+            let Some(existing) = found else {
+                return ConfigDecision::Skip(Err(format!("服务器不存在: {id}")));
+            };
+            *existing = server;
+            ConfigDecision::Write(Ok(()))
+        })
+        .map_err(|error| error.to_string())?;
+    result?;
+    saved.ok_or_else(|| "节点更新未写入".to_string())
 }
 
 /// 删选中节点后的新 `selectedServerId`（D4）：兜底出口须**存活于删除后的 `cfg.servers`** 才采用，否则回落直连
@@ -511,6 +511,8 @@ fn select_in_place(
     validate_candidate: impl FnOnce(&UserConfig) -> Result<(), String>,
     register_intent: impl FnOnce() -> u64,
 ) -> Result<(bool, u64), ServerSwitchError> {
+    crate::runtime::config::validate_server_identities(cfg)
+        .map_err(|error| ServerSwitchError::Other(error.to_string()))?;
     let exists = cfg
         .get("servers")
         .and_then(Value::as_array)
@@ -665,7 +667,65 @@ pub async fn server_switch(
             message,
             code::OUTBOUND_INTERFACE_UNAVAILABLE,
         )),
+        Err(ServerSwitchError::Other(message))
+            if message
+                == format!(
+                    "config validation failed: {}",
+                    crate::runtime::config::IDENTITY_AMBIGUOUS
+                ) =>
+        {
+            Ok(ApiResponse::err_with_code(
+                message,
+                crate::runtime::config::IDENTITY_AMBIGUOUS,
+            ))
+        }
         Err(ServerSwitchError::Other(message)) => Ok(ApiResponse::err(message)),
+    }
+}
+
+/// Read-only preview for explicit identity recovery.
+#[tauri::command]
+pub fn server_identity_conflicts(
+    state: State<'_, AppRuntime>,
+) -> ApiResponse<crate::runtime::config::IdentityConflicts> {
+    match state.config().identity_conflicts() {
+        Ok(preview) => ApiResponse::ok(preview),
+        Err(error) => ApiResponse::err(error.to_string()),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityRepairReceipt {
+    status: &'static str,
+    requires_apply: bool,
+}
+
+#[tauri::command]
+pub fn server_identity_repair(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    request: crate::runtime::config::IdentityRepairRequest,
+) -> ApiResponse<IdentityRepairReceipt> {
+    match state.config().repair_server_identities(&request, new_uuid) {
+        Ok(_) => {
+            // Saved only: do not start, select, or apply unrelated desired settings.
+            emit_config_changed_signal(&app);
+            state.proxy().push_pending_changes();
+            ApiResponse::ok(IdentityRepairReceipt {
+                status: "saved",
+                requires_apply: state.proxy().core_running(),
+            })
+        }
+        Err(polaris_store::StoreError::Validation(reason)) => {
+            let safe_code = match reason.as_str() {
+                "serverIdentityRevisionChanged" => "serverIdentityRevisionChanged",
+                "serverIdentityRepairInvalidChoice" => "serverIdentityRepairInvalidChoice",
+                _ => "serverIdentityRepairUnsupported",
+            };
+            ApiResponse::err_with_code(safe_code, safe_code)
+        }
+        Err(error) => ApiResponse::err(error.to_string()),
     }
 }
 
@@ -984,91 +1044,109 @@ pub(crate) async fn finish_placement_core(
     }
 }
 
-/// 设置选择意图为「自动选择（该订阅）」。清除意图不需要命令：点任一节点即回到手动。
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "Tauri IPC command owns its deserialized payload across the call"
-)]
+/// Native group receipts separate saved references from runtime-observed exits.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeAutoReceipt {
+    intent_applied: bool,
+    status: crate::runtime::proxy::native_auto::NativeAutoStatus,
+}
+
+fn native_response(
+    result: Result<crate::runtime::proxy::native_auto::NativeAutoStatus, String>,
+    intent_applied: bool,
+) -> ApiResponse<NativeAutoReceipt> {
+    match result {
+        Ok(status) => ApiResponse::ok(NativeAutoReceipt {
+            intent_applied,
+            status,
+        }),
+        Err(error) => {
+            let code = if error.starts_with("AUTO_SELECT_") {
+                error.clone()
+            } else {
+                "AUTO_SELECT_SWITCH_FAILED".into()
+            };
+            ApiResponse::err_with_code(error, code)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn auto_select_set_enabled(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+    enabled: bool,
+) -> Result<ApiResponse<NativeAutoReceipt>, ()> {
+    Ok(async {
+        let result = state.proxy.native_auto_set_enabled(enabled).await;
+        emit_config_changed_signal(&app);
+        native_response(result, true)
+    }
+    .await)
+}
+
+#[tauri::command]
+pub async fn auto_select_disable(
+    app: AppHandle,
+    state: State<'_, AppRuntime>,
+) -> Result<ApiResponse<NativeAutoReceipt>, ()> {
+    Ok(async {
+        let result = state.proxy.native_auto_set_enabled(false).await;
+        emit_config_changed_signal(&app);
+        native_response(result, true)
+    }
+    .await)
+}
+
+/// Select only the default reference. Rules keep their independent references.
 #[tauri::command]
 pub async fn auto_select_enable(
     app: AppHandle,
     state: State<'_, AppRuntime>,
-    subscription_id: String,
-) -> Result<ApiResponse<AutoSelectReceipt>, ()> {
-    let written = auto_select_enable_core(
-        state.config(),
-        &subscription_id,
-        state.proxy().auto_select_closed(),
-        |cfg, subscription| state.proxy().auto_select_explicit(cfg, subscription),
-        |candidate| {
-            state
-                .proxy()
-                .validate_selected_server_candidate_blocking(candidate)
-        },
-        || state.proxy().register_selector_intent(),
-    );
-    let (saved, placement) = match written {
-        Ok(written) => written,
-        Err(error) => return Ok(ApiResponse::err_with_code(error.to_string(), error.code())),
-    };
-    log::info!(
-        "自动选择：意图置为自动（订阅 {subscription_id}），{}",
-        if placement.is_some() {
-            "当前出口不在该订阅内，立即落点"
+    subscription_id: Option<String>,
+    scope: Option<String>,
+) -> Result<ApiResponse<NativeAutoReceipt>, ()> {
+    Ok(async {
+        use polaris_config_engine::user_config::auto_select::AutoSelectTarget;
+        let scope = scope.as_deref().unwrap_or(if subscription_id.is_some() {
+            "subscription"
         } else {
-            "出口不动"
+            "global"
+        });
+        let mut value = json!({"scope":scope});
+        if let Some(id) = subscription_id {
+            value["subscriptionId"] = json!(id);
         }
-    );
-    // 先重置选择状态并唤醒评估，再等落点的运行侧结果：落点可能要等一次整核重启。
-    state.proxy().auto_select_armed();
-    let placement = match placement {
-        Some(placement) => Some(finish_placement(&app, &state, &saved, placement).await),
-        None => {
-            emit_config_changed_signal(&app);
-            None
-        }
-    };
-    Ok(ApiResponse::ok(AutoSelectReceipt {
-        intent_applied: true,
-        placement,
-        status: state.proxy().auto_select_status(),
-    }))
+        let target = match serde_json::from_value::<AutoSelectTarget>(value) {
+            Ok(target) if target.valid() => target,
+            _ => {
+                return ApiResponse::err_with_code(
+                    "无效的自动选择范围",
+                    "AUTO_SELECT_INVALID_SCOPE",
+                );
+            }
+        };
+        let result = state.proxy.native_auto_select_default(target).await;
+        emit_config_changed_signal(&app);
+        native_response(result, true)
+    }
+    .await)
 }
 
-/// 自动意图下立即把出口换到裁决此刻认定的落点（允许整核重启），意图保留。没有落点时拒绝。
+/// Compatibility command: request a native measurement round, not an App-side winner.
 #[tauri::command]
 pub async fn auto_select_switch_now(
-    app: AppHandle,
     state: State<'_, AppRuntime>,
-) -> Result<ApiResponse<AutoSelectReceipt>, ()> {
-    let written = auto_select_switch_now_core(
-        state.config(),
-        state.proxy().auto_select_closed(),
-        |cfg, subscription| state.proxy().auto_select_explicit(cfg, subscription),
-        |candidate| {
-            state
-                .proxy()
-                .validate_selected_server_candidate_blocking(candidate)
-        },
-        || state.proxy().register_selector_intent(),
-    );
-    let (saved, placement) = match written {
-        Ok(written) => written,
-        Err(error) => return Ok(ApiResponse::err_with_code(error.to_string(), error.code())),
-    };
-    let placement = finish_placement(&app, &state, &saved, placement).await;
-    Ok(ApiResponse::ok(AutoSelectReceipt {
-        intent_applied: true,
-        placement: Some(placement),
-        status: state.proxy().auto_select_status(),
-    }))
+) -> Result<ApiResponse<NativeAutoReceipt>, ()> {
+    Ok(async { native_response(state.proxy().native_auto_retest().await, false) }.await)
 }
 
-/// 选择状态（只读）：意图、实际出口、模式与原因、上次换点、最近一次评估、自曝标记。
-/// 状态变化时同形的载荷经 `event:autoSelectStatus` 推送。
 #[tauri::command]
-pub fn auto_select_status(state: State<'_, AppRuntime>) -> ApiResponse<auto_select::Status> {
-    ApiResponse::ok(state.proxy().auto_select_status())
+pub async fn auto_select_status(
+    state: State<'_, AppRuntime>,
+) -> Result<ApiResponse<crate::runtime::proxy::native_auto::NativeAutoStatus>, ()> {
+    Ok(async { ApiResponse::ok(state.proxy().native_auto_status().await) }.await)
 }
 
 /// 上游 `SERVER_GENERATE_URL`：节点 → 真实 share URL（`ProtocolParser.generateUrl` 等价）。
@@ -1325,7 +1403,7 @@ pub async fn tailscale_login(
             return Ok(ApiResponse::err_with_code(
                 "Cannot read the saved Tailscale node",
                 "TAILSCALE_LOGIN_FAILED",
-            ))
+            ));
         }
     };
     let (server, credential_transaction) =
@@ -1341,7 +1419,7 @@ pub async fn tailscale_login(
             return Ok(ApiResponse::err_with_code(
                 "invalidCredentialIntent",
                 "TAILSCALE_LOGIN_FAILED",
-            ))
+            ));
         }
     };
     let identity_epoch = match saved_tailscale_identity_epoch(&saved, &requested.id) {
@@ -1358,15 +1436,17 @@ pub async fn tailscale_login(
             .and_then(|path| tailscale_state_exists_at(&path, true));
         match existing_identity {
             Ok(false) => {}
-            Ok(true) => return Ok(ApiResponse::err_with_code(
-                "Retire the existing Tailscale identity before replacing its authentication key",
-                "TAILSCALE_IDENTITY_RETIREMENT_REQUIRED",
-            )),
+            Ok(true) => {
+                return Ok(ApiResponse::err_with_code(
+                    "Retire the existing Tailscale identity before replacing its authentication key",
+                    "TAILSCALE_IDENTITY_RETIREMENT_REQUIRED",
+                ));
+            }
             Err(_) => {
                 return Ok(ApiResponse::err_with_code(
                     "Cannot verify the existing Tailscale identity",
                     "TAILSCALE_STATE_QUERY_FAILED",
-                ))
+                ));
             }
         }
     }
@@ -1553,7 +1633,7 @@ pub async fn tailscale_logout(
                 return Ok(ApiResponse::err_with_code(
                     "Cannot read the saved Tailscale node",
                     "TAILSCALE_LOGOUT_FAILED",
-                ))
+                ));
             }
         };
         let id_valid = saved
@@ -1593,7 +1673,7 @@ pub async fn tailscale_logout(
             return Ok(ApiResponse::err_with_code(
                 "Cannot read the saved Tailscale node",
                 "TAILSCALE_LOGOUT_FAILED",
-            ))
+            ));
         }
     };
     match state
@@ -1664,7 +1744,7 @@ pub fn tailscale_state_exists(
                 return ApiResponse::err_with_code(
                     "Cannot verify Tailscale state",
                     "TAILSCALE_STATE_QUERY_FAILED",
-                )
+                );
             }
         };
         map.insert(id, Value::Bool(exists));

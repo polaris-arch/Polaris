@@ -470,8 +470,11 @@ pub fn logs_unsubscribe(window: WebviewWindow, subscription_id: String) -> ApiRe
 /// 点这颗按钮的主要诉求；核侧那份历史随核退出本就一起没了。为一个 best-effort 的补充动作把整条
 /// 命令判失败，只会让「清空日志」在核未运行时红一个没有意义的错。
 #[tauri::command]
-pub async fn logs_clear(state: State<'_, AppRuntime>) -> Result<ApiResponse<()>, ()> {
-    crate::logging::clear();
+pub async fn logs_clear(state: State<'_, AppRuntime>) -> Result<ApiResponse<u64>, ()> {
+    let boundary = match crate::logging::clear() {
+        Ok(boundary) => boundary,
+        Err(error) => return Ok(ApiResponse::err(error)),
+    };
     if let Some((port, secret)) = state.proxy().management_endpoint() {
         match polaris_singbox_grpc::SingBoxApiClient::connect(
             polaris_singbox_grpc::Endpoint::new("127.0.0.1", port),
@@ -487,7 +490,7 @@ pub async fn logs_clear(state: State<'_, AppRuntime>) -> Result<ApiResponse<()>,
             Err(e) => log::debug!("清空核侧日志环：管理 API 连接失败（本地已清，不阻断）：{e}"),
         }
     }
-    Ok(ok_void())
+    Ok(ApiResponse::ok(boundary))
 }
 
 // ── 核在跑的真实日志级别（`logs:runtimeLevel`）─────────────────────────────────
@@ -872,6 +875,12 @@ pub async fn diagnostic_export(
         Err(_) => json!({ "error": "(核未启动过，无运行期 sing-box 配置)" }),
     };
 
+    let running_secret_keys = state
+        .proxy()
+        .diagnostic_runtime_secret_keys(&singbox_config);
+    let unverified_runtime = running_secret_keys.is_none();
+    let running_secret_keys = running_secret_keys.unwrap_or_default();
+
     let dir = state.config().dir().to_path_buf();
     let app_log_tail = read_managed_tail(&dir.join("logs").join("polaris.log"), LOG_TAIL_BYTES);
     #[cfg(all(target_os = "android", debug_assertions))]
@@ -966,6 +975,8 @@ pub async fn diagnostic_export(
             counters: state.proxy().diagnostic_counters(),
         },
         user_config: config,
+        running_secret_keys,
+        unverified_runtime,
         singbox_config,
         // #57：节点 outbound.server 恒为域名（不烧 IP）→ 无额外预解析 IP 需补脱敏。
         // 若未来引入 resolve-ahead，预解析出的节点 IP 必须从这里传入，否则明文漏进报告。

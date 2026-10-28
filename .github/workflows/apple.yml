@@ -128,7 +128,8 @@ jobs:
           targets: ${{ inputs.include_simulator && 'aarch64-apple-ios,aarch64-apple-ios-sim' || 'aarch64-apple-ios' }}
       - name: Exact tool/source and declared arm64 carrier configuration admission
         run: python3 -B scripts/mobile-core/ci_apple.py prepare
-      - name: Execute pure Swift lifecycle and G4 receipt seams
+      - name: Execute pure Swift lifecycle, monitor and G4 receipt seams
+        id: swift_lifecycle
         shell: bash
         run: |
           set -euo pipefail
@@ -140,6 +141,12 @@ jobs:
             crates/tauri-plugin-polaris-ios/ios/Tests/LifecycleTests.swift \
             -o "$RUNNER_TEMP/polaris-ios-lifecycle-tests"
           "$RUNNER_TEMP/polaris-ios-lifecycle-tests"
+          # Separate @main executable for monitor incarnation/registration races.
+          xcrun swiftc -Onone -parse-as-library \
+            src-tauri/gen/apple/PacketTunnel/TunnelMonitorSession.swift \
+            crates/tauri-plugin-polaris-ios/ios/Tests/MonitorTests.swift \
+            -o "$RUNNER_TEMP/polaris-ios-monitor-tests"
+          "$RUNNER_TEMP/polaris-ios-monitor-tests"
       - name: Scoped frontend tool
         shell: bash
         run: |
@@ -255,16 +262,12 @@ jobs:
 
       - name: Require all shared carrier prerequisites
         id: shared_ready
-        if: ${{ !cancelled() && steps.shared_component.conclusion == 'success' && steps.component_payload.conclusion == 'success' && steps.component_manifest.conclusion == 'success' && steps.component_original.conclusion == 'success' && steps.local_component.conclusion == 'success' && steps.protoc.conclusion == 'success' && steps.rust_cache.conclusion == 'success' && steps.rust_registry_restore.conclusion == 'success' && steps.rust_device_ready.conclusion == 'success' }}
+        if: ${{ !cancelled() && steps.swift_lifecycle.conclusion == 'success' && steps.shared_component.conclusion == 'success' && steps.component_payload.conclusion == 'success' && steps.component_manifest.conclusion == 'success' && steps.component_original.conclusion == 'success' && steps.local_component.conclusion == 'success' && steps.protoc.conclusion == 'success' && steps.rust_cache.conclusion == 'success' && steps.rust_registry_restore.conclusion == 'success' && steps.rust_device_ready.conclusion == 'success' }}
         run: |
           set -euo pipefail
           echo "Exact component, original transport, protobuf and cache prerequisites succeeded"
-          xcrun swiftc -parse-as-library \
-            src-tauri/gen/apple/PacketTunnel/TunnelLifecycle.swift \
-            crates/tauri-plugin-polaris-ios/ios/Sources/VpnEvidence.swift \
-            crates/tauri-plugin-polaris-ios/ios/Tests/LifecycleTests.swift \
-            -o "$RUNNER_TEMP/polaris-tunnel-lifecycle-tests"
-          "$RUNNER_TEMP/polaris-tunnel-lifecycle-tests"
+          # The same host/source lifecycle controls already passed before the
+          # component build. Reuse that required outcome, not a second compile.
 
       - name: Snapshot complete device carrier execution inputs before compilation
         id: carrier_before

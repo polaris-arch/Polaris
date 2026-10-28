@@ -14,15 +14,14 @@ import time
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
-# PacketTunnelProvider/TunnelLifecycle pins consume the finite source-only N freeze
-# 0180ce48c0a045c9610d47d64766ee059ccb8315eb192f02d0f868872cedc41c
-# and independent review 9eaec083963c1a86323177cbda07328d010b75bf180c912251f1799f7c126778.
+# Settings consumer pins include the APPLE-01 success-only publication repair.
+# These hashes identify source bytes; they are not independent review receipts.
 # Swift/SDK/ABI acceptance remains pending.
 CONSUMERS = {
-    'PacketTunnelProvider.swift': 'ca4ec946df1673d2e562f6ea113256d01acadb473e9dee7dcf9f6f768c3f583b',
-    'TunnelLifecycle.swift': 'aec19390a438b4e2ea2ef46d2681473675d92a1aa112e5dfd416a0366b5810f9',
+    'PacketTunnelProvider.swift': '840a5cf052087c3cc4e97b7818ab2d5c4a138fd0b1804de79ae13e04cd17532a',
+    'TunnelLifecycle.swift': '61264efc31c595f6cc2d9a086d51da045472be6adb266cb300be53036f9e0cd1',
     'TunnelMonitorSession.swift': '8d20d4a9f2a4a170ef5d553f2e10679993d4236fd409d1d9b9b803c51cae1ed3',
-    'TunnelPlatform.swift': '76d8d689e7a59c1fb89cb051cac08e140c0f1196831a700a5bb83541b8865d5b',
+    'TunnelPlatform.swift': '34c4af7f0bc27baed35607d24fbe6ee183ee1928ec1331862d20187d8bb7d54a',
 }
 GETTERS = ('RequestID', 'ConfigDigest', 'ContractVersion', 'Validation', 'Cleanup', 'ValidationError', 'CleanupError')
 BOUND = 'github.com/sagernet/sing-box/experimental/libbox'

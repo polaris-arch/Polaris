@@ -21,7 +21,7 @@ export function initialNodesTab(
 ): string | null {
   if (groups.length === 0) return null;
   if (selectedServerId) {
-    const owner = groups.find((g) => g.servers.some((s) => s.id === selectedServerId));
+    const owner = groups.find((g) => !g.isAll && g.servers.some((s) => s.id === selectedServerId));
     if (owner) return owner.id;
   }
   return groups[0].id;

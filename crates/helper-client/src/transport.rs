@@ -20,7 +20,7 @@
 //! 对应 Polaris：`HelperManager.ts` 的 `net.connect(SOCKET_PATH)` + `sock.end(...)` + `sock.on('data')`。
 
 use std::io::{self, Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 单连接读超时（秒）—— 移植自 Go `conn.SetReadDeadline(5s)`
 ///（`helper.go:401` / `helper-win/helper.go:165` / `helper-linux/helper.go:335`），
@@ -41,6 +41,12 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 1500;
 /// **纪律**：trait 不暴露平台特定句柄，只暴露字节流原语 —— 让上层 [`HelperClient`](crate::client::HelperClient)
 /// 三平台共用。
 pub trait ConnectionStream: Send {
+    /// Whether this transport has a reliable complete-request boundary (Unix
+    /// write EOF or Windows message boundary). Immediate test streams default true.
+    fn supports_request_boundaries(&self) -> bool {
+        true
+    }
+
     /// 读一行（含尾部 `\n`）到 `buf`，返回读到的字节数。EOF 返回 0。
     ///
     /// 受当前读超时约束（初值 [`READ_TIMEOUT`]，可由 [`ConnectionStream::set_read_timeout`] 改写）：
@@ -48,6 +54,17 @@ pub trait ConnectionStream: Send {
     /// 不是单次 syscall —— 否则逐字节滴喂的对端能把一次调用拖到预算的任意倍数。
     /// 逐行读对应 上游 `sock.on('data')` 累积 + 拆行（`HelperManager.ts:444-446`）。
     fn read_until_timeout(&mut self, buf: &mut Vec<u8>) -> io::Result<usize>;
+
+    /// Read against the same absolute budget used to connect and write.
+    /// Native implementations override this to avoid resetting the clock.
+    fn read_until_deadline(&mut self, buf: &mut Vec<u8>, deadline: Instant) -> io::Result<usize> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or(io::ErrorKind::TimedOut)?;
+        self.set_read_timeout(remaining)?;
+        self.read_until_timeout(buf)
+    }
 
     /// 改写后续 [`ConnectionStream::read_until_timeout`] 的读超时预算。
     ///
@@ -65,6 +82,19 @@ pub trait ConnectionStream: Send {
 
     /// 写完整字节串（对应 上游 `sock.end(frame)`，`HelperManager.ts:438`）。
     fn write_all(&mut self, data: &[u8]) -> io::Result<()>;
+
+    /// Write within one absolute request budget, including partial writes.
+    /// Default is for immediate in-memory adapters only; production must override.
+    fn write_all_until(&mut self, data: &[u8], deadline: Instant) -> io::Result<()> {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.write_all(data)?;
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    }
 
     /// 通知对端「发送完毕」（半关闭写端，对应 上游 `sock.end()` 语义）。
     ///

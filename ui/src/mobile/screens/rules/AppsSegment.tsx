@@ -1,3 +1,5 @@
+import type { AutoSelectTarget } from '@/contracts/auto-select';
+import { autoSelectTargetFromChoice } from '@/domain/auto-select-choice';
 import { MobileInfo } from '../../MobileInfo';
 /** Mobile presentation for the production AppsSegment contract.
  * The production RulesScreen owns state, validation, persistence, and sheet
@@ -93,7 +95,7 @@ export interface AppsSegmentProps {
   /** 默认展开哪几组（含当前选中节点的那一组；没选节点 = 空集全折叠，**不猜第一组**）。 */
   policyOpenGroups: ReadonlySet<string>;
   /** 落一档策略。`targetServerId` 只在「指定某个节点」时给。 */
-  onPolicyPick: (appId: string, pick: AppPolicyWritablePick, targetServerId?: string) => void;
+  onPolicyPick: (appId: string, pick: AppPolicyWritablePick, targetServerId?: string | AutoSelectTarget) => void;
   /** 添加一个自定义应用（开表单宿主的 `app-add` 那一层）。 */
   onAddCustom: () => void;
   /** 删除一个自定义应用（预设 + 它的 appRule 同一事务，二次确认在容器）。 */
@@ -192,6 +194,8 @@ export function AppsSegment({
    * 不等于「写路径拦住了」—— 两条判据要成对交，少一条就留着一条从别处调用进来的路。
    */
   const handlePick = (appId: string, value: string): void => {
+    const autoTarget = autoSelectTargetFromChoice(value);
+    if (autoTarget) { onPolicyPick(appId, 'proxy', autoTarget); return; }
     if (value.startsWith('node:')) {
       onPolicyPick(appId, 'proxy', value.slice(5));
       onPolicySheetClose();

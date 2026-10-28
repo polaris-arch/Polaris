@@ -145,7 +145,6 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
       '关闭全部 / 关闭筛选命中（原型 :4113 / :4114）',
     ],
     ['components/screens/settings/SettingsAbout.tsx', '完全卸载（原型 :5185 uninstallApp）'],
-    ['components/screens/settings/SettingsHelper.tsx', '卸载提权助手（原型 :4234 helper-uninstall）'],
     ['components/layout/PendingChangesBar.tsx', '重置全部待应用改动（原型 :4070 reset-pending）'],
     [
       'components/screens/resources/ResourcesScreen.tsx',
@@ -164,6 +163,24 @@ describe('T2：原型走 confirmTwice 的破坏性操作，本仓一律原地二
       expect(c, '破坏性操作又走回弹窗了').not.toContain("kind: 'confirm'");
     });
   }
+
+  it('Helper 卸载仍原地二次确认；跨会话停止升级另行解释后果', () => {
+    const c = code(get('components/screens/settings/SettingsHelper.tsx'));
+    expect(c).toContain("from '@/lib/confirm-twice'");
+    expect(c).toMatch(/useConfirmTwice\(\)/);
+    const uninstall = c.slice(c.indexOf('function uninstall()'), c.indexOf('async function recheck()'));
+    expect(uninstall).toContain('confirmTwice(UNINSTALL_KEY');
+    expect(uninstall).not.toContain("kind: 'confirm'");
+    const migration = c.slice(c.indexOf('function stopAndUpgrade()'), c.indexOf('function uninstall()'));
+    expect(migration).toContain("kind: 'confirm'");
+    expect(migration).toContain("message: t('helper.stopAndUpgradeWarning')");
+    expect(migration).toContain("confirmLabel: t('helper.stopAndUpgradeConfirm')");
+    expect(migration).toContain('danger: true');
+    expect(migration).not.toContain('confirmTwice(');
+    expect(migration).toContain("void runInstall('stopAndUpgrade')");
+    // The prototype has only helper uninstall. The full-scope migration modal is
+    // an intentional, separately registered action, never a change to that gate.
+  });
 
   it('RulesScreen 的删除确认与武装态绑定同一 plane 和完整规则快照', () => {
     const c = code(get('components/screens/rules/RulesScreen.tsx'));
@@ -308,6 +325,9 @@ describe('T3：确认弹窗的存量清册（新增一处必须显式登记，�
     'components/screens/rules/NetworkProfilePanel.tsx': 1,
     'components/screens/nodes/use-node-subscription-actions.ts': 1,
     'components/screens/settings/SettingsDns.tsx': 1,
+    // Stops exact com.polaris.helper and connections owned by other app sessions;
+    // this new explicit migration needs the full cross-session impact explained.
+    'components/screens/settings/SettingsHelper.tsx': 1,
     // 清理系统代理会改系统级网络状态，且用户明确要求二次确认；需要成段说明风险，不适合原地双击。
     'components/screens/settings/SettingsNetwork.tsx': 1,
     'components/screens/settings/use-app-update.ts': 1,

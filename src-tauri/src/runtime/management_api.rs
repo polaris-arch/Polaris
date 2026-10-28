@@ -108,6 +108,20 @@ impl GrpcManagementApi {
             .collect())
     }
 
+    /// Preserve native history for the UI; do not invent App-ledger provenance.
+    pub async fn native_groups_snapshot(
+        &self,
+    ) -> Result<Vec<polaris_singbox_grpc::daemon::Group>, ManagementError> {
+        self.client()?
+            .first_groups_snapshot()
+            .await
+            .map_err(map_err)
+    }
+
+    pub async fn url_test(&self, tag: &str) -> Result<(), ManagementError> {
+        self.client()?.url_test(tag).await.map_err(map_err)
+    }
+
     pub async fn rule_set_status(
         &self,
         tags: Vec<String>,

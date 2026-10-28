@@ -1,3 +1,4 @@
+import { useInputRequest } from '@/hooks/use-input-request';
 import { realityUtlsError } from '@/domain/utls';
 import { MobileInfo } from '../MobileInfo';
 import { MobileSelect as MobileSelect } from '../MobileSelect';
@@ -156,6 +157,9 @@ export function NodeFormPanel({
   /* custom 协议内核兼容性探测（同桌面 C10）：结果只在协议为 custom 时被读。 */
   const [probing, setProbing] = useState(false);
   const [probeResult, setProbeResult] = useState<ProbeDisplay | null>(null);
+  const probeInput = JSON.stringify([proto, draft.outbound, draft.isEndpoint === true]);
+  const beginProbe = useInputRequest(probeInput);
+  useEffect(() => { setProbeResult(null); setProbing(false); }, [probeInput]);
   /* Tailcat 客户端公钥（同桌面 D5）：纯展示态，由后端从私钥推导；私钥一改就作废，不落盘、不进日志。 */
   const [tcPublicKey, setTcPublicKey] = useState('');
   const [tcKeyBusy, setTcKeyBusy] = useState(false);
@@ -216,6 +220,7 @@ export function NodeFormPanel({
    * `describeProbeResult` 映射成展示态，两端不各写一份判读。
    */
   const runCompatProbe = async (): Promise<void> => {
+    const isCurrent = beginProbe();
     const raw = typeof draft.outbound === 'string' ? draft.outbound : '';
     let parsed: unknown;
     try {
@@ -228,14 +233,16 @@ export function NodeFormPanel({
     setProbeResult(null);
     try {
       const r = await api.proxy.probeOutbound(parsed, draft.isEndpoint === true);
+      if (!isCurrent()) return;
       setProbeResult(describeProbeResult(r));
     } catch (e) {
+      if (!isCurrent()) return;
       /* IPC 本身失败不是内核给出的兼容性判定：诊断只进日志；界面落表单通知（本表单宿主的失败回显
          通道），**不**冒充成一次「配置校验失败」的内核判定。 */
       console.error('[mobile-node-form] custom outbound probe failed:', e);
       setNotice({ tone: 'err', text: t('errors.operationFailed') });
     } finally {
-      if (hasInstance(instanceId)) setProbing(false);
+      if (isCurrent() && hasInstance(instanceId)) setProbing(false);
     }
   };
 

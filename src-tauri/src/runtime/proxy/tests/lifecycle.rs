@@ -1033,7 +1033,8 @@ fn restart_cross_mode_proxy_cleanup_is_owned_and_between_legs() {
         "跨模式代理收口必须位于 owned stop 与新 start 之间；实际方法体：\n{body}"
     );
     assert!(
-        compact[clear..start].contains("self.clear_system_proxy().await;"),
+        compact[clear..start]
+            .contains("self.clear_system_proxy_if_current(stop_generation).await;"),
         "判定命中后必须复用 marker 门控的统一清理点；实际方法体：\n{body}"
     );
 }
@@ -2590,4 +2591,26 @@ async fn deferred_owned_stop_coex_publication_cannot_replay_over_new_owner_or_in
             assert_eq!(*frames.lock().unwrap(), delivered);
         }
     }
+}
+
+#[tokio::test]
+async fn delayed_proxy_clear_rechecks_generation_after_state_gate_acquisition() {
+    let (rt, _dir, calls) = test_runtime_recording();
+    let old_generation = rt.gate.generation();
+    let state_gate = rt.mesh.tailscale_state_gate().await;
+    let mut cleanup = Box::pin(rt.clear_system_proxy_if_current(old_generation));
+    assert!(futures::poll!(cleanup.as_mut()).is_pending());
+    // A newer Start has claimed ownership while the old cleanup waits. Its eventual
+    // takeover uses this same state gate; old cleanup must not touch its marker.
+    rt.gate.bump_generation();
+    drop(state_gate);
+    cleanup.await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn current_proxy_cleanup_reuses_existing_restore_controller() {
+    let (rt, _dir, calls) = test_runtime_recording();
+    rt.clear_system_proxy_if_current(rt.gate.generation()).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

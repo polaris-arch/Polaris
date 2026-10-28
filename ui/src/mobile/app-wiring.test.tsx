@@ -44,7 +44,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { TailscaleStatusEvent } from '@/contracts/tailscale-status';
 import type { TailscaleLoginProgress } from '@/domain/tailscale-login-progress';
-import type { OpenVpnStatusEvent, VpnStatusSnapshot } from '@/contracts/vpn-status';
+import type { OpenConnectStatusEvent, OpenVpnStatusEvent, VpnStatusSnapshot } from '@/contracts/vpn-status';
 import type { InvalidNodeInfo, IpInfoSnapshot, ProxyStatus, UserConfig } from '@/contracts/types';
 import type { UnlockSnapshot } from '@/contracts/unlock-detection';
 import type { SubscriptionUpdateProgress } from '@/contracts/subscription-progress';
@@ -129,6 +129,9 @@ vi.mock('@/ipc', () => ({
       onStarted: channel<void>('started'),
       onStopped: channel<void>('stopped'),
       onLifecycle: channel<{ phase: string }>('lifecycle'),
+      onLifecycleReady: async (fn: () => void) => channel('lifecycle')(fn),
+      onStartedReady: async (fn: () => void) => channel('started')(fn),
+      onStoppedReady: async (fn: () => void) => channel('stopped')(fn),
       onPendingChanges: channel<unknown>('pending'),
       onError: channel<{ errorCode?: string }>('error'),
       onTailscaleStatus: channel<TailscaleStatusEvent>('tsStatus'),
@@ -140,7 +143,8 @@ vi.mock('@/ipc', () => ({
     },
     vpn: {
       getStatus: () => vpnGetStatusMock(),
-      onOpenVpnStatus: channel<OpenVpnStatusEvent>('openVpn'),
+      onOpenConnectStatusReady: async (fn: (event: OpenConnectStatusEvent) => void) => channel<OpenConnectStatusEvent>('openConnect')(fn),
+      onOpenVpnStatusReady: async (fn: (event: OpenVpnStatusEvent) => void) => channel<OpenVpnStatusEvent>('openVpn')(fn),
     },
     subscription: {
       onUpdateProgress: channel<SubscriptionUpdateProgress>('subProgress'),
@@ -160,7 +164,7 @@ vi.mock('@/ipc', () => ({
       onSpeedTestResult: channel<{ runId?: string; serverId: string; latency: number }>('speedTestResult'),
       onSpeedTestProgress: channel('speedTestProgress'),
       onSpeedTestDone: channel('speedTestDone'),
-      onTaildropTaskUpdated: channel<TaildropTaskSnapshot>('taildropTask'),
+      onTaildropTaskUpdated: async (listener: (snapshot: TaildropTaskSnapshot) => void) => channel<TaildropTaskSnapshot>('taildropTask')(listener),
       taildropTasks: (serverId?: string) => taildropTasksMock(serverId),
     },
     system: { openExternal: (url: string) => openExternalMock(url) },
@@ -170,8 +174,8 @@ vi.mock('@/ipc', () => ({
       // （`privacyModeSeed`），故 ⑧ 那组能验「锁着的时候重建 ⇒ 遮罩立刻回来」。
       getPrivacyMode: () => getPrivacyModeMock(),
       setPrivacyMode: (value: boolean) => setPrivacyModeMock(value),
-      onEnterPrivacyMode: channel<void>('enterPrivacy'),
-      onExitPrivacyMode: channel<void>('exitPrivacy'),
+      onEnterPrivacyMode: async (listener: () => void) => channel<void>('enterPrivacy')(listener),
+      onExitPrivacyMode: async (listener: () => void) => channel<void>('exitPrivacy')(listener),
     },
   },
 }));
@@ -440,6 +444,7 @@ describe('②b 隐私态：水合 + 进/出两条事件都把 store 收敛到真
   });
 
   it('反向对照：不接这条腿时，事件推不动 store（证明上面量的是接线）', () => {
+    useAppStore.getState().setPrivacyMode(false);
     emit('enterPrivacy', undefined);
     expect(useAppStore.getState().privacyMode).toBe(false);
   });
@@ -448,6 +453,7 @@ describe('②b 隐私态：水合 + 进/出两条事件都把 store 收敛到真
     const off = startMobileAppWiring(t);
     await settle();
     off();
+    useAppStore.getState().setPrivacyMode(false);
     emit('enterPrivacy', undefined);
     expect(useAppStore.getState().privacyMode).toBe(false);
   });
@@ -1367,7 +1373,6 @@ describe('⑫ 桌面那批 app 级订阅：要么移植了，要么在表里登�
    * 不许写「本批不做」——那是排期，不是判定。
    */
   const NOT_PORTED: ReadonlyArray<readonly [string, string]> = [
-    ['onOpenConnectStatus', 'OpenConnect 增量在移动端零消费者：节点屏的 `deriveMeshTunnelHealth` 只读 `openVpn`，首帧快照那一跳已经把 `openConnect` 落进 store 了'],
     ['onSystemProxyResidual', '移动端接管方式恒为 TUN，系统代理这个对象在 Android 上不存在'],
     ['subscribeSpeedTestProgressToast', '移动端通过runId会话store与行内进度消费同样事件；不重复显示桌面的sticky toast'],
     // ── 2026-09-06 第二次扩面抓出来的七条：它们不长成订阅的样子，此前整条掉在取材面外 ──
@@ -1461,19 +1466,11 @@ describe('⑫ 桌面那批 app 级订阅：要么移植了，要么在表里登�
    * 那条僵尸断言照样绿（两边一起没了），而遮罩从此永远不出现。
    */
   it('🔴 隐私态进/出两条订阅真的挂上了（遮罩的唯一收敛点）', () => {
-    expect(
-      callSitesIn(MOBILE_SOURCES, 'onEnterPrivacyMode'),
-      '闲置计时把后端的 `PRIVACY_MODE` 翻上去了，而前端没人听 ⇒ 遮罩永远不出现',
-    ).not.toEqual([]);
-    expect(
-      callSitesIn(MOBILE_SOURCES, 'onExitPrivacyMode'),
-      '解锁成功后没人把遮罩收回去 ⇒ 密码对了界面也不解锁',
-    ).not.toEqual([]);
-    // 首帧水合那一拍同样要在：事件只推增量，「锁着的时候 WebView 被系统回收重建」这一档靠它。
-    expect(
-      callSitesIn(MOBILE_SOURCES, 'getPrivacyMode'),
-      '缺首帧水合 ⇒ 锁定期间 WebView 重建后拿到的是一个没有遮罩的解锁界面',
-    ).not.toEqual([]);
+    expect(callSitesIn(MOBILE_SOURCES, 'startPrivacyModeSync')).not.toEqual([]);
+    const privacySource = readFileSync(fileURLToPath(new URL('../lib/privacy-mode-sync.ts', import.meta.url)), 'utf8');
+    for (const method of ['onEnterPrivacyMode', 'onExitPrivacyMode', 'getPrivacyMode']) {
+      expect(privacySource).toContain(`port.${method}(`);
+    }
   });
 
   /*
@@ -1737,5 +1734,34 @@ describe('连接后检测由 Rust 排程，应用级事件跨页接收', () => {
     }
     useAppStore.getState().setIpInfo(ipFrame(1, true));
     expect(useAppStore.getState().ipInfoRevision).toBe(1);
+  });
+});
+
+describe('mobile authoritative language wiring', () => {
+  it('uses the existing effective config feed, waits for hydration, and writes no config back', () => {
+    const source = stripComments(readFileSync(fileURLToPath(new URL('./app-wiring.ts', import.meta.url)), 'utf8'));
+    const start = source.indexOf('const languageChoice = useEffectiveConfig');
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf('}, [languageChoice]);', start);
+    expect(end).toBeGreaterThan(start);
+    const effect = source.slice(start, end);
+    expect(effect).toContain('(c) => c?.language');
+    expect(effect).toContain('if (languageChoice === undefined) return;');
+    expect(effect).toContain('syncLanguageChoice(languageChoice);');
+    expect(effect).not.toMatch(/config\.(patch|save|setValue)|onChanged|subscribe/);
+  });
+});
+
+describe('mobile interactive VPN challenge routing', () => {
+  it('opens both protocols per endpoint without duplicating repeated status and disposes both streams', () => {
+    const stop = startMobileAppWiring(t);
+    const oc = { serverId: 'oc', state: 'AUTH', stateText: '', authChallenge: { id: 'c', kind: 'form', fields: [] } };
+    const ov = { serverId: 'ov', state: 'AUTH', stateText: '', challenge: { id: 'v', kind: 'secret', echo: false, deadline: 0 } };
+    emit('openConnect', oc); emit('openVpn', ov); emit('openConnect', oc);
+    expect(useMobileFormStore.getState().stack.filter(s => s.kind === 'vpn-auth')).toHaveLength(2);
+    expect(useVpnStatusStore.getState().openConnect.oc?.authChallenge?.id).toBe('c');
+    stop();
+    emit('openConnect', { ...oc, serverId: 'late' });
+    expect(useVpnStatusStore.getState().openConnect.late).toBeUndefined();
   });
 });

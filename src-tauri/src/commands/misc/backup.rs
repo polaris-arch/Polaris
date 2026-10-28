@@ -7,7 +7,8 @@ use tauri_plugin_dialog::DialogExt;
 
 use super::support::{node_platform, now_iso8601, today_yyyy_mm_dd};
 use crate::commands::picked_file::{
-    display_of, read_picked_to_string, with_picked_gateway, write_picked, FileGateway, FilePath,
+    classify, display_of, read_picked_to_string, with_picked_gateway, write_picked, FileGateway,
+    FilePath, PickedTarget,
 };
 use crate::i18n::{key, t};
 use crate::response::ApiResponse;
@@ -109,7 +110,7 @@ fn finish_export(gateway: &dyn FileGateway, picked: Option<FilePath>, body: &str
     let Some(target) = picked else {
         return backup_failure("cancelled");
     };
-    if let Err(e) = write_picked(gateway, &target, body.as_bytes()) {
+    if let Err(e) = write_backup(gateway, &target, body) {
         log::warn!("[backup] export write failed: {e}");
         return backup_failure("writeFailed");
     }
@@ -117,6 +118,33 @@ fn finish_export(gateway: &dyn FileGateway, picked: Option<FilePath>, body: &str
         "success": true,
         "filePath": display_of(&target),
     })
+}
+
+/// Bare-path backups contain credentials: stage privately beside the destination,
+/// then publish a complete file. URI targets (including file URLs) keep provider semantics.
+fn write_backup(gateway: &dyn FileGateway, target: &FilePath, body: &str) -> Result<(), String> {
+    match classify(target) {
+        PickedTarget::Path(path) => {
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+                    return Err("backup destination must be a regular file".into());
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            polaris_store::fs::durable_atomic_write(
+                &path,
+                body,
+                &polaris_store::fs::random_tmp_suffix(),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        }
+        PickedTarget::Uri(_) => {
+            write_picked(gateway, target, body.as_bytes()).map_err(|error| error.to_string())
+        }
+    }
 }
 
 /// 导入腿**读源文件**那一段的结果。

@@ -1,4 +1,4 @@
-import type { SelectionIntent } from './auto-select';
+import type { SelectionIntent, AutoSelectTarget } from './auto-select';
 import type {
   NaiveSettings,
   Hysteria2Settings,
@@ -228,7 +228,7 @@ export interface SubscriptionConfig {
   lastUpdated?: string;
   createdAt: string;
   // 拉取订阅时的 User-Agent 覆盖（per-sub）。优先级：subscription.userAgent ?? config.subscriptionUserAgent ?? 默认。
-  // 默认 `Polaris/<版本>`（纯中性）。订阅对话框「自定义 User-Agent」输入框可设置本字段。
+  // 默认 `Polaris/<版本> sing-box/<配套内核版本>`。订阅对话框「自定义 User-Agent」输入框可设置本字段。
   // 【后端行为差异（已登记）】Rust 侧 `resolve_subscription_ua` 用的是 falsy 语义而非 `??`：
   // 显式 `""`／纯空白**不会**胜出，而是继续回落到 config.subscriptionUserAgent → 默认。
   // 差异只在「显式存了空串」这一格（本对话框把空输入折成 undefined，故正常链路不可达；
@@ -604,6 +604,8 @@ export interface UserConfig {
   // 选择意图：缺席即手动；自动选择时由后端置上（`auto_select_enable`），点任一节点时由后端清掉。
   // 界面只读：全量保存与补丁带上的值一律被后端以盘上为准覆盖。`selectedServerId` 始终是实际出口。
   selectionIntent?: SelectionIntent;
+  autoSelectEnabled?: boolean;
+  autoSelectPins?: { target: AutoSelectTarget; serverId: string }[];
 
   // 代理模式
   proxyMode: ProxyMode;
@@ -687,7 +689,7 @@ export interface UserConfig {
   // 订阅经代理更新的【全局三态策略】（默认 'follow'）：'follow'=按各订阅 per-sub updateViaProxy 决定；
   // 'proxy'=所有订阅强制经代理（忽略 per-sub）；'direct'=所有订阅强制直连（忽略 per-sub）。求值见 shared/subscription-proxy。
   subscriptionProxyPolicy?: SubscriptionProxyPolicy;
-  // 全局订阅 UA（被 per-sub subscription.userAgent 覆盖；均缺省时用 `Polaris/<版本>`）。本期无 UI，手编生效。
+  // 全局订阅 UA（被 per-sub subscription.userAgent 覆盖；均缺省时用 `Polaris/<版本> sing-box/<配套内核版本>`）。本期无 UI，手编生效。
   subscriptionUserAgent?: string;
   // 更新链路（应用/资源/订阅/核心）是否经代理（默认 true=代理运行时经 update-in 借道，更新源多在 GitHub、
   // 墙内借道更可靠）；false=强制直连。经 shared/update-proxy#resolveMainSessionViaProxy 求值，Phase 1b 后
@@ -762,7 +764,7 @@ export interface UserConfig {
   // 原 systemProxyBypass 已并入此字段（单一清单，杜绝两处重复）。
   bypassLANList?: string[];
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
-  utlsPolicy?: string; // follow (legacy default), default, or a supported core profile
+  utlsPolicy?: string; // default (Chrome; initial policy), follow, or a supported core profile
   tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
   // WebRTC 防泄露（仅 TUN 模式生效）：off=关；proxy=对 STUN 经协议嗅探强制走代理（srflx=代理 IP，WebRTC 正常）；
   // block=reject STUN（断 P2P、零公网 IP 泄露）。默认 undefined=off（零行为变化）。系统代理模式拦不住（浏览器 WebRTC

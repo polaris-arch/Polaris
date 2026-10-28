@@ -178,10 +178,6 @@ impl FreePortDeps for MockFreePort {
     fn proc_comm(&self, pid: u32) -> Option<String> {
         self.comm_map.lock().unwrap().get(&pid).cloned()
     }
-    fn kill(&self, pid: u32) -> bool {
-        self.killed.lock().unwrap().push(pid);
-        true
-    }
 }
 
 // ===== Mock Systemd（handler 测试用，记录调用）=====
@@ -780,8 +776,7 @@ fn legacy_mutating_commands_cannot_touch_exact_birth() {
     ] {
         assert!(legacy_command_rejected(command, &state, &spawner));
     }
-    // These dispatched paths use only mocks if the guard regresses; cleanup's
-    // external pkill is covered by the same pure predicate above.
+    // These dispatched paths use only mocks; legacy broad pkill is retired.
     for command in [cmd::STOP, cmd::FREEPORT, cmd::START] {
         let mut conn = MockConn::new(vec!["9090"]);
         dispatch_locked(&mut state, &deps, &cred, command, &mut conn);
@@ -1220,7 +1215,7 @@ fn freeport_empty_port_rejected() {
 }
 
 #[test]
-fn freeport_free_when_ss_returns_none() {
+fn freeport_inspection_failure_is_not_free() {
     let (_dir, auth, _core) = setup_env();
     let peer = StaticPeerCred::new(0, 0);
     let spawner = MockSpawner::succeeding(100);
@@ -1232,11 +1227,11 @@ fn freeport_free_when_ss_returns_none() {
     let state = Mutex::new(HandlerState::new());
     let mut conn = MockConn::new(vec!["freeport", "9090"]);
     handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["OK free"]);
+    assert_eq!(conn.writes(), vec!["ERR port-inspection-failed"]);
 }
 
 #[test]
-fn freeport_kills_own_singbox() {
+fn freeport_reports_own_singbox_without_signal() {
     let (_dir, auth, _core) = setup_env();
     let peer = StaticPeerCred::new(0, 0);
     let spawner = MockSpawner::succeeding(100);
@@ -1252,8 +1247,8 @@ fn freeport_kills_own_singbox() {
     let state = Mutex::new(HandlerState::new());
     let mut conn = MockConn::new(vec!["freeport", "9090"]);
     handle(&state, &deps, &mut conn);
-    assert_eq!(conn.writes(), vec!["OK killed 1234"]);
-    assert_eq!(*fp.killed.lock().unwrap(), vec![1234]);
+    assert_eq!(conn.writes(), vec!["OK foreign sing-box"]);
+    assert!(fp.killed.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2166,4 +2161,45 @@ fn continuous_unterminated_command_stops_after_limit_plus_one_bytes() {
         MAX_COMMAND_LINE_BYTES + 1
     );
     assert_eq!(conn.inner.get_ref().output, b"ERR unknown\n");
+}
+
+#[test]
+fn shutdown_snapshot_rejects_queued_start_and_upgrade_cancel() {
+    let (_dir, auth, _core) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = no_op_ss();
+    let fwd = no_op_fwd();
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let mut state = HandlerState::new();
+    // Deterministically model accept before shutdown and dispatch afterwards.
+    assert!(state.begin_shutdown().is_none());
+    for command in [cmd::CANCEL_HELPER_UPGRADE, lcmd::START_PINNED_BIRTH] {
+        let mut conn = MockConn::new(vec![command]);
+        let locked = Mutex::new(state);
+        handle(&locked, &deps, &mut conn);
+        assert_eq!(conn.writes(), ["ERR helper-shutting-down"]);
+        let next = locked.into_inner().unwrap();
+        assert!(next.shutting_down && next.upgrade_closed);
+        state = next;
+    }
+    assert!(spawner.spawn_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn freeport_listener_without_visible_pid_is_not_free() {
+    let (_dir, auth, _core) = setup_env();
+    let peer = StaticPeerCred::new(0, 0);
+    let spawner = MockSpawner::succeeding(100);
+    let fp = MockFreePort::empty();
+    let systemd = MockSystemd::default();
+    let ss = |_p: &str| Some("LISTEN 0 128 0.0.0.0:9090 0.0.0.0:*".into());
+    let fwd = no_op_fwd();
+    let deps = make_deps(None, &auth, &peer, &spawner, &fp, &systemd, &ss, &fwd);
+    let state = Mutex::new(HandlerState::new());
+    let mut conn = MockConn::new(vec!["freeport", "9090"]);
+    handle(&state, &deps, &mut conn);
+    assert_eq!(conn.writes(), ["OK foreign unknown"]);
 }

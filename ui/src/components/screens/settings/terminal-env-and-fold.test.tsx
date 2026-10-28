@@ -419,7 +419,7 @@ describe('更新与测速两行在网络页，通用页无残留', () => {
     const src = full.slice(full.indexOf('\nimport '));
     expect(src).not.toContain('speedTestUrl');
     expect(src).not.toContain('mainSessionViaProxy');
-    expect(src).not.toContain('useRef'); // 唯一用途是测速端点的种子守卫，已随之搬走
+    expect(src).not.toContain('speedTestUrlSeed'); // 测速端点种子不属于通用页；自启动作可有独立在途锁
   });
 });
 

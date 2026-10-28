@@ -812,8 +812,8 @@ fn the_two_fallback_switches_cut_what_they_say() {
         decide(&switched_off, &mut Memory::default()),
         Decision::NotEvaluated(Gate::SwitchedOff)
     );
-    // 生产取值：两个都开。
-    const { assert!(AUTO_SELECT_ENABLED && BETTER_LEG_ENABLED) };
+    // Native URLTest owns production; legacy pure policy remains testable explicitly.
+    const { assert!(!AUTO_SELECT_ENABLED && BETTER_LEG_ENABLED) };
 }
 
 // ── 显式路径：与后台同一个裁决 ────────────────────────────────────────────────

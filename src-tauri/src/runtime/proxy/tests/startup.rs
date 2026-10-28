@@ -3452,7 +3452,8 @@ fn kernel_gate_cache_normalizes_only_known_runtime_ports() {
         "inbounds": [
             { "tag": "probe-in-0", "listen_port": 21001 },
             { "tag": "update-in", "listen_port": 21002 },
-            { "tag": "mixed-in", "listen_port": 17890 }
+            { "tag": "mixed-in", "listen_port": 17890 },
+            { "tag": polaris_config_engine::builder::helpers::PROBE_PROXY_INBOUND_TAG, "listen_port": 21005 }
         ],
         "services": [
             { "type": "api", "listen_port": 21003 },
@@ -3468,6 +3469,7 @@ fn kernel_gate_cache_normalizes_only_known_runtime_ports() {
     different_runtime_ports["inbounds"][0]["listen_port"] = Value::from(31001);
     different_runtime_ports["inbounds"][1]["listen_port"] = Value::from(31002);
     different_runtime_ports["services"][0]["listen_port"] = Value::from(31003);
+    different_runtime_ports["inbounds"][3]["listen_port"] = Value::from(31005);
 
     let mut normalized_original = original.clone();
     normalize_kernel_gate_config(&mut normalized_original);
@@ -4668,4 +4670,41 @@ async fn startup_capability_proof_survives_eviction_but_rejects_real_replacement
         validate_startup_cli_proof(Some(&binary), &proof.snapshot, Some(&proof)),
         Err("Core bytes changed after capability query; retry startup".into())
     );
+}
+
+#[tokio::test]
+async fn delayed_startup_cannot_replace_newer_stop_or_queued_start() {
+    let (rt, _dir, _calls) = test_runtime_gated(HelperGateDecision::Abort);
+    let scheduled = rt.startup_admission().unwrap();
+    rt.stop().await.unwrap();
+    assert!(rt
+        .startup_start_completion(tun_config(), scheduled)
+        .is_err());
+    assert!(rt.normal_start.lock().unwrap().as_ref().is_none());
+
+    let scheduled = rt.startup_admission().unwrap();
+    // No yield: the explicit producer is queued, not yet generation-claimed.
+    let explicit = rt
+        .explicit_start_completion(serde_json::Value::Null)
+        .unwrap();
+    let generation = rt.core_generation();
+    assert!(rt
+        .startup_start_completion(tun_config(), scheduled)
+        .is_err());
+    assert_eq!(rt.core_generation(), generation);
+    drop(explicit);
+}
+
+#[tokio::test]
+async fn untouched_startup_is_admitted_but_exit_retires_its_ticket() {
+    let (rt, _dir, _calls) = test_runtime_gated(HelperGateDecision::Abort);
+    let scheduled = rt.startup_admission().unwrap();
+    assert!(rt
+        .startup_start_completion(serde_json::Value::Null, scheduled)
+        .is_ok());
+    let scheduled = rt.startup_admission().unwrap();
+    rt.begin_shutdown().unwrap();
+    assert!(rt
+        .startup_start_completion(tun_config(), scheduled)
+        .is_err());
 }

@@ -46,14 +46,8 @@ use polaris_updater::traits::DownloadError;
 
 // ── 传输层常量（单点定义，各消费族不得自造第二份）───────────────────────────────
 
-/// 应用自标识 UA（= 上游 `APP_USER_AGENT`）。
-///
-/// **与订阅 UA 是两回事**：订阅走 `net_stack::subscription::default_subscription_user_agent`
-/// （中性 `Polaris/<ver>`，由调用方按订阅偏好覆盖）；本 UA 用于 GitHub API / 资源下载。
-/// **勿与 mesh 的 `WARP_USER_AGENT` 共用** —— 那个是伪装 okhttp 的特例。
-pub fn app_user_agent() -> String {
-    format!("Polaris/{}", env!("CARGO_PKG_VERSION"))
-}
+mod user_agent;
+pub use user_agent::app_user_agent;
 
 /// 响应头超时（连接 + 首字节）。= Polaris 下载链路 15s。
 /// **不是**整请求超时：大文件下载正常会超过 15s，整请求超时会把正常下载判死。
@@ -564,7 +558,7 @@ async fn read_body_to_sink_with_progress(
             None => return Ok(received as u64),
             Some(chunk) => {
                 if let Some(limit) = max {
-                    if received + chunk.len() > limit {
+                    if chunk.len() > limit.saturating_sub(received) {
                         // 中断连接（drop resp 即断）+ Err —— **不把已写出的部分当成功**。
                         return Err(BodyReadError::TooLarge(limit));
                     }
@@ -667,7 +661,10 @@ fn map_body_error(e: BodyReadError, expected: Option<u64>) -> DownloadError {
                 received: received as u64,
                 expected: n,
             },
-            None => DownloadError::Other(message),
+            None => DownloadError::Other(
+                subscription_transport::classify_transport_failure(false, false, &message)
+                    .to_string(),
+            ),
         },
         // `received` 在此**真被消费**（不是死字段）：磁盘满的诊断价值一半在「写到第几字节才满」，
         // 而 `DownloadError::Io` 只装得下一个 `io::Error` ⇒ 把它并进消息里，
@@ -802,6 +799,32 @@ pub struct CoreDownloader {
     /// 单次下载体积硬闸。默认 [`MAX_DOWNLOAD_BYTES`]（仅缺省值），**每条生产腿都由
     /// [`Self::with_max_bytes`] 显式覆盖**。
     max_bytes: usize,
+    #[cfg(test)]
+    test_transport: bool,
+}
+
+/// Executable download policy only. Subscription/resource policies remain independent.
+async fn guarded_update_target<L: polaris_net_stack::ssrf::DnsLookup>(
+    raw: &str,
+    lookup: &L,
+) -> Result<polaris_net_stack::safe_redirect::GuardedTarget, DownloadError> {
+    let url =
+        reqwest::Url::parse(raw).map_err(|_| DownloadError::Other("invalid update URL".into()))?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return Err(DownloadError::Other(
+            "update downloads require HTTPS without URL credentials".into(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| DownloadError::Other("update URL has no host".into()))?;
+    let addresses = polaris_net_stack::ssrf::resolve_host_allowed(host, lookup, false)
+        .await
+        .map_err(|_| DownloadError::Other("update host rejected or DNS unavailable".into()))?;
+    Ok(polaris_net_stack::safe_redirect::GuardedTarget {
+        host: host.to_string(),
+        addresses,
+    })
 }
 
 impl CoreDownloader {
@@ -815,10 +838,19 @@ impl CoreDownloader {
             handle,
             gh_proxy_prefix: String::new(),
             max_bytes: MAX_DOWNLOAD_BYTES,
+            #[cfg(test)]
+            test_transport: false,
         }
     }
 
     /// 设 gh 加速前缀（镜像回退用）。
+    // Legacy loopback stream fixtures exercise body/redirect I/O only. Security tests use new().
+    #[cfg(test)]
+    fn with_test_transport(mut self) -> Self {
+        self.test_transport = true;
+        self
+    }
+
     #[must_use]
     pub fn with_gh_proxy(mut self, prefix: impl Into<String>) -> Self {
         self.gh_proxy_prefix = prefix.into().trim().to_string();
@@ -853,11 +885,30 @@ impl CoreDownloader {
     ) -> Result<(reqwest::Response, Option<u64>), DownloadError> {
         let mut current = url.to_string();
         for _ in 0..=MAX_DOWNLOAD_REDIRECTS {
-            let resp =
-                tokio::time::timeout(RESPONSE_TIMEOUT, self.http.client().get(&current).send())
-                    .await
-                    .map_err(|_| DownloadError::Stalled(RESPONSE_TIMEOUT.as_millis() as u64))?
-                    .map_err(|e| DownloadError::Other(format!("请求失败: {e}")))?;
+            let resp = tokio::time::timeout(RESPONSE_TIMEOUT, async {
+                #[cfg(test)]
+                if self.test_transport {
+                    return self.http.client().get(&current).send().await.map_err(|e| {
+                        DownloadError::Other(subscription_transport::sanitized_reqwest_error(&e))
+                    });
+                }
+                if self.http.resolution_mode != HttpResolutionMode::DirectPinned {
+                    return Err(DownloadError::Other(
+                        "executable downloads require direct pinned transport".into(),
+                    ));
+                }
+                let target = guarded_update_target(&current, &SystemDnsLookup).await?;
+                // Pin the exact admitted addresses for this hop, including mirror/redirect hops.
+                let client =
+                    subscription_transport::build_direct_pinned_client(&target).map_err(|_| {
+                        DownloadError::Other("cannot build guarded update transport".into())
+                    })?;
+                client.get(&current).send().await.map_err(|e| {
+                    DownloadError::Other(subscription_transport::sanitized_reqwest_error(&e))
+                })
+            })
+            .await
+            .map_err(|_| DownloadError::Stalled(RESPONSE_TIMEOUT.as_millis() as u64))??;
 
             let status = resp.status().as_u16();
 
@@ -874,10 +925,10 @@ impl CoreDownloader {
                     )));
                 };
                 let base = reqwest::Url::parse(&current)
-                    .map_err(|e| DownloadError::Other(format!("URL 非法 {current}: {e}")))?;
+                    .map_err(|e| DownloadError::Other(format!("invalid redirect base URL: {e}")))?;
                 let next = base
                     .join(&loc)
-                    .map_err(|e| DownloadError::Other(format!("重定向目标非法 {loc}: {e}")))?;
+                    .map_err(|e| DownloadError::Other(format!("invalid redirect target: {e}")))?;
                 if next.scheme() != "http" && next.scheme() != "https" {
                     return Err(DownloadError::Other(format!(
                         "重定向目标协议不支持（仅 http/https）: {}",
@@ -957,7 +1008,11 @@ impl CoreDownloader {
             match rx.recv() {
                 Ok(Ok(v)) => return Ok(v),
                 Ok(Err(e)) => {
-                    log::warn!("下载失败（{cand}）: {e}");
+                    let endpoint = reqwest::Url::parse(&cand)
+                        .ok()
+                        .map(|_| polaris_net_stack::subscription::redact_url(&cand))
+                        .unwrap_or_else(|| "<invalid URL>".into());
+                    log::warn!("下载失败（{endpoint}）: {e}");
                     last = Some(e);
                 }
                 Err(_) => {

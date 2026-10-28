@@ -46,6 +46,7 @@ export interface NodeCardProps {
   sourceLabel?: string;
   /** 当前出口（选中节点）。 */
   isCurrent?: boolean;
+  autoSelected?: boolean;
   /** 组网出口节点（显示「出口」标记）。 */
   isExit?: boolean;
   /** 仅局域网组网节点（`meshAllowsInternet=false`：WG/WARP 关了「允许访问外网」、TS 没设出口节点）。 */
@@ -132,6 +133,7 @@ function NodeCardView({
   server,
   sourceLabel,
   isCurrent,
+  autoSelected = false,
   isExit,
   lanOnly,
   speedTestable,
@@ -192,7 +194,7 @@ function NodeCardView({
       : undefined;
   /* 「设为出口」那颗的文案：当前出口 / 已武装（两档） / 常态。三处（tip、aria、无障碍）同一份，
      不各写一遍——此前 data-tip 与 aria-label 逐字重复了整段三元式，改一处漏一处只是时间问题。 */
-  const useTip = isCurrent
+  const useTip = isCurrent && !autoSelected
     ? t('nodes.useCurrent')
     : useConfirming
       ? useNeedsApply
@@ -217,9 +219,9 @@ function NodeCardView({
          已是当前出口就什么都不做 —— 重选同一个节点在后端是空操作，弹一条「已切换」是噪声。 */
       onClick={() => {
         if (batchMode) onToggleSelect?.(server);
-        else if (!isCurrent) onUse?.(server, 'card');
+        else if (!isCurrent || autoSelected) onUse?.(server, 'card');
       }}
-      style={!batchMode && !isCurrent && onUse ? { cursor: 'pointer' } : undefined}
+      style={!batchMode && (!isCurrent || autoSelected) && onUse ? { cursor: 'pointer' } : undefined}
       role={batchMode ? 'button' : undefined}
       aria-pressed={batchMode ? !!selected : undefined}
     >
@@ -446,8 +448,8 @@ function NodeCardView({
             <button
               type="button"
               className={cn('nd-a', useConfirming && 'confirming')}
-              disabled={isCurrent}
-              style={isCurrent ? { opacity: 0.35, cursor: 'default' } : undefined}
+              disabled={isCurrent && !autoSelected}
+              style={isCurrent && !autoSelected ? { opacity: 0.35, cursor: 'default' } : undefined}
               onClick={(e) => {
                 e.stopPropagation();
                 onUse(server, 'button');

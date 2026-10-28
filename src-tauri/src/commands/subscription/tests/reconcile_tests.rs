@@ -575,11 +575,11 @@ fn subscription_ua_precedence_per_sub_then_global_then_default() {
         resolve_subscription_ua(&json!({ "subscriptionUserAgent": "" }), &json!({})),
         None
     );
-    // ⑤ 默认 UA 形态（拉取层兜底）——与契约注释 `Polaris/<版本>` 一致。
+    // ⑤ 默认 UA 形态（拉取层兜底）——与契约注释 `Polaris/<版本> sing-box/<内核版本>` 一致。
     assert_eq!(
-        default_subscription_user_agent("9.9.9"),
-        "Polaris/9.9.9",
-        "默认 UA 须中性 Polaris/<ver>"
+        default_subscription_user_agent("9.9.9", "1.2.3"),
+        "Polaris/9.9.9 sing-box/1.2.3",
+        "默认 UA 须包含软件与内核版本"
     );
 }
 
@@ -894,4 +894,158 @@ fn both_sentinels_survive_delete_changed_unchanged_and_auto_reselection() {
             assert_eq!(refreshed["selectedServerId"], sentinel);
         }
     }
+}
+
+fn transport_identity_node(id: &str, sni: &str, path: &str) -> ServerConfig {
+    serde_json::from_value(json!({
+        "id":id,"name":"same display name","protocol":"vless","address":"cdn.example",
+        "port":443,"uuid":"11111111-1111-1111-1111-111111111111","subscriptionId":"sub1",
+        "network":"ws","tlsSettings":{"serverName":sni},"wsSettings":{"path":path}
+    }))
+    .unwrap()
+}
+
+#[test]
+fn reordered_same_coarse_nodes_keep_exact_ids_references_and_local_policy() {
+    // Isolate SNI and path dimensions: each is absent from the coarse fingerprint.
+    for (sni_b, path_b) in [("b.example", "/a"), ("a.example", "/b")] {
+        let a = transport_identity_node("old-a", "a.example", "/a");
+        let b = transport_identity_node("old-b", sni_b, path_b);
+        let mut old_a = serde_json::to_value(&a).unwrap();
+        old_a["meshInboundPolicy"] = json!({"mode":"block"});
+        old_a["createdAt"] = json!("original-a");
+        let mut cfg = json!({"servers":[old_a, b], "selectedServerId":"old-a",
+            "trafficRules":[{"id":"pinned","targetServerId":"old-a"}]});
+        let mut new_a = a.clone();
+        new_a.id = "generated-a".into();
+        new_a.name = "renamed-a".into();
+        let mut new_b = b.clone();
+        new_b.id = "generated-b".into();
+        let out = reconcile_subscription_servers(&mut cfg, "sub1", vec![new_b, new_a], false, &[]);
+        assert_eq!((out.added, out.deleted), (0, 0));
+        assert_eq!(cfg["servers"][0]["id"], "old-b");
+        assert_eq!(cfg["servers"][1]["id"], "old-a");
+        assert_eq!(cfg["servers"][1]["name"], "renamed-a");
+        assert_eq!(cfg["servers"][1]["createdAt"], "original-a");
+        assert_eq!(cfg["servers"][1]["meshInboundPolicy"]["mode"], "block");
+        assert!(cfg["servers"][0].get("meshInboundPolicy").is_none());
+        assert_eq!(cfg["selectedServerId"], "old-a");
+        assert_eq!(cfg["trafficRules"][0]["targetServerId"], "old-a");
+    }
+}
+
+#[test]
+fn singleton_transport_update_keeps_legacy_identity_but_credential_change_does_not() {
+    let old = transport_identity_node("stable", "old.example", "/old");
+    let mut cfg = json!({"servers":[old],"selectedServerId":"stable"});
+    let changed = transport_identity_node("generated", "new.example", "/new");
+    let outcome =
+        reconcile_subscription_servers(&mut cfg, "sub1", vec![changed.clone()], false, &[]);
+    assert_eq!((outcome.added, outcome.deleted), (0, 0));
+    assert_eq!(cfg["servers"][0]["id"], "stable");
+    assert_eq!(
+        cfg["servers"][0]["tlsSettings"]["serverName"],
+        "new.example"
+    );
+    assert_eq!(cfg["selectedServerId"], "stable");
+    cfg["servers"][0]["meshInboundPolicy"] = json!({"mode":"block"});
+    let mut rotated = changed;
+    rotated.id = "new-credential".into();
+    rotated.uuid = Some("22222222-2222-2222-2222-222222222222".into());
+    let outcome = reconcile_subscription_servers(&mut cfg, "sub1", vec![rotated], false, &[]);
+    assert_eq!((outcome.added, outcome.deleted), (1, 1));
+    assert_eq!(cfg["servers"][0]["id"], "new-credential");
+    assert!(cfg["servers"][0].get("meshInboundPolicy").is_none());
+}
+
+#[test]
+fn ambiguous_changed_node_cannot_steal_later_exact_match_or_old_authorization() {
+    let a = transport_identity_node("old-a", "a.example", "/a");
+    let b = transport_identity_node("old-b", "b.example", "/b");
+    let mut old_a = serde_json::to_value(a).unwrap();
+    old_a["meshInboundPolicy"] = json!({"mode":"block"});
+    let mut cfg = json!({"servers":[old_a,b],"selectedServerId":"old-b"});
+    let fresh = transport_identity_node("fresh-c", "c.example", "/c");
+    let exact_b = transport_identity_node("fresh-b", "b.example", "/b");
+    let outcome =
+        reconcile_subscription_servers(&mut cfg, "sub1", vec![fresh, exact_b], false, &[]);
+    assert_eq!((outcome.added, outcome.deleted), (1, 1));
+    assert_eq!(cfg["servers"][0]["id"], "fresh-c");
+    assert_eq!(cfg["servers"][1]["id"], "old-b");
+    assert!(cfg["servers"][0].get("meshInboundPolicy").is_none());
+    assert_eq!(cfg["selectedServerId"], "old-b");
+}
+
+#[test]
+fn exact_refresh_identity_reuses_parser_identity_and_ignores_display_metadata() {
+    let node = transport_identity_node("id", "a.example", "/a");
+    let expected = polaris_net_stack::subscription::server_generation_identity(&node);
+    assert_eq!(
+        node_generation_identity(&serde_json::to_value(&node).unwrap()),
+        Some(expected.clone())
+    );
+    let mut renamed = node.clone();
+    renamed.name = "another display label".into();
+    renamed.id = "another generated id".into();
+    renamed.subscription_id = Some("other subscription metadata".into());
+    assert_eq!(
+        polaris_net_stack::subscription::server_generation_identity(&renamed),
+        expected
+    );
+    assert_eq!(
+        polaris_net_stack::subscription::dedupe_by_fingerprint(vec![node, renamed]).len(),
+        1
+    );
+}
+
+// IP-01: parser dependency IDs survive exact graph matching, stable-ID reuse and partial refresh.
+#[test]
+fn imported_detours_follow_stable_ids_across_reordered_coarse_collisions() {
+    let node = |id: &str, address: &str, detour: Option<&str>| -> ServerConfig {
+        serde_json::from_value(
+            json!({"id":id,"name":id,"protocol":"socks","address":address,"port":1080,
+            "subscriptionId":"sub","detour":detour}),
+        )
+        .unwrap()
+    };
+    let old = vec![
+        node("old-a", "same", Some("old-front-a")),
+        node("old-b", "same", Some("old-front-b")),
+        node("old-front-a", "a", None),
+        node("old-front-b", "b", None),
+    ];
+    let mut cfg = json!({"servers":old,"selectedServerId":"old-a"});
+    let incoming = vec![
+        node("new-b", "same", Some("new-front-b")),
+        node("new-a", "same", Some("new-front-a")),
+        node("new-front-b", "b", None),
+        node("new-front-a", "a", None),
+    ];
+    reconcile_subscription_servers(&mut cfg, "sub", incoming, false, &[]);
+    assert_eq!(cfg["servers"][0]["id"], "old-b");
+    assert_eq!(cfg["servers"][0]["detour"], "old-front-b");
+    assert_eq!(cfg["servers"][1]["id"], "old-a");
+    assert_eq!(cfg["servers"][1]["detour"], "old-front-a");
+    assert_eq!(cfg["selectedServerId"], "old-a");
+}
+
+#[test]
+fn partial_provider_leftover_edges_keep_stable_ids_and_source_removal_is_authoritative() {
+    let mut cfg = json!({"selectedServerId":"old-front", "servers":[
+        {"id":"old-front","name":"front","protocol":"socks","address":"f","port":1080,"subscriptionId":"sub","providerName":"good"},
+        {"id":"leftover","name":"leftover","protocol":"socks","address":"e","port":1080,"subscriptionId":"sub","providerName":"failed","detour":"old-front"}
+    ]});
+    let front: ServerConfig = serde_json::from_value(json!({"id":"new-front","name":"front","protocol":"socks","address":"f","port":1080,"subscriptionId":"sub","providerName":"good"})).unwrap();
+    reconcile_subscription_servers(&mut cfg, "sub", vec![front], true, &["failed".into()]);
+    let servers = cfg["servers"].as_array().unwrap();
+    assert!(servers.iter().any(|s| s["id"] == "old-front"));
+    assert!(servers
+        .iter()
+        .any(|s| s["id"] == "leftover" && s["detour"] == "old-front"));
+    // No generic local-detour provenance exists. Preserve established refresh semantics:
+    // an explicit incoming source without an edge removes the old source edge.
+    let incoming: ServerConfig = serde_json::from_value(json!({"id":"fresh-leftover","name":"leftover","protocol":"socks","address":"e","port":1080,"subscriptionId":"sub","providerName":"failed"})).unwrap();
+    reconcile_subscription_servers(&mut cfg, "sub", vec![incoming], false, &[]);
+    assert_eq!(cfg["servers"][0]["id"], "leftover");
+    assert!(cfg["servers"][0].get("detour").is_none());
 }

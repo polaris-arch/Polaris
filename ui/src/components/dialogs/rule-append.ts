@@ -11,6 +11,7 @@ import {
   RULE_TYPE_IDS,
   RULE_TYPES,
   ruleConditions,
+  ruleRouteEffect,
   validateRuleValue,
   type RuleSubject,
 } from '@/domain/rules';
@@ -215,6 +216,7 @@ function matchingConditions(rule: Rule, subject: RuleSubject): RuleCondition[] |
 }
 
 function subjectMatchesRule(rule: Rule, subject: RuleSubject): boolean {
+  if (rule.networkProfileId || !ruleRouteEffect(rule)) return false;
   const conds = matchingConditions(rule, subject);
   if (!conds) return false;
   const logic = rule.combineMode === 'and' ? 'and' : 'or';
@@ -227,8 +229,8 @@ function subjectMatchesRule(rule: Rule, subject: RuleSubject): boolean {
       ) === 'hit'
     );
   }
-  const value = lower(subject.value);
-  const hits = conds.map((cond) => condValues(cond).some((item) => lower(item) === value));
+  const value = subject.value.trim();
+  const hits = conds.map((cond) => condValues(cond).some((item) => item.trim() === value));
   return logic === 'and' ? hits.every(Boolean) : hits.some(Boolean);
 }
 

@@ -51,7 +51,7 @@
  * 全部判据都写成「X 必须在、且内容必须是 Y」，没有一条是「不许出现 Z」：后者会被
  * 「什么都没发生」骗过 —— 一个空 zip、一次 `unzip` 变哑、一条读错的路径，在纯否定式判据下全是绿。
  * 三份许可文本不只判「在」，还与工作树里那三份**逐字节对拍**（截断 / 占位 / 改错版本都红）；
- * `.srs` 不只判「有」，还与工作树份数相等且要求工作树份数非零（否则 `0 == 0` 恒真）；
+ * `.srs` 与工作树同源资源清单逐路径、逐字节对拍，且工作树须非空并含有效 SRS 魔数；
  * 死字节不只判「不许太大」，而是**算出实际比值并要求它落在带内** —— 带的下沿 `1.0` 守的正是
  * 「条目尺寸读成了 0 / 读错了包」那类取材面塌陷，纯上限判据在那种输入上是恒绿的；
  * 剥符号先要求节表**解析得出、且含 `.text` / `.dynamic` / `.dynsym` / `.dynstr`**，
@@ -65,7 +65,7 @@
  * ── 为什么不复用 `scripts/lib/extract-zip.mjs` ──
  *
  * 那个模块**刻意只提供全解**（见其头注：按成员选择性解压的 flag 语义在 bsdtar 上没有逐字对应物）。
- * 本脚本要从一个 debug APK（实测 150–600 MB）里只取 5 个成员，全解等于在 runner 上多写一遍
+ * 本脚本要从一个 debug APK（实测 150–600 MB）里只取需要校验的原生库、许可文本与 geo 成员，全解等于在 runner 上多写一遍
  * 整包。且本脚本的射程按定义只有 Linux（Android 腿只在 ubuntu 上跑，
  * 见 `.github/workflows/android.yml`），不需要那个模块为 Windows 付的复杂度 —— 直接用
  * `unzip -Z1` / `unzip -p`，两条命令都在 ubuntu runner 与本机实测过（80 MB 成员 0.3s）。
@@ -753,7 +753,7 @@ function debugOwnerHint(lib) {
  * @param {string[]} input.names       APK 内全部成员名（`unzip -Z1`）
  * @param {(name: string) => Buffer} input.readMember   读一个成员的字节
  * @param {(name: string) => Buffer|null} input.repoLicense 工作树里同名许可文本的字节（缺失为 null）
- * @param {number} input.repoSrsCount  工作树 `resources/data/` 下的 `.srs` 份数
+ * @param {Map<string, Buffer>} input.repoSrs 工作树 `resources/data/` 下的 `.srs` 文件名及字节
  * @param {number} input.fileSize      APK 文件本身的字节数（`stat`）
  * @param {number} input.entriesCompressedTotal 全部条目**压缩后**字节数之和（`unzip -Zt`）
  * @param {string} input.abi          按哪个 ABI 判（`ABIS` 的键；未知取值当场抛，不静默按缺省走）
@@ -764,7 +764,7 @@ export function apkViolations({
   names,
   readMember,
   repoLicense,
-  repoSrsCount,
+  repoSrs,
   fileSize,
   entriesCompressedTotal,
   abi,
@@ -865,18 +865,34 @@ export function apkViolations({
     }
   }
 
-  // ── ④ geo `.srs` 出厂副本：份数与工作树相等，且工作树份数非零 ───────────────
-  //     与 ① 同一类（都住在 `assets/_up_/` 下），但它是**计数**判据，必须先钉住真值非零，
-  //     否则「工作树被清空 + 包里也没有」会以 `0 === 0` 判绿。
-  const inApk = names.filter((n) => n.startsWith(`${ASSET_UP}${SRS_DIR}/`) && n.endsWith('.srs')).length;
-  if (repoSrsCount === 0) {
-    fail(`工作树 ${SRS_DIR}/ 下一份 .srs 都没有 —— 真值为零，份数判据退化成恒真`);
-  } else if (inApk !== repoSrsCount) {
-    fail(
-      `APK 内 ${ASSET_UP}${SRS_DIR}/ 有 ${inApk} 份 .srs，工作树 ${SRS_DIR}/ 有 ${repoSrsCount} 份 —— ` +
-        '内置 geo 规则集没有随包（缺失时 route builder fail-closed 剪掉全部 geo 规则，' +
-        '叠加回国模式即全量明文直连）',
-    );
+  // ── ④ geo 出厂副本：复用工作树资源真值，精确路径集与字节必须相同 ───────────
+  // Apple 的 consume.apple_resources() 也从 bundle.resources 指向的工作树取真值。
+  // Android 无需 Apple 的文件 mode；BundledRules.prepare 按这些路径提取，再由 Rust 按文件名播种。
+  const prefix = `${ASSET_UP}${SRS_DIR}/`;
+  const geoNames = names.filter((name) => name.startsWith(prefix) && name.endsWith('.srs'));
+  if (!(repoSrs instanceof Map)) {
+    fail('工作树 .srs 资源真值缺失，不能仅凭份数放行');
+  } else if (repoSrs.size === 0) {
+    fail(`工作树 ${SRS_DIR}/ 下一份 .srs 都没有 —— 真值为零，不能放行`);
+  } else {
+    const missing = [...repoSrs.keys()].filter((name) => !present.has(prefix + name));
+    const extra = geoNames.filter((name) => !repoSrs.has(name.slice(prefix.length)));
+    if (missing.length || extra.length || geoNames.length !== repoSrs.size) {
+      fail(`APK 内 ${prefix} 有 ${geoNames.length} 份 .srs，工作树有 ${repoSrs.size} 份；路径集不一致：` +
+        `缺失 [${missing.join(', ')}]，多出 [${extra.join(', ')}]`);
+    }
+    for (const [name, expected] of repoSrs) {
+      if (!Buffer.isBuffer(expected) || expected.length <= 3 || !expected.subarray(0, 3).equals(Buffer.from('SRS'))) {
+        fail(`工作树 ${SRS_DIR}/${name} 不是有效 SRS 种子（须含 SRS 魔数及内容）`);
+        continue;
+      }
+      const entry = prefix + name;
+      if (!present.has(entry)) continue;
+      const actual = readMember(entry);
+      if (!actual.equals(expected)) {
+        fail(`${entry} 与工作树 .srs 字节不一致（APK ${actual.length} / 工作树 ${expected.length} 字节）`);
+      }
+    }
   }
 
   // ── ⑤ 死字节：文件大小必须 ≈ 全部条目压缩后之和（+ 可解释的 zip 结构开销）─────────
@@ -1121,9 +1137,10 @@ function main() {
   }
 
   const srsDir = join(ROOT, SRS_DIR);
-  const repoSrsCount = existsSync(srsDir)
-    ? readdirSync(srsDir).filter((n) => n.endsWith('.srs')).length
-    : 0;
+  const repoSrs = new Map(existsSync(srsDir)
+    ? readdirSync(srsDir).filter((name) => name.endsWith('.srs'))
+      .map((name) => [name, readFileSync(join(srsDir, name))])
+    : []);
 
   const names = apkNames(apk);
   const fileSize = statSync(apk).size;
@@ -1139,7 +1156,7 @@ function main() {
       const path = join(ROOT, name);
       return existsSync(path) ? readFileSync(path) : null;
     },
-    repoSrsCount,
+    repoSrs,
     fileSize,
     entriesCompressedTotal,
     abi,
@@ -1166,7 +1183,7 @@ function main() {
     console.log(`  ✘ ${boxEntry} 不在包里`);
   }
   const inApk = names.filter((n) => n.startsWith(`${ASSET_UP}${SRS_DIR}/`) && n.endsWith('.srs')).length;
-  console.log(`  ${inApk === repoSrsCount && repoSrsCount > 0 ? '✔' : '✘'} .srs：APK ${inApk} 份 / 工作树 ${repoSrsCount} 份`);
+  console.log(`  .srs：APK ${inApk} 份 / 工作树 ${repoSrs.size} 份（路径与字节差异见违反项）`);
   if (entriesCompressedTotal > 0) {
     const r = deadByteReport({ names, fileSize, entriesCompressedTotal });
     const ok = r.ratio >= 1 && r.ratio <= r.hi;

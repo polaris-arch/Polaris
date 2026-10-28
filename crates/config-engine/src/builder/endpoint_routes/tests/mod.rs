@@ -130,6 +130,7 @@ fn collect_targeted_from_rules() {
             enabled: true,
             bypass_fakeip: None,
             target_server_id: Some("s2".into()),
+            target_auto_select: None,
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
@@ -146,6 +147,7 @@ fn collect_targeted_from_rules() {
             enabled: true,
             bypass_fakeip: None,
             target_server_id: Some("s3".into()),
+            target_auto_select: None,
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
@@ -301,6 +303,7 @@ fn referenced_ids_rule_target_included() {
             enabled: true,
             bypass_fakeip: None,
             target_server_id: Some("s2".into()),
+            target_auto_select: None,
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
@@ -327,6 +330,7 @@ fn active_roots_follow_traffic_rules_sot_and_detour_to_physical_root() {
         action: RuleAction::Proxy,
         enabled: true,
         target_server_id: Some(target.into()),
+        target_auto_select: None,
         ..Default::default()
     };
     let mut child = ss("child", "2.2.2.2");
@@ -343,6 +347,7 @@ fn active_roots_follow_traffic_rules_sot_and_detour_to_physical_root() {
                     enabled: true,
                     action: RuleAction::Proxy,
                     target_server_id: Some("child".into()),
+                    target_auto_select: None,
                     destination_resolution: None,
                     resolution_only: false,
                 }),
@@ -368,6 +373,7 @@ fn active_roots_follow_traffic_rules_sot_and_detour_to_physical_root() {
             action: RuleAction::Proxy,
             enabled: true,
             target_server_id: Some("child".into()),
+            target_auto_select: None,
         }],
         ..Default::default()
     };
@@ -925,4 +931,41 @@ fn engaged_route_union_does_not_reapply_an_empty_engagement_context() {
         engaged_mesh_forced_route_cidrs(&[node], None, &BTreeSet::new(), &observed),
         expected
     );
+}
+
+#[test]
+fn native_auto_roots_include_candidates_and_detours_but_off_uses_only_pin() {
+    use crate::user_config::auto_select::{AutoSelectPin, AutoSelectTarget, SelectionIntent};
+    let server = |id: &str| ServerConfig {
+        id: id.into(),
+        name: id.into(),
+        protocol: Protocol::Vless,
+        address: "example.com".into(),
+        port: 443,
+        ..Default::default()
+    };
+    let mut config = UserConfig::default();
+    let mut child = server("child");
+    child.detour = Some("root".into());
+    config.servers = vec![child, server("root"), server("other")];
+    config.selected_server_id = Some("stale".into());
+    config.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
+    config.auto_select_enabled = true;
+    assert_eq!(
+        active_physical_root_ids(&config),
+        BTreeSet::from(["root".into(), "other".into()])
+    );
+    config.auto_select_enabled = false;
+    config.auto_select_pins = vec![AutoSelectPin {
+        target: AutoSelectTarget::Global,
+        server_id: "child".into(),
+    }];
+    assert_eq!(
+        active_physical_root_ids(&config),
+        BTreeSet::from(["root".into()])
+    );
+    assert!(!referenced_server_ids(&config).contains("stale"));
 }

@@ -268,6 +268,12 @@ impl LifecycleGate {
             .generation
     }
 
+    /// Nonblocking observation for a foreign controller's mutation guard.
+    /// Contention or poison is unknown and must not authorize a stale mutation.
+    pub fn try_generation(&self) -> Option<u64> {
+        self.inner.try_lock().ok().map(|inner| inner.generation)
+    }
+
     /// 世代与最后认领者须同锁读取，供异步选择回执判断是否被主动停止接管。
     pub fn generation_state(&self) -> (u64, Option<LifecycleKind>) {
         let g = self.inner.lock().expect("lifecycle lock poisoned");

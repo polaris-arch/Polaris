@@ -102,7 +102,7 @@ pub fn parse_custom_upstream(c: &CustomDnsUpstream) -> Option<ResolveUpstream> {
         return None;
     }
     let p = parse_dns_server_spec(Some(&c.spec))?;
-    if p.is_domain {
+    if p.is_domain || p.server.parse::<std::net::IpAddr>().is_err() {
         return None; // 纯 IP 强制
     }
     match p.server_type {
@@ -183,11 +183,15 @@ fn lookup_upstream(id: &str, custom: &[CustomDnsUpstream]) -> Option<ResolveUpst
 
 /// 上游 id 列表 → Tier1/Tier2 分桶 + canonical 去重 + Tier1 上限。上游 `resolveUpstreams`。
 ///
-/// 无效 id / 自定义解析失败 / 重复 → 跳过。
-/// **空 Tier1 → 回退默认 `[ali, dnspod]`**（全不勾 / 全无效 / 只勾了 Tier2 时防「无抢跑上游」全断，
-/// 设计 §9.3 校验闸）。
+/// Generation rejects unsupported explicit selections before reaching this planner.
+/// This low-level projection never substitutes defaults for an unsupported selection.
+/// Empty/default and supported Tier2-only selections retain the existing default
+/// Tier1 policy. Any explicit unsupported entry produces no substituted plan.
 #[must_use]
 pub fn resolve_upstreams(ids: &[String], custom: &[CustomDnsUpstream]) -> ResolvedUpstreams {
+    if ids.iter().any(|id| lookup_upstream(id, custom).is_none()) {
+        return ResolvedUpstreams::default();
+    }
     let mut seen: Vec<String> = Vec::new();
     let mut tier1: Vec<ResolveUpstream> = Vec::new();
     let mut tier2: Vec<ResolveUpstream> = Vec::new();
@@ -208,7 +212,7 @@ pub fn resolve_upstreams(ids: &[String], custom: &[CustomDnsUpstream]) -> Resolv
             tier2.push(up);
         }
     }
-    if tier1.is_empty() {
+    if tier1.is_empty() && ids.iter().all(|id| lookup_upstream(id, custom).is_some()) {
         // 竞速至少要有一个抢跑上游；去重防与已选 Tier2 重复（system 在 Tier2，不会撞）。
         for id in DEFAULT_POOL_IDS {
             if let Some(up) = builtin_upstream(id) {
@@ -221,6 +225,25 @@ pub fn resolve_upstreams(ids: &[String], custom: &[CustomDnsUpstream]) -> Resolv
         }
     }
     ResolvedUpstreams { tier1, tier2 }
+}
+
+/// Validate only the enabled selection at generation time, not hydration. Legacy
+/// unsupported entries remain editable; they cannot silently choose other DNS.
+pub fn validate_selected_upstreams(dns: Option<&DnsConfig>) -> Result<(), String> {
+    let Some(dns) = dns else {
+        return Ok(());
+    };
+    if dns.resolve_node_domains_ahead == Some(false) {
+        return Ok(());
+    }
+    let custom = dns.node_resolver_custom.as_deref().unwrap_or(&[]);
+    for id in dns.node_resolver_pool.as_deref().unwrap_or(&[]) {
+        if lookup_upstream(id, custom).is_none() {
+            // No user-controlled resolver ID or URL in the error.
+            return Err("NODE_RESOLVER_UNSUPPORTED: Select an IP-based HTTPS or UDP node resolver in DNS settings".into());
+        }
+    }
+    Ok(())
 }
 
 /// The single immutable planning entry point. Saved false keeps the legacy

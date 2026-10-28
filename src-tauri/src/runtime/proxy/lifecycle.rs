@@ -403,6 +403,7 @@ impl ProxyRuntime {
     pub fn status(&self) -> ProxyStatus {
         let mut snap = self.status.read().map(|g| g.clone()).unwrap_or_default();
         snap.main_generation = self.gate.generation();
+        snap.actual_server_id = self.native_actual_server_id();
         snap.uptime = snap
             .start_time
             .map(|t0| now_ms().saturating_sub(t0) / 1_000);
@@ -411,6 +412,15 @@ impl ProxyRuntime {
         #[cfg(target_os = "android")]
         {
             snap.reconnect_required = native_reconnect_required(self.config.dir());
+            // Native revoke/stop is observed through the existing mobile bridge.
+            // Project unavailable as disconnected, without claiming cleanup or
+            // releasing custody; the normal explicit Stop still owns teardown.
+            if snap.running && !super::android_bridge::core_started() {
+                snap.running = false;
+                snap.start_time = None;
+                snap.uptime = None;
+                snap.actual_server_id = None;
+            }
         }
         snap
     }
@@ -470,10 +480,24 @@ impl ProxyRuntime {
 
     /// 核是否运行（`singboxProcess || singboxPid` 等价，上游 :1736）。
     pub(crate) fn core_running(&self) -> bool {
-        self.status.read().map(|g| g.running).unwrap_or(false)
+        let ready = self.status.read().map(|g| g.running).unwrap_or(false);
+        #[cfg(target_os = "android")]
+        {
+            ready && super::android_bridge::core_started()
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            ready
+        }
     }
 
     pub(crate) fn tailscale_writer_alive(&self) -> bool {
+        // Native Unavailable is not a close/custody proof. Keep the original
+        // conservative writer bit until the existing explicit teardown clears it.
+        #[cfg(target_os = "android")]
+        if self.status.read().map(|g| g.running).unwrap_or(true) {
+            return true;
+        }
         self.core_running()
             || self.core_via_helper.load(Ordering::SeqCst)
             || self.pid.lock().ok().is_some_and(|pid| pid.is_some())
@@ -591,7 +615,23 @@ impl ProxyRuntime {
     ///
     /// **边界**：系统代理 enable / TUN / helper 提权起核**不在本批次**——见模块级声明。
     pub async fn start(self: &Arc<Self>, config: Value) -> Result<ProxyStatus, StartError> {
-        let mut completion = self.explicit_start_completion(config)?;
+        self.wait_start_completion(self.explicit_start_completion(config)?)
+            .await
+    }
+
+    pub(crate) async fn start_automatic(
+        self: &Arc<Self>,
+        config: Value,
+        admission: super::prerequisite::StartupAdmission,
+    ) -> Result<ProxyStatus, StartError> {
+        self.wait_start_completion(self.startup_start_completion(config, admission)?)
+            .await
+    }
+
+    async fn wait_start_completion(
+        &self,
+        mut completion: tokio::sync::watch::Receiver<super::prerequisite::NormalStartCompletion>,
+    ) -> Result<ProxyStatus, StartError> {
         loop {
             let state = completion.borrow_and_update().clone();
             match state {
@@ -1238,7 +1278,7 @@ impl ProxyRuntime {
             // 安全提交点。只消费后端 journal，**绝不**触碰渲染端尚未保存的 staged 条目。
             self.process_deferred_config_deletions().await;
             // 维度7 #8 对称收口（见方法文档）：marker 门控幂等，失败只记日志不阻断停止。
-            self.clear_system_proxy().await;
+            self.clear_system_proxy_if_current(generation).await;
         }
         #[cfg(target_os = "ios")]
         pending_revoke?;
@@ -1272,7 +1312,7 @@ impl ProxyRuntime {
             return Err("mainCoreChanged".into());
         }
         self.process_deferred_config_deletions().await;
-        self.clear_system_proxy().await;
+        self.clear_system_proxy_if_current(generation).await;
         if self.core_generation() != generation || attempt.cancelled() {
             return Err("mainCoreChanged".into());
         }
@@ -1795,7 +1835,7 @@ impl ProxyRuntime {
         let platform = self.helper.platform();
         if should_clear_system_proxy_between_restart(old_mode, new_mode, platform) {
             log::info!("重启跨模式离开 systemProxy → 起新核前清理旧会话系统代理");
-            self.clear_system_proxy().await;
+            self.clear_system_proxy_if_current(stop_generation).await;
         }
         if old_mode.is_some_and(|mode| mode.effective_on(platform).is_tun())
             && new_mode.is_some_and(|mode| mode.effective_on(platform).is_tun())

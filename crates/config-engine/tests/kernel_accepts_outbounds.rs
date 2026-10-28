@@ -1861,7 +1861,7 @@ fn bundled_core_accepts_block_exit_shape() {
 /// 但核 schema 不认的退化。
 #[test]
 fn bundled_core_accepts_first_class_dns_policy_shape() {
-    let input: UserConfig = serde_json::from_value(json!({
+    let mut input: UserConfig = serde_json::from_value(json!({
         "servers": [],
         "selectedServerId": "__direct__",
         "proxyMode": "direct",
@@ -1900,6 +1900,20 @@ fn bundled_core_accepts_first_class_dns_policy_shape() {
         }
     }))
     .expect("v2 UserConfig");
+    // Explicit dnsServers replaces the serde default, unlike the persisted
+    // configuration which retains all three protected built-in resources.
+    input
+        .dns_servers
+        .extend(polaris_config_engine::user_config::dns_policy::builtin_dns_server_resources());
+    // Removing this actual dependency must still reject generation; the fixture
+    // must not make the compiler synthesize a hidden bootstrap endpoint.
+    let mut missing_bootstrap = input.clone();
+    missing_bootstrap.dns_servers.retain(|server| {
+        server.id != polaris_config_engine::user_config::dns_policy::BUILTIN_BOOTSTRAP_DNS_ID
+    });
+    assert!(
+        generate_sing_box_config(&missing_bootstrap, &BTreeMap::new(), &deps_for("linux")).is_err()
+    );
     let cfg = generate_sing_box_config(&input, &BTreeMap::new(), &deps_for("linux"))
         .expect("生成 v2 DNS 配置");
     let value = serde_json::to_value(cfg).expect("序列化");
@@ -1924,7 +1938,7 @@ fn bundled_core_accepts_first_class_dns_policy_shape() {
 /// 也要让随包核亲自接收 DNS + route 的组合形状。
 #[test]
 fn bundled_core_accepts_dns_owned_connection_resolution_with_fakeip() {
-    let input: UserConfig = serde_json::from_value(json!({
+    let mut input: UserConfig = serde_json::from_value(json!({
         "servers": [],
         "selectedServerId": "__direct__",
         "proxyMode": "direct",
@@ -1941,6 +1955,20 @@ fn bundled_core_accepts_dns_owned_connection_resolution_with_fakeip() {
         }
     }))
     .expect("v4 UserConfig");
+    // Explicit dnsServers replaces the serde default, unlike the persisted
+    // configuration which retains all three protected built-in resources.
+    input
+        .dns_servers
+        .extend(polaris_config_engine::user_config::dns_policy::builtin_dns_server_resources());
+    // Removing this actual dependency must still reject generation; the fixture
+    // must not make the compiler synthesize a hidden bootstrap endpoint.
+    let mut missing_bootstrap = input.clone();
+    missing_bootstrap.dns_servers.retain(|server| {
+        server.id != polaris_config_engine::user_config::dns_policy::BUILTIN_BOOTSTRAP_DNS_ID
+    });
+    assert!(
+        generate_sing_box_config(&missing_bootstrap, &BTreeMap::new(), &deps_for("linux")).is_err()
+    );
     let cfg = generate_sing_box_config(&input, &BTreeMap::new(), &deps_for("linux"))
         .expect("生成 v4 DNS 连接解析配置");
     let value = serde_json::to_value(cfg).expect("序列化");
@@ -2415,7 +2443,8 @@ fn bundled_core_accepts_every_admitted_utls_profile_and_rejects_unknown() {
             &DomainResolver::Tag("dns-bootstrap".into()),
             arch,
             platform,
-        );
+        )
+        .expect("valid test outbound");
         let config = json!({"log":{"disabled":true},
             "dns":{"servers":[{"type":"local","tag":"dns-bootstrap"}]},
             "outbounds":[outbound]});

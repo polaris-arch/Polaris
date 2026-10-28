@@ -40,7 +40,13 @@ pub fn start(app: AppHandle) {
                 continue;
             }
 
-            hidden_secs = next_hidden_secs(hidden_secs, TICK_SECS, window_visible(&app));
+            // 自动回收必须保留真实托盘返回入口；无托盘的桌面 fallback 保留主窗。
+            hidden_secs = next_hidden_secs(
+                hidden_secs,
+                TICK_SECS,
+                window_visible(&app),
+                crate::tray::tray_present(&app),
+            );
             if hidden_secs < HIDDEN_RECLAIM_SECS {
                 continue;
             }
@@ -52,10 +58,10 @@ pub fn start(app: AppHandle) {
     });
 }
 
-/// 可见立即归零；隐藏 / 最小化按节拍饱和累加。
+/// 可见或失去托盘返回入口立即归零；有入口时隐藏 / 最小化按节拍饱和累加。
 #[must_use]
-fn next_hidden_secs(previous: u64, tick_secs: u64, visible: bool) -> u64 {
-    if visible {
+fn next_hidden_secs(previous: u64, tick_secs: u64, visible: bool, tray_present: bool) -> u64 {
+    if visible || !tray_present {
         0
     } else {
         previous.saturating_add(tick_secs)
@@ -81,10 +87,15 @@ fn window_visible(app: &AppHandle) -> bool {
     rt.stats().window_visible(app)
 }
 
-/// 在主线程最终复核窗口仍不可见，再走唯一的轻量态销毁实现。
+/// 在主线程最终复核托盘返回入口、配置与窗口仍不可见，再走唯一的轻量态销毁实现。
 fn enter_lightweight_if_still_hidden(app: &AppHandle) {
     let app_for_main = app.clone();
     let post = app.run_on_main_thread(move || {
+        // 排队期间托盘可能已消失或用户已关闭自动回收；失败安全方向是不销毁。
+        // 仅约束自动腿，保留用户主动关窗、手动轻量模式与退出的既有语义。
+        if !crate::tray::tray_present(&app_for_main) || !auto_lightweight_enabled(&app_for_main) {
+            return;
+        }
         if app_for_main.get_webview_window(MAIN_WINDOW_LABEL).is_none() {
             return;
         }

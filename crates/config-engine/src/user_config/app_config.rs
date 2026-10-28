@@ -33,6 +33,16 @@ pub struct SubscriptionInterfacePolicy {
     pub id: String,
     #[serde(rename = "proxyBindInterface", skip_serializing_if = "Option::is_none")]
     pub proxy_bind_interface: Option<String>,
+    #[serde(
+        rename = "speedTestIntervalMinutes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub speed_test_interval_minutes: Option<u64>,
+}
+
+fn default_utls_policy() -> Option<String> {
+    Some("default".into())
 }
 
 /// 用户配置（增量子集）。上游 `UserConfig`。
@@ -44,6 +54,23 @@ pub struct UserConfig {
     )]
     pub config_schema_version: Option<u32>,
     pub servers: Vec<ServerConfig>,
+    #[serde(rename = "autoSelectEnabled", default)]
+    pub auto_select_enabled: bool,
+    #[serde(
+        rename = "speedTestUrl",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub speed_test_url: Option<String>,
+    #[serde(
+        rename = "selectionIntent",
+        default,
+        deserialize_with = "super::auto_select::deserialize_intent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub selection_intent: Option<super::auto_select::SelectionIntent>,
+    #[serde(rename = "autoSelectPins", default)]
+    pub auto_select_pins: Vec<super::auto_select::AutoSelectPin>,
     #[serde(default)]
     pub subscriptions: Vec<SubscriptionInterfacePolicy>,
     #[serde(rename = "selectedServerId")]
@@ -120,7 +147,7 @@ pub struct UserConfig {
     pub tls_fragment: Option<bool>,
     #[serde(
         rename = "utlsPolicy",
-        default,
+        default = "default_utls_policy",
         deserialize_with = "crate::user_config::normalize::de_opt_token",
         skip_serializing_if = "Option::is_none"
     )]
@@ -222,6 +249,10 @@ impl Default for UserConfig {
             servers: Vec::new(),
             subscriptions: Vec::new(),
             selected_server_id: None,
+            auto_select_enabled: false,
+            speed_test_url: None,
+            selection_intent: None,
+            auto_select_pins: Vec::new(),
             proxy_mode: default_proxy_mode(),
             proxy_mode_type: default_proxy_mode_type(),
             tun_config: None,
@@ -249,7 +280,7 @@ impl Default for UserConfig {
             dns_config: None,
             rule_resources: Vec::new(),
             tls_fragment: None,
-            utls_policy: None,
+            utls_policy: default_utls_policy(),
             interrupt_connections_on_switch: None,
             resolve_before_dial: None,
             region_routing: None,
@@ -269,6 +300,19 @@ impl Default for UserConfig {
 }
 
 impl UserConfig {
+    /// A default Auto reference supersedes the last saved concrete/sentinel selection.
+    pub fn effective_selected_server_id(&self) -> Option<&str> {
+        if self
+            .selection_intent
+            .as_ref()
+            .is_some_and(|i| i.mode == "auto")
+        {
+            None
+        } else {
+            self.selected_server_id.as_deref()
+        }
+    }
+
     /// 一等流量规则；存量配置未迁移时兼容读取 policyRules/customRules。
     #[must_use]
     pub fn effective_traffic_rules(&self) -> &[Rule] {
@@ -341,6 +385,10 @@ impl UserConfig {
         "servers",
         "subscriptions",
         "selectedServerId",
+        "selectionIntent",
+        "autoSelectEnabled",
+        "autoSelectPins",
+        "speedTestUrl",
         "proxyMode",
         "proxyModeType",
         "tunConfig",

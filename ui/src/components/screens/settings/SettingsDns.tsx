@@ -281,6 +281,8 @@ export default function SettingsDns({
   const bootstrapNeeded = !isIpDoh(dns.foreignDns) || !isIpDoh(dns.domesticDns);
 
   function toggleRaceUpstream(id: string, on: boolean) {
+    const custom = customUpstreams.find((item) => item.id === id);
+    if (on && custom && !isPureIpDnsSpec(custom.spec)) return;
     patchDns({ nodeResolverPool: nextRacePool(activeRacePool, id, on) });
   }
 
@@ -606,13 +608,16 @@ export default function SettingsDns({
                 renderRowEnd={(entry) => {
                   const upstream = customUpstreams.find((item) => item.spec.trim() === entry.trim());
                   const checked = !!upstream && racePool.includes(upstream.id);
-                  const disabled = !upstream || (!checked && dohRaceCount >= MAX_DOH_RACE_UPSTREAMS);
+                  const unsupported = !!upstream && !isPureIpDnsSpec(upstream.spec);
+                  const disabled = !upstream || (!checked && (unsupported || dohRaceCount >= MAX_DOH_RACE_UPSTREAMS));
                   return (
                     <Switch
                       checked={checked}
                       disabled={disabled}
                       tip={
-                        !upstream
+                        unsupported
+                          ? t('settings.dns.customDohIpOnly')
+                          : !upstream
                           ? t('settings.dns.saveCustomFirst')
                           : !checked && dohRaceCount >= MAX_DOH_RACE_UPSTREAMS
                             ? t('settings.dns.raceQuotaReached')

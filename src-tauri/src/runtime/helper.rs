@@ -31,7 +31,8 @@ use polaris_helper_client::PipeConnector;
 use polaris_helper_client::UnixConnector;
 use polaris_helper_client::{
     read_token, EscalationOutcome, HelperClient, HelperManager, HelperStatus, InstallParams,
-    InstallPaths, StdExecutor, StdSysOps, SysOps, READY_POLL_ATTEMPTS, READY_POLL_DELAY,
+    InstallPaths, MaintenanceUtility, ManagerError, StdExecutor, StdSysOps, SysOps,
+    READY_POLL_ATTEMPTS, READY_POLL_DELAY,
 };
 use polaris_helper_proto::{
     FlushDns, HelperBirthTarget, LinuxBirthStart, LinuxBirthStatus, LinuxBirthStop, LinuxDns,
@@ -171,23 +172,112 @@ pub enum SelectedCoreState {
 #[serde(rename_all = "camelCase")]
 pub enum HelperActionErrorCode {
     Cancelled,
-    AuthorizationUnavailable,
+    AuthorizationIncomplete,
     PartialCleanup,
     ProxyRunning,
     Unsupported,
     MissingAsset,
     BundleMismatch,
     NotReady,
+    InvalidInstallation,
+    TokenWriteFailed,
+    ScriptWriteFailed,
+    AuthorizationLaunchFailed,
+    InstallerFailed,
+    UpgradeDeferred,
     Failed,
 }
 
-/// 提权进程失败 → 稳定业务码。pkexec 127 不是“用户取消”，而是当前 Linux 桌面会话没有
-/// PolicyKit 认证代理；安装与卸载必须共用同一判据，避免一条腿修正、另一条仍误报。
+/// Explicit installation intent. Omitted IPC mode remains the non-disruptive ordinary path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HelperInstallMode {
+    #[default]
+    Ordinary,
+    StopAndUpgrade,
+}
+
+impl HelperInstallMode {
+    pub const fn supported_on(self, platform: Platform) -> bool {
+        matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)
+    }
+
+    fn manager_mode(self) -> polaris_helper_client::manager::InstallMode {
+        use polaris_helper_client::manager::InstallMode;
+        match self {
+            Self::Ordinary => InstallMode::Ordinary,
+            Self::StopAndUpgrade => InstallMode::StopAndUpgrade,
+        }
+    }
+}
+
+/// pkexec 127 表示授权或执行未完成，不能单凭退出码断言缺少认证代理。
+/// 安装与卸载共用分类；126 的用户取消语义由提权层独立保留。
 const fn escalation_failure_code(platform: Platform, code: i32) -> HelperActionErrorCode {
     if matches!(platform, Platform::Linux) && code == 127 {
-        HelperActionErrorCode::AuthorizationUnavailable
+        HelperActionErrorCode::AuthorizationIncomplete
     } else {
         HelperActionErrorCode::Failed
+    }
+}
+
+/// Preserve the typed preparation stage without exposing paths, tokens, or OS error text.
+fn manager_install_failure_code(error: &ManagerError) -> HelperActionErrorCode {
+    match error {
+        ManagerError::InvalidInstallation(_) => HelperActionErrorCode::InvalidInstallation,
+        ManagerError::HelperBinaryMissing(_) => HelperActionErrorCode::MissingAsset,
+        ManagerError::TokenWrite(_) => HelperActionErrorCode::TokenWriteFailed,
+        ManagerError::ScriptWrite(_) => HelperActionErrorCode::ScriptWriteFailed,
+        ManagerError::Escalation(_) => HelperActionErrorCode::AuthorizationLaunchFailed,
+        ManagerError::UnsupportedPlatform(_) => HelperActionErrorCode::Unsupported,
+    }
+}
+
+/// A nonzero authorization/install command exit does not identify an inner failure cause.
+fn install_command_failure_code(
+    platform: Platform,
+    code: i32,
+    stderr: &str,
+) -> HelperActionErrorCode {
+    if matches!(platform, Platform::Win) && code == 75 {
+        return HelperActionErrorCode::UpgradeDeferred;
+    }
+    // osascript wraps the script's exit 75 as exit 1. Recognize only the exact
+    // installer marker (optionally its AppleScript exit suffix), never prose,
+    // a bare exit code, or a guessed old-helper version. This is presentation
+    // only: it grants no admission and does not retry or stop a service.
+    if stderr.lines().any(|line| {
+        matches!(
+            line.trim(),
+            "HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY"
+                | "HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY (75)"
+        )
+    }) {
+        HelperActionErrorCode::UpgradeDeferred
+    } else if matches!(platform, Platform::Linux) && code == 127 {
+        HelperActionErrorCode::AuthorizationIncomplete
+    } else {
+        HelperActionErrorCode::InstallerFailed
+    }
+}
+
+/// These are installer-owned exit stages, never arbitrary child stderr or paths.
+fn install_command_diagnostic(platform: Platform, code: i32) -> &'static str {
+    if matches!(platform, Platform::Win) {
+        match code {
+            75 => "helper installer deferred at Windows upgrade admission",
+            81 => "helper installer failed at Windows sealed staging",
+            82 => "helper installer failed at Windows core installation",
+            83 => "helper installer failed at Windows user registration",
+            84 => "helper installer failed at Windows installed helper policy",
+            85 => "helper installer failed at Windows service stop or removal",
+            86 => "helper installer failed at Windows service replacement or start",
+            87 => "helper installer failed and Windows rollback is incomplete",
+            88 => "helper installer failed at Windows transaction cleanup",
+            _ => "helper installer exited unsuccessfully",
+        }
+    } else {
+        "helper installer exited unsuccessfully"
     }
 }
 
@@ -771,14 +861,9 @@ impl HelperRuntime {
         Err("当前平台无 helper connector".to_owned())
     }
 
-    /// 状态快照（上游 `helper:getStatus`）——真探测：`status_with_recovery`（is_installed 短路、
-    /// ping proto、W20 恢复腿——「装了但停着」先拉起复核，不误报修复态）。未安装 → 不连 socket
-    /// 直接返未装态。恢复腿让所有 status 消费方共享同一自愈：设置页挂载、启动 7s 可升级探测、
-    /// 手动重新检测。
-    ///
-    /// 已知取舍：卸载读门（`HelperUninstallOps::installed`）也走本方法——用户要卸载时若服务正停着，
-    /// 读门会先把服务拉起、随后又被卸载流程停/删（无害但多付一次恢复耗时）。UI 读门一律异步
-    /// （`helper_get_status` spawn_blocking），不冻 UI。
+    /// Read-only helper/core snapshot, shared by queries, tray polling and
+    /// maintenance replies. Never starts a stopped service: another App may be
+    /// holding an install/uninstall transaction. Recovery requires explicit repair.
     #[must_use]
     pub fn status(&self) -> HelperStatusSnapshot {
         // 测试注入的钉死快照（`with_forced_status_for_tests`）。**必须在最前**：本方法余下的每一步
@@ -797,7 +882,8 @@ impl HelperRuntime {
         let manager = self.manager();
         match self.build_client() {
             Ok(client) => {
-                let mut status = snapshot_from(&manager.status_with_recovery(&client), supported);
+                let mut status =
+                    snapshot_from(&manager.compute_status_with_client(&client), supported);
                 self.apply_selected_core_status(&mut status);
                 status
             }
@@ -876,6 +962,18 @@ impl HelperRuntime {
     /// **真机门**：成功路径触发 osascript/UAC/pkexec 弹框。本机无 bundled helper → 早返「二进制缺失」，不弹框。
     #[must_use]
     pub fn install(&self) -> HelperActionResult {
+        self.install_with_mode(HelperInstallMode::Ordinary)
+    }
+
+    /// StopAndUpgrade requires explicit confirmation covering all sessions managed by this helper.
+    #[must_use]
+    pub fn install_with_mode(&self, mode: HelperInstallMode) -> HelperActionResult {
+        if !mode.supported_on(self.platform) {
+            return self.action_failed(
+                HelperActionErrorCode::Unsupported,
+                "explicit helper stop-and-upgrade is supported only on macOS",
+            );
+        }
         if !self.supported() {
             return self.action_failed(HelperActionErrorCode::Unsupported, "helper unsupported");
         }
@@ -894,10 +992,11 @@ impl HelperRuntime {
             }
         };
         if let Err(error) = self.register_core_mutation() {
+            log::warn!("helper install mutation preflight failed: {error}");
             return self.action_failed(HelperActionErrorCode::Failed, error);
         }
         let manager = self.manager();
-        match manager.install(&params, &StdExecutor) {
+        match manager.install_with_mode(&params, &StdExecutor, mode.manager_mode()) {
             Ok(EscalationOutcome::Success) => {
                 // Service readiness and this App's installed content id are
                 // separate receipts, including when a newer helper is retained.
@@ -935,14 +1034,14 @@ impl HelperRuntime {
             Ok(EscalationOutcome::Failed { stderr, code }) => {
                 log::warn!("helper install command failed (exit {code}): {stderr}");
                 self.action_failed(
-                    escalation_failure_code(self.platform, code),
-                    "helper installer exited unsuccessfully",
+                    install_command_failure_code(self.platform, code, &stderr),
+                    install_command_diagnostic(self.platform, code),
                 )
             }
             Err(e) => {
                 log::warn!("helper install failed: {e}");
                 self.action_failed(
-                    HelperActionErrorCode::Failed,
+                    manager_install_failure_code(&e),
                     "helper install operation failed",
                 )
             }
@@ -964,7 +1063,17 @@ impl HelperRuntime {
             return self.action_failed(HelperActionErrorCode::Failed, error);
         }
         let manager = self.manager();
-        match manager.uninstall(&self.dir, &StdExecutor) {
+        let utility = if self.platform == Platform::Win {
+            None
+        } else {
+            match maintenance_utility() {
+                Ok(utility) => Some(utility),
+                Err(error) => {
+                    return self.action_failed(HelperActionErrorCode::MissingAsset, error)
+                }
+            }
+        };
+        match manager.uninstall_with_maintenance(&self.dir, utility.as_ref(), &StdExecutor) {
             Ok(EscalationOutcome::Success) => HelperActionResult {
                 success: true,
                 error_code: None,
@@ -1234,9 +1343,8 @@ impl HelperRuntime {
     ///
     /// # 为什么不是 `status().ready`
     ///
-    /// [`Self::status`] 走 `status_with_recovery`——它在 `needs_repair` 时会**尝试拉起停着的服务**。
-    /// 那是一个真副作用，而刷 DNS 缓存这条腿的契约是 best-effort、永不阻塞、不改系统状态；为了少打
-    /// 一行日志去触发一次服务启动，方向是反的。
+    /// Status is also read-only, but probing IPC for a best-effort DNS preflight
+    /// would add avoidable latency. Token presence is only a structural hint.
     ///
     /// # 这条判据的射程（如实登记）
     ///
@@ -2097,6 +2205,24 @@ fn current_uid() -> u32 {
 #[cfg(not(unix))]
 fn current_uid() -> u32 {
     0
+}
+
+fn maintenance_utility() -> Result<MaintenanceUtility, String> {
+    let src_binary = resolve_helper_binary()?;
+    let file = std::fs::File::open(&src_binary).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err("bundled maintenance utility is not a regular nonempty file".into());
+    }
+    let helper_sha256 = polaris_updater::verify::sha256_reader_hex(std::io::Read::take(
+        file,
+        metadata.len().saturating_add(1),
+    ))
+    .map_err(|e| e.to_string())?;
+    Ok(MaintenanceUtility {
+        src_binary,
+        helper_sha256,
+    })
 }
 
 /// 解析 bundled `polaris-helper` 二进制（镜像 [`resolve_core_binary`](crate::runtime::proxy::resolve_core_binary)

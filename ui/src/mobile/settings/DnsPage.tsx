@@ -340,7 +340,9 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
     tier1: boolean,
   ): ReactElement {
     const on = activeRacePool.includes(id);
-    const blocked = tier1 && !on && raceQuotaFull;
+    const custom = dns.nodeResolverCustom?.find((item) => item.id === id);
+    const unsupported = !!custom && !isPureIpDnsSpec(custom.spec);
+    const blocked = !on && (unsupported || (tier1 && raceQuotaFull));
     return (
       <SettingsRow
         id={rowId}
@@ -349,13 +351,14 @@ export function DnsPage({ config, update, commit }: MobileSettingsPageProps): Re
         /* `hint` 而不是 `problem`：额度用满是**配置的正常状态**（用户在桌面端加满了 3 条自定义
            DoH），不是这一屏出了错。走 `problem` 会把它画成 `--err` 红字，与同页「DNS 地址非法」
            「超时值越界」同一视觉等级 —— 桌面把同一句放在 `Switch` 的 `tip` 里，非错误态。 */
-        hint={blocked ? t('settings.dns.raceQuotaReached') : undefined}
+        problem={unsupported ? t('settings.dns.customDohIpOnly') : undefined}
+        hint={blocked && !unsupported ? t('settings.dns.raceQuotaReached') : undefined}
         control={
           <MobileSwitch
             checked={on}
             disabled={blocked}
             ariaLabel={label}
-            onChange={(v) => patchDns(rowId, { nodeResolverPool: nextRacePool(activeRacePool, id, v) })}
+            onChange={(v) => { if (!v || !unsupported) patchDns(rowId, { nodeResolverPool: nextRacePool(activeRacePool, id, v) }); }}
           />
         }
       />

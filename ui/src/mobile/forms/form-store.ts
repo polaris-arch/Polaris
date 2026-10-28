@@ -58,6 +58,8 @@ export interface MobileConfirmPayload {
  * 否则那里的 `never` 兜底编译不过 —— 这正是本 union 的设计目的。
  */
 export type MobileFormDesc =
+  | { kind: 'vpn-auth'; protocol: 'openconnect' | 'openvpn'; serverId: string }
+  | { readonly kind: 'identity-repair' }
   /**
    * 节点表单。三种打开方式共用一支：
    *  · 新增 —— 两者皆空；

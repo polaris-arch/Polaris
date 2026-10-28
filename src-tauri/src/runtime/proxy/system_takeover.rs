@@ -81,12 +81,24 @@ impl SystemProxyTakeover {
 
     /// marker 门控清理。无 marker 时 controller 自身幂等 no-op。
     async fn clear(&self, blocking_lease: Option<LegacyStartLease>) -> bool {
+        self.clear_when(blocking_lease, || true).await
+    }
+
+    async fn clear_when(
+        &self,
+        blocking_lease: Option<LegacyStartLease>,
+        still_current: impl FnOnce() -> bool + Send + 'static,
+    ) -> bool {
         let controller = Arc::clone(&self.controller);
         let outcome = tokio::task::spawn_blocking(move || {
             let _blocking_lease = blocking_lease;
             controller
                 .lock()
-                .map(|mut guard| guard.ensure_cleared())
+                .map(|mut guard| {
+                    // The predicate travels with the blocking operation, even if its async
+                    // waiter is dropped. Enable uses this same controller mutex.
+                    still_current() && guard.ensure_cleared()
+                })
                 .unwrap_or_else(|error| {
                     log::error!("system proxy controller 锁中毒: {error} → 跳过系统代理清理");
                     false
@@ -272,7 +284,31 @@ impl ProxyRuntime {
             );
             return;
         }
-        self.clear_system_proxy().await;
+        let gate = Arc::clone(&self.gate);
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        self.system_proxy
+            .clear_when(blocking_lease, move || {
+                gate.try_generation() == Some(my_generation)
+            })
+            .await;
+    }
+
+    /// Late Stop/restart cleanup must hold the same state gate as Start's takeover.
+    /// The blocking mutation also checks the authoritative generation under its controller
+    /// mutex, so cancelling this async waiter cannot expose a late clear to a new takeover.
+    /// Start-failure cleanup already owns the state gate and calls clear_when directly.
+    pub(super) async fn clear_system_proxy_if_current(&self, generation: u64) {
+        let _state_gate = self.mesh.tailscale_state_gate().await;
+        if self.gate.generation() != generation {
+            return;
+        }
+        let gate = Arc::clone(&self.gate);
+        let blocking_lease = self.config.retain_active_legacy_start_lease();
+        self.system_proxy
+            .clear_when(blocking_lease, move || {
+                gate.try_generation() == Some(generation)
+            })
+            .await;
     }
 
     /// marker 门控的公开清理 facade，供 stop、失败腿与 command 复用。

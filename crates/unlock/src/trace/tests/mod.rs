@@ -83,3 +83,5 @@ fn is_valid_ip_dispatch() {
     assert!(is_valid_ip("::1"));
     assert!(!is_valid_ip("garbage"));
 }
+
+mod ip_literal_regressions;

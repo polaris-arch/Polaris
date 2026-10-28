@@ -85,7 +85,7 @@ const TS_PROGRESS_FED: Anchor = { file: 'ui/src/mobile/app-wiring.ts', mustConta
 const STORE_TS_PROGRESS: Anchor = { file: 'ui/src/store/use-tailscale-login-progress-store.ts', mustContain: 'export const useTailscaleLoginProgressStore' };
 /** 🔴 W-24 的那条腿。后台 scheduler 自跑，没有任何前端调用点可挂 —— 只能走事件。 */
 const SUB_PROGRESS_FED: Anchor = { file: 'ui/src/mobile/app-wiring.ts', mustContain: 'subscribeSubscriptionProgressEvents()' };
-const VPN_FED: Anchor = { file: 'ui/src/mobile/app-wiring.ts', mustContain: 'api.vpn.onOpenVpnStatus(' };
+const VPN_FED: Anchor = { file: 'ui/src/lib/app-vpn-status-sync.ts', mustContain: 'setOpenVpn(status)' };
 /** 🔴 本表落地当天抓到的那条（批 18 接上）。摘掉它，`invalidNodes` 立刻退回「读点在、没有写入方」。 */
 const INVALID_NODES_FED: Anchor = { file: 'ui/src/mobile/app-wiring.ts', mustContain: 'api.proxy.onInvalidNodes(' };
 const PENDING_FED: Anchor = { file: 'ui/src/mobile/app-wiring.ts', mustContain: 'setPendingChanges(normalizePendingChanges(data))' };
@@ -137,6 +137,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   { id: 'useAppStore.selectedServerId', role: 'state', disposition: fed(CONFIG_FED), note: '当前出口 id。' },
   { id: 'useEffectiveConfig.*', role: 'state', disposition: fed(CONFIG_FED), note: '磁盘配置叠加暂存差集后的**生效**视图。两个上游（配置镜像 + 暂存表）各自的写入方都在本表里。' },
   { id: 'useEffectiveConfig.subscriptions', role: 'state', disposition: fed(CONFIG_FED), note: '订阅表单读取生效视图中的订阅列表，配置加载及暂存差集负责更新。' },
+  { id: 'useEffectiveConfig.language', role: 'state', disposition: fed(CONFIG_FED), note: '权威配置语言驱动界面与启动缓存；恢复备份后同步，未水合不覆盖缓存。' },
   { id: 'useEffectiveConfig.desktopNotifications', role: 'state', disposition: fed(CONFIG_FED), note: '通知总开关的生效值（`app-wiring` 拿它同步给通知出口）。' },
   { id: 'useEffectiveServers.*', role: 'state', disposition: fed(CONFIG_FED), note: '节点的生效视图，同上。' },
 
@@ -172,7 +173,7 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
   // Activity 生命周期就是它的落点），拿不出「平台上没有这个对象」的证据就不许用那个码。
   // 同屏的 `field:autoPrivacyMode` 早就按 `absent` 记着债，两条本来就该是同一个判定。
   // 恒 false 今天确实与界面自洽，但那是「这条腿没做」的自洽，不是「这个对象不存在」。
-  { id: 'useAppStore.privacyMode', role: 'state', disposition: fed({ file: 'ui/src/mobile/app-wiring.ts', mustContain: 'onEnterPrivacyMode' }), note: '隐私模式。2026-09-06 批 5 接上写入方：闲置计时 `armIdlePrivacyLock` 翻真值、`onEnterPrivacyMode`/`onExitPrivacyMode` 两条订阅收敛，冷启动还会按「开关开着且已设密码」补锁。上一版这里写着「移动端没有任何写入方」——那句话现在是假的。' },
+  { id: 'useAppStore.privacyMode', role: 'state', disposition: fed({ file: 'ui/src/mobile/app-wiring.ts', mustContain: 'startPrivacyModeSync' }), note: '隐私模式。2026-09-06 批 5 接上写入方：闲置计时 `armIdlePrivacyLock` 翻真值、`onEnterPrivacyMode`/`onExitPrivacyMode` 两条订阅收敛，冷启动还会按「开关开着且已设密码」补锁。上一版这里写着「移动端没有任何写入方」——那句话现在是假的。' },
   {
     id: 'useAppStore.invalidNodes',
     role: 'state',
@@ -233,8 +234,6 @@ export const MOBILE_FEEDS: readonly FeedEntry[] = [
 
   /* ── VPN / 订阅进度 / 组网缓存 ───────────────────────────────────────── */
   { id: 'useVpnStatusStore.openVpn', role: 'state', disposition: fed(VPN_FED), note: 'OpenVPN 每个节点的状态帧。节点屏的 `deriveMeshTunnelHealth` 读的就是它。' },
-  { id: 'useVpnStatusStore.replace', role: 'action', disposition: act(STORE_VPN), note: '整帧替换 VPN 快照。首帧水合与停核清空都走它 —— 留着旧帧会让「核已停」那一屏还画着上一秒的隧道健康。' },
-  { id: 'useVpnStatusStore.setOpenVpn', role: 'action', disposition: act(STORE_VPN), note: '增量写一条 OpenVPN 状态（事件腿的落点，与整帧替换是两个入口）。' },
   { id: 'useVpnStatusStore.retainServerIds', role: 'action', disposition: act(STORE_VPN), note: 'VPN 快照的对账驱逐（节点删了它的隧道状态也要跟着走）。' },
   { id: 'useSubscriptionProgressStore.progress', role: 'state', disposition: fed(SUB_PROGRESS_FED), note: '🔴 W-24 的那一格：订阅更新进度。它由后台 scheduler 自跑，**没有任何前端调用点可挂** ⇒ 不订阅事件就永远是空表，节点屏的订阅进度恒不出现。' },
   { id: 'useSubscriptionProgressStore.retainSubscriptionIds', role: 'action', disposition: act(STORE_SUBPROG), note: '订阅进度表的对账驱逐（订阅删了它的失败进度也要跟着走）。' },

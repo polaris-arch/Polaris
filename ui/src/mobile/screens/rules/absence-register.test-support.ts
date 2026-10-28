@@ -310,6 +310,8 @@ export const RULES_PARITY: ScreenParityRegister = {
       },
       note: '策略菜单里按订阅分组的可折叠组头。分组与默认展开集复用 `domain/server-grouping` 的 `groupServersBySubscription` / `defaultOpenGroupIds`（桌面三处选择器共用的同一份判据），组头本体由 `SelectSheetPanel` 渲染。',
     },
+    { id: 'AppPolicyScreen.tsx|c:mi', disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: 'autoSelectChoice(autoSelectTarget(group))' } }, note: 'Automatic route targets preserve their group scope in the mobile policy picker, through the shared typed target encoder.' },
+    { id: 'AppPolicyScreen.tsx|k:autoSelect.auto', disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/screens/rules/RulesScreen.tsx', mustContain: 'autoSelectChoice(autoSelectTarget(group))' } }, note: 'Automatic route targets preserve their group scope in the mobile policy picker, through the shared typed target encoder.' },
     {
       id: 'AppPolicyScreen.tsx|c:mi ns-node',
       disposition: {

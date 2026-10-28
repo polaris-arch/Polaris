@@ -359,7 +359,7 @@ fn expected_proto() -> u32 {
 /// 返回 None 当 ping 失败或响应非 Pong。
 fn ping_for_handshake(client: &HelperClient) -> Option<Pong> {
     let resp = client
-        .send_with_timeout(&Request::Ping, Duration::from_millis(1500))
+        .probe_framed_transport(Duration::from_millis(1500))
         .ok()?;
     match resp {
         Response::Ok(ResponseKind::Pong(p)) => Some(p),
@@ -408,57 +408,6 @@ impl HelperManager {
             upgradeable,
             needs_repair: !ready,
         }
-    }
-
-    /// W20（2026-08-20）：带恢复腿的状态探测——「装了但停着」不再直接判 needs_repair，先拉起复核。
-    ///
-    /// 背景：Windows 手动结束 helper 进程（或服务停着）时，[`compute_status_with_client`](Self::compute_status_with_client)
-    /// 的 ping 挂 → needs_repair → UI 引导「修复助手」；但此时结构完好，把服务拉起来即可恢复。
-    /// 三平台自愈对齐：mac=plist `KeepAlive`、linux=unit `Restart=on-failure`、win=安装脚本配
-    /// SCM 失败恢复（`sc failure ... restart/5000`，覆盖异常终止）+ 本腿（覆盖干净 stop / 恢复窗
-    /// 耗尽等残余态）。win 端未提权拉起的可行性由安装脚本 `sdset` 授 IU `SERVICE_START` 保证
-    /// （默认 DACL 无此权，.207 实测 IU 只有查询权）。
-    ///
-    /// 分型（哪些 needs_repair 值得试拉起；拉错场景要么白拉、要么误动服务）：
-    /// - token 为空：拉起也过不了鉴权，与「停着」无关 → 维持修复流；
-    /// - 服务正在跑（is_loaded）仍 ping 不通：结构性问题（proto 过旧 / 管道损坏）→ 维持修复流；
-    /// - 服务停着：拉起（start）→ 复用 [`wait_until_ready`](Self::wait_until_ready) 轮询复核。
-    ///   拉不起（如二进制被删）或复核仍不 ready → 维持 needs_repair（真坏该修，不粉饰）。
-    ///
-    /// 每次调用至多拉一次。接线点：`HelperRuntime::status`（设置页 / 启动 7s 探测 / 重新检测共用）；
-    /// 仅停着态付出 start + 轮询的耗时（轮询窗 5s，管道未绑时连接即刻失败不占 ping 超时，挂起连接
-    /// 最坏 1.5s/次），正常路径零额外成本——故 status 消费方须在非主线程跑（见 helper_get_status）。
-    #[must_use]
-    pub fn status_with_recovery(&self, client: &HelperClient) -> HelperStatus {
-        self.status_with_recovery_poll(client, RECOVERY_POLL_ATTEMPTS, RECOVERY_POLL_DELAY)
-    }
-
-    /// [`status_with_recovery`](Self::status_with_recovery) 的参数化形态（轮询次数/间隔透传，
-    /// 与 [`wait_until_ready`](Self::wait_until_ready) 同一套测试缝隙）。
-    #[must_use]
-    pub fn status_with_recovery_poll(
-        &self,
-        client: &HelperClient,
-        attempts: u32,
-        delay: Duration,
-    ) -> HelperStatus {
-        let status = self.compute_status_with_client(client);
-        if !status.needs_repair {
-            return status;
-        }
-        // token 缺失的 needs_repair 不是「停着」能解释的（拉起也过不了鉴权）。
-        if self.token().is_empty() {
-            return status;
-        }
-        // 跑着仍 ping 不通 → 结构性问题，交回修复流。
-        if self.is_loaded() {
-            return status;
-        }
-        if let Err(e) = self.start() {
-            log::warn!("helper 恢复腿：拉起停着的服务失败（{e}）→ 维持 needs_repair");
-            return status;
-        }
-        self.wait_until_ready(client, attempts, delay)
     }
 }
 
@@ -530,12 +479,6 @@ pub const READY_POLL_ATTEMPTS: u32 = 20;
 /// install 就绪轮询间隔（同上从 300ms 放宽：总窗 10s，覆盖 SCM 冷启动 + 管道监听）。
 pub const READY_POLL_DELAY: Duration = Duration::from_millis(500);
 
-/// W20 恢复腿轮询次数：拉起已装服务后等管道绑定。较 install 的 20 次减半——恢复拉的是已装好的
-/// 服务（无脚本侧删旧/拷贝/建服务竞态），要等的只有「服务起 → 管道监听」这一段（真机实测可 >3s）。
-const RECOVERY_POLL_ATTEMPTS: u32 = 10;
-/// W20 恢复腿轮询间隔（总窗 5s，依据同上）。
-const RECOVERY_POLL_DELAY: Duration = Duration::from_millis(500);
-
 /// 装卸流程错误（escalation 之前的失败：二进制缺失 / token 写失败 / 脚本落盘失败 / 平台不支持）。
 ///
 /// escalation 本身的三态（成功/取消/失败）由 [`EscalationOutcome`] 表达（非 `Err`）—— 用户取消是正常流程，不是错误。
@@ -558,6 +501,30 @@ pub enum ManagerError {
     /// 本编译目标不支持该平台的装卸（如 Linux 二进制上构造 `Platform::Mac` 的装脚本 —— 运行期不会发生）。
     #[error("本构建目标不支持平台 {0:?} 的装卸")]
     UnsupportedPlatform(Platform),
+}
+
+/// Installation intent. Ordinary installation never opts into stopping legacy sessions.
+/// StopAndUpgrade is only valid after explicit confirmation of its cross-session impact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InstallMode {
+    #[default]
+    Ordinary,
+    StopAndUpgrade,
+}
+
+impl InstallMode {
+    #[must_use]
+    pub const fn supported_on(self, platform: Platform) -> bool {
+        matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)
+    }
+}
+
+/// Current bundled utility, sealed again before privileged maintenance.
+/// Uninstall deliberately does not depend on a selected or installed core.
+#[derive(Debug, Clone)]
+pub struct MaintenanceUtility {
+    pub src_binary: PathBuf,
+    pub helper_sha256: String,
 }
 
 /// 安装参数（路径由调用方解析 —— HelperManager 不知道 Tauri 资源布局，对齐「决策+委托」）。
@@ -600,6 +567,20 @@ impl HelperManager {
         params: &InstallParams,
         executor: &dyn Executor,
     ) -> Result<EscalationOutcome, ManagerError> {
+        self.install_with_mode(params, executor, InstallMode::Ordinary)
+    }
+
+    /// Explicit macOS migration is never selected as a fallback from an ordinary install.
+    /// Reject unsupported modes before inspecting parameters, touching tokens, or escalating.
+    pub fn install_with_mode(
+        &self,
+        params: &InstallParams,
+        executor: &dyn Executor,
+        mode: InstallMode,
+    ) -> Result<EscalationOutcome, ManagerError> {
+        if !mode.supported_on(self.platform) {
+            return Err(ManagerError::UnsupportedPlatform(self.platform));
+        }
         validate_install_params(self.platform, params)?;
         // ① 源二进制存在（Polaris: !fs.existsSync(srcBinary) → 缺失）。
         if !self.sysops.exists(&params.src_binary) {
@@ -608,7 +589,7 @@ impl HelperManager {
         // ② token：复用或生成并写 app 侧（linux 无 token 语义，写了也无害；脚本不会用）。
         let token = self.prepare_token().map_err(ManagerError::TokenWrite)?;
         // ③ 生成 root 安装脚本。
-        let script = self.build_install_script(params, &token)?;
+        let script = self.build_install_script(params, &token, mode)?;
         // ④⑤ 落盘 + 提权 + 清理。
         self.run_privileged_script(
             &params.script_dir,
@@ -631,6 +612,23 @@ impl HelperManager {
         script_dir: &Path,
         executor: &dyn Executor,
     ) -> Result<EscalationOutcome, ManagerError> {
+        self.uninstall_with_maintenance(script_dir, None, executor)
+    }
+
+    /// Unix callers must provide the current bundled utility. Never invoke an
+    /// unknown installed legacy helper as a maintenance command interpreter.
+    pub fn uninstall_with_maintenance(
+        &self,
+        script_dir: &Path,
+        utility: Option<&MaintenanceUtility>,
+        executor: &dyn Executor,
+    ) -> Result<EscalationOutcome, ManagerError> {
+        match self.platform {
+            Platform::Mac | Platform::Linux | Platform::Win => {}
+            Platform::Android | Platform::Ios | Platform::Other => {
+                return Err(ManagerError::UnsupportedPlatform(self.platform));
+            }
+        }
         if self.platform == Platform::Win {
             #[cfg(windows)]
             {
@@ -653,7 +651,11 @@ impl HelperManager {
             #[cfg(not(windows))]
             return Err(ManagerError::UnsupportedPlatform(Platform::Win));
         }
-        let script = self.build_uninstall_script();
+        let utility = utility.ok_or(ManagerError::InvalidInstallation(
+            "current bundled maintenance utility required",
+        ))?;
+        validate_maintenance_utility(utility)?;
+        let script = self.build_uninstall_script(utility);
         let outcome = self.run_privileged_script(
             script_dir,
             self.uninstall_script_name(),
@@ -710,10 +712,19 @@ impl HelperManager {
         &self,
         params: &InstallParams,
         token: &str,
+        mode: InstallMode,
     ) -> Result<String, ManagerError> {
+        if !mode.supported_on(self.platform) {
+            return Err(ManagerError::UnsupportedPlatform(self.platform));
+        }
         validate_install_params(self.platform, params)?;
         match self.platform {
-            Platform::Mac => Ok(build_mac_install_script(&self.paths, params, token)),
+            Platform::Mac => Ok(match mode {
+                InstallMode::Ordinary => build_mac_install_script(&self.paths, params, token),
+                InstallMode::StopAndUpgrade => {
+                    build_mac_migration_script(&self.paths, params, token)
+                }
+            }),
             // Android/iOS 同 Other：无 helper 可装，本臂不可达（理由见 `InstallPaths::for_platform`）。
             // iOS 本处特有的那半句：脚本这个概念本身在 iOS 上没有承载物 —— 应用沙箱里没有可执行
             // 的 shell，写出来的 .sh 没有任何东西能跑它。
@@ -725,13 +736,13 @@ impl HelperManager {
     }
 
     /// 生成 root 卸载脚本（按平台分派）。
-    fn build_uninstall_script(&self) -> String {
+    fn build_uninstall_script(&self, utility: &MaintenanceUtility) -> String {
         match self.platform {
-            Platform::Mac => build_mac_uninstall_script(&self.paths),
+            Platform::Mac => uninstall_unix::build_mac_uninstall_script(&self.paths, utility),
             // Android/iOS 同 Other：不可达，理由见 `InstallPaths::for_platform`。
             // iOS 本处特有的那半句：同上——没有 shell 可跑，且没有装过的东西可卸。
             Platform::Linux | Platform::Other | Platform::Android | Platform::Ios => {
-                build_linux_uninstall_script(&self.paths)
+                uninstall_unix::build_linux_uninstall_script(&self.paths, utility)
             }
             Platform::Win => unreachable!("Windows uninstall is a fixed native operation"),
         }
@@ -801,6 +812,26 @@ impl HelperManager {
             Platform::Win => uac_escalation(script_path)?,
         })
     }
+}
+
+fn validate_maintenance_utility(utility: &MaintenanceUtility) -> Result<(), ManagerError> {
+    if !utility.src_binary.is_absolute()
+        || utility
+            .src_binary
+            .to_string_lossy()
+            .contains(['\0', '\n', '\r'])
+        || polaris_helper_proto::core_manifest::CoreId::parse(&utility.helper_sha256).is_err()
+    {
+        return Err(ManagerError::InvalidInstallation(
+            "invalid maintenance utility identity",
+        ));
+    }
+    if !utility.src_binary.is_file() {
+        return Err(ManagerError::HelperBinaryMissing(
+            utility.src_binary.clone(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_install_params(platform: Platform, params: &InstallParams) -> Result<(), ManagerError> {
@@ -1022,7 +1053,12 @@ fn ps_quote(s: &str) -> String {
 ///
 /// `program` = HELPER_DEST（daemon 二进制特权路径）；argv = `--singbox <core/sing-box> --confdir <conf>
 /// --support <support> --coredir <core>`（对齐 daemon `macos/daemon.rs:parse_args` flag 名）。
-fn render_mac_plist(program: &str, core_dir: &str, support_dir: &str) -> String {
+fn render_mac_plist(
+    program: &str,
+    core_dir: &str,
+    support_dir: &str,
+    upgrade_closed: bool,
+) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -1034,7 +1070,7 @@ fn render_mac_plist(program: &str, core_dir: &str, support_dir: &str) -> String 
     <string>{program}</string>\n\
     <string>--support</string><string>{support}</string>\n\
     <string>--coredir</string><string>{coredir}</string>\n\
-  </array>\n\
+{closed_argument}  </array>\n\
   <key>KeepAlive</key><true/>\n\
   <key>RunAtLoad</key><true/>\n\
 </dict>\n\
@@ -1043,32 +1079,14 @@ fn render_mac_plist(program: &str, core_dir: &str, support_dir: &str) -> String 
         program = xml_escape(program),
         support = xml_escape(support_dir),
         coredir = xml_escape(core_dir),
+        closed_argument = if upgrade_closed { "<string>--upgrade-closed</string>\n" } else { "" },
     )
 }
 
 mod install_unix;
-use install_unix::{build_linux_install_script, build_mac_install_script};
-
-/// mac 卸载脚本（bash）。忠实迁自 HelperManager.ts:844-852。
-fn build_mac_uninstall_script(paths: &InstallPaths) -> String {
-    let plist_path = paths
-        .descriptor
-        .as_ref()
-        .expect("mac 必有 plist 描述符")
-        .to_string_lossy();
-    let helper_dest = paths.binary.to_string_lossy();
-    format!(
-        "#!/bin/bash\n\
-PLIST={plist_path}\n\
-launchctl bootout system \"$PLIST\" 2>/dev/null || true\n\
-rm -f \"$PLIST\" {dest}\n\
-rm -rf {support}\n\
-echo uninstalled-ok\n",
-        plist_path = shell_quote(&plist_path),
-        dest = shell_quote(&helper_dest),
-        support = shell_quote(MAC_SUPPORT_DIR),
-    )
-}
+use install_unix::{
+    build_linux_install_script, build_mac_install_script, build_mac_migration_script,
+};
 
 // ===== linux 脚本（移植 LinuxServiceHelper.ts:308-370）=====
 
@@ -1114,36 +1132,8 @@ WantedBy=multi-user.target\n",
     )
 }
 
-/// linux 卸载脚本（sh）。忠实迁自 LinuxServiceHelper.ts:360-370。
-fn build_linux_uninstall_script(paths: &InstallPaths) -> String {
-    let unit_path = paths
-        .descriptor
-        .as_ref()
-        .expect("linux 必有 systemd unit 描述符")
-        .to_string_lossy();
-    // INSTALL_DIR = helper 二进制父目录（/usr/local/lib/polaris）；RUNTIME_DIR = socket 父（/run/polaris）。
-    let install_dir = paths
-        .binary
-        .parent()
-        .map_or_else(|| paths.binary.clone(), Path::to_path_buf);
-    let runtime_dir = paths
-        .socket
-        .parent()
-        .map_or_else(|| paths.socket.clone(), Path::to_path_buf);
-    format!(
-        "#!/bin/sh\n\
-systemctl disable --now {service} 2>/dev/null || true\n\
-rm -f {unit_path}\n\
-rm -rf {install_dir} {state_dir} {runtime_dir}\n\
-systemctl daemon-reload 2>/dev/null || true\n\
-echo polaris-helper-uninstall-ok\n",
-        service = LINUX_SERVICE_NAME,
-        unit_path = shell_quote(&unit_path),
-        install_dir = shell_quote(&install_dir.to_string_lossy()),
-        state_dir = shell_quote(LINUX_STATE_DIR),
-        runtime_dir = shell_quote(&runtime_dir.to_string_lossy()),
-    )
-}
+mod linux_service_stop;
+mod uninstall_unix;
 
 // ===== win 脚本（移植 WindowsServiceHelper.ts:429-517）=====
 

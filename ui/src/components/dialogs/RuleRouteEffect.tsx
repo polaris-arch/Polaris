@@ -1,3 +1,6 @@
+import { useEffectiveConfig } from '@/store/app-store';
+import { autoSelectChoice, autoSelectTargetLabel } from '@/domain/auto-select-choice';
+import { autoSelectTarget } from '@/domain/auto-select-target';
 import { useMemo, useState } from 'react';
 import type { TFunction } from 'i18next';
 import type { RuleRouteEffect, ServerConfig, SubscriptionConfig } from '@/contracts/types';
@@ -41,6 +44,7 @@ export function useRuleRouteEffect(
   t: TFunction,
 ) {
   /* 值编码的判据住在 `rule-effect-state.ts`（与 `rule-submit.ts` 的反解成对，两端共用一份）。 */
+  const config = useEffectiveConfig();
   const [target, setTarget] = useState<string>(() => ruleRouteTargetChoice(baseRouteEffect));
 
   /**
@@ -84,6 +88,8 @@ export function useRuleRouteEffect(
           },
         ],
       },
+      ...(config?.autoSelectEnabled ? [{ label: t('autoSelect.auto'), options: [{ value: autoSelectChoice({ scope: 'global' }), label: autoSelectTargetLabel(config, { scope: 'global' }, t) }] }]
+        : baseRouteEffect?.targetAutoSelect ? [{ label: t('appPolicy.summary.node'), options: [{ value: autoSelectChoice(baseRouteEffect.targetAutoSelect), label: autoSelectTargetLabel(config, baseRouteEffect.targetAutoSelect, t) }] }] : []),
       ...nodeGroups.map((g) => ({
         id: g.id,
         // 自建/组网组的 `name` 是占位符，按 isManual/isMesh 本地化（ServerGroup 契约的明文要求）。
@@ -92,7 +98,7 @@ export function useRuleRouteEffect(
           : g.isMesh
             ? t('nodes.tab.mesh')
             : g.name,
-        options: g.servers.map((s) => ({
+        options: [ ...(config?.autoSelectEnabled && g.servers.length ? [{ value: autoSelectChoice(autoSelectTarget(g)), label: autoSelectTargetLabel(config, autoSelectTarget(g), t) }] : []), ...g.servers.map((s) => ({
           value: `node:${s.id}`,
           label: `${t('rules.targetProxyTo')} ${s.name}`,
           // 国旗：与首页出口选单 / 托盘节点行**同一渲染器 + 同一数据源**（名称派生 `flagCodeForName`，
@@ -100,10 +106,10 @@ export function useRuleRouteEffect(
           // 延迟色点刻意**不加**：本弹窗不订阅测速 store，也不该订阅 —— 「目标出站」回答的是
           // 「把流量路由到哪」，在这里画延迟点是给出一条与该决策无关的判据。
           icon: <FlagImg code={flagCodeForName(s.name)} />,
-        })),
+        }))],
       })),
     ],
-    [nodeGroups, t],
+    [nodeGroups, t, config, baseRouteEffect],
   );
   const targetOpenGroups = useMemo(
     () => defaultOpenGroupIds(nodeGroups, targetNodeId),

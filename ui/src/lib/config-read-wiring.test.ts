@@ -211,6 +211,30 @@ interface Site {
 
 const SITES: readonly Site[] = [
   {
+    file: 'components/screens/home/TsExitWarning.tsx',
+    shape: 'useAppStore((s)=>configuredExitId(s.proxyStatus,s.config))',
+    route: 'disk',
+    why: '对账类：运行状态中的实际出口优先；停核时仅以已保存选择作基准，不把未应用暂存当成运行出口。',
+  },
+  {
+    file: 'components/screens/home/MeshTunnelHealth.tsx',
+    shape: 'useAppStore((s)=>configuredExitId(s.proxyStatus,s.config))',
+    route: 'disk',
+    why: '对账类：运行状态中的实际出口优先；停核时仅以已保存选择作基准，不把未应用暂存当成运行出口。',
+  },
+  {
+    file: 'components/screens/nodes/NodesGrid.tsx',
+    shape: 'useAppStore(state=>state.config?.selectionIntent!==undefined…',
+    route: 'disk',
+    why: '对账类：同节点手动点击是否需要清除已保存 Auto 意图；暂存展示不能冒充后端当前选择意图。',
+  },
+  {
+    file: 'components/screens/nodes/NodesScreen.tsx',
+    shape: 'useAppStore.getState().config?.selectionIntent',
+    route: 'disk',
+    why: '入参类：执行手动选择前即时复核保存的 Auto 意图，避免同节点 no-op 吞掉退出 Auto 操作。',
+  },
+  {
     file: 'components/screens/settings/use-config.ts',
     shape: 'useAppStore.subscribe((state)=>{constpublication=state.confi…',
     route: 'disk',
@@ -573,7 +597,7 @@ const MIRROR_SITES: readonly MirrorSite[] = [
     why: '桌面主连接持有该节点时用户确认断开后的第二次按 id 登出前复核该节点仍在磁盘镜像中；确认等待期间节点可能被删除，effective 暂存集合不能证明后端仍有对象（与 TsSettingsPanel 那条逐字同一件事）。',
   },
   {
-    file: 'components/dialogs/VpnAuthDialog.tsx',
+    file: 'shared/vpn/VpnAuthForm.tsx',
     shape: 'useAppStore((state)=>state.servers.find((server)=>server.id=…',
     count: 1,
     surface: 'operation',

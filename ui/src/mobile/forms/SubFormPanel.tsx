@@ -1,3 +1,4 @@
+import { useInputRequest } from '@/hooks/use-input-request';
 /**
  * 移动端**订阅表单**（新增 / 编辑；「重命名」与「编辑」按 `focus` 落到同一张表的不同字段）。
  *
@@ -207,7 +208,12 @@ export function SubFormPanel({
   };
 
   /** 预检：拉取并解析，**不写 config**。失败按后端分类取当前语种详情，不塞 IPC 原文。 */
+  const previewInput = JSON.stringify([url, ua, viaProxy, proxyPolicy]);
+  const beginPreview = useInputRequest(previewInput);
+  useEffect(() => { setNotice(undefined); setPreviewing(false); }, [previewInput]);
+
   const runPreview = async (): Promise<void> => {
+    const isCurrent = beginPreview();
     if (!isSubscriptionUrl(url)) {
       setErrUrl(true);
       return;
@@ -219,6 +225,7 @@ export function SubFormPanel({
         viaProxy: resolveSubscriptionViaProxy(config?.subscriptionProxyPolicy, viaProxy),
         userAgent: ua.trim() === '' ? undefined : ua.trim(),
       });
+      if (!isCurrent()) return;
       if (r.ok) {
         setNotice({ tone: 'ok', text: t('sub.previewOk', { n: r.nodeCount ?? 0 }) });
       } else {
@@ -230,11 +237,12 @@ export function SubFormPanel({
         });
       }
     } catch (e) {
+      if (!isCurrent()) return;
       // IPC 原始诊断只进日志：提示必须跨语言稳定。
       console.error('[mobile-sub-form] preview failed:', e);
       setNotice({ tone: 'err', text: t('sub.previewFail') });
     } finally {
-      if (hasInstance(instanceId)) setPreviewing(false);
+      if (isCurrent() && hasInstance(instanceId)) setPreviewing(false);
     }
   };
 

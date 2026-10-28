@@ -160,3 +160,67 @@ describe('beginUnlockCheck / resetUnlock', () => {
     });
   });
 });
+
+// IPC consumers capture this immutable identity after beginning their request.
+// Equal-looking empty state after stop is a new identity and must revoke the result.
+describe('unlock IPC display identity', () => {
+  it('held replies cannot refill a stopped, invalidated, or newer display', async () => {
+    for (const supersede of [
+      () => useAppStore.getState().resetUnlock(),
+      () => useAppStore.getState().beginUnlockCheck(),
+      () => useAppStore.getState().applyUnlockSnapshot(snap({ checkedAt: 20 })),
+      () => useAppStore.getState().setUnlockProgress('chatgpt', { status: 'ok' }),
+    ]) {
+      useAppStore.getState().beginUnlockCheck();
+      const requestedState = useAppStore.getState().unlock;
+      let release!: (snapshot: UnlockSnapshot) => void;
+      const pending = new Promise<UnlockSnapshot>((resolve) => { release = resolve; });
+      const consume = pending.then((snapshot) => {
+        if (useAppStore.getState().unlock === requestedState) {
+          useAppStore.getState().applyUnlockSnapshot(snapshot);
+        }
+      });
+      supersede();
+      const newer = useAppStore.getState().unlock;
+      release(snap({ checkedAt: 10 }));
+      await consume;
+      expect(useAppStore.getState().unlock).toBe(newer);
+    }
+  });
+
+  it('empty hydrate state loses ownership even when reset remains empty', () => {
+    const requestedState = useAppStore.getState().unlock;
+    useAppStore.getState().resetUnlock();
+    expect(useAppStore.getState().unlock).not.toBe(requestedState);
+    expect(useAppStore.getState().unlock.results).toEqual({});
+  });
+});
+
+
+describe('unlock empty-state ABA admission', () => {
+  for (const reset of ['resetUnlock', 'reset'] as const) {
+    it(`held cold get stays revoked across ${reset} and begin-reset`, async () => {
+      useAppStore.getState().resetUnlock();
+      const cold = useAppStore.getState().unlock;
+      let release!: (snapshot: UnlockSnapshot) => void;
+      const pending = new Promise<UnlockSnapshot>((resolve) => { release = resolve; });
+      const consume = pending.then((snapshot) => {
+        if (useAppStore.getState().unlock === cold) {
+          useAppStore.getState().applyUnlockSnapshot(snapshot);
+        }
+      });
+      useAppStore.getState().beginUnlockCheck();
+      useAppStore.getState()[reset]();
+      const empty = useAppStore.getState().unlock;
+      expect(empty).not.toBe(cold);
+      expect(empty.results).not.toBe(cold.results);
+      release(snap({ checkedAt: 10, results: { chatgpt: { status: 'ok' } } }));
+      await consume;
+      expect(useAppStore.getState().unlock).toBe(empty);
+      expect(empty.results).toEqual({});
+      useAppStore.getState()[reset]();
+      expect(useAppStore.getState().unlock).not.toBe(empty);
+      expect(useAppStore.getState().unlock.results).not.toBe(empty.results);
+    });
+  }
+});

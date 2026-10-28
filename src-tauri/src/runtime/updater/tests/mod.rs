@@ -6,32 +6,12 @@ fn rt(dir: &Path) -> UpdaterRuntime {
 }
 
 #[test]
-fn bundled_core_version_parses_from_embedded_manifest() {
-    // 编译期嵌入的 core-manifest.json 必须解析出非空基线 —— 它是 C6 全部决策的锚。
-    // 若清单改名/改结构，这条即刻转红（而非在运行期静默按空基线跑）。
-    let v = bundled_core_version();
-    assert!(!v.is_empty(), "bundledCoreVersion 不得为空");
-    assert!(
-        v.starts_with(|c: char| c.is_ascii_digit()),
-        "基线应是版本号，实得: {v}"
-    );
-    // 上面两条分辨不出基线回落（回落值同样非空）。嵌入清单必须被认作冻结清单。
-    let manifest: serde_json::Value = serde_json::from_str(CORE_MANIFEST_JSON).unwrap();
-    let parsed: CoreManifest = serde_json::from_str(CORE_MANIFEST_JSON).unwrap();
-    let source = manifest
-        .get("desktopSourceBuild")
-        .unwrap_or(&manifest["sourceBuild"]);
-    let expected = source["version"].as_str().expect("selected source version");
-    let admitted = if manifest.get("desktopSourceBuild").is_some() {
-        frozen_desktop_source_version(&parsed, source, manifest.get("windowsBuild").is_some())
-    } else {
-        frozen_source_build_version(source, manifest["bundledCoreVersion"].as_str().unwrap())
-    };
+fn bundled_core_version_uses_the_same_selected_build_as_http() {
     assert_eq!(
-        admitted,
-        Some(expected),
-        "嵌入的 core-manifest 未被认作冻结清单，随包基线会回落"
+        bundled_core_version(),
+        crate::runtime::core_version::selected_bundled_version()
     );
+    assert!(!bundled_core_version().is_empty());
 }
 
 const PATCHED_FIXTURE: [&str; 3] = [
@@ -646,4 +626,32 @@ fn desktop_source_with_explicit_null_windows_overlay_is_invalid() {
         bundled_core_version_with_ios(&fixture.to_string(), false, false, true).unwrap(),
         "1.0.0.polaris.2"
     );
+}
+
+#[test]
+fn failed_state_publication_does_not_mutate_memory_or_disk() {
+    let tmp = TestDir::new("polaris-updater-failed-publication-");
+    let runtime = rt(tmp.path());
+    runtime
+        .mutate_state(|state| state.skipped_version = Some("1.2.3".into()))
+        .unwrap();
+    // Block the staging path without depending on permission behavior as root.
+    std::fs::create_dir(tmp.path().join("update-state.json.tmp")).unwrap();
+    assert!(runtime
+        .mutate_state(|state| state.skipped_version = Some("9.9.9".into()))
+        .is_err());
+    assert_eq!(runtime.state().skipped_version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        rt(tmp.path()).state().skipped_version.as_deref(),
+        Some("1.2.3")
+    );
+}
+
+#[test]
+fn version_reader_uses_shared_bounded_probe_without_changing_fallback_semantics() {
+    let source = include_str!("../../updater.rs");
+    let body =
+        crate::commands::guard_scan::top_level_fn_body(source, "pub fn read_core_version_line(");
+    assert!(body.contains("self.core_version_probe.first_line(&bin)"));
+    assert!(!body.contains(".output()"));
 }

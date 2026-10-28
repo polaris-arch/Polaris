@@ -485,3 +485,5 @@ fn read_timeout_maps_to_timeout_error_but_other_io_errors_do_not() {
         "ConnectionReset → {err:?}"
     );
 }
+
+mod request_budget;

@@ -286,6 +286,8 @@ pub enum PathReject {
     TooShallow,
     /// 目标不存在。
     Missing,
+    /// Inspection failed; preserve the OS error rather than claiming absence.
+    InspectionFailed(String),
     /// 目标是软链 —— 跟着删会删到链外的任意位置。
     Symlink,
     /// 目标形态不符（要目录给了文件，或反之）。
@@ -295,12 +297,13 @@ pub enum PathReject {
 impl PathReject {
     /// 人话原因（进报告，用户看得懂为什么没删）。
     #[must_use]
-    pub const fn reason(self) -> &'static str {
+    pub fn reason(&self) -> &str {
         match self {
             Self::NotAbsolute => "路径不是绝对路径（会相对进程工作目录解析）",
             Self::LeafMismatch => "路径末段不是 Polaris 自有目录名（白名单不匹配）",
             Self::TooShallow => "路径过浅（没有具名父目录），拒绝删除",
             Self::Missing => "目标不存在",
+            Self::InspectionFailed(error) => error,
             Self::Symlink => "目标是软链接（跟随删除会删到链接之外的位置）",
             Self::KindMismatch => "目标形态不符（期望目录/文件不一致）",
         }
@@ -322,6 +325,15 @@ fn validate_removable(
     leaf_ok: &dyn Fn(&str) -> bool,
     want: TargetKind,
 ) -> Result<(), PathReject> {
+    validate_removable_with(path, leaf_ok, want, &|path| std::fs::symlink_metadata(path))
+}
+
+fn validate_removable_with(
+    path: &Path,
+    leaf_ok: &dyn Fn(&str) -> bool,
+    want: TargetKind,
+    inspect: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<(), PathReject> {
     if !path.is_absolute() {
         return Err(PathReject::NotAbsolute);
     }
@@ -337,10 +349,10 @@ fn validate_removable(
     }
     // `symlink_metadata` 而非 `metadata`：后者会跟随软链，于是「是不是目录」问的是**链尾**，
     // 而 `remove_dir_all` 删的是链本身/链尾，两者对不上就是任意位置删除。
-    let md = match std::fs::symlink_metadata(path) {
+    let md = match inspect(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(PathReject::Missing),
-        Err(_) => return Err(PathReject::Missing),
+        Err(error) => return Err(PathReject::InspectionFailed(error.to_string())),
     };
     if md.file_type().is_symlink() {
         return Err(PathReject::Symlink);

@@ -16,7 +16,9 @@ use crate::commands::{
 };
 use crate::response::ApiResponse;
 use crate::runtime::{
-    measurement_scheduler::{self, entry_freshness_cap_ms, LedgerView},
+    measurement_scheduler::{
+        self, freshness_period_index, indexed_entry_freshness_cap_ms, LedgerView,
+    },
     AppRuntime,
 };
 
@@ -256,16 +258,29 @@ pub(crate) fn snapshot(app: &AppHandle) -> ApiResponse<Value> {
         .as_str()
         .map_or_else(BTreeSet::new, |id| BTreeSet::from([id.to_owned()]));
     let plan = measurement_scheduler::plan_subscriptions(&config, &auto_scope);
-    let cap = |id: &str, entry: &LedgerEntry| entry_freshness_cap_ms(&plan, id, entry);
+    let periods = freshness_period_index(&plan);
+    let cap = |id: &str, entry: &LedgerEntry| indexed_entry_freshness_cap_ms(&periods, id, entry);
     let now = crate::runtime::subscription_scheduler::now_ms();
     let emission_digest =
         generation.and_then(|generation| proxy.ready_main_emission_digest(generation));
     let connections = crate::runtime::node_fingerprints::measurement_connections_json(&config);
-    let rows = ledger.display_rows(
+    let mut rows = ledger.display_rows(
         &view.read(&cap, ledger, now),
         emission_digest.as_deref(),
         &connections,
     );
+    // One authoritative UI projector; native samples carry distinct provenance.
+    if let Some(native) = proxy
+        .native_measurement_rows(&config, now, emission_digest.as_deref())
+        .as_object()
+    {
+        for (id, record) in native {
+            rows.as_object_mut()
+                .expect("display rows object")
+                .entry(id.clone())
+                .or_insert_with(|| json!({}))["nativeHttp"] = record.clone();
+        }
+    }
     let mut frontend = config.clone();
     crate::commands::config::apply_frontend_view(&mut frontend);
     let frontend_config_digest = polaris_updater::sha256_hex(

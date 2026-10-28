@@ -86,24 +86,44 @@ fn encode_std_base64(bytes: &[u8]) -> String {
 
 /// 生成侧：用户/订阅串 → 内核形态（每条标准 base64）。
 ///
-/// **非法条目丢弃、合法条目保留**：UI 保存时已拒绝非法值（`proto-codec.ts` 的 `certPinInvalid`），
-/// 走到这里的非法值只可能来自手改配置文件。逐条丢而不是整字段丢，是因为整字段丢会让该节点
-/// 退回「不固定」（若同时开了 insecure 即任意证书放行），逐条丢只是少一个可匹配项、仍然 fail-closed。
-/// 全部非法/为空 → `None`（不产生键）。
-pub fn cert_pins_for_kernel(raw: Option<&str>) -> Option<Vec<String>> {
-    let pins: Vec<String> = raw?
+/// Explicit malformed constraints fail closed, including mixed valid/invalid lists.
+/// Empty editor fields mean unset; invalid nonempty input never becomes no pins.
+pub fn cert_pins_for_kernel(raw: Option<&str>) -> Result<Option<Vec<String>>, &'static str> {
+    let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let pins = raw
         .split(',')
-        .filter_map(decode_pin)
-        .map(|d| encode_std_base64(&d))
-        .collect();
-    (!pins.is_empty()).then_some(pins)
+        .map(|item| {
+            decode_pin(item)
+                .map(|d| encode_std_base64(&d))
+                .ok_or("TLS_PIN_INVALID")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(pins))
 }
 
-/// 导入侧：只保留合法条目的**原文**（逗号拼接），无合法条目 → `None`。
-///
-/// 保留原文而不是转成 base64：UI 里给用户看的是订阅给的那个 hex，转码只在生成侧做一次。
-/// 过滤非法条目是为了不把一个导入进来的死值留给 UI —— 否则该节点在编辑器里保存必被拒
-/// （典型：老 Clash 配置把浏览器名 `chrome` 误写进 `fingerprint`，mihomo 对它是报错而非忽略）。
+/// Importers preserve nonempty constraints until shared validation can reject the
+/// node with an explicit failure. Dropping malformed input would remove security.
+pub fn preserve_cert_pins(raw: &str) -> Option<String> {
+    (!raw.trim().is_empty()).then(|| raw.trim().to_owned())
+}
+
+pub fn validate_server_cert_pins(
+    server: &crate::user_config::server_config::ServerConfig,
+) -> Result<(), &'static str> {
+    if pin_is_emitted(server) {
+        if let Some(tls) = &server.tls_settings {
+            cert_pins_for_kernel(tls.certificate_sha256.as_deref())?;
+            cert_pins_for_kernel(tls.certificate_public_key_sha256.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
+/// Validation-only helper retained for the share-link exporter. Importers must use
+/// preserve_cert_pins plus validate_server_cert_pins; filtering import constraints
+/// would silently weaken authentication when all supplied values are malformed.
 pub fn keep_valid_cert_pins(raw: &str) -> Option<String> {
     let kept: Vec<&str> = raw
         .split(',')
@@ -113,14 +133,44 @@ pub fn keep_valid_cert_pins(raw: &str) -> Option<String> {
     (!kept.is_empty()).then(|| kept.join(","))
 }
 
-/// 内核会不会真正校验这个节点的 pin —— 与生成侧同一判据：reality / naive 下 builder 写死不下发
-/// （reality 客户端用自己的 verifier 覆盖 pin 回调、naive 不转交 pin，内核都**静默忽略**）。
-fn pin_is_emitted(s: &crate::user_config::server_config::ServerConfig) -> bool {
-    use crate::user_config::server_config::{Protocol, SecurityMode};
-    s.protocol != Protocol::Naive && s.security != Some(SecurityMode::Reality)
+/// Applicability of the modeled tlsSettings pin fields. Raw custom/VPN payloads
+/// have separate schemas; they do not consume these modeled fields. MASQUE builds
+/// its own ordinary TLS block regardless of the generic security selector.
+pub fn modeled_cert_pins_are_emitted(
+    protocol: crate::user_config::server_config::Protocol,
+    security: Option<&crate::user_config::server_config::SecurityMode>,
+) -> bool {
+    use crate::user_config::server_config::Protocol;
+    match protocol {
+        Protocol::MasqueClient => true,
+        Protocol::Naive
+        | Protocol::Tor
+        | Protocol::Tailcat
+        | Protocol::Ssh
+        | Protocol::Custom
+        | Protocol::Wireguard
+        | Protocol::Tailscale
+        | Protocol::Openconnect
+        | Protocol::OpenvpnClient => false,
+        Protocol::Vless
+        | Protocol::Trojan
+        | Protocol::Hysteria2
+        | Protocol::Shadowsocks
+        | Protocol::Anytls
+        | Protocol::Tuic
+        | Protocol::Vmess
+        | Protocol::Snell
+        | Protocol::Socks
+        | Protocol::Http
+        | Protocol::Hysteria => !security.is_some_and(|security| security.is_reality()),
+    }
 }
 
-/// 导入侧：剔除内核不会校验的 pin（reality / naive 节点）。
+fn pin_is_emitted(s: &crate::user_config::server_config::ServerConfig) -> bool {
+    modeled_cert_pins_are_emitted(s.protocol, s.security.as_ref())
+}
+
+/// 导入侧：剔除生成侧不会消费的建模 pin，复用同一能力判据。
 ///
 /// 这类值存下来只会「存着、看不到（编辑器在 reality 下隐藏、naive 不提供）、不生效」，
 /// 用户也无从处理 —— 不存。放在导入汇合点调用，而不是各导入器里各判一次：安全层（reality）

@@ -9,6 +9,8 @@ import type { LogLevel } from '../types';
  */
 export interface ProxyStatus {
   running: boolean;
+  /** Runtime-confirmed exit, distinct from the saved selection. Null while stopped/unresolved. */
+  actualServerId?: string | null;
   /** Shared lifecycle generation from getStatus; used to reject results from a replaced main. */
   mainGeneration?: number;
   /** Captured under backend D/selector-intent serialization; absent means unknown. */
@@ -69,6 +71,8 @@ export enum ProxyErrorCode {
   TLS_CERT_ERROR = 'TLS_CERT_ERROR', // 'certificate'|'tls'|'ssl'（排除 anytls/shadowtls）
   AUTH_FAILED = 'AUTH_FAILED', // 'authentication failed'|'auth fail'
   // 配置类 → ErrorCategory.Config
+  NODE_RESOLVER_UNSUPPORTED = 'NODE_RESOLVER_UNSUPPORTED',
+  SPEED_TEST_URL_INVALID = 'SPEED_TEST_URL_INVALID',
   CONFIG_INVALID = 'CONFIG_INVALID', // 'invalid config'|'config error'、退出码 2
   PORT_IN_USE = 'PORT_IN_USE', // 'address already in use'
   CLASH_API_PORT_RECYCLING = 'CLASH_API_PORT_RECYCLING', // 9090 处于 TIME_WAIT 回收中（瞬态，自动等待，非终态）

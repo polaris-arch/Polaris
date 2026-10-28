@@ -57,6 +57,19 @@ function Read-ManifestDigest([string]$Name,[string]$SourceField,[string]$Source,
 $appHash = Read-ManifestDigest 'app-artifact.json' 'appSource' $ExpectedAppSource $ExpectedAppManifestSHA256
 $kernelHash = Read-ManifestDigest 'kernel-artifact.json' 'kernelSource' $ExpectedKernelSource $ExpectedKernelManifestSHA256
 $activationHash = Read-ManifestDigest 'activation-artifact.json' 'kernelSource' $ExpectedKernelSource $ExpectedActivationManifestSHA256
+# a4 acceptance includes the reviewed IPC fixture explicitly, bound to the
+# exact test executable. It is never evidence that the unmodified a4 tests passed.
+if ($ExpectedKernelSource -ceq 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae') {
+    $fixture = $receipt.testFixture
+    $kernelArtifact = Get-Content -LiteralPath (Join-Path $EvidenceDirectory 'kernel-artifact.json') -Raw | ConvertFrom-Json
+    if ($fixture.kind -cne 'reviewed-test-ipc-overlay-v1' -or
+        $fixture.sourceCommit -cne $ExpectedKernelSource -or
+        $fixture.path -cne 'protocol/tailscale/directory_process_windows_test.go' -or
+        $fixture.reviewedCommit -cne 'e9f5bb82ed8900ec857dc9cf3135179ba8045111' -or
+        $fixture.originalSHA256 -cne '03f3782f31d323cc7096fe92290e65241ebfb9fd1a5c6806283bb69ebd2570ff' -or
+        $fixture.replacementSHA256 -cne '74511b3ab0524b227020e95316f458453cac4d5a953afe79eab294aa5cebe1ed' -or
+        $fixture.kernelSHA256 -cne $kernelArtifact.sha256) { throw 'Missing or mismatched reviewed test fixture identity' }
+} elseif ($null -ne $receipt.testFixture) { throw 'Unexpected test fixture overlay for selected kernel source' }
 # Re-read the marker after all checks; a replaced pointer cannot be returned as verified.
 $after = Get-Content -LiteralPath $attemptPath -Raw | ConvertFrom-Json
 if ($after.result -cne 'passed' -or $after.attemptId -cne $attempt.attemptId -or $after.receiptSHA256 -cne $receiptSHA256) { throw 'Current attempt changed during verification' }

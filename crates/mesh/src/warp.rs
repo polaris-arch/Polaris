@@ -329,7 +329,7 @@ pub fn build_unregister_request(
 /// - 204 / 404 → Done（404=别处已销，视作成功），优先于一切；
 /// - err 文本含 `1020` → Retry（WAF/版本失效，须优先于 401/403 的 Drop）；
 /// - 401 / 403 → Drop（token 失效/被拒）；
-/// - 网络失败(None) / 5xx / 400 → Retry；
+/// - 网络失败(None) / 5xx / 400 / 429 → Retry；
 /// - 其它未知 4xx → Drop（非暂时性，不无限占预算）。
 pub fn classify_deregister_result(status: Option<u16>, err: Option<&str>) -> DeregisterResult {
     // 网络失败 / 超时：无 HTTP 状态 → 暂时不可达，重试。
@@ -353,7 +353,8 @@ pub fn classify_deregister_result(status: Option<u16>, err: Option<&str>) -> Der
     if status >= 500 {
         return DeregisterResult::Retry;
     }
-    if status == 400 {
+    // Rate limiting does not invalidate self-delete credentials; keep the queued retry.
+    if status == 400 || status == 429 {
         return DeregisterResult::Retry;
     }
     // 其它未知 4xx：非暂时性，Drop。

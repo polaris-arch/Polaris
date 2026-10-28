@@ -501,7 +501,7 @@ jobs:
 
       # Run the S5 source-owned tests against this checkout's real generated Gradle/AAR inputs.
       # The clean task removes prior variant reports; nonzero complete method coverage is checked below.
-      - name: Verify S5 Android network observation unit tests
+      - name: Verify S5 Android network observation and admission unit tests
         shell: bash
         run: |
           set -euo pipefail
@@ -510,13 +510,17 @@ jobs:
             --tests com.polaris2.app.vpn.DefaultNetworkObservationTest \
             --tests com.polaris2.app.vpn.NetworkMonitorSessionTest \
             --tests com.polaris2.app.vpn.LoadedLibboxIdentityTest \
+            --tests com.polaris2.app.vpn.AndroidCallbackSchedulingSourceTest \
+            --tests com.polaris2.app.vpn.AndroidNativeAdmissionTest \
+            --tests com.polaris2.app.vpn.AndroidNativeMainControlsTest \
+            --tests com.polaris2.app.vpn.MainNativeAdmissionWiringTest \
             -PpolarisAllowUnsigned=true -x :app:rustBuildArm64Release --max-workers=2 --no-daemon
           python3 -I - "$RUNNER_TEMP/s5-android-unit-results.json" <<'PYRESULT'
           import hashlib, json, re, subprocess, sys
           from pathlib import Path
           from xml.etree import ElementTree as ET
           base = Path('src-tauri/gen/android/app')
-          classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest']
+          classes = ['DefaultNetworkObservationTest', 'NetworkMonitorSessionTest', 'LoadedLibboxIdentityTest', 'AndroidCallbackSchedulingSourceTest', 'AndroidNativeAdmissionTest', 'AndroidNativeMainControlsTest', 'MainNativeAdmissionWiringTest']
           rows = []
           for name in classes:
               source = base / 'src/test/java/com/polaris2/app/vpn' / (name + '.kt')
@@ -571,6 +575,10 @@ jobs:
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.DefaultNetworkObservationTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.NetworkMonitorSessionTest.xml
             src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.LoadedLibboxIdentityTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidCallbackSchedulingSourceTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidNativeAdmissionTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.AndroidNativeMainControlsTest.xml
+            src-tauri/gen/android/app/build/test-results/testArm64ReleaseUnitTest/TEST-com.polaris2.app.vpn.MainNativeAdmissionWiringTest.xml
             ${{ runner.temp }}/s5-android-unit-results.json
             ${{ runner.temp }}/release-stage1.log
           # Preserve original Rust/Tauri/frontend/first-Gradle stage1 output even on failure.

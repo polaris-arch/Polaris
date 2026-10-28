@@ -80,49 +80,40 @@
 # │    **这一形今天没有门。** 不再加第三道门去堵它 —— 判据表的边界就写在这里。            │
 # └───────────────────────────────────────────────────────────────────────────────┘
 #
-# ┌── 那一层归谁守（逐条点名，不许一句「归 release-smoke」了事）──────────────────┐
-# │ ①②③ 归 **`.github/workflows/android.yml` 的 `release-smoke` job**：真跑一次 release  │
-# │ 构建（联网拉 R8 + 全量交叉编译 + `assembleArm64Release`），判据是                    │
-# │ `scripts/assert-r8-evidence.mjs` 读 R8 的 configuration.txt / seeds.txt。            │
-# │                                                                                    │
-# │ 🔴 **它至今一次都没跑过**（`if: inputs.release_smoke`，默认 false；且今天            │
-# │    **没有任何自动调用方**会传 true —— release-risk.yml 的 android job 是一句裸       │
-# │    `uses: ./.github/workflows/android.yml`，不带 `with:`。只能手动                   │
-# │    `workflow_dispatch` 勾上，而本仓从未这么触发过）。①②③ 今天没有任何东西在守。      │
-# │                                                                                    │
-# │ ④ 的两层**都不归 release-smoke**（2026-09-06 终止轮 R5 —— 上一版那句「那一层归      │
-# │ release-smoke」对签名不成立）：那条腿跑的是                                          │
-# │ `./gradlew assembleArm64Release … -PpolarisAllowUnsigned=true`，走的正是逃生门，     │
-# │ 出的就是 `app-arm64-release-unsigned.apk`；CI 上没有密钥库、也不该有。               │
-# │ 而且全仓 `apksigner` / `jarsigner` 一次都没出现过（`keytool` 只在失败信息的教学文本   │
-# │ 里）。**签名的接线与有效性今天没有任何门** —— 本机手签一次是唯一的观察面。            │
-# │                                                                                    │
-# │ ⑤ 不归任何人（见上）。                                                              │
-# │                                                                                    │
-# │ 部分补偿（只补 ①②，且只补文本这一层）：`src-tauri/tests/android_release_signing_    │
-# │ wiring.rs` 的 `execution_phase_hooks_must_be_registered` 要求 `onlyIf` / `enabled` /│
-# │ `doFirst` / `doLast` 在**三份**入库的 gradle 脚本里逐处登记（app 的                  │
-# │ `build.gradle.kts`、事实任务、以及工程根那份）。那是**文本判据**，能被什么绕过        │
-# │ 写在它自己的头注里（`buildSrc/` 那一形它就看不见）—— 别把它当行为判据用。            │
-# └───────────────────────────────────────────────────────────────────────────────┘
+# ┌── 当前执行期验证归属（按本树 android.yml 的实际 job）─────────────────────────
+# │ ①②③ 由 release_check 和 release-apk 构建真实 release APK 后，运行             │
+# │ assert-r8-evidence.mjs 校验 configuration.txt / seeds.txt，并运行 verify-apk.mjs │
+# │ 检查本次最终 APK。release_check 在 publish_release != true 时执行；               │
+# │ release-apk 在 publish_release 为真时执行。两条腿均保留真实产物检查。              │
+# │ release_check 使用显式命令行 unsigned 开关，其结果不能证明签名有效性。             │
+# │                                                                              │
+# │ ④ 正式 release-apk 从所选 keystore/alias 导出公钥证书摘要，随后用 apksigner        │
+# │ verify --verbose --print-certs 检查每份发布 APK，核对实际签名证书摘要。              │
+# │ 本配置期裁判仍只观察签名容器；实际 APK 的签名接线与有效性由上述产物步骤验证。         │
+# │                                                                              │
+# │ ⑤ 新环境变量名绕过守卫仍超出本裁判枚举范围，见上方能力边界。                       │
+# │ 部分源码补偿仍由 android_release_signing_wiring.rs 的执行期 hook 登记提供，         │
+# │ 不是行为验证，不能把其文本断言当成实际任务执行证据。                                │
+# └───────────────────────────────────────────────────────────────────────────────
+#
+# 2026-09-06 的历史审计曾记录 release-smoke 默认关闭、无自动调用方和无 apksigner。
+# 那是当时源码/运行观察，已不适用于本树当前维护说明。上面描述当前源码中的接线，
+# 不据此推断某次远端运行已经发生或通过；实际运行结论必须引用对应 run 的日志/收据。
 #
 # 本仓成文口径：**一条不受判据管辖的声明，比没有这句话更坏。** 上面这张表就是按这条写的：
-# 能补的补进 ①–⑩，补不了的指名归属并写明它今天没跑。
+# 能补的补进 ①–⑩，补不了的指名归属，并区分源码接线与实际运行证据。
 #
 # ── 本机怎么跑（与 CI 逐字同一条命令）──────────────────────────────────────────
 #
 #   JAVA_HOME=<JDK 21> ANDROID_HOME=<Android SDK> bash scripts/gate-android-release-behavior.sh
 #
 # 判据要 Android SDK，故 `ci.yml` 的 Rust 各 job（lint / cross / test）跑不了它（那里只有 Rust 工具链）。
-# 它挂在 `.github/workflows/android.yml` 的 `apk` job —— 那条腿本来就要装 SDK/NDK 并铺
-# `tauri android build` 的生成物，而本裁判的取材面（三份 `.pro` 里有两份是生成物）恰好要求
-# 生成物在场。挂在 `release-smoke` 是错的：那条腿默认不跑，而这些判据必须每次都说话。
+# 它挂在 `.github/workflows/android.yml` 的 release_check 与 release-apk 两条腿，
+# 都在 SDK/NDK 与生成的规则文件准备好后执行，验证配置期行为；后续真实 APK/R8/签名验证
+# 由各 job 的产物级步骤负责。当前源码接线不等于某次 CI 已运行或已通过。
 #
-# 🔴 但「挂上了」不等于「跑过」（2026-09-06 终止轮实测，只读 API）：远端默认分支 `main` 上
-#    **没有** `.github/workflows/android.yml`（`gh api repos/…/contents/…` 返回 404；
-#    `actions/workflows` 只列得出 ci / package / release-risk / ui 四份），本分支也从未推送。
-#    也就是说本裁判至今**一次都没在 CI 上跑过** —— 它今天的全部观测都来自本机手跑。
-#    这不改判据本身，但「CI 上有一道门在守 release 路径」这句话今天还不成立。
+# 2026-09-06 的只读 API 观察曾记录默认分支缺少 android.yml；这是历史观察，
+# 不能用来判断当前远端分支或执行状态。需要运行证据时应检查目标 run，而不是沿用旧断言。
 #
 # ── 硬要求 ──────────────────────────────────────────────────────────────────────
 #

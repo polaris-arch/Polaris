@@ -364,7 +364,7 @@ fn session_diagnostic_never_downgrades_trace() {
 #[test]
 fn ring_seqs_stay_monotonic_under_concurrent_push() {
     let _g = LEVEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear();
+    clear().unwrap();
     let threads: Vec<_> = (0..8)
         .map(|t| {
             std::thread::spawn(move || {
@@ -383,7 +383,7 @@ fn ring_seqs_stay_monotonic_under_concurrent_push() {
         seqs.windows(2).all(|w| w[0] < w[1]),
         "环内 seq 必须单调递增（乱序 → collect_from 的游标会重放/跨过条目）"
     );
-    clear();
+    clear().unwrap();
 }
 
 /// 水合与流式首尾相接：`snapshot_with_cursor` 的游标之后拉增量 → 只得到快照之后写入的条目，
@@ -393,7 +393,7 @@ fn ring_seqs_stay_monotonic_under_concurrent_push() {
 #[test]
 fn snapshot_and_cursor_hand_off_without_replay_or_gap() {
     let _g = LEVEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear();
+    clear().unwrap();
     for i in 0..3 {
         push_ring(0, Level::Info, "t", format!("hydrate-{i}"));
     }
@@ -416,7 +416,7 @@ fn snapshot_and_cursor_hand_off_without_replay_or_gap() {
         "只推快照之后的增量，不重放水合过的"
     );
     assert!(records_from(next).0.is_empty(), "游标推进后无重放");
-    clear();
+    clear().unwrap();
 }
 
 /// 增量拉取：只取 seq>=from，游标推进到末尾+1；无新条目游标不动（防重放/漏推）。
@@ -450,7 +450,7 @@ impl RingLevelGuard {
     fn new(level: LevelFilter) -> Self {
         let lock = LEVEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = log::max_level();
-        clear();
+        clear().unwrap();
         log::set_max_level(level);
         Self { saved, _lock: lock }
     }
@@ -458,7 +458,7 @@ impl RingLevelGuard {
 
 impl Drop for RingLevelGuard {
     fn drop(&mut self) {
-        clear();
+        clear().unwrap();
         log::set_max_level(self.saved);
     }
 }
@@ -672,4 +672,20 @@ fn main_core_info_still_fills_the_ring_with_ordinary_ring_semantics() {
     assert_eq!(recs.len(), LOG_RING_CAP, "主核照常填满整个环");
     assert_eq!(recs.first().unwrap().message, "core-1000");
     assert_eq!(recs.last().unwrap().message, "core-2999");
+}
+
+#[test]
+fn clear_receipt_separates_removed_and_retained_stream_records() {
+    let _g = LEVEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear().unwrap();
+    push_ring(0, Level::Info, "t", "before-clear".into());
+    let (before, _) = snapshot_with_cursor(None);
+    let boundary = clear().unwrap();
+    assert!(before.iter().all(|row| row.seq < boundary));
+    push_ring(0, Level::Info, "t", "after-clear".into());
+    let (after, _) = snapshot_with_cursor(None);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].seq, boundary);
+    assert_eq!(after[0].message, "after-clear");
+    clear().unwrap();
 }

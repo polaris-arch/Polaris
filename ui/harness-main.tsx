@@ -206,7 +206,19 @@ if (coexFixtureEnabled) {
 }
 
 void i18nReady.then(async () => {
-  if (meshIngressFixture) {
+  if (new URLSearchParams(window.location.search).has('mesh-choice-fixture')) {
+    const { MeshJoinDialogView } = await import('./src/components/dialogs/MeshJoinDialog');
+    const mode = new URLSearchParams(window.location.search).get('mesh-choice-fixture');
+    const servers: typeof DEMO_SERVERS = mode === 'empty' ? [] : [
+      { id: 'choice-warp', name: 'WARP', protocol: 'wireguard', address: 'engage.cloudflareclient.com', port: 2408 },
+      { id: 'choice-ts', name: mode === 'long' ? 'VeryLongUnbrokenAccountName'.repeat(5) : 'Personal', protocol: 'tailscale', address: '', port: 0 },
+      ...(mode === 'long' ? [{ id: 'choice-ts-work', name: 'Work', protocol: 'tailscale' as const, address: '', port: 0 }] : []),
+    ];
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <MeshJoinDialogView servers={servers} tsStates={{ 'choice-ts': mode !== 'signed-out', 'choice-ts-work': true }}
+        onTsLogout={() => {}} onWarpReregister={() => {}} onWarpDeregister={() => {}} />,
+    );
+  } else if (meshIngressFixture) {
     const [{ useAppStore }, { DialogHost }, { useDialogStore }] = await Promise.all([
       import('./src/store/app-store'), import('./src/components/dialogs/DialogHost'),
       import('./src/components/dialogs/dialog-store'),

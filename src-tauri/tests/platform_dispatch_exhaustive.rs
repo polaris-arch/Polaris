@@ -180,6 +180,48 @@ const WILDCARD_ALLOW: &[(&str, &str, &str)] = &[
 /// 一次。只判「有没有」会让「同文件里又加了一处一模一样的比较」静默通过。
 type Comparison = (&'static str, &'static str, usize, &'static str);
 const COMPARISON_REGISTRY: &[Comparison] = &[
+    (
+        "crates/helper-client/src/manager.rs",
+        "matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)",
+        1,
+        "Explicit stop-and-upgrade is macOS-only. Android/iOS/Other cannot obtain this desktop maintenance mode; ordinary requests still require existing platform admission.",
+    ),
+    (
+        "crates/helper/src/mac_migration_guard.rs",
+        "let paths = InstallPaths::for_platform(Platform::Mac)",
+        3,
+        "This macOS-only root CLI binds three independent guard paths to the fixed Mac installation. Android/iOS/Other never compile or dispatch this service-stop implementation.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if matches!(platform, Platform::Win)",
+        1,
+        "Only Windows installer-owned exit stages select Windows diagnostics. Android/iOS/Other retain the generic diagnostic and gain no desktop maintenance capability.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "if matches!(platform, Platform::Win) && code == 75",
+        1,
+        "Only the fixed Windows installer uses native exit 75 as upgrade admission evidence. Other platforms require their exact installer marker; Android/iOS/Other cannot infer admission from an arbitrary exit.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "let utility = if self.platform == Platform::Win",
+        1,
+        "Windows retains its bundled native cleaner and does not prepare a Unix maintenance utility. Android/iOS/Other are rejected before this desktop uninstall path.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "matches!(self, Self::Ordinary) || matches!(platform, Platform::Mac)",
+        1,
+        "Explicit stop-and-upgrade is macOS-only. Android/iOS/Other cannot obtain this desktop maintenance mode; ordinary requests still require existing platform admission.",
+    ),
+    (
+        "src-tauri/src/runtime/helper.rs",
+        "else if matches!(platform, Platform::Linux) && code == 127",
+        1,
+        "安装命令仅在 Linux 将 exit 127 判为授权未完成；Android/iOS/Other 和未来平台不继承 PolicyKit 语义，仍保留安装失败分类，且桌面 helper 平台准入不变。",
+    ),
     ("crates/helper-client/src/manager.rs",
      "!raw.contains([ , , ]) && (path.is_absolute() || platform == Platform::Win && raw.as_bytes().get(1) == Some(&b ) && matches!(raw.as_bytes().get(2), Some(b | b )))", 1,
      "Only Windows accepts a drive-qualified staged path when the authoring host uses Unix path syntax. Android/iOS/Other cannot borrow that path rule or pass native caller admission."),
@@ -353,7 +395,7 @@ const COMPARISON_REGISTRY: &[Comparison] = &[
         "src-tauri/src/runtime/helper.rs",
         "if matches!(platform, Platform::Linux) && code == 127",
         1,
-        "pkexec 127 → AuthorizationUnavailable 的判据。Android → 走 Failed 分支，不可达\
+        "pkexec 127 → AuthorizationIncomplete 的判据。Android → 走 Failed 分支，不可达\
          （Android 上没有提权脚本可跑）。",
     ),
     (
@@ -3203,19 +3245,36 @@ const CFG_REGISTRY: &[CfgSite] = &[
         IosSide::DiffersRight,
         "新增九处 Android 测速走 Android JNI 瞬态实例、drain 与 snapshot；iOS 没有该 Java 宿主，不能编 Android 腿。其错误继承桌面路径的事实在 not(android) 条目单独登记为债。",
     ),
+    // UA and version displays share the selected bundled identity. All four new
+    // sites put Android and iOS on the same side in release and debug; no debt
+    // verdict changes and no device-validation claim is made.
     (
-        "src-tauri/src/runtime/updater.rs",
-        "target_os = \"android\"",
+        "src-tauri/src/runtime/core_version.rs",
+        "any(target_os = \"android\", target_os = \"ios\", test)",
+        2,
+        IosSide::WithAndroid,
+        "移动端构建合同常量与纯版本解析器由 Android/iOS 共用，host test 仅验证取值；两移动平台 release/debug 均进入，不证明设备运行。",
+    ),
+    (
+        "src-tauri/src/runtime/core_version.rs",
+        "not(any(target_os = \"android\", target_os = \"ios\"))",
         1,
-        IosSide::DiffersRight,
-        "core-manifest 的 Android resolver 标志选择 libbox 资源事实，iOS 不应借 Android 资源；未支持目标不因此获得核资源或更新能力。",
+        IosSide::WithAndroid,
+        "桌面版本读取复用实际 compiled selected_manifest 准入身份；Android/iOS 都排除该桌面路径，失败明确 unknown，不退回旧版本。",
+    ),
+    (
+        "src-tauri/src/runtime/core_version.rs",
+        "any(target_os = \"android\", target_os = \"ios\")",
+        1,
+        IosSide::WithAndroid,
+        "Android/iOS 默认 UA 与随包版本展示读取各自构建共同消费的 mobile source-contract version，与 builder 链接 constant.Version 同源，不启动内核或改变更新策略。",
     ),
     (
         "src-tauri/src/runtime/updater.rs",
         "target_os = \"ios\"",
         1,
         IosSide::DiffersRight,
-        "既有 bundled_core_version_from_manifest 的 cfg!(ios) 只传递版本身份分派：iOS 为 true，跳过 desktopSourceBuild 并保留原 legacy/mobile 解析；Android 为 false，但在 android 早退先返回原 bundled 版本，桌面才可进入 desktopSourceBuild。只登记此既有资源身份隔离，不新增 iOS 更新/核功能，不代表 iOS 编译或设备验收。",
+        "旧 bundled_core_version_from_manifest 已仅供 cfg(test) 兼容夹具；生产文件扫描仍计入其内部 cfg!(ios)，谓词本身 iOS=true、Android=false。实际 UA/版本展示改用 core_version 的所选构建身份，本条不再宣称生产旧版本路径可达，也不新增更新能力或设备验收。",
     ),
     (
         "src-tauri/src/runtime/updater.rs",
@@ -4138,16 +4197,19 @@ fn cfg_axis_platform_dispatch_is_registered() {
 // cc681 actual missing sites: uninstall desktop +2; exact owned iOS Stop +1;
 // Android reconnect-status projection +1 retains its existing undecided group.
 // This adds one debt site; no existing iOS verdict is upgraded or erased.
+// UA identity: remove one obsolete updater Android-only site; add four
+// same-side selected-version sites. The test-only legacy cfg!(ios) remains
+// scanned in updater.rs; tests/ files are excluded. Existing debt is unchanged.
 const IOS_SIDE_CENSUS: &[(&str, usize)] = &[
     ("DiffersOnlyInDebug", 30),
     // ME03 adds two explicit iOS query/stub predicates; no old debt is erased.
-    ("DiffersRight", 331),
+    ("DiffersRight", 330),
     ("DiffersUndecided", 27),
     ("DiffersWrongToday", 142),
     // b84e adds eight explicitly same-side cfg sites (1 + 4 + 2 + 1),
     // checked by eval_cfg for Android/iOS in both release/debug. No existing
     // verdict or debt site changes; this does not claim device validation.
-    ("WithAndroid", 126),
+    ("WithAndroid", 130),
 ];
 
 /// 「债」的两个格子。同样只写名字，不写 `IosSide::`，理由同 [`IOS_SIDE_CENSUS`]。

@@ -1,4 +1,4 @@
-import { invoke, listen } from '../ipc-client';
+import { invoke, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { OpenConnectBrowserCookieInput, OpenConnectBrowserHeaderInput, OpenConnectStatusEvent, OpenVpnStatusEvent, VpnStatusSnapshot } from '../../contracts/vpn-status';
 
@@ -29,6 +29,12 @@ export const vpnApi = {
   },
   onOpenVpnStatus(listener: (data: OpenVpnStatusEvent) => void): () => void {
     return listen(IPC_CHANNELS.EVENT_OPENVPN_STATUS, listener);
+  },
+  onOpenConnectStatusReady(listener: (data: OpenConnectStatusEvent) => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_OPENCONNECT_STATUS, listener);
+  },
+  onOpenVpnStatusReady(listener: (data: OpenVpnStatusEvent) => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_OPENVPN_STATUS, listener);
   },
   submitOpenConnectForm(
     serverId: string,

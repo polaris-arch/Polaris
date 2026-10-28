@@ -41,11 +41,17 @@
     "actionError": {
       "partialCleanup": "Cleanup completed only partly. Protected service files may remain. Retry helper removal with administrator authorization.",
       "cancelled": "Administrator authorization was cancelled",
-      "authorizationUnavailable": "No administrator authentication agent is available in this desktop session. Start a PolicyKit authentication agent and try again",
+      "authorizationIncomplete": "Administrator operation did not complete. View logs.",
       "proxyRunning": "Disconnect the proxy managed by the helper before upgrading the helper",
       "unsupported": "This platform does not support the privileged helper",
       "missingAsset": "The helper files bundled with this app are unavailable",
       "notReady": "The helper was installed but is not ready yet",
+      "invalidInstallation": "The installation identity parameters are invalid. Reinstall Polaris from a verified package and check the logs.",
+      "tokenWriteFailed": "Helper authentication data could not be saved. Check available disk space and access to the app’s data folder; see the logs for details.",
+      "scriptWriteFailed": "The Helper installation script could not be saved. Check available disk space and access to the app’s data folder; see the logs for details.",
+      "authorizationLaunchFailed": "The administrator authorization process could not be started. Check the installation log before trying again.",
+      "upgradeDeferred": "The existing helper did not approve a safe upgrade. It may be busy or lack upgrade support. Disconnect its managed connections and check again; if it remains blocked, check the logs to determine whether a confirmed legacy migration is needed.",
+      "installerFailed": "The Helper installation command failed. Check the installation log for the cause before trying again.",
       "failed": "The helper action could not be completed",
       "bundleMismatch": "The bundled core does not match this app’s content identity. Reinstall Polaris."
     },
@@ -59,7 +65,13 @@
       "invalid": "Verification failed",
       "unavailable": "Unavailable"
     },
-    "installSelectedCoreAction": "Install selected core"
+    "failureNextStep": "Check the Helper installation entries in Logs for the failure details. Recheck does not reinstall the helper.",
+    "viewLogsAction": "View logs",
+    "installSelectedCoreAction": "Install selected core",
+    "stopAndUpgradeAction": "Stop connections and upgrade…",
+    "stopAndUpgradeTitle": "Stop com.polaris.helper and upgrade?",
+    "stopAndUpgradeWarning": "This will stop com.polaris.helper and all connections it manages, including connections from other app sessions. Those connections will be interrupted. Polaris will then request administrator authorization to upgrade the helper. Continue only if you agree to stop all of these connections.",
+    "stopAndUpgradeConfirm": "Stop all managed connections and upgrade"
   },
   "proxy": {
     "systemProxyResidualDesc": "A system proxy is still enabled ({{proxy}}) in TUN mode. It wasn't set by Polaris and may cause connection issues. Consider disabling it unless you need it.",
@@ -489,17 +501,13 @@
     },
     "pendingResetShortConfirm": "Discard drafts?",
     "pendingResetDone": "Unsaved changes discarded",
-    "pendingSavedStillNeedsApply": "Saved changes still need to be applied",
-    "switchPending": "{{node}} · saved; applying connection change",
-    "switchRestarting": "{{node}} · saved; restarting the connection to complete the switch",
-    "switchSavedForNextStart": "{{node}} · saved for the next connection",
-    "switchRequiresApply": "{{node}} · saved; apply pending changes before use"
+    "pendingSavedStillNeedsApply": "Saved changes still need to be applied"
   },
   "settings": {
     "utls": {
       "label": "Global uTLS fingerprint",
-      "description": "Follow preserves node settings. Overrides affect generated configuration only. Random selects once per core process; Randomized uses a randomized template.",
-      "follow": "Follow node"
+      "description": "New configurations start with Default (Chrome). Follow preserves node fingerprints. Default, Random or a browser overrides eligible nodes unless uTLS is explicitly disabled on the node. Random selects a browser template once per core process.",
+      "follow": "Follow"
     },
     "coex": {
       "windowsHint": "Independent native observations. Completeness and compartment may remain Unknown. No interface association, route selection or safety verdict is inferred.",
@@ -912,13 +920,16 @@
       "downloadDone": "Download finished",
       "restartToInstall": "Restart Polaris to install it",
       "digestMissingTag": "No checksum",
-      "digestMissingBefore": "This release ships no sha256 digest, so the downloaded installer cannot be matched byte for byte against the publisher. Updating is not blocked; if a GitHub accelerator mirror is enabled, that mirror is inside the trust boundary for this download.",
-      "digestMissingAfter": "This download was not checked against a sha256 digest — the release ships none, so the installer cannot be confirmed byte for byte against the publisher. Whether to install is your call.",
+      "digestMissingBefore": "This release has no trusted SHA-256 digest. Automatic download and installation are unavailable. Open the release page to install manually.",
+      "digestMissingAfter": "This package has no verified SHA-256 digest and cannot be installed by the app. Open the release page to install manually.",
       "restartAndInstall": "Restart and install",
+      "manualInstallPending": "Manual installation pending",
+      "manualInstallerOpened": "The installer disk image is open. Install the app manually, then reopen it to check the version. Installation is not yet confirmed.",
       "downloadedManual": "Downloaded — replace it by hand",
       "portableQuitAndOpen": "Quit and open folders",
       "failed": "Update failed",
       "downloadInterrupted": "Download interrupted",
+      "updateTrustRequired": "This package is no longer trusted for installation. Check for updates and download it again.",
       "installRestartRequired": "Preparing for the install did not complete, and the proxy can no longer be started in this session. Restart the app, then try again.",
       "portableReminderClearFailed": "The update reminder could not be cleared and is still retained. Please retry; the downloaded archive will not be deleted.",
       "err": {
@@ -931,7 +942,7 @@
         "digestHexInvalid": "The release sha256 digest is not valid hex (publisher issue; retrying will not help)",
         "digestMismatch": "Package verification failed (possibly truncated or tampered)",
         "landingFailed": "Failed to finalize the downloaded package on disk",
-        "recheckFailed": "Update check failed"
+        "recheckFailed": "Update check failed. Check again and download a verified package, or use the release page for manual installation."
       },
       "coreCard": "sing-box core",
       "corePackaged": "Packaged core's reported version",
@@ -1063,9 +1074,22 @@
         "hint": "This report describes force-route matching in one configuration snapshot. It does not prove current traffic carriage, connectivity, or stable ownership.",
         "loading": "Refreshing route evidence…",
         "unavailable": "Route evidence is unavailable.",
-        "scope": { "preview": "Draft preview", "applied": "Run snapshot", "persistedUnknown": "Config snapshot; load state unconfirmed" },
-        "configSource": { "draft": "Draft configuration", "running": "Running configuration", "persisted": "Saved configuration" },
-        "load": { "startupReady": "Startup load confirmed", "fileWrittenUnacknowledged": "File written; core load unconfirmed", "loadFailed": "Load failed", "unknown": "Load state unknown" },
+        "scope": {
+          "preview": "Draft preview",
+          "applied": "Run snapshot",
+          "persistedUnknown": "Config snapshot; load state unconfirmed"
+        },
+        "configSource": {
+          "draft": "Draft configuration",
+          "running": "Running configuration",
+          "persisted": "Saved configuration"
+        },
+        "load": {
+          "startupReady": "Startup load confirmed",
+          "fileWrittenUnacknowledged": "File written; core load unconfirmed",
+          "loadFailed": "Load failed",
+          "unknown": "Load state unknown"
+        },
         "stale": "This snapshot is stale; do not treat its ranges as current.",
         "version": "Configuration version",
         "generation": "Run generation",
@@ -1086,11 +1110,30 @@
         "reportUnknown": "Report-level uncertainty",
         "noCandidates": "No route candidate entries are listed in this report.",
         "engagedReason": "Why this candidate participates",
-        "engaged": { "alwaysRouteSubnets": "Always route declared subnets", "selected": "Selected exit node", "ruleTargeted": "Targeted by a rule", "generationFailed": "Candidate generation failed", "unknown": "Reason not classified" },
-        "relation": { "equal": "Same range as an earlier node", "requestedWithinEarlier": "This range lies inside an earlier node's range", "earlierWithinRequested": "An earlier node's range lies inside this range" },
-        "leg": { "preferredBy": "Runtime destination matching", "externalRuleSet": "Referenced range file", "inline": "Direct range rule" },
+        "engaged": {
+          "alwaysRouteSubnets": "Always route declared subnets",
+          "selected": "Selected exit node",
+          "ruleTargeted": "Targeted by a rule",
+          "generationFailed": "Candidate generation failed",
+          "unknown": "Reason not classified"
+        },
+        "relation": {
+          "equal": "Same range as an earlier node",
+          "requestedWithinEarlier": "This range lies inside an earlier node's range",
+          "earlierWithinRequested": "An earlier node's range lies inside this range"
+        },
+        "leg": {
+          "preferredBy": "Runtime destination matching",
+          "externalRuleSet": "Referenced range file",
+          "inline": "Direct range rule"
+        },
         "coverage": "Coverage in this layer",
-        "coverageValue": { "full": "Full", "partial": "Partial", "none": "None", "unknown": "Unknown" },
+        "coverageValue": {
+          "full": "Full",
+          "partial": "Partial",
+          "none": "None",
+          "unknown": "Unknown"
+        },
         "generationFailed": "This node did not generate a route candidate.",
         "configured": "Node-declared ranges (not allocated ranges)",
         "observed": "Observed host addresses",
@@ -1106,7 +1149,13 @@
         "invalid": "Invalid ranges",
         "excludedCatchAll": "Catch-all ranges excluded from mesh ownership",
         "unknownReasons": "Why this result is unknown",
-        "source": { "declared": "declared", "observed": "observed", "retained": "retained", "bootstrap": "default estimate", "opaque": "runtime matching" },
+        "source": {
+          "declared": "declared",
+          "observed": "observed",
+          "retained": "retained",
+          "bootstrap": "default estimate",
+          "opaque": "runtime matching"
+        },
         "unknownOpaque": "A rule's destination set cannot be enumerated",
         "unknownInvalid": "Invalid range input",
         "unknownLimit": "Input or result limit exceeded",
@@ -1223,7 +1272,7 @@
       "builtinTag": "Built-in",
       "noQuotaTag": "Free of quota",
       "addCustomDoh": "Add custom DoH",
-      "customDohIpOnly": "Must be a bare IP form (e.g. 223.5.5.5 or tls://223.5.5.5:853); domain names are rejected",
+      "customDohIpOnly": "Use an IP-address HTTPS or UDP resolver. TLS is not supported for node resolution.",
       "raceEmptyFallback": "With everything off, it falls back to the default ali/dnspod race",
       "fakeIpFilterFold": "Domains that skip FakeIP",
       "fakeIpFilterHint": "Ordinary exceptions use Domestic DNS before user DNS rules; captive-portal exceptions keep the internal resolver. This selects a real resolver, rather than only skipping FakeIP.",
@@ -1495,7 +1544,7 @@
     "testMatch": "Test match (optional)",
     "testMiss": "No match",
     "testPh": "Enter a domain or IP to test…",
-    "testUntestable": "This rule can't be tested with a domain / IP",
+    "testUntestable": "Cannot determine a match from the available input and data.",
     "yourRegion": "Your region",
     "manualNote": "Manual takeover: point your system or app proxy at the local port — only traffic through that port is matched by these rules",
     "reorderFail": "Failed to save rule order",
@@ -1597,7 +1646,9 @@
       "matchIn": "You're on this network now",
       "matchOut": "Not on this network now",
       "matchUnknown": "Unknown whether you're on this network (proxy not running or still checking)"
-    }
+    },
+    "editConflict": "This rule changed or was deleted. Reopen it before saving.",
+    "syntaxUnavailable": "Cannot validate this pattern now. Check the selected core and retry."
   },
   "sub": {
     "editTitle": "Edit Subscription",
@@ -1685,6 +1736,7 @@
     "createTaskRecoveredHint": "The subscription is added in the background; its progress resumes here after the app restarts."
   },
   "errors": {
+    "dnsDependencyInvalid": "This DNS server or group has invalid references or is still in use. Check DNS rules, defaults, and group references before saving.",
     "iosSessionActive": "A Polaris VPN session is already active in the system. Stop that session in iOS Settings before connecting.",
     "operationFailed": "Operation failed, please try again later",
     "systemDnsTakeoverFailed": "Linux system DNS could not be connected to Polaris. The proxy is still running, but DNS may fail or bypass DNS rules. Check Helper and systemd-resolved, then reconnect.",
@@ -1715,7 +1767,9 @@
     "coreBundleMismatch": "The bundled core does not match this app’s content identity. Reinstall Polaris.",
     "helperCoreAbsent": "This app’s selected core is not installed. Go to Settings › Helper to install it.",
     "helperCoreInvalid": "The installed core failed verification. Go to Settings › Helper to repair it.",
-    "helperCoreOccupied": "The helper is occupied or still finishing its previous core. Disconnect that core in its owning app, then retry. If ownership cannot be confirmed, arrange administrator maintenance."
+    "helperCoreOccupied": "The helper is occupied or still finishing its previous core. Disconnect that core in its owning app, then retry. If ownership cannot be confirmed, arrange administrator maintenance.",
+    "nodeResolverUnsupported": "Selected node DNS resolver is unsupported. Choose an IP-based HTTPS or UDP resolver in Settings > DNS.",
+    "speedTestUrlInvalid": "Speed-test URL is invalid. Correct it in Settings > Network, or clear it to use the default."
   },
   "privacy": {
     "wrongPassword": "Incorrect unlock password",
@@ -1839,11 +1893,11 @@
     }
   },
   "import": {
-    "detBase64": "Detected Base64 content (decoded by the backend on submit)",
+    "detBase64": "Base64 content detected; import will attempt to parse it",
     "detClash": "Detected a Clash config",
     "detLinks": "Detected {{n}} share link(s)",
     "detSub": "This looks like a subscription link",
-    "detUnknown": "Format pending backend parsing",
+    "detUnknown": "Format not yet recognized; import will attempt to parse it",
     "discardMsg": "The pasted content won't be saved.",
     "discardTitle": "Discard this import?",
     "dropHere": "Drop a config file here, or click to choose",
@@ -1896,12 +1950,18 @@
   },
   "node": {
     "utls": {
-      "legacy": "Unset (legacy default)",
-      "default": "Core default fingerprint",
-      "disabled": "Disable uTLS (keep TLS)",
+      "legacy": "Default",
+      "default": "Default",
+      "disabled": "Disable uTLS",
       "loading": "Checking core fingerprint capabilities…",
       "unavailable": "Fingerprint capabilities unavailable: {{reason}}. Existing settings are retained and checked by the core.",
-      "realityRequired": "REALITY requires uTLS. Choose the core default or a supported fingerprint."
+      "realityRequired": "REALITY requires uTLS and cannot disable it. Default uses Chrome; a supported browser fingerprint can also be selected.",
+      "random": "Random",
+      "description": "Default uses Chrome on connections that support uTLS. Disable turns off uTLS while keeping TLS; REALITY cannot disable it. Random selects a browser template once per core process.",
+      "engineUnsupported": "This system TLS engine does not support uTLS. Default will not force it on. To select a browser fingerprint, switch to the Go TLS engine.",
+      "savedCoreDefault": "Saved: core default (choose a browser)",
+      "savedRandomized": "Saved: Randomized (choose a browser)",
+      "savedHint": "This historical setting retains its saved value; the global policy still controls the effective configuration. Select a browser fingerprint and save to replace it. Saved values are not automatically rewritten."
     },
     "add": "Add",
     "addTitle": "Add Node",
@@ -2200,10 +2260,10 @@
     "speedTestBlockedLanOnly": "This mesh node has “Allow internet access” turned off: it only carries LAN subnets, so an internet speed test would always time out",
     "speedTestBlockedStagedOnly": "This node has not been saved to the config file yet: the core does not have it, so latency cannot be measured. Press Save on the bar first.",
     "speedTestBlockedSystem": "This node is bound to a System kernel interface: a speed test would go out via the OS default route and report a fake direct-connection value, so it is not testable",
-    "speedTestBlockedTsCoreNotReady": "Testing a Tailscale exit requires the proxy to be running (main-core probe pool) — connect first, then test",
+    "speedTestBlockedTsCoreNotReady": "Connect the proxy before testing Tailscale exit latency",
     "speedTestBlockedTsNoExit": "Tailscale has no exit node configured: there is no internet egress, so a speed test would always time out",
     "speedTestNoActiveExit": "Current exit is direct or unselected — nothing to test",
-    "speedTestOnlyActive": "Speed-test probe pool unavailable this run (port allocation failed, rolled back) — only the current exit is testable",
+    "speedTestOnlyActive": "Testing other nodes could not start; only the current exit can be tested this time",
     "speedTestSentinelExit": "Current exit is Direct or Block: no node behind it, so there is no latency to measure",
     "speedTestSkipped": "{{count}} node(s) not covered by this test (not in the running core's probe pool — restart the core to include them)",
     "speedTestSkippedTsNotReady": "{{count}} Tailscale node(s) not covered by this test (not logged in yet — sign in, then test)",
@@ -2281,6 +2341,7 @@
     "speedTestCoreUnresponsive": "Speed-test core stopped responding",
     "speedTestCancelled": "Speed test cancelled",
     "speedTestPreempted": "Speed test interrupted by another test",
+    "speedTestNativePending": "Waiting for native HTTP results",
     "speedTestNotApplicable": "Not testable",
     "speedTestInterruptedSummary": "Completed {{tested}}/{{total}} nodes; the rest keep prior values",
     "speedTestResume": "Resume remaining",
@@ -2326,7 +2387,7 @@
     "batchDeleteConfirmMobile": "Delete the {{count}} selected nodes? This cannot be undone."
   },
   "procPick": {
-    "empty": "No process data / backend not wired up",
+    "empty": "No process data is available. Refresh to try again.",
     "error": "Failed to load the process list",
     "hint": "Pick from running processes to quickly add a process rule",
     "loading": "Loading…",
@@ -2342,7 +2403,7 @@
     "clickRefresh": "Click \"Refresh List\" to fetch the resource list",
     "download": "Download",
     "downloaded": "Downloaded",
-    "errUnavailable": "Download backend not wired up yet (requires HTTP download support)",
+    "errUnavailable": "No download result received. Try again.",
     "extBuiltin": "Remote fetch failed — falling back to the built-in curated list",
     "extCache": "Remote fetch failed — using the locally cached list",
     "extFetching": "Fetching…",
@@ -2423,7 +2484,7 @@
     "urlDlgErrUrlEmpty": "Enter a resource URL",
     "urlDlgErrUrlInvalid": "Invalid URL (http/https required)",
     "urlDlgErrNameEmpty": "Enter a name",
-    "urlDlgErrUnavailable": "Download backend not wired yet (HTTP download required)",
+    "urlDlgErrUnavailable": "No download result received. Try again.",
     "urlDlgErrFailed": "Download failed",
     "urlDlgDiscardTitle": "Discard download?",
     "urlDlgDiscardMsg": "The details you entered will not be saved.",
@@ -2766,7 +2827,6 @@
     "trafficChart": "Live traffic",
     "ruleHits": "Rule hits",
     "noSamples": "No samples yet",
-    "axisNow": "now",
     "noNodeSelected": "No node selected",
     "noMatchingNode": "No matching node",
     "checkedJustNow": "Checked just now",
@@ -2794,7 +2854,7 @@
     "sortAsc": "ascending",
     "sortDesc": "descending",
     "sortedBy": "Sorted by {{key}}, {{dir}}",
-    "pauseNote": "Pausing unsubscribes: the whole data path stops rather than the view freezing. Resuming refills on the next frame, about one second.",
+    "pauseNote": "Pausing stops connection data updates. After resuming, the latest data appears in about one second.",
     "pausedNote": "Paused: connection details are unsubscribed and the list is no longer updating.",
     "overview": {
       "hostsTitle": "Top hosts (by connection count)",
@@ -2946,7 +3006,7 @@
     "viewDetails": "View details about {{title}}",
     "nodeDetails": "{{name}} · Node details",
     "speedTest": "Speed test",
-    "stagedNodeDetails": "This node is not saved yet, so it cannot be selected as exit or speed-tested. Save it from the bottom notice bar. When the core is running, saved changes must also be applied before they take effect.",
+    "stagedNodeDetails": "Save this node using the bottom bar before selecting or testing it. If connected, also apply changes.",
     "tsExitTitle": "Tailscale exit",
     "tsExitNeedsAuth": "Authorization is unfinished; internet cannot use Tailscale.",
     "tsExitNoDevice": "No exit device selected; internet still goes direct.",
@@ -3140,172 +3200,61 @@
     "unlockFailed": "Service availability could not be checked. Retry the network check."
   },
   "autoSelect": {
-    "title": "Automatic selection status",
     "refresh": "Refresh status",
-    "loading": "Reading selection status…",
     "loadFailed": "Could not read the status. Refresh to retry.",
-    "unrecognized": "This version does not recognize the saved selection intent; automatic selection is inactive.",
-    "unknown": "This status is not recognized. Refresh or check the app version.",
     "unavailable": "Unavailable",
     "direct": "Direct",
     "block": "Block",
-    "scope": "Subscription: {{subscription}} · Actual exit: {{exit}}",
-    "rate": "Better-node switches in this run’s rate window: {{count}} / {{max}}",
-    "barred": "Temporarily excluded challengers (last reported status)",
-    "barredNode": "{{name}}: exclusion had {{seconds}} seconds remaining in the last status",
-    "stalled": "Selection evaluation has not updated for a while. Check the proxy and periodic tests.",
-    "starved": "Fresh selection data has been unavailable for a while. Check periodic tests.",
-    "mode": {
-      "manual": "Manual selection",
-      "settled": "Automatic selection evaluated",
-      "waitingFirstRound": "Waiting for the first periodic test round",
-      "noCandidates": "No available candidates in the subscription; keeping the actual exit",
-      "noData": "No fresh data for selection",
-      "notEvaluated": "Automatic selection is not being evaluated",
-      "needsRestart": "Switching to the candidate requires a proxy restart; no background switch",
-      "rateLimited": "Better-node switch rate limit reached",
-      "commitFailed": "Switching did not complete"
-    },
-    "reason": {
-      "intentUnrecognized": "The saved selection intent is unsupported",
-      "switchedOff": "Automatic selection is not enabled",
-      "platformNotOpen": "Automatic selection is unavailable on this platform",
-      "coreNotRunning": "The proxy is stopped. Connect it first.",
-      "reconciling": "The actual exit is being reconciled",
-      "configPending": "Configuration changes are pending",
-      "background": "The app is in the background; evaluation is paused",
-      "subscriptionEmpty": "The subscription has no nodes",
-      "measuring": "Waiting for the speed test to finish",
-      "periodicDisabled": "Periodic testing is disabled globally",
-      "meteredPaused": "Metered-network policy paused periodic testing",
-      "powerSave": "Power-saving policy paused periodic testing",
-      "notYetEvaluated": "Intent saved; waiting for the next evaluation",
-      "settled": "No candidate is clearly better than the current exit",
-      "challengerPending": "A better candidate exists; switch conditions are not met yet",
-      "currentFailedOnce": "The current exit failed one test; waiting for confirmation",
-      "cooldown": "The switch cooldown has not ended",
-      "betterLegOff": "Background better-node switching is disabled",
-      "committing": "Submitting the switch; actual exit awaits confirmation",
-      "currentExpired": "The current exit’s test result has expired",
-      "currentUnmeasured": "The current exit has not been tested",
-      "currentSkipped": "The current exit was not included in the latest round",
-      "currentMismatch": "Test readback did not confirm the current exit’s identity",
-      "commitFailed": "The target failed runtime confirmation; the previous exit was restored",
-      "commitNotEligible": "The target was no longer eligible for a hot switch at commit time",
-      "commitReconciling": "Neither exit is confirmed; background reconciliation is in progress",
-      "commitYielded": "The switch yielded to a user action or new configuration",
-      "retryPending": "The previous switch did not complete; waiting for a backend retry",
-      "firstPlacement": "Initial placement in the subscription completed",
-      "better": "Switched to a consistently better candidate",
-      "currentFailed": "Switched after repeated test failures on the current exit",
-      "failover": "Switched after a connectivity failure",
-      "winnerRemoved": "The previous exit was removed; another node in the same subscription was selected",
-      "requested": "Switched at the user’s request"
-    },
-    "lacking": {
-      "streak": "Not enough consecutive rounds outperforming the current exit",
-      "gap": "Not enough time between eligible test rounds",
-      "pair": "The current exit and candidate readings are from different rounds",
-      "dwell": "The minimum dwell time since the last switch has not elapsed",
-      "rateLimit": "Waiting for the switch rate window to free up",
-      "cooldown": "Waiting for the switch cooldown to end"
-    },
-    "choose": "Automatically select within a subscription",
-    "choice": "Auto · {{subscription}}",
-    "choiceHelp": "The automatic intent and actual exit are shown separately. Picking any node returns to manual selection.",
-    "switchNow": "Evaluate switching now",
-    "keepManual": "Keep current exit in manual mode",
-    "intentSaved": "Automatic intent saved; the actual exit awaits backend evaluation.",
+    "choose": "Automatic node selection",
+    "intentSaved": "Auto selection saved; switch not yet confirmed.",
     "manualSaved": "Manual selection saved.",
-    "placementFailed": "Automatic intent saved, but the runtime switch did not complete. Check the actual exit and status.",
-    "selectionChanged": "The selection changed. Use the current actual exit and intent.",
+    "selectionChanged": "Selection changed. Check the connected node.",
     "actionFailed": "Selection failed. Check the current status and retry.",
-    "details": "Evaluation details for this run",
-    "basis": "Current exit basis: {{state}} · {{latency}} · {{binding}} · {{at}}",
-    "lastSwitch": "Last switch: {{from}} → {{to}} · {{reason}} · {{at}}",
-    "lastEvaluation": "Last evaluation: {{at}} · {{reason}}",
-    "counts": "Selectable {{selectable}} · Failed {{failed}} · Stale {{stale}} · Untested {{unmeasured}} · Skipped {{skipped}} · Unverified {{unverified}} · Restart required {{needsRestart}}",
-    "challenger": "Candidate {{name}} · Consecutive wins {{wins}} / {{required}} rounds",
-    "commit": "Consecutive commit failures {{count}} · Retry interval {{seconds}} seconds (last status)",
-    "lastFailure": "Last incomplete switch: {{name}} · {{reason}} · {{at}}",
-    "noDataAge": "No selection data for {{seconds}} seconds (last status)",
-    "outside": "The actual exit is outside the automatic subscription.",
-    "outsideOverdue": "The actual exit has remained outside the subscription for a while. Check candidates and tests.",
-    "unverified": "This evidence is not confirmed by runtime readback.",
-    "allUnverified": "No selectable candidate is confirmed by runtime readback.",
-    "switchCounts": "Since this run started: failover switches {{failover}} · automatic selections {{select}}",
-    "dataSource": "Periodic test pause: {{blocked}} · Last skip: {{skip}}",
-    "none": "None",
-    "barStrikes": "Switched away after failures {{count}} times in this context; repeated failures extend exclusion.",
     "error": {
       "AUTO_SELECT_SWITCHED_OFF": "Automatic selection is disabled.",
       "AUTO_SELECT_PLATFORM_NOT_OPEN": "Automatic selection is unavailable on this platform.",
       "AUTO_SELECT_SUBSCRIPTION_NOT_FOUND": "The subscription no longer exists. Refresh nodes.",
-      "AUTO_SELECT_SUBSCRIPTION_EMPTY": "The subscription has no nodes.",
-      "AUTO_SELECT_NOT_AUTO": "Selection is manual. Choose an automatic subscription first.",
+      "AUTO_SELECT_SUBSCRIPTION_EMPTY": "The group has no nodes.",
+      "AUTO_SELECT_NOT_AUTO": "Selection is manual. Choose an automatic group first.",
       "AUTO_SELECT_NO_TARGET": "No candidate currently meets the switch conditions; keeping the actual exit.",
       "AUTO_SELECT_SWITCH_FAILED": "Switching did not complete. Check the actual exit and selection status.",
-      "AUTO_SELECT_READBACK_FAILED": "Could not synchronize saved configuration after the operation; its result is unconfirmed. Refresh to check."
+      "AUTO_SELECT_READBACK_FAILED": "Could not synchronize saved configuration after the operation; its result is unconfirmed. Refresh to check.",
+      "AUTO_SELECT_NO_ACTUAL_EXIT": "The connected node is not confirmed yet. Refresh status and retry.",
+      "AUTO_SELECT_SCOPE_EMPTY": "No eligible exit node in this scope.",
+      "AUTO_SELECT_INVALID_SCOPE": "Invalid automatic selection scope. Choose again.",
+      "SERVER_SWITCH_READBACK_FAILED": "Could not refresh node state after the action. Refresh to confirm before switching again.",
+      "AUTO_SELECT_BUSY": "Another selection is in progress",
+      "AUTO_SELECT_INVALID_CONFIG": "Auto group configuration is invalid",
+      "AUTO_SELECT_REQUIRES_APPLY": "Apply pending changes first"
     },
     "receipt": {
       "applied": "Switched to {{name}}",
-      "pending": "{{name}} saved; awaiting runtime confirmation.",
+      "pending": "Saved {{name}}; connection to this node is not yet confirmed.",
       "restarting": "{{name}} saved; the proxy is restarting.",
       "notRunning": "{{name}} saved for the next connection.",
       "deferred": "{{name}} saved; apply the configuration to activate it."
     },
-    "basisState": {
-      "fresh": "Fresh",
-      "failed": "Failed",
-      "expired": "Expired",
-      "unmeasured": "Untested",
-      "skipped": "Skipped",
-      "mismatch": "Identity mismatch"
-    },
-    "binding": {
-      "confirmed": "Confirmed",
-      "unverified": "Unverified"
-    },
     "event": {
-      "firstPlacement": "{{name}} · Initial placement in the subscription completed",
+      "firstPlacement": "{{name}} · First node selected from this group",
       "better": "{{name}} · Switched to a consistently better candidate",
       "currentFailed": "{{name}} · Switched after repeated test failures on the current exit",
       "failover": "{{name}} · Switched after a connectivity failure",
-      "winnerRemoved": "{{name}} · The previous exit was removed; another node in the same subscription was selected",
+      "winnerRemoved": "{{name}} · The previous exit was removed; another node in the same scope was selected",
       "requested": "{{name}} · Switched at the user’s request",
       "unknown": "Actual exit changed to {{name}}"
     },
-    "dataReason": {
-      "switchedOff": "Periodic testing is disabled in this build",
-      "userDisabled": "Periodic testing is disabled globally",
-      "platformNotEnabled": "Periodic testing is unavailable on this platform",
-      "coreNotRunning": "The proxy is stopped",
-      "noSubscription": "No subscription has periodic testing enabled",
-      "background": "The app is in the background",
-      "metered": "Metered-network policy paused testing",
-      "powerSave": "Power-saving policy paused testing",
-      "gateBusy": "The test channel is busy",
-      "preempted": "This round yielded to another test",
-      "budget": "This round exceeded its time budget",
-      "frozen": "A configuration transaction temporarily froze testing",
-      "poolUnavailable": "The candidate measurement pool is unavailable",
-      "nothingTestable": "No node was testable in this round",
-      "noTargets": "There are no targets to test in this round",
-      "crashed": "This round ended unexpectedly without a receipt"
+    "auto": "Auto",
+    "pendingNode": "Waiting for a confirmed node",
+    "scopeLabels": {
+      "global": "All",
+      "manual": "Manual Nodes",
+      "mesh": "Mesh"
     },
-    "cause": {
-      "firstPlacement": "Initial placement in the subscription",
-      "better": "A consistently better candidate",
-      "currentFailed": "Repeated test failure on the current exit",
-      "failover": "Connectivity failure",
-      "winnerRemoved": "Previous exit removed from the subscription",
-      "requested": "User-requested switch evaluation"
-    },
-    "outcome": {
-      "held": "This evaluation held the exit",
-      "switch": "This evaluation chose to switch; use the actual exit for the runtime result",
-      "notEvaluated": "Not evaluated this time"
-    }
+    "featureOn": "Automatic selection enabled",
+    "featureOff": "Automatic selection disabled",
+    "fixedCurrent": "Current nodes pinned",
+    "fixCurrentHint": "Pin each Auto group to its current node",
+    "tcpNode": "TCP node"
   },
   "measurement": {
     "unavailable": "Results temporarily unavailable",
@@ -3321,6 +3270,27 @@
     "nodePath": "Node measurement",
     "bindingMismatch": "Carrier differs from requested node",
     "iosTitle": "Measure using VPN",
-    "iosWillStart": "This measurement uses the normal VPN connection. If disconnected, it will start the VPN and keep it connected."
+    "iosWillStart": "This measurement uses the normal VPN connection. If disconnected, it will start the VPN and keep it connected.",
+    "nativeHttp": "Native HTTP"
+  },
+  "identityRepair": {
+    "title": "Resolve duplicate node IDs",
+    "explanation": "Choose one node in every group to keep the original ID. Existing rules and selection references will continue to point to that node. The other nodes get new IDs; no nodes are merged or deleted. Saving does not connect or apply other pending changes.",
+    "group": "Conflict group {{count}}",
+    "record": "Record {{index}}:",
+    "confirmReferences": "I understand that existing references will stay with the nodes I selected.",
+    "save": "Confirm and save new IDs",
+    "reload": "Reload conflict list",
+    "review": "Review duplicate IDs",
+    "ambiguous": "Duplicate node IDs prevent switching. Open Nodes and review the identity conflicts.",
+    "none": "No duplicate node IDs remain.",
+    "stale": "The configuration changed. Reload the list and choose again; nothing was retried.",
+    "unsupported": "This group or configuration cannot be repaired here. Tailscale-related records require separate identity recovery. No changes were made.",
+    "invalidChoice": "The choices are incomplete or no longer valid. Reload the list and choose again.",
+    "failed": "The save could not be confirmed. Reload the list before trying again.",
+    "loadFailed": "Could not load the conflict list. Try reloading.",
+    "saved": "New IDs saved. No connection was started.",
+    "savedPending": "New IDs saved. The running connection is unchanged; review and apply pending changes when ready.",
+    "savedRefreshFailed": "New IDs were saved, but the refreshed configuration could not be loaded. Reopen Nodes before making another change."
   }
 }

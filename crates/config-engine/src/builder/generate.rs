@@ -329,14 +329,19 @@ fn generate_base_config(
     deps: &GenerateConfigDeps,
     runtime_bind_interfaces: &BTreeMap<String, String>,
 ) -> Result<GenerateOutcome, String> {
+    crate::user_config::dns_policy::validate_dns_dependencies(config)?;
+    crate::node_dns::upstream::validate_selected_upstreams(config.dns_config.as_ref())?;
+    crate::user_config::auto_select::validate_test_url(config.speed_test_url.as_deref())
+        .map_err(str::to_owned)?;
     let cfg = config.clone();
 
     // ── 2. selectedServer 校验（L3475-3487）─────────────────────────────────────
     // direct / block 哨兵都不是节点 id：其出口由 proxy-selector 的 default 直接接到内置出站
     // （`direct` / `block`），没有节点承载 ⇒ 必须豁免存在性与可用性校验，否则 0 节点或纯哨兵
     // 配置会在这里报 "Selected server not found" 而**根本起不了核**。
-    let is_sentinel = is_sentinel_selection(config.selected_server_id.as_deref());
-    let selected_server = if is_sentinel {
+    let is_sentinel = is_sentinel_selection(config.effective_selected_server_id());
+    let is_auto = config.selection_intent.is_some();
+    let selected_server = if is_sentinel || is_auto {
         None
     } else {
         config
@@ -344,7 +349,7 @@ fn generate_base_config(
             .iter()
             .find(|s| Some(s.id.as_str()) == config.selected_server_id.as_deref())
     };
-    if !is_sentinel {
+    if !is_sentinel && !is_auto {
         let server = selected_server.ok_or_else(|| "Selected server not found".to_string())?;
         if !is_node_usable(server, deps.has_cronet) {
             return Err(naive_unavailable_reason(
@@ -462,6 +467,51 @@ fn generate_base_config(
         netenv_dhcp_suppressed: deps.netenv_dhcp_suppressed,
     };
     let mut dns = build_dns_config(&cfg, &id_to_tag_map, &dns_deps);
+    // The configuration graph can be valid while platform gates remove a node used
+    // by a DNS transport. Validate actual emitted dependencies before any missing
+    // policy action can disappear into the domestic default.
+    let dns_tags: std::collections::BTreeSet<&str> = dns
+        .servers
+        .iter()
+        .map(|server| server.tag.as_str())
+        .collect();
+    let outbound_tags: std::collections::BTreeSet<&str> = outbounds_result
+        .outbounds
+        .iter()
+        .map(|outbound| outbound.tag.as_str())
+        .chain(
+            pending_endpoints
+                .iter()
+                .map(|endpoint| endpoint.tag.as_str()),
+        )
+        .collect();
+    for resource in cfg.dns_servers.iter().filter(|resource| resource.enabled) {
+        if !dns_tags.contains(crate::user_config::dns_server_tag(&resource.id).as_str()) {
+            return Err(format!(
+                "DNS 解析器「{}」无法生成，请检查端点和出口依赖",
+                resource.id
+            ));
+        }
+    }
+    for server in &dns.servers {
+        if let Some(resolver) = &server.domain_resolver {
+            if !dns_tags.contains(resolver.as_str()) {
+                return Err(format!(
+                    "DNS 解析器「{}」引用的 Bootstrap「{resolver}」未生成",
+                    server.tag
+                ));
+            }
+        }
+        if let Some(detour) = &server.detour {
+            if !outbound_tags.contains(detour.as_str()) {
+                return Err(format!(
+                    "DNS 解析器「{}」引用的出口「{detour}」不可用",
+                    server.tag
+                ));
+            }
+        }
+    }
+
     // 网络场景环境项按**已生成的** DNS server 预解析（第一道防线：只引用类型合格、确实生成了的 tag）。
     // DNS builder 内部以同一函数、同一 server 集自建一份，二者同源。
     let network_env = NetworkEnv::new(

@@ -10,12 +10,18 @@ export function projectMeasurement(
   purpose: 'candidate' | 'current' = 'candidate',
 ): MeasurementProjection {
   const rows: MeasurementRows | undefined = Object.prototype.hasOwnProperty.call(snapshot.rows, server.id) ? snapshot.rows[server.id] : undefined;
-  const record: MeasurementRecord | undefined = purpose === 'candidate' ? rows?.candidate
-    : [rows?.candidate, rows?.system, rows?.selected].filter((value): value is MeasurementRecord => value !== undefined)
-      .sort((a, b) => BigInt(a.identity.run) < BigInt(b.identity.run) ? 1 : BigInt(a.identity.run) > BigInt(b.identity.run) ? -1 : b.identity.seq - a.identity.seq)[0];
+  // App runs have their own ordering. Select their latest record first, then
+  // compare original sample timestamps across engines (never mixed sort keys).
+  const appRecord = [rows?.candidate, rows?.system, rows?.selected]
+    .filter((value): value is MeasurementRecord => value !== undefined)
+    .sort((a, b) => BigInt(a.identity.run) < BigInt(b.identity.run) ? 1
+      : BigInt(a.identity.run) > BigInt(b.identity.run) ? -1 : b.identity.seq - a.identity.seq)[0];
+  const record: MeasurementRecord | undefined = purpose === 'candidate' ? rows?.nativeHttp ?? rows?.candidate
+    : rows?.nativeHttp && (!appRecord || rows.nativeHttp.identity.measuredAt >= appRecord.identity.measuredAt)
+      ? rows.nativeHttp : appRecord;
   // A prefilter omission is not a failed measurement and must not reuse an old green value.
-  if (purpose === 'candidate' && rows?.notIncluded) return { state: 'unmeasured', notIncluded: rows.notIncluded };
-  const paused = purpose === 'candidate' && !!server.subscriptionId
+  if (purpose === 'candidate' && !rows?.nativeHttp && rows?.notIncluded) return { state: 'unmeasured', notIncluded: rows.notIncluded };
+  const paused = purpose === 'candidate' && !rows?.nativeHttp && !!server.subscriptionId
     && snapshot.schedule.state === 'paused'
     && Object.prototype.hasOwnProperty.call(snapshot.schedule.subscriptions ?? {}, server.subscriptionId);
   if (paused) return { state: 'paused', reason: snapshot.schedule.reason, measuredAt: record?.identity.measuredAt };
@@ -37,6 +43,7 @@ export function measurementText(
     ? `${result.latency} ms` : t(`measurement.${result.state}`);
   const notes = [result.notIncluded && t('measurement.notIncluded'),
     result.disconnected && t('measurement.disconnected'),
+    result.purpose === 'nativeHttp' && t('measurement.nativeHttp'),
     result.purpose === 'system' && t('measurement.systemPath'),
     result.purpose === 'selected' && t('measurement.selectedPath'),
     result.bindingMismatch && t('measurement.bindingMismatch')].filter(Boolean);

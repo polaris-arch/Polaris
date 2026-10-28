@@ -1,3 +1,5 @@
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
+import { autoSelectTarget } from '@/domain/auto-select-target';
 import { MeasurementLabel } from '@/mobile/MeasurementLabel';
 /**
  * NodeMenu —— 首页出口节点内联选单（1:1 提取自原型 polaris-prototype.html #node-menu，
@@ -174,7 +176,6 @@ export function NodeMenu({
 
   return (
     <div className="node-menu" id="node-menu" role="listbox" aria-label={t('home.nodesMenu')}>
-      {autoSelectControls}
       <div className="nm-search" hidden={totalCount < 8}>
         <input
           className="input"
@@ -230,6 +231,7 @@ export function NodeMenu({
         {blockOn && <MiCheck />}
       </button>
       <div className="mm-sep" />
+      {autoSelectControls ?? <SavedAutoSelectControls t={t} />}
 
       {filteredGroups.map((g) => {
         const isOpen = searching || openGroups.has(g.id);
@@ -266,6 +268,7 @@ export function NodeMenu({
                 其余全是用户看不见也点不到的节点行。
                 检索真值不受影响：`isOpen` 上面那条 `searching ||` 强制搜索态全组展开，
                 「全部测速」读的是 `filteredGroups` 数据而不是 DOM（见 `.nm-foot`）。 */}
+            {isOpen && <SavedAutoSelectControls t={t} target={autoSelectTarget(g)} />}
             {isOpen && items.map((s) => {
               const lat = latencies[s.id];
               const on = !directOn && s.id === selectedServerId;

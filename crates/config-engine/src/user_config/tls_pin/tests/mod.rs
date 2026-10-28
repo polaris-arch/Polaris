@@ -17,7 +17,7 @@ fn colon(hex: &str) -> String {
 
 #[test]
 fn hex_colon_hex_and_base64_all_land_on_the_same_kernel_form() {
-    let want = Some(vec![X_B64.to_string()]);
+    let want = Ok(Some(vec![X_B64.to_string()]));
     assert_eq!(cert_pins_for_kernel(Some(X_HEX)), want, "裸 hex");
     assert_eq!(
         cert_pins_for_kernel(Some(&X_HEX.to_ascii_uppercase())),
@@ -43,34 +43,37 @@ fn hex_colon_hex_and_base64_all_land_on_the_same_kernel_form() {
 }
 
 #[test]
-fn comma_list_keeps_order_and_drops_only_the_bad_items() {
+fn comma_list_rejects_any_malformed_security_constraint() {
     assert_eq!(
         cert_pins_for_kernel(Some(&format!("{X_HEX}, chrome ,{EMPTY_HEX},"))),
-        Some(vec![X_B64.to_string(), EMPTY_B64.to_string()])
+        Err("TLS_PIN_INVALID")
     );
 }
 
 #[test]
 fn illegal_inputs_never_reach_the_kernel() {
     for bad in [
-        "",
-        "   ",
-        "chrome",                       // mihomo 把浏览器名误填进 fingerprint 的老配置
-        &X_HEX[..62],                   // 少一个字节
-        &format!("{X_HEX}00"),          // 多一个字节
-        &format!("{}zz", &X_HEX[..62]), // 非 hex 字符
-        "AAAA",                         // 合法 base64 但只有 3 字节 —— 内核 check 照收，本门必须拒
-        &X_B64.replace('=', ""),        // 无填充
+        "chrome",                                   // mihomo 把浏览器名误填进 fingerprint 的老配置
+        &X_HEX[..62],                               // 少一个字节
+        &format!("{X_HEX}00"),                      // 多一个字节
+        &format!("{}zz", &X_HEX[..62]),             // 非 hex 字符
+        "AAAA",                  // 合法 base64 但只有 3 字节 —— 内核 check 照收，本门必须拒
+        &X_B64.replace('=', ""), // 无填充
         &X_B64.replace('+', "-").replace('/', "_"), // url-safe
         "AA==",
     ] {
         assert_eq!(
             cert_pins_for_kernel(Some(bad)),
-            None,
-            "{bad:?} 不应产生任何 pin"
+            Err("TLS_PIN_INVALID"),
+            "{bad:?} must reject rather than remove pins"
         );
     }
-    assert_eq!(cert_pins_for_kernel(None), None);
+    assert_eq!(cert_pins_for_kernel(None), Ok(None));
+    assert_eq!(cert_pins_for_kernel(Some("  ")), Ok(None));
+    assert_eq!(
+        cert_pins_for_kernel(Some(&format!("{X_HEX},{EMPTY_HEX}"))),
+        Ok(Some(vec![X_B64.into(), EMPTY_B64.into()]))
+    );
 }
 
 #[test]
@@ -157,4 +160,60 @@ fn drop_unemitted_cert_pins_only_touches_reality_and_naive() {
             .as_deref(),
         Some(X_HEX)
     );
+}
+
+#[test]
+fn modeled_pin_policy_matches_protocol_emission_and_import_warning() {
+    use crate::user_config::protocol_settings::TlsSettings;
+    use crate::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
+    for (protocol, security, emitted) in [
+        (Protocol::Trojan, None, true),
+        (Protocol::Vless, Some(SecurityMode::Reality), false),
+        (Protocol::Naive, None, false),
+        (Protocol::Tor, None, false),
+        (Protocol::Tailcat, None, false),
+        (Protocol::Ssh, None, false),
+        (Protocol::Custom, None, false),
+        (Protocol::Wireguard, None, false),
+        (Protocol::Tailscale, None, false),
+        (Protocol::Openconnect, None, false),
+        (Protocol::OpenvpnClient, None, false),
+        (Protocol::MasqueClient, Some(SecurityMode::Reality), true),
+    ] {
+        for pin in [None, Some(X_HEX), Some("invalid-pin")] {
+            let mut server = ServerConfig {
+                protocol,
+                security: security.clone(),
+                tls_settings: Some(TlsSettings {
+                    certificate_sha256: pin.map(str::to_owned),
+                    certificate_public_key_sha256: pin.map(str::to_owned),
+                    allow_insecure: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                modeled_cert_pins_are_emitted(protocol, security.as_ref()),
+                emitted
+            );
+            assert_eq!(
+                validate_server_cert_pins(&server).is_err(),
+                emitted && pin == Some("invalid-pin")
+            );
+            assert_eq!(
+                cert_pin_import_warning(&[server.clone()]).is_some(),
+                emitted && pin.is_some()
+            );
+            drop_unemitted_cert_pins(std::slice::from_mut(&mut server));
+            assert_eq!(
+                server
+                    .tls_settings
+                    .as_ref()
+                    .unwrap()
+                    .certificate_sha256
+                    .is_some(),
+                emitted && pin.is_some()
+            );
+        }
+    }
 }

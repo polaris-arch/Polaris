@@ -145,7 +145,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
   // `Primitives.tsx` 是这一屏的原语库（Button / Switch / Card / SetRow …）：它声明的组件不是
   // 「数据块」。豁免是挣来的 —— ⓪ 组要求它在本屏 desktopDirs 里、且自己一句 `t('…')` 都不渲染。
   primitiveModules: ['ui/src/components/screens/settings/Primitives.tsx'],
-  extraBlockSources: [],
+  extraBlockSources: ['ui/src/mobile/SavedAutoSelectControls.tsx'],
   sharedPrimitives: [
     'ui/src/components/Fold.tsx',
     'ui/src/components/Icons.tsx',
@@ -168,6 +168,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
      * 终端环境变量的两颗复制与 `proxy.clear` 就是从这条缝漏掉的（2026-09-06 复审 major）。
      */
 
+    { id: 'AppUpdateCard.tsx|k:mobileSettings.update.openReleases', disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/settings/UpdatePage.tsx', mustContain: 'openReleases' } }, note: 'Manual release-page navigation is available in both update surfaces.' },
     /* ── 应用更新卡（整卡的处置见 blocks 面 AppUpdateCard 一条）──────────────── */
     {
       id: 'AppUpdateCard.tsx|k:settings.about.checkUpdate',
@@ -186,7 +187,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '「移动端更新页只有一行说明」在接线那天就已经为假。',
     },
     {
-      id: 'AppUpdateCard.tsx|k:settings.update.portableClearAndCheck',
+      id: 'AppUpdateCard.tsx|f:discardPortableAndCheck',
       disposition: {
         kind: 'platform-absent',
         // 与同一张卡上的「退出并打开文件夹」同锚：这张卡只在后端回 Windows 便携形态那条告知时才出现。
@@ -554,6 +555,11 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
         '上一版这里写着「移动端整个隐私锁没有运行时」——那句话现在是假的。',
     },
     {
+      id: 'SettingsGeneral.tsx|k:common.retry',
+      disposition: { kind: 'reachable-elsewhere', mobile: { file: 'ui/src/mobile/settings/GeneralPage.tsx', mustContain: 'autoStartApi.getStatus().then(setAutoStart)' } },
+      note: '桌面自启状态读取失败可原位重试；移动端重新进入通用页会重新读取执行侧状态，失败由该行明确显示。',
+    },
+    {
       id: 'SettingsGeneral.tsx|k:common.save',
       disposition: {
         kind: 'ported',
@@ -571,6 +577,16 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
     },
 
     /* ── 提权助手页（移动端没有 helper 进程这个对象）───────────────────────── */
+    {
+      id: 'SettingsHelper.tsx|k:helper.stopAndUpgradeAction',
+      disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
+      note: '仅 macOS 在普通升级被安全延后后提供的显式迁移：复用确认弹窗说明会停止助手及其全部会话，再请求管理员授权。移动端没有该提权助手或其服务迁移。',
+    },
+    {
+      id: 'SettingsHelper.tsx|k:helper.viewLogsAction',
+      disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
+      note: '助手安装失败面中的查看日志入口；移动端没有助手安装失败这一状态。通用日志屏另有移动端入口。',
+    },
     {
       id: 'SettingsHelper.tsx|k:helper.installAction',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
@@ -606,6 +622,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
       note: '重新检测的第三个渲染位（另一档状态下出现）。同上，同一条腿。',
     },
+
     {
       id: 'SettingsHelper.tsx|k:helper.btmCopyPath',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
@@ -872,6 +889,7 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
   ],
 
   blocks: [
+    { id: 'SavedAutoSelectControls', disposition: { kind: 'ported', mobile: { file: 'ui/src/mobile/settings/NetworkPage.tsx', mustContain: '<SavedAutoSelectControls' } }, note: 'Shared automatic-selection feature switch; both settings surfaces read and commit through the same current-config action owner.' },
     /* ── 九张子页：与 `MobileSettings.test.tsx ①` 同一份真值源，本门另有正面断言把交接钉死 ── */
     {
       id: 'SettingsGeneral',

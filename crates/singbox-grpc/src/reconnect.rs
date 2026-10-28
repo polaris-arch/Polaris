@@ -69,13 +69,16 @@ trait Reconnect<T>: Send + Sync + 'static {
 
 /// 注入 Bearer metadata（h2c per-call auth，对齐 Polaris authMetadata）。secret 空则免认证。
 /// 非法 metadata 字节必须失败关闭，不能 panic，也不能省略认证头后继续连接。
-fn auth_request<R>(secret: &Option<String>, req: R) -> Result<tonic::Request<R>, String> {
+pub(crate) fn auth_request<R>(
+    secret: &Option<String>,
+    req: R,
+) -> Result<tonic::Request<R>, String> {
     let mut req = tonic::Request::new(req);
     if let Some(s) = secret {
         let val = format!("Bearer {s}");
-        let metadata = val.parse().map_err(|error| {
-            format!("管理 API secret 不能编码为 authorization metadata: {error}")
-        })?;
+        let metadata = val
+            .parse()
+            .map_err(|_| "管理 API secret 不能编码为 authorization metadata".to_owned())?;
         req.metadata_mut().insert("authorization", metadata);
     }
     Ok(req)
@@ -126,7 +129,8 @@ impl Reconnect<daemon::ConnectionEvents> for ConnectionsReconnect {
             let channel = h2c::connect_h2c(&target)
                 .await
                 .map_err(|e| format!("h2c connect: {e}"))?;
-            let mut client = StartedServiceClient::new(channel);
+            let mut client = StartedServiceClient::new(channel)
+                .max_decoding_message_size(crate::CONNECTION_EVENTS_MAX_FRAME_BYTES);
             let req = auth_request(
                 &secret,
                 daemon::SubscribeConnectionsRequest {
@@ -290,6 +294,45 @@ impl Reconnect<daemon::Log> for LogReconnect {
     }
 }
 
+/// Group choices and native HTTP histories use the already available core stream.
+struct GroupsReconnect;
+impl Reconnect<daemon::Groups> for GroupsReconnect {
+    fn open(
+        &self,
+        target: String,
+        secret: Option<String>,
+        _interval_ns: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<Streaming<daemon::Groups>, String>> + Send>> {
+        Box::pin(async move {
+            let channel = h2c::connect_h2c(&target)
+                .await
+                .map_err(|e| format!("h2c connect: {e}"))?;
+            let mut client = StartedServiceClient::new(channel);
+            client
+                .subscribe_groups(auth_request(&secret, daemon::Empty {})?)
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|e| format!("SubscribeGroups: {e}"))
+        })
+    }
+}
+
+pub(crate) fn subscribe_groups(
+    target: String,
+    secret: Option<String>,
+    cfg: ReconnectConfig,
+) -> ReconnectingStream<daemon::Groups> {
+    ReconnectingStream {
+        target,
+        secret,
+        interval_ns: 0,
+        cfg,
+        connector: Box::new(GroupsReconnect),
+        state: State::Initial,
+        subscription_reset: false,
+    }
+}
+
 /// 构造 Status 流（带自动重连）。target = `host:port`（h2c 内部加 http://）。
 pub(crate) fn subscribe_status(
     target: String,
@@ -380,6 +423,7 @@ pub struct ReconnectingStream<T> {
     cfg: ReconnectConfig,
     connector: Box<dyn Reconnect<T>>,
     state: State<T>,
+    subscription_reset: bool,
 }
 
 impl ReconnectingStream<daemon::Status> {
@@ -396,6 +440,7 @@ impl ReconnectingStream<daemon::Status> {
             cfg,
             connector: Box::new(StatusReconnect),
             state: State::Initial,
+            subscription_reset: false,
         }
     }
 }
@@ -414,6 +459,7 @@ impl ReconnectingStream<daemon::ConnectionEvents> {
             cfg,
             connector: Box::new(ConnectionsReconnect),
             state: State::Initial,
+            subscription_reset: false,
         }
     }
 }
@@ -432,6 +478,7 @@ impl ReconnectingStream<daemon::TailscaleStatusUpdate> {
             cfg,
             connector: Box::new(TailscaleStatusReconnect),
             state: State::Initial,
+            subscription_reset: false,
         }
     }
 }
@@ -449,6 +496,7 @@ impl ReconnectingStream<daemon::OpenConnectStatusUpdate> {
             cfg,
             connector: Box::new(OpenConnectStatusReconnect),
             state: State::Initial,
+            subscription_reset: false,
         }
     }
 }
@@ -466,6 +514,7 @@ impl ReconnectingStream<daemon::OpenVpnStatusUpdate> {
             cfg,
             connector: Box::new(OpenVpnStatusReconnect),
             state: State::Initial,
+            subscription_reset: false,
         }
     }
 }
@@ -485,6 +534,7 @@ impl ReconnectingStream<daemon::TaildropInbox> {
             cfg,
             connector: Box::new(TaildropInboxReconnect { endpoint_tag }),
             state: State::Initial,
+            subscription_reset: false,
         }
     }
 }
@@ -499,6 +549,7 @@ impl ReconnectingStream<daemon::Log> {
             cfg,
             connector: Box::new(LogReconnect),
             state: State::Initial,
+            subscription_reset: false,
         }
     }
 }
@@ -516,6 +567,13 @@ where
     /// 存于本结构体、不在返回的 future 里，`select!`/`timeout` 丢弃它只是停轮询，下次 `recv` 续上。
     pub async fn recv(&mut self) -> Option<T> {
         self.next().await
+    }
+
+    /// The first delivered frame of each successful subscription carries a reset.
+    /// The flag lives in the stream, so cancelling a pending receive cannot lose it.
+    pub async fn recv_with_reset(&mut self) -> Option<(T, bool)> {
+        let frame = self.next().await?;
+        Some((frame, std::mem::take(&mut self.subscription_reset)))
     }
 }
 
@@ -541,6 +599,7 @@ where
                 State::Connecting(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(streaming)) => {
                         debug!("gRPC 流已连上：{}", this.target);
+                        this.subscription_reset = true;
                         this.state = State::Streaming(Box::new(streaming));
                     }
                     Poll::Ready(Err(e)) => {

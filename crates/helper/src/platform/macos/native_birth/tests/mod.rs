@@ -490,3 +490,37 @@ fn upgrade_admission_closes_only_empty_custody_and_can_be_cancelled() {
     assert!(!custody.is_current(&birth));
     assert!(custody.upgrade_admission(true));
 }
+
+#[test]
+fn upgrade_closed_startup_blocks_all_admission_until_explicit_release() {
+    let custody = NativeCustody::with_upgrade_closed(true);
+    let id = polaris_helper_proto::core_manifest::CoreId::parse(&"a".repeat(64)).unwrap();
+    assert!(custody.active());
+    for uid in [0, 1000, 1001] {
+        assert!(!custody.caller_allowed(Some(uid), Some(&id)));
+        assert_eq!(
+            custody.admit_pinned(uid, &id),
+            Err(NativeBirthStart::NotAdmittedUnknown { target: None })
+        );
+    }
+    assert_eq!(
+        custody.admit(),
+        Err(NativeBirthStart::NotAdmittedUnknown { target: None })
+    );
+    custody.abort_start();
+    assert!(
+        custody.admit().is_err(),
+        "aborting a start must not release the upgrade fence"
+    );
+    assert!(custody.upgrade_admission(false));
+    assert!(!custody.active());
+    assert!(custody.caller_allowed(Some(1000), Some(&id)));
+    assert_eq!(custody.admit_pinned(1000, &id), Ok(()));
+}
+
+#[test]
+fn ordinary_startup_keeps_admission_open() {
+    let custody = NativeCustody::with_upgrade_closed(false);
+    assert!(!custody.active());
+    assert_eq!(custody.admit(), Ok(()));
+}

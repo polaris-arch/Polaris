@@ -146,6 +146,14 @@ pub fn should_emit_tls_engine(engine: Option<&str>, platform: &str) -> bool {
     }
 }
 
+/// Fragmentation is implemented by the Go stream TLS client, not native engines
+/// or protocol-managed TLS. Reused by explicit settings and global overlays.
+pub fn supports_tls_fragment(protocol: &str, engine: Option<&str>) -> bool {
+    !is_quic_managed_tls(protocol)
+        && protocol != "naive"
+        && !matches!(engine, Some("apple" | "windows"))
+}
+
 /// selector default 被剔除后的兜底。上游 `prunedSelectorDefault`。
 pub fn pruned_selector_default(tag: Option<&str>, remaining: &[String]) -> Option<String> {
     match tag {

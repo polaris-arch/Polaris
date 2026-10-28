@@ -1,3 +1,4 @@
+import { configuredExitId } from '@/domain/actual-exit';
 /**
  * 首页「只走内网的组网节点·隧道健康」行内注脚。判定单一真值 = `deriveMeshTunnelHealth`，
  * `'none'` / `'unprobeable'` → 渲染 null（后者是核跑着就恒亮的静态事实，不是运行期信号，
@@ -37,7 +38,7 @@ const TEXT_KEY: Record<Exclude<Health, 'none' | 'unprobeable'>, string> = {
 export function MeshTunnelHealth() {
   const { t } = useTranslation();
   const servers = useAppStore((s) => s.servers);
-  const selectedServerId = useAppStore((s) => s.selectedServerId);
+  const selectedServerId = useAppStore((s) => configuredExitId(s.proxyStatus, s.config));
   const proxyRunning = useAppStore((s) => !!s.proxyStatus?.running);
 
   const selectedServer = servers.find((x) => x.id === selectedServerId);

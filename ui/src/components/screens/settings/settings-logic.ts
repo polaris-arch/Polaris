@@ -514,6 +514,7 @@ export function formMismatchKey(handedToSystem: boolean | undefined): string {
 }
 
 export function installFailureKey(code: string | undefined): string {
+  if (code === 'updateTrustRequired') return 'settings.update.updateTrustRequired';
   return code === 'installRestartRequired'
     ? 'settings.update.installRestartRequired'
     : 'settings.update.downloadInterrupted';
@@ -738,7 +739,7 @@ export function updateCardPatch(p: UpdateProgress): UpdateCardPatch | null {
 // 「`null` ≠ idle 帧」，那正是回读腿与事件腿唯一的语义差别。
 interface UpdateProgressWiring {
   /** 订阅 `update:progress`，返回退订闭包。 */
-  subscribe: (onFrame: (p: UpdateProgress) => void) => () => void;
+  subscribe: (onFrame: (p: UpdateProgress) => void) => (() => void) | Promise<() => void>;
   /** 回读后端最后一帧；`null` = 后端一帧都没发过（**不是** idle 帧，见后端 `update_get_progress`）。 */
   readSnapshot: () => Promise<UpdateProgress | null>;
   /** 本帧要求把摘要校验结论清回 `unknown`；判据是 [`progressResetsIntegrity`]。 */
@@ -773,25 +774,32 @@ interface UpdateProgressWiring {
  * 「帧 → 卡片」映射，两份必然漂，而漂出来的形态恰恰是「同一次下载在两条路上显示成两个样子」。
  */
 export function wireUpdateProgress(w: UpdateProgressWiring): () => void {
+  let disposed = false;
+  let off: (() => void) | null = null;
+  let sawEvent = false;
   const applyFrame = (p: UpdateProgress): void => {
+    if (disposed) return;
     if (progressResetsIntegrity(p.status)) w.resetIntegrity();
     const patch = updateCardPatch(p);
     if (patch) w.applyPatch(patch);
   };
-  let sawEvent = false;
-  const off = w.subscribe((p) => {
+  const registered = (unlisten: () => void) => {
+    if (disposed) { unlisten(); return; }
+    off = unlisten;
+    void w.readSnapshot().then((snapshot) => {
+      if (disposed || sawEvent || !snapshot) return;
+      applyFrame(snapshot);
+    }).catch(() => undefined);
+  };
+  const registration = w.subscribe((p) => {
     sawEvent = true;
     applyFrame(p);
   });
-  void w
-    .readSnapshot()
-    .then((snapshot) => {
-      if (sawEvent || !snapshot) return;
-      applyFrame(snapshot);
-    })
-    // 回读失败不该影响已经建好的订阅：拿不到快照 = 退回「只有事件」的老行为，不是错误态。
-    .catch(() => undefined);
-  return off;
+  if (typeof registration === 'function') registered(registration);
+  else void registration.then(registered).catch((error) => {
+    if (!disposed) console.error('[update] listener registration failed:', error);
+  });
+  return () => { disposed = true; off?.(); off = null; };
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -824,3 +832,23 @@ export const STAGED_SETTING_SECTION_LABELS: Readonly<Record<string, string>> = {
   bypassProcesses: 'settings.section.bypassProcesses',
   customAppPresets: 'settings.section.customAppPresets',
 };
+
+/** OS startup is authoritative; config is only a persisted preference mirror. */
+export async function changeAutoStart(
+  enabled: boolean,
+  port: { set(value: boolean): Promise<unknown>; getStatus(): Promise<boolean> },
+  reflect: (value: boolean | null) => void,
+  persist: (value: boolean) => Promise<void>,
+): Promise<void> {
+  try {
+    await port.set(enabled);
+  } catch (error) {
+    // Transport failure can follow a completed OS action. Read back, never guess rollback.
+    try { reflect(await port.getStatus()); } catch { reflect(null); }
+    throw error;
+  }
+  let actual: boolean;
+  try { actual = await port.getStatus(); } catch (error) { reflect(null); throw error; }
+  reflect(actual);
+  await persist(actual);
+}

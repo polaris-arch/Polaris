@@ -519,6 +519,7 @@ describe('中断后的恢复动作：继续剩余 / 重测原范围 / 关闭', (
       core_unresponsive: 'nodes.speedTestCoreUnresponsive',
       cancelled: 'nodes.speedTestCancelled',
       preempted: 'nodes.speedTestPreempted',
+      native_pending: 'nodes.speedTestNativePending',
     };
     const actionsOf = (reason?: SpeedTestInterruptReason) =>
       reduceSpeedTestDone(

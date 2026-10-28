@@ -302,8 +302,12 @@ interface PromiseRow {
  * `anchor` 用于「不绑配置键」的承诺（纯说明行、或行为由固定实现兜底），指定必须存在的源码片段。
  */
 const REGISTRY: readonly PromiseRow[] = [
+  { snippet: '[isSavedUtlsSelection(config.utlsPolicy)', evidence: { kind: 'anchors', items: [
+    { file: 'ui/src/domain/utls.ts', needle: 'export function isSavedUtlsSelection' },
+    { file: 'ui/src/domain/utls.ts', needle: 'export function tlsFingerprintStatus' },
+  ] } },
   {
-    snippet: '其他选项仅覆盖生成配置，不修改节点',
+    snippet: '新配置预设为默认（Chrome）',
     evidence: {
       kind: 'anchors',
       items: [

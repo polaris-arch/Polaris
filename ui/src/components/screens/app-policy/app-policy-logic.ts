@@ -1,3 +1,4 @@
+import type { AutoSelectTarget } from '@/contracts/auto-select';
 /**
  * 应用分流屏的排序判据（纯函数，脱离组件可断言 —— 本仓 Vitest 走 node 环境无 DOM，
  * 判据留在 .tsx 里就等于没有门）。
@@ -86,11 +87,12 @@ export function isAppPolicyWritable(pick: string): pick is AppPolicyWritablePick
 export function appRuleForPick(
   appId: string,
   pick: AppPolicyWritablePick,
-  targetServerId?: string,
+  targetServerId?: string | AutoSelectTarget,
 ): AppRule {
   if (pick === 'direct') return { appId, action: 'direct', enabled: true };
   if (pick === 'block') return { appId, action: 'block', enabled: true };
-  if (pick === 'proxy' && targetServerId !== undefined && targetServerId !== '') {
+  if (pick === 'proxy' && typeof targetServerId === 'object') return { appId, action: 'proxy', enabled: true, targetAutoSelect: targetServerId };
+  if (pick === 'proxy' && typeof targetServerId === 'string' && targetServerId !== '') {
     return { appId, action: 'proxy', enabled: true, targetServerId };
   }
   return { appId, action: 'proxy', enabled: true };

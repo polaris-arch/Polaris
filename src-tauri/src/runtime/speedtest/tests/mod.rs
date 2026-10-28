@@ -5066,14 +5066,13 @@ fn temp_plan_applies_global_utls_to_node_and_shadow_without_changing_the_subscri
     node.tls_settings.as_mut().unwrap().engine = Some("apple".into());
     let mut native = env();
     native.platform = "darwin".into();
-    let invalid =
-        plan_temp_core_with_utls_policy(&[node], &native, &BTreeMap::new(), Some("safari"));
-    assert!(invalid.testable.is_empty());
+    let plan = plan_temp_core_with_utls_policy(&[node], &native, &BTreeMap::new(), Some("safari"));
+    assert_eq!(plan.testable.len(), 1);
+    assert_eq!(plan.testable[0].node["tls"]["engine"], "apple");
+    assert!(plan.testable[0].node["tls"].get("utls").is_none());
     assert_eq!(
-        invalid.unusable[0].1,
-        UnusableReason::BuildFailed(
-            "uTLS requires the Go TLS engine; disable uTLS or select Go TLS."
-        )
+        plan.testable[0].companion_outbounds[0]["tls"]["utls"]["fingerprint"],
+        "safari"
     );
 }
 
@@ -5153,3 +5152,76 @@ async fn failed_runtime_config_publication_preserves_unowned_destination_before_
 #[cfg(all(unix, not(target_os = "android")))]
 mod private_temp_config_regressions;
 mod temp_config_writer_regressions;
+
+#[test]
+fn temp_tls_defaults_match_main_and_reality_still_rejects_explicit_disabled() {
+    use polaris_config_engine::user_config::protocol_settings::{RealitySettings, TlsSettings};
+    use polaris_config_engine::user_config::server_config::SecurityMode;
+    use polaris_config_engine::user_config::utls::UtlsMode;
+    for protocol in [
+        Protocol::Vless,
+        Protocol::Vmess,
+        Protocol::Trojan,
+        Protocol::Anytls,
+        Protocol::Http,
+    ] {
+        let mut node = srv("default-utls", protocol);
+        node.security = Some(SecurityMode::Tls);
+        node.password = Some("secret".into());
+        let original = serde_json::to_value(&node).unwrap();
+        for policy in [None, Some("follow")] {
+            let plan = plan_temp_core_with_utls_policy(
+                std::slice::from_ref(&node),
+                &env(),
+                &BTreeMap::new(),
+                policy,
+            );
+            assert_eq!(plan.testable.len(), 1, "{protocol:?}");
+            assert_eq!(
+                plan.testable[0].node["tls"]["utls"]["fingerprint"],
+                "chrome"
+            );
+        }
+        assert_eq!(serde_json::to_value(&node).unwrap(), original);
+        node.security = Some(SecurityMode::Reality);
+        node.reality_settings = Some(RealitySettings {
+            public_key: "key".into(),
+            ..Default::default()
+        });
+        let plan = plan_temp_core_with_utls_policy(
+            std::slice::from_ref(&node),
+            &env(),
+            &BTreeMap::new(),
+            Some("follow"),
+        );
+        assert_eq!(plan.testable.len(), 1);
+        assert_eq!(
+            plan.testable[0].node["tls"]["utls"]["fingerprint"],
+            "chrome"
+        );
+        assert!(node.tls_settings.is_none());
+        node.tls_settings = Some(TlsSettings {
+            utls_mode: Some(UtlsMode::Disabled),
+            ..Default::default()
+        });
+        let plan =
+            plan_temp_core_with_utls_policy(&[node], &env(), &BTreeMap::new(), Some("follow"));
+        assert!(plan.testable.is_empty());
+        assert_eq!(plan.unusable.len(), 1);
+    }
+}
+
+#[test]
+fn temporary_probe_rejects_invalid_pin_even_when_insecure() {
+    let server: ServerConfig = serde_json::from_value(serde_json::json!({
+        "id": "pin-probe", "name": "Pin probe", "protocol": "trojan",
+        "address": "example.invalid", "port": 443, "password": "test-only",
+        "tlsSettings": {"enabled": true, "allowInsecure": true,
+                        "certificateSha256": "invalid-pin"}
+    }))
+    .unwrap();
+    assert_eq!(
+        build_temp_node(&server, "pin-probe", &env(), None).err(),
+        Some("TLS_PIN_INVALID")
+    );
+}

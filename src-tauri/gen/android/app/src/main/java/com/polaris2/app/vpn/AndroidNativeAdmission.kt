@@ -91,8 +91,8 @@ internal class AndroidNativeAdmission(
     }
     open class AdmissionClosed(message: String = "android: native admission is closed") : IllegalStateException(message)
     class CapacityClosed : AdmissionClosed(CAPACITY_MESSAGE)
-    data class MetadataUsage(val entries: Int, val consumedOwners: Int, val limit: Int, val capacityClosed: Boolean) {
-        val records: Int get() = entries + consumedOwners
+    data class MetadataUsage(val entries: Int, val consumedOwners: Int, val limit: Int, val capacityClosed: Boolean, val runtimeActions: Int = 0) {
+        val records: Int get() = entries + consumedOwners + runtimeActions
     }
 
     private val lock = Any()
@@ -104,6 +104,10 @@ internal class AndroidNativeAdmission(
     private val entries = LinkedHashMap<String, Entry>()
     private val usedOwners = HashMap<Pair<Kind, String>, Ticket?>()
     private var captured = emptyList<String>()
+    // Reserved at begin, retained through finish: a lost ACK must not consume
+    // the only release proof. The existing metadata budget bounds this history.
+    private data class RuntimeAction(val stateFile: String, val released: Boolean)
+    private val runtimeActions = HashMap<Pair<String, String>, RuntimeAction>()
 
     /** Called once after a marker stat made outside [lock]. An uncertain result never opens. */
     fun bootstrap(proof: RequiredMarkerProof) = synchronized(lock) {
@@ -310,10 +314,17 @@ internal class AndroidNativeAdmission(
         check(store.containsOriginalFile(stateFile)) { "nativeRetirementUnknown" }
         val owner = checkNotNull(entries[store.ticket.id])
         check(owner.warm == null) { "nativeRetirementUnknown" } // Warm has its own exact terminal/revocation path.
+        val key = store.ticket.id to actionId
         if (operation == "finish") {
-            check(owner.targetAction == (actionId to stateFile)) { "nativeRetirementUnknown" }
-            entries[store.ticket.id] = owner.copy(targetAction = null)
-            revision++
+            val original = runtimeActions[key]
+            check(original?.stateFile == stateFile) { "nativeRetirementUnknown" }
+            if (!checkNotNull(original).released) {
+                check(owner.targetAction == (actionId to stateFile)) { "nativeRetirementUnknown" }
+                runtimeActions[key] = original.copy(released = true)
+                entries[store.ticket.id] = owner.copy(targetAction = null)
+                revision++
+            }
+            // An exact replay never touches a newer targetAction reservation.
             return@synchronized JSONObject().put("released", true).put("processNonce", processNonce)
                 .put("nativeTicketId", store.ticket.id).put("actionRequestId", actionId).put("stateFile", stateFile)
         }
@@ -324,9 +335,13 @@ internal class AndroidNativeAdmission(
             .put("actionRequestId", actionId).put("stateFile", stateFile).put("entries", rows)
         check(result.toString().toByteArray(Charsets.UTF_8).size <= AndroidTailscaleStoreCustody.MAX_BYTES) { "nativeRetirementUnknown" }
         if (operation == "begin") {
+            check(!runtimeActions.containsKey(key)) { "nativeRetirementUnknown" }
+            requireCapacityLocked(1) // Reserve the future release receipt before granting custody.
+            runtimeActions[key] = RuntimeAction(stateFile, false)
             entries[store.ticket.id] = owner.copy(targetAction = actionId to stateFile)
             revision++
             result.put("revision", revision)
+            closeIfFullLocked()
         }
         result
     }
@@ -470,7 +485,7 @@ internal class AndroidNativeAdmission(
     }
 
     fun metadataUsage(): MetadataUsage = synchronized(lock) {
-        MetadataUsage(entries.size, usedOwners.size, maxMetadataRecords, capacityClosed)
+        MetadataUsage(entries.size, usedOwners.size, maxMetadataRecords, capacityClosed, runtimeActions.size)
     }
 
     fun admissionRejection(): AdmissionClosed = synchronized(lock) {
@@ -479,14 +494,14 @@ internal class AndroidNativeAdmission(
 
     /** Capacity is a permanent admission failure, never a drain fence or terminal resource fact. */
     private fun requireCapacityLocked(additional: Int) {
-        if (capacityClosed || additional > maxMetadataRecords - entries.size - usedOwners.size) {
+        if (capacityClosed || additional > maxMetadataRecords - entries.size - usedOwners.size - runtimeActions.size) {
             closeCapacityLocked()
             throw CapacityClosed()
         }
     }
 
     private fun closeIfFullLocked() {
-        if (entries.size + usedOwners.size == maxMetadataRecords) closeCapacityLocked()
+        if (entries.size + usedOwners.size + runtimeActions.size == maxMetadataRecords) closeCapacityLocked()
     }
 
     private fun closeCapacityLocked() {

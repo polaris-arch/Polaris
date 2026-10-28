@@ -376,6 +376,8 @@ fn 全协议族_source() -> DiagnosticReportSource {
             runtime: RuntimeSection { proxy_mode: "rule".into(), proxy_mode_type: "tun".into(),
                                       proxy_running: true, log_level: "info".into(), ..Default::default() },
             user_config: 全协议族_原始配置(),
+            running_secret_keys: Default::default(),
+            unverified_runtime: false,
             singbox_config: 全协议族_生成配置(),
             // #57：节点域名预解析出的真实 IP（不在 servers 里）
             extra_addresses: vec!["203.0.113.77".into()],
@@ -514,6 +516,7 @@ fn 红线_组合面_secret_keys_跨节点取并集() {
     let src = DiagnosticReportSource {
         generated_at: "t".into(),
         user_config: cfg,
+        running_secret_keys: Default::default(),
         singbox_config: Value::Null,
         ..Default::default()
     };
@@ -540,6 +543,7 @@ fn 组合面_空配置不panic() {
     let src = DiagnosticReportSource {
         generated_at: "t".into(),
         user_config: json!({}),
+        running_secret_keys: Default::default(),
         singbox_config: Value::Null,
         ..Default::default()
     };
@@ -636,6 +640,7 @@ fn assembly_redacts_native_vpn_credentials_from_typed_user_and_real_endpoint_bui
     }
     let report = assemble_diagnostic_report(&DiagnosticReportSource {
         user_config: raw_user,
+        running_secret_keys: Default::default(),
         singbox_config: raw_generated,
         ..Default::default()
     });
@@ -691,6 +696,7 @@ fn assembly_keeps_redacting_identity_when_unrelated_unicode_changes_folded_lengt
             ..Default::default()
         },
         user_config: json!({"servers": [{"address": "a.com", "name": "İstanbul 节点"}]}),
+        running_secret_keys: Default::default(),
         singbox_config: json!({"outbounds": [{"server": "a.com"}]}),
         app_log_tail: "İ dial A.COM via İSTANBUL 节点 K".into(),
         singbox_log_tail: "peer a.com:443".into(),
@@ -714,6 +720,7 @@ fn assembly_redacts_greek_final_sigma_variants_in_both_directions() {
                 ..Default::default()
             },
             user_config: json!({"servers": [{"name": configured}]}),
+            running_secret_keys: Default::default(),
             singbox_config: json!({"outbounds": [{"tag": logged}]}),
             app_log_tail: format!("İ peer {logged} K"),
             singbox_log_tail: format!("peer {configured}"),
@@ -727,3 +734,5 @@ fn assembly_redacts_greek_final_sigma_variants_in_both_directions() {
         assert!(report.contains("İ peer <node-1> K"));
     }
 }
+
+mod runtime_identity_regressions;

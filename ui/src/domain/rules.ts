@@ -14,6 +14,7 @@ import type {
   RuleDnsEffect,
   RuleRouteEffect,
 } from '../contracts/types';
+import { cidrContainsIp } from './ip-cidr';
 import { isValidMacAddress, isValidSourceHostname, isSourceDeviceMatchSupported } from './neighbor';
 
 export const RULE_TYPE_IDS: RuleType[] = [
@@ -172,12 +173,8 @@ export const ruleTypePlaceholderKey = (id: RuleType): string => `rules.types.${i
 const eqDomain = (tokens: readonly string[], p: RuleTestProbe) => tokens.some((x) => p.lower === x);
 const substrDomain = (tokens: readonly string[], p: RuleTestProbe) =>
   tokens.some((x) => p.lower.includes(x));
-/** IP 轴的前缀启发式（对齐原型：只比前两段，不做真正的掩码运算）。 */
 const ipPrefix = (tokens: readonly string[], p: RuleTestProbe) =>
-  tokens.some((x) => {
-    const pre = x.split('/')[0].split('.').slice(0, 2).join('.');
-    return !!pre && p.lower.startsWith(pre);
-  });
+  tokens.some((x) => cidrContainsIp(x, p.raw));
 
 const FREE: ValueSource = { kind: 'free' };
 
@@ -223,7 +220,10 @@ export const RULE_TYPES: Record<RuleType, RuleTypeDescriptor> = {
     source: FREE,
     test: {
       axis: 'domain',
-      match: (tokens, p) => tokens.some((x) => p.lower === x || p.lower.endsWith('.' + x)),
+      match: (tokens, p) => tokens.some((token) => {
+        const x = token.startsWith('*.') ? token.slice(2) : token;
+        return p.lower === x || p.lower.endsWith('.' + x);
+      }),
     },
   },
   domainKeyword: {
@@ -236,18 +236,7 @@ export const RULE_TYPES: Record<RuleType, RuleTypeDescriptor> = {
     id: 'domainRegex',
     category: 'domain',
     source: FREE,
-    test: {
-      axis: 'domain',
-      // 用**原串**而非小写：正则里的大小写是作者写的意图，归一会改写它（`[A-Z]` 会失效）。
-      match: (tokens, p) =>
-        tokens.some((x) => {
-          try {
-            return new RegExp(x, 'i').test(p.raw);
-          } catch {
-            return false;
-          }
-        }),
-    },
+    test: null, // Native bounded preview only; never execute author regex in render.
   },
   ipCidr: {
     id: 'ipCidr',
@@ -259,7 +248,7 @@ export const RULE_TYPES: Record<RuleType, RuleTypeDescriptor> = {
     id: 'sourceIpCidr',
     category: 'network',
     source: FREE,
-    test: { axis: 'ip', match: ipPrefix },
+    test: null, // A destination-only probe supplies no source address.
   },
   port: {
     id: 'port',
@@ -301,15 +290,14 @@ export const RULE_TYPES: Record<RuleType, RuleTypeDescriptor> = {
     id: 'geosite',
     category: 'ruleset',
     source: geoTagBare(),
-    // 启发式：geosite 标签背后是一张域名表，客户端拿不到 ⇒ 退化成「标签名是域名子串」。
-    test: { axis: 'domain', match: substrDomain },
+    test: null, // Resource contents are unavailable to this preview.
   },
   geoip: {
     id: 'geoip',
     category: 'ruleset',
     source: geoTagBare(),
     // 启发式：假定被测 IP 落在地区标签内（客户端无 GeoIP 库）。
-    test: { axis: 'ip', match: () => true },
+    test: null, // Resource contents are unavailable to this preview.
   },
   ruleSet: {
     id: 'ruleSet',
@@ -487,14 +475,9 @@ export function validateRuleValue(type: RuleType, value: string): boolean {
       // domain/suffix 走域名形状（DOMAIN_RE 无冒号字符类，本就拒）。
       return type === 'domainKeyword' ? !v.includes(':') : DOMAIN_RE.test(v);
     case 'domainRegex':
-      // sing-box 用 Golang RE2：拒绝 RE2 不支持的 lookahead/lookbehind/反向引用（过 JS 校验却启动 FATAL）
-      if (/\(\?[=!<]|\\[1-9]/.test(v)) return false;
-      try {
-        new RegExp(v);
-        return true;
-      } catch {
-        return false;
-      }
+      // Shape only: unchanged legacy expressions must remain metadata-editable.
+      // Size and syntax admission apply only to new/changed expressions at submit.
+      return v.length > 0;
     case 'ipCidr':
     case 'sourceIpCidr':
       return isValidIpCidr(v);
@@ -535,7 +518,7 @@ export function ruleConditions(
 /** 新统一模型的流量效果；存量规则回退到 action/targetServerId。 */
 export function ruleRouteEffect(rule: Rule): RuleRouteEffect | null {
   if (rule.effects) return rule.effects.route ?? null;
-  return { action: rule.action, targetServerId: rule.targetServerId };
+  return { action: rule.action, targetServerId: rule.targetServerId, ...(rule.targetAutoSelect ? { targetAutoSelect: rule.targetAutoSelect } : {}) };
 }
 
 /** 新统一模型的 DNS 效果；存量 bypassFakeIP 按 real + inherit 兼容读取。 */

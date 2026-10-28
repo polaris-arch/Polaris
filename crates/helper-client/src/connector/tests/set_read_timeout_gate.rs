@@ -90,6 +90,14 @@ fn every_production_connection_stream_impl_overrides_set_read_timeout() {
         );
         for block in &blocks {
             assert!(
+                block.contains("fn read_until_deadline"),
+                "{file}: relative read resets absolute budget"
+            );
+            assert!(
+                block.contains("fn write_all_until"),
+                "{file}: unbounded production write fallback"
+            );
+            assert!(
                 block.contains("fn set_read_timeout"),
                 "{file}：有生产 `impl ConnectionStream` 块没有覆写 `fn set_read_timeout`——\
                  trait 的 no-op 默认实现会吞掉调用方下发的单请求预算，读超时 fail-open 回 5s 硬顶\

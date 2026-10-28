@@ -105,7 +105,7 @@ pub(super) fn classify_transport_failure(
 }
 
 /// reqwest 错误 → 无 URL/hostname/token 的稳定诊断串。
-fn sanitized_reqwest_error(error: &reqwest::Error) -> String {
+pub(super) fn sanitized_reqwest_error(error: &reqwest::Error) -> String {
     let mut source_chain = String::new();
     let mut source = std::error::Error::source(error);
     // source 链通常 3~5 层；双上限防第三方错误构造循环/超长 Display 把日志撑大。
@@ -141,7 +141,9 @@ pub(super) fn sanitized_body_read_error(error: BodyReadError) -> String {
     }
 }
 
-fn build_direct_pinned_client(target: &GuardedTarget) -> Result<reqwest::Client, String> {
+pub(super) fn build_direct_pinned_client(
+    target: &GuardedTarget,
+) -> Result<reqwest::Client, String> {
     install_ring_provider();
     let addrs: Vec<std::net::SocketAddr> = target
         .addresses

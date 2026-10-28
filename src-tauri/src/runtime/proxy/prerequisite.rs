@@ -141,6 +141,7 @@ pub(super) struct ReadyMainCore {
     generation: u64,
     saved_digest: String,
     emission_digest: String,
+    diagnostic_secret_keys: BTreeSet<String>,
     targets: BTreeMap<String, String>,
     status: ProxyStatus,
     api_secret: String,
@@ -209,6 +210,25 @@ pub(super) struct NormalStart {
     completion: watch::Sender<NormalStartCompletion>,
     identity: Arc<ProducerCell>,
     attempt: Option<Arc<crate::runtime::tailscale_login_core::Attempt>>,
+}
+
+/// Delayed automatic work is scoped to both lifecycle and the existing producer
+/// identity: a queued explicit Start can supersede it before claiming a generation.
+#[derive(Clone)]
+pub(crate) struct StartupAdmission {
+    generation: u64,
+    producer: Option<Arc<ProducerCell>>,
+}
+
+impl StartupAdmission {
+    fn matches(&self, generation: u64, starts: &NormalStarts) -> bool {
+        self.generation == generation
+            && match (&self.producer, starts.as_ref()) {
+                (None, None) => true,
+                (Some(previous), Some(current)) => Arc::ptr_eq(previous, &current.identity),
+                _ => false,
+            }
+    }
 }
 
 /// Current observer and retained producer responsibilities share the original short lock.
@@ -1330,6 +1350,10 @@ impl ProxyRuntime {
             saved_digest: digest(saved).map_err(|error| StartError::from(error.to_string()))?,
             emission_digest: digest(emitted)
                 .map_err(|error| StartError::from(error.to_string()))?,
+            diagnostic_secret_keys: polaris_stats_engine::redact::collect_custom_secret_keys(
+                &serde_json::to_value(effective)
+                    .map_err(|error| StartError::from(error.to_string()))?,
+            ),
             targets: final_targets(effective, emitted),
             status: status.clone(),
             api_secret: crate::runtime::management_api::clash_api_secret_in(saved),
@@ -1390,7 +1414,7 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         config: Value,
     ) -> Result<watch::Receiver<NormalStartCompletion>, StartError> {
-        self.register_normal_start(config, true, None)
+        self.register_normal_start(config, true, None, None)
     }
 
     /// Explicit Start is a new user intent, even when its configuration is unchanged.
@@ -1398,7 +1422,26 @@ impl ProxyRuntime {
         self: &Arc<Self>,
         config: Value,
     ) -> Result<watch::Receiver<NormalStartCompletion>, StartError> {
-        self.register_normal_start(config, false, None)
+        self.register_normal_start(config, false, None, None)
+    }
+
+    pub(crate) fn startup_admission(&self) -> Result<StartupAdmission, StartError> {
+        let starts = self
+            .normal_start
+            .lock()
+            .map_err(|_| StartError::from("normal Start completion poisoned".to_owned()))?;
+        Ok(StartupAdmission {
+            generation: self.core_generation(),
+            producer: starts.as_ref().map(|start| Arc::clone(&start.identity)),
+        })
+    }
+
+    pub(super) fn startup_start_completion(
+        self: &Arc<Self>,
+        config: Value,
+        admission: StartupAdmission,
+    ) -> Result<watch::Receiver<NormalStartCompletion>, StartError> {
+        self.register_normal_start(config, true, None, Some(admission))
     }
 
     fn register_normal_start(
@@ -1406,6 +1449,7 @@ impl ProxyRuntime {
         config: Value,
         join_existing: bool,
         scope: Option<(u64, Arc<crate::runtime::tailscale_login_core::Attempt>)>,
+        startup: Option<StartupAdmission>,
     ) -> Result<watch::Receiver<NormalStartCompletion>, StartError> {
         let config_digest = digest(&config).map_err(|error| StartError::from(error.to_string()))?;
         let mut current = self
@@ -1415,6 +1459,18 @@ impl ProxyRuntime {
         current.assert_unpaused().map_err(StartError::from)?;
         polaris_core_supervisor::config_gate::assert_check_producer_registration()
             .map_err(|e| StartError::from(e.to_string()))?;
+        // Same publication fence used by Stop/exit claims. The comparison and
+        // insertion are indivisible with those claims, and `normal_start` already
+        // serializes replacement by newer explicit Start producers.
+        let _publication = startup
+            .as_ref()
+            .map(|_| self.gate.lock_generation_publication());
+        if startup
+            .as_ref()
+            .is_some_and(|token| !token.matches(self.core_generation(), &current))
+        {
+            return Err(StartError::from("superseded".to_owned()));
+        }
         let attempt = scope.as_ref().map(|(_, attempt)| Arc::clone(attempt));
         let register = || {
             // Capture under the same short lock held by admission/claim/Starting publication.
@@ -1627,7 +1683,7 @@ impl ProxyRuntime {
                     .ok_or(MainPrerequisiteError::ReadyUnknown)?
             } else {
                 match binding.expected_generation.zip(binding.attempt.clone()) {
-                    Some(scope) => self.register_normal_start(saved, true, Some(scope)),
+                    Some(scope) => self.register_normal_start(saved, true, Some(scope), None),
                     None => self.normal_start_completion(saved),
                 }
                 .map_err(MainPrerequisiteError::Failed)?
@@ -1780,9 +1836,65 @@ impl ProxyRuntime {
         )
     }
 
+    /// Return only declarations tied to this exact emitted runtime config. If the core is
+    /// absent, transitioning, or the on-disk file belongs to another candidate, omit that
+    /// report section rather than exporting custom credentials with guessed metadata.
+    pub(crate) fn diagnostic_runtime_secret_keys(
+        &self,
+        emitted: &Value,
+    ) -> Option<BTreeSet<String>> {
+        let _publication = self.gate.lock_generation_publication();
+        if self.gate.is_busy() {
+            return None;
+        }
+        let generation = self.gate.generation();
+        let ready = self.ready_main.read().ok()?;
+        let core = ready.as_ref()?;
+        if core.generation != generation
+            || !core.committed.load(Ordering::SeqCst)
+            || core.emission_digest != digest(emitted).ok()?
+        {
+            return None;
+        }
+        Some(core.diagnostic_secret_keys.clone())
+    }
+
+    /// Capture the ordinary unlock gate and enqueue its terminal under lifecycle publication.
+    /// The callback must also hold the detector epoch fence before enqueueing; it must not emit.
+    pub(crate) fn with_unlock_gate_commit<T>(
+        &self,
+        commit: impl FnOnce(bool, Option<LocalHttpProxy>) -> T,
+    ) -> T {
+        let _publication = self.gate.lock_generation_publication();
+        // Raw memory only: status() also projects Android filesystem state and actual-node data.
+        let status = self
+            .status
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let snapshot = self
+            .switch_snapshot
+            .read()
+            .ok()
+            .and_then(|value| value.clone());
+        let local_proxy = if status.running {
+            snapshot.and_then(|snapshot| {
+                super::select_local_http_proxy(
+                    status.mixed_port,
+                    snapshot.probe_proxy_port,
+                    snapshot.loopback_auth,
+                )
+            })
+        } else {
+            None
+        };
+        commit(status.running, local_proxy)
+    }
+
     /// Serialize only an in-memory action result with actual generation and saved writers.
     /// Lock order: publication -> live generation -> saved writer/cache -> action -> detector.
-    /// No callback may await, emit, reenter configuration or call a lifecycle method.
+    /// No callback may await, deliver events, reenter configuration or call a lifecycle method.
+    /// A nonblocking send to the unlock-owned FIFO is permitted; the consumer emits outside these locks.
     pub(crate) fn with_ready_main_commit<T>(
         &self,
         ticket: &ReadyMainTicket,

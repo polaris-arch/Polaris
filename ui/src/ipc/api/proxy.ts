@@ -151,6 +151,13 @@ export const proxyApi = {
     return listen(IPC_CHANNELS.EVENT_PROXY_LIFECYCLE, listener);
   },
 
+  onStartedReady(listener: () => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_PROXY_STARTED, listener);
+  },
+  onStoppedReady(listener: () => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_PROXY_STOPPED, listener);
+  },
+
   async onLifecycleReady(listener: (data: ProxyLifecycleEvent) => void): Promise<() => void> {
     return listenReady(IPC_CHANNELS.EVENT_PROXY_LIFECYCLE, listener);
   },

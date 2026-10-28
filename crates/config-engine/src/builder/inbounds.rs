@@ -394,7 +394,7 @@ fn build_tun_inbound(
     }
     let engaged_mesh = engaged_mesh_forced_route_cidrs(
         &config.servers,
-        config.selected_server_id.as_deref(),
+        config.effective_selected_server_id(),
         &rule_targeted,
         &deps.observed_tailnet_addresses,
     );
@@ -521,8 +521,13 @@ fn build_tun_inbound(
     if deps.platform != "linux" {
         let mut all_server_ids: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
-        if let Some(sid) = &config.selected_server_id {
-            all_server_ids.insert(sid.clone());
+        if let Some(sid) = config.effective_selected_server_id() {
+            all_server_ids.insert(sid.to_owned());
+        }
+        if !crate::user_config::auto_select::referenced_targets(config).is_empty() {
+            all_server_ids.extend(crate::builder::endpoint_routes::active_physical_root_ids(
+                config,
+            ));
         }
         for r in &effective_app_rules_proxy(config) {
             if let Some(tid) = &r.target_server_id {

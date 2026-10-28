@@ -322,6 +322,10 @@ fn dispatch_locked<P, S, D, SD>(
     D: FreePortDeps,
     SD: SystemdOps,
 {
+    if state.shutting_down {
+        let _ = conn.write_line("ERR helper-shutting-down");
+        return;
+    }
     match command {
         cmd::PREPARE_HELPER_UPGRADE | cmd::CANCEL_HELPER_UPGRADE => {
             if cred.uid != 0 {
@@ -734,11 +738,11 @@ fn write_stop_blocked(conn: &mut impl Conn, pid: u32, state: ReapBlockerState) {
     let _ = conn.write_line(&Response::Ok(ResponseKind::Stop(outcome)).to_wire_line());
 }
 
-/// cleanup（:381-388）：kill child + pkill sing-box + 复位转发态。
+/// Legacy cleanup stops only the retained child; never process-name discovery.
 fn handle_cleanup<P, S, D, SD>(
     state: &mut HandlerState,
     deps: &HandlerDeps<'_, P, S, D, SD>,
-    cred: &PeerCred,
+    _cred: &PeerCred,
     conn: &mut impl Conn,
 ) where
     P: PeerCredProvider,
@@ -752,11 +756,8 @@ fn handle_cleanup<P, S, D, SD>(
         state.child = Some(ManagedChild::Stopping(h));
     }
     (deps.set_forward)(false);
-    // :387: pkill -9 -U <uid> -f "sing-box run"（兜底清对端 uid 的所有 sing-box 实例）。
-    // best-effort：忽略失败（Go: _ = exec.Command("pkill", ...).Run()）。
-    let _ = std::process::Command::new("pkill")
-        .args(["-9", "-U", &cred.uid.to_string(), "-f", "sing-box run"])
-        .output();
+    // Legacy cleanup has no authority over other same-user processes.
+    // Only the retained child above may be stopped; never rediscover by name/PID.
     let _ = conn.write_line("OK cleaned");
 }
 
@@ -781,10 +782,16 @@ fn handle_freeport<P, S, D, SD>(
     }
     // :392: ss -H -ltnp 'sport = :<port>'。
     let ss_out = (deps.ss_provider)(port_trim);
-    let pids = match ss_out {
-        Some(s) => parse_ss_pids(&s),
-        None => Vec::new(),
+    let Some(ss_out) = ss_out else {
+        let _ = conn.write_line("ERR port-inspection-failed");
+        return;
     };
+    let pids = parse_ss_pids(&ss_out);
+    // A listener without a visible PID remains occupied/unknown, never free.
+    if !ss_out.trim().is_empty() && pids.is_empty() {
+        let _ = conn.write_line("OK foreign unknown");
+        return;
+    }
     // :395: free_port 分发。wire 序列化走协议层单一真值（G3.1/G3.3）。
     let outcome = free_port(&pids, cred.uid, deps.freeport_deps);
     let resp = Response::Ok(ResponseKind::FreePort(outcome));

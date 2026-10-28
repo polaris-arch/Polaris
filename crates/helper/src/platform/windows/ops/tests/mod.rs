@@ -82,3 +82,28 @@ fn poisoned_dns_admission_rejects_spawn_and_still_closes() {
         .is_err());
     assert!(!called.get());
 }
+
+#[test]
+fn parent_capture_is_not_rebound_when_numeric_pid_is_reused() {
+    let ops = MockProcOps::new();
+    ops.set_alive(false);
+    let original = ops.capture_parent(42).unwrap();
+    ops.set_alive(true); // a replacement object now occupies numeric PID 42
+    assert_eq!(original.pid(), 42);
+    assert_eq!(original.poll(), NativeChildPoll::Exited);
+    assert_eq!(
+        ops.capture_parent(42).unwrap().poll(),
+        NativeChildPoll::Running
+    );
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = called.clone();
+    ops.spawn_watch_parent(
+        original,
+        77,
+        Box::new(|_| true),
+        Box::new(move |_| {
+            result.store(true, std::sync::atomic::Ordering::SeqCst);
+        }),
+    );
+    assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+}

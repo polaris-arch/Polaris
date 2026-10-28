@@ -1057,6 +1057,12 @@ pub fn rule_resources_reset_builtin(
     match state
         .config()
         .update_with_explicit_deletions(deletions, |cfg| {
+            // Retire active AND queued downloads while holding the same writer fence
+            // used by publication. Failure to persist reset conservatively cancels old
+            // work; it never restores its authority or removes the existing live file.
+            for builtin in &selected {
+                builtin_update_lock(&builtin_id_for(&builtin.tag)).retire();
+            }
             // 只清本次所选 tag 的网络更新标记；geosite 重置不得顺手把 geoip 也标成出厂态。
             if let Some(metadata) = cfg.get_mut("builtinGeoMeta").and_then(Value::as_object_mut) {
                 for builtin in &selected {
@@ -1210,8 +1216,16 @@ async fn update_builtin_with_mode(
         &SystemDnsLookup,
         &plan,
         &builtin_runtime_dir(state),
-        |resource| {
-            persist_builtin_geo_updated(app, state, &b.tag, &resource.downloaded_at, broadcast)
+        |resource, staged, operation| {
+            persist_builtin_geo_updated(
+                app,
+                state,
+                &b.tag,
+                &resource.downloaded_at,
+                broadcast,
+                (staged, &builtin_runtime_dir(state).join(&plan.file_name)),
+                operation,
+            )
         },
     )
     .await;
@@ -1378,8 +1392,48 @@ fn persist_registered_resource(
 }
 
 /// 同 tag 的手动、后台和 all 更新共用这把锁，覆盖下载、替换与元数据保存。
-fn builtin_update_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    type Locks = Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>;
+struct BuiltinUpdateGate {
+    download: tokio::sync::Mutex<()>,
+    generation: Mutex<std::sync::Arc<()>>,
+}
+
+impl BuiltinUpdateGate {
+    fn generation(&self) -> std::sync::Arc<()> {
+        self.generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    // Called only under the configuration writer fence in production.
+    fn retire(&self) {
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(());
+    }
+}
+
+struct BuiltinUpdateOperation {
+    gate: std::sync::Arc<BuiltinUpdateGate>,
+    generation: std::sync::Arc<()>,
+}
+
+impl BuiltinUpdateOperation {
+    fn begin(id: &str) -> Self {
+        let gate = builtin_update_lock(id);
+        let generation = gate.generation();
+        Self { gate, generation }
+    }
+
+    // Check and publication must share the configuration writer fence with reset.
+    fn is_current(&self) -> bool {
+        std::sync::Arc::ptr_eq(&self.generation, &self.gate.generation())
+    }
+}
+
+fn builtin_update_lock(id: &str) -> std::sync::Arc<BuiltinUpdateGate> {
+    type Locks = Mutex<std::collections::HashMap<String, std::sync::Weak<BuiltinUpdateGate>>>;
     static LOCKS: OnceLock<Locks> = OnceLock::new();
     let mut locks = LOCKS
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -1389,7 +1443,10 @@ fn builtin_update_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
         return lock;
     }
-    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let lock = std::sync::Arc::new(BuiltinUpdateGate {
+        download: tokio::sync::Mutex::new(()),
+        generation: Mutex::new(std::sync::Arc::new(())),
+    });
     locks.insert(id.to_owned(), std::sync::Arc::downgrade(&lock));
     lock
 }
@@ -1439,10 +1496,11 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
     lookup: &L,
     plan: &ResourcePlan,
     runtime_dir: &Path,
-    persist: impl FnOnce(&RuleResource) -> Result<(), String>,
+    persist: impl FnOnce(&RuleResource, &Path, &BuiltinUpdateOperation) -> Result<(), String>,
 ) -> DownloadOutcome {
-    let lock = builtin_update_lock(&plan.id);
-    let _guard = lock.lock().await;
+    // Capture before awaiting the keyed gate: reset retires queued requests too.
+    let operation = BuiltinUpdateOperation::begin(&plan.id);
+    let _guard = operation.gate.download.lock().await;
     // 同盘且每次独立目录；取消/失败/函数退出均清理自己的暂存，不碰其他在途下载。
     let stage = match ResourceStageDir::create(runtime_dir) {
         Ok(stage) => stage,
@@ -1469,9 +1527,7 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
     };
     let live = runtime_dir.join(&plan.file_name);
     let existed_before = live.is_file();
-    let committed = std::fs::rename(stage.0.join(&plan.file_name), &live)
-        .map_err(|error| format!("替换生效副本失败: {error}"))
-        .and_then(|()| persist(&resource));
+    let committed = persist(&resource, &stage.0.join(&plan.file_name), &operation);
     match committed {
         Ok(()) => {
             emit_resource_progress(
@@ -1500,6 +1556,18 @@ async fn update_builtin_resource<H: HttpClient, L: DnsLookup>(
     }
 }
 
+// Caller holds the config writer fence through both publication and metadata save.
+fn publish_builtin_file(
+    operation: &BuiltinUpdateOperation,
+    staged: &Path,
+    live: &Path,
+) -> Result<(), String> {
+    if !operation.is_current() {
+        return Err("内置资源更新已被重置取消".to_owned());
+    }
+    std::fs::rename(staged, live).map_err(|error| format!("替换生效副本失败: {error}"))
+}
+
 /// 记「该内置 tag 已网络更新过」：`config.builtinGeoMeta[tag].updatedAt = <ISO>`。
 ///
 /// 只写 `updatedAt` 一个字段 —— 它是 `geo_seed::network_updated_tags_from_raw` 唯一读的键，
@@ -1512,11 +1580,19 @@ fn persist_builtin_geo_updated(
     tag: &str,
     updated_at: &str,
     broadcast: BroadcastMode,
+    paths: (&Path, &Path),
+    operation: &BuiltinUpdateOperation,
 ) -> Result<(), String> {
+    let (staged, live) = paths;
     match state.config().update(|cfg| {
         let Some(obj) = cfg.as_object_mut() else {
-            return Decision::Skip(false);
+            return Decision::Skip(Err("配置不是对象".to_owned()));
         };
+        // The writer also fences deferred cleanup. No live path is touched until
+        // admission, and no reset/cleanup can interleave publication and metadata.
+        if let Err(error) = publish_builtin_file(operation, staged, live) {
+            return Decision::Skip(Err(error));
+        }
         let meta = obj
             .entry("builtinGeoMeta")
             .or_insert_with(|| json!({}))
@@ -1530,16 +1606,16 @@ fn persist_builtin_geo_updated(
                 json!({ tag: { "updatedAt": updated_at } }),
             );
         }
-        Decision::Write(true)
+        Decision::Write(Ok(()))
     }) {
         // Deferred：批次拥有者收尾统一广播（见 [`BroadcastMode`]）。落盘已完成，跳过的只是通知。
-        Ok((true, Some(cfg))) => {
+        Ok((Ok(()), Some(cfg))) => {
             if broadcast == BroadcastMode::Immediate {
                 broadcast_config_changed(app, &cfg);
             }
             Ok(())
         }
-        Ok((false, None)) => Err(format!("内置 geo `{tag}` 已更新到盘上，但更新标记未落盘")),
+        Ok((Err(error), None)) => Err(error),
         Ok(_) => Err(format!("内置 geo `{tag}` 更新标记事务返回非法状态")),
         Err(e) => Err(format!(
             "内置 geo `{tag}` 已更新到盘上，但保存 config 失败（更新标记未落）: {e}"

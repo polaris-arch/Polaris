@@ -50,7 +50,7 @@ import { editRoute } from '@/lib/staged-config';
 import { useLogRedactStore } from '@/store/use-log-redact-store';
 import { useConfirmTwice } from '@/lib/confirm-twice';
 import { redactSensitive, shouldRedactLogs } from '@/domain/privacy';
-import { mergeHydration, maxLogId, type LogRow } from './logs-buffer';
+import { mergeHydration, maxLogId, retainAfterClear, type LogRow } from './logs-buffer';
 import { runtimeLevelView } from './runtime-level';
 import type { LogLevel, RuntimeLogLevel } from '@/contracts/types';
 import { Csel, type CselOption } from '@/components/dialogs/Csel';
@@ -168,6 +168,7 @@ export function LogsScreen() {
    * 复位反而会让清空前的残留批次被当成新行重新收下。
    */
   const lastIdRef = useRef(-1);
+  const logReadEpoch = useRef(0);
   /** 只记最近一次明确的用户滚动输入；首次水合/程序化吸底没有这个证据。 */
   const lastUserScrollIntentAtRef = useRef<number | null>(null);
   /** follow 态的真实末页会随结果数变化；暂停前把这一页固化，避免瞬间跳回旧页。 */
@@ -314,13 +315,14 @@ export function LogsScreen() {
         return;
       }
       setLogStreamReady(true);
+      const epoch = logReadEpoch.current;
       const batch = await api.logs.get(subscriptionId, MAX_BUFFERED_ROWS);
       if (!alive) {
         // invoke 可能晚于 React cleanup 返回；token 退订只会删除这个陈旧实例。
         void api.logs.unsubscribe(subscriptionId);
         return;
       }
-      if (!Array.isArray(batch)) return;
+      if (epoch !== logReadEpoch.current || !Array.isArray(batch)) return;
       const snapshot = batch.slice(-MAX_BUFFERED_ROWS);
       const top = maxLogId(snapshot);
       if (top !== null && top > lastIdRef.current) lastIdRef.current = top;
@@ -346,11 +348,12 @@ export function LogsScreen() {
     if (!logStreamReady) return;
     let alive = true;
     const key = activeSearchKey;
+    const epoch = logReadEpoch.current;
     const timer = window.setTimeout(() => {
       void api.logs
         .search(query, displayLevel, source, MAX_BUFFERED_ROWS)
         .then((batch) => {
-          if (!alive || !Array.isArray(batch)) return;
+          if (!alive || epoch !== logReadEpoch.current || !Array.isArray(batch)) return;
           setSearchSnapshot((previous) => ({
             key,
             rows: mergeHydration(
@@ -549,11 +552,15 @@ export function LogsScreen() {
     confirmTwice(CLEAR_KEY, () => {
       void (async () => {
         try {
-          await api.logs.clear();
-          setLogs([]);
-          setSearchSnapshot(null);
-          pendingRef.current = [];
-          setPendingCount(0);
+          logReadEpoch.current += 1;
+          const boundary = await api.logs.clear();
+          retainAfterClear([], boundary); // Validate before changing visible state.
+          logReadEpoch.current += 1;
+          lastIdRef.current = Math.max(lastIdRef.current, boundary - 1);
+          setLogs(previous => retainAfterClear(previous, boundary));
+          setSearchSnapshot(previous => previous ? { ...previous, rows: retainAfterClear(previous.rows, boundary) } : null);
+          pendingRef.current = retainAfterClear(pendingRef.current, boundary);
+          setPendingCount(pendingRef.current.length);
           toast.info(t('logs.clearDone'));
         } catch (err) {
           console.error('[logs] clear failed:', err);

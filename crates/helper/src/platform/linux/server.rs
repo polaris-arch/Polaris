@@ -159,7 +159,7 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 
 /// ss 命令的输出提供者（freeport 用，对照 Go `exec.Command("ss", "-H", "-ltnp", ...)`，:292）。
 ///
-/// 生产实现：调 `ss` 子进程；失败返回 None（freeport 视作端口空闲）。
+/// 生产实现：调 `ss` 子进程；失败返回 None（freeport reports inspection failure）。
 pub fn ss_lookup(port: &str) -> Option<String> {
     let sport = format!("sport = :{port}");
     let out = std::process::Command::new("ss")
@@ -489,12 +489,13 @@ impl ReapGroup {
         }
     }
     /// 等在途 terminate 归零，最多 `timeout`（对照 Go `waitReaps`，`main.go:73-80`）。
-    fn wait(&self, timeout: Duration) {
+    fn wait(&self, timeout: Duration) -> bool {
         let g = self.count.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = self
+        let (count, _) = self
             .cv
             .wait_timeout_while(g, timeout, |c| *c > 0)
             .unwrap_or_else(PoisonError::into_inner);
+        *count == 0
     }
 }
 
@@ -551,6 +552,23 @@ fn pin_log_path(path: &Path, uid: u32) -> std::io::Result<PinnedLogPath> {
 struct PinnedReader<R> {
     inner: R,
     _directory: Arc<File>,
+    _tail: ReapTail,
+}
+
+/// Reuse the existing shutdown drain counter for each owned pipe reader.
+/// Drop means the reader has relinquished its pipe/directory custody, including
+/// read errors; it does not claim successful logging or child exit.
+struct ReapTail(Arc<ReapGroup>);
+impl ReapTail {
+    fn new(group: &Arc<ReapGroup>) -> Self {
+        group.add();
+        Self(Arc::clone(group))
+    }
+}
+impl Drop for ReapTail {
+    fn drop(&mut self) {
+        self.0.done();
+    }
 }
 
 impl<R: Read> Read for PinnedReader<R> {
@@ -686,8 +704,8 @@ impl AmbientCapsSpawner {
     }
 
     /// 等在途后台 terminate 归零（对照 Go `waitReaps`）。SIGTERM 退出兜底用。
-    pub fn wait_reaps(&self, timeout: Duration) {
-        self.reaps.wait(timeout);
+    pub fn wait_reaps(&self, timeout: Duration) -> bool {
+        self.reaps.wait(timeout)
     }
 
     /// 同步 terminate 指定 child（SIGTERM 退出兜底对当前 child 用，Go main reaper 同步 `terminateChild`）。
@@ -893,10 +911,12 @@ impl AmbientCapsSpawner {
             let stdout = child.stdout.take().map(|inner| PinnedReader {
                 inner,
                 _directory: Arc::clone(&log.directory),
+                _tail: ReapTail::new(&self.reaps),
             });
             let stderr = child.stderr.take().map(|inner| PinnedReader {
                 inner,
                 _directory: Arc::clone(&log.directory),
+                _tail: ReapTail::new(&self.reaps),
             });
             let owned_log_path = log.path;
             let directory = log.directory;
@@ -1323,19 +1343,43 @@ impl ConnServer {
 
     /// SIGTERM 退出兜底（Go main reaper，`main.go:46-54`）：同步 terminate 当前 child（TERM→≤5s→KILL）+
     /// waitReaps 等在途后台 terminate 归零。调用方随后 `set_forward_prod(false)`（对齐 `main.go:55`）。
-    pub fn reap_on_shutdown(&self) {
+    pub fn reap_on_shutdown(&self) -> bool {
         let child = {
             let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let handle = g.child.as_ref().map(ManagedChild::handle).cloned();
-            if let Some(handle) = handle.as_ref() {
-                g.child = Some(ManagedChild::Stopping(handle.clone()));
-            }
-            handle
+            // Same mutex as Start: accepted-but-not-dispatched calls cannot
+            // create a birth after this snapshot, even after upgrade cancel.
+            g.begin_shutdown()
         };
         if let Some(h) = child {
             self.spawner.terminate_now(&h); // sync; no PID-only lookup
         }
-        self.spawner.wait_reaps(Duration::from_secs(6));
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        if !self.spawner.wait_reaps(Duration::from_secs(6)) {
+            return false;
+        }
+        loop {
+            // Reaper removes slots only after exact wait and DNS cleanup.
+            // Unknown/pending custody and delayed readers cannot become success.
+            let empty = self
+                .spawner
+                .slots
+                .lock()
+                .is_ok_and(|slots| slots.is_empty());
+            let clean = self.state.lock().is_ok_and(|state| {
+                state.child.is_none()
+                    && !state.dns_busy
+                    && !state.dns_cleanup_pending
+                    && state.dns_owner.is_none()
+                    && state.dns_birth.is_none()
+            });
+            if empty && clean {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 

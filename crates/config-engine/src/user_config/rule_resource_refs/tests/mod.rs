@@ -18,6 +18,7 @@ fn app_rule(id: &str, enabled: bool) -> AppRule {
         action: RuleAction::Proxy,
         enabled,
         target_server_id: None,
+        target_auto_select: None,
     }
 }
 

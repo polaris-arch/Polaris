@@ -1,37 +1,19 @@
-//! 自动选点的 I/O 编排：择优腿取读数 → 裁决 → 经故障切换那一个提交事务换点，两条显式命令的
-//! 落盘，心跳循环的唤醒，以及它们与手动选择、订阅范围、平台闸之间的边界。
-//!
-//! 账本、调度器读数、单飞闸与两个时钟一律注入：不碰进程级的那一份，也不读真实时间。
-
+//! Native Auto ownership tests plus retained generic failover/heartbeat receipts.
+//! Retired App-ranking policy stays covered by runtime::auto_select pure tests;
+//! production tests below exercise native group state through the existing PUT harness.
+use super::*;
+use crate::commands::server::{finish_placement_core, server_switch_core, Placement};
+use crate::runtime::auto_select::{Cause, Leg, SwitchRecord};
+use crate::runtime::auto_switch::HEARTBEAT_INTERVAL_MS;
+use crate::runtime::proxy::auto_switch::{run_heartbeat, HeartbeatLegs};
+use polaris_config_engine::user_config::auto_select::{self as native, AutoSelectTarget};
+use polaris_singbox_grpc::daemon::{Group, GroupItem};
 use std::ops::ControlFlow;
 use std::time::Duration;
-
-use super::*;
-use crate::commands::server::{
-    auto_select_enable_core, auto_select_switch_now_core, finish_placement_core,
-    server_switch_core, AutoSelectError, Placement,
-};
-use crate::commands::speedtest::{
-    resolve_speed_test_url, BindingVerdict, CoreInstance, FailKind, FailPhase, MeasureFailure,
-    MeasurePath, ResultIdentity, SpeedTestOrigin,
-};
-use crate::runtime::auto_select::{
-    retry_after_ms, Cause, CommitFailure, Decision, Gate, Hold, Lacking, Leg, SwitchRecord,
-    Switches,
-};
-use crate::runtime::auto_switch::{AutoSwitchMachine, HEARTBEAT_INTERVAL_MS, SWITCH_COOLDOWN_MS};
-use crate::runtime::measurement_ledger::MeasurementLedger;
-use crate::runtime::measurement_scheduler::{Idle, Pause, Signals, Verdict};
-use crate::runtime::proxy::auto_switch::{
-    run_heartbeat, HeartbeatLegs, SelectCache, SelectReadings,
-};
-
 const MINUTE: u64 = 60_000;
-/// 注入的两个时钟的起点。两者毫无关系：用错时钟的比较会立刻露出来。
 const MONO: u64 = 7 * 60 * MINUTE;
 const WALL: u64 = 1_700_000_000_000;
 
-/// 订阅 `sub` 含 `node-b`、`node-c`；`node-a` 是自建节点。
 fn auto_config(selected: &str, intent: Option<&str>) -> Value {
     let mut cfg = two_node_config(7890, selected);
     cfg["servers"]
@@ -50,7 +32,6 @@ fn auto_config(selected: &str, intent: Option<&str>) -> Value {
     cfg
 }
 
-/// 落盘并把运行时标成「这份配置正在运行」。返回落盘后的规范形。
 fn running(rt: &ProxyRuntime, cfg: &Value) -> Value {
     rt.config.save_full(cfg).expect("seed D");
     let saved = rt.config.current().unwrap();
@@ -64,1044 +45,6 @@ fn running(rt: &ProxyRuntime, cfg: &Value) -> Value {
         .id_to_tag
         .insert("node-c".to_string(), "Node C".to_string());
     saved
-}
-
-/// 一条当前核世代、探针槽路径测得的结果的身份块；测量的墙钟时刻就是注入的「现在」。
-fn identity(rt: &ProxyRuntime, cfg: &Value, run: u64) -> ResultIdentity {
-    ResultIdentity {
-        core_binary_sha256: rt.measurement_core_sha256(),
-        run,
-        seq: 1,
-        origin: SpeedTestOrigin::Schedule,
-        scope: None,
-        path: MeasurePath::Candidate,
-        url_digest: polaris_updater::sha256_hex(resolve_speed_test_url(cfg).as_bytes()),
-        instance: CoreInstance::Main {
-            generation: rt.core_generation(),
-            start_time: None,
-        },
-        config_digest: None,
-        node_fingerprint: None,
-        network_epoch: None,
-        measured_at: WALL,
-        binding: Some(BindingVerdict::Confirmed),
-    }
-}
-
-/// Carry both production identity axes independently: node dirty fingerprint
-/// and the full loaded connection digest. Negative identities keep their fields.
-fn record_config(
-    ledger: &MeasurementLedger,
-    rt: &ProxyRuntime,
-    cfg: &Value,
-    node: &str,
-    measured: crate::commands::speedtest::Measured,
-    mut receipt: ResultIdentity,
-    at: u64,
-) -> bool {
-    let _ = rt;
-    if receipt.node_fingerprint.is_none() {
-        receipt.node_fingerprint = crate::commands::speedtest::current_server_fingerprints(cfg)
-            .get(node)
-            .cloned();
-    }
-    ledger.record_connection_at(
-        node,
-        measured,
-        receipt,
-        crate::runtime::node_fingerprints::measurement_table_json(cfg)
-            .get(node)
-            .cloned(),
-        at,
-    )
-}
-
-/// 一轮测速的结果入账：`(节点, 延迟)`，同一个运行号、同一个入账时刻。
-fn round(
-    ledger: &MeasurementLedger,
-    rt: &ProxyRuntime,
-    cfg: &Value,
-    run: u64,
-    at: u64,
-    results: &[(&str, u32)],
-) {
-    for (node, latency_ms) in results {
-        let receipt = identity(rt, cfg, run);
-        record_config(ledger, rt, cfg, node, Ok(*latency_ms), receipt, at);
-    }
-}
-
-fn readings_at(ledger: &MeasurementLedger, now: u64) -> SelectReadings<'_> {
-    SelectReadings {
-        ledger,
-        signals: Signals::idle(),
-        measuring: false,
-        now,
-        now_wall: WALL,
-    }
-}
-
-fn readings(ledger: &MeasurementLedger) -> SelectReadings<'_> {
-    readings_at(ledger, MONO)
-}
-
-async fn assess(
-    rt: &Arc<ProxyRuntime>,
-    readings: &SelectReadings<'_>,
-    last_attempt_at: Option<u64>,
-) -> Option<SelectPlan> {
-    rt.auto_select_assess(
-        rt.core_generation(),
-        last_attempt_at,
-        &mut SelectCache::default(),
-        readings,
-    )
-    .await
-}
-
-async fn commit(
-    rt: &Arc<ProxyRuntime>,
-    machine: &mut AutoSwitchMachine,
-    plan: &SelectPlan,
-    api: &AttestingManagementApi,
-    readings: &SelectReadings<'_>,
-) -> bool {
-    rt.auto_select_commit(
-        rt.core_generation(),
-        machine,
-        plan,
-        api,
-        &mut SelectCache::default(),
-        readings,
-    )
-    .await
-}
-
-fn last_decision(rt: &ProxyRuntime) -> Decision {
-    rt.auto_select
-        .lock()
-        .unwrap()
-        .evaluation
-        .as_ref()
-        .expect("应已评估过")
-        .decision
-        .clone()
-}
-
-fn intent_on_disk(rt: &ProxyRuntime) -> Option<String> {
-    polaris_store::selection_intent_subscription(&rt.config.current().unwrap()).map(str::to_string)
-}
-
-fn exit_on_disk(rt: &ProxyRuntime) -> String {
-    rt.config.current().unwrap()["selectedServerId"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
-}
-
-// ── 择优腿：评估与提交 ────────────────────────────────────────────────────────
-
-/// 首次落点：出口不在订阅内，账本里订阅成员都有当前结果 → 落到延迟最小者。提交走后台事务：
-/// 磁盘侧只改实际出口，意图不变，内核不重启，只换 `proxy-selector`。评估时槽里记的是
-/// 「正在提交」，提交成功才落成换点。
-#[tokio::test]
-async fn the_select_leg_lands_on_the_fastest_member_and_keeps_the_intent() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    // 别的订阅、自建节点再快也不是候选。
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80), ("node-a", 5)],
-    );
-    let reads = readings(&ledger);
-
-    let plan = assess(&rt, &reads, None).await.expect("应换点");
-    assert_eq!(plan.candidate.id, "node-c");
-    assert_eq!((plan.cause, plan.latency_ms), (Cause::FirstPlacement, 80));
-    assert_eq!(plan.subscription, "sub");
-    assert_eq!(last_decision(&rt), Decision::Hold(Hold::Committing));
-
-    let api = AttestingManagementApi::new("Node A");
-    let mut machine = AutoSwitchMachine::new();
-    assert!(commit(&rt, &mut machine, &plan, &api, &reads).await);
-    assert_eq!(exit_on_disk(&rt), "node-c");
-    assert_eq!(
-        intent_on_disk(&rt).as_deref(),
-        Some("sub"),
-        "系统代选不清意图"
-    );
-    assert_eq!(rt.status().pid, 424242, "后台事务不重启内核");
-    assert_eq!(
-        *api.puts.lock().unwrap(),
-        vec![("proxy-selector".to_string(), "Node C".to_string())]
-    );
-    assert!(!machine.is_switching(), "在飞标志已释放");
-    assert_eq!(
-        machine.last_switch_time(),
-        Some(MONO),
-        "两条腿共用的冷却已起"
-    );
-    assert_eq!(
-        last_decision(&rt),
-        Decision::Switch {
-            target: "node-c".to_string(),
-            latency_ms: 80,
-            cause: Cause::FirstPlacement
-        }
-    );
-    let slot = rt.auto_select.lock().unwrap();
-    assert_eq!((slot.select_switches, slot.failover_switches), (1, 0));
-    let record = slot.last_switch.as_ref().unwrap();
-    assert_eq!(
-        (
-            record.leg,
-            record.cause,
-            record.to_id.as_str(),
-            record.unverified,
-            record.at
-        ),
-        (
-            Leg::Select,
-            Cause::FirstPlacement,
-            "node-c",
-            Some(false),
-            WALL
-        )
-    );
-    assert_eq!(record.from_id.as_deref(), Some("node-a"));
-}
-
-#[tokio::test]
-async fn production_tick_passes_the_shared_cooldown_to_assessment() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80)],
-    );
-    let mut machine = AutoSwitchMachine::new();
-    machine.begin_switch(MONO);
-    machine.end_switch();
-    let mut cache = SelectCache::default();
-    rt.auto_select_tick_from(
-        rt.core_generation(),
-        &mut machine,
-        &mut cache,
-        &readings_at(&ledger, MONO + SWITCH_COOLDOWN_MS - 1),
-        async { AttestingManagementApi::new("Node A") },
-    )
-    .await;
-    assert_eq!(last_decision(&rt), Decision::Hold(Hold::Cooldown));
-    assert_eq!(exit_on_disk(&rt), "node-a");
-    let boundary = readings_at(&ledger, MONO + SWITCH_COOLDOWN_MS);
-    assert!(
-        rt.auto_select_assess(
-            rt.core_generation(),
-            machine.last_switch_time(),
-            &mut cache,
-            &boundary
-        )
-        .await
-        .is_some(),
-        "the same candidate becomes eligible at the exact cooldown boundary"
-    );
-}
-
-#[tokio::test]
-async fn production_restart_evidence_survives_background_ticks_and_allows_explicit_placement() {
-    for mixed in [false, true] {
-        let (rt, _dir) = test_runtime();
-        let mut initial = auto_config("node-b", Some("sub"));
-        initial["servers"][2] = valid_force_route_wg_node("node-c", "Node C");
-        initial["servers"][2]["subscriptionId"] = serde_json::json!("sub");
-        if mixed {
-            initial["servers"][0]["subscriptionId"] = serde_json::json!("sub");
-        }
-        let cfg = running(&rt, &initial);
-        let ledger = MeasurementLedger::new();
-        let mut cache = SelectCache::default();
-        for (run, at) in [(1, MONO), (2, MONO + 5 * MINUTE)] {
-            let mut results = vec![("node-b", 400), ("node-c", 10)];
-            if mixed {
-                results.push(("node-a", 390));
-            }
-            round(&ledger, &rt, &cfg, run, at, &results);
-            for beat in [at, at + HEARTBEAT_INTERVAL_MS] {
-                assert!(rt
-                    .auto_select_assess(
-                        rt.core_generation(),
-                        None,
-                        &mut cache,
-                        &readings_at(&ledger, beat)
-                    )
-                    .await
-                    .is_none());
-                assert_eq!(
-                    last_decision(&rt),
-                    Decision::Hold(if run == 1 {
-                        Hold::Pending(Lacking::Streak)
-                    } else {
-                        Hold::NeedsRestart
-                    }),
-                    "mixed={mixed}"
-                );
-            }
-        }
-        assert_eq!(rt.auto_select.lock().unwrap().select_switches, 0);
-        assert_eq!(exit_on_disk(&rt), "node-b");
-        let (saved, placement) = switch_now(
-            &rt,
-            &readings_at(&ledger, MONO + 5 * MINUTE + HEARTBEAT_INTERVAL_MS),
-        )
-        .expect("explicit command inherits the two comparable wins");
-        assert_eq!(placement.to, "node-c");
-        assert_eq!(saved["selectedServerId"], "node-c");
-    }
-}
-
-#[tokio::test]
-async fn refresh_records_only_a_accepted_runtime_exit_change() {
-    use crate::commands::subscription::record_auto_exit_after_removal;
-    for outcome in [
-        None,
-        Some(SwitchOutcome::NotRunning),
-        Some(SwitchOutcome::Pending),
-        Some(SwitchOutcome::Deferred),
-        Some(SwitchOutcome::NoOp),
-        Some(SwitchOutcome::Unchanged),
-        Some(SwitchOutcome::HotSwitched),
-        Some(SwitchOutcome::Restarting),
-    ] {
-        let (rt, _dir) = test_runtime();
-        let cfg = auto_config("node-c", Some("sub"));
-        rt.auto_select
-            .lock()
-            .unwrap()
-            .memory
-            .record_commit_failure(CommitFailure::Failed);
-        record_auto_exit_after_removal(&rt, &cfg, Some("removed-node"), outcome);
-        let slot = rt.auto_select.lock().unwrap();
-        let accepted = matches!(
-            outcome,
-            Some(SwitchOutcome::HotSwitched | SwitchOutcome::Restarting)
-        );
-        assert_eq!(slot.select_switches, u64::from(accepted), "{outcome:?}");
-        assert_eq!(slot.last_switch.is_some(), accepted);
-        assert_eq!(slot.memory.commit_failures(), u32::from(!accepted));
-    }
-}
-
-#[tokio::test]
-async fn production_refresh_broadcast_settles_rejected_and_accepted_apply() {
-    use crate::commands::config::apply_config_broadcast_core;
-    use crate::commands::subscription::record_auto_exit_after_removal;
-    for case in ["stopped", "pending", "superseded", "stale", "restart"] {
-        let (rt, _dir) = test_runtime();
-        let mut cfg = if case == "stopped" {
-            auto_config("node-b", Some("sub"))
-        } else {
-            running(&rt, &auto_config("node-b", Some("sub")))
-        };
-        // Every branch really replaces removed B with C; a rejected Apply must reach
-        // the receipt guard instead of returning early because the exit did not change.
-        cfg["servers"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|server| server["id"] != "node-b");
-        cfg["selectedServerId"] = serde_json::json!("node-c");
-        rt.config.save_full(&cfg).unwrap();
-        rt.auto_select
-            .lock()
-            .unwrap()
-            .memory
-            .record_commit_failure(CommitFailure::Failed);
-        let generation = rt.register_selector_intent();
-        if case == "pending" {
-            rt.gate.begin();
-        }
-        if case == "superseded" {
-            rt.register_selector_intent();
-        }
-        let mut candidate = cfg.clone();
-        if case == "stale" {
-            candidate["selectedServerId"] = serde_json::json!("node-a");
-        }
-        apply_config_broadcast_core(
-            &rt,
-            candidate,
-            false,
-            generation,
-            |_| {},
-            |proxy, outcome| {
-                if case == "restart" {
-                    assert!(matches!(outcome, Some(SwitchOutcome::Restarting)));
-                } else {
-                    assert!(!matches!(
-                        outcome,
-                        Some(SwitchOutcome::HotSwitched | SwitchOutcome::Restarting)
-                    ));
-                }
-                record_auto_exit_after_removal(proxy, &cfg, Some("node-b"), outcome);
-            },
-        )
-        .await;
-        let slot = rt.auto_select.lock().unwrap();
-        assert_eq!(slot.select_switches, u64::from(case == "restart"), "{case}");
-        assert_eq!(slot.last_switch.is_some(), case == "restart", "{case}");
-        assert_eq!(
-            slot.memory.commit_failures(),
-            u32::from(case != "restart"),
-            "{case}"
-        );
-    }
-}
-
-/// 账本里不能进候选的结果一条都换不动出口：停止态临时核测得的（未连接测量）、读回判定量到的
-/// 不是它的、超过新鲜期上限的、别的核世代测的。订阅里没有候选时出口原样保留：不转直连，不借
-/// 别的订阅里更快的节点。
-#[tokio::test]
-async fn results_that_may_not_be_selected_never_move_the_exit() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let good = |run| identity(&rt, &cfg, run);
-    let cases: [(&str, ResultIdentity); 4] = [
-        (
-            "未连接测量",
-            ResultIdentity {
-                instance: CoreInstance::Temp,
-                ..good(1)
-            },
-        ),
-        (
-            "读回不符",
-            ResultIdentity {
-                binding: Some(BindingVerdict::Mismatch),
-                ..good(1)
-            },
-        ),
-        (
-            "超过新鲜期上限",
-            ResultIdentity {
-                measured_at: WALL - 24 * 60 * MINUTE,
-                ..good(1)
-            },
-        ),
-        (
-            "别的核世代",
-            ResultIdentity {
-                instance: CoreInstance::Main {
-                    generation: rt.core_generation() + 1,
-                    start_time: None,
-                },
-                ..good(1)
-            },
-        ),
-    ];
-    for (label, bad) in cases {
-        let ledger = MeasurementLedger::new();
-        record_config(&ledger, &rt, &cfg, "node-b", Ok(10), bad, MONO);
-        // `node-c` 真测了没通。
-        record_config(
-            &ledger,
-            &rt,
-            &cfg,
-            "node-c",
-            Err(MeasureFailure::new(FailPhase::Measure, FailKind::Timeout)),
-            good(1),
-            MONO,
-        );
-        record_config(&ledger, &rt, &cfg, "node-a", Ok(5), good(1), MONO);
-        let mut reads = readings(&ledger);
-        // 读回不符的结果算「有当前结果」，其余三种不算：用调度器的一轮收尾来过首轮闸门。
-        reads
-            .signals
-            .subscriptions
-            .insert("sub".to_string(), (Some(1), None));
-        assert_eq!(assess(&rt, &reads, None).await, None, "{label}");
-        assert_eq!(
-            last_decision(&rt),
-            Decision::Hold(Hold::NoCandidates),
-            "{label}"
-        );
-        assert_eq!(exit_on_disk(&rt), "node-a", "{label}：无候选时出口不动");
-        // 正向对照：同一个节点换成一条合格的结果，立刻成为落点。
-        record_config(&ledger, &rt, &cfg, "node-b", Ok(10), good(2), MONO);
-        let plan = assess(&rt, &reads, None).await.expect(label);
-        assert_eq!(plan.candidate.id, "node-b", "{label}");
-    }
-}
-
-/// 首轮未完成不落点：只测了一部分成员、调度器也没有报告一轮收尾时，出口不动；不取成员表第一个，
-/// 不取半份数据里的最优。调度器报告该订阅有一轮收尾后才评估。周期测速的全局总开关关着时，
-/// 原因如实报成「没有周期数据」。
-#[tokio::test]
-async fn nothing_is_placed_before_the_first_round_completes() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    round(&ledger, &rt, &cfg, 1, MONO, &[("node-b", 120)]);
-
-    let mut reads = readings(&ledger);
-    assert_eq!(assess(&rt, &reads, None).await, None);
-    assert_eq!(
-        last_decision(&rt),
-        Decision::NotEvaluated(Gate::WaitingFirstRound)
-    );
-
-    reads.signals.verdict = Verdict::Idle(Idle::UserDisabled);
-    assert_eq!(assess(&rt, &reads, None).await, None);
-    assert_eq!(
-        last_decision(&rt),
-        Decision::NotEvaluated(Gate::PeriodicDisabled),
-        "总开关关闭时不择优，原因可读"
-    );
-    assert_eq!(exit_on_disk(&rt), "node-a");
-
-    // 调度器的一轮收尾（序号大于进入本范围时的 0）。
-    reads.signals.verdict = Verdict::Waiting;
-    reads.signals.round_serial = 1;
-    reads
-        .signals
-        .subscriptions
-        .insert("sub".to_string(), (Some(1), None));
-    let plan = assess(&rt, &reads, None).await.expect("首轮收尾后落点");
-    assert_eq!(plan.candidate.id, "node-b");
-
-    // 有测速在飞：不拿中途的数据选点。
-    reads.measuring = true;
-    assert_eq!(assess(&rt, &reads, None).await, None);
-    assert_eq!(last_decision(&rt), Decision::NotEvaluated(Gate::Measuring));
-}
-
-/// 首轮完成之后数据源停掉：当前出口的结果过期，而周期测速被总开关关掉、因计费暂停或因省电暂停。
-/// 状态是「没有数据」，原因是被什么挡住；出口不动。读回长期不符同理，原因是读回不符。
-#[tokio::test]
-async fn a_stopped_data_source_after_the_first_round_is_reported_not_settled() {
-    for (verdict, reason) in [
-        (Verdict::Idle(Idle::UserDisabled), "periodicDisabled"),
-        (Verdict::Paused(Pause::Metered), "meteredPaused"),
-        (Verdict::Paused(Pause::PowerSave), "powerSave"),
-        (Verdict::Waiting, "currentExpired"),
-    ] {
-        let (rt, _dir) = test_runtime();
-        let cfg = running(&rt, &auto_config("node-b", Some("sub")));
-        let ledger = MeasurementLedger::new();
-        round(
-            &ledger,
-            &rt,
-            &cfg,
-            1,
-            MONO,
-            &[("node-b", 100), ("node-c", 90)],
-        );
-        // 首轮完成，出口已选定。
-        assert_eq!(assess(&rt, &readings(&ledger), None).await, None);
-        assert_eq!(last_decision(&rt), Decision::Hold(Hold::Settled));
-        // 一天之后：结果早已过期，周期测速没在跑。
-        let mut later = readings_at(&ledger, MONO + 24 * 60 * MINUTE);
-        later.now_wall = WALL + 24 * 60 * MINUTE;
-        later.signals.verdict = verdict;
-        assert_eq!(assess(&rt, &later, None).await, None);
-        let status = rt.auto_select_status_from(&later);
-        assert_eq!(
-            (status.mode, status.reason),
-            ("noData", Some(reason)),
-            "{verdict:?}"
-        );
-        assert_eq!(status.no_data_for_ms, Some(0));
-        assert_eq!(exit_on_disk(&rt), "node-b");
-        // 持续三个周期以上：长期无数据置位。
-        let mut much_later = readings_at(&ledger, later.now + 91 * MINUTE);
-        much_later.now_wall = later.now_wall + 91 * MINUTE;
-        much_later.signals.verdict = verdict;
-        assess(&rt, &much_later, None).await;
-        let status = rt.auto_select_status_from(&much_later);
-        assert!(status.flags.starved, "{verdict:?}");
-        assert_eq!(status.no_data_for_ms, Some(91 * MINUTE));
-    }
-
-    // 当前出口读回长期不符：每一轮都有它的「结果」，但没有一条可用于选点。
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-b", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    for (run, at) in [(1, MONO), (2, MONO + 30 * MINUTE)] {
-        record_config(
-            &ledger,
-            &rt,
-            &cfg,
-            "node-b",
-            Ok(40),
-            ResultIdentity {
-                binding: Some(BindingVerdict::Mismatch),
-                ..identity(&rt, &cfg, run)
-            },
-            at,
-        );
-        round(&ledger, &rt, &cfg, run, at, &[("node-c", 10)]);
-        assert_eq!(assess(&rt, &readings_at(&ledger, at), None).await, None);
-    }
-    let status = rt.auto_select_status_from(&readings_at(&ledger, MONO + 30 * MINUTE));
-    assert_eq!(
-        (status.mode, status.reason),
-        ("noData", Some("currentMismatch"))
-    );
-    assert_eq!(status.no_data_for_ms, Some(30 * MINUTE));
-    assert_eq!(exit_on_disk(&rt), "node-b");
-}
-
-/// 换点没换成（管理面拒绝目标，事务已恢复原出口）：不记换点，实际出口与意图不变，内核不重启；
-/// 结果回写状态 —— 模式是「提交失败」，带原因与连续失败次数。重试间隔随连续失败翻倍：失败一次
-/// 后 60 秒时还不重试，120 秒时才重试；换成之后清零。
-#[tokio::test]
-async fn a_failed_commit_is_recorded_and_retried_with_a_growing_interval() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80)],
-    );
-    let reads = readings(&ledger);
-    let plan = assess(&rt, &reads, None).await.unwrap();
-
-    let rejecting = AttestingManagementApi::rejecting("Node A", "Node C");
-    let mut machine = AutoSwitchMachine::new();
-    assert!(!commit(&rt, &mut machine, &plan, &rejecting, &reads).await);
-    assert_eq!(exit_on_disk(&rt), "node-a");
-    assert_eq!(intent_on_disk(&rt).as_deref(), Some("sub"));
-    assert_eq!(rt.status().pid, 424242);
-    assert!(!machine.is_switching(), "失败路径同样释放在飞标志");
-    assert_eq!(machine.last_switch_time(), Some(MONO), "失败也进冷却");
-    assert_eq!(
-        last_decision(&rt),
-        Decision::Hold(Hold::CommitFailed(CommitFailure::Failed)),
-        "槽里不留一个实际没换的换点"
-    );
-    {
-        let slot = rt.auto_select.lock().unwrap();
-        assert_eq!(slot.select_switches, 0, "回滚的换点不算换点");
-        assert_eq!(slot.last_switch, None);
-        assert_eq!(slot.memory.commit_failures(), 1);
-    }
-    let status = rt.auto_select_status_from(&reads);
-    assert_eq!(
-        (status.mode, status.reason),
-        ("commitFailed", Some("commitFailed"))
-    );
-    assert_eq!(status.commit.consecutive_failures, 1);
-    assert_eq!(status.commit.retry_after_ms, Some(2 * SWITCH_COOLDOWN_MS));
-    assert_eq!(
-        status
-            .commit
-            .last_failure
-            .as_ref()
-            .map(|f| f.to_id.as_str()),
-        Some("node-c")
-    );
-
-    // 60 秒后：平时的冷却已过，但失败过一次，间隔翻倍，还不重试；状态仍是提交失败。
-    let attempted = machine.last_switch_time();
-    let at_60 = readings_at(&ledger, MONO + SWITCH_COOLDOWN_MS);
-    assert_eq!(assess(&rt, &at_60, attempted).await, None);
-    assert_eq!(last_decision(&rt), Decision::Hold(Hold::Cooldown));
-    let status = rt.auto_select_status_from(&at_60);
-    assert_eq!(
-        (status.mode, status.reason),
-        ("commitFailed", Some("retryPending"))
-    );
-    // 120 秒后重试；再失败，间隔到 240 秒。
-    let at_120 = readings_at(&ledger, MONO + retry_after_ms(1));
-    let plan = assess(&rt, &at_120, attempted).await.expect("到点重试");
-    assert!(!commit(&rt, &mut machine, &plan, &rejecting, &at_120).await);
-    assert_eq!(rt.auto_select.lock().unwrap().memory.commit_failures(), 2);
-    let at_239 = readings_at(&ledger, at_120.now + retry_after_ms(2) - 1);
-    assert_eq!(assess(&rt, &at_239, machine.last_switch_time()).await, None);
-    // 管理面恢复：到点重试并换成，失败计数清零，状态回到已选定。
-    let at_240 = readings_at(&ledger, at_120.now + retry_after_ms(2));
-    let plan = assess(&rt, &at_240, machine.last_switch_time())
-        .await
-        .unwrap();
-    let api = AttestingManagementApi::new("Node A");
-    assert!(commit(&rt, &mut machine, &plan, &api, &at_240).await);
-    let status = rt.auto_select_status_from(&at_240);
-    assert_eq!(
-        (status.mode, status.reason),
-        ("settled", Some("firstPlacement"))
-    );
-    assert_eq!(status.commit.consecutive_failures, 0);
-    assert_eq!(status.commit.last_failure, None);
-    assert_eq!(exit_on_disk(&rt), "node-c");
-}
-
-/// 起点是阻断哨兵：切到任何节点都要整核重启（阻断由规则级 reject 表达）。后台不重启：候选全被
-/// 剔除，状态为「需重启才能切换」，没有任何 selector 调用。
-#[tokio::test]
-async fn a_start_that_needs_a_restart_is_reported_and_never_restarted_in_the_background() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config(BLOCK_SERVER_ID, Some("sub")));
-    let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80)],
-    );
-    assert_eq!(assess(&rt, &readings(&ledger), None).await, None);
-    assert_eq!(last_decision(&rt), Decision::Hold(Hold::NeedsRestart));
-    let slot = rt.auto_select.lock().unwrap();
-    assert_eq!(slot.evaluation.as_ref().unwrap().counts.needs_restart, 2);
-    assert_eq!(rt.status().pid, 424242);
-    assert_eq!(exit_on_disk(&rt), BLOCK_SERVER_ID);
-}
-
-#[tokio::test]
-async fn production_assessment_invalidates_cached_eligibility_on_exit_or_generation_change() {
-    for change_generation in [false, true] {
-        let (rt, _dir) = test_runtime();
-        let mut initial = auto_config(
-            if change_generation {
-                "node-a"
-            } else {
-                BLOCK_SERVER_ID
-            },
-            Some("sub"),
-        );
-        // A new kernel may change a candidate's routing requirements while keeping
-        // the same selected exit. The generation is then the sole cache-key change.
-        if change_generation {
-            initial["servers"][2] = valid_force_route_wg_node("node-c", "Node C");
-            initial["servers"][2]["subscriptionId"] = serde_json::json!("sub");
-        }
-        initial["servers"][1]["subscriptionId"] = serde_json::json!("other");
-        let cfg = running(&rt, &initial);
-        let ledger = MeasurementLedger::new();
-        round(&ledger, &rt, &cfg, 1, MONO, &[("node-c", 80)]);
-        let mut cache = SelectCache::default();
-        assert!(rt
-            .auto_select_assess(rt.core_generation(), None, &mut cache, &readings(&ledger))
-            .await
-            .is_none());
-        assert_eq!(last_decision(&rt), Decision::Hold(Hold::NeedsRestart));
-        // Same key keeps the actual cached verdicts, rather than a fresh cache per call.
-        assert!(rt
-            .auto_select_assess(rt.core_generation(), None, &mut cache, &readings(&ledger))
-            .await
-            .is_none());
-        if change_generation {
-            rt.gate.bump_generation();
-        }
-        let mut next_config = auto_config(
-            if change_generation {
-                "node-a"
-            } else {
-                DIRECT_SERVER_ID
-            },
-            Some("sub"),
-        );
-        next_config["servers"][1]["subscriptionId"] = serde_json::json!("other");
-        let live = running(&rt, &next_config);
-        round(&ledger, &rt, &live, 2, MONO + 1, &[("node-c", 80)]);
-        let next = rt
-            .auto_select_assess(rt.core_generation(), None, &mut cache, &readings(&ledger))
-            .await;
-        assert_eq!(
-            next.unwrap_or_else(|| panic!(
-                "generation change={change_generation}, decision={:?}",
-                last_decision(&rt)
-            ))
-            .candidate
-            .id,
-            "node-c",
-            "generation change={change_generation}"
-        );
-    }
-}
-
-/// 起点是直连哨兵：`direct` 恒是 `proxy-selector` 的成员，首次落点可经后台事务热切；事务失败时
-/// 恢复的旧成员是 `direct`。
-#[tokio::test]
-async fn a_direct_start_is_placed_by_the_background_transaction() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("__direct__", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80)],
-    );
-    let reads = readings(&ledger);
-    let plan = assess(&rt, &reads, None).await.expect("直连起点可热切");
-    assert_eq!(plan.current_id, "__direct__");
-
-    let rejecting = AttestingManagementApi::rejecting("direct", "Node C");
-    let mut machine = AutoSwitchMachine::new();
-    assert!(!commit(&rt, &mut machine, &plan, &rejecting, &reads).await);
-    assert_eq!(
-        *rejecting.puts.lock().unwrap(),
-        vec![
-            ("proxy-selector".to_string(), "Node C".to_string()),
-            ("proxy-selector".to_string(), "direct".to_string()),
-        ],
-        "失败后恢复到 direct"
-    );
-    assert_eq!(exit_on_disk(&rt), "__direct__");
-
-    let api = AttestingManagementApi::new("direct");
-    assert!(commit(&rt, &mut machine, &plan, &api, &reads).await);
-    assert_eq!(exit_on_disk(&rt), "node-c");
-    assert_eq!(intent_on_disk(&rt).as_deref(), Some("sub"));
-}
-
-/// 择优腿经真实账本读数凑满连胜：当前出口 `node-b` 连续两轮被明显胜过，两轮里领先的可以是同一个
-/// 节点；只胜一轮不换；当前出口的读数停在旧的一轮时（只重测了候选）不计胜。
-#[tokio::test]
-async fn the_select_leg_takes_a_better_node_after_two_comparable_rounds() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-b", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 300), ("node-c", 100)],
-    );
-    assert_eq!(assess(&rt, &readings(&ledger), None).await, None);
-    assert_eq!(
-        last_decision(&rt),
-        Decision::Hold(Hold::Pending(Lacking::Streak))
-    );
-    // 半小时后只有候选被单独重测：当前出口没有同轮的读数可比。
-    let later = MONO + 30 * MINUTE;
-    round(&ledger, &rt, &cfg, 2, later, &[("node-c", 100)]);
-    assert_eq!(assess(&rt, &readings_at(&ledger, later), None).await, None);
-    assert_eq!(
-        last_decision(&rt),
-        Decision::Hold(Hold::Pending(Lacking::Pair))
-    );
-    // 当前出口也被重测（同一轮）：第二胜，换。
-    round(&ledger, &rt, &cfg, 2, later, &[("node-b", 300)]);
-    let plan = assess(&rt, &readings_at(&ledger, later), None)
-        .await
-        .expect("两轮可比的明显更优");
-    assert_eq!(
-        (plan.candidate.id.as_str(), plan.cause),
-        ("node-c", Cause::Better)
-    );
-}
-
-// ── 与手动选择、订阅范围、平台闸的边界 ────────────────────────────────────────
-
-/// 竞态：评估已给出换点、提交之前用户点了节点 —— 点的就是当前出口，实际出口没变、只有意图
-/// 回到了手动（经真实的 `server:switch` 落盘）。这笔换点在落盘那一刻让位：不发任何 selector
-/// 调用，出口与手动意图都不动；让位不计入提交失败。
-#[tokio::test]
-async fn a_manual_selection_between_assess_and_commit_voids_the_commit() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80)],
-    );
-    let reads = readings(&ledger);
-    let plan = assess(&rt, &reads, None).await.unwrap();
-
-    let (_, exit_changed, _, intent_cleared) = server_switch_core(
-        &rt.config,
-        "node-a",
-        |_| Ok(()),
-        || rt.register_selector_intent(),
-    )
-    .expect("用户重选当前出口");
-    assert!(!exit_changed && intent_cleared);
-
-    let api = AttestingManagementApi::new("Node A");
-    let mut machine = AutoSwitchMachine::new();
-    assert!(!commit(&rt, &mut machine, &plan, &api, &reads).await);
-    assert!(
-        api.puts.lock().unwrap().is_empty(),
-        "让位发生在任何 selector 调用之前"
-    );
-    assert_eq!(exit_on_disk(&rt), "node-a");
-    assert_eq!(intent_on_disk(&rt), None);
-    let slot = rt.auto_select.lock().unwrap();
-    assert_eq!(slot.select_switches, 0);
-    assert_eq!(slot.memory.commit_failures(), 0);
-    assert_eq!(
-        slot.last_commit_failure.as_ref().map(|f| f.outcome),
-        Some("commitYielded")
-    );
-}
-
-/// 提交事务落盘时刻的意图复核：凭「自动（订阅甲）」发起的换点，在意图已是手动、或已指向别的
-/// 订阅时让位；手动意图下的故障切换（不带这项要求）不受影响。
-#[tokio::test]
-async fn the_transaction_yields_when_the_auto_intent_it_acted_on_is_gone() {
-    let candidate = RuntimeCandidate {
-        id: "node-b".to_string(),
-        name: "Node B".to_string(),
-        tag: "Node B".to_string(),
-    };
-    for (intent, required, expected) in [
-        (None, Some("sub"), AutoHotSwitchOutcome::Superseded),
-        (Some("other"), Some("sub"), AutoHotSwitchOutcome::Superseded),
-        (Some("sub"), Some("sub"), AutoHotSwitchOutcome::Applied),
-        (None, None, AutoHotSwitchOutcome::Applied),
-        (Some("sub"), None, AutoHotSwitchOutcome::Applied),
-    ] {
-        let (rt, _dir) = test_runtime();
-        let cfg = running(&rt, &auto_config("node-a", intent));
-        let fingerprint = crate::runtime::node_fingerprints::measurement_table_json(&cfg)
-            .remove("node-b")
-            .unwrap();
-        let api = AttestingManagementApi::new("Node A");
-        let outcome = rt
-            .auto_hot_switch_transaction_with_api(
-                rt.core_generation(),
-                "node-a",
-                &candidate,
-                &fingerprint,
-                required,
-                &api,
-            )
-            .await;
-        assert_eq!(outcome, expected, "意图 {intent:?}，要求 {required:?}");
-        assert_eq!(
-            intent_on_disk(&rt).as_deref(),
-            intent,
-            "事务只改实际出口，从不动意图"
-        );
-        let moved = expected == AutoHotSwitchOutcome::Applied;
-        assert_eq!(exit_on_disk(&rt), if moved { "node-b" } else { "node-a" });
-        assert_eq!(api.puts.lock().unwrap().is_empty(), !moved);
-    }
-}
-
-/// iOS 的意图已开放，但后台择优仍须前台信号和当前前台代次的测量。
-/// 显式路径保持既有用户操作契约；任何路径都不能把旧代次读数当候选。
-#[tokio::test]
-async fn ios_auto_intent_preserves_foreground_and_receipt_epoch_gates() {
-    let (rt, _dir) = test_runtime_on(Platform::Ios);
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 120), ("node-c", 80)]);
-    let mut reads = readings(&ledger);
-    assert!(rt.auto_select_active());
-    assert_eq!(rt.auto_select_closed(), None);
-
-    reads.signals.foreground = false;
-    assert!(assess(&rt, &reads, None).await.is_none());
-    assert_eq!(last_decision(&rt), Decision::NotEvaluated(Gate::Background));
-    let status = rt.auto_select_status_from(&reads);
-    assert_eq!(
-        (status.intent.mode, status.mode, status.reason),
-        ("auto", "notEvaluated", Some("background"))
-    );
-    assert_eq!(
-        rt.auto_select_explicit_from(&cfg, "sub", &reads),
-        Decision::Switch {
-            target: "node-c".to_string(),
-            latency_ms: 80,
-            cause: Cause::FirstPlacement,
-        }
-    );
-
-    reads.signals.foreground = true;
-    assert!(assess(&rt, &reads, None).await.is_some());
-    ledger.set_foreground_epoch(1);
-    assert!(assess(&rt, &reads, None).await.is_none());
-    assert_eq!(
-        last_decision(&rt),
-        Decision::NotEvaluated(Gate::WaitingFirstRound)
-    );
-    assert!(rt.auto_select_fallback_from(&cfg, &reads).is_none());
-    assert_eq!(
-        rt.auto_select_explicit_from(&cfg, "sub", &reads),
-        Decision::Hold(Hold::NoCandidates)
-    );
-    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 120), ("node-c", 80)]);
-    let plan = assess(&rt, &reads, None)
-        .await
-        .expect("新代次结果允许前台择优");
-    assert_eq!(plan.candidate.id, "node-c");
-    assert_eq!(exit_on_disk(&rt), "node-a", "评估不提交出口");
-
-    let (android, _dir) = test_runtime_on(Platform::Android);
-    running(&android, &auto_config("node-a", Some("sub")));
-    assert!(android.auto_select_active());
-    assert_eq!(android.auto_select_closed(), None);
-    assert_eq!(
-        Switches::PRODUCTION,
-        Switches {
-            master: true,
-            better_leg: true
-        }
-    );
-}
-
-/// 没开自动选择的用户：择优腿每次被唤醒都什么也不做 —— 不留评估、不发状态事件，故障腿不因它
-/// 启用；故障腿换点成功之后也不往择优的状态里记任何东西。
-#[tokio::test]
-async fn a_manual_intent_leaves_no_trace() {
-    let (rt, _dir) = test_runtime();
-    let events = Arc::new(Mutex::new(Vec::new()));
-    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
-        auto_select_status: Arc::clone(&events),
-        ..Default::default()
-    }));
-    let cfg = running(&rt, &auto_config("node-a", None));
-    let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80)],
-    );
-    for _ in 0..3 {
-        assert_eq!(assess(&rt, &readings(&ledger), None).await, None);
-    }
-    assert!(!rt.auto_select_active());
-    // 故障腿在手动意图下换了点：`auto_period_ms` 为空。
-    rt.auto_select_note_failover(None, failover_record("node-a", "node-b"), MONO);
-    let slot = rt.auto_select.lock().unwrap();
-    assert_eq!(slot.evaluation, None);
-    assert_eq!(slot.last_switch, None);
-    assert_eq!((slot.failover_switches, slot.select_switches), (0, 0));
-    assert_eq!(
-        slot.memory,
-        crate::runtime::auto_select::Memory::default(),
-        "手动意图下不留任何择优状态"
-    );
-    assert_eq!(*rt.auto_select_announced.lock().unwrap(), None);
-    assert!(events.lock().unwrap().is_empty());
-    assert_eq!(rt.config.current().unwrap(), cfg);
 }
 
 fn failover_record(from: &str, to: &str) -> SwitchRecord {
@@ -1119,452 +62,17 @@ fn failover_record(from: &str, to: &str) -> SwitchRecord {
     }
 }
 
-/// 自动意图下故障腿把出口从 `node-c` 换到了 `node-b`：记一次换点，并把 `node-c` 暂时排除。
-/// 此后 `node-c` 的测速结果再好，择优腿也不把它当挑战者换回去；状态里读得出它被排除、还剩多久。
-/// 排除期满后它才重新被考虑。
-#[tokio::test]
-async fn a_node_left_by_the_failover_leg_is_not_switched_back_to_while_barred() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-b", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    let period = 30 * MINUTE;
-    rt.auto_select_note_failover(Some(period), failover_record("node-c", "node-b"), MONO);
-    {
-        let slot = rt.auto_select.lock().unwrap();
-        assert_eq!(slot.failover_switches, 1);
-        assert!(slot.memory.is_barred("node-c", MONO));
+fn explicit_placement(rt: &ProxyRuntime, target: &str) -> Placement {
+    Placement {
+        from: Some("node-a".into()),
+        to: target.into(),
+        latency_ms: 20,
+        cause: Cause::Better,
+        exit_changed: true,
+        intent_generation: rt.register_selector_intent(),
     }
-    // 两轮里 node-c 都远好于当前出口。
-    for (run, at) in [(1, MONO + 11 * MINUTE), (2, MONO + 41 * MINUTE)] {
-        round(
-            &ledger,
-            &rt,
-            &cfg,
-            run,
-            at,
-            &[("node-b", 400), ("node-c", 60)],
-        );
-        assert_eq!(assess(&rt, &readings_at(&ledger, at), None).await, None);
-        assert_eq!(last_decision(&rt), Decision::Hold(Hold::Settled));
-    }
-    let status = rt.auto_select_status_from(&readings_at(&ledger, MONO + 41 * MINUTE));
-    assert_eq!(status.barred.len(), 1);
-    assert_eq!(status.barred[0].server_id, "node-c");
-    assert_eq!(status.barred[0].remaining_ms, 4 * period - 41 * MINUTE);
-    assert_eq!(status.challenger, None);
-
-    // 排除期满之后的两轮：照常计胜、换回。
-    let after = MONO + 4 * period;
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        3,
-        after,
-        &[("node-b", 400), ("node-c", 60)],
-    );
-    assert_eq!(assess(&rt, &readings_at(&ledger, after), None).await, None);
-    assert_eq!(
-        last_decision(&rt),
-        Decision::Hold(Hold::Pending(Lacking::Streak))
-    );
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        4,
-        after + period,
-        &[("node-b", 400), ("node-c", 60)],
-    );
-    let plan = assess(&rt, &readings_at(&ledger, after + period), None)
-        .await
-        .expect("排除期满后可以换回");
-    assert_eq!(plan.candidate.id, "node-c");
 }
 
-/// 状态事件：结论变了发一次，同一结论的重复评估不重发（「已持续多久」这类自己会走的量不算
-/// 变化）；意图回到手动后发一次手动态并清掉残留。
-#[tokio::test]
-async fn the_status_event_fires_on_change_only() {
-    let (rt, _dir) = test_runtime();
-    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
-    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
-        auto_select_status: Arc::clone(&events),
-        ..Default::default()
-    }));
-    running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    for beat in 0..3 {
-        assess(
-            &rt,
-            &readings_at(&ledger, MONO + beat * HEARTBEAT_INTERVAL_MS),
-            None,
-        )
-        .await;
-    }
-    {
-        let seen = events.lock().unwrap();
-        assert_eq!(seen.len(), 1, "三次评估结论相同，只发一次");
-        assert_eq!(seen[0]["intent"]["subscriptionId"], "sub");
-        assert_eq!(seen[0]["exit"]["inSubscription"], false);
-        assert_eq!(seen[0]["flags"]["exitOutsideSubscription"], true);
-    }
-
-    server_switch_core(
-        &rt.config,
-        "node-a",
-        |_| Ok(()),
-        || rt.register_selector_intent(),
-    )
-    .unwrap();
-    let reads = readings(&ledger);
-    assess(&rt, &reads, None).await;
-    assess(&rt, &reads, None).await;
-    let seen = events.lock().unwrap();
-    assert_eq!(seen.len(), 2);
-    assert_eq!(seen[1]["mode"], "manual");
-    assert_eq!(seen[1]["lastEvaluation"], Value::Null);
-    assert_eq!(rt.auto_select.lock().unwrap().evaluation, None);
-}
-
-/// 并发播报不乱序：取状态、比对、发射在同一把锁里。多个线程同时播报、其间状态在变，收到的
-/// 事件序列里每个状态至多出现一次连续段 —— 不会出现「新状态之后又来一条旧状态」。
-#[test]
-fn concurrent_announcements_never_deliver_an_older_status_after_a_newer_one() {
-    let (rt, _dir) = test_runtime();
-    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
-    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
-        auto_select_status: Arc::clone(&events),
-        ..Default::default()
-    }));
-    running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger: &'static MeasurementLedger = Box::leak(Box::new(MeasurementLedger::new()));
-    std::thread::scope(|scope| {
-        for _ in 0..4 {
-            scope.spawn(|| {
-                for _ in 0..200 {
-                    rt.auto_select_announce_from(&readings(ledger));
-                }
-            });
-        }
-        scope.spawn(|| {
-            for count in 1..=50 {
-                rt.auto_select.lock().unwrap().failover_switches = count;
-                rt.auto_select_announce_from(&readings(ledger));
-            }
-        });
-    });
-    let seen: Vec<u64> = events
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|status| status["counters"]["failoverSwitches"].as_u64().unwrap())
-        .collect();
-    assert!(seen.len() >= 2);
-    assert!(
-        seen.windows(2).all(|pair| pair[0] < pair[1]),
-        "计数只增：每个值恰好发一次、按序到达，{seen:?}"
-    );
-}
-
-/// 接线（源码级）：故障腿在自动意图下把候选收窄到该订阅、并把那个订阅交给提交事务复核；
-/// 心跳里故障腿在自动意图生效时视同启用；换点成功后只在自动意图下记择优的状态。这几处的效果
-/// 要真起核真探测才观测得到，这里守的是取材与传参没有被改掉；候选范围与记账本身的行为由别的
-/// 用例守。
-#[test]
-fn the_failover_leg_is_scoped_and_enabled_by_an_effective_auto_intent() {
-    let source = module_code("runtime/proxy");
-    let body = method_body(
-        &source,
-        "    async fn do_switch_io(self: &Arc<Self>, machine: &mut AutoSwitchMachine, \
-         reason: &str) -> bool {",
-    );
-    let scope = body
-        .find("auto_select::effective_subscription(")
-        .expect("候选范围取自生效的自动意图");
-    let plan = body.find("plan_runtime_candidates(").expect("候选规划锚点");
-    assert!(scope < plan);
-    assert!(
-        body.contains("scope.as_ref(),"),
-        "候选规划必须带上范围；传 None 即回到全部节点"
-    );
-    let squeezed: String = body.split_whitespace().collect();
-    assert!(
-        squeezed.contains("expected_fingerprint,auto_subscription,).await"),
-        "提交事务必须拿到发起所凭的订阅，否则手动选择之后在飞的故障切换仍会换点"
-    );
-    assert!(
-        squeezed.contains("self.auto_select_note_failover(auto_subscription.map(|subscription|{"),
-        "换点成功后的记账以「自动意图是否生效」为条件"
-    );
-    assert!(
-        !body.contains("auto_select_slot()"),
-        "故障腿不直接写择优的状态槽"
-    );
-    let beat = method_body(&source, "    async fn failover_beat(");
-    assert!(beat
-        .contains("let want_enabled = self.auto_switch_enabled() || self.auto_select_active();"));
-}
-
-/// 意图键不进内核配置：只差一个意图键的两份配置，解析出的 `UserConfig` 逐字段相同（生成内核配置
-/// 的全部输入），对运行核的切换判定是「无操作」—— 写入意图既不重新生成配置，也不触发热切或重启。
-#[test]
-fn the_intent_key_never_reaches_the_kernel_config() {
-    let (rt, _dir) = test_runtime();
-    let manual = running(&rt, &auto_config("node-b", None));
-    let mut auto = manual.clone();
-    auto["selectionIntent"] = polaris_store::selection_intent_auto("sub");
-    let typed = |config: &Value| {
-        serde_json::to_value(serde_json::from_value::<UserConfig>(config.clone()).unwrap()).unwrap()
-    };
-    assert_eq!(typed(&manual), typed(&auto));
-    assert!(!UserConfig::FIELD_NAMES.contains(&polaris_store::SELECTION_INTENT_KEY));
-    let classified = rt.classify_staged(&auto);
-    assert_eq!(
-        (classified.decision, classified.restart_required),
-        ("noOp", false)
-    );
-    // 对照：换一个真的进内核配置的键，判定就不是无操作。
-    let mut other = manual;
-    other["mixedPort"] = serde_json::json!(7999);
-    assert_ne!(rt.classify_staged(&other).decision, "noOp");
-}
-
-// ── 两条显式命令的落盘：目标取自同一个裁决，账本读数是真的 ────────────────────
-
-fn enable(
-    rt: &ProxyRuntime,
-    reads: &SelectReadings<'_>,
-) -> Result<(Value, Option<crate::commands::server::Placement>), AutoSelectError> {
-    auto_select_enable_core(
-        &rt.config,
-        "sub",
-        rt.auto_select_closed(),
-        |cfg, subscription| rt.auto_select_explicit_from(cfg, subscription, reads),
-        |_| Ok(()),
-        || rt.register_selector_intent(),
-    )
-}
-
-fn switch_now(
-    rt: &ProxyRuntime,
-    reads: &SelectReadings<'_>,
-) -> Result<(Value, crate::commands::server::Placement), AutoSelectError> {
-    auto_select_switch_now_core(
-        &rt.config,
-        rt.auto_select_closed(),
-        |cfg, subscription| rt.auto_select_explicit_from(cfg, subscription, reads),
-        |_| Ok(()),
-        || rt.register_selector_intent(),
-    )
-}
-
-/// 当前出口已是订阅成员时点「自动选择」：只写意图，出口不动 —— 不论它是订阅里最快的、最慢的，
-/// 还是没有结果；连点多少次都一样。「立即切换」在出口已是最快的那个时拒绝，同样不动出口。
-#[tokio::test]
-async fn enabling_auto_on_a_member_exit_never_moves_it() {
-    for (b_ms, c_ms, label) in [
-        (40, 300, "当前出口是订阅里最快的"),
-        (300, 40, "当前出口是订阅里最慢的"),
-    ] {
-        let (rt, _dir) = test_runtime();
-        let cfg = running(&rt, &auto_config("node-b", None));
-        let ledger = MeasurementLedger::new();
-        round(
-            &ledger,
-            &rt,
-            &cfg,
-            1,
-            MONO,
-            &[("node-b", b_ms), ("node-c", c_ms)],
-        );
-        let reads = readings(&ledger);
-        for attempt in 0..3 {
-            let (saved, placement) = enable(&rt, &reads).expect("写意图");
-            assert_eq!(placement, None, "{label}，第 {attempt} 次");
-            assert_eq!(saved["selectedServerId"], "node-b", "{label}");
-            assert_eq!(intent_on_disk(&rt).as_deref(), Some("sub"));
-        }
-        assert!(saved_has_no_recent(&rt));
-        if b_ms < c_ms {
-            // 出口已是最快的：立即切换没有落点。
-            for _ in 0..2 {
-                assert_eq!(
-                    switch_now(&rt, &reads).unwrap_err(),
-                    AutoSelectError::NoTarget("settled"),
-                    "{label}"
-                );
-                assert_eq!(exit_on_disk(&rt), "node-b");
-            }
-        } else {
-            // 出口明显更慢，但只有一轮读数：连胜没凑满，立即切换同样不换。
-            assert_eq!(
-                switch_now(&rt, &reads).unwrap_err(),
-                AutoSelectError::NoTarget("challengerPending")
-            );
-            assert_eq!(exit_on_disk(&rt), "node-b");
-        }
-    }
-    // 成员出口没有任何结果：点「自动选择」也只写意图。
-    let (rt, _dir) = test_runtime();
-    running(&rt, &auto_config("node-b", None));
-    let ledger = MeasurementLedger::new();
-    let (saved, placement) = enable(&rt, &readings(&ledger)).unwrap();
-    assert_eq!(
-        (placement, saved["selectedServerId"].as_str()),
-        (None, Some("node-b"))
-    );
-}
-
-fn saved_has_no_recent(rt: &ProxyRuntime) -> bool {
-    rt.config
-        .current()
-        .unwrap()
-        .get("recentServerIds")
-        .is_none()
-}
-
-/// 当前出口不属于该订阅时点「自动选择」：有新鲜候选即在同一次写里落到延迟最小者（首次落点），
-/// 没有则只写意图、出口不动（不取成员表第一个）。落点不进最近节点列表。核不在运行时不落点。
-#[tokio::test]
-async fn enabling_auto_from_outside_the_subscription_places_on_the_fastest_member() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-a", None));
-    let ledger = MeasurementLedger::new();
-    let (saved, placement) = enable(&rt, &readings(&ledger)).expect("只写意图");
-    assert_eq!(placement, None);
-    assert_eq!(saved["selectedServerId"], "node-a");
-
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80), ("node-a", 5)],
-    );
-    let (saved, placement) = enable(&rt, &readings(&ledger)).expect("写意图并落点");
-    let placement = placement.expect("首次落点");
-    assert_eq!(
-        (
-            placement.to.as_str(),
-            placement.latency_ms,
-            placement.cause,
-            placement.from.as_deref(),
-            placement.exit_changed
-        ),
-        ("node-c", 80, Cause::FirstPlacement, Some("node-a"), true)
-    );
-    assert_eq!(saved["selectedServerId"], "node-c");
-    assert_eq!(intent_on_disk(&rt).as_deref(), Some("sub"));
-    assert!(saved_has_no_recent(&rt));
-    // 再点一次：出口已在订阅内，不再动。
-    assert_eq!(enable(&rt, &readings(&ledger)).unwrap().1, None);
-    assert_eq!(exit_on_disk(&rt), "node-c");
-
-    // 核不在运行：账本里没有当前结果，只写意图。
-    let (stopped, _dir) = test_runtime();
-    stopped
-        .config
-        .save_full(&auto_config("node-a", None))
-        .unwrap();
-    let (saved, placement) = enable(&stopped, &readings(&ledger)).unwrap();
-    assert_eq!(
-        (placement, saved["selectedServerId"].as_str()),
-        (None, Some("node-a"))
-    );
-}
-
-/// 「立即切换」给出落点的情形，目标都是裁决认定的那一个：后台因须整核重启换不了的首次落点
-/// （起点是阻断）；当前出口测速失败；当前出口没有新鲜结果；当前出口已连续两轮被明显胜过。
-/// 意图保留。意图是手动时拒绝。
-#[tokio::test]
-async fn switch_now_goes_exactly_where_the_decision_points() {
-    // 后台报「需重启才能切换」的那个场景：显式路径换得过去。
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config(BLOCK_SERVER_ID, Some("sub")));
-    let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80)],
-    );
-    let reads = readings(&ledger);
-    assert_eq!(assess(&rt, &reads, None).await, None);
-    assert_eq!(last_decision(&rt), Decision::Hold(Hold::NeedsRestart));
-    let (saved, placement) = switch_now(&rt, &reads).expect("立即切换");
-    assert_eq!(
-        (placement.to.as_str(), placement.cause),
-        ("node-c", Cause::FirstPlacement)
-    );
-    assert_eq!(saved["selectedServerId"], "node-c");
-    assert_eq!(
-        intent_on_disk(&rt).as_deref(),
-        Some("sub"),
-        "显式的立即切换不是手动选择"
-    );
-
-    // 当前出口测速失败（一次即可）与没有新鲜结果。
-    for (seed, cause) in [(true, Cause::CurrentFailed), (false, Cause::Requested)] {
-        let (rt, _dir) = test_runtime();
-        let cfg = running(&rt, &auto_config("node-b", Some("sub")));
-        let ledger = MeasurementLedger::new();
-        if seed {
-            record_config(
-                &ledger,
-                &rt,
-                &cfg,
-                "node-b",
-                Err(MeasureFailure::new(FailPhase::Measure, FailKind::Timeout)),
-                identity(&rt, &cfg, 1),
-                MONO,
-            );
-        }
-        round(&ledger, &rt, &cfg, 1, MONO, &[("node-c", 80)]);
-        let (_, placement) = switch_now(&rt, &readings(&ledger)).expect("立即切换");
-        assert_eq!((placement.to.as_str(), placement.cause), ("node-c", cause));
-    }
-
-    // 已凑满连胜的更优者。
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-b", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    for (run, at) in [(1, MONO), (2, MONO + 30 * MINUTE)] {
-        round(
-            &ledger,
-            &rt,
-            &cfg,
-            run,
-            at,
-            &[("node-b", 300), ("node-c", 100)],
-        );
-        if run == 1 {
-            assert_eq!(assess(&rt, &readings_at(&ledger, at), None).await, None);
-        }
-    }
-    let (_, placement) =
-        switch_now(&rt, &readings_at(&ledger, MONO + 30 * MINUTE)).expect("立即切换");
-    assert_eq!(
-        (placement.to.as_str(), placement.cause),
-        ("node-c", Cause::Better)
-    );
-
-    // 意图是手动。
-    let (rt, _dir) = test_runtime();
-    running(&rt, &auto_config("node-b", None));
-    let ledger = MeasurementLedger::new();
-    assert_eq!(
-        switch_now(&rt, &readings(&ledger)).unwrap_err(),
-        AutoSelectError::NotAuto
-    );
-}
-
-// ── 心跳循环：何时醒、醒了做什么（假时钟）──────────────────────────────────────
-
-/// 记录两条腿各自被调用的时刻（距循环起点的毫秒）。故障腿每拍耗时 `work`。
 struct RecordingLegs {
     started: tokio::time::Instant,
     work: Duration,
@@ -1771,14 +279,56 @@ fn the_production_heartbeat_runs_this_loop() {
     }
 }
 
-fn explicit_placement(rt: &ProxyRuntime, target: &str) -> Placement {
-    Placement {
-        from: Some("node-a".into()),
-        to: target.into(),
-        latency_ms: 20,
-        cause: Cause::Better,
-        exit_changed: true,
-        intent_generation: rt.register_selector_intent(),
+// Explicit barriers are coordinator inputs, independent of the retired ranker.
+fn failover_fixture() -> (
+    Arc<ProxyRuntime>,
+    TestDir,
+    Value,
+    Vec<crate::runtime::auto_switch::RuntimeCandidate>,
+    BTreeSet<String>,
+) {
+    let (rt, dir) = test_runtime();
+    let cfg = running(&rt, &auto_config("node-a", None));
+    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
+    let barred = BTreeSet::from(["node-c".to_owned()]);
+    let snapshot = rt.switch_snapshot.read().unwrap().clone().unwrap();
+    let scope = BTreeSet::from(["node-b".to_owned(), "node-c".to_owned()]);
+    let mut plan = crate::runtime::auto_switch::plan_runtime_candidates(
+        &cfg,
+        Some("node-a"),
+        &snapshot.id_to_tag,
+        &snapshot.measurement_fingerprints,
+        &crate::runtime::node_fingerprints::measurement_table_json(&cfg),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        Some(&scope),
+    );
+    assert!(rt.retain_hot_switchable_candidates(rt.core_generation(), &cfg, &mut plan));
+    assert_eq!(plan.candidates.len(), 2);
+    (rt, dir, cfg, plan.candidates, barred)
+}
+
+fn failover_batch(
+    entries: &[(&str, crate::runtime::auto_switch::CandidateProbe)],
+) -> crate::commands::speedtest::RuntimeProbeBatch {
+    crate::commands::speedtest::RuntimeProbeBatch::Completed(
+        entries
+            .iter()
+            .map(|(id, outcome)| (id.to_string(), *outcome))
+            .collect(),
+    )
+}
+
+fn failover_ids(input: &[(String, String)]) -> Vec<String> {
+    input.iter().map(|(id, _)| id.clone()).collect()
+}
+
+fn failover_best(verdict: Option<crate::runtime::auto_switch::ProbeVerdict>) -> (String, u32) {
+    match verdict {
+        Some(crate::runtime::auto_switch::ProbeVerdict::Best(best)) => {
+            (best.id, best.latency_ms.unwrap())
+        }
+        other => panic!("expected a measured candidate, got {other:?}"),
     }
 }
 
@@ -1888,502 +438,6 @@ async fn explicit_placement_confirmed_restart_records_the_accepted_switch() {
     assert_eq!(slot.last_switch.as_ref().unwrap().to_id, BLOCK_SERVER_ID);
     assert!(sink.calls().is_empty());
     assert!(rt.pending_force_restart.read().unwrap().is_some());
-}
-
-#[tokio::test]
-async fn production_intent_arming_clears_evaluation_and_wakes_the_heartbeat() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    round(
-        &ledger,
-        &rt,
-        &cfg,
-        1,
-        MONO,
-        &[("node-b", 120), ("node-c", 80)],
-    );
-    assert!(assess(&rt, &readings(&ledger), None).await.is_some());
-    assert!(rt.auto_select.lock().unwrap().evaluation.is_some());
-    rt.auto_select_armed();
-    {
-        let slot = rt.auto_select.lock().unwrap();
-        assert!(slot.evaluation.is_none());
-        assert!(slot.intent_set_mono.is_some());
-    }
-    tokio::time::timeout(Duration::from_secs(1), rt.auto_select_wake.notified())
-        .await
-        .expect("writing an automatic intent must wake the live heartbeat");
-    assert!(assess(&rt, &readings(&ledger), None).await.is_some());
-    rt.auto_select_disarmed();
-    let slot = rt.auto_select.lock().unwrap();
-    assert!(slot.evaluation.is_none());
-    assert!(slot.intent_set_mono.is_none());
-}
-
-#[tokio::test]
-async fn production_failover_bookkeeping_starts_better_leg_dwell() {
-    let (rt, _dir) = test_runtime();
-    let cfg = running(&rt, &auto_config("node-b", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    // The failed former node is outside this subscription, leaving C eligible.
-    rt.auto_select_note_failover(
-        Some(30 * MINUTE),
-        failover_record("failed-old", "node-b"),
-        MONO,
-    );
-    for (run, at) in [(1, MONO), (2, MONO + 5 * MINUTE)] {
-        round(
-            &ledger,
-            &rt,
-            &cfg,
-            run,
-            at,
-            &[("node-b", 400), ("node-c", 10)],
-        );
-        assert!(assess(&rt, &readings_at(&ledger, at), None).await.is_none());
-    }
-    assert_eq!(
-        last_decision(&rt),
-        Decision::Hold(Hold::Pending(Lacking::Dwell))
-    );
-    assert_eq!(rt.auto_select.lock().unwrap().failover_switches, 1);
-}
-
-#[test]
-fn production_refresh_fallback_uses_current_receipts_and_surviving_members() {
-    let (rt, _dir) = test_runtime_on(Platform::Linux);
-    let mut config = auto_config("node-a", Some("sub"));
-    // Unique IDs isolate this production-global ledger fixture from parallel tests.
-    config["servers"][1]["id"] = serde_json::json!("me04-refresh-slow");
-    config["servers"][2]["id"] = serde_json::json!("me04-refresh-fast");
-    let saved = running(&rt, &config);
-    let ledger = crate::runtime::measurement_ledger::global();
-    for (id, latency) in [("me04-refresh-slow", 80), ("me04-refresh-fast", 20)] {
-        let mut receipt = identity(&rt, &saved, 1);
-        receipt.measured_at = now_ms();
-        assert!(record_config(
-            ledger,
-            &rt,
-            &saved,
-            id,
-            Ok(latency),
-            receipt,
-            crate::runtime::measurement_ledger::mono_now_ms()
-        ));
-    }
-    assert_eq!(
-        rt.auto_select_fallback(&saved).unwrap().node_id,
-        "me04-refresh-fast"
-    );
-    rt.auto_select_note_failover(
-        Some(30 * MINUTE),
-        failover_record("me04-refresh-fast", "node-a"),
-        crate::runtime::proxy::lifecycle::monotonic_now_ms(),
-    );
-    assert_eq!(
-        rt.auto_select_fallback(&saved).unwrap().node_id,
-        "me04-refresh-slow",
-        "the live production wrapper must consume the bar, not only the injected seam"
-    );
-    let mut refreshed = saved;
-    refreshed["servers"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|node| node["id"] != "me04-refresh-fast");
-    assert_eq!(
-        rt.auto_select_fallback(&refreshed).unwrap().node_id,
-        "me04-refresh-slow"
-    );
-    refreshed.as_object_mut().unwrap().remove("selectionIntent");
-    assert!(rt.auto_select_fallback(&refreshed).is_none());
-}
-
-// Refresh uses the same production entry, with only the ledger and clocks injected.
-fn refresh_fixture() -> (Arc<ProxyRuntime>, TestDir, Value, MeasurementLedger) {
-    let (rt, dir) = test_runtime_on(Platform::Linux);
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
-    (rt, dir, cfg, ledger)
-}
-
-fn refresh_receipts(
-    rt: &ProxyRuntime,
-    cfg: &Value,
-    ledger: &MeasurementLedger,
-    run: u64,
-    results: &[(&str, u32)],
-) {
-    for (node, latency) in results {
-        let receipt = identity(rt, cfg, run);
-        assert!(record_config(
-            ledger,
-            rt,
-            cfg,
-            node,
-            Ok(*latency),
-            receipt,
-            MONO
-        ));
-    }
-}
-
-#[test]
-fn refresh_fallback_prefers_unbarred_eligible_nodes_and_restores_them_at_expiry() {
-    let (rt, _dir, cfg, ledger) = refresh_fixture();
-    let period = 30 * MINUTE;
-    rt.auto_select_note_failover(Some(period), failover_record("node-c", "node-a"), MONO);
-    let end = MONO + 4 * period;
-    for at in [MONO, end - 1] {
-        assert_eq!(
-            rt.auto_select_fallback_from(&cfg, &readings_at(&ledger, at))
-                .unwrap()
-                .node_id,
-            "node-b",
-            "the fresh fastest node is barred, so prefer the fresh slower node"
-        );
-    }
-    assert_eq!(
-        rt.auto_select_fallback_from(&cfg, &readings_at(&ledger, end))
-            .unwrap()
-            .node_id,
-        "node-c",
-        "the bar uses the injected monotonic clock, independently of receipt freshness"
-    );
-    assert_eq!(
-        rt.config.current().unwrap(),
-        cfg,
-        "fallback must not write config or intent"
-    );
-    let slot = rt.auto_select.lock().unwrap();
-    assert_eq!((slot.failover_switches, slot.select_switches), (1, 0));
-    assert_eq!(slot.last_switch.as_ref().unwrap().to_id.as_str(), "node-a");
-}
-
-#[test]
-fn refresh_fallback_rescues_a_barred_node_only_when_other_nodes_are_ineligible() {
-    for other in ["deleted", "expired", "changed", "failed", "unmeasured"] {
-        let (rt, _dir, mut cfg, ledger) = refresh_fixture();
-        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-        match other {
-            "deleted" => cfg["servers"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|node| node["id"] != "node-b"),
-            "changed" => cfg["servers"][1]["port"] = serde_json::json!(19001),
-            "expired" => {
-                let mut old = identity(&rt, &cfg, 2);
-                old.measured_at = WALL - 61 * MINUTE;
-                assert!(record_config(
-                    &ledger,
-                    &rt,
-                    &cfg,
-                    "node-b",
-                    Ok(1),
-                    old,
-                    MONO
-                ));
-            }
-            "failed" => {
-                assert!(record_config(
-                    &ledger,
-                    &rt,
-                    &cfg,
-                    "node-b",
-                    Err(MeasureFailure::new(FailPhase::Measure, FailKind::Timeout)),
-                    identity(&rt, &cfg, 2),
-                    MONO
-                ));
-            }
-            "unmeasured" => {
-                cfg["servers"][1]["id"] = serde_json::json!("never-measured");
-            }
-            _ => unreachable!(),
-        }
-        assert_eq!(
-            rt.auto_select_fallback_from(&cfg, &readings(&ledger))
-                .unwrap()
-                .node_id,
-            "node-c",
-            "{other}: no eligible unbarred node remains"
-        );
-    }
-}
-
-#[test]
-fn refresh_fallback_never_rescues_an_ineligible_barred_node() {
-    for invalid in [
-        "expired",
-        "changed",
-        "deleted",
-        "generation",
-        "stopped",
-        "mismatch",
-        "disconnected",
-    ] {
-        let (rt, _dir, mut cfg, ledger) = refresh_fixture();
-        cfg["servers"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|node| node["id"] != "node-b");
-        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-        match invalid {
-            "expired" => {
-                let mut old = identity(&rt, &cfg, 2);
-                old.measured_at = WALL - 61 * MINUTE;
-                assert!(record_config(
-                    &ledger,
-                    &rt,
-                    &cfg,
-                    "node-c",
-                    Ok(1),
-                    old,
-                    MONO
-                ));
-            }
-            "changed" => cfg["servers"][1]["port"] = serde_json::json!(19002),
-            "deleted" => cfg["servers"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|node| node["id"] != "node-c"),
-            "generation" => {
-                rt.gate.bump_generation();
-            }
-            "stopped" => rt.status.write().unwrap().running = false,
-            "mismatch" | "disconnected" => {
-                let mut bad = identity(&rt, &cfg, 2);
-                if invalid == "mismatch" {
-                    bad.binding = Some(BindingVerdict::Mismatch);
-                } else {
-                    bad.instance = CoreInstance::Temp;
-                }
-                assert!(record_config(
-                    &ledger,
-                    &rt,
-                    &cfg,
-                    "node-c",
-                    Ok(1),
-                    bad,
-                    MONO
-                ));
-            }
-            _ => unreachable!(),
-        }
-        assert_eq!(
-            rt.auto_select_fallback_from(&cfg, &readings(&ledger)),
-            None,
-            "{invalid}"
-        );
-    }
-}
-
-#[test]
-fn refresh_fallback_does_not_cross_subscriptions_even_when_only_barred_members_remain() {
-    let (rt, _dir, mut cfg, ledger) = refresh_fixture();
-    cfg["servers"][0]["subscriptionId"] = serde_json::json!("other");
-    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-a", 1)]);
-    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-    assert_eq!(
-        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
-            .unwrap()
-            .node_id,
-        "node-b"
-    );
-    cfg["servers"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|node| node["id"] != "node-b");
-    assert_eq!(
-        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
-            .unwrap()
-            .node_id,
-        "node-c"
-    );
-    cfg["servers"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|node| node["id"] != "node-c");
-    assert_eq!(rt.auto_select_fallback_from(&cfg, &readings(&ledger)), None);
-}
-
-#[test]
-fn refresh_fallback_requires_effective_intent_and_current_ios_receipts() {
-    let (rt, _dir, cfg, ledger) = refresh_fixture();
-    for invalid in ["manual", "missing", "empty", "all", "malformed"] {
-        let mut config = cfg.clone();
-        match invalid {
-            "manual" => {
-                config.as_object_mut().unwrap().remove("selectionIntent");
-            }
-            "missing" => config["selectionIntent"] = polaris_store::selection_intent_auto("absent"),
-            "empty" => config["selectionIntent"] = polaris_store::selection_intent_auto("other"),
-            "all" => config["selectionIntent"] = serde_json::json!({"mode":"auto","scope":"all"}),
-            "malformed" => config["selectionIntent"] = serde_json::json!(true),
-            _ => unreachable!(),
-        }
-        assert_eq!(
-            rt.auto_select_fallback_from(&config, &readings(&ledger)),
-            None,
-            "{invalid}"
-        );
-    }
-    let (ios, _dir) = test_runtime_on(Platform::Ios);
-    let config = running(&ios, &cfg);
-    let ios_ledger = MeasurementLedger::new();
-    let reads = readings(&ios_ledger);
-    assert!(ios.auto_select_fallback_from(&config, &reads).is_none());
-    refresh_receipts(
-        &ios,
-        &config,
-        &ios_ledger,
-        1,
-        &[("node-b", 80), ("node-c", 20)],
-    );
-    assert_eq!(
-        ios.auto_select_fallback_from(&config, &reads)
-            .unwrap()
-            .node_id,
-        "node-c"
-    );
-    ios_ledger.set_foreground_epoch(1);
-    assert!(ios.auto_select_fallback_from(&config, &reads).is_none());
-    refresh_receipts(
-        &ios,
-        &config,
-        &ios_ledger,
-        2,
-        &[("node-b", 80), ("node-c", 20)],
-    );
-    assert_eq!(
-        ios.auto_select_fallback_from(&config, &reads)
-            .unwrap()
-            .node_id,
-        "node-c"
-    );
-}
-
-#[test]
-fn refresh_fallback_aligns_existing_epoch_before_reading_the_bar() {
-    let (rt, _dir, mut cfg, ledger) = refresh_fixture();
-    rt.auto_select_fallback_from(&cfg, &readings(&ledger));
-    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-    rt.gate.bump_generation();
-    *rt.test_measurement_core_sha256.lock().unwrap() = Some((rt.core_generation(), "a".repeat(64)));
-    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 80), ("node-c", 20)]);
-    assert_eq!(
-        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
-            .unwrap()
-            .node_id,
-        "node-b",
-        "the existing epoch contract retains the bar across a core generation change"
-    );
-    cfg["selectionIntent"] = polaris_store::selection_intent_auto("other");
-    cfg["servers"][1]["subscriptionId"] = serde_json::json!("other");
-    cfg["servers"][2]["subscriptionId"] = serde_json::json!("other");
-    refresh_receipts(&rt, &cfg, &ledger, 3, &[("node-b", 80), ("node-c", 20)]);
-    assert_eq!(
-        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
-            .unwrap()
-            .node_id,
-        "node-c"
-    );
-    assert!(
-        rt.auto_select
-            .lock()
-            .unwrap()
-            .memory
-            .barred(MONO)
-            .is_empty(),
-        "bar belongs to the previous subscription"
-    );
-}
-
-#[test]
-fn refresh_fallback_after_current_deletion_keeps_same_tier_latency_and_tie_order() {
-    let (rt, _dir, mut cfg, ledger) = refresh_fixture();
-    cfg["servers"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|node| node["id"] != "node-a");
-    assert_eq!(
-        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
-            .unwrap()
-            .node_id,
-        "node-c"
-    );
-    for id in ["node-b", "node-c"] {
-        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record(id, "node-a"), MONO);
-    }
-    assert_eq!(
-        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
-            .unwrap()
-            .node_id,
-        "node-c",
-        "all eligible members barred: rescue the fastest"
-    );
-    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 20), ("node-c", 20)]);
-    assert_eq!(
-        rt.auto_select_fallback_from(&cfg, &readings(&ledger))
-            .unwrap()
-            .node_id,
-        "node-b",
-        "tie order remains configuration order"
-    );
-}
-
-// S5 failure leg: the production coordinator is exercised with explicit probe batches.
-fn failover_fixture() -> (
-    Arc<ProxyRuntime>,
-    TestDir,
-    Value,
-    Vec<crate::runtime::auto_switch::RuntimeCandidate>,
-    BTreeSet<String>,
-) {
-    let (rt, dir, cfg, ledger) = refresh_fixture();
-    rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger));
-    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-    let barred =
-        rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger));
-    let snapshot = rt.switch_snapshot.read().unwrap().clone().unwrap();
-    let scope = BTreeSet::from(["node-b".to_string(), "node-c".to_string()]);
-    let mut plan = crate::runtime::auto_switch::plan_runtime_candidates(
-        &cfg,
-        Some("node-a"),
-        &snapshot.id_to_tag,
-        &snapshot.measurement_fingerprints,
-        &crate::runtime::node_fingerprints::measurement_table_json(&cfg),
-        &BTreeSet::new(),
-        &BTreeSet::new(),
-        Some(&scope),
-    );
-    assert!(rt.retain_hot_switchable_candidates(rt.core_generation(), &cfg, &mut plan));
-    assert_eq!(plan.candidates.len(), 2);
-    (rt, dir, cfg, plan.candidates, barred)
-}
-
-fn failover_batch(
-    entries: &[(&str, crate::runtime::auto_switch::CandidateProbe)],
-) -> crate::commands::speedtest::RuntimeProbeBatch {
-    crate::commands::speedtest::RuntimeProbeBatch::Completed(
-        entries
-            .iter()
-            .map(|(id, outcome)| (id.to_string(), *outcome))
-            .collect(),
-    )
-}
-
-fn failover_ids(input: &[(String, String)]) -> Vec<String> {
-    input.iter().map(|(id, _)| id.clone()).collect()
-}
-
-fn failover_best(verdict: Option<crate::runtime::auto_switch::ProbeVerdict>) -> (String, u32) {
-    match verdict {
-        Some(crate::runtime::auto_switch::ProbeVerdict::Best(best)) => {
-            (best.id, best.latency_ms.unwrap())
-        }
-        other => panic!("expected a measured candidate, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -2628,54 +682,6 @@ async fn failover_fallback_preserves_same_tier_latency_and_configuration_tie_ord
     }
 }
 
-#[test]
-fn failover_fallback_bar_projection_uses_existing_expiry_and_epoch_and_ignores_manual_intent() {
-    let (rt, _dir, cfg, ledger) = refresh_fixture();
-    rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger));
-    let period = 30 * MINUTE;
-    rt.auto_select_note_failover(Some(period), failover_record("node-c", "node-a"), MONO);
-    assert_eq!(
-        rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger)),
-        BTreeSet::from(["node-c".to_string()])
-    );
-    let mut manual = cfg.clone();
-    manual.as_object_mut().unwrap().remove("selectionIntent");
-    assert!(rt
-        .auto_select_failover_barred_from(&manual, rt.core_generation(), &readings(&ledger))
-        .is_empty());
-    assert!(rt
-        .auto_select
-        .lock()
-        .unwrap()
-        .memory
-        .is_barred("node-c", MONO));
-    rt.gate.bump_generation();
-    assert_eq!(
-        rt.auto_select_failover_barred_from(&cfg, rt.core_generation(), &readings(&ledger)),
-        BTreeSet::from(["node-c".to_string()])
-    );
-    assert!(rt
-        .auto_select_failover_barred_from(
-            &cfg,
-            rt.core_generation(),
-            &readings_at(&ledger, MONO + 4 * period)
-        )
-        .is_empty());
-    let mut other = cfg.clone();
-    other["selectionIntent"] = polaris_store::selection_intent_auto("other");
-    other["servers"][1]["subscriptionId"] = serde_json::json!("other");
-    rt.auto_select_failover_barred_from(&other, rt.core_generation(), &readings(&ledger));
-    assert!(
-        rt.auto_select
-            .lock()
-            .unwrap()
-            .memory
-            .barred(MONO)
-            .is_empty(),
-        "epoch alignment intentionally mutates memory"
-    );
-}
-
 #[tokio::test]
 async fn failover_fallback_rescue_never_reintroduces_scoped_or_runtime_ineligible_nodes() {
     use crate::runtime::auto_switch::{plan_runtime_candidates, CandidateProbe::Measured};
@@ -2842,219 +848,1107 @@ async fn failover_fallback_empty_candidates_or_missing_failure_receipts_do_not_p
     }
 }
 
-// Invoke the actual three runtime consumers; only readings/ledger/time are injected.
-async fn consume_bar_context(
-    rt: &Arc<ProxyRuntime>,
-    cfg: &Value,
-    reads: &SelectReadings<'_>,
-    entry: usize,
-) {
-    match entry {
-        0 => {
-            assess(rt, reads, None).await;
-        }
-        1 => {
-            rt.auto_select_fallback_from(cfg, reads);
-        }
-        2 => {
-            rt.auto_select_failover_barred_from(cfg, rt.core_generation(), reads);
-        }
-        _ => unreachable!(),
+fn native_fixture(
+    default: Option<AutoSelectTarget>,
+    rule_scope: bool,
+) -> (Arc<ProxyRuntime>, TestDir, Arc<TestPutSink>, Value) {
+    let (rt, dir) = test_runtime();
+    let mut config = auto_config("node-a", None);
+    config["autoSelectEnabled"] = serde_json::json!(true);
+    if let Some(target) = default {
+        config["selectionIntent"] = polaris_store::auto_select::intent(&target);
+    }
+    if rule_scope {
+        config["appRules"] = serde_json::json!([{"appId":"independent","enabled":true,"action":"proxy","targetAutoSelect":{"scope":"subscription","subscriptionId":"sub"}}]);
+    }
+    let config = running(&rt, &config);
+    let typed: UserConfig = serde_json::from_value(config.clone()).unwrap();
+    let nodes = rt
+        .switch_snapshot
+        .read()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .id_to_tag
+        .clone();
+    let now = (crate::runtime::subscription_scheduler::now_ms() / 1000) as i64;
+    let item = |tag: String, time: i64| GroupItem {
+        tag,
+        url_test_time: time,
+        url_test_delay: 20,
+        ..Default::default()
+    };
+    let mut groups = Vec::new();
+    let mut proxy_members: Vec<GroupItem> =
+        nodes.values().map(|tag| item(tag.clone(), 0)).collect();
+    for target in native::referenced_targets(&typed) {
+        let wrapper = native::wrapper_tag(&target);
+        let test = native::urltest_tag(&target);
+        let members = native::eligible_members(&typed, &target);
+        let selected = if target == AutoSelectTarget::Global {
+            "node-a"
+        } else {
+            "node-c"
+        };
+        let mut wrapper_members = vec![item(test.clone(), 0)];
+        wrapper_members.extend(members.iter().map(|id| item(nodes[id].clone(), 0)));
+        groups.push(Group {
+            tag: wrapper.clone(),
+            selected: test.clone(),
+            items: wrapper_members,
+            ..Default::default()
+        });
+        groups.push(Group {
+            tag: test,
+            selected: nodes[selected].clone(),
+            items: members
+                .iter()
+                .map(|id| item(nodes[id].clone(), now))
+                .collect(),
+            ..Default::default()
+        });
+        proxy_members.push(item(wrapper, 0));
+    }
+    let selected = polaris_store::auto_select::target(&config)
+        .map(|target| native::wrapper_tag(&target))
+        .unwrap_or_else(|| nodes["node-a"].clone());
+    groups.push(Group {
+        tag: PROXY_SELECTOR_TAG.into(),
+        selected,
+        items: proxy_members,
+        ..Default::default()
+    });
+    let sink = Arc::new(TestPutSink::default());
+    sink.follow_puts.store(true, Ordering::SeqCst);
+    *sink.groups.lock().unwrap() = Some(
+        groups
+            .iter()
+            .map(|group| GroupSelection {
+                tag: group.tag.clone(),
+                selected: group.selected.clone(),
+            })
+            .collect(),
+    );
+    *sink.native_groups.lock().unwrap() = Some(groups);
+    *rt.management_api_stub.lock().unwrap() = Some(Arc::clone(&sink));
+    (rt, dir, sink, config)
+}
+
+fn subscription_target() -> AutoSelectTarget {
+    AutoSelectTarget::Subscription {
+        subscription_id: "sub".into(),
     }
 }
 
-fn runtime_barred(rt: &ProxyRuntime, id: &str) -> bool {
-    rt.auto_select.lock().unwrap().memory.is_barred(id, MONO)
+#[tokio::test]
+async fn native_groups_own_production_and_legacy_writer_cannot_override_a_reference() {
+    let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    assert_eq!(
+        rt.auto_select_closed(),
+        Some(crate::runtime::auto_select::Gate::SwitchedOff)
+    );
+    assert!(!rt.auto_select_active());
+    let status = rt.native_auto_status().await;
+    assert_eq!(status.native_auto_groups.len(), 2);
+    assert!(status
+        .native_auto_groups
+        .iter()
+        .all(|group| group.confirmed));
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert_eq!(rt.config.current().unwrap(), config);
+    assert!(sink.calls().is_empty());
+    let source = module_code("runtime/proxy");
+    let body=method_body(&source,"    async fn do_switch_io(self: &Arc<Self>, machine: &mut AutoSwitchMachine, reason: &str) -> bool {");
+    assert!(
+        body.find("polaris_store::auto_select::target").unwrap()
+            < body.find("plan_runtime_candidates(").unwrap()
+    );
 }
 
 #[tokio::test]
-async fn s5_epoch_all_runtime_consumers_preserve_foreground_bars_and_consume_cost_once() {
-    for platform in [Platform::Linux, Platform::Android] {
-        for entry in 0..3 {
-            let (rt, _dir) = test_runtime_on(platform);
-            let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-            let ledger = MeasurementLedger::new();
-            refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
-            let mut reads = readings(&ledger);
-            reads.signals.metered_change_epoch = 5;
-            consume_bar_context(&rt, &cfg, &reads, entry).await;
-            rt.auto_select_note_failover(
-                Some(30 * MINUTE),
-                failover_record("node-c", "node-a"),
-                MONO,
-            );
-            ledger.set_foreground_epoch(1);
-            consume_bar_context(&rt, &cfg, &reads, entry).await;
-            assert!(
-                runtime_barred(&rt, "node-c"),
-                "{platform:?}, entry={entry}: resume is not a network change"
-            );
-            reads.signals.metered_change_epoch = 7;
-            consume_bar_context(&rt, &cfg, &reads, entry).await;
-            assert!(
-                !runtime_barred(&rt, "node-c"),
-                "{platform:?}, entry={entry}: observed cost round trip clears"
-            );
-            rt.auto_select_note_failover(
-                Some(30 * MINUTE),
-                failover_record("node-c", "node-a"),
-                MONO,
-            );
-            for sequence in [7, 5, 6, 7] {
-                reads.signals.metered_change_epoch = sequence;
-                consume_bar_context(&rt, &cfg, &reads, entry).await;
-                assert!(runtime_barred(&rt, "node-c"), "{platform:?}, entry={entry}: stale/duplicate {sequence} cannot clear a new bar");
+async fn native_status_observes_runtime_and_rejects_stop_or_old_generation() {
+    let (rt, _dir, _sink, mut desired) = native_fixture(Some(AutoSelectTarget::Global), true);
+    desired["selectedServerId"] = serde_json::json!("node-c");
+    rt.config.save_full(&desired).unwrap();
+    let status = rt.native_auto_status().await;
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert_eq!(rt.status().actual_server_id.as_deref(), Some("node-a"));
+    rt.gate.bump_generation();
+    assert_eq!(rt.native_auto_cached_status().actual_server_id, None);
+    rt.status.write().unwrap().running = false;
+    assert_eq!(rt.status().actual_server_id, None);
+    assert!(rt
+        .native_auto_cached_status()
+        .native_auto_groups
+        .iter()
+        .all(|group| !group.confirmed));
+}
+
+#[tokio::test]
+async fn native_default_same_reference_is_noop_and_independent_rule_group_is_preserved() {
+    let (rt, _dir, sink, mut desired) = native_fixture(Some(AutoSelectTarget::Global), true);
+    desired["selectedServerId"] = serde_json::json!("node-c");
+    rt.config.save_full(&desired).unwrap();
+    let status = rt
+        .native_auto_select_default(AutoSelectTarget::Global)
+        .await
+        .unwrap();
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-a");
+    assert!(sink.calls().is_empty());
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    let status = rt
+        .native_auto_select_default(subscription_target())
+        .await
+        .unwrap();
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-c"));
+    assert_eq!(
+        rt.config.current().unwrap()["appRules"],
+        desired["appRules"]
+    );
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn native_manual_pin_same_leaf_clears_only_default_without_restart() {
+    for (target, outcome) in [
+        ("node-a", SwitchOutcome::NoOp),
+        ("node-b", SwitchOutcome::HotSwitched),
+    ] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let (_, _, intent, cleared) = server_switch_core(
+            &rt.config,
+            target,
+            |_| Ok(()),
+            || rt.register_selector_intent(),
+        )
+        .unwrap();
+        assert!(cleared);
+        let result = rt
+            .switch_selected_server_if_current(target, intent)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(outcome));
+        assert!(rt
+            .config
+            .current()
+            .unwrap()
+            .get("selectionIntent")
+            .is_none());
+        assert_eq!(rt.config.current().unwrap()["appRules"], config["appRules"]);
+        assert_eq!(
+            rt.native_auto_status().await.actual_server_id.as_deref(),
+            Some(target)
+        );
+        assert_eq!(sink.calls().len(), 1);
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn native_off_requires_every_scope_before_first_write_and_never_guesses_desired() {
+    for missing in ["history", "group", "outside"] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let sub_test = native::urltest_tag(&subscription_target());
+        {
+            let mut groups = sink.native_groups.lock().unwrap();
+            let groups = groups.as_mut().unwrap();
+            match missing {
+                "history" => {
+                    for item in groups.iter_mut().flat_map(|group| &mut group.items) {
+                        if item.tag == "Node C" {
+                            item.url_test_time = 0;
+                        }
+                    }
+                }
+                "group" => groups.retain(|group| group.tag != sub_test),
+                "outside" => {
+                    groups
+                        .iter_mut()
+                        .find(|group| group.tag == sub_test)
+                        .unwrap()
+                        .selected = "Node A".into()
+                }
+                _ => unreachable!(),
             }
-            rt.gate.bump_generation();
-            reads.signals.metered_change_epoch = 8;
-            consume_bar_context(&rt, &cfg, &reads, entry).await;
-            assert!(
-                !runtime_barred(&rt, "node-c"),
-                "{platform:?}, entry={entry}: confirmed flip survives core change"
+        }
+        assert_eq!(
+            rt.native_auto_set_enabled(false).await.unwrap_err(),
+            "AUTO_SELECT_NO_ACTUAL_EXIT",
+            "{missing}"
+        );
+        assert!(sink.calls().is_empty());
+        assert_eq!(rt.config.current().unwrap(), config);
+    }
+}
+
+#[tokio::test]
+async fn native_off_partial_failure_rolls_back_and_does_not_commit_flag_or_pins() {
+    for failure in ["second-put", "readback", "persist"] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        match failure {
+            "second-put" => {
+                sink.fail_at.lock().unwrap().insert(2);
+            }
+            "readback" => sink.follow_puts.store(false, Ordering::SeqCst),
+            "persist" => rt.config.fail_next_config_persist_for_test(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            rt.native_auto_set_enabled(false).await.unwrap_err(),
+            "AUTO_SELECT_SWITCH_FAILED",
+            "{failure}"
+        );
+        assert_eq!(rt.config.current().unwrap(), config);
+        let groups = sink.native_groups.lock().unwrap();
+        for target in [AutoSelectTarget::Global, subscription_target()] {
+            assert_eq!(
+                groups
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find(|group| group.tag == native::wrapper_tag(&target))
+                    .unwrap()
+                    .selected,
+                native::urltest_tag(&target)
+            );
+        }
+        assert!(rt.selector_reconcile.is_required());
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn native_off_stop_or_new_intent_at_put_cannot_commit_an_obsolete_receipt() {
+    for stop in [false, true] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let owner = Arc::clone(&rt);
+        *sink.on_put.lock().unwrap() = Some(Box::new(move || {
+            if stop {
+                owner.gate.bump_generation();
+                owner.status.write().unwrap().running = false;
+            } else {
+                owner.register_selector_intent();
+            }
+        }));
+        assert!(rt.native_auto_set_enabled(false).await.is_err());
+        assert_eq!(rt.config.current().unwrap(), config);
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        if stop {
+            assert_eq!(
+                sink.calls().len(),
+                1,
+                "rollback cannot write to a replaced core"
             );
         }
     }
 }
 
 #[tokio::test]
-async fn s5_epoch_facts_and_refresh_still_require_fresh_foreground_receipts() {
-    let (rt, _dir) = test_runtime_on(Platform::Android);
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
-    let reads = readings(&ledger);
-    assert!(assess(&rt, &reads, None).await.is_some());
-    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-    ledger.set_foreground_epoch(1);
-    assert!(assess(&rt, &reads, None).await.is_none());
+async fn native_off_pins_each_confirmed_tcp_group_without_restarting_or_rebinding_default() {
+    let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let status = rt.native_auto_set_enabled(false).await.unwrap();
+    assert!(!status.feature_enabled);
+    assert!(status
+        .native_auto_groups
+        .iter()
+        .all(|group| group.confirmed && group.state == "pinned"));
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    let saved = rt.config.current().unwrap();
+    assert_eq!(saved["selectionIntent"], config["selectionIntent"]);
+    assert_eq!(saved["appRules"], config["appRules"]);
+    let typed: UserConfig = serde_json::from_value(saved).unwrap();
     assert_eq!(
-        last_decision(&rt),
-        Decision::NotEvaluated(Gate::WaitingFirstRound)
+        native::pin(&typed, &AutoSelectTarget::Global),
+        Some("node-a")
     );
-    assert!(rt.auto_select_fallback_from(&cfg, &reads).is_none());
-    assert!(runtime_barred(&rt, "node-c"));
-    refresh_receipts(&rt, &cfg, &ledger, 2, &[("node-b", 80), ("node-c", 20)]);
-    assert!(assess(&rt, &reads, None).await.is_some());
-    assert_eq!(
-        rt.auto_select_fallback_from(&cfg, &reads).unwrap().node_id,
-        "node-b"
-    );
-    assert!(runtime_barred(&rt, "node-c"));
+    assert_eq!(native::pin(&typed, &subscription_target()), Some("node-c"));
+    assert_eq!(sink.calls().len(), 2);
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    let status = rt.native_auto_set_enabled(true).await.unwrap();
+    assert!(status.feature_enabled);
+    assert!(status
+        .native_auto_groups
+        .iter()
+        .all(|group| group.confirmed && group.state == "auto"));
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
 }
 
 #[tokio::test]
-async fn s5_epoch_each_runtime_consumer_uses_confirmed_desktop_network_change() {
-    for entry in 0..3 {
-        let (rt, _dir, cfg, ledger) = refresh_fixture();
-        let reads = readings(&ledger);
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-        rt.gate.bump_generation();
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        assert!(runtime_barred(&rt, "node-c"));
-        rt.network_epoch.fetch_add(1, Ordering::SeqCst);
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        assert!(!runtime_barred(&rt, "node-c"), "entry={entry}");
-    }
-}
-
-fn s5_native_runtime_reading(
-    query: u64,
-    source: &str,
-    seq: u64,
-    known: bool,
-) -> crate::runtime::auto_select::NativeNetworkObservation {
-    crate::runtime::auto_select::NativeNetworkObservation {
-        query,
-        source: source.to_owned(),
-        seq,
-        current_known: known,
-        coverage_gap: !known,
-    }
+async fn native_stopped_off_requires_verified_pins_but_empty_manual_mode_needs_no_node() {
+    let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    rt.status.write().unwrap().running = false;
+    assert_eq!(
+        rt.native_auto_set_enabled(false).await.unwrap_err(),
+        "AUTO_SELECT_NO_ACTUAL_EXIT"
+    );
+    assert_eq!(rt.config.current().unwrap(), config);
+    assert!(sink.calls().is_empty());
+    rt.status.write().unwrap().running = true;
+    rt.native_auto_set_enabled(false).await.unwrap();
+    rt.native_auto_set_enabled(true).await.unwrap();
+    rt.status.write().unwrap().running = false;
+    assert!(
+        !rt.native_auto_set_enabled(false)
+            .await
+            .unwrap()
+            .feature_enabled
+    );
+    let (empty, _dir) = test_runtime();
+    empty
+        .config
+        .save_full(&polaris_store::default_config())
+        .unwrap();
+    assert!(
+        !empty
+            .native_auto_set_enabled(false)
+            .await
+            .unwrap()
+            .feature_enabled
+    );
 }
 
 #[tokio::test]
-async fn s5_android_all_three_runtime_consumers_consume_unknown_growth_once_and_accept_legal_new_source(
-) {
-    for entry in 0..3 {
-        let (rt, _dir) = test_runtime_on(Platform::Android);
-        let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-        let ledger = MeasurementLedger::new();
-        refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
-        let network_before = rt.network_epoch();
-        let mut reads = readings(&ledger);
-        reads.signals.native_network = Some(s5_native_runtime_reading(1, "z-source", 10, true));
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-        reads.signals.native_network = None;
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        assert!(runtime_barred(&rt, "node-c"));
-        reads.signals.native_network = Some(s5_native_runtime_reading(2, "z-source", 10, false));
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        assert!(runtime_barred(&rt, "node-c"), "gap alone entry {entry}");
-        reads.signals.native_network = Some(s5_native_runtime_reading(3, "z-source", 12, false));
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        assert!(
-            !runtime_barred(&rt, "node-c"),
-            "ABA history while Unknown entry {entry}"
+async fn native_enable_without_references_keeps_manual_default_and_app_http_ownership() {
+    let (rt, _dir, sink, mut config) = native_fixture(None, false);
+    config["autoSelectEnabled"] = serde_json::json!(false);
+    rt.config.save_full(&config).unwrap();
+    mark_running_with_snapshot(&rt, &config);
+    rt.native_auto_status().await;
+    let status = rt.native_auto_set_enabled(true).await.unwrap();
+    assert!(status.feature_enabled);
+    assert!(status.native_auto_groups.is_empty());
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert!(sink.calls().is_empty());
+    assert!(!rt.native_owns_any(&["node-a".into(), "node-b".into()]));
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn native_dirty_or_empty_scope_is_refused_before_intent_or_runtime_changes() {
+    for dirty in [false, true] {
+        let (rt, _dir, sink, mut config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        if dirty {
+            config["servers"][1]["port"] = serde_json::json!(19002);
+        }
+        rt.config.save_full(&config).unwrap();
+        let before = rt.config.current().unwrap();
+        let target = if dirty {
+            subscription_target()
+        } else {
+            AutoSelectTarget::Subscription {
+                subscription_id: "absent".into(),
+            }
+        };
+        assert_eq!(
+            rt.native_auto_select_default(target).await.unwrap_err(),
+            if dirty {
+                "AUTO_SELECT_REQUIRES_APPLY"
+            } else {
+                "AUTO_SELECT_SCOPE_EMPTY"
+            }
         );
-        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-        for next in [
-            s5_native_runtime_reading(3, "z-source", 12, false),
-            s5_native_runtime_reading(2, "foreign", 999, true),
-            s5_native_runtime_reading(4, "z-source", 11, true),
-            s5_native_runtime_reading(5, "a-source", 0, true),
-            s5_native_runtime_reading(6, "z-source", 999, true),
-        ] {
-            reads.signals.native_network = Some(next);
-            consume_bar_context(&rt, &cfg, &reads, entry).await;
-            assert!(
-                runtime_barred(&rt, "node-c"),
-                "duplicate/old/source-baseline/retired entry {entry}"
+        assert_eq!(rt.config.current().unwrap(), before);
+        assert!(sink.calls().is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_new_graph_reload_projects_only_runtime_and_seeds_observed_exit() {
+    let (rt, _dir, sink, mut desired) = native_fixture(None, true);
+    desired["mixedPort"] = serde_json::json!(7999);
+    desired["selectedServerId"] = serde_json::json!("node-c");
+    rt.config.save_full(&desired).unwrap();
+    let status = rt
+        .native_auto_select_default(AutoSelectTarget::Global)
+        .await
+        .unwrap();
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert!(status
+        .native_auto_groups
+        .iter()
+        .find(|group| group.target == AutoSelectTarget::Global)
+        .is_some_and(|group| !group.confirmed));
+    let pending = rt.pending_force_restart.read().unwrap();
+    let (_, projected, _) = pending
+        .as_ref()
+        .expect("new graph requires controlled reload");
+    assert_eq!(projected["mixedPort"], 7890);
+    assert_eq!(projected["selectedServerId"], "node-a");
+    assert_eq!(rt.config.current().unwrap()["mixedPort"], 7999);
+    assert_eq!(rt.config.current().unwrap()["selectedServerId"], "node-a");
+    assert!(sink.calls().is_empty());
+}
+
+#[tokio::test]
+async fn native_obsolete_read_or_busy_lifecycle_cannot_save_a_new_reference() {
+    for race in ["busy", "intent", "generation"] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        if race == "busy" {
+            rt.gate.begin();
+        } else {
+            let owner = Arc::clone(&rt);
+            *sink.on_groups.lock().unwrap() = Some(Box::new(move || {
+                if race == "generation" {
+                    owner.gate.bump_generation();
+                } else {
+                    owner.register_selector_intent();
+                }
+            }));
+        }
+        assert!(
+            rt.native_auto_select_default(subscription_target())
+                .await
+                .is_err(),
+            "{race}"
+        );
+        assert_eq!(rt.config.current().unwrap(), config, "{race}");
+        assert!(sink.calls().is_empty(), "{race}");
+        assert!(rt.pending_force_restart.read().unwrap().is_none(), "{race}");
+    }
+}
+
+#[tokio::test]
+async fn native_default_partial_apply_or_intent_race_preserves_runtime_and_pending_reference() {
+    for race in ["put", "intent", "stop"] {
+        let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+        if race == "put" {
+            sink.fail_at.lock().unwrap().insert(2);
+        } else {
+            let owner = Arc::clone(&rt);
+            *sink.on_put.lock().unwrap() = Some(Box::new(move || {
+                if race == "stop" {
+                    owner.gate.bump_generation();
+                    owner.status.write().unwrap().running = false;
+                } else {
+                    owner.register_selector_intent();
+                }
+            }));
+        }
+        assert!(
+            rt.native_auto_select_default(subscription_target())
+                .await
+                .is_err(),
+            "{race}"
+        );
+        assert_eq!(
+            rt.current_config_snapshot().unwrap()["selectionIntent"],
+            config["selectionIntent"],
+            "R must not claim a rejected apply"
+        );
+        assert_eq!(
+            rt.config.current().unwrap()["selectionIntent"],
+            polaris_store::auto_select::intent(&subscription_target()),
+            "the requested reference remains retryable"
+        );
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+        if race == "stop" {
+            assert_eq!(sink.calls().len(), 1);
+        } else {
+            assert_eq!(
+                rt.native_auto_status().await.actual_server_id.as_deref(),
+                Some("node-a")
             );
         }
-        reads.signals.native_network = Some(s5_native_runtime_reading(7, "a-source", 1, true));
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        assert!(
-            !runtime_barred(&rt, "node-c"),
-            "new source growth entry {entry}"
-        );
-        assert_eq!(ledger.foreground_epoch(), 0);
-        assert_eq!(rt.network_epoch(), network_before);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_mode_projection_preserves_queued_default_and_unapplied_desired_fields() {
+    let (rt, _dir, _sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let mut desired = config.clone();
+    desired["mixedPort"] = serde_json::json!(7999);
+    rt.config.save_full(&desired).unwrap();
+    let mut pending = config.clone();
+    pending["selectionIntent"] = polaris_store::auto_select::intent(&subscription_target());
+    let intent = rt.register_selector_intent();
+    rt.restart_selected_projection(&pending, rt.core_generation(), intent);
+    rt.native_auto_set_enabled(false).await.unwrap();
+    let queued = rt.pending_force_restart.read().unwrap();
+    let (_, queued, _) = queued.as_ref().unwrap();
+    assert_eq!(queued["selectionIntent"], pending["selectionIntent"]);
+    assert_eq!(queued["autoSelectEnabled"], false);
+    assert_eq!(queued["mixedPort"], 7890);
+    assert_eq!(rt.config.current().unwrap()["mixedPort"], 7999);
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectionIntent"],
+        config["selectionIntent"]
+    );
+    rt.gate.bump_generation();
+}
+
+#[tokio::test]
+async fn native_wrong_endpoint_dirty_connection_and_missing_history_stay_pending() {
+    for source in ["url", "connection", "history", "missing"] {
+        let (rt, _dir, sink, mut desired) = native_fixture(Some(AutoSelectTarget::Global), true);
+        match source {
+            "url" => {
+                desired["speedTestUrl"] = serde_json::json!("https://other.example/generate_204")
+            }
+            "connection" => desired["servers"][0]["port"] = serde_json::json!(19009),
+            "history" => {
+                for group in sink.native_groups.lock().unwrap().as_mut().unwrap() {
+                    for item in &mut group.items {
+                        item.url_test_time = 0;
+                    }
+                }
+            }
+            "missing" => *sink.native_groups.lock().unwrap() = None,
+            _ => unreachable!(),
+        }
+        rt.config.save_full(&desired).unwrap();
+        let status = rt.native_auto_status().await;
+        let global = status
+            .native_auto_groups
+            .iter()
+            .find(|group| group.target == AutoSelectTarget::Global)
+            .unwrap();
+        assert!(!global.confirmed, "{source}");
+        assert_eq!(global.state, "pending", "{source}");
+        assert!(sink.calls().is_empty());
+        if source == "missing" {
+            assert_eq!(status.actual_server_id, None);
+        } else {
+            assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+        }
+        assert!(rt.native_auto_set_enabled(false).await.is_err(), "{source}");
+        assert!(rt.config.current().unwrap()["autoSelectEnabled"]
+            .as_bool()
+            .unwrap());
     }
 }
 
 #[tokio::test]
-async fn s5_android_runtime_native_growth_does_not_relax_foreground_receipt_freshness() {
-    let (rt, _dir) = test_runtime_on(Platform::Android);
-    let cfg = running(&rt, &auto_config("node-a", Some("sub")));
-    let ledger = MeasurementLedger::new();
-    refresh_receipts(&rt, &cfg, &ledger, 1, &[("node-b", 80), ("node-c", 20)]);
-    let mut reads = readings(&ledger);
-    reads.signals.native_network = Some(s5_native_runtime_reading(1, "source", 0, true));
-    assert!(assess(&rt, &reads, None).await.is_some());
-    rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-    ledger.set_foreground_epoch(1);
-    reads.signals.native_network = Some(s5_native_runtime_reading(2, "source", 1, true));
-    assert!(assess(&rt, &reads, None).await.is_none());
+async fn native_status_event_fires_on_change_only_and_tracks_confirmed_actual_exit() {
+    let (rt, _dir, sink, _config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        auto_select_status: Arc::clone(&events),
+        ..Default::default()
+    }));
+    for _ in 0..3 {
+        rt.native_auto_status().await;
+    }
+    assert_eq!(events.lock().unwrap().len(), 1);
+    let global = native::urltest_tag(&AutoSelectTarget::Global);
+    sink.native_groups
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|group| group.tag == global)
+        .unwrap()
+        .selected = "Node B".into();
+    rt.native_auto_status().await;
+    rt.native_auto_status().await;
+    let seen = events.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0]["actualServerId"], "node-a");
+    assert_eq!(seen[1]["actualServerId"], "node-b");
+    assert!(seen[1]["nativeAutoGroups"][0]["confirmed"]
+        .as_bool()
+        .unwrap());
+}
+
+#[test]
+fn native_concurrent_announcements_never_deliver_an_old_generation_after_a_new_one() {
+    let (rt, _dir, _sink, _config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        auto_select_status: Arc::clone(&events),
+        ..Default::default()
+    }));
+    rt.auto_select_announce();
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    rt.auto_select_announce();
+                }
+            });
+        }
+        scope.spawn(|| {
+            for _ in 1..=50 {
+                rt.gate.bump_generation();
+                rt.auto_select_announce();
+            }
+        });
+    });
+    let seen: Vec<u64> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|status| status["generation"].as_u64().unwrap())
+        .collect();
+    assert!(seen.len() >= 2);
+    assert!(seen.windows(2).all(|pair| pair[0] < pair[1]), "{seen:?}");
+}
+
+#[test]
+fn native_route_projection_uses_running_emitted_members_and_clears_unknown_or_stopped() {
+    let (rt, _dir, _sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    let mut desired = config.clone();
+    desired["servers"][0]["address"] = serde_json::json!("unapplied.example");
+    rt.config.save_full(&desired).unwrap();
+    rt.switch_snapshot
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .id_to_tag
+        .remove("node-c");
+    let projected = rt.emitted_exit_route_config().unwrap();
+    assert_eq!(projected.servers.len(), 2);
+    assert!(!projected.servers.iter().any(|node| node.id == "node-c"));
     assert_eq!(
-        last_decision(&rt),
-        Decision::NotEvaluated(Gate::WaitingFirstRound)
+        projected.servers[0].address,
+        config["servers"][0]["address"].as_str().unwrap()
     );
-    assert!(rt.auto_select_fallback_from(&cfg, &reads).is_none());
-    assert!(!runtime_barred(&rt, "node-c"));
+    *rt.switch_snapshot.write().unwrap() = None;
+    assert!(rt.emitted_exit_route_config().is_none());
+    rt.status.write().unwrap().running = false;
+    assert!(rt.emitted_exit_route_config().is_none());
+}
+
+#[cfg(not(target_os = "ios"))]
+#[test]
+fn native_runtime_snapshot_excludes_configured_but_unemitted_nodes() {
+    let (rt, _dir) = test_runtime();
+    let mut raw = two_node_config(7890, "node-a");
+    raw["autoSelectEnabled"] = serde_json::json!(true);
+    raw["selectionIntent"] = polaris_store::auto_select::intent(&AutoSelectTarget::Global);
+    let typed: UserConfig = serde_json::from_value(raw.clone()).unwrap();
+    let deps = rt.generate_deps(30_101, 0, 0, None, &[20_010], &raw, false);
+    let mut emitted =
+        polaris_config_engine::builder::generate_sing_box_config(&typed, &BTreeMap::new(), &deps)
+            .unwrap();
+    assert!(serde_json::to_value(&emitted)
+        .unwrap()
+        .get("selectionIntent")
+        .is_none());
+    assert!(emitted
+        .outbounds
+        .iter()
+        .any(|outbound| outbound.tag == native::wrapper_tag(&AutoSelectTarget::Global)));
+    emitted
+        .outbounds
+        .retain(|outbound| outbound.tag != "Node B");
+    let snapshot = ProxyRuntime::build_switch_snapshot(&typed, &emitted, &deps);
+    assert!(snapshot.id_to_tag.contains_key("node-a"));
+    assert!(!snapshot.id_to_tag.contains_key("node-b"));
 }
 
 #[tokio::test]
-async fn s5_android_runtime_other_platforms_ignore_native_network_bar_signals() {
-    for entry in 0..3 {
-        let (rt, _dir, cfg, ledger) = refresh_fixture();
-        let mut reads = readings(&ledger);
-        reads.signals.native_network = Some(s5_native_runtime_reading(1, "source", 0, true));
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        rt.auto_select_note_failover(Some(30 * MINUTE), failover_record("node-c", "node-a"), MONO);
-        reads.signals.native_network = Some(s5_native_runtime_reading(2, "source", 1, true));
-        consume_bar_context(&rt, &cfg, &reads, entry).await;
-        assert!(runtime_barred(&rt, "node-c"));
+async fn native_manual_unattested_put_does_not_fall_through_to_structural_restart() {
+    let (rt, _dir, sink, config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    sink.follow_puts.store(false, Ordering::SeqCst);
+    let (_, _, intent, _) = server_switch_core(
+        &rt.config,
+        "node-b",
+        |_| Ok(()),
+        || rt.register_selector_intent(),
+    )
+    .unwrap();
+    assert_eq!(
+        rt.switch_selected_server_if_current("node-b", intent)
+            .await
+            .unwrap(),
+        Some(SwitchOutcome::Pending)
+    );
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["selectionIntent"],
+        config["selectionIntent"]
+    );
+    assert_eq!(
+        rt.native_auto_status().await.actual_server_id.as_deref(),
+        Some("node-a")
+    );
+    assert!(rt.pending_force_restart.read().unwrap().is_none());
+    assert!(rt.selector_reconcile.is_required());
+}
+
+#[tokio::test]
+async fn native_real_config_writer_invalidates_edited_pins_without_fabricating_refresh_winners() {
+    let (rt, _dir, _sink, _config) = native_fixture(Some(AutoSelectTarget::Global), true);
+    rt.native_auto_set_enabled(false).await.unwrap();
+    let mut desired = rt.config.current().unwrap();
+    desired["mixedPort"] = serde_json::json!(7999);
+    rt.config.save_full(&desired).unwrap();
+    let unchanged: UserConfig = serde_json::from_value(rt.config.current().unwrap()).unwrap();
+    assert_eq!(
+        unchanged.auto_select_pins.len(),
+        2,
+        "unrelated pending edits cannot discard verified pins"
+    );
+    desired["servers"][2]["address"] = serde_json::json!("replacement.example");
+    rt.config.save_full(&desired).unwrap();
+    let changed: UserConfig = serde_json::from_value(rt.config.current().unwrap()).unwrap();
+    assert_eq!(
+        native::pin(&changed, &AutoSelectTarget::Global),
+        Some("node-a")
+    );
+    assert_eq!(native::pin(&changed, &subscription_target()), None);
+    let status = rt.native_auto_status().await;
+    assert_eq!(status.actual_server_id.as_deref(), Some("node-a"));
+    assert!(
+        !status
+            .native_auto_groups
+            .iter()
+            .find(|group| group.target == subscription_target())
+            .unwrap()
+            .confirmed
+    );
+    rt.status.write().unwrap().running = false;
+    assert_eq!(
+        rt.native_auto_set_enabled(false).await.unwrap_err(),
+        "AUTO_SELECT_NO_ACTUAL_EXIT"
+    );
+}
+
+#[test]
+fn native_retest_requests_http_without_an_app_winner_write() {
+    let body = method_body(
+        &module_code("runtime/proxy"),
+        "    pub(crate) async fn native_auto_retest(&self) -> Result<NativeAutoStatus,String> {",
+    );
+    assert!(body.contains(".url_test("));
+    assert!(!body.contains("native_put(") && !body.contains("auto_select_explicit"));
+    assert!(
+        body.contains("self.native_auto_status().await"),
+        "ACK is not a winner receipt"
+    );
+}
+
+#[tokio::test]
+async fn native_off_rejects_unapplied_runtime_only_or_retargeted_references_before_any_put() {
+    for change in ["remove-rule", "empty-desired", "retarget-rule"] {
+        let (rt, _dir, sink, original) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let runtime = rt.current_config_snapshot().unwrap();
+        let mut desired = original.clone();
+        if change == "retarget-rule" {
+            desired["appRules"][0]["targetAutoSelect"] = serde_json::json!({"scope":"manual"});
+        } else {
+            desired["appRules"] = serde_json::json!([]);
+        }
+        if change == "empty-desired" {
+            desired.as_object_mut().unwrap().remove("selectionIntent");
+        }
+        rt.config.save_full(&desired).unwrap();
+        let saved = rt.config.current().unwrap();
+        assert_eq!(
+            rt.native_auto_set_enabled(false).await.unwrap_err(),
+            "AUTO_SELECT_REQUIRES_APPLY",
+            "{change}"
+        );
+        assert!(sink.calls().is_empty());
+        assert_eq!(rt.config.current().unwrap(), saved);
+        assert_eq!(rt.current_config_snapshot().unwrap(), runtime);
+    }
+}
+
+#[tokio::test]
+async fn native_mode_read_race_cannot_write_even_before_first_put() {
+    for change in ["saved", "intent", "generation"] {
+        let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let owner = Arc::clone(&rt);
+        *sink.on_groups.lock().unwrap() = Some(Box::new(move || match change {
+            "saved" => {
+                let mut config = owner.config.current().unwrap();
+                config["appRules"] = serde_json::json!([]);
+                owner.config.save_full(&config).unwrap();
+            }
+            "intent" => {
+                owner.register_selector_intent();
+            }
+            _ => {
+                owner.gate.bump_generation();
+            }
+        }));
+        assert!(rt.native_auto_set_enabled(false).await.is_err());
+        assert!(sink.calls().is_empty());
+        assert_eq!(rt.config.current().unwrap()["autoSelectEnabled"], true);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_enable_absent_graph_reports_reload_not_applied_and_preserves_runtime_flag() {
+    let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), true);
+    rt.native_auto_set_enabled(false).await.unwrap();
+    sink.native_groups
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .retain(|group| !group.tag.ends_with("-test"));
+    let status = rt.native_auto_set_enabled(true).await.unwrap();
+    assert_eq!(status.apply_outcome, Some("restarting"));
+    assert_eq!(rt.config.current().unwrap()["autoSelectEnabled"], true);
+    assert_eq!(
+        rt.current_config_snapshot().unwrap()["autoSelectEnabled"],
+        false
+    );
+    assert!(rt.pending_force_restart.read().unwrap().is_some());
+    rt.gate.bump_generation(); // superseded/failed reload cannot turn the earlier receipt into applied
+    assert_eq!(status.apply_outcome, Some("restarting"));
+}
+
+#[tokio::test]
+async fn native_stopped_enable_returns_saved_not_runtime_applied() {
+    let (rt, _dir, _sink, _) = native_fixture(None, false);
+    rt.status.write().unwrap().running = false;
+    let status = rt.native_auto_set_enabled(true).await.unwrap();
+    assert_eq!(status.apply_outcome, Some("saved"));
+    assert_eq!(status.actual_server_id, None);
+}
+
+#[tokio::test]
+async fn native_mode_scheduler_failure_is_deferred_and_obsolete_claim_is_rejected() {
+    let (rt, _dir, _sink, config) = native_fixture(None, false);
+    let generation = rt.core_generation();
+    let intent = rt.selector_reconcile.intent_generation();
+    let owner = Arc::clone(&rt);
+    let _ = std::thread::spawn(move || {
+        let _lock = owner.pending_force_restart.write().unwrap();
+        panic!("poison restart storage");
+    })
+    .join();
+    assert_eq!(
+        rt.commit_native_mode_projection(&config, generation, intent, true),
+        Some(SwitchOutcome::Deferred)
+    );
+    rt.gate.bump_generation();
+    assert_eq!(
+        rt.commit_native_mode_projection(&config, generation, intent, true),
+        None
+    );
+}
+
+#[tokio::test]
+async fn native_cancel_before_admission_or_during_status_never_uses_cached_completed_results() {
+    use crate::commands::speedtest::SpeedTestCancel;
+    use crate::runtime::speedtest::InterruptReason;
+    for before in [true, false] {
+        let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), true);
+        let cancel = SpeedTestCancel::default();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_by_read = Arc::clone(&observed);
+        let during_read = cancel.clone();
+        *sink.on_groups.lock().unwrap() = Some(Box::new(move || {
+            observed_by_read.store(true, Ordering::SeqCst);
+            if !before {
+                during_read.cancel(InterruptReason::Preempted);
+            }
+        }));
+        if before {
+            cancel.cancel(InterruptReason::Cancelled);
+        }
+        assert!(rt
+            .native_measure_requested(&["node-a".into()], &cancel)
+            .await
+            .is_empty());
+        assert_eq!(observed.load(Ordering::SeqCst), !before);
+        assert!(cancel.reason().is_some());
+        assert!(sink.calls().is_empty());
+        assert!(rt.pending_force_restart.read().unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn native_manual_sentinels_are_runtime_attested_despite_pending_saved_selection() {
+    for id in ["__direct__", "__block__"] {
+        let (rt, _dir, sink, mut applied) = native_fixture(None, false);
+        applied["selectedServerId"] = serde_json::json!(id);
+        applied["proxyMode"] = serde_json::json!("smart");
+        mark_running_with_snapshot(&rt, &applied);
+        *rt.startup_snapshot.write().unwrap() = Some(applied.clone());
+        // Desired remains a different ordinary node; it cannot provide actual identity.
+        assert_ne!(rt.config.current().unwrap()["selectedServerId"], id);
+        {
+            let mut groups = sink.native_groups.lock().unwrap();
+            let proxy = groups
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|group| group.tag == PROXY_SELECTOR_TAG)
+                .unwrap();
+            proxy.selected = "direct".into();
+            proxy.items.push(GroupItem {
+                tag: "direct".into(),
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            rt.native_auto_status().await.actual_server_id.as_deref(),
+            Some(id)
+        );
+        assert_eq!(rt.status().actual_server_id.as_deref(), Some(id));
+        if id == "__direct__" {
+            *sink.native_groups.lock().unwrap() = None;
+        } else {
+            *rt.startup_snapshot.write().unwrap() = None;
+        }
+        assert_eq!(rt.native_auto_status().await.actual_server_id, None);
+        assert_eq!(rt.status().actual_server_id, None);
+    }
+}
+
+/// Deterministic suspension points: capture the one-shot ticket and A first,
+/// accept B, then release the old success/failure. No timers or network involved.
+#[tokio::test]
+async fn native_observation_fences_old_success_failure_and_relay_queue() {
+    let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), false);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    rt.set_error_emitter(Box::new(RecordingErrorEmitter {
+        auto_select_status: Arc::clone(&events),
+        ..Default::default()
+    }));
+    let generation = rt.core_generation();
+    let a = sink.native_groups.lock().unwrap().clone().unwrap();
+    let mut b = a.clone();
+    let tag = rt
+        .switch_snapshot
+        .read()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .id_to_tag["node-b"]
+        .clone();
+    b.iter_mut()
+        .find(|group| group.tag == PROXY_SELECTOR_TAG)
+        .unwrap()
+        .selected = tag;
+    let suspended = rt.native_observation_revision();
+    let relay = rt
+        .publish_native_groups(generation, suspended, b.clone())
+        .unwrap();
+    assert_eq!(
+        rt.native_auto_cached_status().actual_server_id.as_deref(),
+        Some("node-b")
+    );
+    assert!(rt
+        .publish_native_groups(generation, suspended, a.clone())
+        .is_none());
+    assert!(rt
+        .publish_native_groups(generation, suspended, Vec::new())
+        .is_none());
+    assert_eq!(
+        rt.native_auto_cached_status().actual_server_id.as_deref(),
+        Some("node-b")
+    );
+
+    // A selector readback wins while the relay has an old A frame queued. Its
+    // old connection ticket must be rejected, forcing a fresh subscription.
+    let selector = rt.publish_native_groups(generation, relay, b).unwrap();
+    assert!(rt
+        .publish_native_groups(generation, relay, a.clone())
+        .is_none());
+    assert_eq!(
+        rt.native_auto_cached_status().actual_server_id.as_deref(),
+        Some("node-b")
+    );
+    assert_eq!(
+        events.lock().unwrap().len(),
+        1,
+        "rejected frames must not announce stale state"
+    );
+    assert_eq!(events.lock().unwrap()[0]["actualServerId"], "node-b");
+    rt.bump_generation();
+    assert!(rt.publish_native_groups(generation, selector, a).is_none());
+    assert_eq!(rt.native_auto_cached_status().actual_server_id, None);
+}
+
+#[tokio::test]
+async fn native_status_inflight_response_cannot_replace_a_newer_observation() {
+    for failed in [false, true] {
+        let (rt, _dir, sink, _) = native_fixture(Some(AutoSelectTarget::Global), false);
+        let mut b = sink.native_groups.lock().unwrap().clone().unwrap();
+        let tag = rt
+            .switch_snapshot
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .id_to_tag["node-b"]
+            .clone();
+        b.iter_mut()
+            .find(|group| group.tag == PROXY_SELECTOR_TAG)
+            .unwrap()
+            .selected = tag;
+        if failed {
+            *sink.native_groups.lock().unwrap() = None;
+        }
+        let newer = Arc::clone(&rt);
+        // Existing request seam fires after the status ticket is captured, before
+        // the request returns its independently held A (or failure).
+        *sink.on_groups.lock().unwrap() = Some(Box::new(move || {
+            let revision = newer.native_observation_revision();
+            assert!(newer
+                .publish_native_groups(newer.core_generation(), revision, b)
+                .is_some());
+        }));
+        let status = rt.native_auto_status().await;
+        assert_eq!(
+            status.actual_server_id.as_deref(),
+            Some("node-b"),
+            "failed={failed}"
+        );
+    }
+}
+
+#[test]
+fn native_measure_frame_rechecks_current_identity_and_membership_without_publishing() {
+    for change in ["fingerprint", "remove"] {
+        let (rt, _dir, sink, request_config) =
+            native_fixture(Some(AutoSelectTarget::Global), false);
+        let generation = rt.core_generation();
+        let url = crate::commands::speedtest::resolve_speed_test_url(&request_config);
+        let frame = sink.native_groups.lock().unwrap().clone().unwrap();
+        let revision = rt.native_observation_revision();
+        let initial = rt
+            .native_measure_frame_status(generation, &url, &frame)
+            .unwrap();
+        assert!(initial
+            .native_measurements
+            .iter()
+            .any(|sample| sample.server_id == "node-b"));
+
+        // Request and native frame still describe the old emitted connection.
+        // D changes during its wait without changing G, Auto, or test URL.
+        let mut latest = request_config.clone();
+        let servers = latest["servers"].as_array_mut().unwrap();
+        if change == "fingerprint" {
+            servers
+                .iter_mut()
+                .find(|node| node["id"] == "node-b")
+                .unwrap()["port"] = serde_json::json!(19002);
+        } else {
+            servers.retain(|node| node["id"] != "node-b");
+        }
+        rt.config.save_full(&latest).unwrap();
+        assert_eq!(rt.core_generation(), generation);
+        // This is the production frame-processing seam, which loads D itself.
+        let current = rt
+            .native_measure_frame_status(generation, &url, &frame)
+            .unwrap();
+        assert!(
+            !current
+                .native_measurements
+                .iter()
+                .any(|sample| sample.server_id == "node-b"),
+            "{change}"
+        );
+        assert!(
+            current
+                .native_measurements
+                .iter()
+                .any(|sample| sample.server_id == "node-a"),
+            "unchanged clean sample: {change}"
+        );
+        assert_eq!(
+            rt.native_observation_revision(),
+            revision,
+            "measurement frames stay local"
+        );
     }
 }

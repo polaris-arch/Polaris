@@ -1,3 +1,5 @@
+import { getStagingActive } from '@/store/use-staging-active';
+import { autoSelectTargetFromChoice } from '@/domain/auto-select-choice';
 import type { TFunction } from 'i18next';
 import type {
   Rule,
@@ -7,7 +9,9 @@ import type {
   RuleDnsResolver,
 } from '@/contracts/types';
 import { api, IpcError } from '@/ipc';
-import { editRoute, type StagedEntry } from '@/lib/staged-config';
+import { configCanonicalText, editRoute, type StagedEntry } from '@/lib/staged-config';
+import { effectiveCollection, useAppStore } from '@/store/app-store';
+import { useStagedConfigStore } from '@/store/staged-config-store';
 import { toast } from '@/lib/error-handler';
 import { isRuleTypeDnsEffectSupported, ruleTypeNameKey, validateRule } from '@/domain/rules';
 import { invalidCondValues, parseConditionValues, type Cond } from './rule-cond';
@@ -56,6 +60,8 @@ export interface RuleSubmitArgs {
   close: () => void;
   loadConfig: (force: boolean) => Promise<unknown> | void;
   setSubmitting: (v: boolean) => void;
+  /** Exact mounted input revision owns asynchronous pre-submit admission. */
+  isCurrent?: () => boolean;
 }
 
 /**
@@ -91,6 +97,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
     close,
     loadConfig,
     setSubmitting,
+    isCurrent = () => true,
   } = args;
 
   /** 面的三个派生量（唯一来源 `initialPlane`）：两条 effects 腿的开关 + 落点集合键。 */
@@ -166,6 +173,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
     target === 'direct' ? 'direct' : target === 'block' ? 'block' : 'proxy';
   // action/targetServerId/bypassFakeIP 是兼容镜像；effects 是新代码权威。
   const action: RuleAction = routeEnabled ? routeAction : 'direct';
+  const targetAutoSelect = routeEnabled && routeAction === 'proxy' ? autoSelectTargetFromChoice(target) : undefined;
   const targetServerId =
     routeEnabled && routeAction === 'proxy' && target.startsWith('node:')
       ? target.slice(5)
@@ -186,6 +194,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
       ? {
           action: routeAction,
           targetServerId,
+          targetAutoSelect,
         }
       : undefined,
     dns: dnsEnabled
@@ -203,8 +212,42 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
   setSubmitting(true);
   /* 暂存闸门（与 NodeDialog 同形）：`customRules` Class B，提交的是完整 Rule ⇒ 天然满足重放要求的
      「幂等整体替换」。新增与编辑两条腿此前各写一遍逐字相同的三元，现按 `collectionKey` 单点判定。 */
-  const stageRule = editRoute(collectionKey, stagingEnabled) === 'staged';
+  let dispatched = false;
   try {
+    const previousConditions = base?.conditions?.length ? base.conditions : base ? [{ type: base.type, values: base.values }] : [];
+    const previousPatterns = previousConditions.filter(c => c.type === 'domainRegex').flatMap(c => c.values);
+    const patterns = rconds.filter(c => c.type === 'domainRegex').flatMap(c => c.values).filter(p => !isEdit || !previousPatterns.includes(p));
+    if (patterns.length > 32 || patterns.some(p => new TextEncoder().encode(p).length > 1024)) {
+      toast.error(t('rules.invalidHead'), t('rules.errInvalidRule'));
+      onValidationError?.('cond');
+      return;
+    }
+    if (patterns.length) {
+      const admitted = await api.rules.validateRegex(patterns);
+      if (!isCurrent()) return;
+      if (admitted.length !== patterns.length || admitted.some(value => value === null)) {
+        toast.error(t('rules.syntaxUnavailable'));
+        return;
+      }
+      if (admitted.some(value => value !== true)) {
+        toast.error(t('rules.invalidHead'), t('rules.errInvalidRule'));
+        onValidationError?.('cond');
+        return;
+      }
+    }
+    if (!isCurrent()) return;
+    const stagingNow = patterns.length ? getStagingActive() : stagingEnabled;
+    const stageRule = editRoute(collectionKey, stagingNow) === 'staged';
+    if (isEdit) {
+      const state = useAppStore.getState();
+      const disk = initialPlane === 'dns' ? state.dnsRules : state.rules;
+      const current = effectiveCollection(collectionKey, disk, useStagedConfigStore.getState().entries)
+        .find((rule) => rule.id === base?.id);
+      if (!base || !current || configCanonicalText(current) !== configCanonicalText(base)) {
+        toast.error(t('home.stagedConflictTitle'), t('rules.editConflict'));
+        return;
+      }
+    }
     if (isEdit && base) {
       // base 起底保全非模型字段（tlsSpoof 等，R5）；单条件时显式清 conditions/combineMode。
       const full: Rule = {
@@ -217,6 +260,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
         action,
         effects,
         targetServerId,
+        targetAutoSelect,
         enabled: base.enabled,
         bypassFakeIP: bypass,
         remarks,
@@ -230,10 +274,11 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
           entityPath: [collectionKey, full.id],
           nextValue: full,
         });
-        close();
+        if (isCurrent()) close();
         return; // 零 IPC 写、零磁盘写（FR-1）
       }
-      await api.rules.update(full, initialPlane);
+      dispatched = true;
+      await api.rules.update(full, initialPlane, base);
     } else {
       const rest: Omit<Rule, 'id'> = {
         type: rconds[0].type,
@@ -244,6 +289,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
         effects,
         enabled: true,
         targetServerId,
+        targetAutoSelect,
         bypassFakeIP: bypass,
         remarks,
         ...(networkProfileId ? { networkProfileId } : {}),
@@ -262,7 +308,7 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
         // 顺序条目与 RulesScreen.commitOrder 同形（整序列、同一个条目 id ⇒ 覆盖而不叠加）；
         // replay 里实体在前、顺序在后，新规则的 id 在重放顺序时已存在。
         const order = firstOrder(entityId);
-        if (order && editRoute(orderKey, stagingEnabled) === 'staged') {
+        if (order && editRoute(orderKey, stagingNow) === 'staged') {
           stage({
             id: `order:${orderKey}`,
             kind: 'rule',
@@ -271,9 +317,10 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
             nextValue: order,
           });
         }
-        close();
+        if (isCurrent()) close();
         return; // 零 IPC 写、零磁盘写（FR-1）
       }
+      dispatched = true;
       const created = await api.rules.add(rest, initialPlane);
       const order = created?.id ? firstOrder(created.id) : null;
       if (order) {
@@ -287,11 +334,14 @@ export async function submitRule(args: RuleSubmitArgs): Promise<void> {
       }
     }
     void loadConfig(true); // 同上：不刷则列表看不到新增/编辑结果
-    close();
+    if (isCurrent()) close();
   } catch (e) {
+    if (!dispatched && !isCurrent()) return;
     console.error('[RuleDialog] save failed:', e);
     // 写时校验（Rust 权威）：RULE_INVALID → 展示校验消息、弹窗不关；其它 → 通用可重试失败。
-    if (e instanceof IpcError && e.code === 'RULE_INVALID') {
+    if (e instanceof IpcError && e.code === 'RULE_CHECK_UNAVAILABLE') {
+      toast.error(t('rules.syntaxUnavailable'));
+    } else if (e instanceof IpcError && e.code === 'RULE_INVALID') {
       toast.error(t('rules.invalidHead'));
     } else {
       toast.error(t('common.saveFailed'));

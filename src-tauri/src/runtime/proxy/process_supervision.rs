@@ -36,7 +36,6 @@ use tokio::process::Child;
 use polaris_helper_proto::Platform;
 
 use crate::runtime::helper::{HelperStopOps, HelperStopTarget};
-use crate::runtime::win_console::no_console_window;
 
 use super::startup::attestation_commit_allowed;
 use super::{code, ProxyRuntime, StartError};
@@ -1078,6 +1077,7 @@ impl ProxyRuntime {
                 .map(|manifest| format!("sing-box version {}", manifest.version))
                 .unwrap_or_default()
         });
+        let version_probe = Arc::clone(&self.core_version_probe);
         // 观测腿全是阻塞 syscall / 子进程 / 同步 IPC → spawn_blocking。
         let attestation = tokio::task::spawn_blocking(move || {
             let running = running_exe_path(pid)
@@ -1087,8 +1087,8 @@ impl ProxyRuntime {
                 Some(r) if r != expected.as_path() => (
                     selected_version
                         .clone()
-                        .unwrap_or_else(|| core_version_first_line(&expected)),
-                    core_version_first_line(r),
+                        .unwrap_or_else(|| version_probe.first_line(&expected)),
+                    version_probe.first_line(r),
                 ),
                 _ => (String::new(), String::new()),
             };
@@ -1472,6 +1472,18 @@ impl ProxyRuntime {
         if victims.is_empty() {
             return Ok(());
         }
+        let unresolved: Vec<u32> = victims
+            .iter()
+            .filter(|process| !io.has_identity(process))
+            .map(|process| process.pid)
+            .collect();
+        if !unresolved.is_empty() {
+            // No signal and no escalation to a broader helper sweep without exact custody.
+            // In particular, arbitrary macOS ps rows cannot authorize kill(PID).
+            let message = format!("无法确认遗留内核进程的身份（PID {unresolved:?}），未发送终止信号。请关闭相关程序或重启系统后重试。");
+            self.set_error(&message, code::STARTUP_FAILED);
+            return Err(StartError::coded(message, code::STARTUP_FAILED));
+        }
         let pids = |cores: &[CoreProcess]| cores.iter().map(|core| core.pid).collect::<Vec<_>>();
         let victim_pids = pids(&victims);
         log::warn!(
@@ -1498,6 +1510,18 @@ impl ProxyRuntime {
             log::info!("孤儿核清理完成：{victim_pids:?}");
             return Ok(());
         }
+        #[cfg(unix)]
+        {
+            // Generic helper Cleanup is a broad process sweep and cannot carry pidfd
+            // authority. Keep unresolved custody rather than widening the target set.
+            let message = format!(
+                "遗留内核进程仍未退出（PID {:?}），已停止清理。请关闭相关程序或重启系统后重试。",
+                pids(&survivors)
+            );
+            self.set_error(&message, code::ROOT_ORPHAN_BLOCKED);
+            Err(StartError::coded(message, code::ROOT_ORPHAN_BLOCKED))
+        }
+        #[cfg(not(unix))]
         self.escalate_root_orphans(&survivors, io).await
     }
 
@@ -1593,8 +1617,8 @@ impl ProxyRuntime {
     ///   「spawn 完再记 `self.pid`」的窗口同构，是本仓既有的取舍。
     /// - **登录核**：已改为 spawn 后先登记、再 await STATUS；cancel 先确认 close/reap，后出表。
     ///   与起核前持有的 TS state gate 合起来封住本腿的扫描/登记窗口。
-    /// - **测速腿**：`victims` 在两段 1500 ms 宽限**之前**冻结；孤儿 pid 若被 init 回收并在
-    ///   宽限内由新测速临时核复用，排除表无从追踪该复用（需 pid 回绕，概率极低）。
+    /// - Frozen stale victims now carry native identity through both grace periods. Linux
+    ///   pidfd and Windows handles never signal a replacement PID; missing custody fails closed.
     pub(super) fn sweep_exclusions(&self) -> Vec<u32> {
         let mut exclude: Vec<u32> = self.pid.lock().ok().and_then(|g| *g).into_iter().collect();
         let temp: Vec<u32> = crate::runtime::speedtest::inflight_temp_core_pids();
@@ -1620,6 +1644,7 @@ impl ProxyRuntime {
     /// 活着的 root 孤儿一直独占 `<userData>/cache.db`，此时起任何新核都会
     /// `initialize cache-file: timeout`，**连切回 systemProxy 模式也起不来**——继续放行只会让用户撞上
     /// 一串无从归因的启动失败。报 [`code::ROOT_ORPHAN_BLOCKED`] 才指得出真正的动作。
+    #[cfg(not(unix))]
     async fn escalate_root_orphans(
         &self,
         orphans: &[CoreProcess],
@@ -1728,6 +1753,10 @@ pub(super) fn manual_orphan_kill_hint(platform: Platform, pids: &[u32]) -> Strin
 /// 清扫对一个候选进程做的两件事。生产实现每个平台一份（[`NativeStaleCoreIo`]）；单测换成记录桩，
 /// 不起进程、不发信号。
 pub(super) trait StaleCoreIo: Send + Sync {
+    /// Production requires retained native custody; inert test doubles own their model rows.
+    fn has_identity(&self, _process: &CoreProcess) -> bool {
+        true
+    }
     /// 请它结束。不回报成败：结束不了的（root / SYSTEM 的进程）由随后的 [`alive`](Self::alive) 看出来。
     fn end(&self, process: &CoreProcess, signal: Signal);
     /// 它是否还在。
@@ -1736,15 +1765,23 @@ pub(super) trait StaleCoreIo: Send + Sync {
 
 pub(super) struct NativeStaleCoreIo;
 
-/// Unix：按 pid 发信号、按 pid 探活。
+/// Unix: retained pidfd only; platforms without exact stale custody refuse before signaling.
 #[cfg(unix)]
 impl StaleCoreIo for NativeStaleCoreIo {
+    fn has_identity(&self, process: &CoreProcess) -> bool {
+        process.hold.has_identity()
+    }
     fn end(&self, process: &CoreProcess, signal: Signal) {
-        send_signal(process.pid, signal);
+        if !process.hold.signal(signal) {
+            log::warn!(
+                "stale core pid={}: retained-identity signal not confirmed",
+                process.pid
+            );
+        }
     }
 
     fn alive(&self, process: &CoreProcess) -> bool {
-        pid_alive(process.pid)
+        process.hold.is_running().unwrap_or(true)
     }
 }
 
@@ -1757,6 +1794,9 @@ impl StaleCoreIo for NativeStaleCoreIo {
 /// 候选没带句柄（不是扫描出来的）时不结束它，探活退回按 pid。
 #[cfg(windows)]
 impl StaleCoreIo for NativeStaleCoreIo {
+    fn has_identity(&self, process: &CoreProcess) -> bool {
+        process.hold.has_identity()
+    }
     fn end(&self, process: &CoreProcess, _signal: Signal) {
         let _ = process.hold.terminate();
     }
@@ -1853,34 +1893,6 @@ fn running_exe_path_impl(pid: u32) -> Option<PathBuf> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn running_exe_path_impl(_pid: u32) -> Option<PathBuf> {
     None
-}
-
-/// **观测腿**：对**磁盘上那个文件**跑一次 `sing-box version`，取原始第一行；失败恒空串。
-///
-/// 与 `UpdaterRuntime::read_core_version_line` 同一纪律：**探测失败绝不回落随包基线** ——
-/// 那会把「读不到」伪装成「就是基线」，正是自证最不能犯的错。此处更严：空串在
-/// [`attest_core_binary`](crate::runtime::core_attest::attest_core_binary) 里被判**告警**而非通过。
-fn core_version_first_line(bin: &Path) -> String {
-    match no_console_window(std::process::Command::new(bin).arg("version")).output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned(),
-        Ok(out) => {
-            log::warn!(
-                "{} version 非零退出 {:?}：版本行置空",
-                bin.display(),
-                out.status
-            );
-            String::new()
-        }
-        Err(e) => {
-            log::warn!("{} version spawn 失败 {e}：版本行置空", bin.display());
-            String::new()
-        }
-    }
 }
 
 /// 发信号给 pid（core-supervisor [`polaris_core_supervisor::ProcessKiller`] 的注入点）。

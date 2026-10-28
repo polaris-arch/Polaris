@@ -78,11 +78,21 @@ export const useTaildropTaskStore = create<TaildropTaskState>((set) => ({
     set((state) => ({ tasks: mergeTaildropTaskSnapshots(state.tasks, snapshots) })),
 }));
 
-/** 窗口级事件订阅；必须在任何水合 pull 之前挂上。 */
-export function subscribeTaildropTaskEvents(): () => void {
-  return api.server.onTaildropTaskUpdated((snapshot) => {
-    useTaildropTaskStore.getState().applySnapshot(snapshot);
+/** Register before hydration; per-task revisions reject stale snapshot rows. */
+export function subscribeTaildropTaskEvents(port: Pick<typeof api.server, 'onTaildropTaskUpdated' | 'taildropTasks'> = api.server): () => void {
+  let disposed = false;
+  let off: (() => void) | null = null;
+  void port.onTaildropTaskUpdated((snapshot) => {
+    if (!disposed) useTaildropTaskStore.getState().applySnapshot(snapshot);
+  }).then(async (unlisten) => {
+    if (disposed) { unlisten(); return; }
+    off = unlisten;
+    const snapshots = await port.taildropTasks();
+    if (!disposed) useTaildropTaskStore.getState().hydrateSnapshots(snapshots);
+  }).catch((error) => {
+    if (!disposed) console.error('[taildrop] task synchronization failed:', error);
   });
+  return () => { disposed = true; off?.(); off = null; };
 }
 
 /** 窗口重建 / 首次挂载水合。与事件竞态由 per-task revision 收敛。 */

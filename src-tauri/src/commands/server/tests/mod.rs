@@ -783,7 +783,10 @@ fn enabling_auto_is_refused_with_a_stable_code_and_writes_nothing() {
     // iOS 已开放意图；拒绝路径仍由上面的注入闸覆盖，前台准入由调度器负责。
     assert_eq!(
         auto_select::closed(
-            auto_select::Switches::PRODUCTION,
+            auto_select::Switches {
+                master: true,
+                better_leg: true
+            },
             polaris_helper_proto::Platform::Ios
         ),
         None
@@ -889,3 +892,64 @@ fn switch_now_moves_the_exit_only_to_the_decided_target_and_keeps_the_intent() {
 }
 
 mod batch_source_protection;
+
+#[test]
+fn malformed_server_updates_preserve_old_node_and_disk() {
+    let dir = temp_dir("invalid-update");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_switch_nodes(&mgr);
+    let before = mgr.load_full().unwrap();
+    let disk_before = std::fs::read(mgr.path()).unwrap();
+    for field in ["password", "name"] {
+        let mut invalid = before["servers"][0].clone();
+        invalid[field] = json!("");
+        assert!(server_update_core(&mgr, invalid).is_err());
+        assert_eq!(mgr.load_full().unwrap(), before);
+        assert_eq!(std::fs::read(mgr.path()).unwrap(), disk_before);
+    }
+    let mut changed = before["servers"][0].clone();
+    changed["name"] = json!("Updated");
+    server_update_core(&mgr, changed).unwrap();
+    assert_eq!(mgr.load_full().unwrap()["servers"][0]["id"], "n-a");
+    assert_eq!(mgr.load_full().unwrap()["servers"][0]["name"], "Updated");
+}
+
+#[test]
+fn malformed_bulk_import_is_atomic_and_scalar_safe() {
+    let dir = temp_dir("invalid-bulk");
+    let mgr = ConfigManager::new(dir.clone());
+    seed_switch_nodes(&mgr);
+    let before = mgr.load_full().unwrap();
+    let disk_before = std::fs::read(mgr.path()).unwrap();
+    for invalid in [
+        json!(7),
+        json!(null),
+        json!({"name":"bad","protocol":"trojan"}),
+    ] {
+        assert!(server_add_bulk_core(&mgr, vec![before["servers"][0].clone(), invalid]).is_err());
+        assert_eq!(mgr.load_full().unwrap(), before);
+        assert_eq!(std::fs::read(mgr.path()).unwrap(), disk_before);
+    }
+}
+
+#[test]
+fn ambiguous_identity_preflight_does_not_register_selector_intent() {
+    let mut cfg = json!({"servers":[{"id":"same"},{"id":"same"}],"selectedServerId":"old"});
+    let before = cfg.clone();
+    let calls = std::cell::Cell::new(0);
+    let result = select_in_place(
+        &mut cfg,
+        "same",
+        |_| panic!("must not reach candidate validation"),
+        || {
+            calls.set(calls.get() + 1);
+            1
+        },
+    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("serverIdentityAmbiguous"));
+    assert_eq!(calls.get(), 0);
+    assert_eq!(cfg, before);
+}

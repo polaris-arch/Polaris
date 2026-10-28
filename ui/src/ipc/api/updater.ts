@@ -1,18 +1,12 @@
-import { invoke, listen } from '../ipc-client';
+import { invoke, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { CoreVersionInfo } from '../../contracts/types/update';
 
 export interface VersionInfo {
   debugReportAvailable?: boolean;
   appVersion: string;
-  appName: string;
-  buildDate: string;
-  singBoxVersion: string;
-  copyright: string;
-  repositoryUrl: string;
-  platform: string;
-  arch: string;
-  osVersion: string;
+  coreVersion: string;
+  coreBaseline: string;
   /**
    * Windows 便携版上次手动交接的压缩包位置。completionUnverified 表示应用无法确认
    * 是否覆盖（包括同版本修复），不能据此报告未完成或已安装。仅显式清除提示会放弃此记录；后台和普通检查保留它。
@@ -130,6 +124,8 @@ export interface UpdateInstallResult {
   advisory?: InstallAdvisory;
   /** 仅随 `advisory: 'portableManualReplace'`：程序所在目录（用户覆盖解压的目标）。 */
   programDir?: string;
+  /** Read-only restored reminder; its persisted archive is not installation authority. */
+  requiresRedownload?: boolean;
   /**
    * 形态错配时是否已回退交系统打开（**不强制 root 安装**）。`false` = 没有打开：系统打不开，
    * 或便携版拿到的是安装程序（交出去就是运行它，后端不交）。
@@ -146,6 +142,8 @@ export interface UpdateInstallResult {
    * `false` = 交不出去，`reason` 里是那五个码之一。
    */
   awaitingSystemInstaller?: boolean;
+  /** macOS DMG opened for manual installation; replacement has not been confirmed. */
+  awaitingManualInstall?: boolean;
   reason?: string;
   detail?: string;
 }
@@ -259,8 +257,8 @@ export const updateApi = {
     return invoke(IPC_CHANNELS.UPDATE_SKIP, { version });
   },
 
-  onProgress(listener: (progress: UpdateProgress) => void): () => void {
-    return listen(IPC_CHANNELS.EVENT_UPDATE_PROGRESS, listener);
+  onProgress(listener: (progress: UpdateProgress) => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_UPDATE_PROGRESS, listener);
   },
 
   /**

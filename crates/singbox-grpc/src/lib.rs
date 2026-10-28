@@ -4,7 +4,7 @@
 //! proto 内嵌在 TS 里；本 crate 把 proto vendored 进 `proto/started_service.proto`，经 build.rs（tonic-prost-build）编译。
 //!
 //! 暴露面（clash 等价管理方法）：
-//! - [`SingBoxApiClient::select_outbound`]：selector/urltest group 内热切换出站（`SelectOutbound`）。
+//! - [`SingBoxApiClient::select_outbound`]：selector group 内热切换出站（`SelectOutbound`）。
 //! - [`SingBoxApiClient::first_groups_snapshot`]：读回各 group 的**运行期**选择（`SubscribeGroups` 首帧）。
 //! - [`SingBoxApiClient::close_connection`] / [`SingBoxApiClient::close_all_connections`]：关单/全连接。
 //! - [`SingBoxApiClient::subscribe_status`]：Status 流（内存/goroutine/上下行速率/累计）→ tokio Stream。
@@ -146,6 +146,7 @@ pub struct SingBoxApiClient {
     /// 原始 target（`host:port`，IPv6 已方括号包裹）；流订阅重连用（h2c::connect_h2c 会自加 http://）。
     target: String,
     secret: Option<String>,
+    authorization: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
 
 /// 把一次 unary 调用收在 [`UNARY_DEADLINE`] 之内，从发起起算。
@@ -180,7 +181,6 @@ impl SingBoxApiClient {
         secret: impl Into<String>,
     ) -> Result<Self, ClientError> {
         let target = endpoint.target();
-        let channel = h2c::connect_h2c(&target).await?;
         let secret = {
             let s = secret.into();
             if s.is_empty() {
@@ -189,20 +189,31 @@ impl SingBoxApiClient {
                 Some(s)
             }
         };
+        // Reuse reconnect admission and retain only validated metadata for infallible calls.
+        // Reject malformed credentials before constructing a channel; never drop auth on error.
+        let authorization = reconnect::auth_request(&secret, ())
+            .map_err(|_| {
+                ClientError::Status(tonic::Status::invalid_argument(
+                    "management API secret cannot be encoded as authorization metadata",
+                ))
+            })?
+            .metadata()
+            .get("authorization")
+            .cloned();
+        let channel = h2c::connect_h2c(&target).await?;
         Ok(Self {
             channel,
             target,
             secret,
+            authorization,
         })
     }
 
     /// 注入 Bearer metadata 的请求包装。secret 空则原样返回（免认证）。
     fn with_auth<R>(&self, mut req: Request<R>) -> Request<R> {
-        if let Some(secret) = &self.secret {
-            let val = format!("Bearer {secret}");
-            // secret 经构造校验为非空串；header value 合法 ASCII——unwrap 安全。
+        if let Some(authorization) = &self.authorization {
             req.metadata_mut()
-                .insert("authorization", val.parse().unwrap());
+                .insert("authorization", authorization.clone());
         }
         req
     }
@@ -212,7 +223,7 @@ impl SingBoxApiClient {
         StartedServiceClient::new(self.channel.clone())
     }
 
-    /// clash 等价：在 selector/urltest group 内热切换出站。
+    /// clash 等价：在 selector group 内热切换出站。
     /// `selector_tag` = group tag，`member_tag` = 目标出站 tag。
     /// 带 [`UNARY_DEADLINE`] deadline 保证必 settle。
     pub async fn select_outbound(
@@ -228,6 +239,34 @@ impl SingBoxApiClient {
         req.set_timeout(UNARY_DEADLINE);
         within_unary_deadline(c.select_outbound(req)).await?;
         Ok(())
+    }
+
+    /// Request an existing native HTTP URLTest. Acceptance is not completion; consume
+    /// SubscribeGroups history before reporting a measured result.
+    pub async fn url_test(&self, outbound_tag: impl Into<String>) -> Result<(), ClientError> {
+        let mut client = self.client();
+        let mut request = self.with_auth(Request::new(daemon::UrlTestRequest {
+            outbound_tag: outbound_tag.into(),
+        }));
+        request.set_timeout(UNARY_DEADLINE);
+        within_unary_deadline(client.url_test(request)).await?;
+        Ok(())
+    }
+
+    /// Non-reconnecting observation stream so consumers can invalidate their
+    /// confirmed state immediately on disconnect rather than displaying stale truth.
+    pub async fn open_groups(&self) -> Result<tonic::Streaming<daemon::Groups>, ClientError> {
+        let mut client = self.client();
+        let request = self.with_auth(Request::new(daemon::Empty {}));
+        match tokio::time::timeout(SNAPSHOT_TIMEOUT, client.subscribe_groups(request)).await {
+            Ok(stream) => Ok(stream?.into_inner()),
+            Err(_) => Err(ClientError::SnapshotTimeout),
+        }
+    }
+
+    /// Native groups publish changes after measurements/selections. No polling timer.
+    pub fn subscribe_groups(&self, cfg: ReconnectConfig) -> ReconnectingStream<daemon::Groups> {
+        reconnect::subscribe_groups(self.target.clone(), self.secret.clone(), cfg)
     }
 
     /// Native dynamic route/DNS policy. The server may silently ignore an invalid mode;

@@ -112,7 +112,7 @@ pub struct SpeedTestTarget {
 }
 
 impl SpeedTestTarget {
-    /// 解析测速 URL。非法 / 非 http(s) / 无 host / 端口越界 → `None`（调用方回落默认端点）。
+    /// Parse a speed-test URL; invalid explicit values return None, never another endpoint.
     ///
     /// 复用 `reqwest::Url`（= `url` crate，reqwest 的公开再导出）—— 本仓已有依赖，不新引 URL 解析器。
     #[must_use]

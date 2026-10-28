@@ -381,8 +381,39 @@ class AndroidNativeAdmissionTest {
         assertTrue(ledger.tailscaleTargetAction(binding, file, "action-one", "finish").getBoolean("released"))
         assertTrue(ledger.enterBirth(pending))
         assertEquals(AndroidNativeAdmission.State.Unknown, ledger.state(ticket))
-        assertTrue(runCatching { ledger.tailscaleTargetAction(binding, file, "action-one", "finish") }.isFailure)
+        // Simulate a lost release ACK: the original exact token remains retryable.
+        assertTrue(ledger.tailscaleTargetAction(binding, file, "action-one", "finish").getBoolean("released"))
         assertTrue(runCatching { ledger.tailscaleTargetAction(binding, file, "second", "begin") }.isFailure)
+    }
+
+    @Test fun releaseReplayCannotReleaseSuccessorOrReuseActionIdentity() {
+        val ledger = open()
+        val (_, custody) = ScopedNativeFixture.closedOwner(ledger, "release-replay")
+        val binding = custody.wire()
+        val file = ScopedNativeFixture.file("one")
+        ledger.tailscaleTargetAction(binding, file, "first", "begin")
+        val released = ledger.tailscaleTargetAction(binding, file, "first", "finish")
+        ledger.tailscaleTargetAction(binding, file, "second", "begin")
+        assertEquals(released.toString(), ledger.tailscaleTargetAction(binding, file, "first", "finish").toString())
+        assertTrue(runCatching { ledger.tailscaleTargetAction(binding, file, "third", "begin") }.isFailure)
+        assertTrue(runCatching { ledger.tailscaleTargetAction(binding, file, "never-issued", "finish") }.isFailure)
+        assertTrue(runCatching { ledger.tailscaleTargetAction(binding, ScopedNativeFixture.file("two"), "first", "finish") }.isFailure)
+        ledger.tailscaleTargetAction(binding, file, "second", "finish")
+        assertTrue(runCatching { ledger.tailscaleTargetAction(binding, file, "first", "begin") }.isFailure)
+        assertEquals(2, ledger.metadataUsage().runtimeActions)
+    }
+
+    @Test fun releaseReceiptIsReservedBeforeGrantAndReplaySurvivesBudgetClosure() {
+        val ledger = bounded(3)
+        val (_, custody) = ScopedNativeFixture.closedOwner(ledger, "bounded-release")
+        val binding = custody.wire()
+        val file = ScopedNativeFixture.file("one")
+        ledger.tailscaleTargetAction(binding, file, "last", "begin")
+        assertEquals(3, ledger.metadataUsage().records)
+        assertTrue(ledger.metadataUsage().capacityClosed)
+        assertTrue(ledger.tailscaleTargetAction(binding, file, "last", "finish").getBoolean("released"))
+        assertTrue(ledger.tailscaleTargetAction(binding, file, "last", "finish").getBoolean("released"))
+        assertTrue(runCatching { ledger.tailscaleTargetAction(binding, file, "new", "begin") }.isFailure)
     }
 
     @Test fun membershipCanExcludeOnlyItsOriginalValidationTicketAndUnknownLedgerRemains() {

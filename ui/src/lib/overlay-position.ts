@@ -156,3 +156,32 @@ export function placeTip(
     top: box.top + clampAxis(p.y - box.top, box.height, tip.h),
   };
 }
+
+/** Inner content boundary for portalled controls; never use a small row/field as a boundary.
+ * The closest semantic card wins, with the viewport and enclosing dialog still constraining it.
+ */
+export function getControlBoundary(trigger: HTMLElement, viewport: OverlayBox): OverlayBox {
+  const card = trigger.closest<HTMLElement>('[data-overlay-boundary], .card, .dlg-body, dialog');
+  const body = trigger.closest<HTMLElement>('.dlg-body');
+  const dialog = trigger.closest<HTMLElement>('dialog');
+  let box = viewport;
+  for (const element of new Set([card, body, dialog])) {
+    if (!element) continue;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    const n = (value: string) => Number.parseFloat(value) || 0;
+    const left = rect.left + n(style.borderLeftWidth) + n(style.paddingLeft);
+    const top = rect.top + n(style.borderTopWidth) + n(style.paddingTop);
+    const right = rect.right - n(style.borderRightWidth) - n(style.paddingRight);
+    const bottom = rect.bottom - n(style.borderBottomWidth) - n(style.paddingBottom);
+    box = intersectOverlayBoxes(box, { left, top, width: Math.max(0, right - left), height: Math.max(0, bottom - top) });
+  }
+  return box;
+}
+
+export function intersectOverlayBoxes(a: OverlayBox, b: OverlayBox): OverlayBox {
+  const left = Math.max(a.left, b.left);
+  const top = Math.max(a.top, b.top);
+  return { left, top, width: Math.max(0, Math.min(a.left + a.width, b.left + b.width) - left),
+    height: Math.max(0, Math.min(a.top + a.height, b.top + b.height) - top) };
+}

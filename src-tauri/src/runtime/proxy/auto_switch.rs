@@ -409,6 +409,9 @@ impl ProxyRuntime {
         let target_id = candidate.id.clone();
         let expected_fingerprint = expected_candidate_fingerprint.to_string();
         let persisted = self.config.update(|latest| {
+            if polaris_store::auto_select::target(latest).is_some() {
+                return Decision::Skip(None);
+            }
             // 显式用户选择也在同一个 ConfigManager 写事务内 bump；因此本检查到 claim 之间没有
             // “同目标但更新意图”可穿过。只比较 selectedServerId 无法分辨这种所有权交接。
             if self.selector_reconcile.intent_generation() != starting_intent_generation {
@@ -456,6 +459,14 @@ impl ProxyRuntime {
         let interrupt = new_cfg.interrupt_connections_on_switch == Some(true);
         let applied_disconnects = match SwitchExecutor.execute(api, &hot_plan, interrupt).await {
             HotSwitchOutcome::Applied { disconnect } => {
+                if let Some(result) = disconnect.as_ref() {
+                    if let Some(error) = result.snapshot_error.as_ref() {
+                        log::warn!("自动故障切换：断连快照失败：{error}");
+                    }
+                    if !result.failed_ids.is_empty() {
+                        log::warn!("自动故障切换：{} 条断连请求未确认", result.failed_ids.len());
+                    }
+                }
                 Some(disconnect.map_or(0, |result| result.closed_ids.len()))
             }
             other => {
@@ -507,9 +518,7 @@ impl ProxyRuntime {
             // 只有管理面回读与配置 CAS 双重自证后，才把候选提交为 R 的真实选择并刷新依赖出口的
             // 派生状态。PUT 成功但随后回滚的瞬态不应污染 current_config / 解锁 / 出口 IP 缓存。
             self.commit_applied(&new_runtime);
-            self.mesh
-                .exit_route_reconcile(&new_cfg, new_cfg.enable_ipv6.unwrap_or(false))
-                .await;
+            self.reconcile_emitted_exit_route(generation).await;
             if !self.selector_operation_is_current(generation, intent_generation) {
                 log::info!("自动故障切换：出口路由对账期间 selector 所有权已交接 → 抑制旧成功通知");
                 return AutoHotSwitchOutcome::Superseded;
@@ -760,6 +769,14 @@ impl ProxyRuntime {
     /// （含 200 节点级 `servers`）纯属常驻浪费。闭包内只取字段，不回调任何子系统。
     ///
     fn auto_switch_enabled(&self) -> bool {
+        // A native default reference owns its wrapper even while the feature is OFF/pinned.
+        if self.current_config.read().ok().is_some_and(|guard| {
+            guard
+                .as_ref()
+                .is_some_and(|config| polaris_store::auto_select::target(config).is_some())
+        }) {
+            return false;
+        }
         self.config
             .with_current(|c| c.get("autoSwitchNode").and_then(Value::as_bool))
             .ok()
@@ -825,6 +842,14 @@ impl ProxyRuntime {
     /// 与 `is_switching` / `last_switch_time` 同类，`AutoSwitchMachine` 就是它的归宿。故取「多借一个
     /// `&mut`」这条更小的改动面，判据与锁存两者仍都是决策层的纯逻辑（各自有真值表锁死）。
     async fn do_switch_io(self: &Arc<Self>, machine: &mut AutoSwitchMachine, reason: &str) -> bool {
+        if self
+            .current_config_snapshot()
+            .as_ref()
+            .and_then(polaris_store::auto_select::target)
+            .is_some()
+        {
+            return false;
+        }
         let generation = self.core_generation();
         let config = match self.config.current() {
             Ok(c) => c,
@@ -1822,12 +1847,30 @@ impl ProxyRuntime {
 
     /// 状态变了才发事件；自曝标记置位时记一行警告（界面没开着也进日志）。
     pub(crate) fn auto_select_announce(&self) {
-        self.auto_select_announce_from(&SelectReadings::live());
+        let mut announced = self
+            .auto_select_announced
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let (Some(emitter), Ok(payload)) = (
+            self.error_emitter.get(),
+            serde_json::to_value(self.native_auto_cached_status()),
+        ) {
+            let key = payload.to_string();
+            if announced.as_deref() == Some(key.as_str()) {
+                return;
+            }
+            *announced = Some(key);
+            emitter.emit_auto_select_status(&payload);
+        }
     }
 
     /// 取状态、比对、发射在同一把锁里完成：并发的两次播报因此先后有序，每次发的都是它拿到锁
     /// 那一刻的状态，旧状态不会排到新状态后面。锁里没有 await。
     pub(super) fn auto_select_announce_from(&self, readings: &SelectReadings<'_>) {
+        if !auto_select::AUTO_SELECT_ENABLED {
+            self.auto_select_announce();
+            return;
+        }
         let mut announced = self
             .auto_select_announced
             .lock()

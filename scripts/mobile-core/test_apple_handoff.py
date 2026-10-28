@@ -290,6 +290,84 @@ class AppleHandoffControls(unittest.TestCase):
                 ci_apple.import_local()
             save.assert_not_called()
 
+    def test_import_creates_private_scratch_before_real_native_environment_subprocess(self):
+        import producer
+        import sys
+        from fork_input import tool_environment
+        for reused in (False, True):
+            with self.subTest(reused=reused), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                component = root / ('historical/component' if reused else 'component')
+                component.mkdir(mode=0o700, parents=True)
+                paths = {name: str(root / name) for name in
+                         ('cache', 'source', 'go', 'gomobile', 'gobind', 'developer')}
+                paths['component-work'] = str(component)
+                go = Path(paths['go'])
+                go.write_text(f'#!{sys.executable}\n'
+                    'import json, os, pathlib, stat, sys, tempfile\n'
+                    'assert sys.argv[1:3] == ["env", "-json"]\n'
+                    'scratch = pathlib.Path(os.environ["TMPDIR"])\n'
+                    'assert scratch.is_dir(), "go env received nonexistent TMPDIR"\n'
+                    'assert stat.S_IMODE(scratch.stat().st_mode) == 0o700\n'
+                    'with tempfile.TemporaryFile(dir=scratch) as probe:\n'
+                    '    probe.write(b"scratch is writable")\n'
+                    '(scratch / "go-env-invoked").write_text("observed")\n'
+                    'print(json.dumps({key: "" for key in sys.argv[3:]}))\n')
+                go.chmod(0o755)
+                for name in ('gomobile', 'gobind'):
+                    Path(paths[name]).write_text('inert tool fixture')
+                pins = {name: file_pin(paths[name]) for name in ('go', 'gomobile', 'gobind')}
+                tools = {'executables': pins}
+                scratch = root / 'import-check'
+                native_env = tool_environment(go, paths['gomobile'], paths['gobind'], paths['cache'],
+                                              scratch, developer=Path(paths['developer']))
+                # Construct expected observations without creating scratch. The
+                # verify_import call below uses the real observer and subprocess.
+                with mock.patch.object(producer, 'run', side_effect=lambda command, **kw:
+                                       json.dumps({key: '' for key in command[3:]})):
+                    expected = producer.apple_native_environment(go, native_env)
+                binding = {'producer': self.app, 'sourceContract': {'source': 'fixed'},
+                           'tools': tools, 'nativeEnvironment': expected}
+                receipt = {'input': binding}
+                receipt_path = component / 'component-receipt.json'
+                receipt_path.write_text(json.dumps(receipt))
+                facts = {'App': self.app, 'tools': pins, 'componentReceipt': file_pin(receipt_path),
+                         'localReplacementSources': {}}
+                if reused:
+                    facts['componentReuse'] = {'originalProducer': self.app}
+                (root / 'component-handoff.json').write_text(json.dumps(facts))
+                (root / 'tools.json').write_text(json.dumps({'paths': paths}))
+                (root / 'component-current-binding.json').write_text(json.dumps(binding))
+                self.assertFalse(scratch.exists())
+                with mock.patch.object(handoff, 'validate_manifest', return_value=facts), \
+                        mock.patch.object(handoff, 'load', return_value=binding['sourceContract']), \
+                        mock.patch.object(producer, 'tool_facts', return_value=(go, tools)), \
+                        mock.patch.object(handoff, 'verify_replacements'), \
+                        mock.patch('consume.verify_original') as verify:
+                    actual = handoff.verify_import(component, paths['cache'], paths['source'], go,
+                        paths['gomobile'], paths['gobind'], paths['developer'], handoff_root=root)
+                    self.assertEqual(actual, receipt)
+                    self.assertEqual((scratch / 'go-env-invoked').read_text(), 'observed')
+                    self.assertEqual(verify.call_args.args[-1], scratch)
+                    # Admission still rejects unsafe scratch before invoking
+                    # either the environment subprocess or native verifier.
+                    (scratch / 'go-env-invoked').unlink()
+                    verify.reset_mock()
+                    scratch.chmod(0o755)
+                    with self.assertRaisesRegex(RuntimeError, 'current-user private'):
+                        handoff.verify_import(component, paths['cache'], paths['source'], go,
+                            paths['gomobile'], paths['gobind'], paths['developer'], handoff_root=root)
+                    self.assertFalse((scratch / 'go-env-invoked').exists())
+                    scratch.chmod(0o700)
+                    held = root / 'held-import-check'
+                    scratch.rename(held)
+                    scratch.symlink_to(held, target_is_directory=True)
+                    with self.assertRaisesRegex(RuntimeError, 'cannot be redirected'):
+                        handoff.verify_import(component, paths['cache'], paths['source'], go,
+                            paths['gomobile'], paths['gobind'], paths['developer'], handoff_root=root)
+                    self.assertFalse((held / 'go-env-invoked').exists())
+                    verify.assert_not_called()
+
     def manifest(self, root, checkout):
         return self.signed({'schema': 'polaris-apple-component-handoff-v1', 'context': self.ctx,
             'producerJob': 'component', 'root': str(root), 'checkout': str(checkout),

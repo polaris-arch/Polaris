@@ -416,3 +416,9 @@ describe('nodeUseAction —— 设为出口按触发面分档', () => {
     expect(nodeUseAction('b', null, false, 'button')).toBe('switch');
   });
 });
+
+
+it('explicit current-node selection can pin an Auto winner manually', () => {
+  expect(nodeUseAction('a', 'a', false, 'button', true)).toBe('switch');
+  expect(nodeUseAction('a', 'a', false, 'card', true)).toBe('confirm');
+});

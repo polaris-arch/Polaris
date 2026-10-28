@@ -1,5 +1,8 @@
+import { needsHelperRecovery, revealHelperRecovery } from '@/domain/helper-recovery';
 import { proxyErrorText } from '@/domain/proxy-error-text';
 import { useQualifiedLatencies } from '@/mobile/use-qualified-latencies';
+import { serverSwitchErrorCode, serverSwitchErrorText } from '@/domain/action-error-text';
+import { configuredExitId } from '@/domain/actual-exit';
 import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
 /**
  * Home 屏（提取自原型 polaris-prototype.html L1633-1711）。
@@ -226,7 +229,6 @@ export function HomeScreen() {
   const proxyStarting = useAppStore((s) => s.proxyStarting);
   const proxyStopping = useAppStore((s) => s.proxyStopping);
   const servers = useAppStore((s) => s.servers);
-  const selectedServerId = useAppStore((s) => s.selectedServerId);
   const unlock = useAppStore((s) => s.unlock);
   /** 出口 IP 快照：与状态栏**同一份 store、同一次探测**（水合与订阅统一挂 App.tsx 顶层）。
    *  出口节点框的旗面只认它带回的 countryCode——绝不用节点名/入口域名派生（见 domain/exit-flag.ts）。 */
@@ -286,6 +288,8 @@ export function HomeScreen() {
   const latencies = useQualifiedLatencies(servers, nodeMenuOpen);
   /** 本次解锁快照是否由用户点「网络检测」触发（喂 onUpdated 里的完成 toast，见 onUnlockRefresh）。 */
   const unlockUserRequested = useRef(false);
+  const unlockRequestLifetime = useRef(0);
+  useEffect(() => () => { unlockRequestLifetime.current += 1; }, []);
   /** 当前出口显示名。走 ref 而非直接读闭包：解锁事件订阅 effect 不该因换节点重挂（重挂会丢事件），
    *  但完成 toast 又要报出「经哪个出口」——ref 让订阅保持长命的同时读到最新名字。 */
   const exitNameRef = useRef('');
@@ -310,15 +314,16 @@ export function HomeScreen() {
   /** 地区分流是否反向（回国）——喂「分流策略」标签行的持久指示器，见 ReverseRoutingBadge。 */
   const reverseRouting = isReverseRegionRouting(config);
   const uptimeSec = useUptimeSeconds(proxyStatus?.startTime, connected);
-  const directSelected = isDirectSelection(selectedServerId);
-  const blockSelected = isBlockSelection(selectedServerId);
+  const displayServerId = configuredExitId(proxyStatus, config);
+  const directSelected = isDirectSelection(displayServerId);
+  const blockSelected = isBlockSelection(displayServerId);
   /** 出口是「非节点哨兵」（直连 / 阻断）：无节点承载，故 currentServer 恒 null 但**仍是有效出口**。 */
-  const sentinelSelected = isSentinelSelection(selectedServerId);
+  const sentinelSelected = isSentinelSelection(displayServerId);
   const currentServer = useMemo(() => {
     if (sentinelSelected) return null;
-    const byId = servers.find((s) => s.id === selectedServerId);
+    const byId = servers.find((s) => s.id === displayServerId);
     return byId ?? null;
-  }, [servers, selectedServerId, sentinelSelected]);
+  }, [servers, displayServerId, sentinelSelected]);
   const exitReachabilityNotice = deriveExitReachabilityNotice({
     connected: connState === 'connected',
     hasNode: !!currentServer?.id,
@@ -534,7 +539,7 @@ export function HomeScreen() {
         // 仅连接分支报（原型断开走 setConnected(false) 不 notify）。
         toast.success(
           t('home.connectedToast', {
-            node: directSelected ? t('home.directConnection') : (currentServer?.name ?? ''),
+            node: (() => { const saved = useAppStore.getState(); const id = configuredExitId(saved.proxyStatus, null); return isDirectSelection(id) ? t('home.directConnection') : isBlockSelection(id) ? t('home.routingBlock') : saved.servers.find(server => server.id === id)?.name ?? t('autoSelect.pendingNode'); })(),
           })
         );
       }
@@ -591,6 +596,10 @@ export function HomeScreen() {
         );
         return;
       }
+      if (code === ProxyErrorCode.NODE_RESOLVER_UNSUPPORTED || code === ProxyErrorCode.SPEED_TEST_URL_INVALID) {
+        toast.error(proxyErrorText({ errorCode: code }, key => t(key)));
+        return;
+      }
       // 残留 root 孤儿阻断起核 → 专属标题，**不能**落到下面的「sing-box 启动失败，请检查服务器
       // 配置」：那句话把用户导向错误的下一步（残留进程与服务器配置毫无关系，照它改永远修不好）。
       // Rust 诊断会带 pid/命令，只进脱敏日志；这里只显示稳定码对应的本地化处置指引。
@@ -613,10 +622,12 @@ export function HomeScreen() {
           code === ProxyErrorCode.HELPER_CORE_ABSENT ||
           code === ProxyErrorCode.HELPER_CORE_INVALID) {
         toast.error(proxyErrorText({ errorCode: code }, key => t(key)));
+        if (needsHelperRecovery(code)) void revealHelperRecovery();
         return;
       }
       if (code === ProxyErrorCode.HELPER_CORE_MISMATCH) {
         toast.error(t('errors.helperCoreMismatch'));
+        void revealHelperRecovery();
         return;
       }
       toast.error(
@@ -717,7 +728,7 @@ export function HomeScreen() {
       // 原型 `pickDirectExit:3514` 同样冒浮标，同 `onPickNode` 一并不移植（见那处理由）。
     } catch (err) {
       console.error('[home] switch to direct failed:', err);
-      toast.error(t('home.switchError'));
+      toast.error(serverSwitchErrorText(serverSwitchErrorCode(err), t));
     }
   }, [diskConfig, switchServer, t]);
 
@@ -736,7 +747,7 @@ export function HomeScreen() {
       else if (feedback) toast.info(feedback.text);
     } catch (err) {
       console.error('[home] switch to block failed:', err);
-      toast.error(t('home.switchError'));
+      toast.error(serverSwitchErrorText(serverSwitchErrorCode(err), t));
     }
   }, [diskConfig, blockDisabledReason, switchServer, t]);
 
@@ -785,6 +796,10 @@ export function HomeScreen() {
   const onUnlockRefresh = useCallback(async () => {
     if (!connected) return;
     beginUnlockCheck();
+    const requestedState = useAppStore.getState().unlock;
+    const lifetime = unlockRequestLifetime.current;
+    const isCurrent = () => unlockRequestLifetime.current === lifetime
+      && useAppStore.getState().unlock === requestedState;
     // 本轮由用户亲手发起 → 放行 onUpdated 里的「网络检测完成」toast（原型 :3649）。
     unlockUserRequested.current = true;
     void ipInfoApi.get(true, true).catch((err) => {
@@ -794,8 +809,10 @@ export function HomeScreen() {
       // **必须消费返回值**（对齐 上游 `use-unlock-detection.ts:85,97` 的 applyUnlockSnapshot）：
       // 后端有若干条 emit 了终态就早退的路径（gating 短路 / S-gate notReady / TTL 命中 / force 15s 硬下限），
       // 丢掉返回值时 `running:true` 就没人收口 —— 徽章一直转圈。这正是本批修的缺陷之一。
-      applyUnlockSnapshot(await unlockApi.run(true));
+      const snapshot = await unlockApi.run(true);
+      if (isCurrent()) applyUnlockSnapshot(snapshot);
     } catch (err) {
+      if (!isCurrent()) return;
       // 失败时徽章从 checking 悄悄退回旧值，用户读作「检测了一下没变化」——实为根本没跑成。透出真实原因。
       console.error('[home] unlock run failed:', err);
       unlockUserRequested.current = false; // 没跑成 → 不许后续任何快照冒领这次的完成 toast
@@ -898,7 +915,7 @@ export function HomeScreen() {
    * 「已配置」含 direct/block 两个哨兵出口：它们都不需要节点承载也能起核（config-engine 侧已豁免
    * selectedServer 存在性校验），故不可只看 currentServer——否则选了阻断后圆钮变灰、用户无法启动，
    * 而且界面会同时谎报成「请配置服务器」。 */
-  const serverConfigured = sentinelSelected || !!currentServer?.id;
+  const serverConfigured = sentinelSelected || !!currentServer?.id || config?.selectionIntent?.mode === 'auto';
   // busy = 本地在飞标志，方向由当前连接态定（连着→停止中，未连→启动中）；store 相位优先。
   // 归一收口到 `deriveProxyPhase`（与托盘同一口径）：**stopping 压过 starting** —— 取消一次启动时
   // 两个标志同时为真（start 还在飞、stop 已发出），starting 若优先，圆钮会在取消途中仍显"可点取消"，
@@ -1110,7 +1127,7 @@ export function HomeScreen() {
                             ? t('home.routingDirect')
                             : blockSelected
                               ? t('home.routingBlock')
-                              : currentServer?.name ?? t('home.plsConfigServer')}
+                              : currentServer?.name ?? t(config?.selectionIntent || proxyStatus?.running ? 'autoSelect.pendingNode' : 'home.plsConfigServer')}
                         </span>
                         {!sentinelSelected && currentServer?.protocol && (
                           <span className="pill proto" id="cur-proto">
@@ -1137,7 +1154,7 @@ export function HomeScreen() {
                     open={nodeMenuOpen}
                     servers={servers}
                     subscriptions={config?.subscriptions ?? []}
-                    selectedServerId={selectedServerId}
+                    selectedServerId={displayServerId}
                     latencies={latencies}
                     onPick={onPickNode}
                     onPickDirect={onPickDirectExit}

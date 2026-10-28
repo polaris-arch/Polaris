@@ -232,3 +232,12 @@ it('a newer shared fresh read supersedes a dedicated manual read without consumi
   expect(useAppStore.getState().selectedServerId).toBe('n-shared');
   expect(useAppStore.getState().config?.selectedServerId).toBe('n-shared');
 });
+
+it('adopts saved selection and cleared Auto after a native runtime switch failure', async () => {
+  seed('old');
+  switchMock.mockRejectedValueOnce(new Error('runtime switch failed'));
+  configGetMock.mockResolvedValueOnce(authoritativeConfig('desired'));
+  await expect(useAppStore.getState().switchServer('desired')).rejects.toThrow('runtime switch failed');
+  expect(useAppStore.getState().selectedServerId).toBe('desired');
+  expect(useAppStore.getState().config?.selectionIntent).toBeUndefined();
+});

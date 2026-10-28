@@ -46,6 +46,8 @@
 
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(windows)]
 mod windows;
 
@@ -67,7 +69,7 @@ pub struct CoreProcess {
     pub raw: String,
     /// 进程属主相对本进程的归类，扫描时与命令行一并读出。
     pub owner: ProcessOwner,
-    /// 扫描时留住的进程把柄（仅 Windows 有内容，见 [`ProcessHold`]）。
+    /// 扫描时留住的进程把柄（Linux / Windows，见 [`ProcessHold`]）。
     pub hold: ProcessHold,
 }
 
@@ -140,16 +142,20 @@ fn owner_from_token(facts: Option<TokenUserFacts>) -> ProcessOwner {
 
 /// 扫描时留住的进程把柄。
 ///
-/// **只在 Windows 上有内容**：一把仅带查询权限的进程句柄，连同当时读到的创建时间。句柄开着期间
+/// Windows retains a query handle plus creation time; Linux retains a pidfd bound to
+/// the same open proc-directory snapshot. Other Unix platforms have no signal authority.
+/// 一把仅带查询权限的进程句柄，连同当时读到的创建时间。句柄开着期间
 /// 这个 pid 不会被系统分给别的进程，所以宽限期前后说的是同一个进程；结束时另开一把只带结束权限
-/// 的句柄，创建时间对上才动手（`ProcessHold::terminate`，仅 Windows 有）。别的平台上是个空壳 —— 那里结束进程
-/// 用信号，按 pid 发。
+/// 的句柄，创建时间对上才动手（`ProcessHold::terminate`，仅 Windows 有）。
+/// Linux signals the retained pidfd; no Unix stale sweep falls back to numeric kill.
 ///
 /// 克隆共享同一把句柄，最后一份丢弃时关闭。相等按「是不是同一把」判，空壳之间恒等。
 #[derive(Clone, Default)]
 pub struct ProcessHold {
     #[cfg(windows)]
     held: Option<std::sync::Arc<windows::HeldProcess>>,
+    #[cfg(target_os = "linux")]
+    held: Option<std::sync::Arc<linux::HeldProcess>>,
 }
 
 impl std::fmt::Debug for ProcessHold {
@@ -159,7 +165,7 @@ impl std::fmt::Debug for ProcessHold {
 }
 
 impl PartialEq for ProcessHold {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn eq(&self, other: &Self) -> bool {
         match (&self.held, &other.held) {
             (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
@@ -168,7 +174,7 @@ impl PartialEq for ProcessHold {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     fn eq(&self, _other: &Self) -> bool {
         true
     }
@@ -191,6 +197,52 @@ impl ProcessHold {
     #[must_use]
     pub fn is_running(&self) -> Option<bool> {
         self.held.as_deref().map(windows::HeldProcess::is_running)
+    }
+}
+
+impl ProcessHold {
+    /// Only a retained native identity can authorize stale-process termination.
+    /// macOS arbitrary process-table entries have no retained Child and remain unresolved.
+    #[must_use]
+    pub fn has_identity(&self) -> bool {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            self.held.is_some()
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+impl ProcessHold {
+    #[must_use]
+    pub fn signal(&self, signal: crate::process_killer::Signal) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.held.as_deref().is_some_and(|held| held.signal(signal))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = signal;
+            false
+        }
+    }
+
+    #[must_use]
+    pub fn is_running(&self) -> Option<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            self.held
+                .as_deref()
+                .and_then(linux::HeldProcess::is_running)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 }
 
@@ -522,27 +574,9 @@ pub fn scan_running_cores() -> Vec<CoreProcess> {
         let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) else {
-            continue; // 进程已退 / 无权限读 → 跳过。
-        };
-        if bytes.is_empty() {
-            continue; // 内核线程 cmdline 为空。
+        if let Some(process) = linux::capture(pid, &entry.path(), me) {
+            out.push(process);
         }
-        // /proc/<pid>/cmdline 是 NUL 分隔的 argv；末尾可能有多余 NUL。
-        let cmdline: Vec<String> = bytes
-            .split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect();
-        if cmdline.is_empty() {
-            continue;
-        }
-        out.push(CoreProcess {
-            pid,
-            cmdline,
-            owner: owner_from_uid(process_owner_uid(pid), me),
-            ..CoreProcess::default()
-        });
     }
     out
 }

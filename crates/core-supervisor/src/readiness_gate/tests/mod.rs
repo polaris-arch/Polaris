@@ -45,8 +45,8 @@ impl ScriptDeps {
                 // Fn（多次调用）：每次 clone Arc 进 async block，避免 move。
                 let s = Arc::clone(&sleep);
                 Box::pin(async move {
-                    let _ = dur;
                     s.sleep_calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(dur).await;
                 })
             }),
             is_superseded: Some(Box::new(move || {
@@ -194,7 +194,7 @@ async fn no_superseded_dep_treated_as_not_superseded() {
             // 第 4 次调用（boundary, i==3）变 ready → Ready。
             Box::pin(async move { i == 3 })
         }),
-        sleep: Box::new(|_| Box::pin(async {})),
+        sleep: Box::new(|duration| Box::pin(tokio::time::sleep(duration))),
         is_superseded: None,
         on_retry: None,
     };
@@ -312,7 +312,7 @@ fn deps_superseded_on_ready_call(
                 false
             })
         }),
-        sleep: Box::new(|_| Box::pin(async {})),
+        sleep: Box::new(|duration| Box::pin(tokio::time::sleep(duration))),
         is_superseded: Some(Box::new(move || f_check.load(Ordering::SeqCst))),
         on_retry: None,
     }
@@ -425,4 +425,89 @@ fn retry_error_carries_message() {
     let e = CoreStartRetryError::new("管理 API 1s 内未绑定");
     assert!(e.message.contains("管理 API"));
     assert!(e.to_string().contains("管理 API"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_probe_is_charged_to_one_deadline() {
+    let start = tokio::time::Instant::now();
+    let calls = Arc::new(AtomicU32::new(0));
+    let observed = calls.clone();
+    let deps = CoreReadyDeps::new(
+        || ChildObservation::Unknown,
+        move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                false
+            })
+        },
+        |duration| Box::pin(tokio::time::sleep(duration)),
+    );
+    assert_eq!(
+        wait_for_core_ready(
+            WaitForCoreReadyOptions {
+                timeout_ms: 100,
+                poll_ms: 50
+            },
+            &deps
+        )
+        .await,
+        CoreReadyOutcome::Timeout
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - start,
+        Duration::from_millis(100)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_budget_does_not_wait_for_probe() {
+    let start = tokio::time::Instant::now();
+    let deps = CoreReadyDeps::new(
+        || ChildObservation::Alive,
+        || Box::pin(std::future::pending()),
+        |duration| Box::pin(tokio::time::sleep(duration)),
+    );
+    assert_eq!(
+        wait_for_core_ready(
+            WaitForCoreReadyOptions {
+                timeout_ms: 0,
+                poll_ms: 50
+            },
+            &deps
+        )
+        .await,
+        CoreReadyOutcome::Timeout
+    );
+    assert_eq!(tokio::time::Instant::now(), start);
+}
+
+#[tokio::test(start_paused = true)]
+async fn superseded_successful_probe_is_not_ready() {
+    let superseded = Arc::new(AtomicBool::new(false));
+    let flip = superseded.clone();
+    let mut deps = CoreReadyDeps::new(
+        || ChildObservation::Alive,
+        move || {
+            let flag = flip.clone();
+            Box::pin(async move {
+                flag.store(true, Ordering::SeqCst);
+                true
+            })
+        },
+        |duration| Box::pin(tokio::time::sleep(duration)),
+    );
+    deps.is_superseded = Some(Box::new(move || superseded.load(Ordering::SeqCst)));
+    assert_eq!(
+        wait_for_core_ready(
+            WaitForCoreReadyOptions {
+                timeout_ms: 100,
+                poll_ms: 50
+            },
+            &deps
+        )
+        .await,
+        CoreReadyOutcome::Superseded
+    );
 }

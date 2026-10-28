@@ -99,7 +99,8 @@ describe('自动选择合同与后端一致', () => {
 
   it('被拒的稳定码逐字相同', () => {
     const server = moduleSource('src-tauri/src/commands/server');
-    const codes = [...server.matchAll(/"(AUTO_SELECT_[A-Z_]+)"/g)].map((match) => match[1]);
+    const native = moduleSource('src-tauri/src/runtime/proxy/native_auto');
+    const codes = [...(server + native).matchAll(/"(AUTO_SELECT_[A-Z_]+)"/g)].map((match) => match[1]);
     expect([...new Set(codes)].sort()).toEqual([...AUTO_SELECT_ERROR_CODES].sort());
   });
 
@@ -120,6 +121,8 @@ describe('自动选择合同与后端一致', () => {
     const server = moduleSource('src-tauri/src/commands/server');
     for (const command of [
       IPC_CHANNELS.AUTO_SELECT_ENABLE,
+      IPC_CHANNELS.AUTO_SELECT_SET_ENABLED,
+      IPC_CHANNELS.AUTO_SELECT_DISABLE,
       IPC_CHANNELS.AUTO_SELECT_SWITCH_NOW,
       IPC_CHANNELS.AUTO_SELECT_STATUS,
     ]) {

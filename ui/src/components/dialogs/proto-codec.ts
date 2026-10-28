@@ -705,7 +705,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.net = lc(cfg.network) ?? 'tcp';                  // R3
       d.sec = lc(cfg.security) ?? 'none';                // R3
       d.sni = cfg.tlsSettings?.serverName ?? '';
-      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4；空=后端缺省 none（不下发 utls 块）
+      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4；空保留默认意图，由运行配置按 uTLS 能力选择 Chrome
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
       transportDraft(cfg, d);
       httpDraft(cfg, d);
@@ -744,7 +744,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.net = lc(cfg.network) ?? 'tcp';                  // R3
       d.sec = lc(cfg.security) ?? 'tls';                 // R3
       d.sni = cfg.tlsSettings?.serverName ?? '';
-      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4；空=后端缺省 none（不下发 utls 块）
+      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4；空保留默认意图，由运行配置按 uTLS 能力选择 Chrome
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
       transportDraft(cfg, d);
       httpDraft(cfg, d);
@@ -1241,7 +1241,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
       d.pwd = cfg.password ?? '';
       d.tls = lc(cfg.security) === 'tls';                // R3：http isHttps（security==='tls' 严格归一）
       d.sni = cfg.tlsSettings?.serverName ?? '';         // TLS 组（门 = tls 开关，非 sec）
-      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4；空=后端缺省 none（不下发 utls 块）
+      d.fp = utlsDraftValue(cfg.tlsSettings);     // R4；空保留默认意图，由运行配置按 uTLS 能力选择 Chrome
       d.insecure = cfg.tlsSettings?.allowInsecure === true;
       tlsAdvDraft(cfg, d, false);                        // http 无 ECH 控件（同 上游 http-form），见 F_HTTP_TLS_ADV
       return d;
@@ -1259,7 +1259,7 @@ export const protoCodec: Record<NodeProto, ProtoCodec> = {
           ? mergeTls(base.tlsSettings, {
               serverName: str(draft.sni),
               // http 不在 `is_quic_managed_tls` 里 ⇒ `final_fp != "none"` 时 utls 块照常下发。
-              // 空 → 删键 → 后端对非 vless/anytls 的缺省 `none` ⇒ 整个 utls 块不下发。
+              // 空只删除持久化指纹；运行默认在支持 uTLS 时用 Chrome，显式关闭才禁用。
               ...utlsPatch(String(draft.fp ?? ''), base.tlsSettings),
               allowInsecure: draft.insecure === true ? true : undefined,
               ...tlsAdvPatch(draft, false),

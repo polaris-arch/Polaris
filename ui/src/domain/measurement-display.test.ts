@@ -69,3 +69,14 @@ describe('Rust producer display IPC interoperability', () => {
       producerFixture.server as ServerConfig,1001)).toMatchObject({state:'expired',latency:undefined});
   });
 });
+
+it('native HTTP preserves source and timestamp, expires without extending on read', () => {
+  const snapshot = measurementFixture(config, { a: 40 });
+  const app = snapshot.rows.a.candidate!;
+  snapshot.rows.a.nativeHttp = { ...app, latency: 70, identity: { ...app.identity, path: 'nativeHttp', origin: 'nativeAuto', metric: 'native_http_v1', run: '1000' } };
+  expect(validMeasurementSnapshot(snapshot)).toBe(true);
+  expect(projectMeasurement(snapshot, server, 1500)).toMatchObject({ latency: 70, purpose: 'nativeHttp', measuredAt: 1000 });
+  expect(projectMeasurement(snapshot, server, 2001)).toMatchObject({ state: 'expired', latency: undefined, measuredAt: 1000 });
+  snapshot.rows.a.nativeHttp.identity.metric = 'warm_ttfb_v1';
+  expect(validMeasurementSnapshot(snapshot)).toBe(false);
+});

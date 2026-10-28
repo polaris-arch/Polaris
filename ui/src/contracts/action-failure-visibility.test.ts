@@ -55,7 +55,7 @@ const ACTION_CHANNELS_BANNED_SWALLOWS = [
 ] as const;
 
 /** TrayMenu 里 `noticeActionFailure` 的调点数：三种出口选择共用一个失败回显，其余动作独立保留。 */
-const NOTICE_CALL_SITES = 12;
+const NOTICE_CALL_SITES = 11; // Server switching now uses the shared typed error mapper below.
 
 /** lockNow 的顺序语义（Med-1）：必须「await 成功 → 才 hide」。先 hide 再 await 的旧序在失败时
  * 连 notice 都无处显示。以 indexOf 顺序钉住——重排回去（hide 在 await 之前）即红。 */
@@ -89,6 +89,7 @@ describe('点击类失败必须可见（W10/W14/W15 防回潮）', () => {
       `noticeActionFailure 应恰有 ${NOTICE_CALL_SITES} 处（含定义）。少于它 = 有动作漏接；` +
         `多于它 = 改了动作面，本门计数与动作清单需同步审`,
     ).toBe(NOTICE_CALL_SITES);
+    expect(src).toContain("setNotice(serverSwitchErrorText(serverSwitchErrorCode(err)");
   });
 
   it('lockNow 必须「await 成功才 hide」——先关浮层再试锁定，失败时 notice 无处显示（Med-1）', () => {

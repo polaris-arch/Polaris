@@ -62,7 +62,7 @@ function temporaryFixture(t, label, extra = [], mutate = () => {}) {
   // These inert inventory fixtures neither acquire nor execute a native payload.
   for (const path of [
     'scripts/verify-packaging.mjs', 'scripts/postprocess-appimage.mjs', 'scripts/release-assets.mjs',
-    ...['cronet-payload', 'cronet-contract', 'nsis-core-sweep', 'nsis-helper-cleanup', 'core-identity']
+    ...['cronet-payload', 'cronet-contract', 'nsis-core-sweep', 'nsis-helper-cleanup', 'core-identity', 'macos-open-guide']
       .map(name => `scripts/lib/${name}.mjs`),
     ...['source-graph', 'bundle', 'release-consumer', 'native-dns-candidate', 'upstream-release', 'validation-origin', 'native-dns-gates']
       .map(name => `scripts/desktop-core/${name}.mjs`),
@@ -271,4 +271,50 @@ test('formal inventory requires exact archived legal paths and rejects temporary
     assert.match(extra.output, /未登记/);
     assert.ok(extra.output.includes(`_up_/resources/win/${member}`), extra.output);
   }
+});
+
+// Exercise the actual registry and binding branch without acquiring native payloads.
+// Other conf checks require downloaded resources; these tests isolate only CI routing.
+function platformBindingFixture(mutate = () => {}) {
+  const source = readFileSync(verifier, 'utf8');
+  const registry = source.slice(source.indexOf('const NON_CORE_CONFS ='), source.indexOf('\nconst errors ='));
+  const specs = Function(`${registry}; return NON_CORE_CONFS;`)();
+  const start = source.indexOf('    if (workflows !== null)', source.indexOf('// ④e'));
+  const end = source.indexOf('\n  }\n\n  if (errors.length === errorsBefore)', start);
+  const check = Function('workflows', 'name', 'spec', 'readFileSync', 'join', 'ROOT', 'fail', source.slice(start, end));
+  const workflows = new Map(readdirSync(join(repo, '.github/workflows')).map(name =>
+    [name, readFileSync(join(repo, '.github/workflows', name), 'utf8')]));
+  const inputs = new Map(specs['tauri.ios.conf.json'].ciLeg.chain.map(([path]) =>
+    [join(repo, path), readFileSync(join(repo, path), 'utf8')]));
+  mutate({ workflows, inputs, specs });
+  const failures = [];
+  for (const [name, spec] of Object.entries(specs)) check(workflows, name, spec,
+    path => { if (!inputs.has(path)) throw new Error('missing fixture source'); return inputs.get(path); },
+    join, repo, message => failures.push(message));
+  return failures;
+}
+
+test('platform registry recognizes the real indirect Apple configuration consumer and direct Android calls', () => {
+  assert.deepEqual(platformBindingFixture(), []);
+});
+for (const part of ['entry', 'carrier', 'app-builder', 'config-read', 'config-env']) {
+  test(`platform registry rejects a broken Apple configuration link: ${part}`, () => {
+    const failures = platformBindingFixture(({ workflows, inputs, specs }) => {
+      const leg = specs['tauri.ios.conf.json'].ciLeg;
+      if (part === 'entry') workflows.set(leg.workflow, workflows.get(leg.workflow).replaceAll(leg.entry, 'missing-carrier'));
+      else {
+        const index = ['carrier', 'app-builder', 'config-read', 'config-env'].indexOf(part);
+        const [path, binding] = leg.chain[index];
+        inputs.set(join(repo, path), inputs.get(join(repo, path)).replace(binding, 'missing-binding'));
+      }
+    });
+    assert.ok(failures.length > 0, part);
+  });
+}
+test('platform registry rejects an unregistered workflow using the indirect Apple entry', () => {
+  assert.ok(platformBindingFixture(({ workflows, specs }) =>
+    workflows.set('extra.yml', specs['tauri.ios.conf.json'].ciLeg.entry)).length > 0);
+});
+test('platform registry fails closed if an indirect consumer source is missing', () => {
+  assert.ok(platformBindingFixture(({ inputs }) => inputs.clear()).length > 0);
 });

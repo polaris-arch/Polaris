@@ -280,7 +280,7 @@ function startMeasurementFeed(pollEnabled: boolean): () => void {
 
 function earliestExpiry(snapshot: MeasurementSnapshot, now: number): number {
   let next = Number.POSITIVE_INFINITY;
-  for (const row of Object.values(snapshot.rows)) for (const purpose of ['candidate','system','selected'] as const) {
+  for (const row of Object.values(snapshot.rows)) for (const purpose of ['candidate','system','selected','nativeHttp'] as const) {
     const record = row[purpose];
     if (record && record.state !== 'expired' && record.expiresAt > now) next = Math.min(next, record.expiresAt);
   }

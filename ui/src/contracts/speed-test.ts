@@ -42,7 +42,8 @@ export type SpeedTestInterruptReason =
   | 'core_exited'
   | 'core_unresponsive'
   | 'cancelled'
-  | 'preempted';
+  | 'preempted'
+  | 'native_pending';
 
 /** 单节点失败时所处的阶段：热切、建隧道、预热（第一次 GET）、计时（第二次 GET）。 */
 export type SpeedTestFailurePhase = 'select' | 'connect' | 'warmup' | 'measure';

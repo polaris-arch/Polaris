@@ -589,6 +589,30 @@ impl CoreStore {
         source_uid: Option<u32>,
         source_sid: Option<&str>,
     ) -> io::Result<InstallOutcome> {
+        self.install_with_preservation(manifest, source, source_uid, source_sid, false)
+    }
+
+    /// Explicit migration may add a new immutable version, but never retires or
+    /// repairs an existing payload. Conflicting/corrupt content needs a separate
+    /// recovery decision after the previous installation is safely preserved.
+    pub fn install_preserving(
+        &self,
+        manifest: &InstalledCoreManifest,
+        source: &Path,
+        source_uid: Option<u32>,
+        source_sid: Option<&str>,
+    ) -> io::Result<InstallOutcome> {
+        self.install_with_preservation(manifest, source, source_uid, source_sid, true)
+    }
+
+    fn install_with_preservation(
+        &self,
+        manifest: &InstalledCoreManifest,
+        source: &Path,
+        source_uid: Option<u32>,
+        source_sid: Option<&str>,
+        preserve_existing: bool,
+    ) -> io::Result<InstallOutcome> {
         #[cfg(not(windows))]
         let _ = source_sid;
         let _lock = self.mutation_lock()?;
@@ -597,6 +621,33 @@ impl CoreStore {
             .map_err(invalid)?;
         let id = CoreId::parse(&manifest.id).map_err(invalid)?;
         let destination = self.root.join("versions").join(id.as_str());
+        if preserve_existing {
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(invalid("migration payload destination is not a directory"));
+                    }
+                    self.verify_for_start(&id).map_err(|_| {
+                        invalid("migration cannot replace an existing unverified payload")
+                    })?;
+                    return Ok(InstallOutcome::AlreadyPresent);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let receipt = self
+                        .root
+                        .join("manifests")
+                        .join(format!("{}.json", id.as_str()));
+                    match fs::symlink_metadata(receipt) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                        Ok(_) => {
+                            return Err(invalid("migration cannot replace an orphan manifest"))
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if destination.exists() {
             if self
                 .root

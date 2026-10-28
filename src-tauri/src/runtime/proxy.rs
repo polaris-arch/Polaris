@@ -37,6 +37,7 @@ mod android_drain;
 mod auto_switch;
 mod connection_flush;
 mod core_binary;
+pub(crate) mod native_auto;
 mod tls_capabilities;
 // `pub(crate)`：`pipe_to_log` 是全 app 唯一一份子进程排空实现，瞬态登录核
 // （`runtime::tailscale_login_core`）与测速临时核（`runtime::speedtest`）都用它。
@@ -59,6 +60,7 @@ mod pending_changes;
 mod prerequisite;
 pub(crate) use prerequisite::{
     ActionBinding, ActionRequirement, MainPrerequisiteError, NormalMainAction, ReadyMainTicket,
+    StartupAdmission,
 };
 // `pub(crate)`：`commands::config` 的排除面预览要用同一份 `platform_tag` /
 // `enumerate_own_lan_cidrs` —— 预览若自己另探一次平台或网卡，就成了第二真值源。
@@ -279,6 +281,9 @@ fn probe_pool_size() -> usize {
 pub struct ProxyStatus {
     /// 是否运行中。
     pub running: bool,
+    /// Runtime-observed TCP default leaf, null when stopped or unverified.
+    #[serde(default)]
+    pub actual_server_id: Option<String>,
     /// Read-time projection of the shared lifecycle generation for action attribution.
     #[serde(rename = "mainGeneration", default)]
     pub main_generation: u64,
@@ -360,6 +365,8 @@ pub mod code {
     pub const SYSTEM_INTERFACE_UNSUPPORTED: &str = "SYSTEM_INTERFACE_UNSUPPORTED";
     /// 起核腿失败（就绪门判定核已死 / 就绪超时）——「启动失败」轴。
     pub const STARTUP_FAILED: &str = "STARTUP_FAILED";
+    pub const SPEED_TEST_URL_INVALID: &str = "SPEED_TEST_URL_INVALID";
+    pub const NODE_RESOLVER_UNSUPPORTED: &str = "NODE_RESOLVER_UNSUPPORTED";
     #[cfg(target_os = "ios")]
     pub const IOS_SESSION_ACTIVE: &str = "IOS_SESSION_ACTIVE";
     #[cfg(target_os = "ios")]
@@ -1454,6 +1461,8 @@ pub struct ProxyRuntime {
     /// helper stop（child 恒 None）+ 崩溃监测/就绪门改用 pid 探活（helper 核无本地 [`tokio::process::Child`] 句柄）。
     /// 起核提交时置、停核/直起时清。
     core_via_helper: Arc<AtomicBool>,
+    /// Bounded diagnostic probe owns its original pending child/readers across generations.
+    core_version_probe: Arc<crate::runtime::core_version_probe::CoreVersionProbe>,
     /// H-1 强制重启专用配置快照（`(id, config, source)`）。
     ///
     /// **不可用 currentConfig 替代**：in-flight start 腿会覆盖 currentConfig，drain 必须读本字段
@@ -1483,6 +1492,7 @@ pub struct ProxyRuntime {
     /// 表现为最后一次点击被盖回、继而由错误快照触发多余重启。Tokio Mutex 按等待顺序放行，且锁只护
     /// 配置入核流水线，不与同步 [`LifecycleGate`] / 配置写锁混用。
     switch_serial: AsyncMutex<()>,
+    native_observation: Mutex<native_auto::NativeObservation>,
     /// selector 意图代次、强制重申脏位与后台单飞交接的唯一 owner。
     /// 它与 `switch_serial` 正交：前者给出跨 await 的所有权事实，后者仍串行真实入核 I/O。
     selector_reconcile: Arc<SelectorReconcileOwner>,
@@ -1831,6 +1841,9 @@ impl ProxyRuntime {
             android_main_token: Mutex::new(None),
             pid: Arc::new(Mutex::new(None)),
             core_via_helper: Arc::new(AtomicBool::new(false)),
+            core_version_probe: Arc::new(
+                crate::runtime::core_version_probe::CoreVersionProbe::default(),
+            ),
             pending_force_restart: RwLock::new(None),
             force_restart_seq: AtomicU64::new(1),
             current_config: RwLock::new(None),
@@ -1838,6 +1851,7 @@ impl ProxyRuntime {
             pending_switch: RwLock::new(None),
             switch_seq: AtomicU64::new(1),
             switch_serial: AsyncMutex::new(()),
+            native_observation: Mutex::new(native_auto::NativeObservation::default()),
             selector_reconcile: Arc::new(SelectorReconcileOwner::default()),
             auto_select: std::sync::Mutex::default(),
             auto_select_wake: tokio::sync::Notify::new(),

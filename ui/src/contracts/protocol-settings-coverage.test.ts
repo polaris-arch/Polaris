@@ -767,17 +767,20 @@ const RUST_NO_SPOOF = (() => {
   return got;
 })();
 
-/** fragment 不支持的协议（`fragment_unsupported = is_quic_managed_tls(…) || … == Protocol::Naive`）。 */
+/** Protocol exclusions come from the shared fragment capability helper; engine exclusions are separately asserted. */
 const RUST_NO_FRAGMENT = (() => {
   const s = stripComments(RUST_OUTBOUND);
   const at = s.indexOf('let fragment_unsupported =');
-  expect(at, 'Rust 侧 fragment_unsupported 解析失败 —— 解析不到必须转红').toBeGreaterThanOrEqual(0);
-  const seg = s.slice(at, s.indexOf(';', at));
-  const out = new Set<string>();
-  if (seg.includes('is_quic_managed_tls')) for (const p of RUST_QUIC_MANAGED) out.add(p);
-  for (const m of seg.matchAll(/Protocol::(\w+)/g)) out.add(m[1].toLowerCase());
-  expect(out.size, 'fragment_unsupported 没解析出任何协议 —— 解析器失效').toBeGreaterThan(0);
-  return [...out];
+  expect(at).toBeGreaterThanOrEqual(0);
+  expect(s.slice(at, s.indexOf(';', at))).toContain('!supports_tls_fragment(');
+  const helpers = stripComments(RUST_OUTBOUND_HELPERS);
+  const body = helpers.slice(helpers.indexOf('pub fn supports_tls_fragment(')).split('\n}')[0];
+  expect(body).toContain('!is_quic_managed_tls(protocol)');
+  expect(body).toContain('!matches!(engine, Some("apple" | "windows"))');
+  const excluded = [...body.matchAll(/protocol != "([^"]+)"/g)].map(m => m[1]);
+  expect(excluded).toEqual(['naive']);
+  expect(RUST_QUIC_MANAGED.length).toBeGreaterThan(0);
+  return [...new Set([...RUST_QUIC_MANAGED, ...excluded])];
 })();
 
 // ── 归属表 · 债务表 · 豁免表 ──────────────────────────────────────────────────
@@ -1146,7 +1149,7 @@ const QUIC_TLS_EXEMPT: Record<string, Exemption> = {
     cite: [
       {
         at: 'crates/config-engine/src/builder/outbound.rs',
-        needle: 'is_quic_managed_tls(&protocol_lower) || server.protocol == Protocol::Naive',
+        needle: '!supports_tls_fragment(\n        &protocol_lower,\n        ob.tls.as_ref().and_then(|t| t.engine.as_deref()),\n    )',
       },
     ],
   },
@@ -1301,7 +1304,7 @@ const NODE_EXEMPT: Record<string, Record<string, Exemption>> = {
       cite: [
         {
           at: 'crates/config-engine/src/builder/outbound.rs',
-          needle: 'is_quic_managed_tls(&protocol_lower) || server.protocol == Protocol::Naive',
+          needle: '!supports_tls_fragment(\n        &protocol_lower,\n        ob.tls.as_ref().and_then(|t| t.engine.as_deref()),\n    )',
         },
       ],
     },

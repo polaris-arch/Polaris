@@ -6,13 +6,14 @@ export interface MeasurementRecord {
   reason: string | null;
   latency: number | null;
   failure: SpeedTestFailure | null;
-  identity: Omit<SpeedTestResultIdentity, 'nodeFingerprint'> & { nodeFingerprintDigest: string | null; connectionDigest: string | null };
+  identity: Omit<SpeedTestResultIdentity, 'nodeFingerprint' | 'path' | 'origin' | 'metric'> & { nodeFingerprintDigest: string | null; connectionDigest: string | null; path: SpeedTestResultIdentity['path'] | 'nativeHttp'; origin: SpeedTestResultIdentity['origin'] | 'nativeAuto'; metric: 'warm_ttfb_v1' | 'native_http_v1' };
   disconnected: boolean;
   bindingMismatch: boolean;
   expiresAt: number;
 }
 export interface MeasurementRows {
   candidate?: MeasurementRecord;
+  nativeHttp?: MeasurementRecord;
   system?: MeasurementRecord;
   selected?: MeasurementRecord;
   notIncluded?: string;
@@ -39,7 +40,7 @@ export interface MeasurementProjection {
   measuredAt?: number;
   notIncluded?: string;
   disconnected?: boolean;
-  purpose?: 'candidate' | 'system' | 'selected';
+  purpose?: 'candidate' | 'system' | 'selected' | 'nativeHttp';
   reason?: string | null;
   bindingMismatch?: boolean;
 }

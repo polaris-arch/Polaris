@@ -1,4 +1,4 @@
-//! sing-box 核就绪门控 —— 上游 `core-readiness.ts` 的 1:1 Rust 移植。
+//! sing-box 核就绪门控 —— 沿用 `core-readiness.ts` 的结局协议，以单调截止时间约束等待。
 //!
 //! 移植锚点（行为不变式见 capability-registry-special-logic.md §1 #2 / #10）：
 //! - [`CoreReadyOutcome`] = `'ready' | 'dead' | 'timeout' | 'superseded'`（core-readiness.ts:63）。
@@ -9,9 +9,9 @@
 //! 1. supersede 先于一切判定（被更新的 start/stop 接管后继续等就绪有害——抢适配器/撞端口）。
 //! 2. isReady（异步）先于 isAlive（同步探活）：成功路径（API 早绑）即返回，绝不触发阻塞探活。
 //!    顺序安全：API 监听随核进程而生灭，端口可连 ⟹ 核存活。
-//! 3. 满轮后末轮再判一次（boundary check），不漏判就绪/退出。
+//! 3. 探测和休眠共享截止时间；边界仅接受立即完成的就绪结果，不追加慢探测预算。
 //!
-//! 纯逻辑：所有 I/O（is_ready/observe_process/sleep/is_superseded）由调用方注入，便于无进程/端口/计时器单测。
+//! 进程/端口 I/O 由调用方注入；截止时间使用 Tokio 单调时钟，可在虚拟时间中验证。
 
 use std::future::Future;
 
@@ -261,28 +261,27 @@ fn settle_failure(deps: &CoreReadyDeps<'_>, fallback: CoreReadyOutcome) -> CoreR
     }
 }
 
-/// 轮询等核就绪（core-readiness.ts:81 `waitForCoreReady`）。
-///
-/// 每轮：被接管 → `Superseded`（立即让位，#176）；API 可连 → `Ready`；进程死 → `Dead`（立即，不等满 timeout）；
-/// 否则 sleep。满 max_polls 仍未就绪 → 末轮再判一次 → `Timeout`。
-///
-/// 两条失败腿（Dead/Timeout）返回前经 `settle_failure` 复判 supersede —— 见该函数文档。
-///
-/// `max_polls = max(1, ceil(timeout_ms / poll_ms))`，与 TS 实现逐字一致（`Math.max(1, Math.ceil(...))`）。
+/// Poll readiness against one monotonic deadline, including probe and observation time.
+/// A boundary probe may succeed immediately, but cannot extend the budget by awaiting I/O.
+/// The injected readiness probe must be cancellation-safe (production uses TCP connect),
+/// never a detached blocking process owner. Synchronous observation cannot be preempted;
+/// its elapsed time is charged before scheduling another probe or sleep.
 pub async fn wait_for_core_ready(
     opts: WaitForCoreReadyOptions,
     deps: &CoreReadyDeps<'_>,
 ) -> CoreReadyOutcome {
-    let poll_ms = opts.poll_ms.max(1);
-    let max_polls = (opts.timeout_ms.div_ceil(poll_ms)).max(1);
-
-    for _ in 0..max_polls {
-        // supersede 先于一切判定（#176）。
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(opts.timeout_ms);
+    let poll = Duration::from_millis(opts.poll_ms.max(1));
+    loop {
         if is_superseded(deps) {
             return CoreReadyOutcome::Superseded;
         }
-        // isReady（异步）先于 isAlive（同步探活）：成功路径即返回。
-        if (deps.is_ready)().await {
+        let ready = tokio::time::timeout_at(deadline, (deps.is_ready)()).await;
+        // Even success belongs to the old request if takeover occurred during the probe.
+        if is_superseded(deps) {
+            return CoreReadyOutcome::Superseded;
+        }
+        if matches!(ready, Ok(true)) {
             return CoreReadyOutcome::Ready;
         }
         match (deps.observe_process)() {
@@ -290,27 +289,17 @@ pub async fn wait_for_core_ready(
             ChildObservation::Absent => return CoreReadyOutcome::Superseded,
             ChildObservation::Alive | ChildObservation::Unknown => {}
         }
-        // 未就绪 + 尚未确认退出 → 即将 sleep 后重试：计一次就绪重试（上游 onRetry，:906）。
-        // 纯观测，位于判定之后、sleep 之前，绝不改变任何 return 分支。
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() || ready.is_err() {
+            return settle_failure(deps, CoreReadyOutcome::Timeout);
+        }
         if let Some(cb) = deps.on_retry.as_ref() {
             cb();
         }
-        (deps.sleep)(Duration::from_millis(poll_ms)).await;
+        // This timeout also bounds an injected sleep implementation; no extra full poll
+        // interval or slow final probe is charged after the deadline.
+        let _ = tokio::time::timeout_at(deadline, (deps.sleep)(poll.min(remaining))).await;
     }
-
-    // 末轮 boundary check（core-readiness.ts:96-99）。
-    if is_superseded(deps) {
-        return CoreReadyOutcome::Superseded;
-    }
-    if (deps.is_ready)().await {
-        return CoreReadyOutcome::Ready;
-    }
-    match (deps.observe_process)() {
-        ChildObservation::Exited => return settle_failure(deps, CoreReadyOutcome::Dead),
-        ChildObservation::Absent => return CoreReadyOutcome::Superseded,
-        ChildObservation::Alive | ChildObservation::Unknown => {}
-    }
-    settle_failure(deps, CoreReadyOutcome::Timeout)
 }
 
 #[cfg(test)]

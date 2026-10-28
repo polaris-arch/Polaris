@@ -19,7 +19,7 @@ pub enum UtlsMode {
 
 /// Recognized JSON IDs. Runtime capability reports/checks decide actual support.
 pub const REALITY_UTLS_REQUIRED: &str =
-    "REALITY requires uTLS; choose the core default or a supported fingerprint.";
+    "REALITY requires uTLS; choose Default or a supported fingerprint.";
 
 pub const SUPPORTED_PROFILES: &[&str] = &[
     "chrome",
@@ -45,21 +45,57 @@ pub const SUPPORTED_PROFILES: &[&str] = &[
     "chrome_pq_psk",
 ];
 
-/// `None` mode preserves protocol-specific legacy defaults. Empty fingerprint
-/// only means core default when explicitly enabled; it never means disabled.
-pub fn node_utls(mode: Option<UtlsMode>, fingerprint: Option<&str>, legacy: &str) -> Option<Utls> {
+/// Missing intent follows the source fingerprint or the capability-aware
+/// fallback supplied by the caller. Explicit disabled intent always wins.
+/// `UtlsMode::Default` retains the historical explicitly enabled,
+/// empty-fingerprint (core default) meaning.
+pub fn node_utls(
+    mode: Option<UtlsMode>,
+    fingerprint: Option<&str>,
+    fallback: &str,
+) -> Option<Utls> {
     let fingerprint = match mode {
         Some(UtlsMode::Disabled) => return None,
         Some(UtlsMode::Default) => String::new(),
         Some(UtlsMode::Profile) => {
             normalize_token(fingerprint.unwrap_or_default()).unwrap_or_default()
         }
-        None => normalize_token(fingerprint.unwrap_or(legacy)).unwrap_or_else(|| legacy.to_owned()),
+        None => {
+            normalize_token(fingerprint.unwrap_or(fallback)).unwrap_or_else(|| fallback.to_owned())
+        }
     };
     (fingerprint != "none").then_some(Utls {
         enabled: true,
         fingerprint,
     })
+}
+
+/// Explicit off wins over global profiles. A dormant fingerprint on the
+/// historical core-default mode is ignored, just as in `node_utls`.
+fn explicitly_disabled(mode: Option<UtlsMode>, fingerprint: Option<&str>) -> bool {
+    mode == Some(UtlsMode::Disabled)
+        || (mode != Some(UtlsMode::Default)
+            && fingerprint.and_then(normalize_token).as_deref() == Some("none"))
+}
+
+/// Default uTLS is Chrome only for the ordinary TLS protocols supported by
+/// this app. An actually emitted native TLS engine cannot use uTLS; foreign
+/// or dormant engine values follow the same platform gate as the builder.
+pub fn ordinary_fallback(server: &ServerConfig, platform: &str) -> &'static str {
+    if matches!(
+        server.protocol,
+        Protocol::Vless | Protocol::Vmess | Protocol::Trojan | Protocol::Anytls | Protocol::Http
+    ) && !crate::builder::outbound_helpers::should_emit_tls_engine(
+        server
+            .tls_settings
+            .as_ref()
+            .and_then(|tls| tls.engine.as_deref()),
+        platform,
+    ) {
+        "chrome"
+    } else {
+        "none"
+    }
 }
 
 /// Share links use `none` for disabled and `chrome` for the current core Auto
@@ -78,7 +114,7 @@ fn validate(
     legacy: &str,
 ) -> Result<Option<Utls>, &'static str> {
     if mode == Some(UtlsMode::Profile) && fp.and_then(normalize_token).is_none() {
-        return Err("Choose a uTLS fingerprint or the core default.");
+        return Err("Choose Default or a uTLS fingerprint.");
     }
     if mode == Some(UtlsMode::Profile) && fp.and_then(normalize_token).as_deref() == Some("none") {
         return Err("This uTLS fingerprint is not supported by the bundled core.");
@@ -115,7 +151,7 @@ pub fn effective_server_for_platform<'a>(
 ) -> Result<Cow<'a, ServerConfig>, &'static str> {
     let policy = policy
         .and_then(normalize_token)
-        .unwrap_or_else(|| "follow".into());
+        .unwrap_or_else(|| "default".into());
     if policy != "follow" && policy != "default" && !SUPPORTED_PROFILES.contains(&policy.as_str()) {
         return Err("The global uTLS policy is not supported by the bundled core.");
     }
@@ -133,46 +169,56 @@ pub fn effective_server_for_platform<'a>(
         return Ok(Cow::Borrowed(server));
     }
 
+    let reality = server
+        .security
+        .as_ref()
+        .is_some_and(SecurityMode::is_reality);
+    let node_tls = server.tls_settings.as_ref();
+    let override_ordinary = ordinary
+        && (reality || ordinary_fallback(server, platform) == "chrome")
+        && !explicitly_disabled(
+            node_tls.and_then(|tls| tls.utls_mode),
+            node_tls.and_then(|tls| tls.fingerprint.as_deref()),
+        );
+    let override_shadow = server
+        .shadow_tls_settings
+        .as_ref()
+        .is_some_and(|tls| !explicitly_disabled(tls.utls_mode, tls.fingerprint.as_deref()));
     let mut effective = Cow::Borrowed(server);
-    if policy != "follow" {
+    if policy != "follow" && (override_ordinary || override_shadow) {
         let node = effective.to_mut();
-        let mode = if policy == "default" {
-            UtlsMode::Default
+        // Global Default is explicitly Chrome. Historical node-level
+        // UtlsMode::Default remains the separate saved core-default intent.
+        let fingerprint = if policy == "default" {
+            "chrome"
         } else {
-            UtlsMode::Profile
+            &policy
         };
-        if ordinary {
+        if override_ordinary {
             let tls = node.tls_settings.get_or_insert_with(TlsSettings::default);
-            tls.utls_mode = Some(mode);
-            tls.fingerprint = (policy != "default").then(|| policy.clone());
+            tls.utls_mode = Some(UtlsMode::Profile);
+            tls.fingerprint = Some(fingerprint.to_owned());
         }
-        if let Some(tls) = node.shadow_tls_settings.as_mut() {
-            tls.utls_mode = Some(mode);
-            tls.fingerprint = (policy != "default").then(|| policy.clone());
+        if override_shadow {
+            if let Some(tls) = node.shadow_tls_settings.as_mut() {
+                tls.utls_mode = Some(UtlsMode::Profile);
+                tls.fingerprint = Some(fingerprint.to_owned());
+            }
         }
     }
     if ordinary {
         let tls = effective.tls_settings.as_ref();
-        let legacy = if matches!(server.protocol, Protocol::Vless | Protocol::Anytls)
-            || server
-                .security
-                .as_ref()
-                .is_some_and(SecurityMode::is_reality)
-        {
+        let fallback = if reality {
             "chrome"
         } else {
-            "none"
+            ordinary_fallback(&effective, platform)
         };
-        let reality = server
-            .security
-            .as_ref()
-            .is_some_and(SecurityMode::is_reality);
         // Historical profile=none has the same REALITY conflict as explicit disabled.
         if reality
             && node_utls(
                 tls.and_then(|t| t.utls_mode),
                 tls.and_then(|t| t.fingerprint.as_deref()),
-                legacy,
+                fallback,
             )
             .is_none()
         {
@@ -181,7 +227,7 @@ pub fn effective_server_for_platform<'a>(
         let utls = validate(
             tls.and_then(|t| t.utls_mode),
             tls.and_then(|t| t.fingerprint.as_deref()),
-            legacy,
+            fallback,
         )?;
         if reality && utls.is_none() {
             return Err(REALITY_UTLS_REQUIRED);

@@ -27,3 +27,32 @@ fn daemon_rejects_retired_machine_user_and_flat_core_flags_without_serving() {
         assert_eq!(daemon_main(argv(&[flag])), std::process::ExitCode::FAILURE);
     }
 }
+
+#[test]
+fn upgrade_closed_is_opt_in_and_a_presence_only_flag() {
+    assert!(!MacConfig::new("/support", "/core").upgrade_closed);
+    assert!(!parse_args(argv(&[])).upgrade_closed);
+    let args: Vec<_> = argv(&["--upgrade-closed", "--support", "/support"]).collect();
+    assert!(
+        crate::cli::validate_flags(&args, &["support", "coredir"], &["upgrade-closed"]).is_ok()
+    );
+    let cfg = parse_args(args.into_iter());
+    assert!(cfg.upgrade_closed);
+    assert_eq!(cfg.support_dir, "/support");
+}
+
+#[test]
+fn upgrade_closed_rejects_values_duplicates_and_near_matches_before_serving() {
+    for args in [
+        vec!["--upgrade-closed=true"],
+        vec!["--upgrade-closed=false"],
+        vec!["--upgrade-closed=1"],
+        vec!["--upgrade-closed="],
+        vec!["--upgrade-closed", "true"],
+        vec!["--upgrade-closed", "false"],
+        vec!["--upgrade-closed", "--upgrade-closed"],
+        vec!["--upgrade-close"],
+    ] {
+        assert_eq!(daemon_main(argv(&args)), std::process::ExitCode::FAILURE);
+    }
+}

@@ -108,3 +108,46 @@ fn retain_unresolved_keeps_retry_and_concurrent_enqueue() {
     assert!(next.contains(&newly), "并发新入队不丢");
     assert_eq!(next.len(), 2);
 }
+
+/// Ordinary 429 must retain exact self-delete credentials through a mixed drain's
+/// disk rewrite, and leave them eligible for the existing scheduled retry.
+#[test]
+fn rate_limited_cleanup_preserves_credentials_on_disk_for_next_drain() {
+    use polaris_mesh::warp::classify_deregister_result;
+
+    let dir = temp_dir("rate-limited");
+    let mesh = MeshRuntime::new(dir.clone());
+    let throttled = entry("throttled");
+    let done = entry("done");
+    let initial = vec![throttled.clone(), done];
+    {
+        let _guard = mesh.warp_queue_lock.lock().unwrap();
+        mesh.save_warp_queue(&initial).unwrap();
+    }
+    let (plan, deferred) = plan_deregister_drain(&mesh.load_warp_queue(), 2);
+    assert!(deferred.is_empty());
+    let results = [
+        classify_deregister_result(Some(429), Some("Too Many Requests")),
+        classify_deregister_result(Some(204), None),
+    ];
+    let remove = plan_removals(&plan, &results);
+    assert_eq!(remove.len(), 1);
+    assert!(!remove.contains(&throttled));
+
+    // Exercise the production reload/retain/save path with a concurrent enqueue.
+    mesh.enqueue_warp_deregister("new", "fixture-token");
+    {
+        let _guard = mesh.warp_queue_lock.lock().unwrap();
+        let next = retain_unresolved(mesh.load_warp_queue(), &remove);
+        mesh.save_warp_queue(&next).unwrap();
+    }
+    let reloaded = MeshRuntime::new(dir.clone()).load_warp_queue();
+    assert_eq!(reloaded.len(), 2);
+    // Boolean equality avoids printing credentials on assertion failure.
+    assert!(reloaded[0] == throttled);
+    assert!(reloaded[1].device_id == "new");
+    let (next_plan, _) = plan_deregister_drain(&reloaded, 3);
+    assert!(next_plan
+        .iter()
+        .any(|item| item.entry == throttled && item.action == DrainAction::Eligible));
+}

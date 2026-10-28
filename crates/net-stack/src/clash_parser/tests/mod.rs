@@ -289,7 +289,7 @@ fn parse_shadowsocks_shadowtls_plugin() {
     assert_eq!(stls.password, "stls-pw");
     assert_eq!(stls.sni, "shadow.example.com");
     assert_eq!(stls.port, Some(443));
-    assert_eq!(stls.fingerprint.as_deref(), Some("chrome"));
+    assert!(stls.fingerprint.is_none());
 }
 
 #[test]
@@ -996,13 +996,9 @@ fn mihomo_fingerprint_browser_name_is_not_a_pin() {
     let r = parse_one(
         "- {name: t, type: trojan, server: a.com, port: 443, password: pw, fingerprint: chrome}\n",
     );
-    assert_eq!(
-        r.servers[0]
-            .tls_settings
-            .as_ref()
-            .and_then(|t| t.certificate_sha256.clone()),
-        None
-    );
+    assert!(r.servers.is_empty());
+    assert_eq!(r.failed, 1);
+    assert!(r.warnings.iter().any(|w| w.contains("TLS_PIN_INVALID")));
 }
 
 /// reality 节点带来的 `fingerprint` 不落盘：内核 reality 下静默忽略 pin，存下来只会「看不到、不生效」。
@@ -1085,3 +1081,84 @@ fn provider_utf8_limits_never_split_names_or_warning_patterns() {
 }
 
 mod audit_regressions;
+
+#[test]
+fn clash_tls_and_shadow_import_preserve_absence_or_explicit_profile() {
+    use polaris_config_engine::user_config::utls::{effective_server, node_utls};
+    for fingerprint in [None, Some("none"), Some("firefox"), Some("randomized")] {
+        for protocol in ["vless", "vmess", "trojan", "anytls", "http"] {
+            let fp = fingerprint
+                .map(|fp| format!(", client-fingerprint: {fp}"))
+                .unwrap_or_default();
+            let parsed = parse_one(&format!("- {{name: node, type: {protocol}, server: example.com, port: 443, uuid: uuid, password: secret, tls: true{fp}}}\n"));
+            assert_eq!(parsed.servers.len(), 1, "{protocol}");
+            let saved: ServerConfig =
+                serde_json::from_value(serde_json::to_value(&parsed.servers[0]).unwrap()).unwrap();
+            let effective = effective_server(&saved, Some("follow")).unwrap();
+            let tls = effective.tls_settings.as_ref();
+            assert_eq!(tls.and_then(|tls| tls.fingerprint.as_deref()), fingerprint);
+            assert_eq!(
+                node_utls(
+                    tls.and_then(|tls| tls.utls_mode),
+                    tls.and_then(|tls| tls.fingerprint.as_deref()),
+                    "chrome"
+                )
+                .map(|utls| utls.fingerprint),
+                if fingerprint == Some("none") {
+                    None
+                } else {
+                    Some(fingerprint.unwrap_or("chrome").to_owned())
+                }
+            );
+        }
+        let fp = fingerprint
+            .map(|fp| format!(", fingerprint: {fp}"))
+            .unwrap_or_default();
+        let parsed = parse_one(&format!("- {{name: shadow, type: ss, server: example.com, port: 443, cipher: aes-128-gcm, password: inner, plugin: shadow-tls, plugin-opts: {{password: outer, host: sni.example.com{fp}}}}}\n"));
+        assert_eq!(parsed.servers.len(), 1);
+        let tls = parsed.servers[0].shadow_tls_settings.as_ref().unwrap();
+        assert!(tls.utls_mode.is_none());
+        assert_eq!(tls.fingerprint.as_deref(), fingerprint);
+    }
+}
+
+#[test]
+fn import_finalization_validates_only_emitted_modeled_pins() {
+    use polaris_config_engine::user_config::protocol_settings::TlsSettings;
+    use polaris_config_engine::user_config::server_config::{Protocol, SecurityMode, ServerConfig};
+    for (protocol, security, emitted) in [
+        (Protocol::Trojan, None, true),
+        (Protocol::MasqueClient, None, true),
+        (Protocol::Vless, Some(SecurityMode::Reality), false),
+        (Protocol::Naive, None, false),
+        (Protocol::Tor, None, false),
+        (Protocol::Tailcat, None, false),
+        (Protocol::Ssh, None, false),
+        (Protocol::Custom, None, false),
+    ] {
+        for pin in [
+            None,
+            Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"),
+            Some("invalid-pin"),
+        ] {
+            let server = ServerConfig {
+                protocol,
+                security: security.clone(),
+                tls_settings: Some(TlsSettings {
+                    certificate_sha256: pin.map(str::to_owned),
+                    allow_insecure: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut result = ClashParseResult::default();
+            result.servers.push(server);
+            let result = result.finish();
+            let rejected = emitted && pin == Some("invalid-pin");
+            assert_eq!(result.servers.is_empty(), rejected);
+            assert_eq!(result.failed, usize::from(rejected));
+        }
+    }
+}
+
+mod import_parity;

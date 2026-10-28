@@ -52,7 +52,8 @@
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -266,9 +267,8 @@ function emit(rel, buffer) {
   written.set(rel, createHash('sha256').update(buffer).digest('hex'));
 }
 
-const scratchRoot = existsSync('/var/tmp') ? '/var/tmp' : REPO;
-const scratch = join(scratchRoot, `polaris-icon-render-${process.pid}`);
-mkdirSync(scratch, { recursive: true });
+// mkdtemp creates a new private directory; never reuse a predictable shared path.
+const scratch = mkdtempSync(join(tmpdir(), 'polaris-icon-render-'));
 
 function render(name, source, px) {
   const src = join(scratch, `${name}.svg`);
@@ -278,20 +278,25 @@ function render(name, source, px) {
   return readFileSync(dst);
 }
 
-for (const [density, factor] of DENSITIES) {
-  const legacyPx = LEGACY_DP * factor;
-  const adaptivePx = ADAPTIVE_DP * factor;
-  if (!Number.isInteger(legacyPx) || !Number.isInteger(adaptivePx)) fail(`${density} 档算出了非整数像素`);
-  emit(`${RES_REL}/mipmap-${density}/ic_launcher.png`, render('legacy', svg, legacyPx));
-  emit(`${RES_REL}/mipmap-${density}/ic_launcher_round.png`, render('legacy-round', roundSvg(), legacyPx));
-  emit(
-    `${RES_REL}/mipmap-${density}/ic_launcher_foreground.png`,
-    render('foreground', foregroundSvg(adaptivePx, false), adaptivePx),
-  );
-  emit(
-    `${RES_REL}/mipmap-${density}/ic_launcher_monochrome.png`,
-    render('monochrome', foregroundSvg(adaptivePx, true), adaptivePx),
-  );
+try {
+  for (const [density, factor] of DENSITIES) {
+    const legacyPx = LEGACY_DP * factor;
+    const adaptivePx = ADAPTIVE_DP * factor;
+    if (!Number.isInteger(legacyPx) || !Number.isInteger(adaptivePx)) fail(`${density} 档算出了非整数像素`);
+    emit(`${RES_REL}/mipmap-${density}/ic_launcher.png`, render('legacy', svg, legacyPx));
+    emit(`${RES_REL}/mipmap-${density}/ic_launcher_round.png`, render('legacy-round', roundSvg(), legacyPx));
+    emit(
+      `${RES_REL}/mipmap-${density}/ic_launcher_foreground.png`,
+      render('foreground', foregroundSvg(adaptivePx, false), adaptivePx),
+    );
+    emit(
+      `${RES_REL}/mipmap-${density}/ic_launcher_monochrome.png`,
+      render('monochrome', foregroundSvg(adaptivePx, true), adaptivePx),
+    );
+  }
+} finally {
+  // Only remove the directory owned by this invocation, including on render/write failure.
+  rmSync(scratch, { recursive: true, force: true });
 }
 
 const adaptiveXml =
@@ -355,9 +360,6 @@ if (IN_REPO) {
     }
   }
 }
-
-for (const entry of readdirSync(scratch)) unlinkSync(join(scratch, entry));
-rmdirSync(scratch);
 
 process.stdout.write(
   `[gen-android-icons] 渲染器 ${rendererVersion}\n` +

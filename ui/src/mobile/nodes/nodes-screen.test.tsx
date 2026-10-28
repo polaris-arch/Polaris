@@ -292,8 +292,9 @@ it('Tailscale 行保留协议与状态，空传输摘要不留下占位 span', (
   expect(html).not.toContain('mesh · wg');
 });
 
-const MOBILE_TSX = walk(MOBILE, /\.tsx$/);
-const MOBILE_SRC = walk(MOBILE, /\.(?:ts|tsx)$/).filter((p) => !/\.test\.tsx?$/.test(p));
+const SHARED_MOBILE_FORMS = [join(SRC, 'shared/vpn/VpnAuthForm.tsx')];
+const MOBILE_TSX = [...walk(MOBILE, /\.tsx$/), ...SHARED_MOBILE_FORMS];
+const MOBILE_SRC = [...walk(MOBILE, /\.(?:ts|tsx)$/).filter((p) => !/\.test\.tsx?$/.test(p)), ...SHARED_MOBILE_FORMS];
 const MOBILE_TEXT = MOBILE_SRC.map((p) => strip(read(p))).join('\n');
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -22,6 +22,64 @@ import sys
 # 图形腿：run.sh 把本轮实际形态写进证据包的 graphics.txt（escape=逃生门已替用户打开，
 # default=生产默认路径）。旧证据包没有这个文件，按「未登记 ⇒ 未覆盖」处理，不追认为已验。
 GRAPHICS_UNKNOWN = "unknown"
+BOUND_FILES = ("polaris.log", "timeline.tsv", "graphics.txt", "graphics-samples.jsonl", "provenance.json", "app.cleanup.json", "xvfb.cleanup.json")
+FLAGS = ('WEBKIT_DISABLE_COMPOSITING_MODE', 'WEBKIT_DISABLE_DMABUF_RENDERER', 'LIBGL_ALWAYS_SOFTWARE')
+
+
+def graphics_bound(evidence, identity, rows):
+    leg = graphics_leg(evidence)
+    if leg not in ('default', 'escape'):
+        return False
+    expected = {key: '1' for key in FLAGS} if leg == 'escape' else {}
+    samples = [json.loads(line) for line in (evidence / 'graphics-samples.jsonl').read_text().splitlines()]
+    if len(samples) != len(rows):
+        return False
+    display = None
+    server_identity = json.loads((evidence / 'xvfb.cleanup.json').read_text())['identity']
+    if not re.fullmatch(r'[1-9][0-9]*:[0-9]+', server_identity):
+        return False
+    for sample, row in zip(samples, rows):
+        cols = row.split('\t')
+        if sample['xvfb_identity'] != server_identity:
+            return False
+        if sample['identity'] != identity or sample['leg'] != leg or sample['effective'] != expected or sample['elapsed'] != cols[0]:
+            return False
+        if not re.fullmatch(r':[0-9]+', sample['display']):
+            return False
+        if display is not None and display != sample['display']:
+            return False
+        display = sample['display']
+        witnesses = sample['witnesses']
+        if type(witnesses) is not list or not cols[1].isdigit() or len(witnesses) != int(cols[1]):
+            return False
+        seen = set()
+        for chain in witnesses:
+            if type(chain) is not list or not 2 <= len(chain) <= 65 or chain[-1] != identity:
+                return False
+            if any(type(item) is not str or not re.fullmatch(r'[1-9][0-9]*:[0-9]+', item) for item in chain):
+                return False
+            if len(set(chain)) != len(chain) or chain[0] in seen:
+                return False
+            seen.add(chain[0])
+    return True
+
+
+def batch_bound(evidence, control):
+    try:
+        current = json.loads((evidence / 'provenance.json').read_text())
+        positive = json.loads((control / 'provenance.json').read_text())
+        keys = {'batch', 'boot_id', 'graphics', 'source_sha256', 'binary_sha256', 'common_config_sha256'}
+        if set(current) != keys or current != positive or current['graphics'] != graphics_leg(evidence):
+            return False
+        if not re.fullmatch(r'[0-9a-f-]{36}', current['boot_id']) or not re.fullmatch(r'[0-9a-f]{32}', current['batch']):
+            return False
+        if any(not re.fullmatch(r'[0-9a-f]{64}', current[key]) for key in keys if key.endswith('_sha256')):
+            return False
+        a = json.loads((evidence / 'observation.json').read_text())
+        b = json.loads((control / 'observation.json').read_text())
+        return (a['warmup'], a['requested']) == (b['warmup'], b['requested']) and (evidence == control or b['end'] < a['start'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def graphics_leg(evidence: pathlib.Path) -> str:
@@ -107,12 +165,20 @@ def window_complete(evidence: pathlib.Path) -> bool:
             return False
         if record["completed"] is not True:
             return False
-        for name in ("polaris.log", "timeline.tsv"):
+        for name in BOUND_FILES:
             if hashlib.sha256((evidence / name).read_bytes()).hexdigest() != record["sha256"][name]:
                 return False
         rows = (evidence / "timeline.tsv").read_text().splitlines()
         if rows[0] != "t\twebproc\twindow\tcolors\tlog_lines\tidentity":
             return False
+        if not graphics_bound(evidence, identity, rows[1:]):
+            return False
+        for label in ('app', 'xvfb'):
+            cleanup = json.loads((evidence / f'{label}.cleanup.json').read_text())
+            if cleanup.get('root_reaped') is not True or cleanup.get('reason') != 'cancelled':
+                return False
+            if label == 'app' and cleanup.get('identity') != identity:
+                return False
         previous = 0.0
         for row in rows[1:]:
             cols = row.split("\t")
@@ -193,7 +259,7 @@ def check(evidence: pathlib.Path) -> int:
         for b in bad:
             print(f"    FAIL: {b}")
         return 1
-    print("    PASS")
+    print("    Scenario observations satisfied; batch acceptance still required")
     return 0
 
 
@@ -201,9 +267,26 @@ def main() -> int:
     if len(sys.argv) < 2:
         print("用法: assert.py <证据包目录> [更多目录...]", file=sys.stderr)
         return 2
-    rc = 0
-    for d in sys.argv[1:]:
-        rc = max(rc, check(pathlib.Path(d).resolve()))
+    return check_batch([pathlib.Path(d).resolve() for d in sys.argv[1:]])
+
+
+def check_batch(paths):
+    controls = [path for path in paths if path.name == 'plain-broken']
+    if len(controls) != 1:
+        print('Evidence unavailable: exactly one same-batch plain-broken control required')
+        return 2
+    control = controls[0]
+    rc = check(control)
+    if rc:
+        return rc
+    for path in paths:
+        if not batch_bound(path, control):
+            print('Evidence unavailable: missing/mismatched/late batch control provenance')
+            return 2
+        if path != control:
+            rc = max(rc, check(path))
+    if rc == 0:
+        print('PASS: same-batch control and scenario evidence satisfied')
     return rc
 
 

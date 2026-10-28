@@ -53,6 +53,7 @@ fn ext_rule(id: &str, target: Option<&str>) -> Rule {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: target.map(String::from),
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -67,6 +68,7 @@ fn first_class_ext_rule(id: &str, target: &str) -> Rule {
                 enabled: true,
                 action: RuleAction::Proxy,
                 target_server_id: Some(target.into()),
+                target_auto_select: None,
                 destination_resolution: None,
                 resolution_only: false,
             }),
@@ -213,10 +215,12 @@ fn subscription_interface_difference_does_not_turn_selection_into_restart() {
         SubscriptionInterfacePolicy {
             id: "sub-a".into(),
             proxy_bind_interface: Some("en0".into()),
+            speed_test_interval_minutes: None,
         },
         SubscriptionInterfacePolicy {
             id: "sub-b".into(),
             proxy_bind_interface: Some("en7".into()),
+            speed_test_interval_minutes: None,
         },
     ];
     let mut new = old.clone();
@@ -743,6 +747,7 @@ fn plan_rule_app_rule_switch() {
         action: RuleAction::Proxy,
         enabled: true,
         target_server_id: Some(NODE_A.into()),
+        target_auto_select: None,
     }];
     let mut new_cfg = old.clone();
     new_cfg.app_rules = vec![AppRule {
@@ -750,6 +755,7 @@ fn plan_rule_app_rule_switch() {
         action: RuleAction::Proxy,
         enabled: true,
         target_server_id: Some(NODE_B.into()),
+        target_auto_select: None,
     }];
     let plan = plan_hot_switch(&old, &new_cfg, &deps);
     assert_eq!(plan.kind, HotSwitchKind::Rules);
@@ -1224,4 +1230,64 @@ fn sel_only_forces_subnets_is_insensitive_to_observed_addresses() {
         "ts-observed",
         Some(true)
     ))));
+}
+
+#[test]
+fn rule_auto_reference_switch_reuses_existing_wrapper_members() {
+    use crate::user_config::auto_select::{wrapper_tag, AutoSelectTarget, SelectionIntent};
+    let (mut deps, _) = setup_rule_deps();
+    let mut old = base_config();
+    old.auto_select_enabled = true;
+    old.selection_intent = Some(SelectionIntent {
+        mode: "auto".into(),
+        target: AutoSelectTarget::Global,
+    });
+    let mut anchor = ext_rule("anchor", None);
+    anchor.target_auto_select = Some(AutoSelectTarget::Manual);
+    old.custom_rules = vec![ext_rule("r1", Some(NODE_A)), anchor];
+    let mut next = old.clone();
+    next.custom_rules[0].target_server_id = None;
+    next.custom_rules[0].target_auto_select = Some(AutoSelectTarget::Manual);
+    assert_eq!(
+        config_generation_norm(&old, None),
+        config_generation_norm(&next, None)
+    );
+    let plan = plan_hot_switch(&old, &next, &deps);
+    assert_eq!(plan.kind, HotSwitchKind::Rules);
+    assert_eq!(
+        plan.puts[0].member_tag,
+        wrapper_tag(&AutoSelectTarget::Manual)
+    );
+    assert_eq!(plan.puts[0].old_member_tag.as_deref(), Some("tagA"));
+    let mut global = next.clone();
+    global.custom_rules[0].target_auto_select = Some(AutoSelectTarget::Global);
+    assert_eq!(
+        plan_hot_switch(&next, &global, &deps).puts[0].member_tag,
+        wrapper_tag(&AutoSelectTarget::Global)
+    );
+    // Missing runtime selector evidence must not become a successful no-op.
+    deps.current_rule_target_map = Some(BTreeMap::new());
+    assert!(plan_hot_switch(&old, &next, &deps).must_restart);
+    deps.current_rule_target_map = None;
+    assert!(plan_hot_switch(&old, &next, &deps).must_restart);
+}
+
+#[test]
+fn newly_referenced_auto_group_remains_a_structural_change() {
+    use crate::user_config::auto_select::AutoSelectTarget;
+    let (deps, _) = setup_rule_deps();
+    let mut old = base_config();
+    old.auto_select_enabled = true;
+    old.custom_rules = vec![ext_rule("r1", Some(NODE_A))];
+    let mut next = old.clone();
+    next.custom_rules[0].target_server_id = None;
+    next.custom_rules[0].target_auto_select = Some(AutoSelectTarget::Global);
+    assert_ne!(
+        config_generation_norm(&old, None),
+        config_generation_norm(&next, None)
+    );
+    assert_eq!(
+        plan_hot_switch(&old, &next, &deps).kind,
+        HotSwitchKind::None
+    );
 }

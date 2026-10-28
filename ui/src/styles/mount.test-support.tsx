@@ -30,6 +30,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import AppShell from '@/components/layout/AppShell';
 import { DEFAULT_DESTINATION, type DestinationId } from '@/mobile/destinations';
 import { MobileShell } from '@/mobile/MobileShell';
+import { MobileLockOverlay } from '@/mobile/MobileLockOverlay';
+import { useAppStore } from '@/store/app-store';
 import type { MountedMarkup } from './css-oracle.test-support';
 
 /** 屏的插入位。渲染外壳时先放这个标记，再把屏的 markup 原样换进去。 */
@@ -45,9 +47,9 @@ export function inMobileShell(
   active: DestinationId = DEFAULT_DESTINATION,
 ): MountedMarkup {
   const shell = renderToStaticMarkup(
-    <MobileShell active={active} onSelect={() => undefined}>
+    <><MobileShell active={active} onSelect={() => undefined}>
       <div data-mobile-screen-slot="1" />
-    </MobileShell>,
+    </MobileShell><MobileLockOverlay locked={useAppStore.getInitialState().privacyMode} /></>,
   );
   const at = shell.indexOf(SLOT);
   if (at < 0)

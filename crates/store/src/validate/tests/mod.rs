@@ -291,3 +291,42 @@ fn save_rejects_reserved_netenv_id_but_load_validation_tolerates_it() {
 }
 
 mod audit_regressions;
+
+#[test]
+fn canonical_save_rejects_removed_or_disabled_protected_dns_resources() {
+    use polaris_config_engine::user_config::dns_policy::{
+        builtin_dns_server_resources, BUILTIN_BOOTSTRAP_DNS_ID, BUILTIN_DOMESTIC_DNS_ID,
+        BUILTIN_REMOTE_DNS_ID,
+    };
+    for id in [
+        BUILTIN_DOMESTIC_DNS_ID,
+        BUILTIN_REMOTE_DNS_ID,
+        BUILTIN_BOOTSTRAP_DNS_ID,
+    ] {
+        for remove in [true, false] {
+            let mut servers = serde_json::to_value(builtin_dns_server_resources()).unwrap();
+            let list = servers.as_array_mut().unwrap();
+            if remove {
+                list.retain(|server| server["id"] != id);
+            } else {
+                list.iter_mut().find(|server| server["id"] == id).unwrap()["enabled"] =
+                    false.into();
+            }
+            let raw = serde_json::json!({"dnsServers":servers});
+            let before = raw.clone();
+            assert!(
+                crate::ConfigStore::canonicalize_for_save(&raw).is_err(),
+                "{id}, remove={remove}"
+            );
+            assert_eq!(raw, before, "rejected save must not synthesize resources");
+        }
+    }
+    // Absent collections keep legacy serde defaults; explicit valid resources work.
+    assert!(crate::ConfigStore::canonicalize_for_save(&serde_json::json!({})).is_ok());
+    assert!(
+        crate::ConfigStore::canonicalize_for_save(&serde_json::json!({
+            "dnsServers":builtin_dns_server_resources()
+        }))
+        .is_ok()
+    );
+}

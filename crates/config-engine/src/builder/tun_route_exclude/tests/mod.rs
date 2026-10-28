@@ -173,3 +173,20 @@ fn win_bypass_skips_mesh_on_protected() {
         .mesh_skipped_own_lan
         .contains(&"127.0.0.0/8".to_string()));
 }
+
+#[test]
+fn mixed_ipv6_cannot_bypass_fakeip_exclusion_protection() {
+    for platform in ["darwin", "win32", "linux"] {
+        let input = UserTunExcludeInput {
+            platform,
+            user_cidrs: &["2001:2::192.0.2.1/128".into()],
+            mesh_cidrs: &[],
+            fakeip_ranges: &["2001:2::/48".into()],
+            own_lan_cidrs: &[],
+        };
+        let result = compute_user_tun_exclude(&input);
+        assert!(result.extra.is_empty());
+        assert_eq!(result.dropped_fakeip_overlap, input.user_cidrs);
+        assert_eq!(result.dropped_invalid, 0);
+    }
+}

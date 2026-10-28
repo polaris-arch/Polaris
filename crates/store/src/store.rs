@@ -141,15 +141,20 @@ impl ConfigStore {
     /// 运行时缓存、乐观并发版本与 API 返回值必须使用这份结果，而不是清洗前入参；否则磁盘已经删除
     /// 坏字段/归一枚举，内存却仍保留旧形，下一次读改写会基于一个磁盘上从未存在过的版本。
     pub fn canonicalize_for_save(config: &Value) -> Result<Value, StoreError> {
+        crate::validate::validate_raw_rule_ids(config)?;
+        crate::validate::validate_raw_tls_pins(config)?;
+        crate::auto_select::validate_raw(config)?;
         crate::sanitize::validate_collection_shapes(config)?;
         crate::mesh_guard::validate_raw(config)?;
         // 安全字段不能先 sanitize：显式坏策略若被改成 block 后再校验，写入者会误以为原值已生效。
         crate::validate::validate_raw_mesh_inbound_policies(config)?;
         // An explicit DNS fallback must never disappear during tolerant sanitization.
         crate::validate::validate_raw_real_query_fallback_action(config)?;
+        crate::validate::validate_raw_rule_dns_actions(config)?;
         let mut value = config.clone();
         crate::sanitize::sanitize_value_in_place_pub(&mut value);
         validate_config(&mut value)?;
+        crate::validate::validate_raw_rule_ids(&value)?;
         crate::validate::validate_for_save(&value)?;
         crate::mesh_guard::validate_raw(&value)?;
         Ok(value)
@@ -240,6 +245,10 @@ pub fn finalize_config(value: &mut Value) -> Result<(), StoreError> {
             .or_insert_with(|| Value::from(7890u16));
         // tunConfig 缺 → validate 会判 Err（必填）；这里不补（保持 Polaris 行为：缺 tunConfig throw）。
         // bool 必填默认
+        obj.entry("autoSelectEnabled")
+            .or_insert_with(|| Value::Bool(false));
+        obj.entry("autoSelectPins")
+            .or_insert_with(|| Value::Array(vec![]));
         obj.entry("autoStart").or_insert_with(|| Value::Bool(false));
         obj.entry("autoConnect")
             .or_insert_with(|| Value::Bool(false));
@@ -291,11 +300,14 @@ pub fn default_config() -> Value {
         "subscriptions": [],
         "servers": [],
         "selectedServerId": null,
+        "autoSelectEnabled": false,
+        "autoSelectPins": [],
         // 分流策略默认「智能」（D1，2026-08-19 陈先生拍板：rule-based 是大多数用户想要的
         // 出厂态；global 会把全部流量压进单一出口，新装即全局易被读作异常）。validate 三值
         // 均合法（global/smart/direct），此处只动出厂默认。
         "proxyMode": "smart",
         "proxyModeType": "systemProxy",
+        "utlsPolicy": "default",
         // mtu **刻意缺席** = 自动（生成期不下发 `mtu` 键，由 sing-box 内核取默认，见 config-engine `TunModeConfig::mtu`）。
         // 新装写一个具体数会把「当时的默认」冻在磁盘上，此后默认值再变也追不上——那正是存量
         // 1350/1400 需要 `migrate_tun_mtu` 清一遍的成因。

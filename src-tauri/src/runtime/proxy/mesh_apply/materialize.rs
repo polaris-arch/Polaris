@@ -197,7 +197,8 @@ fn open_source(path: &Path) -> Result<File, MaterializeError> {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
-        options.custom_flags(nix::libc::O_NOFOLLOW);
+        // A regular file may become a FIFO after lstat: never block before fstat rejects it.
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
         options.open(path).map_err(|_| MaterializeError::SourceIo)
     }
 }

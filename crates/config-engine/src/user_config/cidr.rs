@@ -139,48 +139,10 @@ const V6_FULL: u128 = !0u128;
 
 /// IPv6 字面量（含 :: 压缩）→ u128。非法 → None。上游 `ipv6ToBigInt`。
 fn ipv6_to_u128(addr: &str) -> Option<u128> {
-    let a = addr.trim();
-    if a.is_empty() || !a.contains(':') || !a.bytes().all(|b| b.is_ascii_hexdigit() || b == b':') {
-        return None;
-    }
-    let halves: Vec<&str> = a.split("::").collect();
-    if halves.len() > 2 {
-        return None;
-    }
-    let head: Vec<&str> = if halves[0].is_empty() {
-        vec![]
-    } else {
-        halves[0].split(':').collect()
-    };
-    let tail: Vec<&str> = if halves.len() == 2 && !halves[1].is_empty() {
-        halves[1].split(':').collect()
-    } else {
-        vec![]
-    };
-    if halves.len() == 1 && head.len() != 8 {
-        return None;
-    }
-    let fill = 8usize.saturating_sub(head.len() + tail.len());
-    if halves.len() == 2 && fill < 1 {
-        return None;
-    }
-    let mut groups: Vec<&str> = head;
-    if halves.len() == 2 {
-        groups.extend(std::iter::repeat_n("0", fill));
-    }
-    groups.extend(tail);
-    if groups.len() != 8 {
-        return None;
-    }
-    let mut v: u128 = 0;
-    for g in groups {
-        if g.is_empty() || g.len() > 4 {
-            return None;
-        }
-        let n = u16::from_str_radix(g, 16).ok()?;
-        v = (v << 16) | n as u128;
-    }
-    Some(v)
+    addr.trim()
+        .parse::<std::net::Ipv6Addr>()
+        .ok()
+        .map(u128::from)
 }
 
 /// IPv6 CIDR → (网络地址, 前缀)。上游 `parseIpv6Cidr`。

@@ -1,92 +1,116 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AutoSelectStatus } from '@/contracts/auto-select';
+import { useCallback, useEffect, useSyncExternalStore } from 'react';
+import type { NativeAutoStatus } from '@/contracts/auto-select';
 import type { UserConfig } from '@/contracts/types';
 import { api } from '@/ipc';
+import { useAppStore } from '@/store/app-store';
 
-export interface AutoSelectStatusState {
-  report: AutoSelectStatus | null;
-  loading: boolean;
-  failed: boolean;
+export interface AutoSelectStatusState { report: NativeAutoStatus | null; loading: boolean; failed: boolean }
+const empty: AutoSelectStatusState = { report: null, loading: false, failed: false };
+let snapshot = empty;
+let context = '';
+let clients = 0;
+let session = 0;
+let revision = 0;
+let request = 0;
+let pendingSession: number | null = null;
+let unsubscribe: (() => void) | null = null;
+let ready: Promise<void> | null = null;
+const listeners = new Set<() => void>();
+const publish = (value: AutoSelectStatusState) => {
+  snapshot = value;
+  const status = useAppStore.getState().proxyStatus;
+  if (status?.running && value.report && status.mainGeneration === value.report.generation && status.actualServerId !== value.report.actualServerId) {
+    useAppStore.getState().setProxyStatus({ ...status, actualServerId: value.report.actualServerId });
+  }
+  listeners.forEach(listener => listener());
+};
+const subscribe = (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; };
+const getSnapshot = () => snapshot;
+const contextKeys = new WeakMap<UserConfig, string>();
+function configContext(config: UserConfig): string {
+  const cached = contextKeys.get(config);
+  if (cached !== undefined) return cached;
+  const key = JSON.stringify([config.autoSelectEnabled, config.selectionIntent, config.autoSelectPins,
+    config.servers, config.subscriptions, config.trafficRules, config.policyRules, config.customRules,
+    config.appRules, config.speedTestUrl]);
+  contextKeys.set(config, key);
+  return key;
 }
 
-/** Read-only, scoped to the saved configuration. Events supersede in-flight snapshots. */
-export function useAutoSelectStatus(config: UserConfig | null) {
-  const enabled = !!config && Object.prototype.hasOwnProperty.call(config, 'selectionIntent');
-  const [state, setState] = useState<AutoSelectStatusState & { context: UserConfig | null }>({
-    context: null, report: null, loading: false, failed: false,
+function detach(off: () => void) {
+  try { void Promise.resolve(off()).catch(error => console.error('[nativeAuto] unsubscribe failed', error)); }
+  catch (error) { console.error('[nativeAuto] unsubscribe failed', error); }
+}
+function start() {
+  const token = ++session;
+  ready = Promise.resolve().then(() => api.server.onAutoSelectStatusReady(report => {
+    if (session !== token) return;
+    revision++;
+    publish({ report, loading: false, failed: false });
+  })).then(off => {
+    if (session !== token) { detach(off); return; }
+    unsubscribe = off;
   });
-  const refreshRef = useRef<(() => void) | null>(null);
-  const refresh = useCallback(() => refreshRef.current?.(), []);
+  void ready.catch(() => { if (session === token) { ready = null; publish({ report: null, loading: false, failed: true }); } });
+}
+async function load() {
+  if (!clients || pendingSession === session) return;
+  if (!ready) start();
+  const token = session;
+  pendingSession = token;
+  const id = ++request;
+  let before = revision;
+  publish({ ...snapshot, loading: true, failed: false });
+  try {
+    await ready;
+    if (session !== token) return;
+    before = revision;
+    const report = await api.server.autoSelectStatus();
+    if (!Array.isArray(report?.nativeAutoGroups)) throw new TypeError('Invalid native Auto status');
+    if (session === token && request === id && revision === before) publish({ report, loading: false, failed: false });
+  } catch {
+    if (session === token && request === id && revision === before) publish({ report: null, loading: false, failed: true });
+  } finally {
+    if (pendingSession === token) pendingSession = null;
+  }
+}
 
-  useEffect(() => {
-    if (!enabled) return;
-    let active = true;
-    let pending = false;
-    let eventRevision = 0;
-    const publish = (next: AutoSelectStatusState) => {
-      if (active) setState({ ...next, context: config });
-    };
-    let off: (() => void) | null = null;
-    let registrationAttempt = 0;
-    const detach = (unsubscribe: () => void) => {
-      const failed = (error: unknown) => console.error('[autoSelectStatus] unsubscribe failed:', error);
-      try { void Promise.resolve(unsubscribe()).catch(failed); } catch (error) { failed(error); }
-    };
-    const load = async () => {
-      // Guard both registration and the snapshot before React disables the button.
-      if (!active || pending) return;
-      pending = true;
+function acquire(key: string) {
+    clients++;
+    if (context !== key || clients === 1) {
+      context = key;
+      // Invalidate old reads/events even when other mounted cards still hold a ref.
+      if (unsubscribe) detach(unsubscribe);
+      unsubscribe = null; ready = null; pendingSession = null;
+      start();
       publish({ report: null, loading: true, failed: false });
-      try {
-        if (!off) {
-          const attempt = ++registrationAttempt;
-          let unsubscribe: () => void;
-          try {
-            unsubscribe = await api.server.onAutoSelectStatusReady((report) => {
-              if (!active || attempt !== registrationAttempt) return;
-              eventRevision += 1;
-              publish({ report, loading: pending, failed: false });
-            });
-          } catch {
-            // A failed registration may still deliver a queued callback.
-            registrationAttempt += 1;
-            publish({ report: null, loading: false, failed: true });
-            return;
-          }
-          if (!active) {
-            detach(unsubscribe);
-            return;
-          }
-          off = unsubscribe;
-        }
-        // Read only after registration, closing the initial event delivery gap.
-        const revision = eventRevision;
-        try {
-          const report = await api.server.autoSelectStatus();
-          if (!report?.intent) throw new TypeError();
-          if (active && revision === eventRevision) publish({ report, loading: false, failed: false });
-        } catch {
-          if (active && revision === eventRevision) publish({ report: null, loading: false, failed: true });
-        }
-      } finally {
-        pending = false;
-        if (active) setState(previous => ({ ...previous, loading: false }));
+      void load();
+    }
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      clients--;
+      if (clients === 0) {
+        session++;
+        if (unsubscribe) detach(unsubscribe); unsubscribe = null; ready = null; context = '';
+        publish(empty);
       }
     };
-    refreshRef.current = () => { void load(); };
-    void load();
-    return () => {
-      // Invalidate before detaching: a failed detach must not revive this session.
-      active = false;
-      registrationAttempt += 1;
-      refreshRef.current = null;
-      if (off) detach(off);
-    };
-  }, [config, enabled]);
+}
 
-  return {
-    ...(enabled && state.context === config ? state : { report: null, loading: enabled, failed: false }),
-    enabled,
-    refresh,
-  };
+
+/** Shared production source; React only manages consumer lifetimes. */
+export const nativeAutoStatusSource = { acquire, refresh: load, subscribe, getSnapshot };
+
+/** One event subscription and snapshot for all cards in a webview; no per-card polling. */
+export function useAutoSelectStatus(config: UserConfig | null) {
+  const enabled = !!config && (config.autoSelectEnabled === true || !!config.selectionIntent || !!config.autoSelectPins?.length);
+  const running = useAppStore(state => state.proxyStatus?.running === true);
+  const generation = useAppStore(state => state.proxyStatus?.mainGeneration);
+  const key = enabled && config ? `${configContext(config)}:${running}:${generation ?? ''}` : '';
+  const value = useSyncExternalStore(nativeAutoStatusSource.subscribe, nativeAutoStatusSource.getSnapshot, () => empty);
+  useEffect(() => enabled ? nativeAutoStatusSource.acquire(key) : undefined, [enabled, key]);
+  const refresh = useCallback(() => { if (enabled) void nativeAutoStatusSource.refresh(); }, [enabled]);
+  return { ...(enabled && context === key ? value : empty), enabled, refresh, runtimeCurrent: running && generation !== undefined && generation === value.report?.generation };
 }

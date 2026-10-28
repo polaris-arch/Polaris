@@ -17,14 +17,13 @@ use polaris_net_stack::clash_parser::{default_max_providers, ClashParseResult};
 use polaris_net_stack::singbox_import::ImportOrigin;
 use polaris_net_stack::ssrf::DnsLookup;
 use polaris_net_stack::subscription::{
-    dedupe_by_fingerprint, default_subscription_user_agent, enforce_parse_output_budget_typed,
-    fetch_subscription_full_capped_until, fetch_subscription_with_meta_until,
-    parse_provider_request, parse_subscription_bundle_limited_typed,
-    resolve_proxy_providers_controlled_with_parser, Conditional, ParseOutputMetrics,
-    ProviderFatalError, ProviderFatalErrorKind, ProviderFetchError, ProviderParseRequest,
-    ProviderResolveControl, ProviderResolveLimits, ProviderResolveResult, SubscriptionParseError,
-    SubscriptionParseErrorKind, SubscriptionParseLimits, MAIN_FETCH_TIMEOUT_MS,
-    PROVIDER_FETCH_TIMEOUT_MS,
+    dedupe_by_fingerprint, enforce_parse_output_budget_typed, fetch_subscription_full_capped_until,
+    fetch_subscription_with_meta_until, parse_provider_request,
+    parse_subscription_bundle_limited_typed, resolve_proxy_providers_controlled_with_parser,
+    Conditional, ParseOutputMetrics, ProviderFatalError, ProviderFatalErrorKind,
+    ProviderFetchError, ProviderParseRequest, ProviderResolveControl, ProviderResolveLimits,
+    ProviderResolveResult, SubscriptionParseError, SubscriptionParseErrorKind,
+    SubscriptionParseLimits, MAIN_FETCH_TIMEOUT_MS, PROVIDER_FETCH_TIMEOUT_MS,
 };
 
 use crate::runtime::http::{HttpRuntime, SystemDnsLookup};
@@ -177,7 +176,7 @@ pub(super) async fn fetch_parse_resolve<L: DnsLookup>(
     };
     let ua = user_agent
         .map(str::to_string)
-        .unwrap_or_else(|| default_subscription_user_agent(env!("CARGO_PKG_VERSION")));
+        .unwrap_or_else(crate::runtime::http::app_user_agent);
     let mut retries_done = 0;
     let main_fetch_deadline = (std::time::Instant::now()
         + Duration::from_millis(MAIN_FETCH_TIMEOUT_MS))

@@ -304,6 +304,7 @@ pub fn build_outbounds_with_runtime_bindings(
     deps: &mut OutboundsDeps,
     runtime_bind_interfaces: &BTreeMap<String, String>,
 ) -> Result<OutboundsResult, String> {
+    validate_detour_graph(config)?;
     let mut pending_endpoints: Vec<Endpoint> = Vec::new();
     let mut pending_rule_selectors: Vec<PendingRuleSelector> = Vec::new();
     let mut outbounds: Vec<Outbound> = Vec::new();
@@ -615,7 +616,8 @@ pub fn build_outbounds_with_runtime_bindings(
         }
 
         // 普通代理 outbound。
-        let mut ob = build_proxy_outbound(server, &tag, &dial_resolver, &deps.arch, &deps.platform);
+        let mut ob =
+            build_proxy_outbound(server, &tag, &dial_resolver, &deps.arch, &deps.platform)?;
         // detour 代理链。
         ob.detour = resolve_detour_tag(server, config, &id_to_tag);
         // Tailcat 的 DERP 地图拉取出口跟随前置代理（D10 选项 C）：只有 region 模式才有 `http_client`，
@@ -637,11 +639,16 @@ pub fn build_outbounds_with_runtime_bindings(
     // 全局 TLS 分片。
     if config.tls_fragment == Some(true) {
         for ob in &mut outbounds {
-            if matches!(ob.type_field.as_str(), "hysteria2" | "tuic" | "naive") {
+            if !crate::builder::outbound_helpers::supports_tls_fragment(&ob.type_field, None) {
                 continue;
             }
             if let Some(tls) = ob.tls.as_mut() {
-                tls.fragment = Some(true);
+                if crate::builder::outbound_helpers::supports_tls_fragment(
+                    &ob.type_field,
+                    tls.engine.as_deref(),
+                ) {
+                    tls.fragment = Some(true);
+                }
                 continue;
             }
             // custom 逃生舱：tls 块在 `extra` 里（raw 透传，不进具名字段），同样要吃到全局分片。
@@ -653,17 +660,21 @@ pub fn build_outbounds_with_runtime_bindings(
             //
             // 只认对象形态：非对象的 `tls`（如 `true`）往里塞键没有意义，原样留着交给内核判。
             if let Some(serde_json::Value::Object(tls)) = ob.extra.get_mut("tls") {
-                tls.insert("fragment".into(), serde_json::Value::Bool(true));
+                if crate::builder::outbound_helpers::supports_tls_fragment(
+                    &ob.type_field,
+                    tls.get("engine").and_then(serde_json::Value::as_str),
+                ) {
+                    tls.insert("fragment".into(), serde_json::Value::Bool(true));
+                }
             }
         }
     }
 
     // proxy-selector。
-    let is_direct = is_direct_selection(config.selected_server_id.as_deref());
-    let is_block = is_block_selection(config.selected_server_id.as_deref());
+    let is_direct = is_direct_selection(config.effective_selected_server_id());
+    let is_block = is_block_selection(config.effective_selected_server_id());
     let selected_tag = config
-        .selected_server_id
-        .as_deref()
+        .effective_selected_server_id()
         .and_then(|sid| {
             if is_direct_selection(Some(sid)) {
                 Some(DIRECT_TAG.to_string())
@@ -676,7 +687,7 @@ pub fn build_outbounds_with_runtime_bindings(
     // 出口选阻断**不再经 selector 表达**（2026-08-13）：改由 `builder::route` 把所有「→代理」
     // 的规则整体改写成 `action:"reject"` + 一条无 matcher 兜底。此处 default 落到 direct 只是
     // 让 selector 保持结构合法 —— 阻断态下没有任何规则会路由到它（全被改写成 reject 了）。
-    let selector_default = if is_direct || is_block {
+    let mut selector_default = if is_direct || is_block {
         DIRECT_TAG.to_string()
     } else if node_tags.contains(&selected_tag) {
         selected_tag
@@ -689,13 +700,24 @@ pub fn build_outbounds_with_runtime_bindings(
 
     let mut selector_members: Vec<String> = node_tags.clone();
     selector_members.push(DIRECT_TAG.to_string());
+    let auto_members = generate_auto_groups(config, &id_to_tag, &node_tags, &mut outbounds)?;
+    selector_members.extend(auto_members.iter().cloned());
+    if let Some(intent) = &config.selection_intent {
+        if intent.mode == "auto" {
+            selector_default = crate::user_config::auto_select::wrapper_tag(&intent.target);
+        }
+    }
     // 不再往成员表里塞 `block`：阻断已不经 selector 表达。
     let proxy_selector = Outbound {
         type_field: "selector".into(),
         tag: PROXY_SELECTOR_TAG.into(),
         outbounds: Some(selector_members),
         default: Some(selector_default),
-        interrupt_exist_connections: Some(config.interrupt_connections_on_switch == Some(true)),
+        // A wrapper-to-leaf change may keep the same actual exit. App performs
+        // precise disconnect for real node changes; core must not tear down by tag alone.
+        interrupt_exist_connections: Some(
+            auto_members.is_empty() && config.interrupt_connections_on_switch == Some(true),
+        ),
         extra: serde_json::Map::new(),
         detour: None,
         server: None,
@@ -888,8 +910,7 @@ pub fn build_outbounds_with_runtime_bindings(
     // selector 成员清理 + gateInvalidNodes 记录。
     // 选中节点死引用 → 抛错（调用方转用户可见错误）。迭代收敛到无死引用。
     let selected_server = config
-        .selected_server_id
-        .as_deref()
+        .effective_selected_server_id()
         .and_then(|sid| config.servers.iter().find(|s| s.id == sid));
     prune_detour_dead_references(
         deps,
@@ -898,13 +919,46 @@ pub fn build_outbounds_with_runtime_bindings(
         &mut pending_endpoints,
         selected_server,
     )?;
+    reject_duplicate_generated_tags(&outbounds, &pending_endpoints)?;
     reject_duplicate_system_mesh_interfaces(&pending_endpoints)?;
+    for group in outbounds.iter().filter(|o| {
+        o.tag
+            .starts_with(crate::user_config::auto_select::TAG_PREFIX)
+    }) {
+        if group.outbounds.as_ref().is_some_and(Vec::is_empty)
+            || group
+                .default
+                .as_ref()
+                .is_some_and(|d| !group.outbounds.as_ref().is_some_and(|m| m.contains(d)))
+        {
+            return Err(format!("AUTO_SELECT_SCOPE_EMPTY: {}", group.tag));
+        }
+    }
 
     Ok(OutboundsResult {
         outbounds,
         pending_endpoints,
         pending_rule_selectors,
     })
+}
+
+/// Outbound and endpoint tags share the kernel's namespace. Check the final
+/// emitted graph so future helpers cannot silently capture an existing reference.
+fn reject_duplicate_generated_tags(
+    outbounds: &[Outbound],
+    endpoints: &[Endpoint],
+) -> Result<(), String> {
+    let mut tags = BTreeSet::new();
+    for tag in outbounds
+        .iter()
+        .map(|o| &o.tag)
+        .chain(endpoints.iter().map(|e| &e.tag))
+    {
+        if !tags.insert(tag) {
+            return Err("OUTBOUND_TAG_DUPLICATE".into());
+        }
+    }
+    Ok(())
 }
 
 /// System 模式的接口名由内核固定生成。多个同协议 endpoint 同时发射会抢同一接口；
@@ -945,54 +999,64 @@ fn reject_duplicate_system_mesh_interfaces(endpoints: &[Endpoint]) -> Result<(),
     Ok(())
 }
 
-/// `server.detour`（**节点 id**）→ 生成集合里的 **outbound tag**；不可用一律 `None`。
+/// Validate every declared chain before producing selectable nodes. A missing, cyclic or
+/// unsupported dependency is not equivalent to an absent detour: dropping it exposes the
+/// node's physical dial directly. Keep stored intent intact and reject this build instead.
 ///
-/// 三条排除，逐条与本函数抽出前的代理 outbound 腿逐字等价（行为保持，不是新策略）：
-///  1. 目标 id 不在 `config.servers` 里 → `None`；
-///  2. 沿 `detour` 链走成环（含自指）→ `None`；
-///  3. **目标是 endpoint 协议 → `None`**。
-///
-/// # 为什么抽出来（不是整洁癖）
-///
-/// 本轮给 WG / WARP / Tailscale 三种 endpoint 也接上了 detour（对 上游的有意偏离，见
-/// `singbox/endpoint.rs` 的 `Endpoint::detour`）。若各腿各写一份解析，「代理腿排除了 endpoint 目标、
-/// endpoint 腿忘了排」这种偏斜就只能靠人眼守。同一个函数 ⇒ 排除 3 对四条腿（代理 / WG / WARP / TS）
-/// 同时成立，`endpoint_detour_target_endpoint_excluded` 那道门测的也是它。
-///
-/// # 排除 3 为什么在这一批保持保守
-///
-/// endpoint→endpoint 是否可行**没有结论**：`sing-box check` 根本不做 detour 的引用解析（指向不存在
-/// 的 tag 也 rc=0），拿它验只能得出「schema 接受」，阴性对照立不住。故沿用代理腿早就在用的同一条
-/// 排除，不在这一批放开。要放开须先有真核实测。
+/// Every configured node can become a selector member, including currently idle nodes.
+/// Completed paths are memoized, so validation visits each edge at most once.
+fn validate_detour_graph(config: &UserConfig) -> Result<(), String> {
+    let by_id: BTreeMap<&str, &ServerConfig> = config
+        .servers
+        .iter()
+        .map(|server| (server.id.as_str(), server))
+        .collect();
+    let mut complete = BTreeSet::new();
+    for server in &config.servers {
+        let mut path = BTreeSet::new();
+        let mut current = server.id.as_str();
+        while !complete.contains(current) {
+            if !path.insert(current) {
+                return Err(format!(
+                    "节点「{}」的代理链存在循环引用（{current}），请修复前置代理后重试",
+                    server.name
+                ));
+            }
+            let node = by_id[current];
+            let Some(target_id) = node.detour.as_deref() else {
+                break;
+            };
+            let Some(target) = by_id.get(target_id) else {
+                return Err(format!(
+                    "节点「{}」的前置代理「{target_id}」不存在，请修复代理链后重试",
+                    node.name
+                ));
+            };
+            if lands_in_endpoints(target.protocol) {
+                return Err(format!(
+                    "节点「{}」的前置代理「{}」是当前不支持的端点目标，请更换前置代理后重试",
+                    node.name, target.name
+                ));
+            }
+            current = target_id;
+        }
+        complete.extend(path);
+    }
+    Ok(())
+}
+
+/// Resolve a previously validated detour id to its generated tag. The preflight above
+/// owns dependency validation; generation-time capability pruning remains authoritative
+/// when a structurally valid target cannot be emitted on this platform.
 fn resolve_detour_tag(
     server: &ServerConfig,
-    config: &UserConfig,
+    _config: &UserConfig,
     id_to_tag: &BTreeMap<String, String>,
 ) -> Option<String> {
-    let detour_id = server.detour.as_ref()?;
-    let detour_srv = config.servers.iter().find(|s| &s.id == detour_id)?;
-    // 环检测：从 server 出发沿 detour 链走，撞到已见过的 id 即成环。
-    let mut seen = std::collections::BTreeSet::new();
-    seen.insert(server.id.clone());
-    let mut cur = Some(detour_id.clone());
-    while let Some(c) = cur {
-        if seen.contains(&c) {
-            return None;
-        }
-        seen.insert(c.clone());
-        cur = config
-            .servers
-            .iter()
-            .find(|s| s.id == c)
-            .and_then(|s| s.detour.clone());
-    }
-    // 判据是 `lands_in_endpoints`：endpoint 腿的节点其 tag 根本不在 `outbounds[]` 里，指向它的 detour
-    // 是悬空引用 —— 引用方整个节点会被剪掉并上报 invalid。从前这里只认 WG/TS，openconnect /
-    // openvpn-client 漏在外面。
-    if lands_in_endpoints(detour_srv.protocol) {
-        return None;
-    }
-    id_to_tag.get(detour_id).cloned()
+    server
+        .detour
+        .as_ref()
+        .and_then(|id| id_to_tag.get(id).cloned())
 }
 
 /// Shadow-TLS 后处理：为带 shadowTlsSettings 的节点创建外层 shadowtls outbound 并链接 detour。
@@ -1055,13 +1119,17 @@ fn apply_shadow_tls_postprocess(
 fn drop_tag_from_selectors(outbounds: &mut [Outbound], removed_tag: &str) {
     use crate::builder::outbound_helpers::pruned_selector_default;
     for sel in outbounds.iter_mut() {
-        if sel.type_field != "selector" {
+        if sel.type_field != "selector" && sel.type_field != "urltest" {
             continue;
         }
         if let Some(members) = sel.outbounds.as_mut() {
             members.retain(|t| t != removed_tag);
         }
-        if sel.default.as_deref() == Some(removed_tag) {
+        if sel.default.as_deref() == Some(removed_tag)
+            && !sel
+                .tag
+                .starts_with(crate::user_config::auto_select::TAG_PREFIX)
+        {
             let remaining = sel.outbounds.clone().unwrap_or_default();
             sel.default = pruned_selector_default(Some(&sel.tag), &remaining);
         }
@@ -1301,6 +1369,67 @@ fn selector_outbound(
     }
 }
 
+/// Native selection owns measurement and evaluation. Wrappers preserve stable rule references.
+fn generate_auto_groups(
+    config: &UserConfig,
+    id_to_tag: &BTreeMap<String, String>,
+    node_tags: &[String],
+    outbounds: &mut Vec<Outbound>,
+) -> Result<Vec<String>, String> {
+    use crate::user_config::auto_select::*;
+    let mut wrappers = Vec::new();
+    validate_references(config)?;
+    for target in referenced_targets(config) {
+        let ids = eligible_members(config, &target);
+        let mut members: Vec<String> = ids
+            .iter()
+            .filter_map(|id| id_to_tag.get(id))
+            .filter(|tag| node_tags.contains(tag))
+            .cloned()
+            .collect();
+        if members.is_empty() {
+            return Err("AUTO_SELECT_SCOPE_EMPTY".into());
+        }
+        // Native URLTest falls back to its first compatible member before a measured winner.
+        // Retain a confirmed/persisted seed without pretending that fallback is a fresh measurement.
+        let seed = pin(config, &target)
+            .or(config.selected_server_id.as_deref())
+            .and_then(|id| id_to_tag.get(id));
+        if let Some(index) = seed.and_then(|tag| members.iter().position(|member| member == tag)) {
+            let seed = members.remove(index);
+            members.insert(0, seed);
+        }
+        let wrapper = wrapper_tag(&target);
+        let test = urltest_tag(&target);
+        let mut wrapper_members = members.clone();
+        let default = if config.auto_select_enabled {
+            let interval = interval_minutes(config, &target);
+            outbounds.push(serde_json::from_value(serde_json::json!({
+                "type":"urltest", "tag":test, "outbounds":members, "url":test_url(config),
+                "interval":format!("{interval}m"), "idle_timeout":format!("{}m", interval.max(30)),
+                "interrupt_exist_connections":false
+            })).map_err(|e| format!("AUTO_SELECT_CONFIG: {e}"))?);
+            wrapper_members.insert(0, test.clone());
+            test
+        } else {
+            pin(config, &target)
+                .and_then(|id| id_to_tag.get(id))
+                .filter(|tag| members.contains(tag))
+                .cloned()
+                .ok_or("AUTO_SELECT_NO_CONFIRMED_PIN")?
+        };
+        outbounds.push(
+            serde_json::from_value(serde_json::json!({
+                "type":"selector", "tag":wrapper, "outbounds":wrapper_members,
+                "default":default, "interrupt_exist_connections":false
+            }))
+            .map_err(|e| format!("AUTO_SELECT_CONFIG: {e}"))?,
+        );
+        wrappers.push(wrapper);
+    }
+    Ok(wrappers)
+}
+
 /// rule-sel selector 生成。上游 `generateRuleSelectors`。
 fn generate_rule_selectors(
     config: &UserConfig,
@@ -1328,6 +1457,7 @@ fn generate_rule_selectors(
     let emit = |rule_key: &str,
                 selector_tag: &str,
                 target_server_id: Option<&str>,
+                target_auto_select: Option<&crate::user_config::auto_select::AutoSelectTarget>,
                 existing_tags: &mut std::collections::BTreeSet<String>,
                 outbounds: &mut Vec<Outbound>,
                 pending: &mut Vec<PendingRuleSelector>| {
@@ -1339,7 +1469,9 @@ fn generate_rule_selectors(
         }
         existing_tags.insert(tag.clone());
         let target_tag = target_server_id.and_then(|tid| id_to_tag.get(tid));
-        let default_tag = if let Some(tt) = target_tag {
+        let default_tag = if let Some(target) = target_auto_select {
+            crate::user_config::auto_select::wrapper_tag(target)
+        } else if let Some(tt) = target_tag {
             if node_tags.contains(tt) {
                 tt.clone()
             } else {
@@ -1350,6 +1482,11 @@ fn generate_rule_selectors(
         };
         let mut members = node_tags.to_vec();
         members.push(PROXY_SELECTOR_TAG.to_string());
+        members.extend(
+            crate::user_config::auto_select::referenced_targets(config)
+                .iter()
+                .map(crate::user_config::auto_select::wrapper_tag),
+        );
         // 上游 `generateRuleSelectors`（outbound-builder.ts:762）恒写 interrupt_exist_connections
         // （true|false），非条件省略——rule-sel selector 与 proxy-selector 同形态。此处对齐。
         outbounds.push(Outbound {
@@ -1437,6 +1574,7 @@ fn generate_rule_selectors(
             &format!("custom:{}", rule.id),
             &crate::builder::helpers::custom_rule_selector_tag(&rule.id),
             rule.route_target_server_id(),
+            rule.route_target_auto_select(),
             &mut existing_tags,
             outbounds,
             pending,
@@ -1450,6 +1588,7 @@ fn generate_rule_selectors(
             &format!("app:{}", app_rule.app_id),
             &format!("rule-sel-app-{}", app_rule.app_id),
             app_rule.target_server_id.as_deref(),
+            app_rule.target_auto_select.as_ref(),
             &mut existing_tags,
             outbounds,
             pending,

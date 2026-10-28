@@ -460,3 +460,17 @@ fn parked_tailscale_credentials_are_not_main_or_transient_endpoint_input() {
         assert!(!emitted.contains("tailscaleCredentialRevision"));
     }
 }
+
+#[test]
+fn masque_rejects_invalid_pin_even_when_insecure() {
+    let mut server = masque(None);
+    server.tls_settings = Some(crate::user_config::protocol_settings::TlsSettings {
+        allow_insecure: Some(true),
+        certificate_sha256: Some("invalid-pin".into()),
+        ..Default::default()
+    });
+    assert_eq!(
+        build_masque_endpoint(&server, "MQ", None, None, no_log).err(),
+        Some("TLS_PIN_INVALID")
+    );
+}

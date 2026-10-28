@@ -55,8 +55,8 @@ impl<G: ManualBindingGuard> ManualBindingGuard for UnlockBinding<'_, G> {
     }
 }
 
-struct BoundUnlockSink<'a, G> {
-    sink: BroadcastSink<'a>,
+struct BoundUnlockSink<'a, G, S = BroadcastSink<'a>> {
+    sink: S,
     guard: &'a G,
 }
 
@@ -81,7 +81,7 @@ impl<G: ManualBindingGuard> polaris_unlock::UnlockHttp for BoundUnlockClient<'_,
     }
 }
 
-impl<G: ManualBindingGuard> UnlockEventSink for BoundUnlockSink<'_, G> {
+impl<G: ManualBindingGuard, S: UnlockEventSink> UnlockEventSink for BoundUnlockSink<'_, G, S> {
     fn with_current_commit(&self, commit: &mut dyn FnMut() -> bool) -> bool {
         self.guard.commit(|| Ok(commit())).unwrap_or(false)
     }
@@ -102,6 +102,31 @@ impl<G: ManualBindingGuard> UnlockEventSink for BoundUnlockSink<'_, G> {
         if self.is_current() {
             self.sink.invalidated(running, exit_blocked);
         }
+    }
+    // `with_current_commit` already holds the producer/action locks. Checking again here
+    // would reenter those non-reentrant locks; the detector also holds its epoch fence.
+    fn progress_committed(
+        &self,
+        _fence: &crate::runtime::unlock::UnlockPublicationFence,
+        service_id: &str,
+        result: &polaris_unlock::UnlockResult,
+    ) {
+        self.sink.progress(service_id, result);
+    }
+    fn updated_committed(
+        &self,
+        _fence: &crate::runtime::unlock::UnlockPublicationFence,
+        snapshot: &UnlockSnapshot,
+    ) {
+        self.sink.updated(snapshot);
+    }
+    fn invalidated_committed(
+        &self,
+        _fence: &crate::runtime::unlock::UnlockPublicationFence,
+        running: bool,
+        exit_blocked: bool,
+    ) {
+        self.sink.invalidated(running, exit_blocked);
     }
     // A manual bracket loss cannot enqueue an unbound follow-up through the ordinary self-run path.
 }
@@ -128,8 +153,9 @@ pub(super) async fn run_bound_unlock_cycle<G: ManualBindingGuard + Clone + 'stat
     };
     if let Some(reason) = unlock_gate_reason(true, local_proxy.port, exit_blocked) {
         let snapshot = UnlockSnapshot::blocked(reason);
-        guard.check()?;
-        sink.updated(&snapshot);
+        if !unlock.publish_terminal(&sink, epoch, &snapshot) {
+            return Err(ManualCheckFailure::new("superseded"));
+        }
         return Ok(snapshot);
     }
     let auth = local_proxy
@@ -259,35 +285,33 @@ pub(super) fn compute_selected_exit_blocked(state: &AppRuntime, running: bool) -
 /// `Err` = 建出口 pin 客户端失败（唯一硬失败面）。
 pub async fn run_unlock_cycle(app: AppHandle, force: bool) -> Result<UnlockSnapshot, String> {
     // ── 同步段：取 Arc + 算 gating。Tauri `State` 守卫非 Send，**绝不可跨 await**，故限定在此块内。──
-    let (unlock, running, local_proxy, exit_blocked) = {
+    let sink = BroadcastSink::new(&app);
+    let (unlock, local_proxy, terminal, epoch0) = {
         use tauri::Manager;
         let Some(state) = app.try_state::<AppRuntime>() else {
-            // setup 前极早期 / 关停中 → 静默放弃（同 proxy.rs try_state 范式，绝不 panic）。
             return Err("AppRuntime 尚未装配".to_string());
         };
-        let status = state.proxy.status();
-        let exit_blocked = compute_selected_exit_blocked(&state, status.running);
-        (
-            state.unlock.clone(),
-            status.running,
-            // 本机 http 代理入站（桌面 `mixed-in`；Android 没有 mixed 入站，走带凭据的 `probe-proxy-in`）。
-            // 此前读 `status.mixed_port`：Android 上它指向一个没人监听的口 ⇒ 解锁检测全超时、无报错。
-            state.proxy.local_http_proxy(),
-            exit_blocked,
-        )
+        // Capture epoch BEFORE gate inputs. A concurrent invalidation revokes the terminal;
+        // a lifecycle generation transition is excluded during capture/publication below.
+        let epoch = state.unlock.epoch();
+        state.proxy.with_unlock_gate_commit(|running, local_proxy| {
+            let port = local_proxy.as_ref().map_or(0, |proxy| proxy.port);
+            let blocked = compute_selected_exit_blocked(&state, running);
+            let terminal = unlock_gate_reason(running, port, blocked).map(|reason| {
+                let snapshot = UnlockSnapshot::blocked(reason);
+                if state.unlock.publish_terminal(&sink, epoch, &snapshot) {
+                    Ok(snapshot)
+                } else {
+                    Err("superseded".to_string())
+                }
+            });
+            (state.unlock.clone(), local_proxy, terminal, epoch)
+        })
     };
-    let proxy_port = local_proxy.as_ref().map_or(0, |p| p.port);
-
-    // ── gating（SoT `unlock_gate_reason`）：核未运行 → ProxyNotRunning；选中 TS 出口直判无效 → ExitInvalid
-    //    （不空跑死出口检测）。blocked 快照不缓存，emit UPDATED 让前端 spinner 复位 ──
-    if let Some(reason) = unlock_gate_reason(running, proxy_port, exit_blocked) {
-        // info 而非 warn：这是**预期**短路（没开代理就点检测 / 出口没选好），且前端会显示明确的 blocked 态，
-        // 不是「卡住」。真机 logLevel=warn 下不刷屏。
-        log::info!("解锁检测短路：{reason:?}（running={running}，proxy_port={proxy_port}，exit_blocked={exit_blocked}）");
-        let snap = UnlockSnapshot::blocked(reason);
-        BroadcastSink::new(&app).updated(&snap);
-        return Ok(snap);
+    if let Some(terminal) = terminal {
+        return terminal;
     }
+    let proxy_port = local_proxy.as_ref().map_or(0, |proxy| proxy.port);
 
     // ── 出口 pin：经本机 http 代理入站建客户端（桌面 mixed 口走当前分流出口；Android probe-proxy-in 走 proxy-selector）──
     //
@@ -305,9 +329,8 @@ pub async fn run_unlock_cycle(app: AppHandle, force: bool) -> Result<UnlockSnaps
         log::warn!("解锁检测：建出口 pin 客户端失败（proxy_port={proxy_port}）：{e}");
         e
     })?;
-    let epoch0 = unlock.epoch();
     let snap = unlock
-        .run(&http, &BroadcastSink::new(&app), force, unix_millis)
+        .run_at_epoch(&http, &sink, force, unix_millis, epoch0)
         .await;
 
     // ── warm 补测调度（#6）：partial-timeout（含 timeout 但非全超/受限）→ 5s 后定向重打 ──
@@ -373,3 +396,6 @@ pub fn unlock_get(state: State<'_, AppRuntime>) -> ApiResponse<Option<UnlockSnap
     }
     ApiResponse::ok(state.unlock().peek(unix_millis()))
 }
+
+#[cfg(test)]
+mod tests;

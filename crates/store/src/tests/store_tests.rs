@@ -615,3 +615,188 @@ fn legacy_invalid_tun_stack_loads_and_saves_without_validation_error() {
     assert!(!res2.loaded_from_disk, "非法 proxyMode 必须回落默认");
     assert!(matches!(res2.error, Some(StoreError::Validation(_))));
 }
+
+#[test]
+fn new_installation_uses_global_chrome_default_policy() {
+    assert_eq!(default_config()["utlsPolicy"], "default");
+}
+
+#[test]
+fn dns_enable_toggle_rejects_referenced_resources_without_writing() {
+    let mut original = default_config();
+    original["dnsServers"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id":"private-dns", "name":"Private", "enabled":true, "type":"udp",
+            "endpoint":{"host":"10.0.0.53"}, "outbound":{"type":"direct"}
+        }));
+    original["dnsRules"] = serde_json::json!([{
+        "id":"private-rule", "type":"domain", "values":["private.example"],
+        "action":"direct", "enabled":true,
+        "effects":{"dns":{"enabled":true,"resolver":"inherit","answerMode":"real",
+            "action":{"type":"server","serverId":"private-dns"}}}
+    }]);
+    let fs = MockFs::default();
+    ConfigStore::save(&fs, Path::new(CFG), &original, "first").unwrap();
+    let before = fs.read_to_string(Path::new(CFG)).unwrap();
+    let persisted: serde_json::Value = serde_json::from_str(&before).unwrap();
+    assert_eq!(
+        persisted["dnsRules"][0]["effects"]["dns"]["action"]["serverId"],
+        "private-dns"
+    );
+    // Same shape as desktop/mobile resource enabled toggles: only enabled changes.
+    let mut disabled = original.clone();
+    disabled["dnsServers"][3]["enabled"] = serde_json::json!(false);
+    let error = ConfigStore::save(&fs, Path::new(CFG), &disabled, "second").unwrap_err();
+    assert_eq!(error.code(), Some("DNS_DEPENDENCY_INVALID"));
+    assert!(error.to_string().contains("private-rule"));
+    assert!(error.to_string().contains("private-dns"));
+    assert_eq!(fs.read_to_string(Path::new(CFG)).unwrap(), before);
+}
+
+#[test]
+fn dns_bootstrap_disable_and_cycles_are_rejected_before_write() {
+    let mut original = default_config();
+    original["dnsServers"].as_array_mut().unwrap().extend([
+        serde_json::json!({"id":"bootstrap-a","name":"A","enabled":true,"type":"udp",
+            "endpoint":{"host":"10.0.0.53"},"outbound":{"type":"direct"}}),
+        serde_json::json!({"id":"resolver-b","name":"B","enabled":true,"type":"https",
+            "endpoint":{"host":"resolver.example"},"bootstrapServerId":"bootstrap-a",
+            "outbound":{"type":"direct"}}),
+    ]);
+    let fs = MockFs::default();
+    ConfigStore::save(&fs, Path::new(CFG), &original, "first").unwrap();
+    let before = fs.read_to_string(Path::new(CFG)).unwrap();
+    for cyclic in [false, true] {
+        let mut invalid = original.clone();
+        if cyclic {
+            invalid["dnsServers"][3]["endpoint"]["host"] = serde_json::json!("bootstrap.example");
+            invalid["dnsServers"][3]["bootstrapServerId"] = serde_json::json!("resolver-b");
+        } else {
+            invalid["dnsServers"][3]["enabled"] = serde_json::json!(false);
+        }
+        assert!(ConfigStore::save(&fs, Path::new(CFG), &invalid, "invalid").is_err());
+        assert_eq!(fs.read_to_string(Path::new(CFG)).unwrap(), before);
+    }
+}
+
+#[test]
+fn explicit_action_only_dns_policy_survives_save_and_rejects_bad_updates() {
+    let mut original = default_config();
+    original["dnsServers"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id":"action-only-dns", "name":"Private", "enabled":true, "type":"udp",
+            "endpoint":{"host":"10.0.0.53"}, "outbound":{"type":"direct"}
+        }));
+    original["dnsRules"] = serde_json::json!([{
+        "id":"action-only-rule", "type":"domain", "values":["private.example"],
+        "action":"direct", "enabled":true,
+        "effects":{"dns":{"action":{"type":"server","serverId":"action-only-dns"}}}
+    }]);
+    let fs = MockFs::default();
+    ConfigStore::save(&fs, Path::new(CFG), &original, "initial").unwrap();
+    let before = fs.read_to_string(Path::new(CFG)).unwrap();
+    let persisted: serde_json::Value = serde_json::from_str(&before).unwrap();
+    assert_eq!(
+        persisted["dnsRules"][0]["effects"]["dns"]["action"],
+        original["dnsRules"][0]["effects"]["dns"]["action"]
+    );
+
+    for action in [
+        serde_json::json!({"type":"server","serverId":"missing"}),
+        serde_json::json!({"type":"server"}),
+        serde_json::json!({"type":"unknown"}),
+        serde_json::json!(null),
+        serde_json::json!("direct"),
+    ] {
+        let mut invalid = original.clone();
+        invalid["dnsRules"][0]["effects"]["dns"]["action"] = action;
+        let error = ConfigStore::save(&fs, Path::new(CFG), &invalid, "invalid").unwrap_err();
+        assert_eq!(error.code(), Some("DNS_DEPENDENCY_INVALID"));
+        assert_eq!(fs.read_to_string(Path::new(CFG)).unwrap(), before);
+    }
+    let mut disabled = original.clone();
+    disabled["dnsServers"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["enabled"] = serde_json::json!(false);
+    let error = ConfigStore::save(&fs, Path::new(CFG), &disabled, "disabled").unwrap_err();
+    assert_eq!(error.code(), Some("DNS_DEPENDENCY_INVALID"));
+    assert_eq!(fs.read_to_string(Path::new(CFG)).unwrap(), before);
+
+    // A malformed sibling must not make the sanitizer erase the whole explicit policy.
+    let mut malformed_rule = original.clone();
+    malformed_rule["dnsRules"][0]["enabled"] = serde_json::json!("yes");
+    assert!(ConfigStore::save(&fs, Path::new(CFG), &malformed_rule, "malformed").is_err());
+    assert_eq!(fs.read_to_string(Path::new(CFG)).unwrap(), before);
+}
+
+#[test]
+fn malformed_explicit_dns_action_remains_tolerant_on_load_only() {
+    let mut config = default_config();
+    config["dnsRules"] = serde_json::json!([{
+        "id":"legacy-bad", "type":"domain", "values":["private.example"],
+        "action":"direct", "enabled":true,
+        "effects":{"dns":{"action":{"type":"unknown"}}}
+    }]);
+    assert!(ConfigStore::canonicalize_for_save(&config).is_err());
+    let raw = serde_json::to_string(&config).unwrap();
+    let sanitized = crate::sanitize_config(&raw).expect("load sanitization remains tolerant");
+    assert!(sanitized["dnsRules"][0]["effects"]["dns"]
+        .get("action")
+        .is_none());
+}
+
+#[test]
+fn explicit_malformed_tls_pin_cannot_be_sanitized_into_an_unpinned_save() {
+    for pin in [
+        serde_json::json!("bad"),
+        serde_json::json!(false),
+        serde_json::json!(["bad"]),
+    ] {
+        let input = serde_json::json!({"servers":[{"tlsSettings":{"allowInsecure":true,"certificateSha256":pin}}]});
+        let before = input.clone();
+        let err = ConfigStore::canonicalize_for_save(&input).unwrap_err();
+        assert!(err.to_string().contains("TLS_PIN_INVALID"));
+        assert_eq!(input, before);
+    }
+}
+
+#[test]
+fn raw_save_pin_validation_uses_the_shared_emission_policy() {
+    for (protocol, security, emitted) in [
+        ("trojan", "tls", true),
+        ("vless", "reality", false),
+        ("naive", "tls", false),
+        ("tor", "tls", false),
+        ("tailcat", "tls", false),
+        ("ssh", "tls", false),
+        ("custom", "tls", false),
+        ("wireguard", "tls", false),
+        ("tailscale", "tls", false),
+        ("openconnect", "tls", false),
+        ("openvpn-client", "tls", false),
+        ("masque-client", "reality", true),
+    ] {
+        for pin in [
+            serde_json::Value::Null,
+            serde_json::json!("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"),
+            serde_json::json!("invalid-pin"),
+            serde_json::json!([false]),
+        ] {
+            let malformed = pin == serde_json::json!("invalid-pin") || pin.is_array();
+            let raw = serde_json::json!({"servers":[{"protocol":protocol,"security":security,
+                "tlsSettings":{"allowInsecure":true,"certificateSha256":pin.clone(),
+                    "certificatePublicKeySha256":pin}}]});
+            assert_eq!(
+                crate::validate::validate_raw_tls_pins(&raw).is_err(),
+                emitted && malformed,
+                "{protocol}/{security}"
+            );
+        }
+    }
+}

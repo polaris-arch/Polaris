@@ -119,6 +119,16 @@ fn spawn_exit_ip_probe(app: AppHandle) {
 /// 带 helper-missing 闸门 + 发 `EVENT_PROXY_STARTED`（托盘图标 / 前端连接态的同一真值源），
 /// 绕过它就得在这里重造两份逻辑且必然漂移。
 fn spawn_auto_connect(app: AppHandle) {
+    // Capture before the delay, never when the timer wakes. Adoption uses the
+    // same fence but remains its own policy decision below; Rust absence does
+    // not authorize native cleanup.
+    let admission = match app.state::<AppRuntime>().proxy().startup_admission() {
+        Ok(admission) => admission,
+        Err(error) => {
+            log::warn!("启动时自动连接准入拒绝: {error}");
+            return;
+        }
+    };
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(AUTO_CONNECT_DELAY_MS)).await;
         #[cfg(not(target_os = "android"))]
@@ -158,7 +168,9 @@ fn spawn_auto_connect(app: AppHandle) {
                 let state = app.state::<AppRuntime>();
                 // 不再把 `config` 传进去：命令层自己读盘（见 `proxy_start` 头注）。上面那份
                 // 只用于 `decide_auto_connect` 的判定，与起核用哪份配置无关。
-                match crate::commands::proxy_start(app.clone(), state).await {
+                match crate::commands::proxy::proxy_start_automatic(app.clone(), state, admission)
+                    .await
+                {
                     Ok(resp) if resp.success => log::info!("启动时自动连接成功"),
                     Ok(resp) => log::error!(
                         "启动时自动连接失败: {}",

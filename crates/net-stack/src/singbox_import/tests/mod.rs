@@ -327,7 +327,8 @@ fn round_trip_hysteria2_anti_censorship_fields() {
         &DomainResolver::Tag("dns-bootstrap".to_string()),
         "x64",
         "linux",
-    );
+    )
+    .expect("valid test outbound");
     let wrapped = json!({ "outbounds": [serde_json::to_value(&ob).unwrap()] });
     let out = parse(wrapped);
 
@@ -580,13 +581,16 @@ fn round_trip_custom_wrapped_node_survives_generation() {
         ] }));
     assert_eq!(out.servers.len(), 2);
 
-    let hy = serde_json::to_value(build_proxy_outbound(
-        &out.servers[0],
-        "proxy-1",
-        &DomainResolver::Tag("dns-bootstrap".to_string()),
-        "x64",
-        "linux",
-    ))
+    let hy = serde_json::to_value(
+        build_proxy_outbound(
+            &out.servers[0],
+            "proxy-1",
+            &DomainResolver::Tag("dns-bootstrap".to_string()),
+            "x64",
+            "linux",
+        )
+        .expect("valid test outbound"),
+    )
     .unwrap();
     assert_eq!(
         hy.get("type").unwrap(),
@@ -604,13 +608,16 @@ fn round_trip_custom_wrapped_node_survives_generation() {
     assert_eq!(hy.get("server").unwrap(), "hy1.example.com");
     assert_eq!(hy.get("server_port").unwrap(), 8443);
 
-    let tor = serde_json::to_value(build_proxy_outbound(
-        &out.servers[1],
-        "proxy-2",
-        &DomainResolver::Tag("dns-bootstrap".to_string()),
-        "x64",
-        "linux",
-    ))
+    let tor = serde_json::to_value(
+        build_proxy_outbound(
+            &out.servers[1],
+            "proxy-2",
+            &DomainResolver::Tag("dns-bootstrap".to_string()),
+            "x64",
+            "linux",
+        )
+        .expect("valid test outbound"),
+    )
     .unwrap();
     assert_eq!(tor.get("type").unwrap(), "tor");
     assert_eq!(tor.get("executable_path").unwrap(), "/usr/bin/tor");
@@ -798,7 +805,11 @@ fn wireguard_endpoint_without_catch_all_is_mesh_only() {
     let wg = s.wireguard_settings.as_ref().unwrap();
     assert_eq!(wg.allow_internet, Some(false), "无 catch-all → 仅组网");
     assert_eq!(wg.allowed_ips, vec!["10.0.0.0/24"]);
-    assert_eq!(wg.persistent_keepalive, None, "缺省不写");
+    assert_eq!(
+        wg.persistent_keepalive,
+        Some(0),
+        "源缺省关闭保活，不能继承本机 25 秒默认"
+    );
     assert_eq!(wg.mtu, None);
     assert!(wg.reserved.is_empty());
     assert_eq!(wg.pre_shared_key, None);
@@ -1098,7 +1109,10 @@ fn tls_cert_pins_imported_and_round_trip_through_the_builder() {
     assert_eq!(tls.certificate_public_key_sha256.as_deref(), Some(B64));
 
     let resolver = DomainResolver::Tag("dns-bootstrap".to_string());
-    let ob = serde_json::to_value(build_proxy_outbound(s, "p", &resolver, "x64", "linux")).unwrap();
+    let ob = serde_json::to_value(
+        build_proxy_outbound(s, "p", &resolver, "x64", "linux").expect("valid test outbound"),
+    )
+    .unwrap();
     assert_eq!(ob["tls"]["certificate_sha256"], json!([B64, B64_2]));
     assert_eq!(ob["tls"]["certificate_public_key_sha256"], json!([B64]));
 }
@@ -1118,11 +1132,11 @@ fn masque_tailcat_doc() -> Value {
         "endpoints": [{
             "type": "masque-client", "tag": "MQ3", "server": "mq.example.com", "server_port": 18443,
             "username": "u", "password": "p", "on_demand": true, "bind_interface": "eth9",
-            "detour": "front", "domain_resolver": "dns-x",
+            "domain_resolver": "dns-x",
             "path": "/.well-known/masque/ip/", "mtu": 1400,
             "headers": { "Authorization": "Bearer t", "X-A": ["1", "2"] },
             "tls": { "enabled": true, "server_name": "sni.example.com", "insecure": true,
-                     "certificate_sha256": [PIN_HEX, "not-a-pin"],
+                     "certificate_sha256": [PIN_HEX],
                      "certificate_public_key_sha256": PIN_B64,
                      "alpn": ["h3"], "utls": { "enabled": true, "fingerprint": "chrome" } },
             // 无害的未建模键（缺省版本下 H2/QUIC 键都收）—— 必须活着到产物。
@@ -1137,7 +1151,7 @@ fn masque_tailcat_doc() -> Value {
             "type": "tailcat", "tag": "TC-REGION",
             "server_public_key": TC_PUB, "server_disco_key": TC_DISCO, "pre_shared_key": TC_PSK,
             "derp_region": 900, "derp_map_url": "https://derp.example/derpmap.json",
-            "http_client": { "detour": "proxy" }, "detour": "front", "bind_interface": "eth9",
+            "http_client": { "detour": "proxy" }, "bind_interface": "eth9",
             "connect_timeout": "7s", "server": "stray.example.com"
         }, {
             "type": "tailcat", "tag": "TC-SERVERS",
@@ -1184,7 +1198,10 @@ fn masque_client_local_mapping_strips_what_generation_would_drop() {
     assert_eq!(m.password.as_deref(), Some("p"));
     assert_eq!(m.on_demand, Some(true));
     assert_eq!(m.bind_interface.as_deref(), Some("eth9"));
-    assert_eq!(m.detour, None, "文件内 tag 对本机无意义");
+    assert_eq!(
+        m.detour, None,
+        "此成功样例未声明代理链；独立用例覆盖保留及拒绝"
+    );
     assert_eq!(m.security, Some(SecurityMode::Tls));
     let tls = m.tls_settings.as_ref().unwrap();
     assert_eq!(tls.server_name.as_deref(), Some("sni.example.com"));
@@ -1192,7 +1209,7 @@ fn masque_client_local_mapping_strips_what_generation_would_drop() {
     assert_eq!(
         tls.certificate_sha256.as_deref(),
         Some(PIN_HEX),
-        "pin 走 keep_valid_cert_pins：合法原文保留、非法条目丢"
+        "合法 pin 原文保留；混合非法 pin 必须拒绝整个节点"
     );
     assert_eq!(tls.certificate_public_key_sha256.as_deref(), Some(PIN_B64));
     assert_eq!(tls.alpn, None, "MASQUE 生成侧不下发 alpn，存下来就是假设置");
@@ -2033,24 +2050,34 @@ fn wireguard_on_demand_and_bind_interface_lift_to_top_level_and_reach_output() {
 #[test]
 fn utls_enabled_intent_survives_import_save_share_and_generation() {
     use polaris_config_engine::user_config::utls::{effective_server, UtlsMode};
-    for protocol in ["vless", "vmess", "trojan", "anytls"] {
+    for protocol in ["vless", "vmess", "trojan", "anytls", "http"] {
         for (input, mode, expected) in [
             (
                 json!({"enabled":false,"fingerprint":"chrome"}),
-                UtlsMode::Disabled,
+                Some(UtlsMode::Disabled),
                 None,
             ),
-            (json!({"enabled":false}), UtlsMode::Disabled, None),
-            (Value::Null, UtlsMode::Disabled, None),
-            (json!({"enabled":true}), UtlsMode::Default, Some("")),
+            (json!({"enabled":false}), Some(UtlsMode::Disabled), None),
+            (Value::Null, None, Some("chrome")),
+            (
+                json!({"fingerprint":"chrome"}),
+                Some(UtlsMode::Disabled),
+                None,
+            ),
+            (json!({"enabled":true}), Some(UtlsMode::Default), Some("")),
             (
                 json!({"enabled":true,"fingerprint":""}),
-                UtlsMode::Default,
+                Some(UtlsMode::Default),
                 Some(""),
             ),
             (
+                json!({"enabled":true,"fingerprint":"randomized"}),
+                Some(UtlsMode::Profile),
+                Some("randomized"),
+            ),
+            (
                 json!({"enabled":true,"fingerprint":"FiReFox"}),
-                UtlsMode::Profile,
+                Some(UtlsMode::Profile),
                 Some("firefox"),
             ),
         ] {
@@ -2064,36 +2091,47 @@ fn utls_enabled_intent_survives_import_save_share_and_generation() {
             }]}));
             assert_eq!(parsed.servers.len(), 1);
             let node = &parsed.servers[0];
-            assert_eq!(node.tls_settings.as_ref().unwrap().utls_mode, Some(mode));
+            assert_eq!(node.tls_settings.as_ref().unwrap().utls_mode, mode);
             let saved: ServerConfig =
                 serde_json::from_value(serde_json::to_value(node).unwrap()).unwrap();
             let effective = effective_server(&saved, Some("follow")).unwrap();
-            let built = serde_json::to_value(build_proxy_outbound(
-                effective.as_ref(),
-                "p",
-                &DomainResolver::Tag("dns-bootstrap".into()),
-                "x64",
-                "linux",
-            ))
+            let built = serde_json::to_value(
+                build_proxy_outbound(
+                    effective.as_ref(),
+                    "p",
+                    &DomainResolver::Tag("dns-bootstrap".into()),
+                    "x64",
+                    "linux",
+                )
+                .expect("valid test outbound"),
+            )
             .unwrap();
             assert_eq!(built["tls"]["enabled"], true);
             match expected {
                 Some(profile) => assert_eq!(built["tls"]["utls"]["fingerprint"], profile),
                 None => assert!(built["tls"].get("utls").is_none()),
             }
+            // HTTP links do not carry uTLS settings; the persistence and
+            // generation checks above still cover HTTP.
+            if protocol == "http" {
+                continue;
+            }
             // Share formats use fp=none/chrome to represent off/core Auto.
             let link = crate::share_link::encode_share_url(&saved).unwrap();
             let round =
                 crate::share_link::parse_share_url(&link, &mut || "round".into(), &mut |_| {})
                     .unwrap();
-            let effective = effective_server(&round, None).unwrap();
-            let shared = serde_json::to_value(build_proxy_outbound(
-                effective.as_ref(),
-                "p",
-                &DomainResolver::Tag("dns-bootstrap".into()),
-                "x64",
-                "linux",
-            ))
+            let effective = effective_server(&round, Some("follow")).unwrap();
+            let shared = serde_json::to_value(
+                build_proxy_outbound(
+                    effective.as_ref(),
+                    "p",
+                    &DomainResolver::Tag("dns-bootstrap".into()),
+                    "x64",
+                    "linux",
+                )
+                .expect("valid test outbound"),
+            )
             .unwrap();
             match expected {
                 Some("") => assert_eq!(shared["tls"]["utls"]["fingerprint"], "chrome"),
@@ -2105,7 +2143,7 @@ fn utls_enabled_intent_survives_import_save_share_and_generation() {
 }
 
 #[test]
-fn imported_native_tls_engine_keeps_disabled_utls_and_rejects_an_active_conflict() {
+fn imported_native_tls_engine_keeps_disabled_utls_under_global_overrides() {
     use polaris_config_engine::user_config::utls::effective_server_for_platform;
     let parsed = parse(
         json!({"outbounds":[{"type":"vless","tag":"native","server":"example.com","server_port":443,
@@ -2119,19 +2157,94 @@ fn imported_native_tls_engine_keeps_disabled_utls_and_rejects_an_active_conflict
         Some("apple")
     );
     let effective = effective_server_for_platform(node, None, "darwin").unwrap();
-    let built = serde_json::to_value(build_proxy_outbound(
-        effective.as_ref(),
-        "p",
-        &DomainResolver::Tag("dns-bootstrap".into()),
-        "x64",
-        "darwin",
-    ))
+    let built = serde_json::to_value(
+        build_proxy_outbound(
+            effective.as_ref(),
+            "p",
+            &DomainResolver::Tag("dns-bootstrap".into()),
+            "x64",
+            "darwin",
+        )
+        .expect("valid test outbound"),
+    )
     .unwrap();
     assert_eq!(built["tls"]["engine"], "apple");
     assert!(built["tls"].get("utls").is_none());
-    assert!(effective_server_for_platform(node, Some("default"), "darwin").is_err());
+    for policy in ["default", "random", "safari"] {
+        let effective = effective_server_for_platform(node, Some(policy), "darwin").unwrap();
+        assert_eq!(effective.as_ref(), node);
+    }
     assert!(
         effective_server_for_platform(node, Some("default"), "linux").is_ok(),
         "foreign engine remains dormant according to the original platform gate"
     );
 }
+
+#[test]
+fn imported_reality_uses_chrome_only_when_utls_is_absent() {
+    use polaris_config_engine::user_config::utls::{effective_server, REALITY_UTLS_REQUIRED};
+    for (input, expected) in [
+        (Value::Null, Some("chrome")),
+        (json!({"enabled":false,"fingerprint":"chrome"}), None),
+        (json!({"enabled":true}), Some("")),
+        (
+            json!({"enabled":true,"fingerprint":"safari"}),
+            Some("safari"),
+        ),
+    ] {
+        let mut tls = json!({"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"key"}});
+        if !input.is_null() {
+            tls["utls"] = input;
+        }
+        let parsed = parse(
+            json!({"outbounds":[{"type":"vless","tag":"reality","server":"example.com","server_port":443,"uuid":"uuid","tls":tls}]}),
+        );
+        assert_eq!(parsed.servers.len(), 1);
+        let node: ServerConfig =
+            serde_json::from_value(serde_json::to_value(&parsed.servers[0]).unwrap()).unwrap();
+        match expected {
+            Some(profile) => {
+                let effective = effective_server(&node, Some("follow")).unwrap();
+                let output = serde_json::to_value(
+                    build_proxy_outbound(
+                        &effective,
+                        "node",
+                        &DomainResolver::Tag("dns-bootstrap".into()),
+                        "x64",
+                        "linux",
+                    )
+                    .expect("valid test outbound"),
+                )
+                .unwrap();
+                assert_eq!(output["tls"]["utls"]["fingerprint"], profile);
+                if profile == "chrome" {
+                    assert!(node.tls_settings.as_ref().unwrap().utls_mode.is_none());
+                    assert!(node.tls_settings.as_ref().unwrap().fingerprint.is_none());
+                }
+            }
+            None => assert_eq!(
+                effective_server(&node, Some("follow")).unwrap_err(),
+                REALITY_UTLS_REQUIRED
+            ),
+        }
+    }
+}
+
+#[test]
+fn malformed_pins_fail_import_instead_of_becoming_insecure_unpinned_nodes() {
+    for pin in [
+        json!("bad"),
+        json!(["bad"]),
+        json!([false]),
+        json!({"bad":true}),
+    ] {
+        let parsed = parse(
+            json!({"outbounds":[{"type":"trojan", "tag":"n", "server":"a.example", "server_port":443,
+            "password":"pw", "tls":{"enabled":true, "insecure":true, "certificate_sha256":pin}}]}),
+        );
+        assert!(parsed.servers.is_empty());
+        assert_eq!(parsed.failed, 1);
+    }
+}
+
+mod import_parity;

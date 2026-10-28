@@ -35,3 +35,10 @@ export function useStagingActive(): boolean {
   );
   return stagingActive(enabled, coreActive, stagedCount);
 }
+
+/** Async editors re-read the same policy immediately before dispatch. */
+export function getStagingActive(): boolean {
+  const app = useAppStore.getState();
+  const staged = useStagedConfigStore.getState();
+  return stagingActive(staged.enabled, !!app.proxyStatus?.running || app.proxyStarting || app.proxyStopping, staged.entries.length);
+}

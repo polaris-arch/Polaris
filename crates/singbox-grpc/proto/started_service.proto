@@ -67,6 +67,8 @@ service StartedService {
   rpc SubscribeStatus(SubscribeStatusRequest) returns (stream Status);
   rpc SubscribeConnections(SubscribeConnectionsRequest) returns (stream ConnectionEvents);
   rpc SelectOutbound(SelectOutboundRequest) returns (Empty);
+  // Existing native URLTest command; the ACK starts work, it does not attest results.
+  rpc URLTest(URLTestRequest) returns (Empty);
   // **SelectOutbound 的读侧对偶**：group 的**运行期**选择（`Group.selected`）。
   //
   // 没有它，本仓对「selector 现在实际指着谁」就只能靠推断生成产物——而 `cache_file` 的
@@ -661,3 +663,6 @@ message RuleSetStatusResponse {
   int64 instance_started_at_unix_nano = 1;
   repeated RuleSetLoadStatus rule_sets = 2;
 }
+
+// Existing a4 daemon wire shape (outbound_tag field 1).
+message URLTestRequest { string outbound_tag = 1; }

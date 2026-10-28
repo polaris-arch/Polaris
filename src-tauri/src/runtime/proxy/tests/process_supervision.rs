@@ -4103,3 +4103,69 @@ fn post_logout_sign_in_requires_original_normal_ready_and_fresh_status() {
         "normal permission failures keep their structured code"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn missing_stale_identity_never_signals_or_escalates() {
+    struct Unproven;
+    impl StaleCoreIo for Unproven {
+        fn has_identity(&self, _: &polaris_core_supervisor::CoreProcess) -> bool {
+            false
+        }
+        fn end(&self, _: &polaris_core_supervisor::CoreProcess, _: Signal) {
+            panic!("unproven PID must never receive a signal");
+        }
+        fn alive(&self, _: &polaris_core_supervisor::CoreProcess) -> bool {
+            panic!("number-only liveness cannot authorize cleanup");
+        }
+    }
+    let (rt, _dir) = test_runtime();
+    let start = tokio::time::Instant::now();
+    let error = rt
+        .sweep_scanned_cores(
+            vec![core_shaped(
+                &rt,
+                960_123,
+                polaris_core_supervisor::ProcessOwner::SameUser,
+            )],
+            &[],
+            &Unproven,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("未发送终止信号"));
+    assert_eq!(tokio::time::Instant::now(), start);
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn held_unix_survivor_fails_closed_without_broad_helper_escalation() {
+    let (rt, _dir) = test_runtime();
+    let pid = 960_124;
+    let io = RecordingStaleIo {
+        immortal: vec![pid],
+        ..Default::default()
+    };
+    let error = rt
+        .sweep_scanned_cores(
+            vec![core_shaped(
+                &rt,
+                pid,
+                polaris_core_supervisor::ProcessOwner::Elevated,
+            )],
+            &[],
+            &io,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("已停止清理"));
+    assert_eq!(
+        *io.ended.lock().unwrap(),
+        vec![(pid, Signal::Sigterm), (pid, Signal::Sigkill)]
+    );
+    // The production survivor dispatch excludes generic Cleanup on Unix even when a
+    // helper is installed; exercise the survivor branch above and pin its cfg boundary.
+    let source = module_code("runtime/proxy/process_supervision");
+    assert!(source
+        .contains("#[cfg(not(unix))]\n        self.escalate_root_orphans(&survivors, io).await"));
+    assert!(source.contains("#[cfg(not(unix))]\n    async fn escalate_root_orphans("));
+}

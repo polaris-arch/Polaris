@@ -96,26 +96,7 @@ function ExternalRow({
   );
 }
 
-/**
- * `version_get_info` 的载荷 → `AppVersionInfo` 的**运行时**窄化守卫。
- *
- * # 为什么不是 `as unknown as AppVersionInfo`
- *
- * `version_get_info` 的真实载荷是 `{ appVersion, coreVersion, coreBaseline }`
- * （`src-tauri/src/commands/updater/app_update.rs:428-436`，权威声明 `contracts/types/update.ts:96`）。
- * 而 `ipc/api/updater.ts` 的 `VersionInfo` 还是 Electron 遗留形状（`singBoxVersion` / `appName` /
- * `buildDate` … 后端一个都不返回）—— 桌面 `SettingsAbout.tsx:171` 读 `info.singBoxVersion` 因此是条
- * 恒假分支。改那份类型会连带动桌面，属别的线的面。
- *
- * 但**双重断言不是收窄，是把编译期保护整个关掉**：`as unknown as` 之后两侧的类型关系彻底切断，
- * 后端把 `coreVersion` 改名（或 `read_core_version` 改返 `Option` 而序列化成 `null`）时 `tsc` 一个字
- * 都不会说，关于页静默退回 `—`，而那正是 K5-07 原本要修的症状。故改成**读入处逐字段检查**：
- * 形状不符就整段保持 `null`（没有版本号，好过给一个编出来的），而检查本身在运行时真的执行。
- *
- * ⚠️ 面外的两条姊妹腿仍未处理，登记在此免得它们无人认领：
- *  ① `ipc/api/updater.ts` 的 `VersionInfo` 与 `contracts/types/update.ts` 的 `AppVersionInfo` 不一致；
- *  ② 桌面 `SettingsAbout.tsx:171` 的 `info.singBoxVersion` 是恒假分支。
- */
+/** Validate the native version payload at runtime; desktop and mobile share coreVersion. */
 export function narrowVersionInfo(payload: unknown): AppVersionInfo | null {
   if (typeof payload !== 'object' || payload === null) return null;
   const p = payload as Record<string, unknown>;

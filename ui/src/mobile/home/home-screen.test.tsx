@@ -268,7 +268,7 @@ const baseProps = (over: Partial<HomeScreenViewProps> = {}): HomeScreenViewProps
   unlockDetailId: null,
   onOpenUnlockDetail: () => {},
   onCloseUnlockDetail: () => {},
-  samples: Array.from({ length: 12 }, (_, i) => ({ up: i * 100, down: i * 300 })),
+  samples: Array.from({ length: 12 }, (_, i) => ({ at: i * 1000, up: i * 100, down: i * 300 })),
   composition: [
     { key: 'proxy', bytes: 800 },
     { key: 'Direct', bytes: 200 },
@@ -737,7 +737,7 @@ describe('⑤ 流量采样：按秒差分、计数器归零重启缓冲', () => 
     b = pushTotals(b, 100, 300, 500); // 不足一秒 ⇒ 原样返回
     expect(b.samples).toEqual([]);
     b = pushTotals(b, 200, 600, 2000); // Δt=2s
-    expect(b.samples).toEqual([{ up: 100, down: 300 }]);
+    expect(b.samples).toEqual([{ at: 2000, up: 100, down: 300 }]);
   });
 
   it('计数器变小 = 新的一条核生命线 ⇒ **丢掉那个差分并清空缓冲**，不画负值也不画尖峰', () => {
@@ -781,7 +781,7 @@ describe('⑤ 流量采样：按秒差分、计数器归零重启缓冲', () => 
       expect(html).not.toContain('class="h-ymin"');
       expect(html).not.toContain('class="h-xaxis"');
     }
-    const sampled = render({ samples: [{ up: 0, down: 0 }, { up: 1, down: 10 }] });
+    const sampled = render({ samples: [{ at: 1000, up: 0, down: 0 }, { at: 2000, up: 1, down: 10 }] });
     expect(sampled).not.toContain('mobileHome.noSamples');
     expect(sampled).toContain('class="h-ymax"');
     expect(sampled).toContain('class="h-xaxis"');

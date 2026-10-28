@@ -22,6 +22,9 @@ const view = vi.hoisted(() => ({
   errMsg: '',
   installing: false,
   manualCompletionUnverified: false,
+  manualInstallerOpened: false,
+  sha256: "a".repeat(64) as string | undefined,
+  integrity: "verified" as string,
 }));
 
 vi.mock('react-i18next', async (importOriginal) => ({
@@ -37,13 +40,14 @@ vi.mock('./use-app-update', () => ({
   useAppUpdate: () => ({
     appVersionInfo: null,
     us: view.us as AppUpdateState,
-    updateInfo: { version: 'v1.2.3', isPrerelease: false },
+    updateInfo: { version: 'v1.2.3', isPrerelease: false, sha256: view.sha256 },
     progress: 0,
     receivedBytes: null,
     errMsg: view.errMsg,
-    downloadIntegrity: 'verified',
+    downloadIntegrity: view.integrity,
     installing: view.installing,
     manualCompletionUnverified: view.manualCompletionUnverified,
+    manualInstallerOpened: view.manualInstallerOpened,
     checkUpdate: vi.fn(),
     reinstallCurrent: vi.fn(),
     skipVersion: vi.fn(),
@@ -88,6 +92,47 @@ describe('AppUpdateCard · 便携版手动覆盖卡', () => {
       renderToStaticMarkup(<AppUpdateCard config={{} as never} update={async () => undefined} />),
     );
   }
+
+  it.each(LOCALES)('%s: digest-less release offers manual release page, never automatic download', (lng) => {
+    const t = instances.get(lng)!.t;
+    view.sha256 = undefined;
+    try {
+      const html = render(lng, 'available', '');
+      expect(html).toContain(t('settings.update.digestMissingBefore'));
+      expect(html).toContain(t('mobileSettings.update.openReleases'));
+      expect(html).not.toContain(`<span>${t('settings.update.download')}</span>`);
+    } finally { view.sha256 = 'a'.repeat(64); }
+  });
+
+  it.each(LOCALES)('%s: unverified old download cannot offer install or portable execution', (lng) => {
+    const t = instances.get(lng)!.t;
+    view.integrity = 'unverified';
+    try {
+      for (const state of ['downloaded', 'manual']) {
+        const html = render(lng, state, '');
+        expect(html).toContain(t('settings.update.digestMissingAfter'));
+        expect(html).toContain(t('mobileSettings.update.openReleases'));
+        expect(html).not.toContain(t('settings.update.restartAndInstall'));
+        expect(html).not.toContain(t('settings.update.portableQuitAndOpen'));
+      }
+    } finally { view.integrity = 'verified'; }
+  });
+
+  it.each(LOCALES)('%s: opened macOS installer remains explicitly manual, without portable actions', (lng) => {
+    const t = instances.get(lng)!.t;
+    view.manualInstallerOpened = true;
+    try {
+      const html = render(lng, 'manual', t('settings.update.manualInstallerOpened'));
+      expect(html).toContain(t('settings.update.manualInstallPending'));
+      expect(html).toContain(t('settings.update.manualInstallerOpened'));
+      expect(html).not.toContain(t('settings.update.portableQuitAndOpen'));
+      expect(html).not.toContain(t('settings.update.portableClearAndCheck'));
+      expect(html).toContain(t('settings.about.checkUpdate'));
+      expect(html).not.toContain('settings.update.manualInstaller');
+    } finally {
+      view.manualInstallerOpened = false;
+    }
+  });
 
   it.each(LOCALES)('%s：说明里填进了压缩包与程序目录两个位置，并画出退出按钮', (lng) => {
     const t = instances.get(lng)!.t;

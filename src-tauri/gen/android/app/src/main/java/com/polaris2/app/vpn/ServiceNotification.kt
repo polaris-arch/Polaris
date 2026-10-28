@@ -34,6 +34,9 @@ import io.nekohasekai.libbox.OutboundGroupItemIterator
 import io.nekohasekai.libbox.OutboundGroupIterator
 import io.nekohasekai.libbox.StatusMessage
 import io.nekohasekai.libbox.StringIterator
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /** Serializes callback publication with invalidation, like StatsBridge's service epoch. */
 internal class ServiceNotificationEpoch {
@@ -83,7 +86,15 @@ internal class ServiceNotificationEpoch {
 class ServiceNotification(private val service: Service) {
     private val handler = Handler(Looper.getMainLooper())
     private val epoch = ServiceNotificationEpoch()
-    private var commandClient: CommandClient? = null
+    // The worker alone owns the native client. The epoch protects only desired
+    // state, never connect/disconnect: stop admission must not wait on native I/O.
+    private val statusWorker = ThreadPoolExecutor(0, 1, 10, TimeUnit.SECONDS,
+        ArrayBlockingQueue<Runnable>(1), { Thread(it, "polaris-notification-status") },
+        ThreadPoolExecutor.AbortPolicy())
+    private var desiredStatusToken: Long? = null
+    private var statusRevision = 0L
+    private var statusPumpRunning = false
+    private var commandClient: CommandClient? = null // worker only
     private var screenReceiverRegistered = false
 
     @Volatile private var state: ServiceState = ServiceState.Starting
@@ -167,6 +178,9 @@ class ServiceNotification(private val service: Service) {
         state = ServiceState.Stopping
         trafficLine = null
         val token = epoch.invalidate()
+        desiredStatusToken = null
+        statusRevision = token
+        scheduleStatusPump()
         handler.removeCallbacksAndMessages(null)
         token
     }
@@ -211,27 +225,85 @@ class ServiceNotification(private val service: Service) {
     }
 
     private fun connectStatusClient(): Unit = synchronized(epoch) {
-        if (state != ServiceState.Started || commandClient != null) return@synchronized
+        if (state != ServiceState.Started || desiredStatusToken != null) return@synchronized
         val token = epoch.begin()
-        val options = CommandClientOptions().apply {
-            addCommand(Libbox.CommandStatus)
-            statusInterval = STATUS_INTERVAL_NANOS
-        }
-        val client = Libbox.newCommandClient(StatusHandler(token), options)
-        commandClient = client
-        // Each client captures its own epoch, including screen-off/reconnect cycles.
-        runCatching { client.connect() }.onFailure { Log.w(TAG, "订阅状态失败", it) }
-        Unit
+        desiredStatusToken = token
+        statusRevision = token
+        scheduleStatusPump()
     }
 
-    private fun disconnectStatusClient() {
-        val client = synchronized(epoch) {
-            epoch.invalidate()
-            handler.removeCallbacksAndMessages(null)
-            trafficLine = null
-            commandClient.also { commandClient = null }
+    private fun disconnectStatusClient() = synchronized(epoch) {
+        statusRevision = epoch.invalidate()
+        desiredStatusToken = null
+        handler.removeCallbacksAndMessages(null)
+        trafficLine = null
+        scheduleStatusPump()
+    }
+
+    /** Caller holds epoch. At most one admitted drain; screen toggles coalesce. */
+    private fun scheduleStatusPump() {
+        if (statusPumpRunning) return
+        statusPumpRunning = true
+        try { statusWorker.execute { pumpStatusClient() } }
+        catch (error: java.util.concurrent.RejectedExecutionException) {
+            statusPumpRunning = false
+            Log.w(TAG, "状态订阅工作被拒绝", error)
         }
-        runCatching { client?.disconnect() }
+    }
+
+    private fun pumpStatusClient() {
+        var processedRevision: Long? = null
+        while (true) {
+            val request = synchronized(epoch) {
+                if (processedRevision == statusRevision) {
+                    statusPumpRunning = false
+                    null
+                } else statusRevision to desiredStatusToken
+            } ?: return
+            val (revision, token) = request
+            // Native cancellation may itself callback; neither epoch nor BoxService
+            // is held. Callback guards, not disconnect return, fence publication.
+            val previous = commandClient
+            commandClient = null
+            runCatching { previous?.disconnect() }
+            if (token != null) {
+                var admitted = false
+                epoch.runIfCurrent(token) {
+                    admitted = state == ServiceState.Started && desiredStatusToken == token
+                }
+                if (admitted) {
+                    var client: CommandClient? = null
+                    val error = runCatching {
+                        val options = CommandClientOptions().apply {
+                            addCommand(Libbox.CommandStatus)
+                            statusInterval = STATUS_INTERVAL_NANOS
+                        }
+                        val created = Libbox.newCommandClient(StatusHandler(token), options)
+                        client = created
+                        // Skip a request revoked while constructing its native handle.
+                        check(epoch.runIfCurrent(token) {}) { "状态订阅已换代" }
+                        created.connect()
+                    }.exceptionOrNull()
+                    var installed = false
+                    if (error == null) epoch.runIfCurrent(token) {
+                        if (state == ServiceState.Started && desiredStatusToken == token) {
+                            commandClient = client
+                            installed = true
+                        }
+                    }
+                    if (!installed) runCatching { client?.disconnect() }
+                    if (error != null) {
+                        // Retire only this request. A replacement retains its token.
+                        epoch.runIfCurrent(token) {
+                            desiredStatusToken = null
+                            statusRevision = epoch.invalidate()
+                        }
+                        Log.w(TAG, "订阅状态失败", error)
+                    }
+                }
+            }
+            processedRevision = revision
+        }
     }
 
     private inner class StatusHandler(private val token: Long) : CommandClientHandler {

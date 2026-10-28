@@ -95,6 +95,7 @@ fn android_exclude_packages_of(custom: &[CustomAppPreset]) -> Vec<String> {
                 action: RuleAction::Direct,
                 enabled: true,
                 target_server_id: None,
+                target_auto_select: None,
             })
             .collect(),
         custom_app_presets: custom.to_vec(),
@@ -142,6 +143,7 @@ fn seed_keeps_custom_and_fills_missing() {
         action: RuleAction::Direct,
         enabled: true,
         target_server_id: None,
+        target_auto_select: None,
     }];
     let seeded = seed_default_app_rules(&existing);
     // custom-x 保留
@@ -159,6 +161,7 @@ fn seed_drops_offline_preset() {
         action: RuleAction::Proxy,
         enabled: true,
         target_server_id: None,
+        target_auto_select: None,
     }];
     let seeded = seed_default_app_rules(&existing);
     assert!(!seeded.iter().any(|r| r.app_id == "bilibili"));

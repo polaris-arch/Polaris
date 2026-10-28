@@ -27,6 +27,7 @@
 
 /** 一个采样点：两条序列各一个 bytes/s。 */
 export interface RateSample {
+  readonly at?: number;
   readonly up: number;
   readonly down: number;
 }
@@ -77,10 +78,10 @@ export function pushTotals(
   const perSec = 1000 / dt;
   const next = [
     ...buf.samples,
-    { up: (totalUp - base.up) * perSec, down: (totalDown - base.down) * perSec },
+    { at: atMs, up: (totalUp - base.up) * perSec, down: (totalDown - base.down) * perSec },
   ];
   return {
-    samples: next.length > TRAFFIC_WINDOW ? next.slice(next.length - TRAFFIC_WINDOW) : next,
+    samples: next.filter((sample) => sample.at !== undefined && sample.at >= atMs - TRAFFIC_WINDOW * 1000).slice(-TRAFFIC_WINDOW),
     baseline: { up: totalUp, down: totalDown, at: atMs },
   };
 }
@@ -121,10 +122,11 @@ export function splinePath(
   width: number,
   height: number,
   max: number,
+  positions?: readonly number[],
 ): string {
   const n = values.length;
   if (n < 2 || max <= 0) return '';
-  const x = (i: number): number => (i / (n - 1)) * width;
+  const x = (i: number): number => positions?.[i] ?? (i / (n - 1)) * width;
   // 值域翻转：SVG 的 y 向下。夹取在**取点时**做一次，控制点再夹一次。
   const clampY = (v: number): number => Math.min(height, Math.max(0, height - (v / max) * height));
   const y = (i: number): number => clampY(values[Math.min(n - 1, Math.max(0, i))]);
@@ -141,4 +143,29 @@ export function splinePath(
     d += ` C ${c1x.toFixed(2)} ${c1y.toFixed(2)}, ${c2x.toFixed(2)} ${c2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
   }
   return d;
+}
+
+/** Fixed-time axis; reuse the existing clamped spline separately for each observed segment. */
+export function timedTrafficPath(samples: readonly RateSample[], field: 'up' | 'down', width: number, height: number, max: number): string {
+  const end = samples[samples.length - 1]?.at;
+  if (end === undefined || samples.length < 2 || max <= 0) return '';
+  const start = end - TRAFFIC_WINDOW * 1000;
+  const segments: RateSample[][] = [];
+  let previous: number | undefined;
+  for (const sample of samples) {
+    if (sample.at === undefined || sample.at < start || sample.at > end) continue;
+    if (previous === undefined || sample.at - previous > TRAFFIC_INTERVAL_MS * 2) segments.push([]);
+    segments[segments.length - 1].push(sample);
+    previous = sample.at;
+  }
+  return segments.map(segment => splinePath(
+    segment.map(sample => sample[field]), width, height, max,
+    segment.map(sample => (sample.at! - start) / (TRAFFIC_WINDOW * 1000) * width),
+  )).filter(Boolean).join(' ');
+}
+
+/** Right edge is the observation timestamp, never a claim of freshness. */
+export function trafficObservationLabel(samples: readonly RateSample[], format: (at: number) => string): string {
+  const at = samples[samples.length - 1]?.at;
+  return at === undefined ? '—' : format(at);
 }

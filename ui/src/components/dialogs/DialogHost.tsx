@@ -1,3 +1,4 @@
+import { IdentityRepairDialog } from './IdentityRepairDialog';
 /**
  * DialogHost —— 弹窗唯一挂载点（挂 AppShell 内，§1.3）。
  *
@@ -40,6 +41,7 @@ import { VpnAuthDialog } from './VpnAuthDialog';
 
 function renderDialog(desc: DialogEntry) {
   switch (desc.kind) {
+    case 'identity-repair': return <IdentityRepairDialog instanceId={desc.instanceId} />;
     case 'res-url':
       return <ResUrlDialog instanceId={desc.instanceId} />;
     case 'confirm':
@@ -55,7 +57,7 @@ function renderDialog(desc: DialogEntry) {
     case 'warp':
       return <WarpDialog instanceId={desc.instanceId} edit={desc.edit} />;
     case 'ts-login':
-      return <TsLoginDialog serverId={desc.serverId} replaceIdentity={desc.replaceIdentity} />;
+      return <TsLoginDialog instanceId={desc.instanceId} serverId={desc.serverId} replaceIdentity={desc.replaceIdentity} />;
     case 'ts-settings':
       return <TsSettingsDialog instanceId={desc.instanceId} serverId={desc.serverId} />;
     case 'taildrop':

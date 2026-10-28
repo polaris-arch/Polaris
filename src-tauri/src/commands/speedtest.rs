@@ -2112,6 +2112,9 @@ async fn run_temp_core_speed_test(
     cancel: &SpeedTestCancel,
     done: &mut Option<Value>,
 ) -> ApiResponse<Value> {
+    if let Err(code) = validate_speed_test_url(config) {
+        return ApiResponse::err_with_code("Correct the HTTP(S) speed-test URL in settings", code);
+    }
     let url = resolve_speed_test_url(config);
     let all = all_server_ids(config);
     let requested: Vec<String> = server_ids.unwrap_or(all);
@@ -2402,6 +2405,12 @@ pub async fn server_speed_test(
         Ok(saved) => saved,
         Err(error) => return Ok(ApiResponse::err(error.to_string())),
     };
+    if let Err(code) = validate_speed_test_url(&saved) {
+        return Ok(ApiResponse::err_with_code(
+            "Correct the HTTP(S) speed-test URL in settings",
+            code,
+        ));
+    }
     let ticket = if NormalMainAction::ManualSpeedTest
         .requirement(polaris_helper_proto::Platform::current())
         == ActionRequirement::NormalMainRequired
@@ -2445,6 +2454,12 @@ pub async fn server_speed_test(
         Ok(saved) => saved,
         Err(error) => return Ok(ApiResponse::err(error.to_string())),
     };
+    if let Err(code) = validate_speed_test_url(&config) {
+        return Ok(ApiResponse::err_with_code(
+            "Correct the HTTP(S) speed-test URL in settings",
+            code,
+        ));
+    }
     if let Some(ticket) = ticket.as_ref() {
         if let Err(error) = proxy.validate_ready_main(ticket).await {
             return Ok(ApiResponse::err_with_code(error.to_string(), error.code()));
@@ -2513,6 +2528,55 @@ pub async fn server_speed_test(
         release_then_emit(guard, done, emit_done);
         return Ok(response);
     }
+    let requested_all = server_ids
+        .clone()
+        .unwrap_or_else(|| all_server_ids(&config));
+    let native_owned = crate::runtime::proxy::native_auto::native_owned_members(&config);
+    let native_requested: Vec<String> = requested_all
+        .iter()
+        .filter(|id| native_owned.contains(*id))
+        .cloned()
+        .collect();
+    let native_results = if native_requested.is_empty() {
+        BTreeMap::new()
+    } else {
+        proxy
+            .native_measure_requested(&native_requested, guard.cancel())
+            .await
+    };
+    let native_pending: Vec<String> = native_requested
+        .iter()
+        .filter(|id| !native_results.contains_key(*id))
+        .cloned()
+        .collect();
+    let server_ids = Some(
+        requested_all
+            .iter()
+            .filter(|id| !native_owned.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    if server_ids.as_ref().is_some_and(Vec::is_empty) {
+        let cancelled = guard.cancel().reason().is_some();
+        let outcome = if native_pending.is_empty() && !cancelled {
+            "completed"
+        } else {
+            "interrupted"
+        };
+        let mut payload = json!({"runId":run_id,"outcome":outcome,"pending":native_pending,"serverIds":requested_all,
+            "tested":native_results.len(),"ok":native_results.len(),"total":requested_all.len()});
+        if !native_pending.is_empty() || cancelled {
+            payload["reason"] = json!(guard
+                .cancel()
+                .reason()
+                .map_or("native_pending", |reason| reason.as_str()));
+        }
+        release_then_emit(guard, Some(payload), emit_done);
+        return Ok(ApiResponse::ok(
+            json!({"runId":run_id,"outcome":outcome,"results":native_results,
+            "nativePending":native_pending,"notInPool":[],"tsNotReady":[]}),
+        ));
+    }
     let active = config
         .get("selectedServerId")
         .and_then(Value::as_str)
@@ -2564,7 +2628,7 @@ pub async fn server_speed_test(
                 WatchedInbounds::ProbePool,
             )
         };
-        let response = run_pool_speed_test(
+        let mut response = run_pool_speed_test(
             &app,
             &proxy,
             &targets,
@@ -2580,6 +2644,41 @@ pub async fn server_speed_test(
             &open_readback,
         )
         .await;
+        if let Some(payload) = done.as_mut() {
+            payload["tested"] = json!(
+                payload.get("tested").and_then(Value::as_u64).unwrap_or(0)
+                    + native_results.len() as u64
+            );
+            payload["ok"] = json!(
+                payload.get("ok").and_then(Value::as_u64).unwrap_or(0)
+                    + native_results.len() as u64
+            );
+            payload["total"] = json!(requested_all.len());
+            payload["serverIds"] = json!(requested_all);
+            if let Some(pending) = payload.get_mut("pending").and_then(Value::as_array_mut) {
+                pending.extend(native_pending.iter().map(|id| json!(id)));
+            }
+            if !native_pending.is_empty() {
+                payload["outcome"] = json!("interrupted");
+                if payload.get("reason").is_none() {
+                    payload["reason"] = json!(guard
+                        .cancel()
+                        .reason()
+                        .map_or("native_pending", |reason| reason.as_str()));
+                }
+            }
+        }
+        if let Some(data) = response.data.as_mut() {
+            if let Some(results) = data.get_mut("results").and_then(Value::as_object_mut) {
+                for (id, latency) in &native_results {
+                    results.insert(id.clone(), json!(latency));
+                }
+            }
+            data["nativePending"] = json!(native_pending);
+            if !native_pending.is_empty() {
+                data["outcome"] = json!("interrupted");
+            }
+        }
         release_then_emit(guard, done, emit_done);
         return Ok(response);
     }
@@ -2665,6 +2764,7 @@ pub async fn server_speed_test(
     let superseded = || {
         invalid.load(Ordering::SeqCst)
             || is_superseded(proxy.core_generation(), gen0, proxy.status().running)
+            || proxy.native_owns_any(std::slice::from_ref(&active))
             || ticket
                 .as_ref()
                 .is_some_and(|ticket| proxy.check_ready_main(ticket).is_err())
@@ -2754,15 +2854,45 @@ pub async fn server_speed_test(
         },
     )
     .await;
+    let mut combined_results = round_results_json(&results);
+    if let Some(results) = combined_results.as_object_mut() {
+        for (id, latency) in &native_results {
+            results.insert(id.clone(), json!(latency));
+        }
+    }
+    if let Some(payload) = done.as_mut() {
+        payload["tested"] = json!(
+            payload.get("tested").and_then(Value::as_u64).unwrap_or(0)
+                + native_results.len() as u64
+        );
+        payload["ok"] = json!(
+            payload.get("ok").and_then(Value::as_u64).unwrap_or(0) + native_results.len() as u64
+        );
+        payload["total"] = json!(requested_all.len());
+        payload["serverIds"] = json!(requested_all);
+        if let Some(pending) = payload.get_mut("pending").and_then(Value::as_array_mut) {
+            pending.extend(native_pending.iter().map(|id| json!(id)));
+        }
+        if !native_pending.is_empty() {
+            payload["outcome"] = json!("interrupted");
+            if payload.get("reason").is_none() {
+                payload["reason"] = json!(guard
+                    .cancel()
+                    .reason()
+                    .map_or("native_pending", |reason| reason.as_str()));
+            }
+        }
+    }
     release_then_emit(guard, done, emit_done);
 
     Ok(ApiResponse::ok(json!({
         "runId": run_id,
         "measurementContext": context,
-        "results": round_results_json(&results),
+        "results": combined_results,
+        "nativePending": native_pending,
         // completed：本次入参已全部裁定（测的测了、缺席的进 notInPool）；interrupted：被核跃迁/崩溃打断，
         // 该节点**缺席**（前端据此保留旧值，见 contracts/speed-test.ts SpeedTestOutcome）。
-        "outcome": outcome,
+        "outcome": if native_pending.is_empty() { outcome } else { "interrupted" },
         // 请求了但本层测不了的节点（需探针池）→ 如实回报，UI 据此显「N 未纳入」而非假装测过。
         "notInPool": skipped,
         // 本腿走到这里 ⇒ 活跃出口已通过 TS 就绪预筛（未就绪已在上面早退），其余节点的缺席原因一律是
@@ -3037,6 +3167,7 @@ async fn run_pool_speed_test(
     let superseded = || {
         invalid.load(Ordering::SeqCst)
             || is_superseded(proxy.core_generation(), gen0, proxy.status().running)
+            || proxy.native_owns_any(requested)
             || ticket.is_some_and(|ticket| proxy.check_ready_main(ticket).is_err())
     };
 
@@ -3166,6 +3297,9 @@ pub(crate) async fn probe_runtime_candidates(
     candidates: &[(String, String)],
     url: &str,
 ) -> RuntimeProbeBatch {
+    if polaris_config_engine::user_config::auto_select::validate_test_url(Some(url)).is_err() {
+        return RuntimeProbeBatch::Interrupted;
+    }
     let Some(guard) = SpeedTestGuard::acquire(SpeedTestOrigin::Failover).await else {
         return RuntimeProbeBatch::Busy;
     };
@@ -3627,9 +3761,32 @@ pub(crate) async fn run_scheduled_round(
         });
         (probe, config, dirty, ts_pending)
     };
+    if validate_speed_test_url(&config).is_err() {
+        let at = crate::runtime::subscription_scheduler::now_ms();
+        return ScheduledRound::Ran(RoundReport {
+            started_at: at,
+            ended_at: at,
+            skipped: targets
+                .iter()
+                .map(|id| (id.clone(), "SPEED_TEST_URL_INVALID"))
+                .collect(),
+            ..RoundReport::default()
+        });
+    }
     let url = resolve_speed_test_url(&config);
     let gen0 = proxy.core_generation();
-    let superseded = || is_superseded(proxy.core_generation(), gen0, proxy.status().running);
+    let superseded = || {
+        is_superseded(proxy.core_generation(), gen0, proxy.status().running)
+            || app
+                .state::<AppRuntime>()
+                .config()
+                .current()
+                .is_ok_and(|latest| {
+                    crate::runtime::proxy::native_auto::native_owned_members(&latest)
+                        .iter()
+                        .any(|id| targets.contains(id))
+                })
+    };
     // 读回流在准入之后才开；测量闭包从这里取同一份去登记自己的连接。
     let round_readback: std::sync::OnceLock<Readback> = std::sync::OnceLock::new();
     let open_readback = || {
@@ -4082,20 +4239,23 @@ fn record_measured(
     );
 }
 
-/// 测速目标 URL 求值（单一真值）：用户配的 `speedTestUrl`（须**解析得出隧道目标**）否则
-/// [`DEFAULT_SPEED_TEST_URL`]。
-///
-/// 池路径 / 回退路径 / 出口伴测三处共用同一口径 —— 测速值可跨路径合法比较（同端点 = 同 warm TTFB 语义）。
-///
-/// **判据是「能否解析成 [`SpeedTestTarget`]」而不是「是否 `http(s)://` 开头」**：CONNECT 腿要的是
-/// host/port/path 三件套，`http://` 这种前缀对但解析不出 host 的值若被放行，会让每个节点都拿一个
-/// -1 假失败（原因在配置、锅记在节点头上）。对齐 上游 `resolveSpeedTestTarget` 的回落语义。
+/// Shared parser admission before any measurement I/O. Invalid explicit settings
+/// are a configuration error, never a replacement endpoint or a failed node.
+pub(crate) fn validate_speed_test_url(config: &Value) -> Result<(), &'static str> {
+    match config.get("speedTestUrl") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(raw)) => {
+            polaris_config_engine::user_config::auto_select::validate_test_url(Some(raw))
+        }
+        Some(_) => Err(polaris_config_engine::user_config::auto_select::SPEED_TEST_URL_INVALID),
+    }
+}
+
 pub(crate) fn resolve_speed_test_url(config: &Value) -> String {
-    config
-        .get("speedTestUrl")
-        .and_then(Value::as_str)
-        .filter(|&u| SpeedTestTarget::parse(u).is_some())
-        .map_or_else(|| DEFAULT_SPEED_TEST_URL.to_string(), str::to_string)
+    polaris_config_engine::user_config::auto_select::configured_test_url(
+        config.get("speedTestUrl").and_then(Value::as_str),
+    )
+    .to_owned()
 }
 
 /// warm-TTFB 计时的**纯时序核**（隧道的建立与 I/O 全部经 [`WarmTunnel`] 注入 ⇒ 「两段各自独立计时、
@@ -4221,8 +4381,9 @@ async fn measure_warm_ttfb_with<T: WarmTunnel>(
 /// （[`SPEED_TEST_COLD_TIMEOUT_MS`] 包 CONNECT+TLS+GET1，[`SPEED_TEST_REUSE_TIMEOUT_MS`] 包 GET2，
 /// 首段超时即返回不发第二次），见 [`measure_warm_ttfb`]；传输面见 [`crate::runtime::speedtest_tunnel`]。
 ///
-/// URL 解析失败 → 失败：`resolve_speed_test_url` 已保证传进来的一定可解析（不可解析的用户值在那里
-/// 就回落成默认端点了），故这条腿实际不可达；即便到达也**不伪造数值**（上层记 -1）。
+/// URL parsing remains a final defensive gate; callers reject malformed explicit configuration.
+/// Historical fallback is intentionally removed (invalid explicit settings are not substituted).
+///
 /// 超时 / 传输错 / 非 2xx → 失败（上层记 -1，绝不伪造数值）。
 ///
 /// `auth`：该入站要求的凭据（Android 主核的 `probe-in-k` / `probe-proxy-in`：本次起核的一次性凭据；
@@ -4395,6 +4556,9 @@ pub(crate) fn spawn_warm_rtt_probe(
     let Some(run_id) = next_speed_test_run_id(&SPEED_TEST_RUN_SEQUENCE) else {
         return;
     };
+    if validate_speed_test_url(config).is_err() {
+        return;
+    }
     let request = SpeedTestRequest {
         origin: SpeedTestOrigin::Companion,
         targets: vec![active_id.clone()],

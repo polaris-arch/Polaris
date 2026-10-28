@@ -22,25 +22,9 @@ use polaris_updater::popup::{
 };
 use polaris_updater::state::PopupPhase;
 
-// ── 宿主指针宽度绊线（非 64 位直接编不过）────────────────────────────────────────
-//
-// 本文件的写入闸全程以 `u64` 表达（`fileSize` / [`APP_UPDATE_MAX_BYTES`]），而
-// [`CoreDownloader::with_max_bytes`](crate::runtime::http::CoreDownloader::with_max_bytes) 吃
-// `usize` ⇒ 中间必有一次 `u64 → usize` 换算。在 <64 位宿主上装不下的闸值只能退到 `usize::MAX`，
-// 也就是**把闸悄悄变成「不设闸」**：一个报 100 GiB 的 `fileSize` 会一路写到 ENOSPC，
-// 而这恰恰是 [`APP_UPDATE_MAX_BYTES`] 自陈要防的那件事。
-//
-// 这条降级腿从未被测过（Polaris 三平台均为 64 位构建，CI 的交叉编译矩阵也只有 64 位目标），
-// 与其留一条**静默**失效的闸，不如让非 64 位目标当场编不过 —— 失效面从「用户的盘被写满」
-// 降到「构建期一条明确的错误」。
-//
-// 将来真要支持 32 位：不是放宽本绊线，而是把这些闸改成**全程 u64 比较、不经 usize**
-// （即 `with_max_bytes` 也收 `u64`，读侧比较在 u64 上做）。
-#[cfg(not(target_pointer_width = "64"))]
-compile_error!(
-    "polaris 的 App 更新写入闸以 u64 表达，非 64 位宿主上 `u64 → usize` 会退化成 usize::MAX（闸形同不设）。\
-     支持 32 位前须先把 http.rs 的体积闸改成全程 u64 比较。"
-);
+// The bounded update budget must fit the target pointer width. Android armv7
+// is a supported 32-bit build; 512 MiB fits it without weakening the limit.
+const _: () = assert!(APP_UPDATE_MAX_BYTES <= usize::MAX as u64);
 
 /// 单次 GitHub releases 响应体上限（16 MiB；= 上游 `MAX_GITHUB_JSON_BYTES`：被劫持/WAF 回灌 GB 级
 /// 响应会撞堆，流式超限即中断）。
@@ -407,7 +391,7 @@ pub fn update_clear_portable_handoff(state: State<'_, AppRuntime>) -> ApiRespons
 /// 上游 `VERSION_GET_INFO`：版本信息（app + core 版本）。
 ///
 /// ✅ **已接线**：app 版本取自 Tauri `package_info`；core 版本经 `UpdaterRuntime` 双读法的**展示读法**
-/// （探测失败回落随包基线，= 上游 `getCoreVersion` 语义）；基线取自编译期嵌入的 `core-manifest.json`。
+/// （探测失败回落随包基线，= 上游 `getCoreVersion` 语义）；基线与默认 HTTP UA 共用实际所选随包构建身份。
 #[allow(
     clippy::needless_pass_by_value,
     reason = "Tauri IPC command owns its deserialized payload across the call"
@@ -677,6 +661,9 @@ pub async fn update_check(
     match checked {
         Ok(AppUpdateCheck::Available(info)) => {
             let info_v = serde_json::to_value(&info).unwrap_or(Value::Null);
+            if let Err(error) = state.updater().custody.select(info_v.clone()) {
+                return Ok(ApiResponse::err(error));
+            }
             Ok(ApiResponse::ok(json!({
                 "hasUpdate": true,
                 "updateInfo": info_v,
@@ -716,6 +703,9 @@ pub async fn update_check(
         ) {
             Ok(AppUpdateCheck::Available(info)) => {
                 let info_v = serde_json::to_value(&info).unwrap_or(Value::Null);
+                if let Err(error) = state.updater().custody.select(info_v.clone()) {
+                    return Ok(ApiResponse::err(error));
+                }
                 Ok(ApiResponse::ok(json!({
                     "hasUpdate": false,
                     "isCurrentVersion": true,
@@ -830,13 +820,14 @@ pub(super) struct ExpectedDigest {
 
 /// 按 [`EXPECTED_DIGEST_SOURCES`] 的优先级挑第一条可用的期望摘要。
 ///
-/// `Ok(None)` = 一条都没有：**不拒装**，降级为「Content-Length + `fileSize` 完整性校验 + 结果里
-/// 如实标记未校验」（否则所有旧 release 都更新不了）。字段**整个缺失**是旧 release 的正常形态
+/// `Ok(None)` means no digest was supplied. Parsing stays compatible with old releases;
+/// executable download admission rejects this case and directs users to manual installation.
+/// 字段**整个缺失**是旧 release 的正常形态
 /// （`AppUpdateInfo.sha256` 带 `skip_serializing_if = "Option::is_none"`），空串/纯空白同理。
 ///
 /// # 两类「拿不到摘要」必须分开（本函数的全部难点）
 ///
-///  - **本来就没有**（字段缺失 / 空串）→ `Ok(None)`，降级放行；
+///  - **本来就没有**（字段缺失 / 空串）→ `Ok(None)`；实际下载准入仍要求可信摘要；
 ///  - **有，但不是个字符串**（`123` / `null` / `["…"]`）→ `Err`，**显式早退**。
 ///
 /// 原实现两类都走 `Value::as_str` ⇒ 后者被**静默丢弃**成前者 ⇒ `verified:false` 放行 ——
@@ -973,10 +964,8 @@ pub(super) fn app_update_size_limit(declared: Option<u64>) -> usize {
         Some(n) => n.min(APP_UPDATE_MAX_BYTES),
         None => APP_UPDATE_MAX_BYTES,
     };
-    // 本回落（装不下 → usize::MAX）在受支持的宿主上**不可达**：本文件顶部的
-    // `compile_error!` 已把非 64 位目标挡在编译期之外。保留 `try_from` 而不写 `as usize`，
-    // 是因为 `as` 会**静默截断**成一个小值（闸比声明值还紧 ⇒ 正常包被拒）。
-    usize::try_from(limit).unwrap_or(usize::MAX)
+    // The compile-time assertion above proves every capped value fits usize.
+    usize::try_from(limit).expect("compile-time checked update size budget")
 }
 
 /// 发布清单声明的 `fileSize` 当**等值判据**（无摘要腿的硬化）。
@@ -1311,8 +1300,8 @@ pub(super) fn cached_download_is_reusable(dest: &Path, expected_sha: Option<&str
 ///  3. 兜底 `Content-Length` 完整性（`CoreDownloader` 内）。**它对撒谎方零约束**——那个数就是撒谎方
 ///     自己给的，故绝不可把它当作「无摘要也安全」的理由（原文档正是这么写的，已订正）。
 ///
-/// 三级全无（旧 release + 清单无 `fileSize`）时**不拒装**，但结果里 `verified:false`
-/// **如实标记未校验**——否则所有旧 release 都更新不了。
+/// Admission requires a backend-selected trusted SHA-256. Older digest-less releases
+/// remain available for manual installation from their release page; they are not executable here.
 ///
 /// **进度事件**：走 [`CoreDownloader::download_to_sink_with_progress`](crate::runtime::http::CoreDownloader::download_to_sink_with_progress) 的逐 chunk 回调，发
 /// `downloading(0%)` → `downloading(n%)`（**按整数百分比去重**，见下）→ `downloaded(100%)`。
@@ -1346,6 +1335,17 @@ pub async fn update_download(
             None => e.code.en().to_string(),
         };
         ApiResponse::err_with_code(msg, e.code.wire())
+    };
+
+    // Keep progress projection compatible; all executable fields below come from the backend.
+    let update_info = match state.updater().custody.admit(&update_info) {
+        Ok(trusted) => trusted,
+        Err(error) => {
+            return Ok(fail(UpdateErr::with_detail(
+                UpdateErrCode::RecheckFailed,
+                &error,
+            )))
+        }
     };
 
     let Some(url) = update_info
@@ -1422,6 +1422,17 @@ pub async fn update_download(
             .unwrap_or(false)
     };
     if reuse_probe {
+        let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        if let Err(error) = state.updater().custody.record(
+            &dest,
+            expected_sha.as_deref().unwrap_or_default(),
+            bytes,
+        ) {
+            return Ok(fail(UpdateErr::with_detail(
+                UpdateErrCode::RecheckFailed,
+                &error,
+            )));
+        }
         log::info!(
             "更新包已在本地且 sha256 复核通过，复用不重复下载: {}",
             dest.display()
@@ -1554,6 +1565,17 @@ pub async fn update_download(
         LandingOutcome::Landed => {
             // tmp 这个 inode 现在叫 dest 了 —— 先解除守卫，再广播成功。
             partial.disarm();
+            if let Err(error) =
+                state
+                    .updater()
+                    .custody
+                    .record(&dest, &streamed.sha256_hex, streamed.bytes)
+            {
+                return Ok(fail(UpdateErr::with_detail(
+                    UpdateErrCode::RecheckFailed,
+                    &error,
+                )));
+            }
             // 「下载完成 / 校验完成 / 落位完成」三点分离后，`downloaded` **只在这一支**发：
             // 早一步发就是广播一个 dest 尚不存在的假成功态，设置页会给出一个点不开的安装入口。
             // 随行的 `path` 就是刚落位的那个 dest，`verified` 与下面回包里那个字段同源同值。
@@ -1574,7 +1596,7 @@ pub async fn update_download(
     Ok(ApiResponse::ok(json!({
         "success": true,
         "filePath": dest.to_string_lossy(),
-        // `verified` 特指**摘要**这一级。无摘要时如实标记未校验（不拒装）——此时仍过了
+        // `verified` 特指**摘要**这一级；生产准入已要求可信摘要。其他完整性检查仍包括
         // `fileSize` 等值判据与 Content-Length，但那两级都弱于摘要，不配叫 verified。
         "verified": expected_digest.is_some(),
         "digestSource": expected_digest.as_ref().map(|d| d.source.as_str()),
@@ -1609,10 +1631,8 @@ pub async fn update_request_install_permission() -> Result<ApiResponse<Value>, (
 /// **顺序不可换**（= 上游 `UpdateService.ts:306-315` 的明确注释）：确认框必须在**停代理之前**，
 /// 用户取消即真 no-op —— 否则会留下「代理被停了但没更新」的坏态。
 ///
-/// # 形态错配 → 交系统，**绝不强制 root**
-///
-/// 资产形态与运行形态错配（如 AppImage 运行拿到 `.deb`）时不自动提权安装，回退 `shell.open`
-/// 让系统处理（= 上游 `:427-436`）。
+/// Unsupported extensions or platform/form mismatches fail closed before any OS open.
+/// Installation requires an in-memory receipt and a freshly verified private copy.
 #[tauri::command]
 pub async fn update_install(
     app: AppHandle,
@@ -1621,12 +1641,6 @@ pub async fn update_install(
     confirmed: Option<bool>,
 ) -> Result<ApiResponse<Value>, ()> {
     let installer = std::path::PathBuf::from(&file_path);
-    if !installer.is_file() {
-        return Ok(ApiResponse::err(format!(
-            "更新包不存在（请先下载）: {}",
-            installer.display()
-        )));
-    }
     let Ok(exe_path) = std::env::current_exe() else {
         return Ok(ApiResponse::err("无法解析当前可执行文件路径"));
     };
@@ -1639,7 +1653,30 @@ pub async fn update_install(
     let portable = is_portable_layout(&exe_path).then(|| exe_path.clone());
     let run_form = update_install::detect_run_form(os, appimage.as_deref(), portable.as_deref());
 
-    let plan = match update_install::decide_install_plan(
+    // Read-only restoration of a portable reminder. A persisted path is display data,
+    // never authority: no existence check, copy, write, delete, or OS open in this branch.
+    if confirmed == Some(false)
+        && os == "windows"
+        && portable.is_some()
+        && state.updater().custody.admits_install(&installer).is_err()
+    {
+        return Ok(ApiResponse::ok(json!({
+            "ok": false, "needConfirm": true, "advisory": "portableManualReplace",
+            "programDir": exe_path.parent().map(|p| p.to_string_lossy().into_owned()),
+            "requiresRedownload": true,
+        })));
+    }
+    if let Err(error) = state.updater().custody.admits_install(&installer) {
+        return Ok(ApiResponse::err_with_code(error, "updateTrustRequired"));
+    }
+    if !installer.is_file() {
+        return Ok(ApiResponse::err_with_code(
+            "Update package is missing; check and download again",
+            "updateTrustRequired",
+        ));
+    }
+
+    let mut plan = match update_install::decide_install_plan(
         os,
         run_form,
         &installer,
@@ -1648,24 +1685,11 @@ pub async fn update_install(
         portable.as_deref(),
     ) {
         Ok(p) => p,
-        Err(reject) => {
-            // 形态错配 / 不认识的资产 → **交系统处理**（不强制 root、不瞎猜脚本）。
-            // 便携形态拿到安装程序是例外：交出去就是运行它，只报错（见 `hands_to_system`）。
-            let opened = if reject.hands_to_system() {
-                log::warn!("安装计划被拒（{reject:?}）：回退交系统打开");
-                #[allow(deprecated)]
-                let opened = app.shell().open(installer.to_string_lossy(), None).is_ok();
-                opened
-            } else {
-                log::warn!("安装计划被拒（{reject:?}）：便携版不运行安装程序，未打开");
-                false
-            };
-            return Ok(ApiResponse::ok(json!({
-                "ok": false,
-                "handedToSystem": opened,
-                "reason": "form-mismatch",
-                "detail": format!("{reject:?}"),
-            })));
+        Err(_reject) => {
+            // Unsupported assets must never be opened as a fallback executable.
+            return Ok(ApiResponse::err(
+                "Update package does not match this platform or installation form",
+            ));
         }
     };
 
@@ -1675,6 +1699,23 @@ pub async fn update_install(
             return Ok(ApiResponse::ok(confirm_request(&plan, advisory)));
         }
     }
+
+    // Freeze and rehash receipt-bound bytes before any OS handoff or shutdown.
+    let updater = state.updater.clone();
+    let source = installer.clone();
+    let stage = match tokio::task::spawn_blocking(move || updater.custody.stage(&source)).await {
+        Ok(Ok(stage)) => stage,
+        Ok(Err(error)) => return Ok(ApiResponse::err_with_code(error, "updateTrustRequired")),
+        Err(_) => {
+            return Ok(ApiResponse::err_with_code(
+                "Update validation task failed; download again",
+                "updateTrustRequired",
+            ))
+        }
+    };
+    let installer = stage.path().to_path_buf();
+    let file_path = installer.to_string_lossy().into_owned();
+    plan.installer_path = installer.clone();
 
     // ── Android：交系统安装器，**在停代理与写脚本之前整条早退** ────────────────────
     //
@@ -1696,16 +1737,15 @@ pub async fn update_install(
     // 系统安装器弹出来的同时看到一句「安装失败」。故成功走 `awaitingSystemInstaller` 这个
     // 只属于本条腿的键 —— 它说的是一件桌面没有的事：**包交出去了，而本进程还活着在等**。
     //
-    // ⚠️ 前端今天还没有消费这个键（那半留给接 UI 的那一批）。这不是被忘掉的一格：
-    // `AssetPlatform::from_os("android")` 恒 `None` ⇒ Android 上整条更新腿今天不可达，
-    // 而「要补 UI 分支 + REASON_* 文案」已经登记进
-    // `tests::android_has_no_update_asset_selector_yet_and_that_is_registered` 的解锁清单。
+    // Android selects native APK assets; the mobile updater consumes awaitingSystemInstaller
+    // and reason codes. Handoff is not proof that the user completed installation.
     if plan.platform == update_install::InstallPlatform::Android {
         return Ok(
             match crate::runtime::proxy::android_bridge::hand_apk_to_system_installer(&file_path)
                 .await
             {
                 Ok(handoff) if handoff.handed_off => {
+                    stage.hand_off();
                     log::info!("APK 已交系统安装器，等待用户在系统 UI 上确认：{file_path}");
                     ApiResponse::ok(json!({ "ok": true, "awaitingSystemInstaller": true }))
                 }
@@ -1744,8 +1784,11 @@ pub async fn update_install(
                 #[allow(deprecated)]
                 let opened = app.shell().open(file_path.clone(), None);
                 return Ok(match opened {
-                    Ok(()) => ApiResponse::ok(json!({ "ok": true, "awaitingManualInstall": true,
-                        "reason": format!("安装目录需要管理员权限，请从已打开的 DMG 手动安装: {error}") })),
+                    Ok(()) => {
+                        stage.hand_off();
+                        ApiResponse::ok(json!({ "ok": true, "awaitingManualInstall": true,
+                            "reason": format!("安装目录需要管理员权限，请从已打开的 DMG 手动安装: {error}") }))
+                    }
                     Err(open_error) => ApiResponse::err(format!(
                         "无法准备自动安装（{error}），打开 DMG 也失败: {open_error}"
                     )),
@@ -1781,6 +1824,7 @@ pub async fn update_install(
         (None, None) => Err("没有可用的安装交付方式".to_string()),
     };
     if delivered.is_ok() {
+        stage.hand_off();
         log::info!("更新已交付（{:?}），应用即将退出", plan.platform);
         // 便携腿：应用一退，写着这两个位置的卡片就没了，而「打开」只是向系统发起、弹没弹出来
         // 这边看不出。位置写进日志，并留一条记录供重开应用后的更新卡取回。

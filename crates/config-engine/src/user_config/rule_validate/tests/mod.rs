@@ -56,7 +56,7 @@ fn validate_rule_value_accept_reject_per_type() {
         ("domain", "example.com", "bad!domain"),
         ("domainSuffix", "sub.example.com", "exa mple.com"),
         ("domainKeyword", "anything-goes", "   "),
-        ("domainRegex", "^ab.*$", "(?=lookahead)"),
+        ("domainRegex", "^ab.*$", ""),
         ("ipCidr", "10.0.0.0/8", "010.0.0.1"),
         ("sourceIpCidr", "192.168.1.0/24", "256.1.1.1"),
         ("port", "443", "70000"),
@@ -76,9 +76,11 @@ fn validate_rule_value_accept_reject_per_type() {
     }
     // 未知类型一律非法
     assert!(!validate_rule_value("bogus", "x"));
-    // domainRegex 反向引用 \1..\9 全拒（非仅 \1）
-    assert!(!validate_rule_value("domainRegex", r"(a)\2"));
-    // processPath Windows 路径
+    // This synchronous layer only checks shape. Syntax rejection belongs to
+    // bounded actual-core admission, including lookahead and backreferences.
+    assert!(validate_rule_value("domainRegex", r"\Q(a)\2\E"));
+    assert!(validate_rule_value("domainRegex", &"a".repeat(1025))); // admission bounds are changed-pattern only
+                                                                    // processPath Windows 路径
     assert!(validate_rule_value(
         "processPath",
         r"C:\Program Files\app.exe"
@@ -99,6 +101,7 @@ fn rule(type_field: RuleType, values: Vec<&str>, conditions: Option<Vec<RuleCond
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,

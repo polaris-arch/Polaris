@@ -58,6 +58,8 @@ export const IPC_CHANNELS = {
 
   // 服务器管理
   SERVER_SWITCH: 'server_switch',
+  SERVER_IDENTITY_CONFLICTS: 'server_identity_conflicts',
+  SERVER_IDENTITY_REPAIR: 'server_identity_repair',
   SERVER_GENERATE_URL: 'server_generate_url',
   TAILCAT_KEYPAIR: 'tailcat_keypair', // Tailcat 客户端密钥对：不传私钥=生成新的；传了=只推导公钥（私钥不进日志）
   SERVER_ADD: 'server_add',
@@ -70,6 +72,8 @@ export const IPC_CHANNELS = {
   SERVER_SPEED_TEST: 'server_speed_test',
   SPEED_TEST_SCHEDULE_STATUS: 'speed_test_schedule_status', // 周期测速的计划状态（只读）
   SPEED_TEST_RESULT_SNAPSHOT: 'speed_test_result_snapshot', // Existing ledger, read-only UI projection.
+  AUTO_SELECT_SET_ENABLED: 'auto_select_set_enabled',
+  AUTO_SELECT_DISABLE: 'auto_select_disable',
   AUTO_SELECT_ENABLE: 'auto_select_enable', // 把选择意图置为「自动选择（该订阅）」；清掉只需点任一节点
   AUTO_SELECT_SWITCH_NOW: 'auto_select_switch_now', // 自动意图下按共享裁决请求换点（允许重启内核）
   AUTO_SELECT_STATUS: 'auto_select_status', // 选择状态（只读）
@@ -115,6 +119,8 @@ export const IPC_CHANNELS = {
 
   // 路由规则管理
   RULES_ADD: 'rules_add',
+  RULES_PREVIEW_REGEX: 'rules_preview_regex',
+  RULES_VALIDATE_REGEX: 'rules_validate_regex',
   RULES_UPDATE: 'rules_update',
   RULES_DELETE: 'rules_delete',
   RULES_REORDER: 'rules_reorder',

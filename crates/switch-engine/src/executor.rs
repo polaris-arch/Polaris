@@ -170,7 +170,7 @@ impl SwitchExecutor {
     /// （实际改变了指向的 selector 的 (selector, 旧成员) 对）。
     ///
     /// best-effort：连接首帧超时 / 关连接失败 → 不阻断热切换（已 PUT 成功）。
-    /// outcome 保留筛选时的 ID 顺序和口径，不是逐条关闭成功的 ACK 收据。
+    /// selected_ids retains selection; closed_ids contains successful RPC acknowledgements only.
     async fn precision_disconnect(
         &self,
         api: &dyn ManagementApi,
@@ -190,22 +190,36 @@ impl SwitchExecutor {
                 }
             }
         };
-        let outcome = select_connections_to_close(&snapshot, &pairs);
-        // 复用 runtime 的 owned ID + 借用 API + buffer_unordered 模式，不调用 close-all。
-        // ID 按需克隆，最多 16 条在途；不收集无用的结果，也不改变 outcome 的选择顺序。
-        // 无 spawn：外层 future 被取消时，一起丢弃尚未完成的关闭 future。已发出的 RPC 无法撤回。
-        let mut closes = futures::stream::iter(outcome.closed_ids.iter().cloned())
-            .map(|id| close_selected_connection(api, id))
+        let mut outcome = select_connections_to_close(&snapshot, &pairs);
+        // No spawned tasks: cancellation drops all pending close futures. Already-issued RPCs
+        // cannot be undone. Record acknowledgements separately from selected attempts.
+        let mut acknowledged = vec![false; outcome.selected_ids.len()];
+        let mut closes = futures::stream::iter(outcome.selected_ids.iter().cloned().enumerate())
+            .map(|(index, id)| async move {
+                let (_, success) = close_selected_connection(api, id).await;
+                (index, success)
+            })
             .buffer_unordered(CLOSE_CONCURRENCY);
-        while closes.next().await.is_some() {}
+        while let Some((index, success)) = closes.next().await {
+            acknowledged[index] = success;
+        }
         drop(closes);
+        for (id, success) in outcome.selected_ids.iter().zip(acknowledged) {
+            if success {
+                outcome.closed_ids.push(id.clone());
+            } else {
+                outcome.failed_ids.push(id.clone());
+            }
+        }
+
         outcome
     }
 }
 
 /// 沿用收到的 API（含上层 generation/intent gate）；单项失败不阻断其余选中 ID。
-async fn close_selected_connection(api: &dyn ManagementApi, id: String) {
-    let _ = api.close_connection(&id).await;
+async fn close_selected_connection(api: &dyn ManagementApi, id: String) -> (String, bool) {
+    let success = api.close_connection(&id).await.is_ok();
+    (id, success)
 }
 
 /// 测试用 mock 管理 API：可预设 PUT 成功/失败 + 连接快照。

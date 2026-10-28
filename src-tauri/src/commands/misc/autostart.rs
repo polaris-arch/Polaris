@@ -72,6 +72,9 @@ pub async fn auto_start_get_status(app: AppHandle) -> ApiResponse<bool> {
     #[cfg(desktop)]
     {
         let autostart = app.state::<tauri_plugin_autostart::AutoLaunchManager>();
-        ApiResponse::ok(autostart.is_enabled().unwrap_or(false))
+        match autostart.is_enabled() {
+            Ok(enabled) => ApiResponse::ok(enabled),
+            Err(error) => ApiResponse::err(format!("autostart status unavailable: {error}")),
+        }
     }
 }

@@ -1,3 +1,4 @@
+import type { IdentityConflicts, IdentityRepairRequest, IdentityRepairReceipt } from '@/domain/identity-repair/model';
 import { invoke, listen, listenReady } from '../ipc-client';
 import { IPC_CHANNELS } from '../../domain/ipc-channels';
 import type { ServerConfig } from '../../contracts/types';
@@ -6,7 +7,7 @@ import type { TailscaleStatusSnapshot } from '../../contracts/tailscale-status';
 import type { TaildropInbox, TaildropSaveResult, TaildropSendResult, TaildropTaskSnapshot } from '../../contracts/taildrop';
 import type { SpeedTestDonePayload, SpeedTestInvokeResult, SpeedTestProgressPayload, SpeedTestResultPayload, SpeedTestScheduleStatus } from '../../contracts/speed-test';
 import type { ServerSwitchReceipt } from '../../contracts/server-switch';
-import type { AutoSelectReceipt, AutoSelectStatus } from '../../contracts/auto-select';
+import type { NativeAutoReceipt as AutoSelectReceipt, NativeAutoStatus as AutoSelectStatus } from '../../contracts/auto-select';
 import type { MeasurementSnapshot } from '../../contracts/measurement-display';
 
 // ============================================================================
@@ -134,8 +135,8 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.TAILDROP_TASK_CANCEL, { taskId });
   },
 
-  onTaildropTaskUpdated(listener: (snapshot: TaildropTaskSnapshot) => void): () => void {
-    return listen(IPC_CHANNELS.EVENT_TAILDROP_TASK_UPDATED, listener);
+  onTaildropTaskUpdated(listener: (snapshot: TaildropTaskSnapshot) => void): Promise<() => void> {
+    return listenReady(IPC_CHANNELS.EVENT_TAILDROP_TASK_UPDATED, listener);
   },
 
   /** 取件：后端开原生保存框再写盘。`canceled:true` = 用户取消，**不是失败**。 */
@@ -143,6 +144,12 @@ export const serverApi = {
     return invoke(IPC_CHANNELS.TAILDROP_SAVE, { serverId, name });
   },
 
+  async identityConflicts(): Promise<IdentityConflicts> {
+    return invoke(IPC_CHANNELS.SERVER_IDENTITY_CONFLICTS);
+  },
+  async identityRepair(request: IdentityRepairRequest): Promise<IdentityRepairReceipt> {
+    return invoke(IPC_CHANNELS.SERVER_IDENTITY_REPAIR, { request });
+  },
   async switch(serverId: string): Promise<ServerSwitchReceipt> {
     return invoke(IPC_CHANNELS.SERVER_SWITCH, { serverId });
   },
@@ -221,14 +228,22 @@ export const serverApi = {
    * 否则只写意图，后续按共享裁决评估，不因启用而替换订阅内出口。被拒时信封带 `AUTO_SELECT_*` 稳定码
    * （本平台未开放、订阅不存在、订阅为空）。清掉意图不需要命令：点任一节点即回到手动。
    */
-  async autoSelectEnable(subscriptionId: string): Promise<AutoSelectReceipt> {
-    return invoke(IPC_CHANNELS.AUTO_SELECT_ENABLE, { subscriptionId });
+  async autoSelectEnable(subscriptionId?: string, scope?: import('@/contracts/auto-select').AutoSelectScope): Promise<AutoSelectReceipt> {
+    return invoke(IPC_CHANNELS.AUTO_SELECT_ENABLE, { subscriptionId, scope });
   },
 
   /**
    * 自动意图下按共享裁决请求换点，保留连胜、驻留和限频条件；意图保留。用于需要重启时由用户
    * 显式发起：与手动点节点同级，允许重启内核。
    */
+  async autoSelectSetEnabled(enabled: boolean): Promise<AutoSelectReceipt> {
+    return invoke(IPC_CHANNELS.AUTO_SELECT_SET_ENABLED, { enabled });
+  },
+
+  async autoSelectDisable(): Promise<AutoSelectReceipt> {
+    return invoke(IPC_CHANNELS.AUTO_SELECT_DISABLE);
+  },
+
   async autoSelectSwitchNow(): Promise<AutoSelectReceipt> {
     return invoke(IPC_CHANNELS.AUTO_SELECT_SWITCH_NOW);
   },

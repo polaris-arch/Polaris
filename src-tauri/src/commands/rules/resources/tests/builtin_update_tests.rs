@@ -74,16 +74,24 @@ async fn builtin_update_commits_live_and_metadata_before_done() {
     let client = TestHttp::new(200, b"SRS-new");
     let sink = RecordingSink::default();
     let saved = AtomicUsize::new(0);
-    let outcome = update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |resource| {
-        assert_eq!(
-            std::fs::read(dir.join(&plan.file_name)).unwrap(),
-            b"SRS-new"
-        );
-        assert!(!resource.downloaded_at.is_empty());
-        assert_eq!(sink.statuses(), ["downloading"]);
-        saved.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    })
+    let outcome = update_builtin_resource(
+        &sink,
+        &client,
+        &PublicLookup,
+        &plan,
+        &dir,
+        |resource, staged, operation| {
+            publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
+            assert_eq!(
+                std::fs::read(dir.join(&plan.file_name)).unwrap(),
+                b"SRS-new"
+            );
+            assert!(!resource.downloaded_at.is_empty());
+            assert_eq!(sink.statuses(), ["downloading"]);
+            saved.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
     .await;
     assert!(matches!(
         outcome,
@@ -104,10 +112,11 @@ async fn builtin_http_or_invalid_content_failure_preserves_live() {
         let (plan, dir) = fixture();
         let sink = RecordingSink::default();
         let client = TestHttp::new(status, body);
-        let outcome = update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_| {
-            panic!("下载失败不能保存元数据")
-        })
-        .await;
+        let outcome =
+            update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_, _, _| {
+                panic!("下载失败不能保存元数据")
+            })
+            .await;
         assert!(matches!(outcome, DownloadOutcome::Failed { .. }));
         assert_eq!(
             std::fs::read(dir.join(&plan.file_name)).unwrap(),
@@ -129,7 +138,10 @@ async fn builtin_metadata_failure_is_retryable_error_and_never_done() {
         &PublicLookup,
         &plan,
         &dir,
-        |_| Err("保存更新标记失败，可重试".into()),
+        |_, staged, operation| {
+            publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
+            Err("保存更新标记失败，可重试".into())
+        },
     )
     .await;
     let result = outcome.into_value(&plan);
@@ -147,7 +159,8 @@ async fn builtin_same_tag_updates_are_serialized_and_cleanup_isolated() {
     let first = RecordingSink::default();
     let second = RecordingSink::default();
     let saved = AtomicUsize::new(0);
-    let persist = |_: &RuleResource| {
+    let persist = |_: &RuleResource, staged: &Path, operation: &BuiltinUpdateOperation| {
+        publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
         saved.fetch_add(1, Ordering::SeqCst);
         Ok(())
     };
@@ -196,4 +209,173 @@ fn manual_all_wires_real_builtin_registry_and_one_deferred_batch_broadcast() {
     let builtin = body.find("for builtin in builtins").unwrap();
     assert!(!body[external..builtin].contains("return"));
     assert!(body[builtin..].contains("results.push(result)"));
+}
+
+#[test]
+fn reset_retires_active_and_queued_generations_without_resurrecting_files() {
+    let (mut plan, dir) = fixture();
+    plan.id = format!("reset-fixture-{}", new_uuid());
+    let active = BuiltinUpdateOperation::begin(&plan.id);
+    let queued = BuiltinUpdateOperation::begin(&plan.id);
+    let other = BuiltinUpdateOperation::begin(&format!("other-{}", new_uuid()));
+    let staged = ResourceStageDir::create(&dir).unwrap();
+    let path = staged.0.join(&plan.file_name);
+    let live = dir.join(&plan.file_name);
+    std::fs::write(&path, b"SRS-stale").unwrap();
+    // Same transition reset performs under the config writer. Cleanup already ran.
+    builtin_update_lock(&plan.id).retire();
+    std::fs::remove_file(&live).unwrap();
+    assert!(!active.is_current());
+    assert!(!queued.is_current());
+    assert!(other.is_current());
+    assert!(publish_builtin_file(&active, &path, &live).is_err());
+    assert!(publish_builtin_file(&queued, &path, &live).is_err());
+    assert!(!live.exists());
+    assert!(path.exists());
+    // A genuinely post-reset update owns a new generation, including before cleanup.
+    let successor = BuiltinUpdateOperation::begin(&plan.id);
+    assert!(successor.is_current());
+    let successor_stage = ResourceStageDir::create(&dir).unwrap();
+    let successor_path = successor_stage.0.join(&plan.file_name);
+    std::fs::write(&successor_path, b"SRS-successor").unwrap();
+    publish_builtin_file(&successor, &successor_path, &live).unwrap();
+    assert!(publish_builtin_file(&active, &path, &live).is_err());
+    drop(staged); // Cancellation only cleans the old operation's exclusive stage.
+    assert_eq!(std::fs::read(&live).unwrap(), b"SRS-successor");
+    drop(successor_stage);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn failed_reset_persistence_conservatively_cancels_old_work_without_file_deletion() {
+    let (mut plan, dir) = fixture();
+    plan.id = format!("failed-reset-fixture-{}", new_uuid());
+    let active = BuiltinUpdateOperation::begin(&plan.id);
+    builtin_update_lock(&plan.id).retire();
+    // A persistence failure after retirement does not roll operation identity back.
+    let staged = ResourceStageDir::create(&dir).unwrap();
+    let path = staged.0.join(&plan.file_name);
+    std::fs::write(&path, b"SRS-stale").unwrap();
+    let live = dir.join(&plan.file_name);
+    assert!(publish_builtin_file(&active, &path, &live).is_err());
+    assert_eq!(std::fs::read(&live).unwrap(), b"SRS-old");
+    let successor = BuiltinUpdateOperation::begin(&plan.id);
+    assert!(successor.is_current());
+    drop(active);
+    // The successor keeps the weak registry entry alive; retirement cannot ABA.
+    builtin_update_lock(&plan.id).retire();
+    assert!(!successor.is_current());
+    drop(staged);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn reset_and_publish_share_writer_fence_and_capture_precedes_queue() {
+    use crate::commands::guard_scan::top_level_fn_body;
+    let src = crate::test_support::crate_code("commands/rules/resources.rs");
+    let reset = top_level_fn_body(&src, "pub fn rule_resources_reset_builtin(");
+    assert!(
+        reset
+            .find("update_with_explicit_deletions(deletions, |cfg|")
+            .unwrap()
+            < reset.find(".retire()").unwrap()
+    );
+    assert!(!reset.contains(".await"));
+    let update = top_level_fn_body(&src, "async fn update_builtin_resource<");
+    assert!(
+        update.find("BuiltinUpdateOperation::begin").unwrap()
+            < update.find(".lock().await").unwrap()
+    );
+    assert!(!update.contains("std::fs::rename"));
+    let persist = top_level_fn_body(&src, "fn persist_builtin_geo_updated(");
+    assert!(
+        persist.find("state.config().update(|cfg|").unwrap()
+            < persist.find("publish_builtin_file(").unwrap()
+    );
+    assert!(
+        persist.find("publish_builtin_file(").unwrap()
+            < persist.find(".entry(\"builtinGeoMeta\")").unwrap()
+    );
+}
+
+struct PausedHttp {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+impl HttpClient for PausedHttp {
+    async fn fetch(&self, _: &str, _: &FetchInit) -> Result<MinimalResponse, String> {
+        self.entered.notify_one();
+        self.resume.notified().await;
+        Ok(MinimalResponse {
+            status: 200,
+            body: b"SRS-new".to_vec(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn download_paused_across_reset_cannot_publish_or_mark_metadata_done() {
+    let (mut plan, dir) = fixture();
+    plan.id = format!("paused-reset-{}", new_uuid());
+    let client = PausedHttp {
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    };
+    let sink = RecordingSink::default();
+    let saved = AtomicUsize::new(0);
+    let update = update_builtin_resource(
+        &sink,
+        &client,
+        &PublicLookup,
+        &plan,
+        &dir,
+        |_, staged, operation| {
+            publish_builtin_file(operation, staged, &dir.join(&plan.file_name))?;
+            saved.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    );
+    let reset = async {
+        client.entered.notified().await;
+        builtin_update_lock(&plan.id).retire();
+        std::fs::remove_file(dir.join(&plan.file_name)).unwrap();
+        client.resume.notify_one();
+    };
+    let (outcome, ()) = tokio::join!(update, reset);
+    assert!(matches!(outcome, DownloadOutcome::Failed { .. }));
+    assert_eq!(saved.load(Ordering::SeqCst), 0);
+    assert!(!dir.join(&plan.file_name).exists());
+    assert!(!sink.statuses().iter().any(|status| status == "done"));
+    assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_paused_download_cleans_only_its_stage_and_releases_gate() {
+    let (mut plan, dir) = fixture();
+    plan.id = format!("cancel-paused-{}", new_uuid());
+    let client = PausedHttp {
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    };
+    let sink = RecordingSink::default();
+    {
+        let update =
+            update_builtin_resource(&sink, &client, &PublicLookup, &plan, &dir, |_, _, _| {
+                panic!("cancelled download must not publish")
+            });
+        tokio::pin!(update);
+        tokio::select! {
+            _ = &mut update => panic!("download must still be paused"),
+            () = client.entered.notified() => {}
+        }
+    }
+    assert_eq!(
+        std::fs::read(dir.join(&plan.file_name)).unwrap(),
+        b"SRS-old"
+    );
+    assert_eq!(std::fs::read_dir(dir.join(".update")).unwrap().count(), 0);
+    assert!(builtin_update_lock(&plan.id).download.try_lock().is_ok());
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -1,3 +1,7 @@
+import { startAppVpnStatusSync } from '@/lib/app-vpn-status-sync';
+import { useMobileFormStore } from './forms/form-store';
+import { syncLanguageChoice } from '@/i18n';
+import { startPrivacyModeSync } from '@/lib/privacy-mode-sync';
 import { subscribeMobileSpeedTestProgress } from './use-mobile-speed-test';
 /**
  * 移动端的**全局接线层** —— 对应桌面 `App.tsx` 那批 app 级 effect。
@@ -44,7 +48,7 @@ import { subscribeMobileSpeedTestProgress } from './use-mobile-speed-test';
  * | `useSystemProxyLivePolling()` | 不接 | 移动端接管方式恒为 TUN（`MobileHomeScreen.MOBILE_TAKEOVER`），`systemProxy` 档在 Android 上连入站都不发；那条轮询每轮 exec `networksetup`/`gsettings`/`reg`，在这里既无对象也无消费者 |
  * | `initTooltips()` | 不接 | 引擎是 `data-tip` 的 hover 委托；触屏没有 hover，移动端按 IA §4.12 把桌面的 `data-tip` 一律落成常驻行（各屏头注逐条登记过），全树零 `data-tip` |
  * | `useIdlePrivacyLock()` + 隐私态水合 / 进出事件 | **已接**（2026-09-06，W-16） | ⚠️ 这一行**曾经**写着「不接」，理由是「`privacyMode` 在 Android 上没有生产端 ⇒ 接了恒收不到帧」。那条判定当时是对的，射程也只到「**订阅桌面发的隐私态事件**」这一格：三个来源（托盘「立即锁定」/ 桌面 idle 计时 / 桌面窗解锁）确实一个都不在移动入口上。W-16 做的是另一件事 —— 让移动端**自己**产生这个状态（本文件下面那条闲置计时 + `MobileLockOverlay` 的解锁腿），生产端于是有了，水合与两条事件订阅随之成为真接线而不是假接线 |
- * | 界面语言水合（`syncLanguageChoice`） | 不接 | 移动端的写腿自带这一跳（`settings/DisplayPage.tsx` 改语言时当场 `syncLanguageChoice`），冷启动那一格由 `i18n/index.ts` 读 localStorage 兑现。缺的只是「config 被别处改了」这一档（备份恢复 / 桌面同步），不构成会说假话的界面，登记为后续线 |
+ * | 界面语言水合（`syncLanguageChoice`） | 已接 | 启动缓存只用于首帧；权威配置到达或恢复备份后，effective language 同步界面与缓存。 |
  * | 订阅**创建**操作水合（`subscribeAndHydrateSubscriptionCreateOperations`） | **已接**（2026-09-25，ζ 批 A8） | ⚠️ 这一行**曾经**写着「不接」，最后一版理由是「找回来之后要交给一个可见的重试面，移动端没有那个面」。面现在有了：`forms/SubFormPanel.tsx#SubCreateTaskPanel`（进度文案与表单同一份），经 `forms/form-store.ts#openMobileSubscriptionCreateRecovery` 打开（桌面 `openTrackedSubscriptionCreateRecovery` 开的是桌面弹窗栈，移动端用自己的栈、同一条去重判据）。Android 上进程被回收 / Activity 重建是日常，这一格此前的代价是「表单关掉 / 应用被回收之后那次创建仍在后端跑、进度与结局都看不见」 |
  * | Taildrop 任务（`subscribeTaildropTaskEvents` + 水合） | **已接**（2026-09-25，ζ 批 A12） | ⚠️ 这一行**曾经**写着「不接」，理由是「唯一的消费者是一张短命面板，面板自持进度 + 一颗刷新」。代价是发件进行中进度不会自己跳，面板关掉再打开也只是再拉一次当时的快照。现在事件逐帧落 `useTaildropTaskStore`（跨面板存活的消费者就是这张 store），`forms/TaildropPanel.tsx` 只是它的视图（`visibleTaildropTasks`，与桌面 `TaildropDialog` 同一份） |
  * | 测速**进度** | **已接** | 窗口级 runId 会话 store 消费 PROGRESS/DONE；跨页保留，计数仅取真实事件与回执。桌面 sticky toast 不复用。 |
@@ -73,7 +77,6 @@ import { useTranslation } from 'react-i18next';
 import { api } from '@/ipc';
 import { autoNodeSwitchFeedback } from '@/lib/auto-node-switch-feedback';
 import type { UserConfig } from '@/contracts/types';
-import type { VpnStatusSnapshot } from '@/contracts/vpn-status';
 import { shouldArmIdleLock } from '@/domain/privacy';
 import { handleProxyErrorEvent } from '@/domain/proxy-error-routing';
 import { isDefinitiveTsLoginFrame } from '@/domain/tailscale-conn-state';
@@ -91,7 +94,7 @@ import {
   stopSubscriptionCreateOperationSubscription,
   subscribeAndHydrateSubscriptionCreateOperations,
 } from '@/store/subscription-create-operation-store';
-import { hydrateTaildropTasks, subscribeTaildropTaskEvents } from '@/store/use-taildrop-task-store';
+import { subscribeTaildropTaskEvents } from '@/store/use-taildrop-task-store';
 import { useTailscaleLoginCacheStore } from '@/store/use-tailscale-login-cache-store';
 import { useTailscaleLoginProgressStore } from '@/store/use-tailscale-login-progress-store';
 import { useVpnStatusStore } from '@/store/use-vpn-status-store';
@@ -130,23 +133,13 @@ function pullPendingChanges(): void {
     .catch(() => {});
 }
 
-/**
- * 一帧 VPN 快照写进 store。
- *
- * **与桌面的唯一差别：不开认证弹窗。** 桌面在 `authChallenge` / `challenge` 到达时
- * `dialogs.open({kind:'vpn-auth'})`，而弹窗层住在 `components/dialogs/**`（契约 A1 禁入移动端）。
- * 这里只落 store —— 移动端的消费者是节点屏的 `deriveMeshTunnelHealth`，它读的是隧道健康，不是挑战。
- * ⚠️ 连带结论，如实登记：**OpenVPN 的交互式认证挑战在移动端今天没有出口**，属表单层那一批，
- * 不在本批射程内；这里不为它造一个点了没有下一步的入口。
- */
-function applyVpnStatusSnapshot(snapshot: VpnStatusSnapshot): void {
-  useVpnStatusStore
-    .getState()
-    .replace(snapshot.connected, snapshot.openConnect ?? [], snapshot.openVpn ?? []);
-}
-
-function clearVpnStatusSnapshot(): void {
-  useVpnStatusStore.getState().replace(false, [], []);
+/** Share the existing endpoint status store; only the presentation stack is mobile-specific. */
+function ensureVpnAuthPanel(protocol: 'openconnect' | 'openvpn', serverId: string): void {
+  if (!serverId) return;
+  const forms = useMobileFormStore.getState();
+  if (!forms.stack.some(form => form.kind === 'vpn-auth' && form.protocol === protocol && form.serverId === serverId)) {
+    forms.open({ kind: 'vpn-auth', protocol, serverId });
+  }
 }
 
 /**
@@ -224,15 +217,6 @@ export function startMobileAppWiring(t: WiringT): () => void {
      Android 上这一档特别常见：VPN 服务是前台服务，进程被系统回收后 WebView 重建，核还在跑。 */
   void store().refreshProxyStatus();
   pullPendingChanges();
-  void api.vpn.getStatus().then(applyVpnStatusSnapshot).catch(() => {});
-  /* 隐私态首帧水合（W-16）。读的是 Rust 进程内的 `PRIVACY_MODE` atomic，**跨 WebView 重建存活** ——
-     Android 上这一格比桌面更要紧：应用长期在后台，WebView 被系统回收重建是常态，而 enter/exit
-     两条事件只推**增量**。少这一拍，「锁着的时候界面被重建」会得到一个没有遮罩的解锁界面，
-     那正是这把锁要挡的场景。逐字同桌面 `App.tsx:269`。 */
-  void api.config
-    .getPrivacyMode()
-    .then((on) => store().setPrivacyMode(on))
-    .catch(() => {});
 
   const offs: Array<() => void> = [];
 
@@ -277,14 +261,14 @@ export function startMobileAppWiring(t: WiringT): () => void {
   offs.push(
     api.proxy.onStarted(() => {
       void store().refreshProxyStatus();
-      void api.vpn.getStatus().then(applyVpnStatusSnapshot).catch(() => {});
-      pullPendingChanges();
+          pullPendingChanges();
     }),
   );
   offs.push(
     api.proxy.onStopped(() => {
+      unlockFeedRevision += 1;
+      store().resetUnlock();
       void store().refreshProxyStatus();
-      clearVpnStatusSnapshot();
       pullPendingChanges();
     }),
   );
@@ -380,10 +364,7 @@ export function startMobileAppWiring(t: WiringT): () => void {
     }
   }));
 
-  /* OpenVPN 原生状态增量 → `use-vpn-status-store`。消费者是节点屏组网分组的隧道健康
-     （`deriveMeshTunnelHealth`），不接它那格恒为 undefined。认证挑战没有移动端出口，见
-     `applyVpnStatusSnapshot` 头注。 */
-  offs.push(api.vpn.onOpenVpnStatus((status) => useVpnStatusStore.getState().setOpenVpn(status)));
+  offs.push(startAppVpnStatusSync(ensureVpnAuthPanel));
 
   /* 订阅更新逐阶段进度 → `use-subscription-progress-store` → 节点屏分组标签上的失败详情。
      这条腿有一个本条独有的理由：**后台 scheduler 也会更新订阅**，那条腿没有任何前端调用点
@@ -420,7 +401,6 @@ export function startMobileAppWiring(t: WiringT): () => void {
      `useTaildropTaskStore` —— 它活一整个应用生命周期，`TaildropPanel` 关掉再打开读到的是事件推过来的
      当下那一帧，发大文件时进度自己跳，不用按刷新。水合失败静默：非 Tauri 预览 / 核没跑时本就没有任务。 */
   offs.push(subscribeTaildropTaskEvents());
-  void hydrateTaildropTasks().catch(() => {});
 
   /* 订阅后台自动更新结果 → 只 pull 一次差集。
      **刻意不弹 toast**（桌面弹）：移动端节点屏的分组标签上挂着一条**常驻**失败详情
@@ -463,12 +443,7 @@ export function startMobileAppWiring(t: WiringT): () => void {
     }),
   );
 
-  /* 隐私态进/出（W-16）。后端 `config_set_privacy_mode` 只在**真状态跃迁**时 emit
-     （`commands/config.rs:1327-1341`：`prev != value` 才发），故这两条是遮罩的唯一收敛点：
-     闲置计时（下面那条 hook）与解锁腿（`privacy-lock.ts`）都只调 `setPrivacyMode`，谁都不写 store。
-     单一收敛点是刻意的 —— 两个写入方会在「后端拒了但界面已经翻过去」时分叉。 */
-  offs.push(api.config.onEnterPrivacyMode(() => store().setPrivacyMode(true)));
-  offs.push(api.config.onExitPrivacyMode(() => store().setPrivacyMode(false)));
+  offs.push(startPrivacyModeSync(api.config, (locked) => store().setPrivacyMode(locked)));
 
   /* ── ③ 30s 兜底轮询 ──────────────────────────────────────────────────────── */
   const poll = setInterval(() => void store().refreshProxyStatus(), MOBILE_STATUS_POLL_MS);
@@ -522,6 +497,13 @@ export function useMobileAppWiring(): void {
      这一条**刻意读 effective**，与上面那条对账相反：它问的不是「后端认得哪些实体」，而是
      「用户现在把这个开关拨到哪一档」—— 用户刚关掉通知、还没落盘的那段时间里就不该再发。
      它也没有对账那条的风险：开关是个布尔，落盘失败会由设置页的行内回显说话，不驱逐任何持久状态。 */
+  // Cache seeds first paint only. Restored/saved config is authoritative once available.
+  const languageChoice = useEffectiveConfig((c) => c?.language);
+  useEffect(() => {
+    if (languageChoice === undefined) return;
+    syncLanguageChoice(languageChoice);
+  }, [languageChoice]);
+
   const desktopNotifications = useEffectiveConfig((c) => c?.desktopNotifications);
   useEffect(() => {
     setDesktopNotificationsEnabled(desktopNotifications);

@@ -21,6 +21,7 @@
  *    只钉「有没有 catch」是钉不住那个形态的（裁定 #14 原文点名）。
  * 3. **写成功要清掉上一次的错误**，否则一条修好的失败会永久挂在控件下面，读作「它还是坏的」。
  */
+import { toast } from '@/lib/error-handler';
 import type { TFunction } from 'i18next';
 import type { ProxyStatus } from '@/contracts/types';
 import { proxyErrorReason, proxyErrorText } from '@/domain/proxy-error-text';
@@ -78,7 +79,7 @@ export function writeFailureText(t: TFunction, err: unknown): string {
 }
 
 /** 唯一写出口。接线层的**每一处**写调用都必须在它的参数区间内，门逐个对拍。 */
-export type RunWrite = (id: WriteControlId, op: () => Promise<unknown>) => Promise<void>;
+export type RunWrite = (id: WriteControlId, op: () => Promise<unknown>, isCurrent?: () => boolean) => Promise<void>;
 
 /**
  * 纯工厂。抽出来是为了**可测** —— 本仓 vitest 跑 node、无 jsdom，真 hook 一行都跑不起来，
@@ -88,12 +89,13 @@ export function createRunWrite(
   setErrors: (updater: (prev: WriteErrors) => WriteErrors) => void,
   t: TFunction,
 ): RunWrite {
-  return async (id, op) => {
+  return async (id, op, isCurrent = () => true) => {
     try {
       await op();
-      setErrors((prev) => withoutWriteError(prev, id));
+      if (isCurrent()) setErrors((prev) => withoutWriteError(prev, id));
     } catch (err) {
-      setErrors((prev) => withWriteError(prev, id, writeFailureText(t, err)));
+      if (isCurrent()) setErrors((prev) => withWriteError(prev, id, writeFailureText(t, err)));
+      else toast.error(writeFailureText(t, err));
     }
   };
 }

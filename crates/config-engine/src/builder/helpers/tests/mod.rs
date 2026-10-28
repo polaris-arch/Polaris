@@ -78,6 +78,7 @@ fn effective_rules_smart_only() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -104,6 +105,7 @@ fn geo_categories_from_rules() {
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -129,6 +131,7 @@ fn geo_categories_from_custom_app_preset() {
         action: RuleAction::Proxy,
         enabled: true,
         target_server_id: None,
+        target_auto_select: None,
     };
     let preset = CustomAppPreset {
         id: "custom-mytube".into(),
@@ -157,6 +160,7 @@ fn geo_categories_from_builtin_app_preset() {
         action: RuleAction::Proxy,
         enabled: true,
         target_server_id: None,
+        target_auto_select: None,
     };
     let (geosite, geoip) = get_required_geo_categories(&[], &[app_rule], &[]);
     assert!(
@@ -177,6 +181,7 @@ fn geo_categories_builtin_wins_over_custom_same_id() {
         action: RuleAction::Proxy,
         enabled: true,
         target_server_id: None,
+        target_auto_select: None,
     };
     let shadow = CustomAppPreset {
         id: "youtube".into(),
@@ -202,6 +207,7 @@ fn geo_categories_skip_disabled_app_rule() {
         action: RuleAction::Proxy,
         enabled: false,
         target_server_id: None,
+        target_auto_select: None,
     };
     let (geosite, geoip) = get_required_geo_categories(&[], &[app_rule], &[]);
     assert!(geosite.is_empty(), "禁用的 appRule 不该贡献 geo tag");

@@ -76,10 +76,41 @@ if ($ldflags.Contains($key)) {
     if ($matches.Count -ne 1 -or $matches[0].Groups[1].Value -cne $win.sourceCommit) { throw 'Conflicting formal SourceRevision flag' }
     if ($mode -eq 'candidate') { $ldflags = $ldflags.Replace($key+$win.sourceCommit,$key+$source) }
 } else { $ldflags += " -X ${key}${source}" }
+# The alpha.12 production checkout stays clean and pinned. Only this test file
+# gets the already-reviewed e9 IPC reader; Go's overlay never edits kernel source.
+# Hashes below are UTF-8/LF bytes (checkout CRLF is normalized explicitly).
+$testFixture = $null
+$testOverlayArgs = @()
+function Read-FixtureText([string]$Path, [string]$ExpectedSHA256) {
+    if ((Get-Item -LiteralPath $Path).LinkType) { throw 'Test fixture must be a regular file' }
+    $text = [IO.File]::ReadAllText($Path).Replace("`r`n", "`n")
+    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($text))).ToLowerInvariant()
+    if ($hash -cne $ExpectedSHA256) { throw "Exact test fixture hash mismatch: $Path" }
+    return $text
+}
+if ($source -ceq 'a4d0858605b51b7f5b3c29a9969a6f2c3ae5a0ae') {
+    $fixturePath = 'protocol/tailscale/directory_process_windows_test.go'
+    $originalHash = '03f3782f31d323cc7096fe92290e65241ebfb9fd1a5c6806283bb69ebd2570ff'
+    $replacementHash = '74511b3ab0524b227020e95316f458453cac4d5a953afe79eab294aa5cebe1ed'
+    $originalPath = Join-Path $kernelRoot $fixturePath
+    $null = Read-FixtureText $originalPath $originalHash
+    $replacement = Read-FixtureText (Join-Path $appRoot 'scripts/fixtures/windows-directory/directory-process-windows-test.go') $replacementHash
+    $replacementPath = Join-Path $outputRoot 'directory_process_windows_test.go'
+    [IO.File]::WriteAllText($replacementPath, $replacement, [Text.UTF8Encoding]::new($false))
+    $overlayPath = Join-Path $outputRoot 'test-fixture-overlay.json'
+    @{Replace=@{$originalPath=$replacementPath}} | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $overlayPath -Encoding utf8NoBOM
+    $testOverlayArgs = @('-overlay', $overlayPath)
+    $testFixture = @{kind='reviewed-test-ipc-overlay-v1';sourceCommit=$source;path=$fixturePath;reviewedCommit='e9f5bb82ed8900ec857dc9cf3135179ba8045111';originalSHA256=$originalHash;replacementSHA256=$replacementHash}
+    Write-Output "Directory acceptance uses original production source $source plus explicit reviewed test IPC fixture e9f5bb82; not unmodified-source test acceptance."
+}
 $kernelExe = Join-Path $outputRoot 'tailscale-tests.exe'
 $activationExe = Join-Path $outputRoot 'directory-activation-tests.exe'
 Push-Location $kernelRoot
 try {
+    # Read effective flags, including persisted GOENV settings; do not modify them.
+    $effectiveGoFlags = & go env GOFLAGS
+    if ($LASTEXITCODE -ne 0) { throw 'Effective Go flags unavailable' }
+    if ($effectiveGoFlags -match '(?:^|[\s"''])-{1,2}overlay(?:=|\s|["'']|$)') { throw 'Ambient Go overlay is forbidden' }
     $actualGo = & go env GOVERSION
     if ($LASTEXITCODE -ne 0) { throw 'Go compiler identity unavailable' }
     $toolchainJson = & python (Join-Path $PSScriptRoot 'resolve-toolchain.py') --kernel-root $kernelRoot --mode $mode --source $source --actual-go $actualGo
@@ -88,11 +119,21 @@ try {
     $expectedGo = $toolchain.selectedCompiler
     if ($actualGo -cne $expectedGo) { throw 'Go compiler differs from exact selected compiler' }
     $toolchainJson | Set-Content -LiteralPath (Join-Path $outputRoot 'toolchain-evidence.json') -Encoding utf8NoBOM
-    & go test -c -buildvcs=true -mod=readonly -trimpath -tags $tags -ldflags $ldflags -o $kernelExe ./protocol/tailscale
+    & go test -c @testOverlayArgs -buildvcs=true -mod=readonly -trimpath -tags $tags -ldflags $ldflags -o $kernelExe ./protocol/tailscale
     if ($LASTEXITCODE -ne 0) { throw 'Native kernel test producer build failed' }
     & go test -c -buildvcs=true -mod=readonly -trimpath -tags $tags -ldflags $ldflags -o $activationExe .
     if ($LASTEXITCODE -ne 0) { throw 'Native kernel activation test build failed' }
 } finally { Pop-Location }
+# The overlay is an explicit test input, never a dirty production checkout.
+$actual = & git -C $kernelRoot rev-parse HEAD
+if ($LASTEXITCODE -ne 0 -or $actual -cne $source) { throw 'Kernel HEAD changed during test build' }
+$dirty = & git -C $kernelRoot status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Kernel source changed during test build' }
+if ($testFixture) {
+    $null = Read-FixtureText $originalPath $originalHash
+    $null = Read-FixtureText $replacementPath $replacementHash
+    $testFixture.kernelSHA256 = (Get-FileHash -LiteralPath $kernelExe -Algorithm SHA256).Hash.ToLowerInvariant()
+}
 Push-Location $appRoot
 try {
     $buildLog = Join-Path $outputRoot 'app-test-build.jsonl'
@@ -131,12 +172,13 @@ $required = @(
  'TestWindowsDirectoryForeignOwnerRejectsUnverifiedParent',
  'TestWindowsDirectoryForeignOwnerRejectsNonSystemToken'
 )
+if ($testFixture) { $required += @('TestWindowsDirectorySignalReadDuringRename', 'TestWindowsDirectorySignalValidation') }
 foreach ($name in $required) { if (-not ($listing -ccontains $name)) { throw "Missing exact kernel regression: $name" } }
 & $kernelExe '-test.run=^TestWindows' '-test.v' '-test.timeout=10m'
 if ($LASTEXITCODE -ne 0) { throw 'Native kernel Windows regressions failed' }
 & (Join-Path $PSScriptRoot 'Run-WindowsDirectoryInterop.ps1') -AppArtifactManifest $appManifest -KernelArtifactManifest $kernelManifest -ExpectedAppSource $appSource -ExpectedKernelSource $source -ValidationMode $mode
 Assert-AppTrackedSource
-@{attemptId=$attemptId;validationMode=$mode;kernelSource=$source;appSource=$appSource;repository='polaris-arch/sing-box-polaris';result='passed';scope='directory-protocol-tests-only';formalSourceContractMatched=($mode -eq 'formal')} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM $validationReceipt
+@{attemptId=$attemptId;validationMode=$mode;kernelSource=$source;appSource=$appSource;repository='polaris-arch/sing-box-polaris';result='passed';scope='directory-protocol-tests-only';testFixture=$testFixture;formalSourceContractMatched=($mode -eq 'formal')} | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM $validationReceipt
 @{attemptId=$attemptId;result='passed';receipt='validation-receipt.json';receiptSHA256=(Get-FileHash -LiteralPath $validationReceipt -Algorithm SHA256).Hash.ToLowerInvariant()} | ConvertTo-Json | Set-Content -Encoding utf8NoBOM $attemptPath
 } catch {
     # If final receipt publication succeeded but attempt publication failed,

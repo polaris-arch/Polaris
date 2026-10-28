@@ -78,6 +78,7 @@ fn dns_effect_rule(
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,
@@ -197,7 +198,7 @@ fn native_dns_and_conditions_share_one_rule_and_fakeip_is_native() {
 fn v2_hosts_first_emits_preferred_hosts_then_explicit_fallback_before_fakeip() {
     let mut config = base_config();
     config.config_schema_version = Some(2);
-    config.dns_servers = vec![DnsServerResource {
+    config.dns_servers.push(DnsServerResource {
         id: "hosts-corp".into(),
         name: "Corp hosts".into(),
         enabled: true,
@@ -205,7 +206,7 @@ fn v2_hosts_first_emits_preferred_hosts_then_explicit_fallback_before_fakeip() {
         paths: vec!["/etc/hosts".into(), "/opt/corp.hosts".into()],
         predefined: BTreeMap::from([("git.corp.example".into(), vec!["10.0.0.8".into()])]),
         ..Default::default()
-    }];
+    });
     config.dns_defaults = Some(DnsPolicyDefaults {
         direct_server_id: "builtin-domestic".into(),
         proxy_server_id: "builtin-remote".into(),
@@ -279,7 +280,7 @@ fn v2_hosts_first_emits_preferred_hosts_then_explicit_fallback_before_fakeip() {
 fn v2_race_group_uses_native_evaluate_respond_and_node_egress_is_preserved() {
     let mut config = base_config();
     config.config_schema_version = Some(2);
-    config.dns_servers = vec![DnsServerResource {
+    config.dns_servers.push(DnsServerResource {
         id: "node-dns".into(),
         name: "Node DNS".into(),
         enabled: true,
@@ -293,7 +294,7 @@ fn v2_race_group_uses_native_evaluate_respond_and_node_egress_is_preserved() {
             node_id: "s1".into(),
         },
         ..Default::default()
-    }];
+    });
     config.dns_server_groups = vec![DnsServerGroup {
         id: "fastest".into(),
         name: "Fastest".into(),
@@ -989,6 +990,7 @@ fn custom_bypass_fakeip_inline_rule() {
             enabled: true,
             bypass_fakeip: Some(true),
             target_server_id: None,
+            target_auto_select: None,
             remarks: None,
             tls_spoof: None,
             tls_spoof_method: None,
@@ -1110,14 +1112,14 @@ fn dns_and_preserves_same_type_conditions_and_actions_only_at_root() {
 #[test]
 fn dns_and_hosts_first_and_group_keep_matcher_children_headless() {
     let mut config = base_config();
-    config.dns_servers = vec![DnsServerResource {
+    config.dns_servers.push(DnsServerResource {
         id: "hosts".into(),
         name: "Hosts".into(),
         enabled: true,
         kind: DnsServerKind::Hosts,
         predefined: BTreeMap::from([("api.example.com".into(), vec!["10.0.0.8".into()])]),
         ..Default::default()
-    }];
+    });
     config.dns_server_groups = vec![DnsServerGroup {
         id: "race".into(),
         name: "Race".into(),
@@ -1213,3 +1215,79 @@ fn default_dns_rule_serde_keeps_legacy_shape_without_logical_fields() {
 }
 
 mod real_query_fallback;
+
+#[test]
+fn reused_groups_have_unique_evaluate_occurrences_and_matching_responses() {
+    let mut config = base_config();
+    config.dns_config = Some(UserDnsConfig {
+        enable_fake_ip: Some(false),
+        ..Default::default()
+    });
+    config.dns_server_groups = vec![DnsServerGroup {
+        id: "same".into(),
+        name: "same".into(),
+        enabled: true,
+        mode: DnsServerGroupMode::Race,
+        members: vec!["builtin-domestic".into(), "builtin-remote".into()],
+        fallback_server_id: None,
+    }];
+    let action = DnsPolicyAction::Group {
+        group_id: "same".into(),
+    };
+    let mut first = dns_effect_rule(
+        "one",
+        RuleType::Domain,
+        &["a.example"],
+        RuleDnsResolver::Direct,
+        RuleDnsAnswerMode::Real,
+    );
+    first.effects.as_mut().unwrap().dns.as_mut().unwrap().action = Some(action.clone());
+    first.combine_mode = Some(CombineMode::Or);
+    first.conditions = Some(vec![
+        RuleCondition {
+            type_field: RuleType::Domain,
+            values: vec!["a.example".into()],
+        },
+        RuleCondition {
+            type_field: RuleType::DomainSuffix,
+            values: vec!["b.example".into()],
+        },
+    ]);
+    let mut second = first.clone();
+    second.id = "two".into();
+    config.policy_rules = Some(vec![first, second]);
+    config.dns_defaults = Some(DnsPolicyDefaults {
+        direct_server_id: "builtin-domestic".into(),
+        proxy_server_id: "builtin-remote".into(),
+        unmatched_action: Some(action),
+        connection_resolution: Default::default(),
+        real_query_fallback_action: None,
+    });
+    let built = build_dns_config(&config, &BTreeMap::new(), &deps_false());
+    let rules = built.rules.unwrap();
+    let evaluations: Vec<_> = rules
+        .iter()
+        .filter(|r| r.action.as_deref() == Some("evaluate"))
+        .collect();
+    assert_eq!(
+        evaluations.len(),
+        10,
+        "two OR rules plus unmatched fallback retain all occurrences"
+    );
+    let tags: BTreeSet<_> = evaluations
+        .iter()
+        .map(|r| r.tag.as_deref().unwrap())
+        .collect();
+    assert_eq!(tags.len(), evaluations.len());
+    let responses: Vec<_> = rules
+        .iter()
+        .filter_map(|r| {
+            r.match_response
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    for tag in tags {
+        assert_eq!(responses.iter().filter(|r| **r == tag).count(), 1);
+    }
+}

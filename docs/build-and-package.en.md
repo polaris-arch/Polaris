@@ -92,7 +92,8 @@ node scripts/fetch-dashboard.mjs
 
 `fetch-core` verifies the pinned release inputs and places resources in `resources/<platform>/`. Linux / Windows
 Cronet libraries must also match their manifest digests; macOS uses static inputs. `fetch-dashboard` obtains the
-sing-box `gh-pages` dashboard and currently has no SHA256 pin. Resources are not committed and must be prepared
+sing-box dashboard from a fixed commit, verifies the archive byte count and SHA256, and checks the
+post-prune file inventory digest before reuse or installation. Resources are not committed and must be prepared
 before packaging. This build-time fetch is not an in-app online core replacement feature.
 
 #### Release packaging and native acceptance bundles

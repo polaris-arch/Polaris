@@ -139,6 +139,15 @@ final class TunnelLifecycle {
         return generation == token && !quarantined && !stopPending
     }
 
+    /// Publish local settings only while this generation is still accepted.
+    /// The callback must be synchronous, local state only, and must not reenter
+    /// lifecycle methods or perform NE/Go calls while this lock is held.
+    func publishSettings(_ token: UInt64, publication: () -> Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard generation == token && !quarantined && !stopPending else { return false }
+        return publication()
+    }
+
     @discardableResult
     func complete(_ token: UInt64, phase: String, stopped: Bool?, error: String? = nil, cleanup: String? = nil) -> Bool {
         lock.lock()

@@ -1,3 +1,5 @@
+import { SavedAutoSelectControls } from '@/mobile/SavedAutoSelectControls';
+import { autoSelectTarget } from '@/domain/auto-select-target';
 import { MeasurementLabel } from '../MeasurementLabel';
 import { Fragment, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react';
 import type { SubscriptionConfig } from '@/contracts/types';
@@ -49,6 +51,7 @@ export function HomeNodePickerList({ rows, subscriptions = [], query, sortByLate
           <svg className={`h-pick-group-chevron${open ? ' open' : ''}`} viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden><path d="m9 6 6 6-6 6" /></svg>
           <span>{label}</span><span className="h-pick-group-count">{group.servers.length}</span>
         </button></li>
+        {open && <li><SavedAutoSelectControls t={t} target={autoSelectTarget(group)} /></li>}
         {open && group.servers.map(server => {
           const row = byId.get(server.id)!;
           return <li key={server.id} data-picker-node={server.id}>

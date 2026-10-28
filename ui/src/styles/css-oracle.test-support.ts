@@ -140,7 +140,7 @@
  *    本模块把「层叠算错」这一类从门里除掉，剩下的引擎差异仍然只有真机能答。
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { dirname, join, relative, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterAll } from 'vitest';
@@ -153,24 +153,8 @@ import { DISK_FS, ENTRY_MODULE, stripComments, type CtxName, type SourceFs } fro
 // ① Chrome 定位 —— 缺席即抛（模块加载期）
 // ════════════════════════════════════════════════════════════════════════════
 
-/** 按顺序探这些路径；一个都没有就抛。**没有环境变量后门** —— 后门等于一个静默的 skip。 */
-export const CHROME_CANDIDATES: readonly string[] = [
-  '/usr/bin/google-chrome',
-  '/usr/bin/google-chrome-stable',
-  '/usr/bin/chromium',
-  '/usr/bin/chromium-browser',
-  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-];
-
-/** 纯函数形态，便于对「缺席 ⇒ 抛」这条本身做正向对照（见 `css-oracle.test.ts` ⑥）。 */
-export function resolveChromeBinary(candidates: readonly string[] = CHROME_CANDIDATES): string {
-  for (const c of candidates) if (existsSync(c) && statSync(c).isFile()) return c;
-  throw new Error(
-    'CSS 裁判找不到浏览器 —— 探过：\n' +
-      candidates.map((c) => `    ${c}`).join('\n') +
-      '\n本模块**不 skip**：「没检查」与「检查通过」的输出必须可区分。装一个 Chrome，或改这份候选表。',
-  );
-}
+import { resolveChromeBinary } from './chrome-binary.test-support';
+export { CHROME_CANDIDATES, resolveChromeBinary } from './chrome-binary.test-support';
 
 /** 模块加载期就抛：import 得到本模块 ⇒ 浏览器一定在。 */
 const CHROME_BIN = resolveChromeBinary();
@@ -517,6 +501,7 @@ export async function cssChain(ctx: CtxName): Promise<{ file: string; css: strin
 // ════════════════════════════════════════════════════════════════════════════
 
 interface Conn {
+  startup: { spawn: number; endpoint: number; websocket: number };
   owned: Owned;
   child: ChildProcess;
   ws: WebSocket;
@@ -922,20 +907,24 @@ export async function waitForDevToolsEndpoint(
 }
 
 async function launch(): Promise<Conn> {
+  const began = performance.now();
   const spawned = spawnOwnedBrowser();
+  const spawnMs = performance.now() - began;
   let ws: WebSocket | undefined;
   try {
-    return await launchInto(spawned, (w) => (ws = w));
+    return await launchInto(spawned, (w) => (ws = w), spawnMs);
   } catch (err) {
     await abandon(spawned.owned, spawned.child, ws);
     throw err;
   }
 }
 
-async function launchInto(spawned: SpawnedBrowser, keepWs: (w: WebSocket) => void): Promise<Conn> {
+async function launchInto(spawned: SpawnedBrowser, keepWs: (w: WebSocket) => void, spawnMs: number): Promise<Conn> {
   const { owned, child } = spawned;
   const dir = owned.dir;
+  const endpointBegan = performance.now();
   const { port, path } = await waitForDevToolsEndpoint(spawned);
+  const endpointReady = performance.now();
 
   const ws = new WebSocket(`ws://127.0.0.1:${port}${path}`);
   keepWs(ws);
@@ -943,6 +932,7 @@ async function launchInto(spawned: SpawnedBrowser, keepWs: (w: WebSocket) => voi
     ws.onopen = () => res();
     ws.onerror = () => rej(new Error('CDP 的 WebSocket 握手失败'));
   });
+  const websocketReady = performance.now();
 
   let nextId = 0;
   const pending = new Map<number, { res: (v: Record<string, unknown>) => void; rej: (e: Error) => void }>();
@@ -972,7 +962,11 @@ async function launchInto(spawned: SpawnedBrowser, keepWs: (w: WebSocket) => voi
   // 子进程句柄不再钉住事件循环：收尾仍然只走 `Browser.close`（本模块任何路径都不 kill），
   // 但万一它退得慢，测试进程不必陪着它一起吊死。
   child.unref();
-  return { owned, child, ws, dir, send };
+  return { owned, child, ws, dir, send, startup: {
+    spawn: Math.round(spawnMs),
+    endpoint: Math.round(endpointReady - endpointBegan),
+    websocket: Math.round(websocketReady - endpointReady),
+  } };
 }
 
 async function conn(): Promise<Conn> {
@@ -1355,6 +1349,7 @@ interface RawAsk {
   hits: Hit[];
 }
 interface RawResult {
+  userAgent?: string;
   asks: RawAsk[];
   probes: Record<string, string | null>;
 }
@@ -1431,7 +1426,7 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
   });
   const expression = `(() => {
     const spec = JSON.parse(${JSON.stringify(spec)});
-    const out = { asks: [], probes: {} };
+    const out = { asks: [], probes: {}, userAgent: navigator.userAgent };
     const describe = (el) => el.tagName.toLowerCase()
       + (el.id ? '#' + el.id : '')
       + (el.className && typeof el.className === 'string' && el.className.trim()
@@ -1467,6 +1462,7 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
   const { targetId } = (await c.send('Target.createTarget', { url: 'about:blank' })) as { targetId: string };
   const targetReady = performance.now();
   let raw: RawResult;
+  let browserUserAgent: string | undefined;
   try {
     const { sessionId } = (await c.send('Target.attachToTarget', { targetId, flatten: true })) as { sessionId: string };
     await c.send('Page.enable', {}, sessionId);
@@ -1489,6 +1485,7 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
     if (evaluated.exceptionDetails !== undefined)
       throw new Error(`裁判取值时页面抛了：${JSON.stringify(evaluated.exceptionDetails)}`);
     raw = JSON.parse(String(evaluated.result?.value)) as RawResult;
+    browserUserAgent = raw.userAgent;
   } finally {
     // This request alone owns the page. Browser shutdown still drains every in-flight measure.
     const closeBegan = performance.now();
@@ -1496,6 +1493,8 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
     if (reportCold) console.log('[css-oracle] cold measure stages (ms):', {
       css: Math.round(cssReady - began),
       connection: Math.round(connected - cssReady),
+      connectionStages: c.startup,
+      browser: { path: CHROME_BIN, pid: c.child.pid, userAgent: browserUserAgent },
       target: Math.round(targetReady - connected),
       measurement: Math.round(closeBegan - targetReady),
       close: Math.round(performance.now() - closeBegan),

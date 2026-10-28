@@ -13,7 +13,7 @@ log = "0.4"
 # Existing locked implementations, only for Linux immutable preparation.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", features = ["fs"] }
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process", "event"] }
 sha2 = "0.11"
 
 # Windows 进程接口：作业对象（直起的核随主程序一起结束）与孤儿清扫的进程枚举 / 命令行读取。

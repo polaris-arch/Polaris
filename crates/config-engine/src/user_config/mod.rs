@@ -5,6 +5,7 @@
 
 pub mod app_config;
 pub mod app_rules_preset;
+pub mod auto_select;
 pub mod builtin_geo_rulesets;
 pub mod cidr;
 pub mod collections;

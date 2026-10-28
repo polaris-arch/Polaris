@@ -1,3 +1,6 @@
+//! Legacy pure App evaluator retained for regression coverage. Production Auto is
+//! native URLTest (`proxy::native_auto`); the old master is permanently disabled.
+//! The historical policy description below applies only to that retired evaluator.
 //! 自动选点的决策层：选择意图、择优腿的裁决、首轮锁存与对外状态。
 //!
 //! 自动选点有两条腿，跑在同一个按核世代挂载的心跳任务里（`runtime::proxy::auto_switch`）：
@@ -43,7 +46,8 @@ use crate::runtime::measurement_ledger::{Candidate, Candidates, Exclusion};
 
 /// 自动选点总开关。`false`：设置意图的命令拒绝，已有的自动意图按手动处理（故障切换回到只看
 /// `autoSwitchNode`、候选为全部节点）。回退 = 改这个常量后重新出包。
-pub(crate) const AUTO_SELECT_ENABLED: bool = true;
+// Native URLTest is the sole production Auto writer. Keep pure legacy decider tests only.
+pub(crate) const AUTO_SELECT_ENABLED: bool = false;
 /// 择优腿开关。`false`：不因「当前节点测速失败」或「更优」换点；首次落点与限定在订阅内的故障
 /// 切换保留。
 pub(crate) const BETTER_LEG_ENABLED: bool = true;

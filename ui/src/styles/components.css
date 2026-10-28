@@ -501,10 +501,22 @@
 .mesh-col-sub{ font-size:11px; color:hsl(var(--fg-dim)); line-height:1.4;
   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
 .mesh-acts{ display:flex; align-items:center; gap:6px; flex:none; }
-.mesh-choice-grid{ grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); margin-top:8px; }
-.mesh-choice{ min-width:0; }
-.mesh-choice > .mesh-col{ width:100%; text-align:left; }
-.mesh-choice-actions{ display:flex; justify-content:flex-end; gap:6px; padding:6px 4px 0; }
+/* Shared card/action tracks keep configured and new entries aligned. The minimum
+   matches a two-line title + description; longer/localized content grows freely. */
+.mesh-grid.mesh-choice-grid{ grid-template-columns:repeat(auto-fill,minmax(min(210px,100%),1fr));
+  grid-auto-rows:minmax(100px,auto) auto; margin-top:8px; }
+.mesh-choice{ min-width:0; display:grid; grid-row:span 2; grid-template-rows:subgrid; }
+.mesh-choice > .mesh-col{ width:100%; min-height:100px; text-align:start; }
+.mesh-choice .mesh-tx{ overflow-wrap:anywhere; }
+.mesh-choice .mesh-col-sub{ display:block; overflow:visible; -webkit-line-clamp:unset; }
+.mesh-choice-actions{ display:flex; flex-wrap:wrap; align-content:flex-start; justify-content:flex-end;
+  gap:6px; padding:0 4px; }
+.mesh-choice-actions > .btn{ max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+/* Older embedded webviews still get readable cards, without clipped content. */
+@supports not (grid-template-rows:subgrid){
+  .mesh-grid.mesh-choice-grid{ grid-auto-rows:auto; }
+  .mesh-choice{ grid-row:auto; grid-template-rows:minmax(100px,1fr) auto; gap:12px; }
+}
 .danger-text{ color:hsl(var(--err)) !important; }
 /* 弹窗内提示 / 进行态 / 成功态 / .conf 预览 */
 .warn-line{ display:flex; gap:7px; align-items:flex-start; font-size:11px; color:hsl(var(--warn));

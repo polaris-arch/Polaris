@@ -101,3 +101,16 @@ fn partition_by_overlap() {
     assert_eq!(overlapping, vec!["192.168.0.0/16".to_string()]);
     assert_eq!(disjoint.len(), 2);
 }
+
+#[test]
+fn dotted_ipv6_and_hex_use_the_same_overlap_and_subtraction_arithmetic() {
+    assert!(ipv6_cidrs_overlap("2001:2::192.0.2.1/128", "2001:2::/48"));
+    assert!(ipv6_cidrs_overlap(
+        "::ffff:192.0.2.1/128",
+        "::ffff:c000:200/120"
+    ));
+    assert_eq!(
+        subtract_cidrs(&["2001:2::/120".into()], &["2001:2::0.0.0.1/128".into()]),
+        subtract_cidrs(&["2001:2::/120".into()], &["2001:2::1/128".into()])
+    );
+}

@@ -616,3 +616,5 @@ async fn via_local_proxy_presents_the_loopback_credential() {
     );
 }
 mod manual_guard;
+
+mod redirect_policy;

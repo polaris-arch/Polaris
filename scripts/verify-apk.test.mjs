@@ -179,7 +179,7 @@ function goodApk(patch = {}, abi = DEFAULT_ABI) {
   members.set(`lib/${abi}/libpolaris_lib.so`, fakeAppSo({ cls, machine }));
   members.set(`lib/${abi}/libc++_shared.so`, fakeAppSo({ cls, machine }));
   for (let i = 0; i < SRS_COUNT; i += 1) {
-    members.set(`${ASSET_UP}${SRS_DIR}/geosite-${i}.srs`, Buffer.from('srs'));
+    members.set(`${ASSET_UP}${SRS_DIR}/geosite-${i}.srs`, Buffer.from(`SRS\x03geo-${i}`));
   }
   // 填充到真实 APK 的量级（classes.dex / res / META-INF …），让扫描面自检那条不误红。
   for (let i = 0; i < 200; i += 1) members.set(`res/filler/${i}.xml`, Buffer.from('x'));
@@ -211,7 +211,7 @@ function goodApk(patch = {}, abi = DEFAULT_ABI) {
       return hit;
     },
     repoLicense: (name) => licenses.get(name) ?? null,
-    repoSrsCount: SRS_COUNT,
+    repoSrs: new Map([...members].filter(([name]) => name.endsWith('.srs')).map(([name, bytes]) => [name.slice(`${ASSET_UP}${SRS_DIR}/`.length), Buffer.from(bytes)])),
     abi,
     // 判据 ⑦ 的取材面：默认造一份与登记表恰等的权限集（`patch` 可以就地改它）。
     permissions: {
@@ -230,14 +230,14 @@ function goodApk(patch = {}, abi = DEFAULT_ABI) {
 }
 
 function run(patch = () => {}, { abi = DEFAULT_ABI, judgeAs = abi } = {}) {
-  const { names, readMember, repoLicense, repoSrsCount, fileSize, entriesCompressedTotal, permissions, zipEntries } =
+  const { names, readMember, repoLicense, repoSrs, fileSize, entriesCompressedTotal, permissions, zipEntries } =
     goodApk(patch, abi);
   // `judgeAs` 与 `abi` 分开：造包用一个 ABI、判它用另一个，正是「参数没真的进判据」这条变异要的形状。
   return apkViolations({
     names,
     readMember,
     repoLicense,
-    repoSrsCount,
+    repoSrs,
     fileSize,
     entriesCompressedTotal,
     abi: judgeAs,
@@ -464,7 +464,7 @@ test('工作树 .srs 份数为零 ⇒ 红（`0 === 0` 不许判绿）', () => {
     repoLicense,
     permissions: g.permissions,
     zipEntries: g.zipEntries,
-    repoSrsCount: 0,
+    repoSrs: new Map(),
     fileSize: g.fileSize,
     entriesCompressedTotal: g.entriesCompressedTotal,
     abi: DEFAULT_ABI,
@@ -478,7 +478,7 @@ test('成员清单塌了（空 / 过短）⇒ 红在扫描面，不报成「许�
     names: [],
     readMember: () => Buffer.alloc(0),
     repoLicense: () => Buffer.from('x'),
-    repoSrsCount: SRS_COUNT,
+    repoSrs: new Map(),
     fileSize: 1,
     entriesCompressedTotal: 1,
     abi: DEFAULT_ABI,
@@ -594,7 +594,7 @@ test('真实尺度的红/绿对照：本机实测的两份产物喂进判据，�
     names,
     readMember: base.readMember,
     repoLicense: base.repoLicense,
-    repoSrsCount: SRS_COUNT,
+    repoSrs: base.repoSrs,
     abi: DEFAULT_ABI,
     permissions: base.permissions,
     zipEntries: base.zipEntries,
@@ -997,4 +997,62 @@ test('16 KB alignment checks every LOAD, including dependency libraries', () => 
   const result = run(input => input._members.set(`lib/${ABI}/libextra.so`, so));
   assert.ok(result.some(message => message.includes('libextra.so') && message.includes('16 KB')));
   assert.equal(elfPageAlignment(so.subarray(0, 70)).ok, false);
+});
+
+
+test('geo exact inventory rejects same-count renames and nested replacements', () => {
+  for (const replacement of ['renamed.srs', 'nested/geosite-0.srs']) {
+    const violations = run((input) => {
+      const old = `${ASSET_UP}${SRS_DIR}/geosite-0.srs`;
+      const bytes = input._members.get(old);
+      input._members.delete(old);
+      input._members.set(`${ASSET_UP}${SRS_DIR}/${replacement}`, bytes);
+    });
+    assert.equal(violations.length, 1, violations.join(' | '));
+    assert.match(violations[0], /路径集不一致/);
+    assert.ok(violations[0].includes(replacement));
+  }
+});
+
+test('geo exact bytes reject empty, truncated, and same-size changed content for every ABI', () => {
+  for (const abi of Object.keys(ABIS)) {
+    for (const mutation of [() => Buffer.alloc(0), (bytes) => bytes.subarray(0, -1),
+      (bytes) => { const changed = Buffer.from(bytes); changed[changed.length - 1] ^= 1; return changed; }]) {
+      const violations = run((input) => {
+        const key = `${ASSET_UP}${SRS_DIR}/geosite-0.srs`;
+        input._members.set(key, mutation(input._members.get(key)));
+      }, { abi });
+      assert.equal(violations.length, 1, violations.join(' | '));
+      assert.match(violations[0], /geosite-0.srs.*字节不一致/);
+    }
+  }
+});
+
+test('geo truth must be supplied and contain valid nonempty SRS seeds', () => {
+  const missing = run((input) => { input.repoSrs = undefined; });
+  assert.equal(missing.length, 1);
+  assert.match(missing[0], /资源真值缺失/);
+  for (const bytes of [Buffer.alloc(0), Buffer.from('SRS'), Buffer.from('bad!'), Buffer.from([0xd3, 0xd2, 0xd3, 3])]) {
+    const violations = run((input) => {
+      input.repoSrs.set('geosite-0.srs', bytes);
+      input._members.set(`${ASSET_UP}${SRS_DIR}/geosite-0.srs`, bytes);
+    });
+    assert.equal(violations.length, 1, violations.join(' | '));
+    assert.match(violations[0], /工作树.*不是有效 SRS/);
+  }
+});
+
+test('geo byte check reads each expected member once and ignores ZIP mode/compression metadata', () => {
+  const reads = new Map();
+  const violations = run((input) => {
+    const read = input.readMember;
+    input.readMember = (name) => { reads.set(name, (reads.get(name) ?? 0) + 1); return read(name); };
+    for (const [name, row] of input.zipEntries) {
+      if (name.endsWith('.srs')) { row.method = 0; row.externalAttributes = 0; }
+    }
+  });
+  assert.deepEqual(violations, []);
+  const geoReads = [...reads].filter(([name]) => name.endsWith('.srs'));
+  assert.equal(geoReads.length, SRS_COUNT);
+  assert.ok(geoReads.every(([, count]) => count === 1));
 });

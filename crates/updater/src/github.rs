@@ -144,7 +144,7 @@ pub struct GithubAsset {
     /// **供应链增强（上游 没有这一层）**：下载件按它做 sha256 强校验，补上「HTTPS 只保传输、
     /// 镜像回退把信任面扩到 gh-proxy 运营方」的洞。信任根仍是 GitHub（摘要与资产同源），
     /// 故**不需要自建密钥**——防的是截断/镜像投毒，不是防 GitHub 本身。
-    /// 缺失时回落 Content-Length 完整性校验（= 上游 基线），**不因缺摘要就拒绝更新**。
+    /// 缺失仍可展示发布信息；宿主可执行更新准入要求可信摘要，否则须手动安装。
     #[serde(default)]
     pub digest: Option<String>,
 }
@@ -195,8 +195,8 @@ pub struct AppUpdateInfo {
     pub file_name: String,
     /// 选中资产的期望 sha256（由 GitHub `digest` 字段解析；旧 release 无该字段 → `None`）。
     ///
-    /// 下载侧据此做强校验（**上游 没有这一层**）。`None` 时回落 Content-Length 完整性校验，
-    /// **不因缺摘要就拒绝更新**——否则所有旧 release 都会更新不了。
+    /// 下载侧据此做强校验。`None` 保留旧发布的信息展示；
+    /// 宿主可执行更新准入拒绝无摘要安装，用户可从发布页手动安装。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 }

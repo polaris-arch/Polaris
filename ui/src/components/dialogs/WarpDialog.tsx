@@ -110,6 +110,7 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
     setDirty(true);
   };
   const requestClose = () => {
+    if (submitting) return;
     if (!dirty || done) {
       close();
       return;
@@ -284,14 +285,12 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
       titleId="warp-dlg-title"
       title={isEdit ? t('warp.editTitle') : t('warp.addTitle')}
       onClose={requestClose}
+      closeDisabled={submitting}
       icon={<WarpIcon />}
       className="entry-form-dlg"
       footer={
         <>
-          {/* 提交中**不锁**「取消」：原型 `:2545` 的 ghost 钮无 disabled，且本仓此前四个弹窗锁、
-              两个不锁（NodeDialog/SubDialog）—— 不是与原型的差，是实现自己两套。统一为不锁：
-              提交卡住（IPC 无应答）时用户必须还能退出，否则弹窗成了死窗。 */}
-          <button type="button" className="btn ghost" onClick={requestClose}>
+          <button type="button" className="btn ghost" disabled={submitting} onClick={requestClose}>
             {t('common.cancel')}
           </button>
           <button type="button" className="btn flow" onClick={() => void handleSubmit()} disabled={submitting}>
@@ -303,6 +302,8 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
     >
       {!done && (
         <>
+          {registration.current.server && <p className="card-sub">{t('warp.registeredLocked')}</p>}
+          <fieldset disabled={submitting || !!registration.current.server} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
           {!isEdit && (
             <div className="mesh-note">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
@@ -386,6 +387,7 @@ function WarpForm({ instanceId, editNode, servers }: WarpFormProps) {
             collapsible
           />
 
+          </fieldset>
           {submitting && !isEdit && (
             <div className="ts-status">
               <span className="spinner spin-inline" />

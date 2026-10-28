@@ -1266,8 +1266,8 @@ jobs:
 
       # ── mac dmg 内附首次打开引导并封印最终 app bundle（#318）──
       # 本 workflow 没有 Developer ID / notarize（见文件头「发行信任边界」）⇒ 从下载的 dmg 拖出的 app 带
-      # `com.apple.quarantine`，首次打开被 Gatekeeper 拦下。此前的止血只有 README 一句
-      # `xattr -cr`，而**用户读不到 README** —— 他看到的是一个双击报错的 app。
+      # quarantine 可能触发 Gatekeeper。随包提供来源核验、系统批准和损坏/恶意告警停止指引；
+      # 不清除隔离属性，不把 ad-hoc seal 冒充 Developer ID 或 notarization。
       #
       # 为什么要转换往返：上游 那边是自己 `hdiutil create` 出 dmg，塞文件就是一次 cp；
       # Polaris 的 dmg 由 Tauri bundler 出，格式是 UDZO（只读压缩），必须
@@ -1431,13 +1431,10 @@ jobs:
               echo "::error::$(basename "$dmg") 的指南布局无效: position=$guide_position, windowHeight=$window_height"
               exit 1
             fi
-            # 内容也要对：空文件 / 半截文件同样是「有名无实」。
-            # 计数而非存在性：引导是五语单文件，每语一处 xattr 命令。用 `grep -Fq` 的话
-            # 射程只有 1/5 —— 五段里丢四段、或某段命令写错，门照样绿。加语种时同步改这个数。
-            cmd_count=$(grep -Fc 'xattr -cr /Applications/Polaris.app' "$mnt/$guide_name" || true)
-            if [ "$cmd_count" -ne 5 ]; then
+            # Compare all five complete translations, not a single marker or command.
+            if ! cmp -s packaging/macos-dmg-open-guide.txt "$mnt/$guide_name"; then
               hdiutil detach "$mnt" -quiet || true
-              echo "::error::$(basename "$dmg") 里的引导含 $cmd_count 处 xattr 命令，应为 5 处（五语各一）—— 内容不完整"
+              echo "::error::$(basename "$dmg") first-open guide differs from the validated source"
               exit 1
             fi
             detach_retry "$mnt"

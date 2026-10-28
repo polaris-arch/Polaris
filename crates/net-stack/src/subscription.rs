@@ -134,11 +134,27 @@ impl From<clash_parser::ClashDocumentError> for SubscriptionParseError {
     }
 }
 
-/// 默认订阅 UA：中性 `Polaris/<version>`（不带 clash.meta/mihomo 标识）。
-///
-/// **勿用于 GitHub API / 资源下载**：带版本号会泄漏客户端指纹，那条链路应使用应用自标识 UA。
-pub fn default_subscription_user_agent(version: &str) -> String {
-    format!("Polaris/{version}")
+/// Default application/subscription UA. The caller supplies the selected bundled
+/// kernel version; this pure crate never guesses a kernel version or probes a process.
+/// Custom subscription overrides bypass this formatter.
+pub fn default_subscription_user_agent(version: &str, core_version: &str) -> String {
+    fn safe_version(value: &str) -> &str {
+        if !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+        {
+            value
+        } else {
+            "unknown"
+        }
+    }
+    format!(
+        "Polaris/{} sing-box/{}",
+        safe_version(version),
+        safe_version(core_version)
+    )
 }
 
 /// 订阅流量/到期元数据（`Subscription-UserInfo` 响应头解析）。上游 `SubscriptionConfig['userInfo']`。
@@ -273,11 +289,8 @@ pub fn redact_url(url: &str) -> String {
                 u.to_string()
             }
         }
-        // 非法 URL 无法结构化处理：截到 `?` 前兜底去 query。
-        Err(_) => match url.find('?') {
-            Some(q) => format!("{}?<redacted>", &url[..q]),
-            None => url.to_string(),
-        },
+        // An unparsed authority cannot be safely partially redacted.
+        Err(_) => "<invalid-url>".to_owned(),
     }
 }
 
@@ -545,6 +558,9 @@ async fn fetch_core<H: HttpClient, L: DnsLookup>(
         // 安全拒绝：原文案冒泡（含 hostname / 解析结果，诊断需要）。
         SafeFetchRejectReason::Ssrf | SafeFetchRejectReason::TooManyRedirects => {
             SubscriptionFetchError::new(SubscriptionErrorKind::Ssrf, e.message)
+        }
+        SafeFetchRejectReason::Dns => {
+            SubscriptionFetchError::new(SubscriptionErrorKind::Dns, e.message)
         }
         SafeFetchRejectReason::RedirectProtocol => {
             SubscriptionFetchError::new(SubscriptionErrorKind::Scheme, e.message)
@@ -1081,26 +1097,13 @@ fn parse_subscription_bundle_inner(
                 Ok(v) => {
                     enforce_json_node_count(&v, &["outbounds", "endpoints"], limits)
                         .map_err(SubscriptionParseError::limit)?;
-                    let null = serde_json::Value::Null;
-                    let mut r = crate::singbox_import::parse_singbox_outbounds(
-                        v.get("outbounds").unwrap_or(&null),
+                    crate::singbox_import::parse_singbox_document(
+                        &v,
                         subscription_id,
                         now,
                         id_gen,
                         origin,
-                    );
-                    let ep = crate::singbox_import::parse_singbox_endpoints(
-                        v.get("endpoints").unwrap_or(&null),
-                        subscription_id,
-                        now,
-                        id_gen,
-                        origin,
-                    );
-                    r.servers.extend(ep.servers);
-                    r.skipped += ep.skipped;
-                    r.failed += ep.failed;
-                    r.warnings.extend(ep.warnings);
-                    r
+                    )
                 }
                 Err(e) => ClashParseResult {
                     warnings: vec![format!("sing-box JSON 解析失败: {e}")],
@@ -1357,29 +1360,58 @@ fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.is_empty())
 }
 
+/// Complete parser identity, excluding display labels and volatile source metadata.
+/// Shared by deduplication and subscription refresh matching so distinct TLS/transport
+/// configurations never exchange persistent IDs when a provider reorders its output.
+#[must_use]
+pub fn server_generation_identity(server: &ServerConfig) -> String {
+    let mut projection = server.clone();
+    projection.id.clear();
+    projection.name.clear();
+    projection.subscription_id = None;
+    let generation = polaris_config_engine::builder::orchestration::server_fingerprint(&projection);
+    if server.protocol == polaris_config_engine::user_config::server_config::Protocol::Tailscale {
+        serde_json::to_string(&(server_fingerprint(server), generation)).expect("string tuple")
+    } else {
+        generation
+    }
+}
+
 /// 同指纹去重（首见保留）。上游 `dedupeByFingerprint`：内联在前、provider 按声明序在后 →
 /// 同节点多源留内联那份。
 #[must_use]
 pub fn dedupe_by_fingerprint(servers: Vec<ServerConfig>) -> Vec<ServerConfig> {
-    let mut seen = std::collections::HashSet::new();
+    let graph = servers
+        .iter()
+        .map(|server| {
+            let mut projection = server.clone();
+            projection.detour = None;
+            (
+                server.id.clone(),
+                server_generation_identity(&projection),
+                server.detour.clone(),
+            )
+        })
+        .collect();
+    let classes = dependency_identity_classes(&[graph])
+        .pop()
+        .unwrap_or_default();
+    let mut retained: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    let mut remap = std::collections::HashMap::new();
     let mut out = Vec::with_capacity(servers.len());
-    for s in servers {
-        let mut projection = s.clone();
-        projection.id.clear();
-        projection.name.clear();
-        projection.subscription_id = None;
-        let generation =
-            polaris_config_engine::builder::orchestration::server_fingerprint(&projection);
-        // Tailscale source identity owns persistent state and must not merge across providers.
-        let key = if s.protocol
-            == polaris_config_engine::user_config::server_config::Protocol::Tailscale
-        {
-            serde_json::to_string(&(server_fingerprint(&s), generation)).expect("string tuple")
-        } else {
-            generation
-        };
-        if seen.insert(key) {
-            out.push(s);
+    for (server, class) in servers.into_iter().zip(classes) {
+        if let Some(class) = class {
+            if let Some(id) = retained.get(&class) {
+                remap.insert(server.id.clone(), id.clone());
+                continue;
+            }
+            retained.insert(class, server.id.clone());
+        }
+        out.push(server);
+    }
+    for server in &mut out {
+        if let Some(id) = server.detour.as_ref().and_then(|id| remap.get(id)) {
+            server.detour = Some(id.clone());
         }
     }
     out
@@ -1465,3 +1497,6 @@ fn base64_decode_inner(s: &str) -> Result<String, ()> {
 
 #[cfg(test)]
 mod tests;
+
+mod dependency_identity;
+pub use dependency_identity::dependency_identity_classes;

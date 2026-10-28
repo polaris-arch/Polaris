@@ -1494,31 +1494,27 @@ describe('无摘要明示：接线面 + 五语文案', () => {
       }
       // 两条说明必须写出「缺的是 sha256 摘要」——只写「未校验」会被读成「什么都没查」，
       // 而实际还有清单体积 / Content-Length 两级弱校验（虽都有条件，不写进文案）。
-      expect(json.settings.update.digestMissingBefore, `${loc} 下载前文案未点名 sha256`).toContain('sha256');
-      expect(json.settings.update.digestMissingAfter, `${loc} 下载后文案未点名 sha256`).toContain('sha256');
+      expect(json.settings.update.digestMissingBefore.toLowerCase().replaceAll('-', ''), `${loc} 下载前文案未点名 SHA-256`).toContain('sha256');
+      expect(json.settings.update.digestMissingAfter.toLowerCase().replaceAll('-', ''), `${loc} 下载后文案未点名 SHA-256`).toContain('sha256');
     }
   });
 
-  it('文案不得暗示「已校验」，也不得把它写成一次失败', async () => {
+  it('missing digest copy matches fail-closed executable admission and manual fallback', async () => {
     const fs = await import('node:fs');
-    const read = (loc: string) =>
-      (
-        JSON.parse(
-          fs.readFileSync(fileURLToPath(new URL(`../../../i18n/locales/${loc}.json`, import.meta.url)), 'utf8'),
-        ) as { settings: { update: Record<string, string> } }
-      ).settings.update;
+    const read = (loc: string) => JSON.parse(fs.readFileSync(
+      fileURLToPath(new URL(`../../../i18n/locales/${loc}.json`, import.meta.url)), 'utf8',
+    )).settings.update;
     const zh = read('zh-CN');
     const en = read('en-US');
-    for (const k of ['digestMissingBefore', 'digestMissingAfter'] as const) {
-      expect(zh[k], `zh-CN ${k} 不得声称已校验`).not.toMatch(/已校验|校验通过/);
-      // 无摘要不是错误、不阻断安装：写成「失败」会把一次正常更新描述成故障。
-      expect(zh[k], `zh-CN ${k} 不得写成失败`).not.toMatch(/失败|错误/);
-      expect(en[k], `en-US ${k} 不得声称 verified`).not.toMatch(/\bverified\b/i);
-      expect(en[k], `en-US ${k} 不得写成 failed`).not.toMatch(/\bfail(ed|ure)?\b/i);
+    expect(zh.digestMissingBefore).toContain('无法');
+    expect(zh.digestMissingAfter).toContain('无法');
+    expect(en.digestMissingBefore).toContain('unavailable');
+    expect(en.digestMissingAfter).toContain('cannot be installed');
+    for (const key of ['digestMissingBefore', 'digestMissingAfter']) {
+      expect(zh[key]).toContain('发布页手动安装');
+      expect(en[key]).toContain('release page');
+      expect(en[key]).not.toMatch(/not blocked|your call/i);
     }
-    // 下载前那条必须明说不阻断（用户此刻要决定的正是「还下不下」）。
-    expect(zh.digestMissingBefore, 'zh-CN 未说明不阻断更新').toMatch(/不会因此被阻断|不阻断/);
-    expect(en.digestMissingBefore, 'en-US 未说明不阻断更新').toMatch(/not blocked/i);
   });
 });
 
@@ -1961,7 +1957,7 @@ describe('预发布档次明示：接线面 + 五语文案', () => {
       ).toBe(false);
     }
     const settles = body.match(/settleInstall\(/g) ?? [];
-    expect(settles.length, 'installUpdate 的三条终态腿（便携 / 形态错配 / 抛错）都得 settle').toBe(3);
+    expect(settles.length, 'installUpdate 的四条终态腿（便携 / 手动 DMG / 形态错配 / 抛错）都得 settle').toBe(4);
 
     // ⑤ settleInstall 必须把「态 + `InstallSubject` 的**每一个**字段」一起写下。
     //    名单**由类型派生**：前身逐字枚举四条 setter，于是主语加第 5 个事实时第 5 格永远不会
@@ -2175,4 +2171,44 @@ describe('appUpdateErrText local reminder failure', () => {
     expect(appUpdateErrText('portableReminderClearFailed', null, (key) => key))
       .toBe('settings.update.downloadInterrupted');
   });
+});
+
+describe('OS-authoritative autostart changes', () => {
+  it('reflects OS state before config persistence and retains it when persistence fails', async () => {
+    const { changeAutoStart } = await import('./settings-logic');
+    const states: (boolean | null)[] = [];
+    await expect(changeAutoStart(true, { set: async () => {}, getStatus: async () => true },
+      (v) => states.push(v), async () => { throw new Error('disk'); })).rejects.toThrow('disk');
+    expect(states).toEqual([true]);
+  });
+  it('reads OS after failed mutation instead of assuming rollback', async () => {
+    const { changeAutoStart } = await import('./settings-logic');
+    const states: (boolean | null)[] = []; let writes = 0;
+    await expect(changeAutoStart(true, { set: async () => { throw new Error('transport'); }, getStatus: async () => true },
+      (v) => states.push(v), async () => { writes++; })).rejects.toThrow('transport');
+    expect(states).toEqual([true]); expect(writes).toBe(0);
+  });
+  it('unreadable OS state is unknown, never a fabricated disabled value', async () => {
+    const { changeAutoStart } = await import('./settings-logic');
+    const states: (boolean | null)[] = [];
+    await expect(changeAutoStart(false, { set: async () => {}, getStatus: async () => { throw new Error('read'); } },
+      (v) => states.push(v), async () => {})).rejects.toThrow('read');
+    expect(states).toEqual([null]);
+  });
+});
+
+
+it('explains that untrusted installation needs a fresh checked download', () => {
+  expect(installFailureKey('updateTrustRequired')).toBe('settings.update.updateTrustRequired');
+});
+
+
+it('settles a successful manual DMG handoff without claiming installation completed', () => {
+  const src = readFileSync(new URL('./use-app-update.ts', import.meta.url), 'utf8');
+  const branch = src.slice(src.indexOf('if (result.awaitingManualInstall)'), src.indexOf('if (result.handedToSystem'));
+  expect(branch).toContain("settleInstall('manual', t('settings.update.manualInstallerOpened'), subj, true)");
+  expect(branch).not.toContain('setManualInstallerOpened(');
+  expect(src).toContain('subject: InstallSubject, manualInstallerOpened = false');
+  expect(src).toContain('setManualInstallerOpened(manualInstallerOpened)');
+  expect(branch).toContain('return;');
 });

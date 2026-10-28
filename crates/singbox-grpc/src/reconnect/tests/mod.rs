@@ -20,3 +20,20 @@ fn auth_request_sets_bearer_value_for_valid_secret() {
         "Bearer abc-123"
     );
 }
+
+#[test]
+fn auth_request_without_secret_omits_authorization() {
+    assert!(auth_request(&None, ())
+        .unwrap()
+        .metadata()
+        .get("authorization")
+        .is_none());
+}
+
+#[test]
+fn auth_request_error_never_contains_secret() {
+    let secret = Some("private-credential\nsecret-suffix".to_owned());
+    let error = auth_request(&secret, ()).unwrap_err();
+    assert!(!error.contains("private-credential"));
+    assert!(!error.contains("secret-suffix"));
+}

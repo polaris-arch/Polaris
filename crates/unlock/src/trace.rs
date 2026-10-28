@@ -26,35 +26,9 @@ fn is_valid_ipv4(s: &str) -> bool {
     })
 }
 
-/// IPv6 校验（标准含冒号形式，支持 `::` 省略；不支持 IPv4-mapped 末段 dotted-quad，因 trace 不产该形态）。
+/// IPv6 语法校验：复用标准库，包含 `::` 压缩和 IPv4-mapped dotted-quad 形式。
 fn is_valid_ipv6(s: &str) -> bool {
-    if !s.contains(':') || s.is_empty() {
-        return false;
-    }
-    // 不含 `::` → 恰好 8 组。
-    // 含 `::` → 至多 7 组（省略段补零），且 `::` 仅出现一次。
-    let (groups, has_double_colon) = if let Some(idx) = s.find("::") {
-        // 确保仅一次 `::`
-        if s[idx + 2..].contains("::") {
-            return false;
-        }
-        (s.replace("::", ":"), true)
-    } else {
-        (s.to_string(), false)
-    };
-    let parts: Vec<&str> = groups.split(':').collect();
-    // replace 后首/尾可能产生空串（如 "::1" -> ":1" -> ["", "1"]；"1::" -> "1:" -> ["1",""]）。
-    let non_empty: Vec<&str> = parts.iter().copied().filter(|p| !p.is_empty()).collect();
-    let max_groups = if has_double_colon { 7 } else { 8 };
-    if non_empty.len() > max_groups {
-        return false;
-    }
-    if !has_double_colon && non_empty.len() != 8 {
-        return false;
-    }
-    non_empty
-        .iter()
-        .all(|p| p.len() <= 4 && !p.is_empty() && p.bytes().all(|b| b.is_ascii_hexdigit()))
+    s.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
 /// 解析后的 trace 信息（unlock 只用 ip + countryCode）。

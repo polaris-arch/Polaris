@@ -175,16 +175,30 @@ pub fn subscription_update(
     state: State<'_, AppRuntime>,
     subscription: Value,
 ) -> ApiResponse<()> {
+    match subscription_update_core(state.config(), subscription) {
+        Ok(cfg) => {
+            broadcast_config_changed(&app, &cfg);
+            ok_void()
+        }
+        Err(error) => ApiResponse::err(error),
+    }
+}
+
+fn subscription_update_core(
+    config: &crate::runtime::config::ConfigManager,
+    subscription: Value,
+) -> Result<Value, String> {
+    let subscription = normalized_subscription_update(subscription)?;
     let id = subscription
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_string);
     let id = match id {
         Some(i) => i,
-        None => return ApiResponse::err("subscription.id required"),
+        None => return Err("subscription.id required".to_owned()),
     };
     let mut subscription = subscription;
-    match state.config().update(|cfg| {
+    match config.update(|cfg| {
         let Some(idx) = cfg
             .get("subscriptions")
             .and_then(Value::as_array)
@@ -209,13 +223,10 @@ pub fn subscription_update(
         arr[idx] = subscription;
         Decision::Write(Ok(()))
     }) {
-        Ok((Ok(()), Some(cfg))) => {
-            broadcast_config_changed(&app, &cfg);
-            ok_void()
-        }
-        Ok((Err(error), None)) => ApiResponse::err(error),
+        Ok((Ok(()), Some(cfg))) => Ok(cfg),
+        Ok((Err(error), None)) => Err(error),
         Ok(_) => unreachable!("subscription_update decision and persistence must agree"),
-        Err(e) => ApiResponse::err(format!("{e}")),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -642,6 +653,11 @@ pub(crate) async fn perform_subscription_update(
     state: &AppRuntime,
     subscription_id: &str,
 ) -> Value {
+    // Reject overlaps before emitting progress: a rejected request must not publish a
+    // terminal frame over the current owner's still-running progress.
+    let Some(_refresh_owner) = state.subscription_refresh.try_admit(subscription_id) else {
+        return update_failure("该订阅正在更新，请等待当前更新完成后重试");
+    };
     let sink: Arc<dyn UpdateProgressSink> = Arc::new(BroadcastUpdateProgress {
         app: app.clone(),
         subscription_id: subscription_id.to_string(),
@@ -910,11 +926,8 @@ impl SubscriptionFetchIdentity {
     fn new(cfg: &Value, sub: &Value) -> Self {
         Self {
             url: sub.get("url").and_then(Value::as_str).map(str::to_owned),
-            user_agent: resolve_subscription_ua(cfg, sub).unwrap_or_else(|| {
-                polaris_net_stack::subscription::default_subscription_user_agent(env!(
-                    "CARGO_PKG_VERSION"
-                ))
-            }),
+            user_agent: resolve_subscription_ua(cfg, sub)
+                .unwrap_or_else(crate::runtime::http::app_user_agent),
         }
     }
 
@@ -925,6 +938,20 @@ impl SubscriptionFetchIdentity {
         }
         Ok(())
     }
+}
+
+/// Use the store's exact canonicalization before entering a mutating transaction.
+/// A malformed edit must not be silently dropped by save-time sanitization.
+fn normalized_subscription_update(subscription: Value) -> Result<Value, String> {
+    let cleaned =
+        polaris_store::sanitize_config(&json!({ "subscriptions": [subscription] }).to_string())
+            .map_err(|_| "订阅字段校验失败".to_owned())?;
+    cleaned["subscriptions"]
+        .as_array()
+        .filter(|subscriptions| subscriptions.len() == 1)
+        .and_then(|subscriptions| subscriptions.first())
+        .cloned()
+        .ok_or_else(|| "订阅 id、名称和 URL 必须是非空字符串".to_owned())
 }
 
 fn subscription_url_changed(old: &Value, new: &Value) -> bool {
@@ -1030,6 +1057,22 @@ fn node_fingerprint(v: &Value) -> String {
         .to_ascii_lowercase();
     let cred = node_cred(v);
     format!("{protocol}|{address}|{port}|{cred}|{network}")
+}
+
+/// Exact refresh identity. Local inbound authorization is not provider data; exclude
+/// it from comparison and restore it only after a source node has matched.
+fn node_generation_identity(value: &Value) -> Option<String> {
+    let mut node: ServerConfig = serde_json::from_value(value.clone()).ok()?;
+    node.mesh_inbound_policy = None;
+    if node.protocol == polaris_config_engine::user_config::server_config::Protocol::Tailscale {
+        // Tailscale identity owns account state; its mutable local/runtime settings
+        // must not split the provider/sourceTag/control identity.
+        Some(node_fingerprint(value))
+    } else {
+        Some(polaris_net_stack::subscription::server_generation_identity(
+            &node,
+        ))
+    }
 }
 
 /// Only a matched Tailscale source can inherit local account authorization and runtime policy.
@@ -1268,7 +1311,7 @@ pub(crate) fn record_auto_exit_after_removal(
 /// 破坏性对账：以拉取的新节点集为准，对本订阅节点做差集（add/update/remove），
 /// **他订阅节点与自建节点（subscriptionId 不匹配）一律不动**。
 ///
-/// 命中（指纹一致）：保留原 `id` + `createdAt`（选中节点 id 不失效、用户可见身份不变），
+/// 命中（完整身份优先；原始粗键桶双方唯一时兼容更新）：保留原 `id` + `createdAt`，
 /// 其余字段以新拉取为准。选中节点被删 → `selectedServerId` 置 `pick_viable_fallback_exit ?? DIRECT`
 /// 哨兵（**绝不裸 null**，避 generate 回归 + 不静默泄漏，对齐 上游 手动/自动路径 F14 reselect）。
 ///
@@ -1307,33 +1350,123 @@ fn reconcile_subscription_servers(
         .into_iter()
         .partition(|s| s.get("subscriptionId").and_then(Value::as_str) == Some(sub_id));
 
-    // 指纹 → 该指纹下**所有**现有节点的 FIFO 队列。指纹（protocol/address/port/cred/network，**不含 name**）
-    // 会碰撞：同 uuid 同 host:port 同传输、仅 name/SNI/path 异的 CDN/中转节点常见。此前用 `insert` 只留最后一个
-    // → 丢其余 id；且两个同指纹新节点会 `get` 到同一个旧节点 → 复制**同一个** id（重复 id）。
-    // 改为保留全部 + 逐个 1:1 消费（`pop_front`），彻底杜绝 id 丢失与重复。
-    let mut existing_by_key: HashMap<String, VecDeque<Value>> = HashMap::new();
-    for s in this_sub {
-        existing_by_key
-            .entry(node_fingerprint(&s))
+    // Compare dependency structure, not ephemeral imported IDs. Include unrelated
+    // persisted nodes for existing local references, in a separate ID namespace.
+    let graph_nodes = |values: &[Value]| -> Vec<(String, String, Option<String>)> {
+        values
+            .iter()
+            .map(|value| {
+                let id = value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let detour = value
+                    .get("detour")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let mut projection = value.clone();
+                if let Some(object) = projection.as_object_mut() {
+                    object.remove("detour");
+                }
+                // Unparseable nodes retain an exact serialized signature rather than
+                // masquerading as a valid source node with an empty identity.
+                let signature = node_generation_identity(&projection)
+                    .unwrap_or_else(|| format!("invalid:{}", projection));
+                (id, signature, detour)
+            })
+            .collect()
+    };
+    let mut old_graph_values = this_sub.clone();
+    old_graph_values.extend(others.iter().cloned());
+    let classes = polaris_net_stack::subscription::dependency_identity_classes(&[
+        graph_nodes(&old_graph_values),
+        graph_nodes(&new_vals),
+    ]);
+    let old_classes = &classes[0];
+    let new_classes = &classes[1];
+
+    // Reserve every exact match before considering legacy compatibility. A one-pass
+    // coarse FIFO can steal B's ID for changed A before reaching unchanged B.
+    let mut old_nodes: Vec<Option<Value>> = this_sub.into_iter().map(Some).collect();
+    let mut exact: HashMap<usize, VecDeque<usize>> = HashMap::new();
+    let mut old_coarse: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut new_coarse: HashMap<String, usize> = HashMap::new();
+    for (index, old) in old_nodes.iter().enumerate() {
+        let old = old.as_ref().expect("unconsumed old node");
+        old_coarse
+            .entry(node_fingerprint(old))
             .or_default()
-            .push_back(s);
+            .push(index);
+        if let Some(key) = old_classes[index] {
+            exact.entry(key).or_default().push_back(index);
+        }
     }
+    for new in &new_vals {
+        *new_coarse.entry(node_fingerprint(new)).or_default() += 1;
+    }
+    let mut matches = vec![None; new_vals.len()];
+    for (index, new) in new_vals.iter().enumerate() {
+        let coarse = node_fingerprint(new);
+        // Never choose an arbitrary Tailscale account state, even if generation
+        // fields could distinguish two old records with the same source identity.
+        if coarse.starts_with("tailscale:")
+            && old_coarse.get(&coarse).is_some_and(|nodes| nodes.len() > 1)
+        {
+            continue;
+        }
+        if let Some(key) = new_classes[index] {
+            matches[index] = exact.get_mut(&key).and_then(VecDeque::pop_front);
+        }
+    }
+    let reserved: std::collections::HashSet<usize> = matches.iter().flatten().copied().collect();
+    for (index, new) in new_vals.iter().enumerate() {
+        if matches[index].is_some() {
+            continue;
+        }
+        let key = node_fingerprint(new);
+        // Only ORIGINAL singleton buckets can inherit the existing compatibility
+        // contract (e.g. an SNI/path update). Remaining ambiguous nodes never guess.
+        if new_coarse.get(&key) == Some(&1) {
+            if let Some(indices) = old_coarse.get(&key).filter(|indices| indices.len() == 1) {
+                let old_index = indices[0];
+                if !reserved.contains(&old_index) {
+                    matches[index] = Some(old_index);
+                }
+            }
+        }
+    }
+
+    // All matches are reserved before any edge is rewritten. Provider leftovers
+    // already carry stable IDs and are left untouched by this imported-ID map.
+    let imported_to_final: HashMap<String, String> = new_vals
+        .iter()
+        .zip(&matches)
+        .filter_map(|(new, matched)| {
+            let imported = new.get("id")?.as_str()?;
+            let final_id = matched
+                .and_then(|index| old_nodes[index].as_ref())
+                .and_then(|old| old.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or(imported);
+            Some((imported.to_owned(), final_id.to_owned()))
+        })
+        .collect();
 
     let mut reconciled: Vec<Value> = Vec::with_capacity(new_vals.len());
     let (mut added, mut updated) = (0usize, 0usize);
-    for mut nv in new_vals {
-        let key = node_fingerprint(&nv);
-        // 1:1 消费：pop 掉一个已匹配的旧节点，防第二个同指纹新节点复用同一 id。
-        // An old duplicate TS identity is ambiguous: never guess which account state to reuse.
-        let matched = if key.starts_with("tailscale:")
-            && existing_by_key
-                .get(&key)
-                .is_some_and(|queue| queue.len() > 1)
+    for (mut nv, matched_index) in new_vals.into_iter().zip(matches) {
+        if let Some(target) = nv
+            .get("detour")
+            .and_then(Value::as_str)
+            .and_then(|id| imported_to_final.get(id))
+            .cloned()
         {
-            None
-        } else {
-            existing_by_key.get_mut(&key).and_then(VecDeque::pop_front)
-        };
+            nv.as_object_mut()
+                .expect("serialized ServerConfig")
+                .insert("detour".into(), Value::String(target));
+        }
+        let matched = matched_index.and_then(|index| old_nodes[index].take());
         if let Some(old) = matched {
             // 命中 → 保留稳定 id + 原 createdAt。
             if let Some(nobj) = nv.as_object_mut() {
@@ -1357,8 +1490,8 @@ fn reconcile_subscription_servers(
         reconciled.push(nv);
     }
 
-    // 未被任何新节点 1:1 消费掉的现有本订阅节点（队列剩余）。指纹整体消失 + 碰撞未配对都算。
-    let leftover: Vec<Value> = existing_by_key.into_values().flatten().collect();
+    // Unconsumed old records retain their original order for deterministic partial-provider merge-back.
+    let leftover: Vec<Value> = old_nodes.into_iter().flatten().collect();
     let leftover_total = leftover.len();
     // merge_only（provider 部分失败）→ 按 provider 精确挑保留项；否则 leftover 整体即删除集。
     let kept: Vec<Value> = if merge_only {

@@ -1,3 +1,6 @@
+import { useInputRequest } from '@/hooks/use-input-request';
+import { autoSelectChoice, autoSelectTargetLabel } from '@/domain/auto-select-choice';
+import { autoSelectTarget } from '@/domain/auto-select-target';
 import { MobileSelect as MobileSelect } from '../MobileSelect';
 /**
  * 移动端**规则表单**（新建 / 编辑；流量面与 DNS 面共用一张表，由 `initialPlane` 分叉）。
@@ -6,7 +9,7 @@ import { MobileSelect as MobileSelect } from '../MobileSelect';
  *
  * 桌面 `RuleDialog.tsx` 那 516 行里，真正是判据的部分早就住在纯 `.ts` 里，本面板原样吃它们：
  *  · 草稿编辑 —— `rule-cond.ts` 的 `setCondTypeAt` / `toggleCondValueAt` / `parseConditionValues` /
- *    `invalidCondValues` / `computeTestMatch`，以及候选面的 `matchRuleValueOptions` /
+ *    `invalidCondValues` / `useRuleTestFold`，以及候选面的 `matchRuleValueOptions` /
  *    `offPoolSelectedOptions`；
  *  · 候选池 —— `use-rule-pools.ts` 的 `useRulePools`（惰性取数 + 排序快照，零 DOM 依赖）；
  *  · 类型物料 —— `domain/rules.ts` 的 `RULE_TYPES` / `RULE_TYPE_IDS` / `RULE_CATEGORY_ORDER` /
@@ -44,6 +47,7 @@ import { MobileSelect as MobileSelect } from '../MobileSelect';
  */
 
 import { useMemo, useState, type ReactElement } from 'react';
+import { useRuleTestFold } from '@/hooks/use-rule-test';
 import { useTranslation } from 'react-i18next';
 import type { Rule, RuleType } from '@/contracts/types';
 import {
@@ -66,7 +70,6 @@ import {
 import { defaultOpenGroupIds, groupServersBySubscription } from '@/domain/server-grouping';
 import type { CselGroup } from '@/components/dialogs/csel-logic';
 import {
-  computeTestMatch,
   matchRuleValueOptions,
   offPoolSelectedOptions,
   selectedValueSet,
@@ -138,8 +141,8 @@ export function RuleFormPanel({
   const plane: 'route' | 'dns' = initialPlane ?? 'route';
   /* 读 **effective** 不读盘：暂存过的规则打开时要显示暂存后的值（同桌面 `RuleDialog.tsx:501`）。 */
   const planeRules = useEffectiveRules(plane);
-  const base = ruleId === undefined ? undefined : planeRules.find((rule) => rule.id === ruleId);
-  const isEdit = base !== undefined;
+  const [base] = useState(() => ruleId === undefined ? undefined : planeRules.find((rule) => rule.id === ruleId));
+  const isEdit = ruleId !== undefined;
 
   const config = useEffectiveConfig();
   const servers = useEffectiveServers();
@@ -296,6 +299,8 @@ export function RuleFormPanel({
           { value: TARGET_POLICY_VALUES[2], label: tr('rules.targetBlock'), danger: true },
         ],
       },
+      ...(config?.autoSelectEnabled ? [{ label: tr('autoSelect.auto'), options: [{ value: autoSelectChoice({ scope: 'global' }), label: autoSelectTargetLabel(config, { scope: 'global' }, tr) }] }]
+        : baseRouteEffect?.targetAutoSelect ? [{ label: tr('appPolicy.summary.node'), options: [{ value: autoSelectChoice(baseRouteEffect.targetAutoSelect), label: autoSelectTargetLabel(config, baseRouteEffect.targetAutoSelect, tr) }] }] : []),
       ...nodeGroups.map((group) => ({
         id: group.id,
         /* 自建 / 组网组的 `name` 是占位符，按 isManual/isMesh 本地化（ServerGroup 契约的明文要求）。 */
@@ -304,14 +309,14 @@ export function RuleFormPanel({
           : group.isMesh
             ? tr('nodes.tab.mesh')
             : group.name,
-        options: group.servers.map((server) => ({
+        options: [ ...(config?.autoSelectEnabled && group.servers.length ? [{ value: autoSelectChoice(autoSelectTarget(group)), label: autoSelectTargetLabel(config, autoSelectTarget(group), tr) }] : []), ...group.servers.map((server) => ({
           value: `node:${server.id}`,
           label: `${tr('rules.targetProxyTo')} ${server.name}`,
-        })),
+        }))],
       })),
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [nodeGroups, t],
+    [nodeGroups, t, config, baseRouteEffect],
   );
   const targetOpenGroups = useMemo(
     () => defaultOpenGroupIds(nodeGroups, targetNodeId),
@@ -378,7 +383,7 @@ export function RuleFormPanel({
 
   /* ── 测试匹配 ───────────────────────────────────────────────────────── */
 
-  const testResult = useMemo(() => computeTestMatch(conds, logic, test), [conds, logic, test]);
+  const testResult = useRuleTestFold(conds, logic, test);
 
   /* ── 提交 / 删除 / 关闭 ─────────────────────────────────────────────── */
 
@@ -403,10 +408,13 @@ export function RuleFormPanel({
     });
   };
 
+  const beginSubmit = useInputRequest(JSON.stringify([conds, name, networkProfileId,
+    logic, target, dns]));
   const submit = (): void => {
     if (submitting) return;
     setNotice(undefined);
     void submitRule({
+      isCurrent: beginSubmit(),
       t,
       conds,
       name,

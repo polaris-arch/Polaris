@@ -82,7 +82,7 @@ fn backfill_does_not_overwrite_corrupt_config() {
     let corrupt = "{ not valid json at all";
     std::fs::write(dir.join("config.json"), corrupt).unwrap();
     let mgr = ConfigManager::new(dir.clone());
-    backfill_secret_and_privacy(&mgr).unwrap();
+    assert!(backfill_secret_and_privacy(&mgr).is_err());
     // 原损坏文件须原样保留（未被默认+secret 覆盖）。
     assert_eq!(
         std::fs::read_to_string(dir.join("config.json")).unwrap(),
@@ -147,4 +147,132 @@ fn f29_skips_when_scrypt_file_already_present() {
         !unlock_core(&mgr2, "stale-plaintext").unwrap(),
         "旧明文不得成为新密码"
     );
+}
+
+#[test]
+fn failed_privacy_maintenance_still_persists_api_secret_and_remains_retryable() {
+    for initial_secret in [None, Some("")] {
+        for unreadable in [false, true] {
+            let dir = temp_dir("independent-secret");
+            let mut cfg = valid_config();
+            if let Some(secret) = initial_secret {
+                cfg["clashApiSecret"] = json!(secret);
+            }
+            std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+            let mgr = ConfigManager::new(dir.clone());
+            let credential = privacy_lock_path(&mgr);
+            if unreadable {
+                std::fs::create_dir(&credential).unwrap();
+            } else {
+                std::fs::write(&credential, "{broken").unwrap();
+            }
+            let done = AtomicBool::new(false);
+            assert!(run_startup_maintenance(&mgr, &done).is_err());
+            assert!(!done.load(Ordering::SeqCst));
+            let disk: Value =
+                serde_json::from_str(&std::fs::read_to_string(mgr.path()).unwrap()).unwrap();
+            let secret = disk["clashApiSecret"].as_str().unwrap().to_owned();
+            assert_eq!(secret.len(), 32);
+            // Explicit fixture repair, never a real user's credential.
+            if unreadable {
+                std::fs::remove_dir(&credential).unwrap();
+            } else {
+                std::fs::remove_file(&credential).unwrap();
+            }
+            assert!(run_startup_maintenance(&mgr, &done).is_ok());
+            assert!(done.load(Ordering::SeqCst));
+            assert_eq!(mgr.current().unwrap()["clashApiSecret"], secret);
+        }
+    }
+}
+
+#[test]
+fn plaintext_survives_failed_scrypt_migration_without_blocking_api_secret_publication() {
+    let dir = temp_dir("plaintext-migration-retry");
+    let mut cfg = valid_config();
+    cfg["privacyPassword"] = json!("legacy-password");
+    std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    std::fs::write(privacy_lock_path(&mgr), "{broken").unwrap();
+    assert!(backfill_secret_and_privacy(&mgr).is_err());
+    assert!(unlock_core(&mgr, "legacy-password").is_err());
+    let disk: Value = serde_json::from_str(&std::fs::read_to_string(mgr.path()).unwrap()).unwrap();
+    assert!(!disk["clashApiSecret"].as_str().unwrap().is_empty());
+    assert!(verify_password(
+        disk[PRIVACY_PASSWORD_HASH_KEY].as_str().unwrap(),
+        "legacy-password"
+    ));
+    assert_ne!(disk["privacyPassword"], "legacy-password");
+    std::fs::remove_file(privacy_lock_path(&mgr)).unwrap();
+    backfill_secret_and_privacy(&mgr).unwrap();
+    assert!(unlock_core(&mgr, "legacy-password").unwrap());
+}
+
+fn duplicate_identity_cold_recovery(plain_password: bool) {
+    let dir = temp_dir("duplicate-cold-recovery");
+    let mut cfg = valid_config();
+    cfg["servers"] = json!([
+        {"id":"same","name":"A","protocol":"trojan","address":"a.invalid","port":443,"password":"fixture-a"},
+        {"id":"same","name":"B","protocol":"trojan","address":"b.invalid","port":443,"password":"fixture-b"}
+    ]);
+    if plain_password {
+        cfg["clashApiSecret"] = json!("existing-fixture-secret");
+        cfg["privacyPassword"] = json!("fixture-legacy-password");
+    } else {
+        cfg["clashApiSecret"] = json!("");
+    }
+    std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+    let mgr = ConfigManager::new(dir.clone());
+    let done = AtomicBool::new(false);
+    // config_get must remain fail-closed; the independent recovery projection is available.
+    assert!(run_startup_maintenance(&mgr, &done).is_err());
+    assert!(!done.load(Ordering::SeqCst));
+    let preview = serde_json::to_value(mgr.identity_conflicts().unwrap()).unwrap();
+    assert_eq!(preview["groups"].as_array().unwrap().len(), 1);
+    let mut expected = cfg.clone();
+    expected["servers"][1]["id"] = json!("recovered-fixture-id");
+    mgr.repair_server_identities(
+        &serde_json::from_value::<crate::runtime::config::IdentityRepairRequest>(json!({
+            "version": preview["version"],
+            "choices": [{"indices":[0,1],"keeperIndex":0}]
+        }))
+        .unwrap(),
+        || "recovered-fixture-id".into(),
+    )
+    .unwrap();
+    let repaired: Value = serde_json::from_slice(&std::fs::read(mgr.path()).unwrap()).unwrap();
+    assert_eq!(
+        repaired, expected,
+        "repair changes only the explicitly chosen nonkeeper ID"
+    );
+    assert!(
+        serde_json::to_value(mgr.identity_conflicts().unwrap()).unwrap()["groups"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    run_startup_maintenance(&mgr, &done).unwrap();
+    assert!(done.load(Ordering::SeqCst));
+    let mut frontend = mgr.load_full().unwrap();
+    apply_frontend_view(&mut frontend);
+    assert!(frontend["clashApiSecret"]
+        .as_str()
+        .is_some_and(|s| !s.trim().is_empty()));
+    assert!(frontend.get("privacyPassword").is_none());
+    if plain_password {
+        assert!(
+            polaris_store::privacy_lock::has(&polaris_store::StdFs, &privacy_lock_path(&mgr))
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn cold_duplicate_ids_with_blank_api_secret_have_independent_recovery() {
+    duplicate_identity_cold_recovery(false);
+}
+
+#[test]
+fn cold_duplicate_ids_with_pending_privacy_migration_have_independent_recovery() {
+    duplicate_identity_cold_recovery(true);
 }

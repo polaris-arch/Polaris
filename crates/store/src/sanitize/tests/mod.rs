@@ -376,7 +376,7 @@ fn periodic_speed_test_settings_are_removed_not_clamped_when_invalid() {
 /// 原样保留；结构完好而取值本版本不认识（更新的版本写的模式或作用域）→ 原样保留，读取时不生效。
 /// 订阅本身被清洗掉（缺必填字段）时，指向它的意图一并移除。
 #[test]
-fn the_selection_intent_is_removed_when_broken_or_dangling_and_kept_otherwise() {
+fn auto_references_remain_explicit_when_empty_or_in_need_of_repair() {
     let cleaned = |intent: Value| {
         let config = json!({
             "subscriptions": [
@@ -417,9 +417,16 @@ fn the_selection_intent_is_removed_when_broken_or_dangling_and_kept_otherwise() 
         Value::Null,
     ] {
         let result = cleaned(bad.clone());
-        assert!(result.get("selectionIntent").is_none(), "{bad} 应被移除");
-        assert_eq!(crate::selection_intent_subscription(&result), None);
-        assert!(!crate::selection_intent_unrecognized(&result));
+        if bad.get("mode").and_then(Value::as_str) == Some("auto") {
+            assert_eq!(
+                result["selectionIntent"], bad,
+                "explicit Auto intent stays pending repair"
+            );
+        } else {
+            assert!(result.get("selectionIntent").is_none(), "{bad} 应被移除");
+            assert_eq!(crate::selection_intent_subscription(&result), None);
+            assert!(!crate::selection_intent_unrecognized(&result));
+        }
         assert_eq!(result["subscriptions"][0]["id"], "sub", "只丢意图这一个键");
     }
 
@@ -445,7 +452,7 @@ fn the_selection_intent_is_removed_when_broken_or_dangling_and_kept_otherwise() 
     // 没有订阅表时本版本认识的意图是悬空的；没有意图键时什么都不做。
     let no_subscriptions =
         sanitize_config(&json!({ "selectionIntent": valid }).to_string()).unwrap();
-    assert!(no_subscriptions.get("selectionIntent").is_none());
+    assert_eq!(no_subscriptions["selectionIntent"], valid);
     assert!(sanitize_config("{}")
         .unwrap()
         .get("selectionIntent")

@@ -874,14 +874,29 @@ fn helper_action_error_codes_serialize_as_frontend_contract() {
         (HelperActionErrorCode::Cancelled, "cancelled"),
         (HelperActionErrorCode::PartialCleanup, "partialCleanup"),
         (
-            HelperActionErrorCode::AuthorizationUnavailable,
-            "authorizationUnavailable",
+            HelperActionErrorCode::AuthorizationIncomplete,
+            "authorizationIncomplete",
         ),
         (HelperActionErrorCode::ProxyRunning, "proxyRunning"),
         (HelperActionErrorCode::Unsupported, "unsupported"),
         (HelperActionErrorCode::MissingAsset, "missingAsset"),
         (HelperActionErrorCode::BundleMismatch, "bundleMismatch"),
         (HelperActionErrorCode::NotReady, "notReady"),
+        (
+            HelperActionErrorCode::InvalidInstallation,
+            "invalidInstallation",
+        ),
+        (HelperActionErrorCode::TokenWriteFailed, "tokenWriteFailed"),
+        (
+            HelperActionErrorCode::ScriptWriteFailed,
+            "scriptWriteFailed",
+        ),
+        (
+            HelperActionErrorCode::AuthorizationLaunchFailed,
+            "authorizationLaunchFailed",
+        ),
+        (HelperActionErrorCode::InstallerFailed, "installerFailed"),
+        (HelperActionErrorCode::UpgradeDeferred, "upgradeDeferred"),
         (HelperActionErrorCode::Failed, "failed"),
     ];
     for (code, wire) in cases {
@@ -893,10 +908,10 @@ fn helper_action_error_codes_serialize_as_frontend_contract() {
 }
 
 #[test]
-fn pkexec_without_auth_agent_has_its_own_stable_error_code() {
+fn pkexec_authorization_incomplete_has_its_own_stable_error_code() {
     assert_eq!(
         escalation_failure_code(Platform::Linux, 127),
-        HelperActionErrorCode::AuthorizationUnavailable
+        HelperActionErrorCode::AuthorizationIncomplete
     );
     assert_eq!(
         escalation_failure_code(Platform::Linux, 126),
@@ -906,7 +921,7 @@ fn pkexec_without_auth_agent_has_its_own_stable_error_code() {
     assert_eq!(
         escalation_failure_code(Platform::Mac, 127),
         HelperActionErrorCode::Failed,
-        "127 的认证代理语义只属于 pkexec"
+        "127 的授权未完成语义只属于 pkexec"
     );
 }
 
@@ -993,37 +1008,22 @@ fn resolve_helper_binary_env_override_rejects_missing() {
     assert!(r.is_err());
 }
 
-/// W20 防回潮：`status()` 必须走带恢复腿的探测。直连 `compute_status_with_client` 会把
-/// 「装了但停着」误报成修复态（UI 弹「修复助手」），而那只是 `sc start` 一把的事。
-/// 行为已在 helper-client 单测覆盖（recovery_* 五条），这里源码级钉住接线不被回退——
-/// 本机 Linux gate 走不到 win 分身，编译器拦不住这行被改回去。
-///
-/// 钉法：走共用取材器 [`impl_method_body`]（`impl` 块内方法，按四空格 `}` 封顶），
-/// 只断言生产方法体；断言串再经 `concat!` 打断——否则测试自身的字符串字面量就是取材面里的一个
-/// 命中点，改回生产代码后测试照样绿（评审 F1 实证过的假绿形态）。
-///
-/// # 手写切片器换成共用器，换掉的是三处会静默放水的地方
-///
-/// 旧写法 `find("pub fn status(")` → 封顶到 `"\n    /// "`（下一个兄弟文档注释）：
-/// - **封顶锚在注释上**：把 `status` 与下一个方法之间那段文档注释删掉（或改成 `//` 行注释），
-///   `unwrap_or(rest.len())` 直接把切片放到**文件尾** —— 射程从「这个方法」变成「这个文件」，
-///   而 `status_with_recovery(&client)` 在别处出现一次就能替它作证，门不会喊；
-/// - **锚点不校验唯一性**：`find` 取首次命中，取材面里再出现一个 `pub fn status(`（另一个类型的
-///   同名方法）时，切的是哪一个全凭书写顺序；
-/// - **不剥注释**：本条是正面 `contains`，把那行调用整行注释掉，注释里那份副本照样喂饱它。
-///
-/// 共用器三处都反过来：锚点必须带 `impl` 方法缩进、必须**恰好**出现一次、内部再剥一道；
-/// 取材先过 [`crate_code`]，行尾与块注释也一并剥掉。
+/// Query, tray polling, action replies and uninstall preflight all use the same
+/// side-effect-free status method. Exact production-body checks reject a hidden
+/// recovery/start call even when a comment or another method mentions the probe.
 #[test]
-fn status_wiring_uses_recovery_probe() {
+fn status_wiring_is_read_only_for_all_callers() {
+    let source = crate_code("runtime/helper.rs");
     let body = impl_method_body(
-        &crate_code("runtime/helper.rs"),
+        &source,
         "    pub fn status(&self) -> HelperStatusSnapshot {",
     );
-    assert!(
-        body.contains(concat!("status_with_recovery", "(&client)")),
-        "HelperRuntime::status 必须调 status_with_recovery（W20 恢复腿）"
-    );
+    assert!(body.contains(concat!("compute_status_with_client", "(&client)")));
+    assert!(!body.contains(".start("));
+    assert!(!source.contains(concat!("status_with_", "recovery")));
+    let failure = impl_method_body(&source, "    fn action_failed(");
+    assert!(failure.contains("status: self.status()"));
+    assert!(!failure.contains(".start("));
 }
 
 /// B1：`start` 回传的 `created=` 必须**存下来**当崩溃监测的初始基线，且拿不到时不留陈值。
@@ -1224,7 +1224,7 @@ fn native_partial_cleanup_is_only_an_uninstall_failure_code() {
     );
     assert_eq!(
         uninstall_failure_code(Platform::Linux, 127),
-        HelperActionErrorCode::AuthorizationUnavailable
+        HelperActionErrorCode::AuthorizationIncomplete
     );
 }
 
@@ -1301,5 +1301,139 @@ fn installer_uid_matches_the_native_nonroot_app_user() {
     assert_ne!(
         observed, 0,
         "Mac App/admin-CLI regression must run as the actual nonroot runner"
+    );
+}
+
+#[test]
+fn helper_install_errors_preserve_preparation_stage_without_guessing_cause() {
+    use std::io::{Error, ErrorKind};
+    let cases = [
+        (
+            ManagerError::InvalidInstallation("private"),
+            HelperActionErrorCode::InvalidInstallation,
+        ),
+        (
+            ManagerError::HelperBinaryMissing(PathBuf::from("private")),
+            HelperActionErrorCode::MissingAsset,
+        ),
+        (
+            ManagerError::TokenWrite(Error::from(ErrorKind::PermissionDenied)),
+            HelperActionErrorCode::TokenWriteFailed,
+        ),
+        (
+            ManagerError::ScriptWrite(Error::from(ErrorKind::StorageFull)),
+            HelperActionErrorCode::ScriptWriteFailed,
+        ),
+        (
+            ManagerError::Escalation(ClientError::Io(Error::from(ErrorKind::NotFound))),
+            HelperActionErrorCode::AuthorizationLaunchFailed,
+        ),
+        (
+            ManagerError::UnsupportedPlatform(Platform::Ios),
+            HelperActionErrorCode::Unsupported,
+        ),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(manager_install_failure_code(&error), expected);
+    }
+    for platform in [Platform::Mac, Platform::Win, Platform::Linux] {
+        assert_eq!(
+            install_command_failure_code(platform, 1, ""),
+            HelperActionErrorCode::InstallerFailed
+        );
+    }
+    assert_eq!(
+        install_command_failure_code(Platform::Linux, 127, ""),
+        HelperActionErrorCode::AuthorizationIncomplete
+    );
+    assert_eq!(
+        install_command_failure_code(Platform::Mac, 127, ""),
+        HelperActionErrorCode::InstallerFailed
+    );
+}
+
+#[test]
+fn helper_upgrade_deferral_recognizes_the_observed_macos_marker_not_exit_code_or_prose() {
+    let actual = "0:174: execution error: helper administration: helper busy, unknown or legacy upgrade admission unsupported\nHELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY (75)";
+    assert_eq!(
+        install_command_failure_code(Platform::Mac, 1, actual),
+        HelperActionErrorCode::UpgradeDeferred
+    );
+    assert_eq!(
+        install_command_failure_code(
+            Platform::Linux,
+            75,
+            "HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY"
+        ),
+        HelperActionErrorCode::UpgradeDeferred
+    );
+    for diagnostic in [
+        "",
+        "helper busy",
+        "helper busy, unknown or legacy upgrade admission unsupported",
+        "path/HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY",
+        "HELPER_UPGRADE_DEFERRED_ACTIVE_OR_LEGACY (1)",
+    ] {
+        assert_eq!(
+            install_command_failure_code(Platform::Mac, 75, diagnostic),
+            HelperActionErrorCode::InstallerFailed
+        );
+    }
+}
+
+#[test]
+fn helper_install_mode_is_typed_and_defaults_to_ordinary() {
+    assert_eq!(HelperInstallMode::default(), HelperInstallMode::Ordinary);
+    assert_eq!(
+        serde_json::from_str::<HelperInstallMode>("\"stopAndUpgrade\"").unwrap(),
+        HelperInstallMode::StopAndUpgrade
+    );
+    assert_eq!(
+        serde_json::from_str::<HelperInstallMode>("\"ordinary\"").unwrap(),
+        HelperInstallMode::Ordinary
+    );
+    for invalid in ["true", "1", "\"force\"", "\"stop-and-upgrade\"", "{}"][..].iter() {
+        assert!(serde_json::from_str::<HelperInstallMode>(invalid).is_err());
+    }
+    for &platform in Platform::ALL {
+        assert!(HelperInstallMode::Ordinary.supported_on(platform));
+        assert_eq!(
+            HelperInstallMode::StopAndUpgrade.supported_on(platform),
+            platform == Platform::Mac
+        );
+        if platform != Platform::Mac {
+            let dir = TestDir::new("polaris-helper-explicit-mode-");
+            let runtime = HelperRuntime::with_platform_for_tests(dir.clone(), platform);
+            let result = runtime.install_with_mode(HelperInstallMode::StopAndUpgrade);
+            assert!(!result.success);
+            assert_eq!(result.error_code, Some(HelperActionErrorCode::Unsupported));
+        }
+    }
+}
+
+#[test]
+fn windows_installer_stage_codes_are_presentation_only_and_platform_scoped() {
+    assert_eq!(
+        install_command_failure_code(Platform::Win, 75, ""),
+        HelperActionErrorCode::UpgradeDeferred
+    );
+    assert_eq!(
+        install_command_failure_code(Platform::Mac, 75, ""),
+        HelperActionErrorCode::InstallerFailed
+    );
+    for code in 81..=88 {
+        assert_eq!(
+            install_command_failure_code(Platform::Win, code, "secret details"),
+            HelperActionErrorCode::InstallerFailed
+        );
+        assert!(install_command_diagnostic(Platform::Win, code).contains("Windows"));
+        assert_eq!(
+            install_command_diagnostic(Platform::Linux, code),
+            "helper installer exited unsuccessfully"
+        );
+    }
+    assert_eq!(
+        install_command_diagnostic(Platform::Win, 1),
+        "helper installer exited unsuccessfully"
     );
 }

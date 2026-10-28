@@ -405,8 +405,13 @@ pub(super) async fn run_connections_stream(
                 offline_sent = true;
             }
             let detail_open = gate.topic_open(Topic::Detail);
+            let Some(detail_baseline_due) = lifecycle.consume_detail_baseline(task_epoch) else {
+                return;
+            };
             if ((!detail_open && offline_detail_was_open)
-                || (detail_open && !offline_detail_was_open && !detail_pending.reset))
+                || (detail_open
+                    && (!offline_detail_was_open || detail_baseline_due)
+                    && !detail_pending.reset))
                 && !begin_detail_generation(&lifecycle, task_epoch, &mut detail_pending)
             {
                 return;
@@ -568,7 +573,10 @@ pub(super) async fn run_connections_stream(
             // 那一条闸门 —— 同一次拓扑变更 —— 但各看各的订阅门）。
             let now = mono_ms(clock);
             let detail_open = gate.topic_open(Topic::Detail);
-            if detail_open != detail_was_open {
+            let Some(detail_baseline_due) = lifecycle.consume_detail_baseline(task_epoch) else {
+                return;
+            };
+            if detail_open != detail_was_open || (detail_open && detail_baseline_due) {
                 // 新的 detail 订阅生命周期没有旧索引，必须从当前活动表 reset，而非半截增量开始。
                 if !begin_detail_generation(&lifecycle, task_epoch, &mut detail_pending) {
                     return;
@@ -794,7 +802,8 @@ pub(super) async fn run_stats_stream(
             }
             tokio::select! {
                 frame = stream.recv() => match frame {
-                    Some(st) => {
+                    Some(frame) => {
+                        let st = &frame.status;
                         if !stream_session_current(&proxy, port, generation) {
                             break;
                         }
@@ -812,7 +821,7 @@ pub(super) async fn run_stats_stream(
                                 );
                             }
                         }
-                        meter.on_status(&st, mono_ms(clock));
+                        frame.apply(&mut meter, mono_ms(clock));
                         // 门关的一瞬可能正好收到一帧（`wait_until(false, ..)` 那条腿还没被调度到）→
                         // emit 前再看一次订阅门，别把帧推给已经没人看的窗口。
                         if gate.topic_open(Topic::Stats) {

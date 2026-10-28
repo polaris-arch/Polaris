@@ -365,6 +365,10 @@ fn unknown_config_values_fall_back_to_the_same_default_as_the_overlay() {
 fn tray_screen_whitelist_only_admits_registered_targets() {
     assert_eq!(normalize_tray_screen("settings"), Some("settings"));
     assert_eq!(
+        normalize_tray_screen("settings-helper"),
+        Some("settings-helper")
+    );
+    assert_eq!(
         normalize_tray_screen(" settings "),
         Some("settings"),
         "容忍空白"

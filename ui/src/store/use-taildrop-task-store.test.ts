@@ -1,10 +1,12 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { TaildropTaskPhase, TaildropTaskSnapshot } from '@/contracts/taildrop';
 import { crateRootSource } from '@/contracts/rust-source.test-support';
 import {
   MAX_TAILDROP_TASK_SNAPSHOTS,
+  subscribeTaildropTaskEvents,
+  useTaildropTaskStore,
   mergeTaildropTaskSnapshots,
   reduceTaildropTaskSnapshot,
   type TaildropTaskMap,
@@ -76,10 +78,11 @@ describe('Taildrop task 纵向接线契约', () => {
 
   it('主窗口先挂持久事件，再 pull 水合；弹窗不拥有订阅', () => {
     const app = read('App.tsx');
-    const effect = app.slice(app.indexOf('const off = subscribeTaildropTaskEvents()'));
-    expect(effect.indexOf('subscribeTaildropTaskEvents()')).toBeLessThan(
-      effect.indexOf('hydrateTaildropTasks()')
-    );
+    expect(app).toContain('const off = subscribeTaildropTaskEvents()');
+    expect(app).not.toContain('void hydrateTaildropTasks()');
+    const lifecycle = read('store/use-taildrop-task-store.ts');
+    expect(lifecycle).toContain('port.onTaildropTaskUpdated(');
+    expect(lifecycle).toContain('const snapshots = await port.taildropTasks()');
     expect(read('components/dialogs/TaildropDialog.tsx')).not.toContain(
       'subscribeTaildropTaskEvents'
     );
@@ -95,7 +98,7 @@ describe('Taildrop task 纵向接线契约', () => {
       "EVENT_TAILDROP_TASK_UPDATED: 'event:taildropTaskUpdated'"
     );
     expect(readApiClient()).toContain(
-      'listen(IPC_CHANNELS.EVENT_TAILDROP_TASK_UPDATED, listener)'
+      'listenReady(IPC_CHANNELS.EVENT_TAILDROP_TASK_UPDATED, listener)'
     );
   });
 
@@ -113,5 +116,49 @@ describe('Taildrop task 纵向接线契约', () => {
     expect(dialog).toContain('status?.receivingFileCount');
     expect(dialog).toContain('status?.unreadFileCount');
     expect(dialog).toMatch(/status\?\.waitingFileCount[\s\S]*status\?\.receivingFileCount[\s\S]*status\?\.unreadFileCount/);
+  });
+});
+
+
+describe('Taildrop native readiness lifecycle', () => {
+  async function flush() { for (let n = 0; n < 6; n++) await Promise.resolve(); }
+  function pending() {
+    useTaildropTaskStore.setState({ tasks: {} });
+    let ready!: (off: () => void) => void;
+    let reject!: (error: Error) => void;
+    let emit!: (snapshot: TaildropTaskSnapshot) => void;
+    let snapshot!: (rows: TaildropTaskSnapshot[]) => void;
+    let failRead!: (error: Error) => void;
+    const off = vi.fn();
+    const taildropTasks = vi.fn(() => new Promise<TaildropTaskSnapshot[]>((yes, no) => { snapshot = yes; failRead = no; }));
+    const dispose = subscribeTaildropTaskEvents({
+      onTaildropTaskUpdated: (fn) => { emit = fn; return new Promise((yes, no) => { ready = yes; reject = no; }); },
+      taildropTasks,
+    });
+    return { off, taildropTasks, dispose, ready: () => ready(off), reject: () => reject(new Error('registration')),
+      emit: (row: TaildropTaskSnapshot) => emit(row), snapshot: (rows: TaildropTaskSnapshot[]) => snapshot(rows),
+      failRead: () => failRead(new Error('read')) };
+  }
+  it('waits for native listener, then merges snapshot without erasing terminal event', async () => {
+    const h = pending(); expect(h.taildropTasks).not.toHaveBeenCalled(); h.ready(); await flush();
+    expect(h.taildropTasks).toHaveBeenCalledOnce(); h.emit(task('a', 2, 'completed'));
+    h.snapshot([task('a', 1)]); await flush();
+    expect(useTaildropTaskStore.getState().tasks.a.phase).toBe('completed'); h.dispose();
+  });
+  it('late registration after disposal is released, never hydrated', async () => {
+    const h = pending(); h.dispose(); h.ready(); await flush();
+    expect(h.off).toHaveBeenCalledOnce(); expect(h.taildropTasks).not.toHaveBeenCalled();
+  });
+  it('disposal suppresses pending snapshot and events', async () => {
+    const h = pending(); h.ready(); await flush(); h.dispose();
+    h.emit(task('a', 2)); h.snapshot([task('a', 1)]); await flush();
+    expect(useTaildropTaskStore.getState().tasks).toEqual({});
+  });
+  it('registration failure cannot trigger an unprotected snapshot', async () => {
+    const h = pending(); h.reject(); await flush(); expect(h.taildropTasks).not.toHaveBeenCalled(); h.dispose();
+  });
+  it('failed snapshot does not disable subsequent terminal events', async () => {
+    const h = pending(); h.ready(); await flush(); h.failRead(); await flush();
+    h.emit(task('a', 2, 'completed')); expect(useTaildropTaskStore.getState().tasks.a.phase).toBe('completed'); h.dispose();
   });
 });

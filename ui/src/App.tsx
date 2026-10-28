@@ -1,3 +1,5 @@
+import { startAppVpnStatusSync } from '@/lib/app-vpn-status-sync';
+import { startPrivacyModeSync } from '@/lib/privacy-mode-sync';
 import { acquireConfigSync } from '@/store/app-store';
 import { autoNodeSwitchFeedback } from '@/lib/auto-node-switch-feedback';
 /**
@@ -29,7 +31,6 @@ import {
   useSubscriptionProgressStore,
 } from './store/use-subscription-progress-store';
 import {
-  hydrateTaildropTasks,
   subscribeTaildropTaskEvents,
 } from './store/use-taildrop-task-store';
 import { useTailscaleLoginCacheStore } from './store/use-tailscale-login-cache-store';
@@ -50,7 +51,6 @@ import { createOnceGate } from './components/screens/settings/settings-logic';
 import { useDialogStore } from './components/dialogs/dialog-store';
 import { useNavStore } from './store/nav-store';
 import { useVpnStatusStore } from './store/use-vpn-status-store';
-import type { VpnStatusSnapshot } from './contracts/vpn-status';
 import {
   stopSubscriptionCreateOperationSubscription,
   subscribeAndHydrateSubscriptionCreateOperations,
@@ -81,21 +81,6 @@ function ensureVpnAuthDialog(protocol: 'openconnect' | 'openvpn', serverId: stri
   dialogs.open({ kind: 'vpn-auth', protocol, serverId });
 }
 
-function applyVpnStatusSnapshot(snapshot: VpnStatusSnapshot): void {
-  useVpnStatusStore
-    .getState()
-    .replace(snapshot.connected, snapshot.openConnect ?? [], snapshot.openVpn ?? []);
-  for (const status of snapshot.openConnect ?? []) {
-    if (status.authChallenge) ensureVpnAuthDialog('openconnect', status.serverId);
-  }
-  for (const status of snapshot.openVpn ?? []) {
-    if (status.challenge) ensureVpnAuthDialog('openvpn', status.serverId);
-  }
-}
-
-function clearVpnStatusSnapshot(): void {
-  useVpnStatusStore.getState().replace(false, [], []);
-}
 
 /**
  * R2 待应用差集 pull 兜底：拉当下差集写 store（覆盖 PUSH 盖不住的清差集/冷启/订阅刷新——对齐 上游的
@@ -163,7 +148,6 @@ export default function App() {
   const refreshProxyStatus = useAppStore((s) => s.refreshProxyStatus);
   const servers = useAppStore((s) => s.servers);
   const config = useAppStore((s) => s.config);
-  const proxyRunning = useAppStore((s) => s.proxyStatus?.running);
   /** 每个节点只记最后一个登录 URL，配置对账时同步驱逐，避免长会话按 URL 永久增长。 */
   const tsAuthSeen = useRef<Map<string, string>>(new Map());
 
@@ -265,55 +249,12 @@ export default function App() {
     return releaseConfig;
   }, [refreshProxyStatus]);
 
-  // 隐私态首帧水合：`config_get_privacy_mode` 读的是 Rust 进程内 PRIVACY_MODE atomic（跨 renderer
-  // reload 存活）。**必须自取初值**——若锁定期间 renderer 白屏 reload / 从托盘锁定后首次开主窗，
-  // 光靠 enter/exit 事件（只推增量）会漏掉「已在隐私态」这一初值，遮罩不出 = 安全缺口。幂等且便宜。
-  useEffect(() => {
-    void api.config
-      .getPrivacyMode()
-      .then((on) => useAppStore.getState().setPrivacyMode(on))
-      .catch(() => {});
-  }, []);
+  // Shared ready-aware VPN stream and snapshot owner.
+  useEffect(() => startAppVpnStatusSync(ensureVpnAuthDialog), []);
 
-  // OpenConnect/OpenVPN rc.2 原生状态增量。挑战到达时只为该 endpoint 打开一个认证弹窗；
-  // 弹窗提交仍由后端校验当前 challengeID，故窗口重建/事件重放不会把旧挑战提交进新核会话。
-  useEffect(() => {
-    const offOpenConnect = api.vpn.onOpenConnectStatus((status) => {
-      useVpnStatusStore.getState().setOpenConnect(status);
-      if (status.authChallenge) ensureVpnAuthDialog('openconnect', status.serverId);
-    });
-    const offOpenVpn = api.vpn.onOpenVpnStatus((status) => {
-      useVpnStatusStore.getState().setOpenVpn(status);
-      if (status.challenge) ensureVpnAuthDialog('openvpn', status.serverId);
-    });
-    return () => {
-      offOpenConnect();
-      offOpenVpn();
-    };
-  }, []);
-
-  // 权威连接态负责 VPN 快照的会话边界：运行时拉当前末帧；停止、崩溃或冷启动未运行时清空。
-  // 不能只依赖 proxyStopped——崩溃腿按既有契约可能不发该事件，但 30s 状态收敛仍会更新 proxyRunning。
-  useEffect(() => {
-    if (proxyRunning === undefined) return;
-    if (!proxyRunning) {
-      clearVpnStatusSnapshot();
-      return;
-    }
-    void api.vpn.getStatus().then(applyVpnStatusSnapshot).catch(() => {});
-  }, [proxyRunning]);
-
-  // 隐私模式进/出：后端 config_set_privacy_mode 状态跃迁时 emit（config.rs:355-362）。三来源
-  // （托盘「立即锁定」/ idle 计时 / 本窗解锁后 setPrivacyMode(false)）统一经事件收敛到 store。
-  useEffect(() => {
-    const setPrivacyMode = useAppStore.getState().setPrivacyMode;
-    const offEnter = api.config.onEnterPrivacyMode(() => setPrivacyMode(true));
-    const offExit = api.config.onExitPrivacyMode(() => setPrivacyMode(false));
-    return () => {
-      offEnter();
-      offExit();
-    };
-  }, []);
+  // Native listeners must be ready before the initial privacy snapshot.
+  useEffect(() => startPrivacyModeSync(api.config,
+    (locked) => useAppStore.getState().setPrivacyMode(locked)), []);
 
   // Tailscale 登录态挂载兜底：不起核、只查 state 目录「登录过没」，喂 tailscaleLoginStates
   // （组网卡角标的三条 feed 之一，见 domain/tailscale-conn-state.ts）。
@@ -427,13 +368,12 @@ export default function App() {
   useEffect(() => {
     const offStarted = api.proxy.onStarted(() => {
       void refreshProxyStatus();
-      void api.vpn.getStatus().then(applyVpnStatusSnapshot).catch(() => {});
       // R2 pull 兜底：重启落地 → 起核快照刷新 → 待应用差集清空/更新（PUSH 的重启腿留下的 added 由此清）。
       pullPendingChanges();
     });
     const offStopped = api.proxy.onStopped(() => {
+      useAppStore.getState().resetUnlock();
       void refreshProxyStatus();
-      clearVpnStatusSnapshot();
       // R2 pull 兜底：停核 → 无起核快照 → 差集恒空（操作条自然卸载）。
       pullPendingChanges();
     });
@@ -535,9 +475,6 @@ export default function App() {
   // 重建后都能继续显示与取消。旧 pull 与新事件的竞态由快照 revision 在 store 内拒绝。
   useEffect(() => {
     const off = subscribeTaildropTaskEvents();
-    void hydrateTaildropTasks().catch(() => {
-      /* 非 Tauri 预览或主进程退出时静默；发起命令仍会给用户稳定错误码。 */
-    });
     return off;
   }, []);
 
@@ -613,18 +550,21 @@ export default function App() {
     let cancelled = false;
     const hasState = (u: UnlockDisplayState) =>
       u.running || u.checkedAt != null || Object.keys(u.results).length > 0;
-    if (hasState(useAppStore.getState().unlock)) return;
+    const requestedState = useAppStore.getState().unlock;
+    if (hasState(requestedState)) return;
+    // Immutable display identity changes on events, invalidate, stop, or a newer request.
+    const isCurrent = () => !cancelled && useAppStore.getState().unlock === requestedState;
     void unlockApi
       .get()
       .then((snap) => {
-        if (cancelled || hasState(useAppStore.getState().unlock)) return; // 期间已被事件填充 → 不覆盖
+        if (!isCurrent()) return; // A reset to empty is also a newer state.
         if (snap && (snap.checkedAt || snap.notReady || snap.blockedReason)) {
           useAppStore.getState().applyUnlockSnapshot(snap); // 有终态快照 → 零网络水合
         } else {
           void unlockApi
             .run(false)
-            .then((s) => useAppStore.getState().applyUnlockSnapshot(s))
-            .catch(() => useAppStore.getState().resetUnlock());
+            .then((s) => { if (isCurrent()) useAppStore.getState().applyUnlockSnapshot(s); })
+            .catch(() => { if (isCurrent()) useAppStore.getState().resetUnlock(); });
         }
       })
       .catch(() => {

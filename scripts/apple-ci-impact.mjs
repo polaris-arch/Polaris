@@ -16,7 +16,7 @@ export function appleRequired(paths, full = false) {
       || ['.github/workflows/apple.yml', '.github/workflows/release-risk.yml',
         'scripts/apple-ci-impact.mjs', 'scripts/apple-ci-impact.test.mjs', 'scripts/classify-ci-impact.mjs',
         'scripts/apple-carrier.py', 'scripts/fetch-dashboard.mjs', 'scripts/fetch-protoc.mjs',
-        'scripts/lib/extract-zip.mjs', 'scripts/gate-node-test.sh'].includes(path);
+        'scripts/lib/extract-zip.mjs', 'scripts/lib/bounded-download.mjs', 'scripts/gate-node-test.sh'].includes(path);
   });
 }
 

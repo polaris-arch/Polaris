@@ -1,5 +1,9 @@
 package com.polaris2.app.vpn
 
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+
 /** A fresh platform callback belongs to one SDK registration of one attempt. */
 internal interface NetworkMonitorEvents<N> {
     fun available(network: N)
@@ -136,7 +140,7 @@ internal class NetworkMonitorCoordinator<N, L>(
                 enqueue(session)
             }
         }
-        launch?.let { pump(session, it) }
+        if (launch == true) dispatch(session)
     }
 
     private fun event(session: NetworkMonitorSession<N, L>, network: N, kind: Int, notVpn: Boolean = false) {
@@ -154,7 +158,7 @@ internal class NetworkMonitorCoordinator<N, L>(
             session.revision++
             enqueue(session)
         }
-        launch?.let { pump(session, it) }
+        if (launch == true) dispatch(session)
     }
 
     internal fun startListener(session: NetworkMonitorSession<N, L>, listener: L) {
@@ -171,7 +175,7 @@ internal class NetworkMonitorCoordinator<N, L>(
             session.current = NetworkMonitorSession.Listener(incarnation, listener)
             if (active === session && session.started) enqueue(session) else null
         }
-        launch?.let { pump(session, it) }
+        if (launch == true) dispatch(session)
     }
 
     internal fun closeListener(session: NetworkMonitorSession<N, L>, listener: L) {
@@ -196,14 +200,28 @@ internal class NetworkMonitorCoordinator<N, L>(
         return number
     }
 
-    private fun enqueue(session: NetworkMonitorSession<N, L>): NetworkMonitorSession.Listener<N, L>? {
-        val listener = session.current ?: return null
-        if (listener.sealed) return null
+    private fun enqueue(session: NetworkMonitorSession<N, L>): Boolean {
+        val listener = session.current ?: return false
+        if (listener.sealed) return false
         listener.pending = NetworkMonitorSession.Work(session.network, session.revision)
-        if (listener.running) return null
-        listener.running = true
+        // Coalesce across listener replacements as well as network revisions.
+        // There is only one admitted pump per original session, including queued work.
+        if (session.pumpRunning) return false
+        session.pumpRunning = true
         session.lookups++
-        return listener
+        return true
+    }
+
+    private fun dispatch(session: NetworkMonitorSession<N, L>) {
+        try { session.worker.execute { pump(session) } }
+        catch (error: java.util.concurrent.RejectedExecutionException) {
+            synchronized(gate) {
+                session.pumpRunning = false
+                session.lookups--
+                // A fence may shut the executor between admission and submission.
+                if (!session.revoked) recordFailure(session, error)
+            }
+        }
     }
 
     private fun seal(listener: NetworkMonitorSession.Listener<N, L>) {
@@ -212,22 +230,19 @@ internal class NetworkMonitorCoordinator<N, L>(
         listener.value = null // an already permitted JNI stack keeps its exact local value
     }
 
-    private fun pump(session: NetworkMonitorSession<N, L>, listener: NetworkMonitorSession.Listener<N, L>) {
-        var failure: Throwable? = null
+    private fun pump(session: NetworkMonitorSession<N, L>) {
         while (true) {
-            val work = synchronized(gate) {
-                val pending = listener.pending
-                listener.pending = null
-                if (pending == null || listener.sealed || session.revoked) {
-                    listener.running = false
+            val next = synchronized(gate) {
+                val listener = session.current
+                val pending = listener?.pending
+                if (listener != null) listener.pending = null
+                if (pending == null || listener == null || listener.sealed || session.revoked) {
+                    session.pumpRunning = false
                     session.lookups--
                     null
-                } else pending
-            }
-            if (work == null) {
-                failure?.let { throw it }
-                return
-            }
+                } else listener to pending
+            } ?: return
+            val (listener, work) = next
             try {
                 val update = if (work.network == null) NetworkMonitorUpdate("", -1) else lookup(work.network)
                 if (update == null) continue
@@ -240,7 +255,6 @@ internal class NetworkMonitorCoordinator<N, L>(
                 finally { synchronized(gate) { session.delivering-- } }
             } catch (error: Throwable) {
                 synchronized(gate) { recordFailure(session, error) }
-                if (failure == null) failure = error
                 // Drain the latest retained event after actual JNI/lookup return;
                 // error handling cannot strand an event queued during delivery.
             }
@@ -253,6 +267,9 @@ internal class NetworkMonitorCoordinator<N, L>(
         session.current = null
         session.network = null
         if (active === session) { observation.stop(session); active = null }
+        // Do not interrupt/join an admitted JNI call, or drop a queued admission.
+        // It drains normally and remains visible in lookups/delivering until return.
+        session.worker.shutdown()
     }
 
     internal fun stop(session: NetworkMonitorSession<N, L>) {
@@ -282,7 +299,6 @@ internal class NetworkMonitorCoordinator<N, L>(
 internal class NetworkMonitorSession<N, L> internal constructor(private val owner: NetworkMonitorCoordinator<N, L>) {
     internal class Listener<N, L>(val identity: Long, var value: L?) {
         var sealed = false
-        var running = false
         var pending: Work<N>? = null
     }
     internal data class Work<N>(val network: N?, val revision: Long)
@@ -295,6 +311,10 @@ internal class NetworkMonitorSession<N, L> internal constructor(private val owne
     internal var current: Listener<N, L>? = null
     internal var startedThrough = 0L
     internal var closedThrough = 0L
+    internal val worker = ThreadPoolExecutor(0, 1, 10, TimeUnit.SECONDS,
+        ArrayBlockingQueue<Runnable>(1), { Thread(it, "polaris-network-observer") },
+        ThreadPoolExecutor.AbortPolicy())
+    internal var pumpRunning = false
     internal var lookups = 0
     internal var delivering = 0
     internal var firstFailure: Throwable? = null

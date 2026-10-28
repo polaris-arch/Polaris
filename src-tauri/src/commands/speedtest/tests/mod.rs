@@ -1980,22 +1980,39 @@ fn the_default_speed_test_endpoint_resolves_to_a_tunnel_target() {
     );
 }
 
-/// 用户自配 URL 的取舍：可解析则用它，否则回落默认（**不因配置坏而给节点记假 -1**）。
+/// Invalid explicit endpoints stay visible and fail admission; no fake node failure/default request.
 #[test]
-fn user_speed_test_url_falls_back_to_default_when_unusable() {
-    let pick = |v: Value| resolve_speed_test_url(&v);
-    assert_eq!(
-        pick(json!({ "speedTestUrl": "https://my.endpoint:8443/ping?t=1" })),
-        "https://my.endpoint:8443/ping?t=1"
-    );
-    for bad in ["", "http://", "socks5://1.2.3.4:1080", "garbage"] {
-        assert_eq!(
-            pick(json!({ "speedTestUrl": bad })),
-            DEFAULT_SPEED_TEST_URL,
-            "`{bad}` 解析不出隧道目标 → 必须回落默认端点"
-        );
+fn user_speed_test_url_rejects_explicit_invalid_without_substitution() {
+    for good in [
+        "http://example.com/check",
+        "https://example.com:8443/check?t=1",
+    ] {
+        let config = json!({"speedTestUrl":good});
+        assert!(validate_speed_test_url(&config).is_ok());
+        assert_eq!(resolve_speed_test_url(&config), good);
     }
-    assert_eq!(pick(json!({})), DEFAULT_SPEED_TEST_URL, "未配置 → 默认端点");
+    for bad in [
+        "http://",
+        "https://example.com:99999",
+        "socks5://1.2.3.4:1080",
+        "garbage",
+    ] {
+        let config = json!({"speedTestUrl":bad});
+        assert_eq!(
+            validate_speed_test_url(&config),
+            Err("SPEED_TEST_URL_INVALID")
+        );
+        assert_eq!(resolve_speed_test_url(&config), bad);
+    }
+    for config in [
+        json!({}),
+        json!({"speedTestUrl":""}),
+        json!({"speedTestUrl":"  "}),
+    ] {
+        assert!(validate_speed_test_url(&config).is_ok());
+        assert_eq!(resolve_speed_test_url(&config), DEFAULT_SPEED_TEST_URL);
+    }
+    assert!(validate_speed_test_url(&json!({"speedTestUrl":42})).is_err());
 }
 
 // ── 回退腿（probe_pool_ports 为空）的让位覆盖 ──────────────────────────────────

@@ -19,15 +19,15 @@ export function validMeasurementSnapshot(value: unknown): value is MeasurementSn
     || !object(value.rows) || Object.keys(value.rows).length > 16384) return false;
   return Object.values(value.rows).every(row => object(row) && Object.entries(row).every(([purpose, record]) => {
     if (purpose === 'notIncluded') return typeof record === 'string';
-    if (!['candidate', 'system', 'selected'].includes(purpose) || !object(record) || !object(record.identity)) return false;
+    if (!['candidate', 'system', 'selected', 'nativeHttp'].includes(purpose) || !object(record) || !object(record.identity)) return false;
     const identity = record.identity;
     return ['success', 'failed', 'expired'].includes(String(record.state))
       && nullableNumber(record.latency) && integer(record.expiresAt)
       && typeof record.disconnected === 'boolean' && typeof record.bindingMismatch === 'boolean'
       && decimal(identity.run) && integer(identity.seq) && integer(identity.measuredAt)
-      && identity.path === purpose && identity.metric === 'warm_ttfb_v1'
+      && identity.path === purpose && identity.metric === (purpose === 'nativeHttp' ? 'native_http_v1' : 'warm_ttfb_v1')
       && typeof identity.urlDigest === 'string' && /^[a-f0-9]{64}$/.test(identity.urlDigest)
-      && ['manual', 'failover', 'schedule', 'companion'].includes(String(identity.origin))
+      && (purpose === 'nativeHttp' ? identity.origin === 'nativeAuto' : ['manual', 'failover', 'schedule', 'companion'].includes(String(identity.origin)))
       && ['connected', 'disconnected'].includes(String(identity.context))
       && object(identity.instance) && (identity.instance.kind === 'temp' ||
         identity.instance.kind === 'main' && integer(identity.instance.generation) && nullableNumber(identity.instance.startTime))

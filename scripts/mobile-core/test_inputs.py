@@ -214,6 +214,24 @@ class MobileInputs(unittest.TestCase):
         self.assertEqual(env['ANDROID_NDK_HOME'], '/verified/ndk30')
         self.assertNotIn('GOBIN', env)
 
+    def test_apple_actual_environment_excludes_host_pkgconfig_search_extensions(self):
+        import os
+        from unittest.mock import patch
+        for host_path in ('/Users/runner/hostedtoolcache/Python/3.12.10/arm64/lib/pkgconfig',
+                          '/custom/untracked/pkgconfig'):
+            with self.subTest(host_path=host_path), patch.dict(os.environ, {
+                    'PKG_CONFIG_PATH': host_path, 'CPATH': '/custom/headers',
+                    'PKG_CONFIG_LIBDIR': '/custom/libconfig'}, clear=True):
+                apple = tool_environment('/tools/go', '/tools/gomobile', '/tools/gobind',
+                                         '/cache', '/scratch', developer='/verified/Xcode')
+                self.assertNotIn('PKG_CONFIG_PATH', apple)
+                self.assertEqual(apple['CPATH'], '/custom/headers')
+                self.assertEqual(apple['PKG_CONFIG_LIBDIR'], '/custom/libconfig')
+                self.assertEqual(os.environ['PKG_CONFIG_PATH'], host_path)
+                android = tool_environment('/tools/go', '/tools/gomobile', '/tools/gobind',
+                                           '/cache', '/scratch', sdk='/sdk', ndk='/ndk', jdk='/jdk')
+                self.assertEqual(android['PKG_CONFIG_PATH'], host_path)
+
     def test_pinned_javac_precedes_ambient_java21_path(self):
         import os
         import shutil

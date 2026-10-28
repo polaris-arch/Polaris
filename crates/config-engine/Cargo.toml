@@ -6,9 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Existing regex parser, syntax only: no matcher or regex execution at save time.
 polaris-helper-proto = { path = "../helper-proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+url = "2"
 # 非法字符 rule id 文件名 sha1 派生（对齐 上游 createHash('sha1').digest('hex').slice(0,12)）。
 sha1 = "0.11"
 

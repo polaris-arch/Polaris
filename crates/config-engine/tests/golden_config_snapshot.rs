@@ -819,6 +819,7 @@ fn rule_set_rule(id: &str, value: &str) -> polaris_config_engine::user_config::r
         enabled: true,
         bypass_fakeip: None,
         target_server_id: None,
+        target_auto_select: None,
         remarks: None,
         tls_spoof: None,
         tls_spoof_method: None,

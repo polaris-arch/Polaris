@@ -43,6 +43,8 @@ required_tests=(
   # 内核从安装目录直接运行后的两条打包侧判据：被删/改名时安装器照样编得过、dmg 照样出得来。
   scripts/nsis-core-sweep.test.mjs
   scripts/macos-nested-code.test.mjs
+  scripts/macos-open-guide.test.mjs
+  scripts/helper-installer-target-scope.test.mjs
   # 卸载钩子里唯一提权执行的那一段：脚本随命令行进入提权进程、删除前逐项校验、退出码被消费。
   scripts/nsis-helper-cleanup.test.mjs
   scripts/release-assets.test.mjs

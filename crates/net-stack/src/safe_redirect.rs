@@ -11,7 +11,7 @@ use std::{future::Future, net::IpAddr, time::Instant};
 
 use url::Url;
 
-use crate::ssrf::{resolve_host_allowed, DnsLookup};
+use crate::ssrf::{resolve_host_allowed_typed, DnsLookup, HostResolutionError};
 
 /// 安全 fetch 拒绝原因：调用方据此映射 HTTP 状态码或区分错误类别。
 /// 上游 `SafeFetchRejectReason`。
@@ -21,6 +21,8 @@ pub enum SafeFetchRejectReason {
     RedirectProtocol,
     /// SSRF guard 命中（首跳或某跳解析到内网）。
     Ssrf,
+    /// DNS failed or returned no addresses; no HTTP request was made.
+    Dns,
     /// 重定向次数超过上限。
     TooManyRedirects,
     /// absolute network deadline 已耗尽，或单跳传输明确报告 timeout。
@@ -147,23 +149,25 @@ pub struct SafeRedirectFetchOptions<'a, H: HttpClient, L: DnsLookup> {
 
 const DEFAULT_MAX_REDIRECTS: usize = 5;
 
-/// SSRF guard：[`crate::ssrf::resolve_host_allowed`] 报错统一归类为 [`SafeFetchError`] reason=`Ssrf`，
-/// 保留原始消息（含 hostname/解析结果）。上游 `guard`。
+/// Fail closed on both DNS unavailability and unsafe addresses, preserving their typed distinction.
 async fn guard<L: DnsLookup>(
     url: &Url,
     lookup: &L,
     exempt_fake_ip: bool,
 ) -> Result<GuardedTarget, SafeFetchError> {
     let host = url.host_str().unwrap_or("");
-    resolve_host_allowed(host, lookup, exempt_fake_ip)
+    resolve_host_allowed_typed(host, lookup, exempt_fake_ip)
         .await
         .map(|addresses| GuardedTarget {
             host: host.to_ascii_lowercase(),
             addresses,
         })
-        .map_err(|msg| SafeFetchError {
-            reason: SafeFetchRejectReason::Ssrf,
-            message: msg,
+        .map_err(|error| SafeFetchError {
+            reason: match &error {
+                HostResolutionError::Dns(_) => SafeFetchRejectReason::Dns,
+                HostResolutionError::Unsafe(_) => SafeFetchRejectReason::Ssrf,
+            },
+            message: error.to_string(),
         })
 }
 

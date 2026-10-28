@@ -184,8 +184,8 @@ pub fn plan_hot_switch(old: &UserConfig, new: &UserConfig, deps: &HotSwitchDeps)
     // 这是那次迁移**唯一**的行为代价，如实记在这里：切出阻断此前是热切（毫秒、不断流），
     // 现在会断掉阻断期间仍然活着的直连连接（LAN/NAS/本地 SSH）。换到的是「阻断态不再每拦一条
     // 连接就打一行 ERROR 把核日志历史挤掉」。
-    if is_block_selection(old.selected_server_id.as_deref())
-        != is_block_selection(new.selected_server_id.as_deref())
+    if is_block_selection(old.effective_selected_server_id())
+        != is_block_selection(new.effective_selected_server_id())
     {
         return HotSwitchPlan::none();
     }
@@ -195,7 +195,10 @@ pub fn plan_hot_switch(old: &UserConfig, new: &UserConfig, deps: &HotSwitchDeps)
 
     // 全局节点变化（含切到/切出 direct 哨兵：memberTag=direct，direct 恒是 proxy-selector 成员→可热切不重启）。
     // Polaris: old.selectedServerId !== newConfig.selectedServerId && newConfig.selectedServerId
-    if old.selected_server_id != new.selected_server_id && new.selected_server_id.is_some() {
+    if new.selection_intent.is_none()
+        && old.selected_server_id != new.selected_server_id
+        && new.selected_server_id.is_some()
+    {
         let new_id = new.selected_server_id.as_deref().unwrap();
         let to_direct = is_direct_selection(Some(new_id));
         // 目标节点必须已存在于运行中的 selector（= 启动时 old.servers），否则 PUT 指向不存在的成员；
@@ -334,7 +337,28 @@ fn plan_rule_hot_switch(
     new: &UserConfig,
     deps: &HotSwitchDeps,
 ) -> RuleHotSwitchResult {
+    let auto_rule_choices = |config: &UserConfig| {
+        let mut choices = BTreeMap::new();
+        for rule in config
+            .effective_traffic_rules()
+            .iter()
+            .filter(|r| r.enabled)
+        {
+            if let Some(target) = rule.route_target_auto_select() {
+                choices.insert(format!("custom:{}", rule.id), target.clone());
+            }
+        }
+        for rule in config.app_rules.iter().filter(|r| r.enabled) {
+            if let Some(target) = &rule.target_auto_select {
+                choices.insert(format!("app:{}", rule.app_id), target.clone());
+            }
+        }
+        choices
+    };
     let map = match &deps.current_rule_target_map {
+        None if auto_rule_choices(old) != auto_rule_choices(new) => {
+            return RuleHotSwitchResult::CannotHotSwitch
+        }
         None => return RuleHotSwitchResult::Puts(Vec::new()), // 启动时无 rule-sel → 无规则热切换
         Some(m) => m,
     };
@@ -344,25 +368,39 @@ fn plan_rule_hot_switch(
     };
 
     let mut puts: Vec<HotSwitchPut> = Vec::new();
+    let existing_auto = crate::user_config::auto_select::referenced_targets(old);
 
     // visit 单条规则的 target 变化。返回 true=可继续，false=该规则目标无法热切（调用方返 CannotHotSwitch）。
     // Polaris 内层 `visit(ruleKey, oldTarget, newTarget): boolean`。
     let visit = |rule_key: &str,
                  old_target: Option<&str>,
                  new_target: Option<&str>,
+                 old_auto: Option<&crate::user_config::auto_select::AutoSelectTarget>,
+                 new_auto: Option<&crate::user_config::auto_select::AutoSelectTarget>,
                  puts: &mut Vec<HotSwitchPut>|
      -> bool {
-        if old_target == new_target.map(|s| s.to_string()).as_deref() {
+        if old_target == new_target && old_auto == new_auto {
             return true; // 未变
         }
         let entry = match map.get(rule_key) {
-            None => return true, // currentRuleTargetMap 无此条（启动时该规则未生成 rule-sel，如被 gate 剔除）→ 跳过
+            None => return old_auto.is_none() && new_auto.is_none(), // currentRuleTargetMap 无此条（启动时该规则未生成 rule-sel，如被 gate 剔除）→ 跳过
             Some(e) => e,
         };
         // 新目标有→解析节点 tag；无（节点切回默认/跟全局）→ proxy-selector（rule-sel 嵌套 default）。
-        let member_tag: Option<String> = match new_target {
-            Some(t) => id_to_tag.get(t).cloned(),
-            None => Some(PROXY_SELECTOR_TAG.to_string()),
+        let member_tag: Option<String> = if let Some(target) = new_auto {
+            if !existing_auto.contains(target)
+                || crate::user_config::auto_select::eligible_members(new, target)
+                    .iter()
+                    .any(|id| is_server_dirty(id, new, deps))
+            {
+                return false;
+            }
+            Some(crate::user_config::auto_select::wrapper_tag(target))
+        } else {
+            match new_target {
+                Some(t) => id_to_tag.get(t).cloned(),
+                None => Some(PROXY_SELECTOR_TAG.to_string()),
+            }
         };
         let member_tag = match member_tag {
             Some(t) => t,
@@ -377,12 +415,16 @@ fn plan_rule_hot_switch(
         }
         // 旧成员 tag（供精准断连 pair）：旧目标节点 tag，无旧目标（跟全局）→ proxy-selector。
         // 必须从 oldTarget 现算，禁用 currentRuleTargetMap.memberTag（那是生成时 default，首次规则热切后即陈旧）。
-        let old_member_tag: String = match old_target {
-            Some(t) => id_to_tag
-                .get(t)
-                .cloned()
-                .unwrap_or_else(|| PROXY_SELECTOR_TAG.to_string()),
-            None => PROXY_SELECTOR_TAG.to_string(),
+        let old_member_tag: String = if let Some(target) = old_auto {
+            crate::user_config::auto_select::wrapper_tag(target)
+        } else {
+            match old_target {
+                Some(t) => id_to_tag
+                    .get(t)
+                    .cloned()
+                    .unwrap_or_else(|| PROXY_SELECTOR_TAG.to_string()),
+                None => PROXY_SELECTOR_TAG.to_string(),
+            }
         };
         puts.push(HotSwitchPut {
             selector_tag: entry.selector_tag.clone(),
@@ -412,6 +454,8 @@ fn plan_rule_hot_switch(
             &rule_key,
             old_r.route_target_server_id(),
             r.route_target_server_id(),
+            old_r.route_target_auto_select(),
+            r.route_target_auto_select(),
             &mut puts,
         ) {
             return RuleHotSwitchResult::CannotHotSwitch;
@@ -439,6 +483,8 @@ fn plan_rule_hot_switch(
             &rule_key,
             old_a.target_server_id.as_deref(),
             a.target_server_id.as_deref(),
+            old_a.target_auto_select.as_ref(),
+            a.target_auto_select.as_ref(),
             &mut puts,
         ) {
             return RuleHotSwitchResult::CannotHotSwitch;

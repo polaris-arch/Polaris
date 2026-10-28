@@ -24,6 +24,9 @@ fn is_no_exit_ts(server: &ServerConfig) -> bool {
 /// One TS without an exit node and at least one real public exit. Multiple Tailscale endpoints
 /// are deliberately excluded: selection can change the MagicDNS endpoint binding.
 pub fn mode_candidates(config: &UserConfig) -> Option<(String, String)> {
+    if config.selection_intent.is_some() {
+        return None;
+    }
     let ts: Vec<_> = config
         .servers
         .iter()
@@ -36,7 +39,7 @@ pub fn mode_candidates(config: &UserConfig) -> Option<(String, String)> {
         .servers
         .iter()
         .find(|s| {
-            Some(s.id.as_str()) == config.selected_server_id.as_deref()
+            Some(s.id.as_str()) == config.effective_selected_server_id()
                 && s.protocol != Protocol::Tailscale
                 && (!crate::user_config::server_config::is_mesh_node(s)
                     || mesh_node_carries_full_tunnel(s))
@@ -55,7 +58,7 @@ pub fn selected_mode(config: &UserConfig) -> &'static str {
     if config
         .servers
         .iter()
-        .find(|s| Some(s.id.as_str()) == config.selected_server_id.as_deref())
+        .find(|s| Some(s.id.as_str()) == config.effective_selected_server_id())
         .is_some_and(is_no_exit_ts)
     {
         MESH_DIRECT
@@ -67,7 +70,7 @@ pub fn selected_mode(config: &UserConfig) -> &'static str {
 /// A mode transition may only select one of the public exits represented by the compiled
 /// normal policy, or the unique split-only Tailscale endpoint represented by mesh-direct.
 pub fn selected_is_mode_candidate(config: &UserConfig, mesh_id: &str) -> bool {
-    let Some(selected) = config.selected_server_id.as_deref() else {
+    let Some(selected) = config.effective_selected_server_id() else {
         return false;
     };
     selected == mesh_id

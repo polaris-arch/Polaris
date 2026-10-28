@@ -9,17 +9,14 @@
 //!
 //! ## 平台差异（真差异，cfg 隔离）
 //!
-//! - **mac/linux**：`std::os::unix::net::UnixStream::connect` + 有界非阻塞读取（移植 Go
-//!   `conn.SetReadDeadline`，默认预算 5s）。写完请求帧后 `shutdown(Write)` 半关闭 = 上游 `sock.end(frame)`，通知
-//!   helper「请求发完」（helper 据此立即处理并回响应，不必等 5s 读超时）。
-//! - **win**：命名管道 `\\.\pipe\polaris-helper`。复用 helper 服务端同款同步 Win32 原语：
-//!   `CreateFileW + WriteFile + ReadFile`，逐字节读到单行响应结束。真机同帧原生 A/B 往返约
-//!   0.2s；`std::fs::File` 虽同为同步句柄，却会在 helper 已回包后额外挂数秒，不能替代。
-//!   `ERROR_PIPE_BUSY` 在 `READ_TIMEOUT` 内有界重试。
+//! - Unix: safe socket2 bounded connect, nonblocking writes and reads; write half-close.
+//! - Windows: overlapped byte-pipe operations, per-operation event and cancellation
+//!   completion custody; bounded busy-connect retry and explicit frame boundary.
 //!
 //! ## 移植纪律
 //!
-//! - Unix 路径全为安全 std；Windows FFI 收口在 `windows_pipe` 单模块，逐处审计安全不变量。
+//! - Unix uses safe socket2/std APIs; Windows FFI is confined to windows_pipe.
+//! - One absolute caller deadline covers connect, partial writes and response reads.
 //! - trait 边界只暴露字节流原语（[`ConnectionStream`]），三平台 [`HelperClient`](crate::client::HelperClient) 共用。
 
 use crate::client::{ClientError, Connector};
@@ -29,7 +26,6 @@ use crate::transport::READ_TIMEOUT;
 #[cfg(unix)]
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 // ===== Unix socket 连接器（mac/linux）=====
@@ -74,13 +70,37 @@ impl UnixConnector {
 #[cfg(unix)]
 impl Connector for UnixConnector {
     fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
-        use std::os::unix::net::UnixStream;
-        let stream = UnixStream::connect(&self.socket_path).map_err(|e| {
-            ClientError::Connect(format!("connect {}: {e}", self.socket_path.display()))
-        })?;
+        self.connect_until(Instant::now() + self.read_timeout)
+    }
+
+    fn connect_until(&self, deadline: Instant) -> Result<Box<dyn ConnectionStream>, ClientError> {
         if self.read_timeout.is_zero() {
             return Err(ClientError::Io(io::ErrorKind::InvalidInput.into()));
         }
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        let connected = (|| -> io::Result<std::os::unix::net::UnixStream> {
+            let address = socket2::SockAddr::unix(&self.socket_path)?;
+            let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or(io::ErrorKind::TimedOut)?;
+            socket.connect_timeout(&address, remaining)?;
+            let fd: std::os::fd::OwnedFd = socket.into();
+            Ok(std::os::unix::net::UnixStream::from(fd))
+        })();
+        if Instant::now() >= deadline {
+            return Err(ClientError::Timeout);
+        }
+        let stream = connected.map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                ClientError::Timeout
+            } else {
+                ClientError::Connect(format!("connect {}: {error}", self.socket_path.display()))
+            }
+        })?;
         Ok(Box::new(UnixConnStream {
             stream,
             read_timeout: self.read_timeout,
@@ -103,29 +123,41 @@ struct UnixConnStream {
 #[cfg(unix)]
 impl ConnectionStream for UnixConnStream {
     fn read_until_timeout(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        self.read_until_deadline(buf, Instant::now() + self.read_timeout)
+    }
+
+    fn read_until_deadline(&mut self, buf: &mut Vec<u8>, deadline: Instant) -> io::Result<usize> {
         use std::io::Read;
         // XNU rejects setsockopt after both halves close, even when a complete
         // response is still buffered. Never reset SO_RCVTIMEO after shutdown:
         // nonblocking reads + one absolute deadline also bound trickled bytes.
-        let deadline = Instant::now() + self.read_timeout;
         self.stream.set_nonblocking(true)?;
         let result = (|| {
-            let mut byte = [0u8; 1];
+            let mut byte = [0u8; 4096];
             let mut total = 0;
             loop {
                 if Instant::now() >= deadline {
                     return Err(io::Error::from(io::ErrorKind::TimedOut));
                 }
-                let result = self.stream.read(&mut byte);
+                let capacity = polaris_helper_proto::codec::MAX_FRAME_BYTES
+                    .saturating_sub(total)
+                    .min(byte.len());
+                if capacity == 0 {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                let result = self.stream.read(&mut byte[..capacity]);
                 if Instant::now() >= deadline {
                     return Err(io::Error::from(io::ErrorKind::TimedOut));
                 }
                 match result {
                     Ok(0) => return Ok(total),
-                    Ok(_) => {
-                        buf.push(byte[0]);
-                        total += 1;
-                        if byte[0] == b'\n' {
+                    Ok(n) => {
+                        buf.extend_from_slice(&byte[..n]);
+                        total += n;
+                        if let Some(end) = byte[..n].iter().position(|value| *value == b'\n') {
+                            if end + 1 != n {
+                                return Err(io::ErrorKind::InvalidData.into());
+                            }
                             return Ok(total);
                         }
                     }
@@ -161,8 +193,38 @@ impl ConnectionStream for UnixConnStream {
     }
 
     fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.write_all_until(data, Instant::now() + self.read_timeout)
+    }
+
+    fn write_all_until(&mut self, mut data: &[u8], deadline: Instant) -> io::Result<()> {
         use std::io::Write;
-        self.stream.write_all(data)
+        self.stream.set_nonblocking(true)?;
+        let result = (|| {
+            while !data.is_empty() {
+                if Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                match self.stream.write(data) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => data = &data[n..],
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(1)),
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            Ok(())
+        })();
+        let restored = self.stream.set_nonblocking(false);
+        result.and(restored)
     }
 
     fn shutdown(&mut self) -> io::Result<()> {
@@ -202,20 +264,36 @@ impl PipeConnector {
 #[cfg(windows)]
 impl Connector for PipeConnector {
     fn connect(&self) -> Result<Box<dyn ConnectionStream>, ClientError> {
-        use crate::windows_pipe::WinPipeStream;
-        use std::time::Instant;
+        self.connect_until(Instant::now() + READ_TIMEOUT)
+    }
 
+    fn connect_until(&self, deadline: Instant) -> Result<Box<dyn ConnectionStream>, ClientError> {
+        use crate::windows_pipe::WinPipeStream;
         const ERROR_PIPE_BUSY: i32 = 231;
-        let deadline = Instant::now() + READ_TIMEOUT;
         loop {
+            if Instant::now() >= deadline {
+                return Err(ClientError::Timeout);
+            }
             match WinPipeStream::connect(&self.pipe_path) {
-                Ok(pipe) => return Ok(Box::new(pipe)),
+                Ok(pipe) => {
+                    if Instant::now() >= deadline {
+                        return Err(ClientError::Timeout);
+                    }
+                    return Ok(Box::new(pipe));
+                }
                 Err(e)
                     if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline =>
                 {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(10)),
+                    );
                 }
                 Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(ClientError::Timeout);
+                    }
                     return Err(ClientError::Connect(format!(
                         "open pipe {}: {e}",
                         self.pipe_path.display()

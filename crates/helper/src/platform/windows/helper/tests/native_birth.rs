@@ -585,8 +585,16 @@ fn shutdown_cannot_guess_empty_from_missing_upper_entry_or_legacy_pid() {
     let ops = MockProcOps::new();
     let h = make_helper(ops.clone(), MockNetTableOps::new());
     let birth = ops.mint_native_birth().unwrap();
-    ops.start_native_singbox("bin", "cfg", "", false, birth)
-        .unwrap();
+    ops.start_native_singbox(
+        "bin",
+        "cfg",
+        "",
+        false,
+        birth,
+        "conf",
+        &polaris_helper_proto::core_protocol::CallerIdentity::Windows("S-1-5-21-1".into()),
+    )
+    .unwrap();
     assert!(h.reap_child_on_exit().is_err());
     assert_eq!(
         handle_selected(&h, "real-token", Request::NativeStatusBirth),
@@ -792,4 +800,73 @@ fn cleanup_cannot_cross_an_in_progress_control_reservation() {
     );
     assert_eq!(ops.native_stop_calls(), 1);
     assert_eq!(stop(&h, target), NativeBirthStop::Stopped { target });
+}
+
+#[test]
+fn lost_helper_record_with_retained_native_handle_blocks_replacement() {
+    let ops = MockProcOps::new();
+    let original = make_helper(ops.clone(), MockNetTableOps::new());
+    let target = start(&original, false);
+    let replacement = make_helper(ops.clone(), MockNetTableOps::new());
+    let reply = handle_selected(
+        &replacement,
+        "real-token",
+        pinned_start(
+            &replacement,
+            StartParams {
+                cfg: r"C:\Users\polaris\config\c.json".into(),
+                log: String::new(),
+                fwd: false,
+                parent_pid: None,
+            },
+        ),
+    );
+    assert!(matches!(
+        reply,
+        HandleOutcome::Respond(Response::Ok(ResponseKind::NativeBirthStart(
+            NativeBirthStart::NotAdmittedUnknown { target: None }
+        )))
+    ));
+    assert!(!ops.native_custody_empty());
+    assert_eq!(stop(&original, target), NativeBirthStop::Stopped { target });
+    let next = start(&replacement, false);
+    assert_ne!(next.birth, target.birth);
+    assert_eq!(
+        stop(&replacement, next),
+        NativeBirthStop::Stopped { target: next }
+    );
+}
+
+#[test]
+fn windows_native_config_uses_verified_object_without_path_reopen() {
+    let source = include_str!("../../winproc/win.rs");
+    let gate = source
+        .split("fn open_confined_config(")
+        .nth(1)
+        .unwrap()
+        .split("fn preopen_log_files")
+        .next()
+        .unwrap();
+    for required in [
+        "open_directory_no_reparse",
+        "is_private_user_config",
+        "directory.open_regular(name)",
+        "nNumberOfLinks != 1",
+    ] {
+        assert!(
+            gate.contains(required),
+            "missing object boundary: {required}"
+        );
+    }
+    let spawn = source
+        .split("fn spawn_tracked(")
+        .nth(1)
+        .unwrap()
+        .split("fn ensure_job")
+        .next()
+        .unwrap();
+    assert!(spawn.contains("cmd.args([\"run\", \"-c\", \"stdin\"])"));
+    assert!(spawn.contains("Stdio::from(file)"));
+    assert!(spawn.contains("current_dir"));
+    assert!(!spawn.contains("cmd.args([\"run\", \"-c\", cfg])"));
 }

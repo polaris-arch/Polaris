@@ -449,3 +449,18 @@ fn stop_terminal_drops_force_restart_set_during_busy_window() {
     assert_eq!(d.discarded_force_restart_id, Some(456));
     assert!(g.pending().is_empty());
 }
+
+#[test]
+fn nonblocking_generation_observation_rejects_contention_and_poison() {
+    let gate = LifecycleGate::default();
+    assert_eq!(gate.try_generation(), Some(0));
+    let held = gate.inner.lock().unwrap();
+    assert_eq!(gate.try_generation(), None);
+    drop(held);
+    assert_eq!(gate.try_generation(), Some(0));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = gate.inner.lock().unwrap();
+        panic!("inert fixture poison");
+    }));
+    assert_eq!(gate.try_generation(), None);
+}

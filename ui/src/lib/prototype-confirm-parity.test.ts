@@ -479,7 +479,10 @@ const PARITY: readonly ParityRow[] = [
   {
     site: 'case:helper-uninstall',
     impl: { key: 'helper-uninstall', file: 'components/screens/settings/SettingsHelper.tsx' },
-    note: '卸载提权助手',
+    note:
+      '卸载提权助手仍按原型原地二次点击。另一个显式停止并升级动作是实现新增的 macOS 跨会话迁移，' +
+      '需要说明助手及其他会话受管连接都会中断，故复用确认弹窗；它不是本表的 confirmTwice 站点，' +
+      '由 destructive-confirm-wiring 的 SettingsHelper 单次弹窗清册及 SettingsHelper.migration 交互门登记。',
   },
   {
     site: 'fn:uninstallApp',
