@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { basename, join } from 'node:path';
@@ -646,37 +646,63 @@ test('formal host activation derives compiler and source from the validated cont
 });
 
 
-test('Windows controlled runtime summary requires all five exact logs and passed records', () => {
+test('Windows controlled runtime summary requires all five exact stdout logs and passed records', () => {
   const source = nodeScript('Record ordinary candidate outcomes without claiming skipped acceptance');
   const names = [...step('Run exact controlled App lifecycle hot-switch and stats tests')
     .matchAll(/^            (runtime::proxy::[^\s]+)$/gm)].map((m) => m[1]);
   assert.equal(names.length, 5);
-  function summary(missing = '', status = 'passed', logText = 'test result: ok. 1 passed; 0 failed; 0 ignored;', system = {}) {
-    const files = new Map([['native-dns-ci-evidence/runtime-status.txt', names.flatMap((name) =>
-      [`${name}: started`, `${name}: ${name === missing ? 'started' : status}`]).join('\n')]]);
-    for (const name of names) files.set(`native-dns-ci-evidence/${name.split('::').at(-1)}.log`, logText);
-    let result;
-    new Function('process', 'copyFileSync', 'existsSync', 'mkdirSync', 'readFileSync', 'writeFileSync', source)(
-      { env: { RUNNER_OS: 'Windows', RUNTIME_OUTCOME: 'success', ...system } }, () => {}, (path) => files.has(path),
-      () => {}, (path) => files.get(path), (path, value) => { if (path.endsWith('/summary.json')) result = JSON.parse(value); });
-    return result;
+  const pass = 'test result: ok. 1 passed; 0 failed; 0 ignored;';
+  function summary({ missingStatus = '', status = 'passed', stdout = pass, missingStdout = '',
+    mixed = pass, statusFile = true, system = {} } = {}) {
+    const directory = mkdtempSync(join(tmpdir(), 'windows-runtime-summary-'));
+    const fixturePath = (path) => join(directory, path);
+    try {
+      mkdirSync(fixturePath('native-dns-ci-evidence'));
+      if (statusFile) writeFileSync(fixturePath('native-dns-ci-evidence/runtime-status.txt'), names.flatMap((name) =>
+        [`${name}: started`, `${name}: ${name === missingStatus ? 'started' : status}`]).join('\n'));
+      for (const name of names) {
+        const log = `native-dns-ci-evidence/${name.split('::').at(-1)}`;
+        if (name !== missingStdout) writeFileSync(fixturePath(`${log}.stdout.log`), stdout);
+        // Legacy human logs and stderr deliberately contain tempting pass text.
+        writeFileSync(fixturePath(`${log}.log`), mixed);
+        writeFileSync(fixturePath(`${log}.stderr.log`), pass);
+      }
+      new Function('process', 'copyFileSync', 'existsSync', 'mkdirSync', 'readFileSync', 'writeFileSync', source)(
+        { env: { RUNNER_OS: 'Windows', RUNTIME_OUTCOME: 'success', ...system } },
+        (from, to) => copyFileSync(fixturePath(from), fixturePath(to)), (path) => existsSync(fixturePath(path)),
+        (path, options) => mkdirSync(fixturePath(path), options),
+        (path, encoding) => readFileSync(fixturePath(path), encoding),
+        (path, value) => writeFileSync(fixturePath(path), value));
+      return JSON.parse(readFileSync(fixturePath('native-dns-ci-evidence/summary.json'), 'utf8'));
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   }
   const success = summary();
   assert.equal(success.windowsProxyRuntimeTests.state, 'passed');
   assert.equal(success.windowsProxyRuntimeTests.requirementState, 'satisfied');
+  assert.deepEqual(success.windowsProxyRuntimeTests.tests.map(({ name }) => name), names);
+  assert.ok(success.windowsProxyRuntimeTests.tests.every(({ log }) => log.endsWith('.stdout.log')));
   assert.equal(success.AppAccepted, false);
   assert.equal(success.systemAcceptance.state, 'unexecuted');
   for (const [fresh, prebuilt, state] of [['success','success','passed'], ['success','skipped','failed-or-incomplete'],
     ['failure','skipped','failed-or-incomplete'], ['skipped','skipped','unexecuted']]) {
-    const value = summary('', 'passed', 'test result: ok. 1 passed; 0 failed; 0 ignored;',
-      { SYSTEM_FRESH_OUTCOME: fresh, SYSTEM_PREBUILT_OUTCOME: prebuilt });
+    const value = summary({ system: { SYSTEM_FRESH_OUTCOME: fresh, SYSTEM_PREBUILT_OUTCOME: prebuilt } });
     assert.equal(value.systemAcceptance.state, state);
     assert.equal(value.AppAccepted, false);
   }
-  for (const name of names) assert.equal(summary(name).windowsProxyRuntimeTests.requirementState, 'open');
+  for (const name of names) {
+    for (const absent of [{ missingStatus: name }, { missingStdout: name }]) {
+      const value = summary(absent).windowsProxyRuntimeTests;
+      assert.equal(value.requirementState, 'open');
+      assert.equal(value.tests.find((item) => item.name === name).state, 'failed-or-incomplete');
+      assert.ok(value.tests.filter((item) => item.name !== name).every((item) => item.state === 'passed'));
+    }
+  }
   for (const log of ['', 'test result: ok. 0 passed; 0 failed; 0 ignored;', 'test result: FAILED.'])
-    assert.equal(summary('', 'passed', log).windowsProxyRuntimeTests.requirementState, 'open');
-  assert.equal(summary('', 'started').windowsProxyRuntimeTests.requirementState, 'open');
+    assert.equal(summary({ stdout: log }).windowsProxyRuntimeTests.requirementState, 'open',
+      'fake pass text in mixed/stderr logs cannot replace stdout proof');
+  assert.equal(summary({ mixed: 'human-only diagnostics without a verdict' }).windowsProxyRuntimeTests.requirementState, 'satisfied');
+  assert.equal(summary({ status: 'started' }).windowsProxyRuntimeTests.requirementState, 'open');
+  assert.equal(summary({ statusFile: false }).windowsProxyRuntimeTests.state, 'unexecuted');
 });
 
 test('final SYSTEM request fails before heavy work for wrong identity, platform or diagnostic scope', () => {

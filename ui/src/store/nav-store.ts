@@ -9,6 +9,17 @@
 
 import { create } from 'zustand';
 import { IPC_CHANNELS } from '@/domain/ipc-channels';
+import { useDialogStore } from '@/components/dialogs/dialog-store';
+
+// A late bootstrap take must not resurrect an intent already delivered by an event or superseded by navigation.
+let trayIntentGeneration = 0;
+function revokeHelperRecovery(): void {
+  trayIntentGeneration += 1;
+  const dialogs = useDialogStore.getState();
+  for (const entry of dialogs.stack) {
+    if (entry.kind === 'helper-recovery') dialogs.closeInstance(entry.instanceId);
+  }
+}
 
 /** 主屏导航项（对齐原型 .nav-item[data-nav]）。settings 走独立 scope。 */
 export type MainScreen =
@@ -74,11 +85,13 @@ export const useNavStore = create<NavState>((set) => ({
   settingsScreen: 'general',
   sidebarCollapsed: readSidebarCollapsed(),
 
-  navigate: (screen) => set({ scope: 'main', mainScreen: screen }),
-  enterSettings: (screen) =>
-    set({ scope: 'settings', settingsScreen: screen ?? 'general' }),
-  setSettingsScreen: (screen) => set({ settingsScreen: screen }),
-  backToApp: () => set({ scope: 'main' }),
+  navigate: (screen) => { revokeHelperRecovery(); set({ scope: 'main', mainScreen: screen }); },
+  enterSettings: (screen) => {
+    revokeHelperRecovery();
+    set({ scope: 'settings', settingsScreen: screen ?? 'general' });
+  },
+  setSettingsScreen: (screen) => { revokeHelperRecovery(); set({ settingsScreen: screen }); },
+  backToApp: () => { revokeHelperRecovery(); set({ scope: 'main' }); },
 
   toggleSidebar: () =>
     set((state) => {
@@ -97,7 +110,7 @@ export const useNavStore = create<NavState>((set) => ({
  *
  * 托盘浮层是独立窗口、独立 JS 堆，够不着本 store；而设置屏只存在于主窗。后端因此给了一条**窄通道**：
  * `tray_show_main` 的受限目标屏参数 → `event:trayOpenScreen`（值域由 Rust 白名单
- * `normalize_tray_screen` 钉死，仅 `'settings'` / `'settings-helper'`）。这不是已删除的 `EVENT_NAVIGATE` 通用路由的
+ * `normalize_tray_screen` 钉死，仅 `'settings'` / `'settings-helper'` / `'helper-recovery'`）。这不是已删除的 `EVENT_NAVIGATE` 通用路由的
  * 复活——选型理由见 `src-tauri/src/events.rs` 该常量上方与 `src-tauri/src/tray/model.rs::normalize_tray_screen`。
  *
  * 两条投递腿，对应主窗的两种状态：
@@ -109,6 +122,13 @@ export const useNavStore = create<NavState>((set) => ({
 
 /** 窄通道的目标屏 → 导航动作。未登记值一律忽略（**不猜**：宁可不跳，也不跳错屏）。 */
 export function applyTrayScreenIntent(screen: unknown): boolean {
+  if (screen === 'helper-recovery') {
+    trayIntentGeneration += 1;
+    const dialogs = useDialogStore.getState();
+    // Event/seed/await duplicates share one main-window owner, not a tray-local modal.
+    if (!dialogs.stack.some(entry => entry.kind === 'helper-recovery')) dialogs.open({ kind: 'helper-recovery' });
+    return true;
+  }
   if (screen === 'settings-helper') {
     useNavStore.getState().enterSettings('helper');
     return true;
@@ -136,13 +156,14 @@ declare global {
  *
  * 失败静默：非 Tauri（浏览器预览/测试）没有这个 command，另两条腿不受影响。
  */
-async function drainTrayPendingScreen(apply: boolean): Promise<void> {
+export async function drainTrayPendingScreen(apply: boolean): Promise<void> {
+  const generation = trayIntentGeneration;
   try {
     const { invoke } = await import('@/ipc/ipc-client');
     // 命令名字面量（托盘族 command 全在 `tray.rs`、不走 `api-client`，与 `TrayMenu.tsx` 里
     // `invoke('tray_show_main')` 同款写法）。ipc-client 已拆 ApiResponse 信封 → 直接是目标屏。
     const screen = await invoke<string | null>(IPC_CHANNELS.TRAY_TAKE_PENDING_SCREEN);
-    if (apply && screen != null) applyTrayScreenIntent(screen);
+    if (apply && generation === trayIntentGeneration && screen != null) applyTrayScreenIntent(screen);
   } catch {
     /* 非 Tauri / 命令不可达：另两条腿仍在 */
   }

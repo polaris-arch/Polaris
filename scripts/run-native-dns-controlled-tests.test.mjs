@@ -61,13 +61,24 @@ test('the actual host preserves its native Cargo paths and inherited search entr
   if (oldKey !== key) assert.equal(Object.hasOwn(env, oldKey), false);
 });
 
+const capturedStreams = (stdout, stderr = '') => ({
+  stdout, stderr, output: stdout + stderr,
+  stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr),
+  stdoutSha256: createHash('sha256').update(stdout).digest('hex'),
+  stderrSha256: createHash('sha256').update(stderr).digest('hex'),
+});
+const withStdout = (result, stdout) => ({ ...result, ...capturedStreams(stdout, result.stderr) });
+
 test('exact one-test verdict rejects zero, ignored, failed, duplicated and interrupted results', () => {
-  const passed = { status: 0, output: 'test result: ok. 1 passed; 0 failed; 0 ignored; 10 filtered out;\n' };
+  const passed = { status: 0, ...capturedStreams('test result: ok. 1 passed; 0 failed; 0 ignored; 10 filtered out;\n') };
   assert.equal(exactPass(passed), true);
-  for (const output of ['', passed.output.replace('1 passed', '0 passed'), passed.output.replace('0 ignored', '1 ignored'), passed.output.repeat(2)])
-    assert.equal(exactPass({ ...passed, output }), false);
+  for (const stdout of ['', passed.stdout.replace('1 passed', '0 passed'), passed.stdout.replace('0 ignored', '1 ignored'), passed.stdout.repeat(2)])
+    assert.equal(exactPass(withStdout(passed, stdout)), false);
   for (const patch of [{ status: 1 }, { error: 'failed' }, { timedOut: true }, { cleanupUncertain: true }, { interrupted: true }])
     assert.equal(exactPass({ ...passed, ...patch }), false);
+  assert.equal(exactPass({ ...passed, ...capturedStreams('', passed.stdout) }), false);
+  assert.equal(exactPass({ status: 0, output: passed.stdout }), false);
+  assert.equal(exactPass({ ...passed, ...capturedStreams(passed.stdout, passed.stdout) }), true);
   const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   const names = [...workflow.matchAll(/^            (runtime::[^\s]+)$/gm)].map((m) => m[1]);
   assert.deepEqual(names, TESTS);
@@ -95,18 +106,19 @@ const syntheticGraph = () => {
 };
 const syntheticResult = (name, failed = false) => ({
   status: failed ? 1 : 0, processId: 70,
-  output: `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(syntheticCleanup(name))}\n`
+  ...capturedStreams(`POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(syntheticCleanup(name))}\n`
     + (name === TESTS[2] ? `POLARIS_DEFAULT_GRAPH ${JSON.stringify(syntheticGraph())}\n` : '')
-    + `test result: ${failed ? 'FAILED. 0 passed; 1 failed' : 'ok. 1 passed; 0 failed'}; 0 ignored;\n`,
+    + `test result: ${failed ? 'FAILED. 0 passed; 1 failed' : 'ok. 1 passed; 0 failed'}; 0 ignored;\n`),
 });
 
-test('six exact isolated cases aggregate ordinary failures only after positive owned-child cleanup', async () => {
+test('six exact isolated cases aggregate business and graph failures only after positive owned-child cleanup', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'controlled-processes-')));
   try {
     const executable = join(root, 'fixture'), manifest = join(root, 'Cargo.toml');
     writeFileSync(executable, 'original');
     const selected = { executable, manifest };
-    for (const mode of ['pass', 'ordinary-failure', 'zero', 'unknown-cleanup', 'cleanup-failure', 'wrong-pid', 'wrong-test', 'drift']) {
+    for (const mode of ['pass', 'ordinary-failure', 'bad-graph', 'bad-graph-cleanup', 'bad-graph-count', 'stderr-graph', 'polluted-output',
+      'zero', 'unknown-cleanup', 'cleanup-failure', 'wrong-pid', 'wrong-test', 'stderr-cleanup', 'stderr-pass', 'output-only', 'drift']) {
       const directory = join(root, mode); mkdirSync(directory);
       const calls = [];
       writeFileSync(executable, 'original');
@@ -114,19 +126,56 @@ test('six exact isolated cases aggregate ordinary failures only after positive o
         calls.push(command);
         assert.equal(options.root, root); assert.equal(options.env.FROZEN, 'yes');
         const name = command.args[0], result = syntheticResult(name, mode === 'ordinary-failure');
-        if (mode === 'zero') result.output = result.output.replace('1 passed', '0 passed');
-        if (mode === 'unknown-cleanup') { result.status = 1; result.output = 'test result: FAILED. 0 passed; 1 failed; 0 ignored;\n'; }
+        if (mode === 'zero') Object.assign(result, capturedStreams(result.stdout.replace('1 passed', '0 passed')));
+        if (mode === 'unknown-cleanup') { result.status = 1; Object.assign(result, capturedStreams('test result: FAILED. 0 passed; 1 failed; 0 ignored;\n')); }
         if (mode === 'cleanup-failure') result.cleanupUncertain = true;
         if (mode === 'wrong-pid') result.processId = 71;
-        if (mode === 'wrong-test') result.output = result.output.replace(name, TESTS[1]);
+        if (mode === 'wrong-test') Object.assign(result, capturedStreams(result.stdout.replace(name, TESTS[1])));
+        if (['bad-graph', 'bad-graph-cleanup', 'bad-graph-count'].includes(mode) && name === TESTS[2])
+          Object.assign(result, capturedStreams(result.stdout.replace(/POLARIS_DEFAULT_GRAPH [^\n]+\n/, 'POLARIS_DEFAULT_GRAPH {broken-json}\n')));
+        if (mode === 'bad-graph-cleanup' && name === TESTS[2]) result.cleanupUncertain = true;
+        if (mode === 'bad-graph-count' && name === TESTS[2])
+          Object.assign(result, capturedStreams(result.stdout.replace('1 passed', '0 passed')));
+        if (mode === 'stderr-graph' && name === TESTS[2]) {
+          const graphLine = result.stdout.match(/POLARIS_DEFAULT_GRAPH [^\n]+\n/)[0];
+          Object.assign(result, capturedStreams(result.stdout.replace(graphLine, ''), graphLine));
+        }
+        if (mode === 'polluted-output') {
+          Object.assign(result, capturedStreams(result.stdout, 'INFO diagnostics\n' + result.stdout));
+          result.output = result.stdout.replace('"configJson":', 'INFO interleaved core stderr\n"configJson":') + result.stderr;
+        }
+        if (mode === 'stderr-cleanup') {
+          const cleanupLine = result.stdout.match(/POLARIS_CONTROLLED_CLEANUP [^\n]+\n/)[0];
+          Object.assign(result, capturedStreams(result.stdout.replace(cleanupLine, ''), cleanupLine));
+        }
+        if (mode === 'stderr-pass') {
+          const summary = result.stdout.match(/test result: [^\n]+\n/)[0];
+          Object.assign(result, capturedStreams(result.stdout.replace(summary, ''), summary));
+        }
+        if (mode === 'output-only') return { status: result.status, processId: result.processId, output: result.output };
         if (mode === 'drift') writeFileSync(executable, 'different bytes');
         return result;
       });
-      if (mode === 'pass') await run; else await assert.rejects(run);
-      assert.equal(calls.length, ['pass', 'ordinary-failure'].includes(mode) ? 6 : 1);
+      if (['pass', 'polluted-output'].includes(mode)) await run;
+      else if (['ordinary-failure', 'bad-graph', 'stderr-graph'].includes(mode))
+        await assert.rejects(run, /Controlled business\/evidence failures after confirmed cleanup/);
+      else if (['zero', 'stderr-pass', 'bad-graph-count'].includes(mode)) await assert.rejects(run, /did not execute exactly one reviewed test/);
+      else if (mode === 'bad-graph-cleanup') await assert.rejects(run, /owned-child cleanup is unconfirmed/);
+      else await assert.rejects(run);
+      const expectedCalls = ['pass', 'ordinary-failure', 'bad-graph', 'stderr-graph', 'polluted-output'].includes(mode) ? 6
+        : ['bad-graph-cleanup', 'bad-graph-count'].includes(mode) ? 3 : 1;
+      assert.equal(calls.length, expectedCalls);
       assert.ok(calls.every((c) => c.program === executable && c.args.slice(1).join(' ') === '--exact --ignored --nocapture --test-threads=1'));
       if (calls.length === 6) assert.deepEqual(calls.map((c) => c.args[0]), TESTS);
       if (mode === 'ordinary-failure') assert.equal((readFileSync(join(directory, 'runtime-status.txt'), 'utf8').match(/cleanup confirmed/g) ?? []).length, 6);
+      if (['bad-graph', 'stderr-graph'].includes(mode)) {
+        const status = readFileSync(join(directory, 'runtime-status.txt'), 'utf8');
+        assert.ok(status.includes(`${TESTS[2]}: failed; owned-child cleanup confirmed`));
+        for (const name of TESTS.slice(3)) assert.ok(status.includes(`${name}: passed\n`));
+        assert.ok(!readdirSync(directory).includes('default-production-graph.json'));
+      }
+      if (['bad-graph-cleanup', 'bad-graph-count'].includes(mode))
+        assert.ok(!readdirSync(directory).includes('default-production-graph.json'));
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -135,22 +184,38 @@ test('cleanup requires one affirmative current-process/current-test original-cus
   const name = TESTS[0], valid = syntheticResult(name, true);
   assert.equal(confirmedCleanup(valid, name), true);
   for (const patch of [{ processId: null }, { timedOut: true }, { interrupted: true }, { error: 'spawn' },
-    { status: null }, { output: valid.output + valid.output }, { output: '' }, { cleanupUncertain: true }]) {
+    { status: null }, capturedStreams(valid.stdout.repeat(2)), capturedStreams(''), { cleanupUncertain: true }]) {
     assert.equal(confirmedCleanup({ ...valid, ...patch }, name), false);
   }
   for (const patch of [{ shutdownFenced: false }, { generation: -1 }, { publicationEligible: true },
-    { testName: TESTS[1] }, { processId: 71 }, { custody: { state: 'unknown' } }]) {
-    const output = `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify({ ...syntheticCleanup(name), ...patch })}\n`;
-    assert.equal(confirmedCleanup({ ...valid, output }, name), false);
+    { schema: 'wrong-schema' }, { testName: TESTS[1] }, { processId: 71 }, { custody: { state: 'unknown' } }]) {
+    const stdout = `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify({ ...syntheticCleanup(name), ...patch })}\n`;
+    assert.equal(confirmedCleanup(withStdout(valid, stdout), name), false);
   }
   for (const state of ['retained-child-exit-observed', 'emergency-owned-child-reaped']) {
     const record = syntheticCleanup(name);
     record.custody = { state, runRef: 'direct-00000000-0000-0000-0000-000000000001', corePid: 81 };
-    const result = { ...valid, output: `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(record)}\n` };
+    const result = withStdout(valid, `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(record)}\n`);
     assert.equal(confirmedCleanup(result, name), true);
     record.custody.runRef = 'rediscovered-by-name';
-    assert.equal(confirmedCleanup({ ...valid, output: `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(record)}\n` }, name), false);
+    assert.equal(confirmedCleanup(withStdout(valid, `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(record)}\n`), name), false);
   }
+  assert.equal(confirmedCleanup({ ...valid, ...capturedStreams('', valid.stdout) }, name), false);
+  assert.equal(confirmedCleanup({ status: valid.status, processId: valid.processId, output: valid.stdout }, name), false);
+  assert.equal(confirmedCleanup({ ...valid, ...capturedStreams(valid.stdout, valid.stdout) }, name), true);
+});
+
+test('cleanup admits only complete LF or CRLF protocol lines anchored at line start', () => {
+  const name = TESTS[0], valid = syntheticResult(name);
+  const line = `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(syntheticCleanup(name))}`;
+  for (const eol of ['\n', '\r\n']) {
+    assert.equal(confirmedCleanup(withStdout(valid, `${line}${eol}`), name), true);
+    assert.equal(confirmedCleanup(withStdout(valid, `ordinary diagnostic${eol}${line}${eol}unterminated diagnostic`), name), true);
+  }
+  for (const stdout of [line, `${line}\r`, line.slice(0, -1), `${line.slice(0, -1)}\n`,
+    `prefix ${line}\n`, ` ${line}\n`, 'POLARIS_CONTROLLED_CLEANUP {invalid}\n',
+    `${line}\n${line}`, `${line}\nPOLARIS_CONTROLLED_CLEANUP {invalid}\n`])
+    assert.equal(confirmedCleanup(withStdout(valid, stdout), name), false);
 });
 
 test('default graph stores exact generator bytes, never reconstructs or accepts mismatched evidence', () => {
@@ -169,13 +234,13 @@ test('default graph stores exact generator bytes, never reconstructs or accepts 
       assert.throws(() => preserveProductionGraph(bad, name, empty, 'a'.repeat(64)));
       assert.deepEqual(readdirSync(empty), []);
     };
-    for (const patch of [{ processId: 71 }, { bytes: 1 }, { sha256: '0'.repeat(64) },
+    for (const patch of [{ processId: 71 }, { schema: 'wrong-schema' }, { bytes: 1 }, { sha256: '0'.repeat(64) },
       { dashboardEnabled: false }, { source: 'reconstructed' }, { publicationEligible: true },
       { configJson: '{}' }, { dashboardPath: '/other' }]) {
-      const output = `POLARIS_DEFAULT_GRAPH ${JSON.stringify({ ...syntheticGraph(), ...patch })}\n`;
-      rejectedBeforeWrite({ ...result, output });
+      const stdout = `POLARIS_DEFAULT_GRAPH ${JSON.stringify({ ...syntheticGraph(), ...patch })}\n`;
+      rejectedBeforeWrite(withStdout(result, stdout));
     }
-    rejectedBeforeWrite({ ...result, output: result.output + result.output });
+    rejectedBeforeWrite(withStdout(result, result.stdout.repeat(2)));
     rejectedBeforeWrite(result, TESTS[0]);
     for (const mutate of [(g) => { g.services = []; }, (g) => { g.inbounds[0].listen = '0.0.0.0'; },
       (g) => { g.inbounds[0].type = 'tun'; }]) {
@@ -183,9 +248,64 @@ test('default graph stores exact generator bytes, never reconstructs or accepts 
       const configJson = JSON.stringify(graph), bytes = Buffer.from(configJson);
       const row = { ...syntheticGraph(), configJson, bytes: bytes.length,
         sha256: createHash('sha256').update(bytes).digest('hex') };
-      rejectedBeforeWrite({ ...result, output: `POLARIS_DEFAULT_GRAPH ${JSON.stringify(row)}\n` });
+      rejectedBeforeWrite(withStdout(result, `POLARIS_DEFAULT_GRAPH ${JSON.stringify(row)}\n`));
     }
-    assert.equal(preserveProductionGraph({ ...result, output: '' }, TESTS[2], root, 'a'.repeat(64)), false);
+    assert.equal(preserveProductionGraph(withStdout(result, ''), TESTS[2], root, 'a'.repeat(64)), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('graph evidence requires complete protocol lines and never falls back to stderr or combined output', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'controlled-graph-lines-')));
+  try {
+    const result = syntheticResult(TESTS[2]);
+    const line = `POLARIS_DEFAULT_GRAPH ${JSON.stringify(syntheticGraph())}`;
+    for (const eol of ['\n', '\r\n']) {
+      const directory = mkdtempSync(join(root, 'valid-'));
+      assert.equal(preserveProductionGraph(withStdout(result, `diagnostic${eol}${line}${eol}unterminated diagnostic`), TESTS[2], directory, 'a'.repeat(64)), true);
+      assert.equal(readFileSync(join(directory, 'default-production-graph.json'), 'utf8'), syntheticGraph().configJson);
+    }
+    for (const stdout of [line, `${line}\r`, line.slice(0, -1), `${line.slice(0, -1)}\n`,
+      'POLARIS_DEFAULT_GRAPH {invalid}\n', `${line}\n${line}`, `${line}\nPOLARIS_DEFAULT_GRAPH {invalid}\n`]) {
+      const directory = mkdtempSync(join(root, 'invalid-'));
+      assert.throws(() => preserveProductionGraph(withStdout(result, stdout), TESTS[2], directory, 'a'.repeat(64)));
+      assert.deepEqual(readdirSync(directory), []);
+    }
+    for (const bad of [withStdout(result, `prefix ${line}\n`), withStdout(result, ` ${line}\n`),
+      { ...result, ...capturedStreams('', `${line}\n`) },
+      { status: result.status, processId: result.processId, output: `${line}\n` }]) {
+      const directory = mkdtempSync(join(root, 'absent-'));
+      assert.equal(preserveProductionGraph(bad, TESTS[2], directory, 'a'.repeat(64)), false);
+      assert.deepEqual(readdirSync(directory), []);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('80516-byte production graph survives stderr interleaving in the human combined log', () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'controlled-graph-streams-')));
+  try {
+    const graph = JSON.parse(syntheticGraph().configJson);
+    graph.outbounds[0].tag = '';
+    graph.outbounds[0].tag = 'x'.repeat(80_516 - Buffer.byteLength(JSON.stringify(graph)));
+    const configJson = JSON.stringify(graph);
+    const record = { ...syntheticGraph(), configJson, bytes: Buffer.byteLength(configJson),
+      sha256: createHash('sha256').update(configJson).digest('hex') };
+    assert.equal(record.bytes, 80_516);
+    const stdout = `POLARIS_CONTROLLED_CLEANUP ${JSON.stringify(syntheticCleanup(TESTS[2]))}\n`
+      + `POLARIS_DEFAULT_GRAPH ${JSON.stringify(record)}\n`
+      + 'test result: ok. 1 passed; 0 failed; 0 ignored;\n';
+    const stderr = 'INFO core diagnostic\nPOLARIS_DEFAULT_GRAPH {broken-json}\n'
+      + 'POLARIS_CONTROLLED_CLEANUP {broken-json}\ntest result: FAILED. 0 passed; 1 failed; 0 ignored;\n';
+    const result = { status: 0, processId: 70, ...capturedStreams(stdout, stderr),
+      output: stdout.slice(0, 32_768) + stderr + stdout.slice(32_768) };
+    assert.equal(exactPass(result), true);
+    assert.equal(confirmedCleanup(result, TESTS[2]), true);
+    assert.equal(preserveProductionGraph(result, TESTS[2], root, 'a'.repeat(64)), true);
+    const raw = readFileSync(join(root, 'default-production-graph.json'));
+    assert.deepEqual(raw, Buffer.from(configJson));
+    assert.equal(createHash('sha256').update(raw).digest('hex'), record.sha256);
+    const receipt = JSON.parse(readFileSync(join(root, 'default-production-graph.receipt.json'), 'utf8'));
+    assert.equal(receipt.bytes, record.bytes); assert.equal(receipt.sha256, record.sha256);
+    assert.equal(receipt.executableSha256, 'a'.repeat(64));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -204,21 +324,24 @@ test('ordinary exact execution keeps per-test one-pass and immutable binary boun
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'ordinary-contract-')));
   try {
     const executable = join(root, 'inert-fixture'), manifest = join(root, 'Cargo.toml');
-    for (const mode of ['pass', 'zero', 'duplicate', 'failed', 'timeout', 'cleanup', 'drift']) {
+    for (const mode of ['pass', 'polluted-output', 'stderr-pass', 'output-only', 'zero', 'duplicate', 'failed', 'timeout', 'cleanup', 'drift']) {
       writeFileSync(executable, 'original'); const calls = [];
       const execute = async (command, options) => {
         calls.push(command); assert.equal(options.root, root); assert.equal(options.timeout, 20 * 60_000);
-        const row = { status: 0, output: 'test result: ok. 1 passed; 0 failed; 0 ignored;\n' };
-        if (mode === 'zero') row.output = row.output.replace('1 passed', '0 passed');
-        if (mode === 'duplicate') row.output += row.output;
+        const row = { status: 0, ...capturedStreams('test result: ok. 1 passed; 0 failed; 0 ignored;\n') };
+        if (mode === 'zero') Object.assign(row, capturedStreams(row.stdout.replace('1 passed', '0 passed')));
+        if (mode === 'duplicate') Object.assign(row, capturedStreams(row.stdout.repeat(2)));
         if (mode === 'failed') row.status = 1;
         if (mode === 'timeout') row.timedOut = true;
         if (mode === 'cleanup') row.cleanupUncertain = true;
+        if (mode === 'polluted-output') Object.assign(row, capturedStreams(row.stdout, row.stdout));
+        if (mode === 'stderr-pass') Object.assign(row, capturedStreams('', row.stdout));
+        if (mode === 'output-only') return { status: row.status, output: row.output };
         if (mode === 'drift') writeFileSync(executable, 'changed');
         return row;
       };
       const action = () => runContractTests({ executable, manifest }, ['module::one', 'module::two'], {}, root, execute);
-      if (mode === 'pass') { await action(); assert.equal(calls.length, 2); }
+      if (['pass', 'polluted-output'].includes(mode)) { await action(); assert.equal(calls.length, 2); }
       else { await assert.rejects(action); assert.equal(calls.length, 1); }
       for (const call of calls) assert.deepEqual(call.args.slice(1), ['--exact', '--nocapture', '--test-threads=1']);
     }

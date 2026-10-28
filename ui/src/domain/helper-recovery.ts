@@ -7,16 +7,16 @@ export function needsHelperRecovery(code: unknown): boolean {
     code === 'HELPER_CORE_INVALID';
 }
 
-/** Reveal/recreate the main window and reuse its Helper page. Never install or elevate here.
+/** Reveal/recreate the main window and offer the cancellable Helper explanation. Never install or elevate here.
  * The native command persists the intent across hidden, destroyed and booting renderers.
  * No main-window stores are imported: this module also runs in the independent tray webview.
  */
 export async function revealHelperRecovery(): Promise<boolean> {
   try {
-    await invoke(IPC_CHANNELS.TRAY_SHOW_MAIN, { screen: 'settings-helper' });
+    await invoke(IPC_CHANNELS.TRAY_SHOW_MAIN, { screen: 'helper-recovery' });
     return true;
   } catch (error) {
-    console.error('[helper-recovery] could not reveal Helper settings:', error);
+    console.error('[helper-recovery] could not reveal Helper recovery:', error);
     return false;
   }
 }

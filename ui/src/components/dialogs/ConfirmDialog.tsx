@@ -18,13 +18,18 @@ import { useTranslation } from 'react-i18next';
 import { Modal } from './Modal';
 import { useDialogStore, type ConfirmPayload } from './dialog-store';
 
-export function ConfirmDialog({ payload }: { payload: ConfirmPayload }) {
+export function ConfirmDialog({ payload, instanceId }: { payload: ConfirmPayload; instanceId?: string }) {
   const { t } = useTranslation();
   const close = useDialogStore((s) => s.close);
   /** 所有「不是确认」的离开路径统一走这里：先 pop 自身，再通知调用点。顺序不可颠倒 ——
    *  onCancel 里可能同步 resolve 出一个立刻再开弹窗的流程（双重确认的第二问就是这样）。 */
   const dismiss = () => {
-    close();
+    // The narrow cross-window recovery owns an exact instance; stale dismissals must not pop another dialog.
+    if (instanceId !== undefined) {
+      const dialogs = useDialogStore.getState();
+      if (!dialogs.hasInstance(instanceId)) return;
+      dialogs.closeInstance(instanceId);
+    } else close();
     payload.onCancel?.();
   };
 

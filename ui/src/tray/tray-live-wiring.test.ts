@@ -78,11 +78,25 @@ describe('托盘卡片随系统栏边缘贴合', () => {
     );
   });
 
-  it('自适应高度取未裁剪内容，不能被初始 420px viewport 锁死', () => {
-    expect(MENU).toContain('menu.scrollHeight + borderHeight');
-    expect(MENU).toMatch(/Math\.max\(rect\.height,\s*naturalMenuHeight\)/);
+  it('自适应高度独立量自然内层，初始 420px 能长且旧宿主变高后还能缩', () => {
+    expect(MENU).toContain('className="tray-menu-content" ref={contentRef}');
+    expect(MENU).toContain('trayNaturalWindowHeight(content.getBoundingClientRect().height, {');
+    expect(MENU).toContain('top: menu.getBoundingClientRect().top');
+    expect(MENU).not.toContain('menu.scrollHeight');
+    expect(MENU).not.toContain('document.body.scrollHeight');
+    expect(MENU).not.toMatch(/Math\.max\(rect\.height/);
+    expect(MENU).toMatch(/parseFloat\(style\.paddingTop/);
+    expect(MENU).toMatch(/parseFloat\(style\.paddingBottom/);
     expect(MENU).toMatch(/parseFloat\(style\.borderTopWidth/);
     expect(MENU).toMatch(/parseFloat\(style\.borderBottomWidth/);
+    expect(MENU).toMatch(/parseFloat\(style\.marginBottom/);
+    expect(MENU).toContain('if (contentRef.current) ro.observe(contentRef.current)');
+    const inner = code(OVERLAY_RAW).match(/\.tray-menu-content\s*\{([^}]*)\}/)?.[1] ?? '';
+    expect(inner).toContain('display: flow-root');
+    expect(inner).toContain('height: auto');
+    expect(inner).toContain('min-height: 0');
+    expect(inner).not.toMatch(/(?:vh|%|flex|stretch)/);
+    expect(OVERLAY_RAW).toMatch(/\.tray-menu\s*{[^}]*overflow-y:\s*auto;/s);
   });
 
   it('配置加载后的主视图高度在**一次展开内**固化，节点折叠/展开只走内部滚动', () => {

@@ -26,11 +26,66 @@ import {
   armScreenChangeRemeasure,
   resetTrayHeightLock,
   screenMetricQueries,
+  trayNaturalWindowHeight,
   trayReportedHeight,
   type TrayHeightLock,
   type TrayMediaQueryList,
   type TrayScreenView,
+  type TrayMenuFrame,
 } from './tray-menu-height';
+
+const FRAME: TrayMenuFrame = {
+  top: 2, paddingTop: 6, paddingBottom: 6, borderTop: 1, borderBottom: 1, marginBottom: 10,
+};
+
+describe('自然内容高度：不把旧宿主 viewport 当作下界', () => {
+  it('初始宿主 420px 已溢出时仍回报完整内容；宿主夹限不改测量', () => {
+    const measured = trayNaturalWindowHeight(940, FRAME);
+    expect(measured).toBe(966);
+    expect(measured).toBeGreaterThan(420);
+    for (const platformLimit of [700, 720]) {
+      const host = Math.min(measured, platformLimit);
+      expect(host).toBe(platformLimit);
+      expect(trayNaturalWindowHeight(940, FRAME)).toBe(measured);
+    }
+  });
+
+  it('同次展开主视图长→短→长，外卡片仍是旧宿主高也不阻止回缩', () => {
+    const lock: TrayHeightLock = { current: null };
+    const long = trayNaturalWindowHeight(674, FRAME);
+    expect(trayReportedHeight(lock, long, true)).toBe(700);
+    const short = trayNaturalWindowHeight(574, FRAME);
+    // 旧外卡片 rect/scrollHeight 算法在宿主 700px 时只能再次报 700。
+    const oldOuterBasedHeight = FRAME.top + Math.max(700 - 12, short - 12) + FRAME.marginBottom;
+    expect(oldOuterBasedHeight).toBe(700);
+    expect(trayReportedHeight(lock, short, true)).toBe(600);
+    expect(trayReportedHeight(lock, long, true)).toBe(700);
+  });
+
+  it('非 main 展开/折叠仍保持卡片；回 main 刷新为更短自然高', () => {
+    const lock: TrayHeightLock = { current: null };
+    expect(trayReportedHeight(lock, trayNaturalWindowHeight(674, FRAME), true)).toBe(700);
+    expect(trayReportedHeight(lock, trayNaturalWindowHeight(1200, FRAME), false)).toBe(700);
+    expect(trayReportedHeight(lock, trayNaturalWindowHeight(180, FRAME), false)).toBe(700);
+    expect(trayReportedHeight(lock, trayNaturalWindowHeight(574, FRAME), true)).toBe(600);
+  });
+
+  it('屏幕边缘 top/bottom/left/right 都只计一次原有 padding、边框和外边距', () => {
+    for (const edge of ['top', 'bottom', 'left', 'right']) {
+      const frame = edge === 'bottom' ? { ...FRAME, top: 12, marginBottom: 0 } : FRAME;
+      expect(trayNaturalWindowHeight(574, frame)).toBe(600);
+    }
+  });
+
+  it('字体重排与 DPI/缩放的分数 CSS 像素只在最后取整，无旧窗高或物理像素倍率', () => {
+    const lock: TrayHeightLock = { current: null };
+    for (const height of [574.25, 590.5, 550.125, 574.25]) {
+      expect(trayReportedHeight(lock, trayNaturalWindowHeight(height, FRAME), true))
+        .toBe(Math.ceil(height + 26));
+    }
+    expect(trayNaturalWindowHeight(574.25, { ...FRAME, borderTop: 0.5, borderBottom: 0.5 })).toBe(600);
+  });
+});
 
 /**
  * 可注入的假屏。`matchMedia` 每次调用返回**新对象**（与浏览器一致），故 `removeEventListener`

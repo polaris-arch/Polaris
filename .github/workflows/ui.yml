@@ -126,7 +126,7 @@ jobs:
         id: browser_forms
         run: |
           pnpm exec playwright install --with-deps chromium
-          POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts src/components/dialogs/app-transactions.browser.test.ts --maxWorkers=1
+          POLARIS_BROWSER_TESTS=1 pnpm exec vitest run src/mobile/measurement-view.browser.test.ts src/components/dialogs/app-transactions.browser.test.ts src/hooks/use-subscription-user-agent.browser.test.tsx --maxWorkers=1
           pnpm exec playwright test --config playwright.config.ts
 
       - name: Browser form failure evidence (mock fixture only)

@@ -131,28 +131,38 @@ def private_root_probe(source, directory, expected_hash):
                     hashlib.sha256(data).hexdigest() == expected_hash and
                     identity(os.fstat(fd)) == identity(before) and
                     identity(source.lstat()) == identity(before), 'private probe source changed')
-        name = 'root-rpc-probe'
-        out = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
-        with os.fdopen(out, 'w+b') as target:
-            created = os.fstat(out)
-            require(stat.S_ISREG(created.st_mode) and created.st_uid == uid and created.st_nlink == 1 and
-                    (created.st_dev, created.st_ino) != (before.st_dev, before.st_ino),
-                    'private probe copy identity invalid')
-            target.write(data); target.flush(); os.fchmod(out, 0o500); os.fsync(out)
-            copied = os.fstat(out)
-            target.seek(0)
-            require(hashlib.sha256(target.read(128 * 1024 * 1024 + 1)).hexdigest() == expected_hash and
-                    copied.st_size == len(data) and copied.st_uid == uid and copied.st_nlink == 1 and
-                    identity(os.fstat(out)) == identity(copied) and
-                    identity(os.stat(name, dir_fd=dfd, follow_symlinks=False)) == identity(copied),
-                    'private probe copy changed')
-        final_parent = directory.lstat()
-        require(stat.S_ISDIR(final_parent.st_mode) and final_parent.st_uid == uid and
-                final_parent.st_mode & 0o077 == 0 and
-                (final_parent.st_dev, final_parent.st_ino) == (parent.st_dev, parent.st_ino) and
-                identity(source.lstat()) == identity(before) and
-                identity((directory / name).lstat()) == identity(copied), 'private probe path changed')
-        return directory / name
+            def verify_source_bytes():
+                # Same bounded, uncached descriptor read used by HeldScript.sample.
+                # Same-size writes can share metadata timestamps; a BufferedReader
+                # seek must not replay the first read instead of current bytes.
+                require(os.pread(fd, before.st_size + 1, 0) == data and
+                        os.pread(fd, before.st_size + 1, 0) == data and
+                        identity(os.fstat(fd)) == identity(before) and
+                        identity(source.lstat()) == identity(before), 'private probe source changed')
+            verify_source_bytes()
+            name = 'root-rpc-probe'
+            out = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            with os.fdopen(out, 'w+b') as target:
+                created = os.fstat(out)
+                require(stat.S_ISREG(created.st_mode) and created.st_uid == uid and created.st_nlink == 1 and
+                        (created.st_dev, created.st_ino) != (before.st_dev, before.st_ino),
+                        'private probe copy identity invalid')
+                target.write(data); target.flush(); os.fchmod(out, 0o500); os.fsync(out)
+                copied = os.fstat(out)
+                target.seek(0)
+                require(hashlib.sha256(target.read(128 * 1024 * 1024 + 1)).hexdigest() == expected_hash and
+                        copied.st_size == len(data) and copied.st_uid == uid and copied.st_nlink == 1 and
+                        identity(os.fstat(out)) == identity(copied) and
+                        identity(os.stat(name, dir_fd=dfd, follow_symlinks=False)) == identity(copied),
+                        'private probe copy changed')
+            final_parent = directory.lstat()
+            require(stat.S_ISDIR(final_parent.st_mode) and final_parent.st_uid == uid and
+                    final_parent.st_mode & 0o077 == 0 and
+                    (final_parent.st_dev, final_parent.st_ino) == (parent.st_dev, parent.st_ino) and
+                    identity(source.lstat()) == identity(before) and
+                    identity((directory / name).lstat()) == identity(copied), 'private probe path changed')
+            verify_source_bytes()
+            return directory / name
     finally:
         # On error retain any partial/changed target for the existing guarded
         # workspace cleanup; never unlink an unconfirmed same-name replacement.

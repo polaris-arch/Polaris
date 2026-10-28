@@ -525,14 +525,16 @@ test('Node gate streams diagnostics and rejects runner failure, missing coverage
   const source = readFileSync(new URL('./gate-node-test.sh', import.meta.url), 'utf8');
   const required = [...source.matchAll(/^  (scripts\/[^\s]+\.test\.mjs)$/gm)].map(m => m[1]);
   const minimum = Number(/"\$passed" -lt (\d+)/.exec(source)?.[1]);
-  assert(minimum >= 500); assert(required.includes('scripts/ci-workflow-efficiency.test.mjs'));
+  assert.equal(minimum, 501); assert(required.includes('scripts/ci-workflow-efficiency.test.mjs'));
   const root = mkdtempSync(join(tmpdir(), 'node-gate-'));
   try {
     mkdirSync(join(root, 'scripts')); mkdirSync(join(root, 'bin'));
     writeFileSync(join(root, 'scripts/gate-node-test.sh'), source);
     for (const name of required) writeFileSync(join(root, name), '');
     const shim = join(root, 'bin/node');
-    const env = { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}` };
+    const inertNode = join(root, 'inert-node.mjs');
+    const env = { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`,
+      NODE_GATE_REAL_NODE: process.execPath, NODE_GATE_INERT_SCRIPT: inertNode };
     const run = (body) => {
       writeFileSync(shim, `#!/bin/bash\n${body}\n`, { mode: 0o755 });
       const result = spawnSync('bash', ['scripts/gate-node-test.sh'], { cwd: root, env, encoding: 'utf8', timeout: 5000 });
@@ -546,6 +548,33 @@ test('Node gate streams diagnostics and rejects runner failure, missing coverage
     ]) assert.notEqual(run(body).status, 0, body);
     const failure = run('echo "not ok 1 - diagnostic"; exit 1');
     assert.match(failure.stdout, /not ok 1 - diagnostic/);
+    // A real inert Node process exercises the actual pipeline's file descriptors.
+    // Await writes rather than depending on the scheduler's order across pipes.
+    const runNode = (stdout, stderr, status = 0) => {
+      writeFileSync(inertNode, `
+        const write = (stream, text) => new Promise((resolve, reject) =>
+          stream.write(text, error => error ? reject(error) : resolve()));
+        await write(process.stderr, ${JSON.stringify(stderr)});
+        await write(process.stdout, ${JSON.stringify(stdout)});
+        process.exitCode = ${status};
+      `);
+      return run('exec "$NODE_GATE_REAL_NODE" "$NODE_GATE_INERT_SCRIPT"');
+    };
+    const tap = `TAP version 13\n# pass ${minimum}\n`;
+    for (const diagnostic of [`# pass ${minimum + 999}\n`, 'stderr noise without a final newline']) {
+      const result = runNode(tap, diagnostic);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.equal(result.stdout, tap, 'stderr must never enter the stdout TAP parser or forwarded TAP');
+      assert.equal(result.stderr, diagnostic, 'diagnostics retain their original stderr channel and bytes');
+    }
+    for (const [stdout, stderr, status] of [
+      ['', `# pass ${minimum}\n`, 0],
+      ['changed summary\n', `# pass ${minimum}\n`, 0],
+      [`# pass ${minimum}\n# pass ${minimum}\n`, '', 0],
+      [`# pass ${minimum - 1}\n`, `# pass ${minimum}\n`, 0],
+      [tap, '', 7],
+    ]) assert.notEqual(runNode(stdout, stderr, status).status, 0,
+      'only one sufficient stdout summary and a successful runner can satisfy the gate');
     writeFileSync(shim, `#!/bin/bash\necho live-marker\nread -r release\necho '# pass ${minimum}'\n`, { mode: 0o755 });
     await new Promise((resolve, reject) => {
       const child = spawn('bash', ['scripts/gate-node-test.sh'], { cwd: root, env });

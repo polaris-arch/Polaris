@@ -1,10 +1,11 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { clearHelperInstallFeedback } from './helper-install-session';
 import { isValidElement, type ReactElement } from 'react';
 
 const h = vi.hoisted(() => ({
   state: [] as unknown[], refs: [] as Array<{ current: unknown }>,
   stateIndex: 0, refIndex: 0, effect: null as null | (() => (() => void)),
-  refresh: null as null | (() => void), platform: 'mac' as string | undefined,
+  refresh: null as null | (() => void), platform: 'mac' as string | undefined, cleanup: null as null | (() => void),
 }));
 vi.mock('react', async (original) => ({
   ...await original<typeof import('react')>(),
@@ -59,7 +60,7 @@ function click(label: string) {
 }
 async function mounted() {
   vi.mocked(helperApi.getStatus).mockResolvedValue(absent as never);
-  render(); const unmount = h.effect!();
+  render(); const unmount = h.effect!(); h.cleanup = unmount;
   await vi.waitFor(() => expect(h.state[1]).toBe('none'));
   return unmount;
 }
@@ -80,6 +81,7 @@ function confirmation() {
 }
 beforeEach(() => {
   h.state = []; h.refs = []; h.effect = h.refresh = null; h.platform = 'mac';
+  clearHelperInstallFeedback();
   vi.clearAllMocks(); useDialogStore.getState().closeAll();
 });
 it('mount, refresh, and ordinary upgradeDeferred never select or auto-start migration', async () => {
@@ -136,14 +138,14 @@ it('an explicit failure stays visible with no fallback or retry', async () => {
   expect(button('helper.stopAndUpgradeAction')).toBeUndefined();
 });
 
-it('an ordinary retry invalidates a previously opened migration confirmation', async () => {
-  await deferred(); click('helper.stopAndUpgradeAction');
+it('the deferred primary action no longer offers an ordinary retry and a cancelled confirmation is inert', async () => {
+  await deferred();
+  expect(button('helper.installAction')).toBeUndefined();
+  click('helper.stopAndUpgradeAction');
   const stale = confirmation();
-  vi.mocked(helperApi.install).mockResolvedValue({ success: false, errorCode: 'cancelled', status: absent } as never);
-  click('helper.installAction'); stale.onConfirm();
-  await vi.waitFor(() => expect(h.state[3]).toBe('cancelled'));
-  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[], []]);
-  expect(useDialogStore.getState().stack).toHaveLength(0);
+  useDialogStore.getState().close(); stale.onCancel?.(); stale.onConfirm();
+  expect(vi.mocked(helperApi.install).mock.calls).toEqual([[]]);
+  expect(h.state[3]).toBe('upgradeDeferred');
 });
 it('revalidates the platform before a confirmed migration request', async () => {
   await deferred(); click('helper.stopAndUpgradeAction');
@@ -182,3 +184,5 @@ it('classified install failure remains in the global toast after settings unmoun
   expect(toast.error).toHaveBeenCalledExactlyOnceWith('helper.installFail', 'helper.actionError.installerFailed');
   expect(helperApi.install).toHaveBeenCalledExactlyOnceWith();
 });
+
+afterEach(() => { h.cleanup?.(); h.cleanup = null; clearHelperInstallFeedback(); });

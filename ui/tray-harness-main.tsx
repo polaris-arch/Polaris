@@ -7,6 +7,9 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { mockIPC } from '@tauri-apps/api/mocks';
+import { emit } from '@tauri-apps/api/event';
+import { DEMO_CONFIG as BASE_CONFIG } from './harness-fixture';
+import type { ServerConfig, UserConfig } from './src/contracts/types';
 import TrayMenu from './src/tray/TrayMenu';
 import { applyTrayTheme } from './src/tray/tray-theme';
 import './src/styles/index.css';
@@ -18,7 +21,7 @@ const theme = params.get('theme') as 'light' | 'dark' | undefined;
 // 节点数量可调（验证多项时的窗高/截断）。默认给出足够多的节点以触发主视图较高内容。
 const nNodes = Number(params.get('nodes') ?? '3');
 
-const DEMO_SERVERS = Array.from({ length: nNodes }, (_, i) => ({
+const DEMO_SERVERS: ServerConfig[] = Array.from({ length: nNodes }, (_, i) => ({
   id: `s${i + 1}`,
   name: i === 0 ? '香港 IEPL · 01' : `节点 ${String(i + 1).padStart(2, '0')}`,
   protocol: i % 2 === 0 ? 'vless' : 'trojan',
@@ -36,8 +39,8 @@ const recentServerIds = DEMO_SERVERS.slice(0, recentCount)
   .map((s) => s.id)
   .reverse();
 
-const DEMO_CONFIG = {
-  subscriptions: [{ id: 'sub1', name: 'IEPL 机场', url: 'https://sub.example.net/link', updatedAt: Date.now() }],
+let demoConfig: UserConfig = {
+  ...structuredClone(BASE_CONFIG),
   servers: DEMO_SERVERS,
   selectedServerId: 's1',
   recentServerIds,
@@ -47,23 +50,40 @@ const DEMO_CONFIG = {
   language: 'zh-CN',
 };
 
+// Fixture transport only: never resizes a native window or invokes real backend actions.
+const control = {
+  reportedHeights: [] as number[],
+  async setRecent(count: number) {
+    demoConfig = { ...demoConfig, recentServerIds: DEMO_SERVERS.slice(0, count).map(s => s.id).reverse() };
+    await emit('event:configChanged', structuredClone(demoConfig));
+  },
+};
+declare global {
+  interface Window {
+    __trayHeightHarness: typeof control;
+    __trayReportedHeight: number;
+  }
+}
+window.__trayHeightHarness = control;
+
 mockIPC((cmd, payload) => {
   switch (cmd) {
-    case 'config_get': return Promise.resolve(DEMO_CONFIG);
+    case 'config_get': return Promise.resolve({ success: true, data: structuredClone(demoConfig) });
     case 'proxy_get_status': return Promise.resolve({ running: false });
     case 'ipinfo_get': return Promise.resolve({ proxy: null, direct: null });
     case 'server_get_all': return Promise.resolve(DEMO_SERVERS);
     case 'plugin:os|platform': return Promise.resolve(os === 'mac' ? 'macos' : os === 'win' ? 'windows' : 'linux');
     case 'tray_resize': {
-      // 复刻 Rust tray_resize：把窗高设为 body.scrollHeight（clamp 80..720）。
-      // 用 window.__trayReportedHeight 暴露给 Playwright 断言真实上报值。
+      // Record the renderer request; Playwright separately applies the native 80..700/720 clamp
+      // to its viewport. This mock itself does NOT resize a browser or native window.
       const h = (payload as { height?: number })?.height ?? 0;
-      (window as unknown as { __trayReportedHeight: number }).__trayReportedHeight = h;
+      window.__trayReportedHeight = h;
+      control.reportedHeights.push(h);
       return Promise.resolve(null);
     }
     default: return Promise.resolve(null);
   }
-});
+}, { shouldMockEvents: true });
 
 document.documentElement.setAttribute('data-os', os);
 applyTrayTheme(theme);

@@ -64,7 +64,8 @@ done
 # Stream TAP directly without retaining a second complete log in the shell.
 # pipefail keeps the runner exit status authoritative; the terminal count adds
 # coverage protection and never substitutes for successful test execution.
-node --test --test-reporter=tap scripts/*.test.mjs 2>&1 | (
+# Diagnostics retain stderr; only the runner's stdout is the TAP protocol.
+node --test --test-reporter=tap scripts/*.test.mjs | (
   summaries=0
   passed=0
   while IFS= read -r line || [ -n "$line" ]; do

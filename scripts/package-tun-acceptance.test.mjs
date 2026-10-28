@@ -115,8 +115,8 @@ test('actual full dispatch ref survives setup admission for both authentication 
     const admitted = admit(ROOT, env, git);
     const selected = verifyKernel(releaseInstallationContract(ROOT,
       JSON.parse(readFileSync(join(ROOT, 'src-tauri/core-manifest.json'), 'utf8'))));
-    assert.equal(selected.sourceCommit, '0cfa24573ff34c26608151068334329268cfdf14');
-    assert.equal(selected.version, '1.15.0-polaris-alpha.12.4');
+    assert.equal(selected.sourceCommit, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e');
+    assert.equal(selected.version, '1.15.0-polaris-alpha.12.6');
     assert.equal(admitted.kernelSourceCommit, selected.sourceCommit);
     const facts = authorizationFacts(admitted, actual, env);
     assert.equal(facts.mode, mode);
@@ -135,11 +135,17 @@ test('actual full dispatch ref survives setup admission for both authentication 
     assert.throws(() => authorizationFacts(tagContext, { ...event, ref }, tagEnv), /Actual dispatch payload/);
   assert.equal(authorizationFacts(tagContext, { ...event, ref: tagEnv.GITHUB_REF }, tagEnv).mode, 'existing-session');
 });
-test('historical c6 and 814 or renamed versions cannot satisfy current TUN alpha.12.4 admission', () => {
-  assert.equal(KERNEL, '0cfa24573ff34c26608151068334329268cfdf14');
-  assert.equal(VERSION, '1.15.0-polaris-alpha.12.4');
+test('historical 12.5, 12.4, c6 and 814 or renamed versions cannot satisfy current TUN alpha.12.6 admission', () => {
+  assert.equal(KERNEL, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e');
+  assert.equal(VERSION, '1.15.0-polaris-alpha.12.6');
   assert.equal(verifyKernel(contract), contract);
-  for (const change of [{ sourceCommit: 'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a' },
+  for (const change of [{ sourceCommit: '332935c310e78e15319d434f33a9103329200931' },
+    { sourceCommit: '332935c310e78e15319d434f33a9103329200931', version: '1.15.0-polaris-alpha.12.5', tag: 'v1.15.0-polaris-alpha.12.5' },
+    { version: '1.15.0-polaris-alpha.12.5', tag: 'v1.15.0-polaris-alpha.12.5' },
+    { sourceCommit: '0cfa24573ff34c26608151068334329268cfdf14' },
+    { sourceCommit: '0cfa24573ff34c26608151068334329268cfdf14', version: '1.15.0-polaris-alpha.12.4', tag: 'v1.15.0-polaris-alpha.12.4' },
+    { version: '1.15.0-polaris-alpha.12.4', tag: 'v1.15.0-polaris-alpha.12.4' },
+    { sourceCommit: 'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a' },
     { sourceCommit: 'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a', version: '1.15.0-polaris-alpha.12.2', tag: 'v1.15.0-polaris-alpha.12.2' },
     { sourceCommit: '814da362838e96e54f904836a92c2b0d8c3ae29b' },
     { repository: 'fork/kernel' }, { version: '1.15.0-polaris-alpha.12.1' }, { tag: 'vwrong' }])
@@ -149,7 +155,15 @@ test('historical original material stays historical and cannot be relabelled as 
   const pendingPath = join(ROOT, 'scripts/desktop-core/pending-release-selection.json');
   const before = readFileSync(pendingPath);
   const pending = JSON.parse(before);
-  const c6 = pending.sourceEvidence.historicalSourceEvidence;
+  const previous125 = pending.sourceEvidence.historicalSourceEvidence;
+  assert.equal(previous125.actualSourceArchive.sha256, 'bf09f49ed4244bc5573a2e6dbb6c76df62169610e7d59b75c6afa73e1038542a');
+  assert.equal(previous125.originalIndexSha256, '711805e6010d5c3230818b508a0a53bf951605adc63aedcdd5fb1855bc1c7bbf');
+  const previous124 = previous125.historicalSourceEvidence;
+  assert.equal(previous124.actualSourceArchive.name,
+    'sing-box-polaris-0cfa24573ff34c26608151068334329268cfdf14.tar.gz');
+  assert.equal(previous124.actualSourceArchive.sha256, '47447ab8665433752d1144a7ee23ae07f81cbb885191378173c26100263c2683');
+  assert.equal(previous124.originalIndexSha256, '10629e4d325de33124b496e1021f9d097710a497e632071c16f006c324f7afc4');
+  const c6 = previous124.historicalSourceEvidence;
   assert.equal(c6.actualSourceArchive.name,
     'sing-box-polaris-c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a.tar.gz');
   assert.equal(c6.actualSourceArchive.sha256, '7a734c45a7765ec45fe389f09976808c5a7a6e7caadd6689b840889e6335d775');

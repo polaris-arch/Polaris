@@ -106,8 +106,9 @@ def fixture_evidence():
 
 class PureContracts(unittest.TestCase):
     def test_historical_admission_is_rejected_before_carrier_or_product(self):
-        self.assertEqual(M.tun.KERNEL_COMMIT, '0cfa24573ff34c26608151068334329268cfdf14')
-        for commit in ('c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
+        self.assertEqual(M.tun.KERNEL_COMMIT, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e')
+        for commit in ('0cfa24573ff34c26608151068334329268cfdf14',
+                       'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
                        '814da362838e96e54f904836a92c2b0d8c3ae29b'):
             with self.subTest(commit=commit), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / 'historical-admission.json'
@@ -605,6 +606,125 @@ class PureContracts(unittest.TestCase):
 
 
 class PrivateProbeContracts(unittest.TestCase):
+    def test_source_size_bounds_reject_before_read_or_target_creation(self):
+        for size in (0, 128 * 1024 * 1024 + 1):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp); source = home / 'source'
+                with source.open('wb') as stream: stream.truncate(size)
+                with patch.object(M.os, 'pread') as reread:
+                    with self.assertRaisesRegex(ValueError, 'private probe source metadata invalid'):
+                        M.private_root_probe(source, home, hashlib.sha256(b'probe').hexdigest())
+                reread.assert_not_called()
+                self.assertFalse((home / 'root-rpc-probe').exists())
+
+    def test_same_observed_timestamps_do_not_hide_source_content_changes(self):
+        # Model timestamp collisions, not the real CI filesystem's unrecorded
+        # timestamps. Every mutation writes real bytes; reads are never cached
+        # or replaced with fixture bytes. Only this source's timestamp fields
+        # are held constant, leaving inode/owner/mode/size/link checks active.
+        for fault in (None, 'after-read', 'first-reread', 'during-copy', 'thread-copy', 'final-reread'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp); source = home / 'source'; source.write_bytes(b'probe')
+                initial = source.lstat()
+                real_stat, real_lstat = os.fstat, Path.lstat
+                real_read, real_sync, real_open = os.pread, os.fsync, os.open
+                counts = {}; opened = []; reads = []; changed = []; source_fd = []
+                def same_timestamps(value):
+                    if (value.st_dev, value.st_ino) != (initial.st_dev, initial.st_ino): return value
+                    fields = {key: getattr(value, key) for key in dir(value) if key.startswith('st_')}
+                    fields.update(st_mtime_ns=initial.st_mtime_ns, st_ctime_ns=initial.st_ctime_ns)
+                    return SimpleNamespace(**fields)
+                def change():
+                    if fault == 'thread-copy':
+                        errors = []
+                        def writer():
+                            try: source.write_bytes(b'other')
+                            except Exception as error: errors.append(error)
+                        worker = threading.Thread(target=writer)
+                        worker.start(); worker.join(timeout=5)
+                        self.assertFalse(worker.is_alive()); self.assertEqual(errors, [])
+                    else: source.write_bytes(b'other')
+                    changed.append(True)
+                def observed_stat(fd):
+                    value = real_stat(fd)
+                    if (value.st_dev, value.st_ino) == (initial.st_dev, initial.st_ino):
+                        counts[fd] = counts.get(fd, 0) + 1
+                        if not source_fd: source_fd.append(fd)
+                        if fault == 'after-read' and counts[fd] == 2:
+                            change(); value = real_stat(fd)
+                    return same_timestamps(value)
+                def observed_lstat(path, *args, **kwargs):
+                    return same_timestamps(real_lstat(path, *args, **kwargs))
+                def read_current(fd, size, offset):
+                    self.assertEqual(fd, source_fd[0])
+                    self.assertEqual((size, offset), (initial.st_size + 1, 0))
+                    data = real_read(fd, size, offset); reads.append(data)
+                    if (fault == 'first-reread' and len(reads) == 1) or (fault == 'final-reread' and len(reads) == 3): change()
+                    return data
+                def sync_target(fd):
+                    self.assertNotEqual(fd, source_fd[0])
+                    self.assertEqual(real_stat(source_fd[0]).st_ino, initial.st_ino)
+                    real_sync(fd)
+                    if fault in ('during-copy', 'thread-copy'): change()
+                def opened_fd(*args, **kwargs):
+                    fd = real_open(*args, **kwargs); opened.append(fd); return fd
+                with patch.object(M.os, 'fstat', side_effect=observed_stat), \
+                     patch.object(M.Path, 'lstat', observed_lstat), \
+                     patch.object(M.os, 'pread', side_effect=read_current), \
+                     patch.object(M.os, 'fsync', side_effect=sync_target), \
+                     patch.object(M.os, 'open', side_effect=opened_fd):
+                    if fault is None:
+                        copied = M.private_root_probe(source, home, hashlib.sha256(b'probe').hexdigest())
+                        self.assertEqual(copied.read_bytes(), b'probe')
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'private probe source changed'):
+                            M.private_root_probe(source, home, hashlib.sha256(b'probe').hexdigest())
+                self.assertEqual(changed, [] if fault is None else [True])
+                self.assertEqual(source.read_bytes(), b'probe' if fault is None else b'other')
+                self.assertEqual(len(reads), {None: 4, 'after-read': 1, 'first-reread': 2, 'during-copy': 3, 'thread-copy': 3, 'final-reread': 4}[fault])
+                target = home / 'root-rpc-probe'
+                self.assertEqual(target.exists(), fault in (None, 'during-copy', 'thread-copy', 'final-reread'))
+                if target.exists(): self.assertEqual(target.read_bytes(), b'probe')
+                for fd in opened:
+                    with self.assertRaises(OSError): real_stat(fd)
+                self.assertIs(os.fstat, real_stat); self.assertIs(Path.lstat, real_lstat)
+                self.assertIs(os.pread, real_read); self.assertIs(os.fsync, real_sync)
+                self.assertIs(os.open, real_open)
+
+    def test_bounded_source_reread_faults_fail_closed_and_close_descriptors(self):
+        for phase in ('before-copy', 'after-copy'):
+            for fault in ('short-read', 'read-error', 'truncate', 'grow', 'replace', 'symlink', 'mode', 'unlink'):
+                with self.subTest(phase=phase, fault=fault), tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp); source = home / 'source'; source.write_bytes(b'probe')
+                    replacement = home / 'replacement'; replacement.write_bytes(b'probe')
+                    real_read, real_open, real_stat = os.pread, os.open, os.fstat
+                    opened = []; calls = []; changed = []
+                    def read_current(fd, size, offset):
+                        self.assertEqual((size, offset), (6, 0)); calls.append(fd)
+                        if len(calls) == (1 if phase == 'before-copy' else 3):
+                            changed.append(True)
+                            if fault == 'short-read': return real_read(fd, size, offset)[:-1]
+                            if fault == 'read-error': raise OSError('controlled pread failure')
+                            if fault == 'truncate': source.write_bytes(b'pr')
+                            if fault == 'grow': source.write_bytes(b'probe-extra')
+                            if fault == 'replace': replacement.replace(source)
+                            if fault == 'symlink': source.unlink(); source.symlink_to(replacement)
+                            if fault == 'mode': source.chmod(0o777)
+                            if fault == 'unlink': source.unlink()
+                        return real_read(fd, size, offset)
+                    def opened_fd(*args, **kwargs):
+                        fd = real_open(*args, **kwargs); opened.append(fd); return fd
+                    with patch.object(M.os, 'pread', side_effect=read_current), patch.object(M.os, 'open', side_effect=opened_fd):
+                        with self.assertRaises(OSError if fault == 'read-error' else ValueError):
+                            M.private_root_probe(source, home, hashlib.sha256(b'probe').hexdigest())
+                    self.assertEqual(changed, [True])
+                    target = home / 'root-rpc-probe'
+                    self.assertEqual(target.exists(), phase == 'after-copy')
+                    if target.exists(): self.assertEqual(target.read_bytes(), b'probe')
+                    for fd in opened:
+                        with self.assertRaises(OSError): real_stat(fd)
+                    self.assertIs(os.pread, real_read); self.assertIs(os.open, real_open)
+
     def test_hardlinked_cargo_source_gets_independent_single_link_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp); source = home / 'hashed'; source.write_bytes(b'cargo-probe')

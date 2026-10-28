@@ -5,10 +5,18 @@
  * 两道白名单不是重复——Rust 那道保证「发出去的只能是登记值」，这道保证「就算通道被别的东西污染
  * （或将来有人在前端另发一次），也不会跳到没预期的屏」。宁可不跳，也不跳错。
  */
-import { describe, it, expect, beforeEach } from 'vitest';
-import { useNavStore, applyTrayScreenIntent } from './nav-store';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+const { invoke, privacy } = vi.hoisted(() => ({ invoke: vi.fn(), privacy: { privacyMode: false } }));
+vi.mock('@/ipc/ipc-client', () => ({ invoke }));
+vi.mock('@/store/app-store', () => ({ useAppStore: { getState: () => privacy } }));
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+import { useDialogStore } from '@/components/dialogs/dialog-store';
+import { HelperRecoveryDialog } from '@/components/dialogs/HelperRecoveryDialog';
+import { useNavStore, applyTrayScreenIntent, drainTrayPendingScreen } from './nav-store';
 
 beforeEach(() => {
+  invoke.mockReset(); privacy.privacyMode = false;
+  useDialogStore.getState().closeAll();
   useNavStore.setState({ scope: 'main', mainScreen: 'home', settingsScreen: 'general' });
 });
 
@@ -36,5 +44,79 @@ describe('applyTrayScreenIntent', () => {
     useNavStore.setState({ settingsScreen: 'about' });
     applyTrayScreenIntent('settings');
     expect(useNavStore.getState().settingsScreen).toBe('general');
+  });
+});
+
+
+describe('cancellable Helper recovery intent', () => {
+  function prompt() {
+    applyTrayScreenIntent('helper-recovery');
+    const stack = useDialogStore.getState().stack;
+    const entry = stack[stack.length - 1]!;
+    return { entry, payload: HelperRecoveryDialog({ instanceId: entry.instanceId }).props.payload };
+  }
+  it('opens one explanation without navigation, install or native mutation across duplicate deliveries', () => {
+    const first = prompt();
+    applyTrayScreenIntent('helper-recovery'); applyTrayScreenIntent('helper-recovery');
+    expect(useDialogStore.getState().stack).toEqual([first.entry]);
+    expect(useNavStore.getState().scope).toBe('main');
+    expect(invoke).not.toHaveBeenCalled();
+  });
+  it('only a live top owner can confirm; confirm navigates once and does not invoke native', () => {
+    const { entry, payload } = prompt();
+    const other = useDialogStore.getState().open({ kind: 'res-url' });
+    payload.onConfirm(); expect(useNavStore.getState().scope).toBe('main');
+    useDialogStore.getState().closeInstance(other);
+    payload.onConfirm();
+    expect(useNavStore.getState()).toMatchObject({ scope: 'settings', settingsScreen: 'helper' });
+    expect(useDialogStore.getState().hasInstance(entry.instanceId)).toBe(false);
+    useNavStore.getState().navigate('logs'); payload.onConfirm();
+    expect(useNavStore.getState()).toMatchObject({ scope: 'main', mainScreen: 'logs' });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+  it('cancel/closeAll revoke captured callbacks and preserve a newer top dialog', () => {
+    const { entry, payload } = prompt();
+    useDialogStore.getState().closeInstance(entry.instanceId);
+    const other = useDialogStore.getState().open({ kind: 'res-url' });
+    payload.onConfirm();
+    expect(useDialogStore.getState().stack.map(x => x.instanceId)).toEqual([other]);
+    expect(useNavStore.getState().scope).toBe('main');
+    useDialogStore.getState().closeAll();
+    payload.onConfirm(); expect(invoke).not.toHaveBeenCalled();
+  });
+  it.each(['navigate', 'enterSettings', 'setSettingsScreen', 'backToApp'] as const)('navigation %s revokes the previous owner', action => {
+    const { entry, payload } = prompt();
+    const nav = useNavStore.getState();
+    if (action === 'navigate') nav.navigate('logs');
+    else if (action === 'enterSettings') nav.enterSettings('about');
+    else if (action === 'setSettingsScreen') nav.setSettingsScreen('about');
+    else nav.backToApp();
+    expect(useDialogStore.getState().hasInstance(entry.instanceId)).toBe(false);
+    const before = useNavStore.getState(); payload.onConfirm();
+    expect(useNavStore.getState()).toBe(before);
+  });
+  it('privacy lock rejects captured confirmation without navigating or invoking native', () => {
+    const { payload } = prompt(); privacy.privacyMode = true;
+    payload.onConfirm();
+    expect(useNavStore.getState().scope).toBe('main');
+    expect(invoke).not.toHaveBeenCalled();
+  });
+  it('event then cancel makes an already in-flight bootstrap drain stale', async () => {
+    let release!: (screen: string) => void;
+    invoke.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const drain = drainTrayPendingScreen(true);
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledOnce());
+    const { entry } = prompt(); useDialogStore.getState().closeInstance(entry.instanceId);
+    release('helper-recovery'); await drain;
+    expect(useDialogStore.getState().stack).toEqual([]);
+    expect(useNavStore.getState().scope).toBe('main');
+  });
+  it('bootstrap-only delivery opens once; clear-only pending delivery never reopens it', async () => {
+    invoke.mockResolvedValue('helper-recovery');
+    await drainTrayPendingScreen(true);
+    expect(useDialogStore.getState().stack.map(x => x.kind)).toEqual(['helper-recovery']);
+    useDialogStore.getState().closeAll();
+    await drainTrayPendingScreen(false);
+    expect(useDialogStore.getState().stack).toEqual([]);
   });
 });

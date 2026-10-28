@@ -139,17 +139,19 @@ export function gateEnvironment(gate, key, root, env) {
 }
 
 export function classifyResult(gate, raw, key) {
-  const text = raw.output ?? '';
+  const text = typeof raw.stdout === 'string' ? raw.stdout : '';
+  const channels = [text, typeof raw.stderr === 'string' ? raw.stderr : ''];
   const summaries = [...text.matchAll(/test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;/g)];
   const testsPassed = summaries.reduce((sum, match) => sum + Number(match[1]), 0);
   const testsIgnored = summaries.reduce((sum, match) => sum + Number(match[3]), 0);
   const exclusions = gate.id === 'network_profile_runtime' && key !== 'linux'
-    && text.includes(EXCLUDED_DHCP) ? [EXCLUDED_DHCP] : [];
-  const visible = exclusions.length ? text.replaceAll(EXCLUDED_DHCP, '') : text;
+    && channels.some((value) => value.includes(EXCLUDED_DHCP)) ? [EXCLUDED_DHCP] : [];
   // libtest may prefix nocapture output with "test name ... " on the same line.
-  const skipped = /(?:⚠|⛔)[^\n]*(?:跳过|skip)|NOT_EXECUTED|\bnot executed:/i.test(visible);
+  const skipped = channels.some((value) => /(?:⚠|⛔)[^\n]*(?:跳过|skip)|NOT_EXECUTED|\bnot executed:/i
+    .test(exclusions.length ? value.replaceAll(EXCLUDED_DHCP, '') : value));
   const passed = raw.status === 0 && !raw.error && !raw.timedOut && !raw.cleanupUncertain
     && !raw.interrupted
+    && typeof raw.stdout === 'string' && typeof raw.stderr === 'string'
     && !skipped && (!gate.rustTests || (testsPassed > 0 && testsIgnored === 0))
     && (!gate.proofRequired || raw.proofValid === true);
   return { id: gate.id, state: passed ? 'passed' : 'failed', exitCode: raw.status ?? null,
@@ -157,6 +159,8 @@ export function classifyResult(gate, raw, key) {
     platformExclusions: exclusions, skippedEvidence: skipped, timedOut: Boolean(raw.timedOut),
     cleanupUncertain: Boolean(raw.cleanupUncertain), interrupted: Boolean(raw.interrupted), error: raw.error ?? null,
     logSha256: raw.logSha256 ?? null, logBytes: raw.logBytes ?? null,
+    stdoutSha256: raw.stdoutSha256 ?? null, stdoutBytes: raw.stdoutBytes ?? null,
+    stderrSha256: raw.stderrSha256 ?? null, stderrBytes: raw.stderrBytes ?? null,
     ...(gate.proofRequired ? { proofValid: raw.proofValid === true } : {}) };
 }
 
@@ -178,19 +182,28 @@ export async function collectGates(plan, key, execute, checkpoint = () => {}) {
   return results;
 }
 
-export function executeCommand(gate, { root, env, directory, timeout, captureStdout = false }) {
+export function executeCommand(gate, { root, env, directory, timeout }) {
   const logPath = join(directory, `${gate.id}.log`);
+  const stdoutPath = join(directory, `${gate.id}.stdout.log`);
+  const stderrPath = join(directory, `${gate.id}.stderr.log`);
   writeFileSync(logPath, `${JSON.stringify({ program: gate.program, args: gate.args })}\n`);
-  if (timeout <= 0) return Promise.resolve({ status: null, error: 'Overall candidate gate deadline exhausted', output: '' });
+  writeFileSync(stdoutPath, '', { mode: 0o600 });
+  writeFileSync(stderrPath, '', { mode: 0o600 });
+  if (timeout <= 0) return Promise.resolve({ status: null, error: 'Overall candidate gate deadline exhausted', output: '', stdout: '', stderr: '' });
   return new Promise((done) => {
-    const fd = openSync(logPath, 'a');
+    const descriptors = [];
+    try {
+      for (const path of [logPath, stdoutPath, stderrPath]) descriptors.push(openSync(path, 'a'));
+    } catch (cause) {
+      for (const fd of descriptors) closeSync(fd);
+      throw cause;
+    }
+    const [fd, stdoutFd, stderrFd] = descriptors;
     let bytes = 0, timedOut = false, error = null, cleanupUncertain = false, settled = false, interrupted = false;
-    const stdout = [];
-    const child = spawn(gate.program, gate.args, { cwd: root, env, shell: false,
-      detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
+    let child, timer, hardTimer;
     const terminate = (reason) => {
       error ||= reason;
-      if (!child.pid) return;
+      if (!child?.pid) return;
       try {
         if (process.platform === 'win32') {
           const killed = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { encoding: 'utf8', timeout: 10_000 });
@@ -198,34 +211,53 @@ export function executeCommand(gate, { root, env, directory, timeout, captureStd
         } else process.kill(-child.pid, 'SIGKILL');
       } catch (killError) { cleanupUncertain ||= killError.code !== 'ESRCH'; }
     };
-    const timer = setTimeout(() => { timedOut = true; terminate('Gate deadline exceeded'); }, timeout);
-    const hardTimer = setTimeout(() => { cleanupUncertain = true; terminate('Child did not settle after termination'); finish(null); }, timeout + 30_000);
     const interrupt = () => { interrupted = true; terminate('Runner interrupted'); };
-    process.once('SIGTERM', interrupt);
-    process.once('SIGINT', interrupt);
     function finish(status) {
       if (settled) return;
       settled = true;
       clearTimeout(timer); clearTimeout(hardTimer);
       process.removeListener('SIGTERM', interrupt); process.removeListener('SIGINT', interrupt);
-      closeSync(fd);
-      const output = readFileSync(logPath);
-      done({ processId: child.pid ?? null, status, error, timedOut, cleanupUncertain, interrupted, output: output.toString('utf8'),
-        ...(captureStdout ? { stdout: Buffer.concat(stdout).toString('utf8') } : {}),
-        logSha256: sha256(output), logBytes: output.length });
+      for (const descriptor of descriptors) {
+        try { closeSync(descriptor); } catch (cause) { error ||= `Gate log close failed: ${cause.message}`; }
+      }
+      const read = (path) => {
+        try { return readFileSync(path); }
+        catch (cause) { error ||= `Gate log read failed: ${cause.message}`; return null; }
+      };
+      const output = read(logPath), stdout = read(stdoutPath), stderr = read(stderrPath);
+      let protocol = '';
+      if (stdout) {
+        try { protocol = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(stdout); }
+        catch { error ||= 'Gate stdout is not complete valid UTF-8'; }
+      }
+      done({ processId: child?.pid ?? null, status, error, timedOut, cleanupUncertain, interrupted,
+        output: output?.toString('utf8') ?? '', stdout: protocol, stderr: stderr?.toString('utf8') ?? '',
+        logSha256: output ? sha256(output) : null, logBytes: output?.length ?? null,
+        stdoutSha256: stdout ? sha256(stdout) : null, stdoutBytes: stdout?.length ?? null,
+        stderrSha256: stderr ? sha256(stderr) : null, stderrBytes: stderr?.length ?? null });
     }
-    const consume = (chunk) => {
+    const consume = (chunk, channelFd, stream) => {
       if (settled) return;
       bytes += chunk.length;
       if (bytes > MAX_LOG_BYTES) { terminate('Gate log budget exceeded'); return; }
-      appendFileSync(fd, chunk);
-      process.stdout.write(chunk);
+      try {
+        appendFileSync(fd, chunk);
+        appendFileSync(channelFd, chunk);
+        stream.write(chunk);
+      } catch (cause) { terminate(`Gate log write failed: ${cause.message}`); }
     };
-    child.stdout.on('data', (chunk) => {
-      if (captureStdout && !settled && bytes + chunk.length <= MAX_LOG_BYTES) stdout.push(chunk);
-      consume(chunk);
-    });
-    child.stderr.on('data', consume);
+    try {
+      child = spawn(gate.program, gate.args, { cwd: root, env, shell: false,
+        detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (cause) { error = cause.message; finish(null); return; }
+    timer = setTimeout(() => { timedOut = true; terminate('Gate deadline exceeded'); }, timeout);
+    hardTimer = setTimeout(() => { cleanupUncertain = true; terminate('Child did not settle after termination'); finish(null); }, timeout + 30_000);
+    process.once('SIGTERM', interrupt);
+    process.once('SIGINT', interrupt);
+    child.stdout.on('data', (chunk) => consume(chunk, stdoutFd, process.stdout));
+    child.stderr.on('data', (chunk) => consume(chunk, stderrFd, process.stderr));
+    child.stdout.once('error', (cause) => terminate(`Gate stdout read failed: ${cause.message}`));
+    child.stderr.once('error', (cause) => terminate(`Gate stderr read failed: ${cause.message}`));
     child.once('error', (cause) => { error = cause.message; });
     child.once('close', (status) => finish(status));
   });

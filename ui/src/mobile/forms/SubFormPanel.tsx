@@ -1,3 +1,5 @@
+import { useSubscriptionUserAgent } from '@/hooks/use-subscription-user-agent';
+import { MobileSubscriptionUserAgentHint } from './SubscriptionUserAgentHint';
 import { isSavedEditProgress, presentSubscriptionRefreshResult, subscriptionEditProgressText } from '@/domain/subscription-refresh';
 import { useSubscriptionProgress } from '@/store/use-subscription-progress-store';
 import { useInputRequest } from '@/hooks/use-input-request';
@@ -108,6 +110,7 @@ export function SubFormPanel({
   const [name, setName] = useState(base?.name ?? '');
   const [url, setUrl] = useState(base?.url ?? '');
   const [ua, setUa] = useState(base?.userAgent ?? '');
+  const uaInfo = useSubscriptionUserAgent(ua);
   const [autoUpdate, setAutoUpdate] = useState(base?.autoUpdate ?? false);
   const autoUpdateNoticeKey = subAutoUpdateNoticeKey(
     subAutoUpdateNoticeMode({ autoUpdate }, config, config?.restartOnNodeChange === true),
@@ -397,13 +400,15 @@ export function SubFormPanel({
           id="msf-ua"
           className="m-form-input mono"
           value={ua}
-          placeholder={t('sub.uaPh')}
+          placeholder={uaInfo.status === 'ready' && uaInfo.info.effectiveStatus === 'ready' ? uaInfo.info.fallbackUserAgent : t('sub.uaPh')}
+          aria-describedby="msf-ua-info"
           onChange={(e) => {
             setUa(e.target.value);
             setDirty(true);
           }}
         />
         <p className="m-form-hint">{t('sub.uaHint')}</p>
+        <MobileSubscriptionUserAgentHint id="msf-ua-info" model={uaInfo} />
       </div>
 
       <div className="m-form-row m-form-switch">

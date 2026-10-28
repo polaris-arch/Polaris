@@ -579,19 +579,19 @@ export const SETTINGS_PARITY: ScreenParityRegister = {
       note: '助手安装失败面中的查看日志入口；移动端没有助手安装失败这一状态。通用日志屏另有移动端入口。',
     },
     {
-      id: 'SettingsHelper.tsx|k:helper.installAction',
+      id: 'SettingsHelper.tsx|k:helper.installAction+helper.stopAndUpgradeAction',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
-      note: '安装提权助手。移动端的隧道来自 `VpnService`、权限来自系统授权弹窗，没有可安装的助手进程。',
+      note: '安装主按钮在 macOS typed upgradeDeferred 后原位切换至显式确认迁移；不自动安装/停止。移动端的隧道来自 `VpnService`、权限来自系统授权弹窗，没有可安装的助手进程。',
     },
     {
-      id: 'SettingsHelper.tsx|f:install',
+      id: 'SettingsHelper.tsx|k:helper.installSelectedCoreAction+helper.stopAndUpgradeAction+helper.upgradeHelperAction',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
-      note: '同一 install handler 按实际 selectedCore.state 显示安装缺失核或升级助手动作；移动端没有可安装的提权助手进程，VpnService 另有真实权限入口。',
+      note: '升级主按钮按实际 selectedCore.state 显示安装缺失核或升级助手，macOS typed upgradeDeferred 后原位切换至显式确认迁移；移动端没有可安装的提权助手进程，VpnService 另有真实权限入口。',
     },
     {
-      id: 'SettingsHelper.tsx|k:helper.repairAction',
+      id: 'SettingsHelper.tsx|k:helper.repairAction+helper.stopAndUpgradeAction',
       disposition: { kind: 'platform-absent', evidence: HELPER_IS_VPN_SERVICE },
-      note: '修复助手安装（重装 + 重注册守护）。同上，没有被修复的那个对象。',
+      note: '修复主按钮在 macOS typed upgradeDeferred 后原位切换至显式确认迁移，否则仍为重装修复。同上，没有被修复的那个对象。',
     },
     {
       id: 'SettingsHelper.tsx|k:helper.uninstall+helper.uninstallConfirmAgain',

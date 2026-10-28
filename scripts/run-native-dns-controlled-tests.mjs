@@ -105,13 +105,16 @@ export function runtimeEnvironment(messages, targetDirectory, executable, sysroo
 }
 
 export function exactPass(result) {
-  const summaries = result.output.match(/test result: [^\r\n]+/g) ?? [];
+  const summaries = (typeof result.stdout === 'string' ? result.stdout : '').match(/test result: [^\r\n]+/g) ?? [];
   return result.status === 0 && !result.error && !result.timedOut && !result.cleanupUncertain && !result.interrupted
     && summaries.length === 1 && summaries[0].startsWith('test result: ok. 1 passed; 0 failed; 0 ignored;');
 }
 
 function records(output, prefix) {
-  return output.split(/\r?\n/).filter((line) => line.startsWith(prefix))
+  if (typeof output !== 'string') return [];
+  const lines = output.split(/\r?\n/);
+  demand(!lines.at(-1).startsWith(prefix), 'Incomplete controlled protocol line');
+  return lines.slice(0, -1).filter((line) => line.startsWith(prefix))
     .map((line) => JSON.parse(line.slice(prefix.length)));
 }
 
@@ -120,7 +123,7 @@ export function confirmedCleanup(result, name) {
       || !Number.isSafeInteger(result.processId) || result.processId <= 0
       || !Number.isInteger(result.status)) return false;
   try {
-    const rows = records(result.output, 'POLARIS_CONTROLLED_CLEANUP ');
+    const rows = records(result.stdout, 'POLARIS_CONTROLLED_CLEANUP ');
     if (rows.length !== 1) return false;
     const r = rows[0], c = r.custody;
     if (r.schema !== 'polaris-controlled-cleanup-v1' || r.testName !== name
@@ -136,13 +139,13 @@ export function confirmedCleanup(result, name) {
 }
 
 function oneExecutedTest(result) {
-  const counts = [...result.output.matchAll(/test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;/g)];
+  const counts = [...(typeof result.stdout === 'string' ? result.stdout : '').matchAll(/test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;/g)];
   return counts.length === 1 && Number(counts[0][1]) + Number(counts[0][2]) === 1
     && Number(counts[0][3]) === 0;
 }
 
 export function preserveProductionGraph(result, name, directory, executableSha256) {
-  const rows = records(result.output, 'POLARIS_DEFAULT_GRAPH ');
+  const rows = records(result.stdout, 'POLARIS_DEFAULT_GRAPH ');
   if (!rows.length) return false;
   demand(rows.length === 1, 'Duplicate controlled production graph record');
   const r = rows[0];
@@ -165,6 +168,8 @@ export function preserveProductionGraph(result, name, directory, executableSha25
   writeFileSync(path, bytes, { flag: 'wx', mode: 0o600 });
   writeFileSync(join(directory, 'default-production-graph.receipt.json'), JSON.stringify({
     ...r, configJson: undefined, testName: name, executableSha256, graphFile: 'default-production-graph.json',
+    stdoutSha256: result.stdoutSha256, stdoutBytes: result.stdoutBytes,
+    stderrSha256: result.stderrSha256, stderrBytes: result.stderrBytes,
     outboundCount: graph.outbounds?.length ?? null, appAccepted: false,
   }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
   return true;
@@ -183,10 +188,12 @@ export async function runTests(selected, env, directory, execute = executeComman
     demand(hash(selected.executable) === digest, 'Controlled executable changed during a test');
     demand(confirmedCleanup(result, name), `Controlled owned-child cleanup is unconfirmed: ${name}`);
     demand(oneExecutedTest(result), `Controlled invocation did not execute exactly one reviewed test: ${name}`);
-    const graph = preserveProductionGraph(result, name, directory, digest);
-    const passed = exactPass(result) && (name !== TESTS[2] || graph);
-    appendFileSync(statusPath, `${name}: ${passed ? 'passed' : 'failed; owned-child cleanup confirmed'}\n`);
-    if (!passed) failures.push(name);
+    let graph = false, evidenceError = null;
+    try { graph = preserveProductionGraph(result, name, directory, digest); }
+    catch (cause) { evidenceError = String(cause.message ?? cause).replace(/[\r\n]/g, ' '); }
+    const passed = !evidenceError && exactPass(result) && (name !== TESTS[2] || graph);
+    appendFileSync(statusPath, `${name}: ${passed ? 'passed' : `failed; owned-child cleanup confirmed${evidenceError ? `; evidence: ${evidenceError}` : ''}`}\n`);
+    if (!passed) failures.push(evidenceError ? `${name} (evidence: ${evidenceError})` : name);
   }
   demand(!failures.length, `Controlled business/evidence failures after confirmed cleanup: ${failures.join(', ')}`);
 }

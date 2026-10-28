@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { digest } from './desktop-core/source-graph.mjs';
 import { ADAPTER_FILES, RELEASE_TARGETS, loadReleaseContract } from './desktop-core/release-consumer.mjs';
@@ -12,7 +13,8 @@ import { candidateContext } from './desktop-core/native-dns-candidate.mjs';
 import { validationContext } from './desktop-core/validation-origin.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const green = { status: 0, output: 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' };
+const green = { status: 0, stdout: 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n',
+  stderr: '', output: 'Human-readable mixed log; never a verdict source.\n' };
 const env = { CORE_CANDIDATE: 'a'.repeat(40), GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '1' };
 
 function withHistoricalTemporaryFixture(run) {
@@ -65,7 +67,7 @@ test('ordinary failure does not hide independent later gates, and every required
   const plan = gatePlan('linux', '/fixture'), seen = [], checkpoints = [];
   const results = await collectGates(plan, 'linux', async (gate) => {
     seen.push(gate.id);
-    if (gate.id === 'core_schema_surface') return { status: 101, output: 'schema drift' };
+    if (gate.id === 'core_schema_surface') return { status: 101, stdout: '', stderr: 'schema drift', output: 'schema drift' };
     if (gate.id === 'kernel_accepts_full_config') throw Error('compiler failed');
     return { ...green, proofValid: true };
   }, (partial) => checkpoints.push(partial.length));
@@ -86,25 +88,49 @@ test('ordinary failure does not hide independent later gates, and every required
 test('zero tests, ignored tests, spawn errors, timeout, skip and missing Cronet proof fail closed', () => {
   const gate = gatePlan('linux', '/fixture')[0];
   for (const raw of [
-    { ...green, output: green.output.replace('1 passed', '0 passed') },
-    { ...green, output: green.output.replace('0 ignored', '1 ignored') },
+    { ...green, stdout: green.stdout.replace('1 passed', '0 passed') },
+    { ...green, stdout: green.stdout.replace('0 ignored', '1 ignored') },
     { ...green, status: null, error: 'ENOENT' }, { ...green, timedOut: true }, { ...green, interrupted: true },
-    { ...green, output: `${green.output}⚠ skipped missing kernel\n` },
-    { ...green, output: `test foo ... ⚠ skipped missing kernel\n${green.output}` },
-    { ...green, output: `${green.output}NOT_EXECUTED: kernel unavailable\n` },
+    { ...green, stdout: `${green.stdout}⚠ skipped missing kernel\n` },
+    { ...green, stdout: `test foo ... ⚠ skipped missing kernel\n${green.stdout}` },
+    { ...green, stdout: `${green.stdout}NOT_EXECUTED: kernel unavailable\n` },
   ]) assert.equal(classifyResult(gate, raw, 'linux').state, 'failed');
   const cronet = gatePlan('linux', '/fixture').at(-1);
-  assert.equal(classifyResult(cronet, { status: 0, output: '' }, 'linux').state, 'failed');
-  assert.equal(classifyResult(cronet, { status: 0, output: '', proofValid: true }, 'linux').state, 'passed');
+  assert.equal(classifyResult(cronet, { status: 0, stdout: '', stderr: '', output: '' }, 'linux').state, 'failed');
+  assert.equal(classifyResult(cronet, { status: 0, stdout: '', stderr: '', output: '', proofValid: true }, 'linux').state, 'passed');
 });
 
 test('only the documented non-Linux DHCP exclusion is recorded as inapplicable', () => {
   const gate = gatePlan('win', '/fixture').find((item) => item.id === 'network_profile_runtime');
-  const raw = { ...green, output: `${green.output}⚠ 跳过 dhcp 起核门：不触网前置只在 Linux 上可证\n` };
-  assert.equal(classifyResult(gate, raw, 'win').state, 'passed');
-  assert.equal(classifyResult(gate, raw, 'win').platformExclusions.length, 1);
-  assert.equal(classifyResult(gate, raw, 'linux').state, 'failed');
-  assert.equal(classifyResult({ ...gate, id: 'unrelated_gate' }, raw, 'win').state, 'failed');
+  const exclusion = '⚠ 跳过 dhcp 起核门：不触网前置只在 Linux 上可证\n';
+  for (const channel of ['stdout', 'stderr']) {
+    const raw = { ...green, [channel]: green[channel] + exclusion };
+    assert.equal(classifyResult(gate, raw, 'win').state, 'passed');
+    assert.equal(classifyResult(gate, raw, 'win').platformExclusions.length, 1);
+    assert.equal(classifyResult(gate, raw, 'linux').state, 'failed');
+    assert.equal(classifyResult({ ...gate, id: 'unrelated_gate' }, raw, 'win').state, 'failed');
+    assert.equal(classifyResult(gate, { ...raw, stderr: raw.stderr + 'NOT_EXECUTED: another gate\n' }, 'win').state, 'failed');
+  }
+});
+
+test('only stdout supplies test counts while either channel can veto skipped execution', () => {
+  const gate = gatePlan('linux', '/fixture')[0];
+  for (const stdout of ['', undefined, green.stdout.replace('1 passed', '0 passed')]) {
+    const raw = { ...green, stdout, stderr: green.stdout, output: green.stdout };
+    assert.equal(classifyResult(gate, raw, 'linux').state, 'failed', 'stderr/mixed log cannot supply a missing verdict');
+  }
+  const diagnostic = { ...green, stderr: 'test result: ok. 999 passed; 0 failed; 99 ignored;\n',
+    output: 'NOT_EXECUTED: retained human log is not a machine input\n' };
+  const passed = classifyResult(gate, diagnostic, 'linux');
+  assert.equal(passed.state, 'passed');
+  assert.equal(passed.testsPassed, 1);
+  assert.equal(passed.testsIgnored, 0);
+  for (const channel of ['stdout', 'stderr']) {
+    for (const warning of ['⚠ skipped missing kernel\n', 'test foo ... ⛔ 跳过起核\n', 'NOT_EXECUTED: unavailable\n'])
+      assert.equal(classifyResult(gate, { ...green, [channel]: green[channel] + warning }, 'linux').state, 'failed');
+  }
+  assert.equal(classifyResult(gate, { ...green, stdout: green.stdout + 'NOT_EXEC', stderr: 'UTED\n' }, 'linux').state,
+    'passed', 'independent channels must not manufacture a skip token across their boundary');
 });
 
 test('uncertain child cleanup blocks remaining launches', async () => {
@@ -126,6 +152,192 @@ test('interruption stops additional gates even when the current child settled', 
   assert.equal(called, 1);
   assert.ok(results.slice(1).every((gate) => gate.state === 'blocked'));
 });
+
+// Run the real executor in an isolated Node wrapper. Its forwarded bytes are
+// drained independently, so large/invalid fixture output never pollutes TAP and
+// no test needs to replace the parent process's global stdout/stderr methods.
+async function commandFixture(t, source, timeout = 30_000) {
+  const directory = mkdtempSync(join(tmpdir(), 'native-gate-streams-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const childPath = join(directory, 'child.mjs'), wrapperPath = join(directory, 'wrapper.mjs');
+  writeFileSync(childPath, source);
+  writeFileSync(wrapperPath, `
+    import { writeFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    import { executeCommand, classifyResult } from ${JSON.stringify(new URL('./desktop-core/native-dns-gates.mjs', import.meta.url).href)};
+    const [directory, childPath, timeout] = process.argv.slice(2);
+    const result = await executeCommand({ id: 'fixture', program: process.execPath, args: [childPath] },
+      { root: directory, env: process.env, directory, timeout: Number(timeout) });
+    const { stdout, stderr, output, ...facts } = result;
+    const small = text => typeof text === 'string' && Buffer.byteLength(text) <= 256 * 1024 ? text : null;
+    writeFileSync(join(directory, 'result.json'), JSON.stringify({ ...facts,
+      stdout: small(stdout), stderr: small(stderr), output: small(output),
+      stdoutIsString: typeof stdout === 'string', stderrIsString: typeof stderr === 'string',
+      inertState: classifyResult({ id: 'inert-transport', rustTests: false }, result, 'linux').state }));
+  `);
+  const forwarded = Object.fromEntries(['stdout', 'stderr'].map(channel =>
+    [channel, { bytes: 0, hash: createHash('sha256') }]));
+  const wrapper = spawn(process.execPath, [wrapperPath, directory, childPath, String(timeout)], {
+    cwd: directory, env: { ...process.env, NODE_NO_WARNINGS: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'], timeout: timeout + 35_000,
+  });
+  for (const channel of ['stdout', 'stderr']) wrapper[channel].on('data', chunk => {
+    forwarded[channel].bytes += chunk.length;
+    forwarded[channel].hash.update(chunk);
+  });
+  const status = await new Promise((resolve, reject) => {
+    wrapper.once('error', reject);
+    wrapper.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  assert.deepEqual(status, { code: 0, signal: null }, 'isolated executor wrapper must settle normally');
+  return { directory, result: JSON.parse(readFileSync(join(directory, 'result.json'), 'utf8')),
+    forwarded: Object.fromEntries(Object.entries(forwarded).map(([channel, value]) =>
+      [channel, { bytes: value.bytes, sha256: value.hash.digest('hex') }])) };
+}
+
+function assertChannelEvidence(observed, expectedStdout = null, expectedStderr = null) {
+  const { directory, result, forwarded } = observed;
+  assert.equal(result.stdoutIsString, true);
+  assert.equal(result.stderrIsString, true);
+  for (const [channel, expected] of [['stdout', expectedStdout], ['stderr', expectedStderr]]) {
+    const bytes = readFileSync(join(directory, `fixture.${channel}.log`));
+    if (expected !== null) assert.deepEqual(bytes, Buffer.from(expected));
+    assert.equal(result[`${channel}Bytes`], bytes.length, `${channel} byte count binds the raw file`);
+    assert.equal(result[`${channel}Sha256`], digest(bytes), `${channel} hash binds the raw file`);
+    assert.deepEqual(forwarded[channel], { bytes: bytes.length, sha256: digest(bytes) },
+      `${channel} is forwarded only to its own parent channel`);
+  }
+  const combined = readFileSync(join(directory, 'fixture.log'));
+  assert.equal(result.logBytes, combined.length);
+  assert.equal(result.logSha256, digest(combined), 'legacy human log keeps its original byte identity');
+}
+
+const childWrite = `const write = (stream, bytes) => new Promise((resolve, reject) =>
+  stream.write(bytes, error => error ? reject(error) : resolve()));`;
+
+test('real executor preserves a large JSON record across stdout fragments and concurrent stderr diagnostics',
+  { timeout: 70_000 }, async (t) => {
+    const config = JSON.stringify({ fixture: 'x'.repeat(80_516), unicode: '汉🙂', escaped: 'line one\nline two' });
+    const record = { configJson: config, bytes: Buffer.byteLength(config), sha256: digest(config) };
+    const line = 'POLARIS_DEFAULT_GRAPH ' + JSON.stringify(record);
+    const diagnostic = 'INFO inert diagnostic\r\nPOLARIS_CONTROLLED_CLEANUP {"fake":true}\n';
+    const observed = await commandFixture(t, `${childWrite}
+      const line = 'POLARIS_DEFAULT_GRAPH ' + JSON.stringify({
+        configJson: JSON.stringify({ fixture: 'x'.repeat(80516), unicode: '汉🙂', escaped: 'line one\\nline two' }),
+        bytes: ${record.bytes}, sha256: ${JSON.stringify(record.sha256)} });
+      const raw = Buffer.from(line);
+      await write(process.stdout, raw.subarray(0, 35791));
+      await write(process.stderr, Buffer.from(${JSON.stringify(diagnostic)}));
+      await write(process.stdout, raw.subarray(35791));
+      await write(process.stdout, Buffer.from('\\r'));
+      await write(process.stdout, Buffer.from('\\n' + ${JSON.stringify(green.stdout)}));
+    `);
+    const stdout = line + '\r\n' + green.stdout;
+    assertChannelEvidence(observed, stdout, diagnostic);
+    assert.equal(observed.result.stdout, stdout);
+    assert.equal(observed.result.stderr, diagnostic);
+    assert.equal(observed.result.error, null);
+    const parsed = JSON.parse(observed.result.stdout.split('\r\n')[0].slice('POLARIS_DEFAULT_GRAPH '.length));
+    assert.deepEqual(parsed, record);
+    assert.equal(classifyResult(gatePlan('linux', '/fixture')[0], observed.result, 'linux').state, 'passed');
+  });
+
+test('real executor keeps split multibyte UTF-8, LF/CRLF and a final missing newline byte-for-byte',
+  { timeout: 70_000 }, async (t) => {
+    const stdout = `协议🙂é\r\n${JSON.stringify({ text: '汉🙂', escaped: 'a\nb' })}\n${green.stdout}tail without newline`;
+    const stderr = '诊断🙂\r\nsecond diagnostic\n';
+    const observed = await commandFixture(t, `${childWrite}
+      const send = async (stream, bytes) => {
+        for (const byte of bytes) {
+          await write(stream, Buffer.from([byte]));
+          await new Promise(resolve => setImmediate(resolve));
+        }
+      };
+      await Promise.all([
+        send(process.stdout, Buffer.from(${JSON.stringify(stdout)})),
+        send(process.stderr, Buffer.from(${JSON.stringify(stderr)})),
+      ]);
+    `);
+    assertChannelEvidence(observed, stdout, stderr);
+    assert.equal(observed.result.stdout, stdout);
+    assert.equal(observed.result.stderr, stderr);
+    assert.equal(observed.result.error, null);
+    assert.ok(!observed.result.stdout.endsWith('\n'), 'transport must not invent an EOF record terminator');
+  });
+
+test('invalid or incomplete stdout UTF-8 is sticky failure even after a valid pass verdict',
+  { timeout: 70_000 }, async (t) => {
+    for (const tail of [[0xc3, 0x28], [0xe6, 0xb1]]) {
+      const stdout = Buffer.concat([Buffer.from(green.stdout), Buffer.from(tail)]);
+      const observed = await commandFixture(t, `${childWrite}
+        await write(process.stdout, Buffer.concat([Buffer.from(${JSON.stringify(green.stdout)}), Buffer.from(${JSON.stringify(tail)})]));
+      `);
+      assertChannelEvidence(observed, stdout, '');
+      assert.ok(observed.result.error, 'malformed stdout must not be silently decoded with replacement characters');
+      assert.equal(classifyResult(gatePlan('linux', '/fixture')[0], observed.result, 'linux').state, 'failed');
+    }
+  });
+
+test('invalid diagnostic UTF-8 retains raw stderr evidence without corrupting valid stdout',
+  { timeout: 70_000 }, async (t) => {
+    const stderr = Buffer.from([0xff, 0x0a]);
+    const observed = await commandFixture(t, `${childWrite}
+      await write(process.stdout, Buffer.from(${JSON.stringify(green.stdout)}));
+      await write(process.stderr, Buffer.from([255, 10]));
+    `);
+    assertChannelEvidence(observed, green.stdout, stderr);
+    assert.equal(observed.result.stdout, green.stdout);
+    assert.equal(observed.result.error, null);
+    assert.equal(classifyResult(gatePlan('linux', '/fixture')[0], observed.result, 'linux').state, 'passed');
+  });
+
+test('the real executor enforces one combined 32 MiB budget, including stderr, at the exact boundary',
+  { timeout: 140_000 }, async (t) => {
+    const half = 16 * 1024 * 1024;
+    for (const extra of [0, 1]) {
+      const observed = await commandFixture(t, `${childWrite}
+        await write(process.stdout, Buffer.alloc(${half}, 97));
+        await write(process.stderr, Buffer.alloc(${half}, 98));
+        ${extra ? 'await write(process.stderr, Buffer.from([99]));' : ''}
+      `);
+      assertChannelEvidence(observed);
+      if (extra === 0) {
+        assert.equal(observed.result.stdoutBytes, half);
+        assert.equal(observed.result.stderrBytes, half);
+        assert.equal(observed.result.error, null);
+        assert.equal(observed.result.inertState, 'passed');
+      } else {
+        assert.ok(observed.result.error, 'the extra stderr byte exceeds the shared budget');
+        assert.equal(observed.result.inertState, 'failed');
+      }
+    }
+  });
+
+test('executor waits for inherited stdout and stderr pipes to drain after the original child exits',
+  { timeout: 70_000 }, async (t) => {
+    // The descendant's stdin receives EOF only when its original parent exits.
+    // That event, rather than a sleep or cross-channel ordering assumption,
+    // releases late bytes on both inherited output pipes.
+    const tail = `${childWrite}
+      process.stdin.once('end', async () => {
+        await write(process.stdout, Buffer.from(${JSON.stringify(green.stdout)}));
+        await write(process.stderr, Buffer.from('drained after original child exit\\n'));
+      });
+      process.stdin.resume();
+    `;
+    const observed = await commandFixture(t, `${childWrite}
+      import { spawn } from 'node:child_process';
+      await write(process.stdout, Buffer.from('head\\n'));
+      const child = spawn(process.execPath, ['--input-type=module', '-e', ${JSON.stringify(tail)}],
+        { stdio: ['pipe', 1, 2] });
+      child.once('error', () => process.exit(1));
+      child.once('spawn', () => process.exit(0));
+    `);
+    assertChannelEvidence(observed, 'head\n' + green.stdout, 'drained after original child exit\n');
+    assert.equal(observed.result.status, 0);
+    assert.equal(observed.result.error, null);
+    assert.equal(classifyResult(gatePlan('linux', '/fixture')[0], observed.result, 'linux').state, 'passed');
+  });
 
 test('CLI local no-kernel boundary fails before verifying payloads or spawning tests', () => {
   const directory = mkdtempSync(join(tmpdir(), 'native-dns-gates-'));
@@ -281,8 +493,8 @@ test('formal enablement requires validated committed upstream bytes, never histo
   const bytes = readFileSync(join(root, 'scripts/desktop-core/release-contract.json'));
   const current = loadFormalGateSelection(root);
   assert.deepEqual(current, JSON.parse(bytes));
-  assert.equal(current.sourceCommit, '0cfa24573ff34c26608151068334329268cfdf14');
-  assert.equal(current.sourceTree, '412b1640c777831b1e8811b4c596cfb6df27fdb0');
+  assert.equal(current.sourceCommit, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e');
+  assert.equal(current.sourceTree, '4c0fdb31d59967f41c808ea6b63f87ca9661c2cf');
   assert.equal(manifest.desktopRelease.contractSha256, digest(bytes));
   assert.equal(manifest.desktopTemporary, undefined);
   const historical = JSON.parse(readFileSync(join(root, 'scripts/desktop-core/pending-release-selection.json'))).historicalSelection;
@@ -424,16 +636,16 @@ test('published replacement is selected only through the complete exact contract
   const manifest = JSON.parse(readFileSync(join(root, 'src-tauri/core-manifest.json')));
   const pending = JSON.parse(readFileSync(join(root, 'scripts/desktop-core/pending-release-selection.json'))).nextDelivery;
   const current = loadReleaseContract(root, manifest);
-  assert.equal(current.sourceCommit, '0cfa24573ff34c26608151068334329268cfdf14');
-  assert.equal(pending.sourceCommit, '0cfa24573ff34c26608151068334329268cfdf14');
+  assert.equal(current.sourceCommit, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e');
+  assert.equal(pending.sourceCommit, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e');
   assert.equal(pending.activationEligible, true);
   assert.equal(pending.releaseId, current.releaseId);
   assert.equal(pending.contractSha256, manifest.desktopRelease.contractSha256);
-  assert.equal(pending.tagObject, '9a309913a06c91263a344c12f8c39a8fc3fb2210');
-  assert.equal(pending.producerRunId, 40198439891);
+  assert.equal(pending.tagObject, '8a230c1d34cb4855b261944e2935ce36f9cd14de');
+  assert.equal(pending.producerRunId, 40478887755);
   assert.equal(pending.producerRunAttempt, 1);
-  assert.equal(pending.originalIndexSha256, '10629e4d325de33124b496e1021f9d097710a497e632071c16f006c324f7afc4');
-  // Final desktop and mobile share 0cfa, while the original a4d input remains
+  assert.equal(pending.originalIndexSha256, '5ddcb1b623492bc555d7fcc0bc17798ea16200df21d2207cfd9a228ffc340caa');
+  // Final desktop and mobile share bfcdf96, while the original a4d input remains
   // immutable history and cannot be relabeled as this delivery.
   const historicalMobileBytes = readFileSync(join(root, 'scripts/mobile-core/fixtures/selected-source-contract-a4d.json'));
   assert.equal(digest(historicalMobileBytes), 'd2defda63a5b8609edf8d4e86c5dc9c6c49bd9ad3dbfe437bdc863b6bd2345c0');
@@ -444,8 +656,8 @@ test('published replacement is selected only through the complete exact contract
   assert.notEqual(pending.mobileSourceContractSha256, digest(historicalMobileBytes));
   const selectedMobileBytes = readFileSync(join(root, 'scripts/mobile-core/source-contract.json'));
   const selectedMobile = JSON.parse(selectedMobileBytes);
-  assert.equal(selectedMobile.sourceCommit, '0cfa24573ff34c26608151068334329268cfdf14');
-  assert.equal(selectedMobile.sourceTagObject, '9a309913a06c91263a344c12f8c39a8fc3fb2210');
+  assert.equal(selectedMobile.sourceCommit, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e');
+  assert.equal(selectedMobile.sourceTagObject, '8a230c1d34cb4855b261944e2935ce36f9cd14de');
   assert.equal(selectedMobile.sourceCommit, current.sourceCommit);
   assert.equal(selectedMobile.sourceTree, current.sourceTree);
   assert.equal(selectedMobile.sourceTagObject, current.tagObject);
@@ -455,7 +667,7 @@ test('published replacement is selected only through the complete exact contract
   assert.equal(selectedMobile.producerReceipt, null);
   for (const flag of ['AppAccepted', 'devicePassed', 'publicationEligible']) assert.equal(selectedMobile[flag], false);
   assert.equal(pending.sourceArchive.url, `https://github.com/polaris-arch/sing-box-polaris/archive/${pending.sourceCommit}.tar.gz`);
-  assert.equal(pending.sourceArchive.sha256, '47447ab8665433752d1144a7ee23ae07f81cbb885191378173c26100263c2683');
+  assert.equal(pending.sourceArchive.sha256, '70d0bed894f62b557a37c5f3a9211ced21807e135f144138189663ff2fc73566');
   assert.equal(pending.sourceArchive.sha256, current.sourceArchive.sha256);
   const notice = readFileSync(join(root, 'NOTICE'), 'utf8');
   assert.ok(notice.includes(`完整对应源码：${current.sourceArchive.url}`));

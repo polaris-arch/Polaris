@@ -26,6 +26,18 @@ async function openFixture(page: Page, url: string) {
   await page.waitForFunction(name => (window as unknown as Record<string, { ready?: boolean }>)[name]?.ready === true, key);
   const bootstrap = await page.evaluate(name => (window as unknown as Record<string, { bootstrap: unknown }>)[name].bootstrap, key);
   assertFixtureLocale(bootstrap, language);
+  if (feedback && target.searchParams.has('helper-bridge')) {
+    if (target.searchParams.has('recovery')) {
+      await page.waitForFunction(() => (window as any).__feedback.privacyApplied && (window as any).__feedback.trayReads >= 1);
+      expect(await page.evaluate('window.__feedback.unexpected')).toEqual([]);
+      return;
+    }
+    await page.waitForFunction(() => {
+      const state = (window as any).__feedback;
+      return state.privacyApplied && state.configReads > 0 && state.cleanExitReads === 1 && state.pendingAcks > 0 && state.trayReads === 1;
+    });
+    expect(await page.evaluate('window.__feedback.unexpected')).toEqual([]);
+  }
 }
 
 async function closeFixturePages(browser: Browser | undefined, failed: boolean, name: string) {
@@ -43,10 +55,16 @@ async function closeFixturePages(browser: Browser | undefined, failed: boolean, 
           const state = await page.evaluate(() => {
             const globals = window as unknown as Record<string, Record<string, unknown> | undefined>;
             const transactions = globals.__transactions;
+            const feedback = globals.__feedback;
             const count = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
             return { locale: document.documentElement.lang, documentReadyState: document.readyState,
               transactionsReady: transactions?.ready === true, feedbackReady: globals.__feedback?.ready === true,
               // Only bounded synthetic fixture counts, never arbitrary DOM/IPC values.
+              feedbackCounts: { installs: count(feedback?.installs), checks: count(feedback?.checks),
+                privacyReads: count(feedback?.privacyReads), privacyApplied: feedback?.privacyApplied === true,
+                cleanExitReads: count(feedback?.cleanExitReads), pendingAcks: count(feedback?.pendingAcks), trayReads: count(feedback?.trayReads) },
+              dialogs: { attached: document.querySelectorAll('dialog').length, open: document.querySelectorAll('dialog[open]').length,
+                hidden: document.querySelectorAll('dialog[aria-hidden="true"]').length },
               transactionCounts: { runtimeStatusReads: count(transactions?.runtimeStatusReads),
                 applyCalls: count(transactions?.applyCalls), writes: count(transactions?.writes),
                 persistenceRetries: Array.isArray(transactions?.persistenceTransactions) ? transactions.persistenceTransactions.length : null } };
@@ -1231,19 +1249,15 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('App transaction inter
 const feedbackEntry = `
 import React, { useLayoutEffect } from 'react';
 import { createRoot } from 'react-dom/client';
-import SettingsHelper from '/src/components/screens/settings/SettingsHelper';
-import { FormSheet } from '/src/mobile/forms/FormSheet';
-import { SettingsRow, SettingsGroup } from '/src/mobile/settings/SettingsChrome';
-import { WriteErrorsContext } from '/src/mobile/settings/write-feedback';
-import { Toaster } from '/src/components/layout/Toaster';
-import { MobileToaster } from '/src/mobile/MobileToaster';
-import { MobileShell } from '/src/mobile/MobileShell';
-import { helperApi } from '/src/ipc/api-client';
-import { toast } from '/src/lib/error-handler';
-import { useNavStore } from '/src/store/nav-store';
+import { mockIPC } from '@tauri-apps/api/mocks';
+import { startPrivacyModeSync } from '/src/lib/privacy-mode-sync';
+import { DEMO_CONFIG } from '/harness-fixture';
 import i18n, { i18nReady } from '/src/i18n';
 const q = new URLSearchParams(location.search);
 const mobile = q.get('mode') === 'mobile';
+const helperBridge = q.has('helper-bridge');
+const recovery = q.get('recovery');
+if (recovery === 'seed') window.__POLARIS_TRAY_SCREEN__ = 'helper-recovery';
 if (mobile) {
   await import('/src/styles/tokens.resolved.css');
   await import('/src/mobile/theme.css');
@@ -1258,14 +1272,117 @@ await i18nReady;
 document.documentElement.dataset.theme = q.get('theme') || 'light';
 document.documentElement.lang = i18n.language;
 document.documentElement.dir = i18n.dir();
-document.documentElement.dataset.os = 'mac';
+document.documentElement.dataset.os = helperBridge && q.has('os') ? q.get('os') : 'mac';
 if (q.get('scale') === '2') document.documentElement.style.setProperty('--font-scale', '2');
-const state = window.__feedback = { installs: 0, checks: 0, navigation: [], release: null, submitted: 0, closed: 0 };
-const status = { supported: true, installed: false, ready: false, needsRepair: false, upgradeable: false, backgroundDisabled: false };
-helperApi.getStatus = async () => { state.checks++; return status; };
-helperApi.onUpgradeable = () => () => {};
-helperApi.install = () => { state.installs++; return new Promise(resolve => { state.release = () => resolve({ success: false, errorCode: 'installerFailed', status }); }); };
-useNavStore.setState({ navigate: screen => { state.navigation.push(screen); } });
+const state = window.__feedback = { installs: 0, checks: 0, navigation: [], release: null, submitted: 0, closed: 0,
+  configReads: 0, privacyReads: 0, privacyApplied: false, cleanExitReads: 0, pendingAcks: 0, trayReads: 0, unexpected: [] };
+const config = structuredClone(DEMO_CONFIG);
+const status = { supported: true, installed: false, ready: false, needsRepair: false, upgradeable: false, backgroundDisabled: false, loaded: null, pathMismatch: false, installedSingboxPath: null };
+if (helperBridge) {
+  // Only the native transport is synthetic: real React hooks, SettingsPage/useConfig,
+  // helperApi, ipc-client's single unwrap and the actual confirmation dialog stay mounted.
+  // This fixture neither installs nor talks to any native helper.
+  const repair = { ...status, installed: true, needsRepair: true, version: 1, expectedProtocolVersion: 2,
+    expectedBuildId: 'fixture-current-app', selectedCore: { id: 'a'.repeat(64), version: 'fixture-core',
+      providerFingerprint: 'b'.repeat(64), state: 'unavailable' } };
+  let observedStatus = repair;
+  let pendingScreen = recovery === 'seed' || recovery === 'pending' ? 'helper-recovery' : null;
+  state.revealTargets = [];
+  state.installModes = [];
+  state.forcedChecks = 0;
+  mockIPC(async (command, payload) => {
+    switch (command) {
+      case 'plugin:notification|is_permission_granted': return false; // explicit synthetic denied permission, never request or notify
+      case 'config_get': state.configReads++; return { success: true, data: config };
+      case 'config_get_privacy_mode': state.privacyReads++; return { success: true, data: q.has('privacy-locked') };
+      case 'app_take_clean_exit_flag': state.cleanExitReads++; return { success: true, data: false };
+      case 'config_set_staged_pending':
+        if (payload?.pending !== false || !Array.isArray(payload?.nodeIds) || payload.nodeIds.length !== 0) throw new Error('Unexpected nonempty staged fixture mutation');
+        state.pendingAcks++; return { success: true };
+      case 'app_startup_config_flags': return { success: true, data: { hardwareAcceleration: true, windowEffects: true, rememberWindowSize: true } };
+      case 'tray_take_pending_screen': {
+        state.trayReads++;
+        const screen = pendingScreen; pendingScreen = null;
+        if (recovery === 'late-pending' && state.trayReads === 1) return new Promise(resolve => {
+          state.releasePending = () => resolve({ success: true, data: 'helper-recovery' });
+        });
+        return { success: true, data: screen };
+      }
+      case 'tray_show_main': {
+        if (payload?.screen !== 'helper-recovery') throw new Error('Unexpected native reveal target');
+        state.revealTargets.push(payload.screen); pendingScreen = payload.screen;
+        // Real event API + raw IPC mock; this is not an actual separate native webview.
+        const { emit } = await import('@tauri-apps/api/event');
+        await emit('event:trayOpenScreen', payload.screen);
+        return { success: true };
+      }
+      case 'helper_get_status':
+        state.checks++;
+        if (payload?.force === true) state.forcedChecks++;
+        if (state.holdNextStatus && payload?.force !== true) {
+          state.holdNextStatus = false;
+          return new Promise(resolve => { state.releaseOldStatus = () => resolve({ success: true, data: repair }); });
+        }
+        return { success: true, data: observedStatus };
+      case 'helper_install':
+        state.installs++;
+        state.installModes.push(payload?.mode ?? 'ordinary');
+        return new Promise(resolve => {
+          state.release = (errorCode = 'upgradeDeferred') => {
+            if (errorCode === null) observedStatus = { ...repair, ready: true, needsRepair: false, version: 2, helperBuildId: 'fixture-current-app', selectedCore: { ...repair.selectedCore, state: 'present' } };
+            resolve({ success: true, data: { success: errorCode === null, errorCode, diagnostic: 'synthetic bounded helper rejection', status: observedStatus } });
+          };
+        });
+      default: state.unexpected.push(command); throw new Error('Unexpected helper transport fixture command: ' + command);
+    }
+  }, { shouldMockEvents: true });
+}
+// Install the raw transport before importing production modules with startup effects.
+// This is the same fail-closed privacy synchronizer that App mounts, not a forced unlock.
+const [{ default: SettingsHelper }, { default: SettingsPage }, { DialogHost }, { useDialogStore }, { useAppStore }, { FormSheet }, { SettingsRow, SettingsGroup }, { WriteErrorsContext }, { Toaster }, { MobileToaster }, { MobileShell }, { helperApi, configApi }, { toast }, { useNavStore }] = await Promise.all([
+  import('/src/components/screens/settings/SettingsHelper'),
+  import('/src/components/screens/settings/SettingsPage'),
+  import('/src/components/dialogs/DialogHost'),
+  import('/src/components/dialogs/dialog-store'),
+  import('/src/store/app-store'),
+  import('/src/mobile/forms/FormSheet'),
+  import('/src/mobile/settings/SettingsChrome'),
+  import('/src/mobile/settings/write-feedback'),
+  import('/src/components/layout/Toaster'),
+  import('/src/mobile/MobileToaster'),
+  import('/src/mobile/MobileShell'),
+  import('/src/ipc/api-client'),
+  import('/src/lib/error-handler'),
+  import('/src/store/nav-store'),
+]);
+if (helperBridge) {
+  useAppStore.setState({ config });
+  if (!recovery) useNavStore.getState().enterSettings('helper');
+  const { revealHelperRecovery } = await import('/src/domain/helper-recovery');
+  const { handleProxyErrorEvent } = await import('/src/domain/proxy-error-routing');
+  state.revealRecovery = revealHelperRecovery;
+  state.errorEvent = code => handleProxyErrorEvent({ errorCode: code }, { t: key => i18n.t(key), refreshProxyStatus: async () => {} });
+  state.scope = () => ({ scope: useNavStore.getState().scope, settings: useNavStore.getState().settingsScreen });
+  state.setPrivacy = locked => useAppStore.getState().setPrivacyMode(locked);
+  state.leave = () => useNavStore.getState().navigate('logs');
+  state.returnToHelper = () => useNavStore.getState().enterSettings('helper');
+  state.captureConfirm = () => { const entry = useDialogStore.getState().stack.at(-1); if (entry?.kind !== 'confirm') throw new Error('Missing actual confirmation'); state.savedConfirm = entry.payload.onConfirm; };
+} else {
+  helperApi.getStatus = async () => { state.checks++; return status; };
+  helperApi.onUpgradeable = () => () => {};
+  helperApi.install = () => { state.installs++; return new Promise(resolve => { state.release = () => resolve({ success: false, errorCode: 'installerFailed', status }); }); };
+  useNavStore.setState({ navigate: screen => { state.navigation.push(screen); } });
+}
+function HelperBridgeRoute() {
+  React.useEffect(() => startPrivacyModeSync(configApi, locked => {
+    useAppStore.getState().setPrivacyMode(locked);
+    if (state.privacyReads > 0) state.privacyApplied = true;
+  }), []);
+  const scope = useNavStore(s => s.scope);
+  // Same settings parent is genuinely unmounted when navigation changes scope.
+  // The logs body itself is irrelevant and deliberately not fabricated as real log output.
+  return <>{scope === 'settings' ? <SettingsPage /> : <div data-fixture-logs>synthetic logs destination</div>}<DialogHost /><Toaster /></>;
+}
 const synthetic = i18n.language === 'fa' ? 'این پیام آزمایشی فقط برای بررسی نمایش است و هیچ دادهٔ کاربری ندارد. ' : i18n.language === 'en-US' ? 'Synthetic layout detail with no user data or credentials. ' : '这是仅用于界面排版的合成错误说明，不含网址、凭据或用户数据。';
 const long = i18n.t('feedback.followupIncomplete') + ' ' + synthetic.repeat(16);
 state.connectionTitle = i18n.t('feedback.connectionFailed');
@@ -1278,7 +1395,7 @@ function FeedbackReady() {
   }, []);
   return null;
 }
-createRoot(document.getElementById('root')).render(<><FeedbackReady />{mobile ?
+createRoot(document.getElementById('root')).render(<><FeedbackReady />{helperBridge ? <HelperBridgeRoute /> : mobile ?
   <MobileShell active="settings" onSelect={() => {}} toastHost={<MobileToaster />}><FormSheet title="订阅编辑" closeLabel="关闭表单" cancelLabel="取消" submitLabel="保存" onRequestClose={() => state.closed++} onSubmit={() => state.submitted++}
     notice={{ tone: 'err', title: i18n.t('feedback.subscriptionSaved'), text: long }}>
     <WriteErrorsContext.Provider value={{fixture:"保存失败"}}><SettingsGroup><SettingsRow id="fixture" label="设置校验" problem="参数无效" /></SettingsGroup></WriteErrorsContext.Provider>
@@ -1347,6 +1464,244 @@ describe.runIf(process.env.POLARIS_BROWSER_TESTS === '1')('feedback presentation
       presentation: await page.evaluate(() => ({ locale: document.documentElement.lang, direction: document.documentElement.dir, theme: document.documentElement.dataset.theme, rootFontSize: getComputedStyle(document.documentElement).fontSize })),
       fixtureOnly: true, stability, facts, visualVerdict: 'pending-human-review' }, null, 2));
   }
+
+  // Incident regression: a typed deferral must replace the original repair action,
+  // not leave the user repeating ordinary installs while recovery is elsewhere above it.
+  it.each(['cancel', 'escape', 'close', 'scrim'])('Helper recovery %s dismisses the explanation without navigation or install', async dismiss => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge&recovery=event');
+    await page.evaluate('window.__feedback.revealRecovery()');
+    const dialog = page.getByRole('dialog', { name: zhCN.helper.connectionRecoveryTitle });
+    await dialog.waitFor({ state: 'visible' });
+    await page.evaluate('window.__feedback.revealRecovery()');
+    expect(await page.getByRole('dialog').count()).toBe(1);
+    expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
+    if (dismiss === 'escape') await page.keyboard.press('Escape');
+    else if (dismiss === 'scrim') await page.mouse.click(1, 1);
+    else await dialog.getByRole('button', { name: dismiss === 'cancel' ? zhCN.common.cancel : zhCN.common.close, exact: true }).click();
+    await dialog.waitFor({ state: 'detached' });
+    expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
+    await page.close();
+  });
+
+  it.each(['seed', 'pending'])('Helper recovery cold %s opens translated explanation before any settings navigation', async delivery => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge&recovery=' + delivery);
+    const dialog = page.getByRole('dialog', { name: zhCN.helper.connectionRecoveryTitle });
+    await dialog.waitFor({ state: 'visible' });
+    expect(await dialog.textContent()).toContain(zhCN.helper.connectionRecoveryMessage);
+    expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
+    await dialog.getByRole('button', { name: zhCN.helper.connectionRecoverySettings, exact: true }).click();
+    await page.locator('[data-s="needs-repair"]').waitFor();
+    expect(await page.evaluate('window.__feedback.scope()')).toEqual({ scope: 'settings', settings: 'helper' });
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
+    await page.close();
+  });
+
+  it('Helper recovery event then cancel ignores an older pending drain reply', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge&recovery=late-pending');
+    await page.evaluate('window.__feedback.revealRecovery()');
+    const dialog = page.getByRole('dialog', { name: zhCN.helper.connectionRecoveryTitle });
+    await dialog.getByRole('button', { name: zhCN.common.cancel, exact: true }).click();
+    await page.evaluate(async () => { (window as any).__feedback.releasePending(); await new Promise(resolve => requestAnimationFrame(() => resolve(null))); });
+    await dialog.waitFor({ state: 'detached' });
+    expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
+    await page.close();
+  });
+
+  it.each(['HELPER_CORE_MISMATCH', 'HELPER_CORE_ABSENT', 'HELPER_CORE_INVALID'])('Helper recovery generic %s event shares the main prompt owner with await delivery', async code => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge&recovery=event');
+    await page.evaluate(code => (window as any).__feedback.errorEvent(code), code);
+    const dialog = page.getByRole('dialog', { name: zhCN.helper.connectionRecoveryTitle });
+    await dialog.waitFor({ state: 'visible' });
+    await page.evaluate('window.__feedback.revealRecovery()');
+    expect(await page.getByRole('dialog').count()).toBe(1);
+    expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
+    await page.close();
+  });
+
+  it('Helper recovery privacy hides the prompt and only unlock makes the choice available', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge&recovery=seed&privacy-locked');
+    const dialog = page.locator('dialog');
+    await dialog.waitFor({ state: 'attached' });
+    expect(await dialog.isVisible()).toBe(false);
+    expect(await dialog.getAttribute('aria-hidden')).toBe('true');
+    expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual([]);
+    // Synthetic external unlock, through the same actual setter used by privacy hydration.
+    await page.evaluate('window.__feedback.setPrivacy(false)');
+    await dialog.waitFor({ state: 'visible' });
+    await dialog.getByRole('button', { name: zhCN.common.cancel, exact: true }).click();
+    expect(await page.evaluate('window.__feedback.scope().scope')).toBe('main');
+    await page.close();
+  });
+
+  it('Helper raw IPC deferral reaches real SettingsPage and replaces the repair action in place', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN', viewport: { width: 640, height: 480 } });
+    await openFixture(page, origin + '/__feedback?helper-bridge');
+    const repair = page.locator('[data-s="needs-repair"]');
+    await repair.getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
+    await page.waitForFunction('window.__feedback.installs === 1 && typeof window.__feedback.release === "function"');
+    await page.evaluate('window.__feedback.release()');
+    await page.locator('[data-testid="helper-install-failure"]').waitFor();
+    // The parent and typed envelope must both be real before asserting the main operation.
+    expect(await page.locator('[data-testid="helper-selected-core"]').textContent()).toContain('fixture-core');
+    const primary = repair.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true });
+    await primary.waitFor({ state: 'visible' });
+    expect(await repair.getByRole('button', { name: zhCN.helper.repairAction, exact: true }).count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await primary.click();
+    const dialog = page.getByRole('dialog');
+    await dialog.waitFor();
+    expect(await dialog.textContent()).toContain(zhCN.helper.stopAndUpgradeWarning);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.evaluate('window.__feedback.captureConfirm()');
+    await dialog.getByRole('button', { name: zhCN.common.cancel, exact: true }).click();
+    await page.evaluate('window.__feedback.savedConfirm()');
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.getByRole('button', { name: zhCN.helper.recheck, exact: true }).click();
+    await page.waitForFunction('window.__feedback.forcedChecks >= 2');
+    await primary.click();
+    await page.evaluate('window.__feedback.captureConfirm()');
+    await dialog.getByRole('button', { name: zhCN.helper.stopAndUpgradeConfirm, exact: true }).click();
+    await page.evaluate('window.__feedback.savedConfirm(); window.__feedback.savedConfirm()');
+    await page.waitForFunction('window.__feedback.installs === 2');
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary', 'stopAndUpgrade']);
+    await page.evaluate('window.__feedback.release("cancelled")');
+    await page.waitForFunction(copy => document.querySelector('[data-testid="helper-install-failure"]')?.textContent?.includes(copy), zhCN.helper.actionError.cancelled);
+    expect(await page.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary', 'stopAndUpgrade']);
+    await page.close();
+  });
+
+  it.each(['after-reply', 'before-reply'])('Helper deferral survives real settings unmount %s without re-install or automatic stop', async timing => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge');
+    await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
+    await page.waitForFunction('window.__feedback.installs === 1 && typeof window.__feedback.release === "function"');
+    if (timing === 'before-reply') {
+      await page.evaluate('window.__feedback.leave()');
+      await page.locator('[data-fixture-logs]').waitFor();
+    }
+    await page.evaluate('window.__feedback.release()');
+    if (timing === 'after-reply') {
+      await page.locator('[data-testid="helper-install-failure"]').waitFor();
+      await page.getByRole('button', { name: zhCN.helper.viewLogsAction, exact: true }).click();
+      await page.locator('[data-fixture-logs]').waitFor();
+    }
+    await page.evaluate('window.__feedback.returnToHelper()');
+    await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).waitFor({ state: 'visible' });
+    expect(await page.getByRole('dialog').count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.close();
+  });
+
+  it('Helper real parent remount retains the in-flight lock and clears feedback only after success', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge');
+    const primary = page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true });
+    await primary.click();
+    await page.waitForFunction('window.__feedback.installs === 1');
+    await page.evaluate('window.__feedback.leave()');
+    await page.locator('[data-fixture-logs]').waitFor();
+    await page.evaluate('window.__feedback.returnToHelper()');
+    await primary.waitFor();
+    expect(await primary.isDisabled()).toBe(true);
+    await primary.evaluate(element => { (element as HTMLButtonElement).click(); (element as HTMLButtonElement).click(); });
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.evaluate('window.__feedback.release(null)');
+    await page.locator('[data-s="installed"]').waitFor();
+    expect(await page.evaluate('window.__feedback.forcedChecks')).toBeGreaterThanOrEqual(1);
+    expect(await page.locator('[data-testid="helper-install-failure"]').count()).toBe(0);
+    expect(await page.getByRole('dialog').count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.close();
+  });
+
+  it('Helper terminal refresh wins over a delayed pre-install status read in the remounted parent', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge');
+    await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
+    await page.waitForFunction('window.__feedback.installs === 1');
+    await page.evaluate('window.__feedback.leave()');
+    await page.locator('[data-fixture-logs]').waitFor();
+    await page.evaluate('window.__feedback.holdNextStatus = true; window.__feedback.returnToHelper()');
+    await page.waitForFunction('typeof window.__feedback.releaseOldStatus === "function"');
+    await page.evaluate('window.__feedback.release(null)');
+    await page.locator('[data-s="installed"]').waitFor();
+    await page.evaluate('window.__feedback.releaseOldStatus()');
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+    expect(await page.locator('[data-s="installed"]').count()).toBe(1);
+    expect(await page.locator('[data-s="needs-repair"]').count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.close();
+  });
+
+  it('Helper real settings unmount discards confirmation but retains typed recovery presentation', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge');
+    await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
+    await page.waitForFunction('typeof window.__feedback.release === "function"');
+    await page.evaluate('window.__feedback.release()');
+    await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).click();
+    await page.getByRole('dialog').waitFor();
+    await page.evaluate('window.__feedback.captureConfirm(); window.__feedback.leave()');
+    await page.locator('[data-fixture-logs]').waitFor();
+    await page.evaluate('window.__feedback.savedConfirm(); window.__feedback.returnToHelper()');
+    await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).waitFor();
+    expect(await page.getByRole('dialog').count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.close();
+  });
+
+  it.each(['win', 'lin', 'unknown'])('Helper raw typed deferral on %s cannot select migration', async platform => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge&os=' + platform);
+    const primary = page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true });
+    await primary.click();
+    await page.waitForFunction('typeof window.__feedback.release === "function"');
+    await page.evaluate('window.__feedback.release()');
+    await page.locator('[data-testid="helper-install-failure"]').waitFor();
+    await primary.waitFor();
+    expect(await page.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).count()).toBe(0);
+    expect(await page.getByRole('dialog').count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.close();
+  });
+
+  it('Helper raw locked privacy snapshot keeps the real confirmation hidden and sends no migration', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge&privacy-locked');
+    await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
+    await page.waitForFunction('typeof window.__feedback.release === "function"');
+    await page.evaluate('window.__feedback.release()');
+    await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).click();
+    await page.locator('dialog').waitFor({ state: 'attached' });
+    expect(await page.locator('dialog').getAttribute('aria-hidden')).toBe('true');
+    expect(await page.locator('dialog').isVisible()).toBe(false);
+    expect(await page.locator('dialog[open]').count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    expect(await page.evaluate('window.__feedback.unexpected')).toEqual([]);
+    await page.close();
+  });
+
+  it('Helper raw ordinary installer failure does not authorize migration', async () => {
+    const page = await browser.newPage({ locale: 'zh-CN' });
+    await openFixture(page, origin + '/__feedback?helper-bridge');
+    await page.locator('[data-s="needs-repair"]').getByRole('button', { name: zhCN.helper.repairAction, exact: true }).click();
+    await page.waitForFunction('typeof window.__feedback.release === "function"');
+    await page.evaluate('window.__feedback.release("installerFailed")');
+    await page.locator('[data-testid="helper-install-failure"]').waitFor();
+    expect(await page.getByRole('button', { name: zhCN.helper.stopAndUpgradeAction, exact: true }).count()).toBe(0);
+    expect(await page.evaluate('window.__feedback.installModes')).toEqual(['ordinary']);
+    await page.close();
+  });
 
   for (const width of [1280, 640]) for (const theme of ['light', 'dark']) {
     it(`Helper failure hierarchy and original actions ${width}/${theme}`, async () => {

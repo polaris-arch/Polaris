@@ -956,6 +956,22 @@ test('alpha.12.4 keeps its complete version in producer and public archive ident
     c => { c.platforms.linux.sourceCommit = 'f'.repeat(40); },
   ]) { const changed = structuredClone(contract); alter(changed); assert.throws(() => validateReleaseContract(changed)); }
 });
+test('alpha.12.6 keeps its complete version in producer and public archive identities', () => {
+  const version = '1.15.0-polaris-alpha.12.6';
+  const { contract, index } = brandedFixture(version);
+  assert.equal(validateReleaseContract(contract), contract);
+  assert.equal(validateUpstreamIndex(index, contract), index);
+  for (const row of Object.values(contract.platforms)) {
+    assert.equal(row.version, version);
+    assert.equal(row.tag, `v${version}`);
+    assert.ok(row.releaseAsset.url.includes(`/v${version}/`));
+  }
+  for (const alter of [
+    c => { c.tag = 'v1.15.0-polaris-alpha.12'; },
+    c => { c.platforms.linux.version = '1.15.0-polaris-alpha.12.4'; },
+    c => { c.platforms.linux.sourceCommit = 'f'.repeat(40); },
+  ]) { const changed = structuredClone(contract); alter(changed); assert.throws(() => validateReleaseContract(changed)); }
+});
 test('patch syntax never substitutes for complete release identity or matching raw versions', () => {
   const version = '1.15.0-polaris-alpha.12.1';
   for (const mutate of [

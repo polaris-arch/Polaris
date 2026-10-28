@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import sys
 import unittest
@@ -24,7 +25,9 @@ class ToolingTests(unittest.TestCase):
         self.root = Path(self.tmp.name) / 'polaris-package-automation'
         (self.root / 'bin').mkdir(parents=True)
         self.driver = self.root / 'bin/tauri-driver'; self.driver.write_bytes(b'\x7fELFtest-only-not-executable-code'); self.driver.chmod(0o700)
-        (self.root / '.crates.toml').write_text('[v1]\n"' + T.PACKAGE + '" = ["tauri-driver"]\n')
+        self.inventory = self.root / '.crates.toml'
+        self.inventory.write_text('[v1]\n"' + T.PACKAGE + '" = ["tauri-driver"]\n')
+        self.inventory.chmod(0o600)
         self.env = {'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'Linux', 'GITHUB_REPOSITORY': 'polaris-arch/Polaris',
                     'GITHUB_SHA': 'a' * 40, 'GITHUB_RUN_ID': '120', 'GITHUB_RUN_ATTEMPT': '1',
                     'GITHUB_JOB': 'linux_tun_package_acceptance', 'RUNNER_NAME': 'runner-123',
@@ -50,6 +53,7 @@ class ToolingTests(unittest.TestCase):
         return T.prepare(self.root, self.receipt, self.env, self.run)
 
     def test_exact_inventory_and_actual_bytes_not_claimed_version_stdout(self):
+        self.assertEqual(self.inventory.stat().st_mode & 0o777, 0o600)
         facts = self.prepare()
         self.assertEqual(T.verify(self.env, self.run), facts)
         self.assertEqual(facts['automation']['version'], '2.0.5')
@@ -58,6 +62,39 @@ class ToolingTests(unittest.TestCase):
         self.assertEqual(self.receipt.stat().st_mode & 0o777, 0o600)
         self.assertTrue(all(call.args[0][0] == '/usr/bin/dpkg-query' for call in self.run.call_args_list))
         with self.assertRaises(FileExistsError): self.prepare()
+
+    def test_private_inventory_fixture_is_safe_under_group_writable_umask(self):
+        # Keep the caller's umask untouched. Only this child test process uses
+        # 0002, then runs the existing positive receipt/identity assertions.
+        code = '''import os, runpy, sys
+source, target = sys.argv[1:]
+previous = os.umask(0o002)
+try:
+    sys.argv = [source, target]
+    runpy.run_path(source, run_name='__main__')
+finally:
+    os.umask(previous)
+'''
+        result = subprocess.run(
+            [sys.executable, '-B', '-c', code, str(Path(__file__).resolve()),
+             'ToolingTests.test_exact_inventory_and_actual_bytes_not_claimed_version_stdout'],
+            text=True, capture_output=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stderr, r'Ran 1 test\b')
+
+    def test_group_or_other_writable_tool_inputs_fail_before_native_observation(self):
+        for path in (self.inventory, self.driver, self.native):
+            original_mode = path.stat().st_mode & 0o777
+            for write_bit in (0o020, 0o002):
+                with self.subTest(path=path.name, write_bit=oct(write_bit)):
+                    self.run.reset_mock()
+                    path.chmod(original_mode | write_bit)
+                    try:
+                        with self.assertRaisesRegex(ValueError, '^writable tool input$'):
+                            T.observe(self.root, self.env, self.run)
+                        self.run.assert_not_called()
+                    finally:
+                        path.chmod(original_mode)
 
     def test_wrong_version_registry_binary_and_multiple_packages_rejected(self):
         good = (self.root / '.crates.toml').read_bytes()

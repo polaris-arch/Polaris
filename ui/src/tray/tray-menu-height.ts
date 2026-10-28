@@ -12,6 +12,26 @@ export interface TrayHeightLock {
   current: number | null;
 }
 
+/** Outer card decorations only — its viewport-filled height must never feed back into measurement. */
+export interface TrayMenuFrame {
+  top: number;
+  paddingTop: number;
+  paddingBottom: number;
+  borderTop: number;
+  borderBottom: number;
+  marginBottom: number;
+}
+
+/**
+ * Measure the unconstrained inner flow, not the scroll container: that container fills the current
+ * host, so both its rect and scrollHeight retain the previous window height after content shrinks.
+ * Keep fractional CSS pixels until the final rounding; native platform/work-area clamps stay native.
+ */
+export function trayNaturalWindowHeight(contentHeight: number, frame: TrayMenuFrame): number {
+  return Math.ceil(contentHeight + frame.top + frame.paddingTop + frame.paddingBottom
+    + frame.borderTop + frame.borderBottom + frame.marginBottom);
+}
+
 /**
  * 本次测量应回报给宿主的窗高：**主视图最近一次量到的值胜**。
  *

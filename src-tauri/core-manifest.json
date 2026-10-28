@@ -306,13 +306,13 @@
   "desktopRelease": {
     "schema": "polaris-app-release-selection-v1",
     "contractPath": "scripts/desktop-core/release-contract.json",
-    "contractSha256": "96e8cc61d7abf345145b2af230724708f9a1baea77715467e38e96277ae0ffdf",
-    "version": "1.15.0-polaris-alpha.12.4",
-    "tag": "v1.15.0-polaris-alpha.12.4",
-    "tagObject": "9a309913a06c91263a344c12f8c39a8fc3fb2210",
-    "sourceCommit": "0cfa24573ff34c26608151068334329268cfdf14",
-    "sourceTree": "412b1640c777831b1e8811b4c596cfb6df27fdb0",
-    "releaseId": 423508237,
+    "contractSha256": "66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f",
+    "version": "1.15.0-polaris-alpha.12.6",
+    "tag": "v1.15.0-polaris-alpha.12.6",
+    "tagObject": "8a230c1d34cb4855b261944e2935ce36f9cd14de",
+    "sourceCommit": "bfcdf96b244f63e0fe84736ee4a4edd58f6b209e",
+    "sourceTree": "4c0fdb31d59967f41c808ea6b63f87ca9661c2cf",
+    "releaseId": 425664135,
     "librarySha256": {
       "linux": "99eb98eb47102c7418c7fed1e666d27e2bfb67c6b5517f7ae6b033748d657ed4",
       "win": "8b005a933ac0d0899c047617a9cd18418810d9426d0919c824520094a2c893f5"

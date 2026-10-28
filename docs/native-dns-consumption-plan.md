@@ -4,21 +4,27 @@ The native node DNS generator requires the corresponding kernel implementation.
 Source-only success, an absent kernel or a previous kernel cannot establish the
 new policy's runtime compatibility.
 
-## Published alpha.12.4 selection
+## Published alpha.12.6 selection
 
-The final 0cfa source is selected using actual public immutable Release 423508237,
-published on 2026-10-25 at 16:25:49Z, and the four independently matched public
+The final bfcdf96 source is selected using actual public immutable Release 425664135,
+published at 2026-10-27T15:58:25Z, and the four independently matched public
 asset identities below. The original All producer index, exact automatic source
 archive, annotated tag and producer identity are bound in one exact contract.
+The prior alpha.12.5 / 332935 desktop contract/index and source evidence remain
+unchanged at App main 311ce7a407c9478b09b43ddff7e7cd81f4737928 and in nested history.
+Its delivered DMG retains that exact App/core identity, not alpha.12.6.
+The prior alpha.12.4 / 0cfa desktop contract/index and source evidence remain unchanged
+at App main f236f4001da3a688e22aa09fdfd1b5df2511b179 and in nested historical source evidence.
+The delivered ec422d DMG remains its original App/core identity, not alpha.12.6.
 The prior c6 desktop contract/index and source evidence retain their original identities
-in Git history and the nested historical source evidence; they are not relabeled as 0cfa.
+in Git history and the nested historical source evidence; they are not relabeled as bfcdf96.
 The prior 814 desktop contract/index and observations remain unchanged in Git history at App commit `bce3056c600f1738468acb7810cf2c086279aa5a`; they are not relabeled as c6.
 The a4d085 desktop contract and observations remain available unchanged at App
 commit 42706a1fc096b91f9a4186c0a4c68b0cdc88591b; the older c002/fe182 material and
 mobile a4d snapshot retain their own identities. No prior package, runtime or
 mobile acceptance observation is relabeled as this delivery.
 
-Source, producer and public bytes establish input provenance, not App runtime
+Source, producer and public metadata establish input provenance, not App runtime
 acceptance. Do not overwrite this immutable Release, its tag or its assets to
 repair an App consumer failure.
 
@@ -28,17 +34,17 @@ repair an App consumer failure.
 canonical `scripts/desktop-core/release-contract.json` bytes:
 
 - Repository: `polaris-arch/sing-box-polaris`.
-- Source: `0cfa24573ff34c26608151068334329268cfdf14`.
-- Tree: `412b1640c777831b1e8811b4c596cfb6df27fdb0`.
-- Version/tag: `1.15.0-polaris-alpha.12.4` / `v1.15.0-polaris-alpha.12.4`.
-- Annotated tag object: `9a309913a06c91263a344c12f8c39a8fc3fb2210`.
-- Public asset names use `sing-box-polaris-1.15.0-alpha.12.4-*`; the tag,
-  original archive filename/root and BuildInfo retain `1.15.0-polaris-alpha.12.4`.
+- Source: `bfcdf96b244f63e0fe84736ee4a4edd58f6b209e`.
+- Tree: `4c0fdb31d59967f41c808ea6b63f87ca9661c2cf`.
+- Version/tag: `1.15.0-polaris-alpha.12.6` / `v1.15.0-polaris-alpha.12.6`.
+- Annotated tag object: `8a230c1d34cb4855b261944e2935ce36f9cd14de`.
+- Public asset names use `sing-box-polaris-1.15.0-alpha.12.6-*`; the tag,
+  original archive filename/root and BuildInfo retain `1.15.0-polaris-alpha.12.6`.
   The original producer index and provenance retain their historical name
   annotations; public renaming changes neither their bytes nor payload pins.
-- Public prerelease: `423508237`; producer run `40198439891`, attempt 1.
-- Exact four archive IDs: Linux `675521886`, Windows `675522119`, Intel macOS
-  `675522601`, Apple Silicon macOS `675510691`.
+- Public prerelease: `425664135`; producer run `40478887755`, attempt 1.
+- Exact four archive IDs: Linux `682088894`, Windows `682077119`, Intel macOS
+  `682082597`, Apple Silicon macOS `682089262`.
 
 This is a real upstream-layout formal release contract, not a relabeled staging
 index. The exact historical 577d contract is retained as
@@ -56,15 +62,15 @@ asset is needed by this selection.
 
 The entire unchanged original index is committed at
 `scripts/desktop-core/release-asset-index.json`, with SHA-256
-`10629e4d325de33124b496e1021f9d097710a497e632071c16f006c324f7afc4`.
+`5ddcb1b623492bc555d7fcc0bc17798ea16200df21d2207cfd9a228ffc340caa`.
 The consumer checks its byte count, hash and all selected original rows against
 the canonical contract. It does not obtain the index from cross-repository
 Actions credentials or accept a replacement environment path.
 
 Source transport is the fixed commit URL
-`https://github.com/polaris-arch/sing-box-polaris/archive/0cfa24573ff34c26608151068334329268cfdf14.tar.gz`.
-The actual 19,711,858 bytes have SHA-256
-`47447ab8665433752d1144a7ee23ae07f81cbb885191378173c26100263c2683`.
+`https://github.com/polaris-arch/sing-box-polaris/archive/bfcdf96b244f63e0fe84736ee4a4edd58f6b209e.tar.gz`.
+The actual 19,747,580 bytes have SHA-256
+`70d0bed894f62b557a37c5f3a9211ced21807e135f144138189663ff2fc73566`.
 Only its exact same-commit codeload redirect is admitted. The existing archive
 verifier checks the complete expanded Git tree, separately observed gitlinks,
 module hashes, the v3 source policy with all ten reviewed local replacement trees
@@ -134,9 +140,14 @@ admission. Sealed-runtime evidence remains pending.
 The fifth private 814da row remains historical and cannot match the new compiled contract.
 The sixth private c6c0d8 row retains its historical source, contract and
 Linux ELF `80e21e78875f2f1cbfb1356dd977d6043a7776179df61f57897a4d811eaa1eaf`.
-A seventh private E0CFA24 row binds the current 0cfa source and canonical contract
+The seventh private E0CFA24 row retains the historical 0cfa source, contract
 `96e8cc61d7abf345145b2af230724708f9a1baea77715467e38e96277ae0ffdf`
-to Linux ELF `7fde19e331e654280e134a89c26af5be706e4364e3003a74b7619c220d5a03aa`.
+and Linux ELF `7fde19e331e654280e134a89c26af5be706e4364e3003a74b7619c220d5a03aa`.
+The eighth private E332935 row retains its historical alpha.12.5 source/contract
+and Linux ELF `d34fd051f8e089610bf32e58a5cf95ac36411827e46845157777baba078893ad`.
+A ninth private BFCDF96 row binds the current bfcdf96 source and canonical contract
+`66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f`
+to Linux ELF `9089e0a78616d714eeb63d052dff8505a8b21ed9ba24285ed7444067cde69988`.
 It uses the same PlainTcpCheckV1 semantics, rejects cross-paired historical
 sources/contracts and explicitly records runtime evidence pending. It permits the existing
 Linux Test gate to collect its own sealed check evidence; no prior probe is
@@ -144,26 +155,28 @@ claimed or required as a circular prerequisite to that gate. Check success never
 grants managed launch. The closed managed opt-in proposal remains Unsupported
 and is not a dependency of ordinary native birth.
 
-The four public archive bytes/IDs/API digests match the reviewed final producer
-inventory and immutable Release. Their payload hashes, raw/parsed Go BuildInfo,
+The four public archive metadata sizes/IDs/API digests match the reviewed final
+producer inventory and immutable Release. Public archive body downloads and their
+static payload verification are pending the next formal four-host App consumers;
+API equality and producer upload checks do not claim those downloads occurred. Their payload hashes, raw/parsed Go BuildInfo,
 module graph, source, tags and producer observations remain the original index
 facts. This source change does not claim a fresh App download, ELF execution,
 Mac signature observation, Rust pass, sealed execution or final-package runtime
 acceptance. Those must be collected by the existing actual native consumers.
 Earlier four-host success on fe182, a4d085 or another App commit does not transfer
-to 0cfa. Schema fixtures cannot be regenerated merely to obtain a pass.
+to bfcdf96. Schema fixtures cannot be regenerated merely to obtain a pass.
 
 ## Mobile and publication boundaries
 
-Mobile source-contract independently binds the same actual 0cfa source/tree/tag,
+Mobile source-contract independently binds the same actual bfcdf96 source/tree/tag,
 Go 1.27.0 directive, Go 1.27.2 toolchain, exact module hashes, the v3 source policy's
 ten reviewed vendor trees and libbox source/API declarations. Its raw SHA-256 is
-`3740b0fe0739ae8f811b2a2a3665cfb0d0dc0d7882ffaec796956fed7714e5b6`.
+`8acececd46ddbe2f12056a15b6009400044508f2c162781f86ef2b63fee01104`.
 Unknown output receipts remain null and acceptance flags remain false; neither
 a public desktop ELF nor a successful kernel SDK producer can fill them.
 
 The prior All producer's genuine 814 internal SDK artifacts remain historical
-814 evidence, not observations of the new 0cfa SDKs. They are not App formal
+814 evidence, not observations of the new bfcdf96 SDKs. They are not App formal
 `polaris-mobile-component-v1` inputs: Android artifacts are separate single-ABI
 AARs, Apple lacks the required iOS-arm64 simulator slice, and their empty BuildID
 and producer receipts do not satisfy the current App input-fingerprint binding.
@@ -190,3 +203,24 @@ asset-digest and promotion checks still execute. Native/device acceptance remain
 NotObserved, Exact/NoOwner Unknown and managed NotGranted. No new acceptance
 receipt or launch permission is introduced. Neither source eligibility, producer
 native smoke nor static verification invents final App/device acceptance.
+
+## Alpha.12.6 cleanup regression boundary
+
+Review the six existing controlled cases against the exact selected source/core hash.
+For full lifecycle final stop, the explicit-restart successor final stop in the
+hot-switch-failure case, and aggregate relay stop, retain raw stdout/stderr with
+owned PID/generation and the final-stop interval. Reject unexpected core cleanup
+errors, including fake-IP database-already-closed failures, in that interval; do not
+misattribute the earlier intentional SIGKILL or other injected-failure output.
+Process reap and App shutdown-fence evidence remain a separate layer. The current
+CLI prints resource snapshots only on Close error, so silence and exit0 are not a
+positive zero-failure core resource receipt. The kernel's actual CloseWithResult,
+resource-snapshot and database-reopen regression tests retain their own source/test
+identity; they are not substituted for a new App flow or device acceptance.
+
+The alpha.12.6 CLI explicitly binds the existing Tailscale child registrar before
+ordinary `run`/`check` construction. The reviewed constructor regression and
+source-bound tests do not establish real Mac startup recovery. The final new
+App package must contain this exact source/core, and real startup/stop remains
+a separate observation; the previous failing 311ce7 / 12.5 package is not rebuilt
+or relabeled as fixed.

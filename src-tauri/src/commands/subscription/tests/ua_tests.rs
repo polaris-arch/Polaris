@@ -352,3 +352,215 @@ fn effective_ua_default_and_persisted_override_matrix() {
         );
     }
 }
+
+#[test]
+fn ua_display_reports_actual_identity_and_shared_precedence_without_mutation() {
+    use super::super::describe_subscription_user_agent;
+    let actual_default = crate::runtime::http::app_user_agent();
+    let cfg = json!({ "subscriptionUserAgent": " global/2 " });
+    let unchanged = cfg.clone();
+    for draft in [
+        json!({}),
+        json!({"userAgent": ""}),
+        json!({"userAgent": "  "}),
+    ] {
+        let info = describe_subscription_user_agent(
+            Some(&cfg),
+            &draft,
+            "app-fixture",
+            "core-fixture",
+            actual_default.clone(),
+        )
+        .unwrap();
+        assert_eq!(info.default_user_agent, actual_default);
+        assert_eq!(info.fallback_user_agent.as_deref(), Some("global/2"));
+        assert_eq!(info.effective_user_agent.as_deref(), Some("global/2"));
+        assert_eq!(info.source, Some("global"));
+    }
+    for cfg in [json!({}), json!({"subscriptionUserAgent": "  "})] {
+        let info = describe_subscription_user_agent(
+            Some(&cfg),
+            &json!({"userAgent": ""}),
+            "app-fixture",
+            "core-fixture",
+            actual_default.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            info.effective_user_agent.as_deref(),
+            Some(actual_default.as_str())
+        );
+        assert_eq!(
+            info.fallback_user_agent.as_deref(),
+            Some(actual_default.as_str())
+        );
+        assert_eq!(info.source, Some("default"));
+    }
+    let info = describe_subscription_user_agent(
+        Some(&cfg),
+        &json!({"userAgent": " custom/3 "}),
+        "app-fixture",
+        "core-fixture",
+        actual_default.clone(),
+    )
+    .unwrap();
+    assert_eq!(info.default_user_agent, actual_default);
+    assert_eq!(info.effective_user_agent.as_deref(), Some("custom/3"));
+    assert_eq!(info.fallback_user_agent.as_deref(), Some("global/2"));
+    assert_eq!(info.source, Some("subscription"));
+    let wire = serde_json::to_value(&info).unwrap();
+    assert_eq!(wire["appVersion"], "app-fixture");
+    assert_eq!(wire["coreVersion"], "core-fixture");
+    assert_eq!(wire["defaultUserAgent"], actual_default);
+    assert_eq!(wire["fallbackUserAgent"], "global/2");
+    assert_eq!(wire["effectiveUserAgent"], "custom/3");
+    assert_eq!(wire["source"], "subscription");
+    assert_eq!(wire["effectiveStatus"], "ready");
+    assert_eq!(
+        cfg, unchanged,
+        "read-only preview must never persist a default or override"
+    );
+}
+
+#[test]
+fn ua_display_rejects_unavailable_versions_even_when_override_exists() {
+    use super::super::describe_subscription_user_agent;
+    for (app, core, default) in [
+        ("", "core", "ua"),
+        ("app", "", "ua"),
+        ("app", "unknown", "ua"),
+        ("unknown", "core", "ua"),
+        ("app", " ", "ua"),
+        ("app", "core", ""),
+    ] {
+        let result = describe_subscription_user_agent(
+            Some(&json!({"subscriptionUserAgent":"global"})),
+            &json!({"userAgent":"custom"}),
+            app,
+            core,
+            default.to_owned(),
+        );
+        assert!(
+            result.is_err(),
+            "a custom UA cannot disguise unavailable build identity"
+        );
+    }
+}
+
+#[test]
+fn ua_display_command_reads_real_sources_without_fetch_or_write() {
+    let source = crate::test_support::crate_source("commands/subscription.rs");
+    let body = crate::commands::guard_scan::top_level_fn_body(
+        &source,
+        "pub async fn subscription_user_agent_info(",
+    );
+    for required in [
+        "state.config().try_with_saved_commit(|cfg|",
+        "env!(\"CARGO_PKG_VERSION\")",
+        "crate::runtime::core_version::selected_bundled_version()",
+        "crate::runtime::http::app_user_agent()",
+        "describe_subscription_user_agent(",
+        "ApiResponse::err_with_code",
+        "subscriptionUserAgentUnavailable",
+        "Err(_) => ApiResponse::ok(build_info)",
+    ] {
+        assert!(
+            body.contains(required),
+            "missing authoritative read: {required}"
+        );
+    }
+    let fence = body.find("try_with_saved_commit").unwrap();
+    assert!(body.find("selected_bundled_version()").unwrap() < fence);
+    assert!(body.find("app_user_agent()").unwrap() < fence);
+    for forbidden in [
+        "load_full",
+        ".current()",
+        "save_full",
+        "fetch_parse_resolve",
+        "preview_core",
+        "proxy.start",
+        "unwrap_or_default",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "read-only identity must not fetch, write or hide errors: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn ua_display_saved_projection_is_cold_busy_safe_and_never_loads_or_writes() {
+    use super::super::describe_subscription_user_agent;
+    use crate::runtime::config::ConfigManager;
+    use crate::test_support::TestDir;
+    let directory = TestDir::new("polaris-ua-display-read-only-");
+    let manager = ConfigManager::new(directory.clone());
+    let called = std::cell::Cell::new(false);
+    let project = |cfg: &serde_json::Value| {
+        called.set(true);
+        describe_subscription_user_agent(
+            Some(cfg),
+            &json!({"userAgent":"custom/fixture"}),
+            "app-fixture",
+            "core-fixture",
+            "opaque/default".to_owned(),
+        )
+    };
+    let unavailable = || {
+        describe_subscription_user_agent(
+            None,
+            &json!({"userAgent":"custom/fixture"}),
+            "app-fixture",
+            "core-fixture",
+            "opaque/default".to_owned(),
+        )
+    };
+    let assert_build_only = |info: super::super::SubscriptionUserAgentInfo| {
+        assert_eq!(info.app_version, "app-fixture");
+        assert_eq!(info.core_version, "core-fixture");
+        assert_eq!(info.default_user_agent, "opaque/default");
+        assert_eq!(info.effective_status, "unavailable");
+        assert!(info.fallback_user_agent.is_none());
+        assert!(info.effective_user_agent.is_none());
+        assert!(info.source.is_none());
+        let wire = serde_json::to_value(info).unwrap();
+        assert!(wire["effectiveUserAgent"].is_null());
+        assert!(wire["fallbackUserAgent"].is_null());
+    };
+    let cold = manager
+        .try_with_saved_commit(project)
+        .unwrap_or_else(|_| unavailable())
+        .unwrap();
+    assert_build_only(cold);
+    assert!(
+        !called.get(),
+        "cold config must not evaluate the UA projection"
+    );
+    assert!(
+        !directory.join("config.json").exists(),
+        "UA read must not initialize or migrate config"
+    );
+    // Only fixture setup warms the real manager; the production read never does this.
+    manager.current().unwrap();
+    let before = std::fs::read(directory.join("config.json")).unwrap();
+    let writer = manager.hold_write_lock_for_test();
+    let busy = manager
+        .try_with_saved_commit(project)
+        .unwrap_or_else(|_| unavailable())
+        .unwrap();
+    assert_build_only(busy);
+    assert!(
+        !called.get(),
+        "busy writer must not evaluate the UA projection"
+    );
+    drop(writer);
+    let info = manager.try_with_saved_commit(project).unwrap().unwrap();
+    assert!(called.get());
+    assert_eq!(info.default_user_agent, "opaque/default");
+    assert_eq!(info.effective_status, "ready");
+    assert_eq!(info.effective_user_agent.as_deref(), Some("custom/fixture"));
+    assert_eq!(
+        std::fs::read(directory.join("config.json")).unwrap(),
+        before
+    );
+}

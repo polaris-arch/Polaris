@@ -45,7 +45,7 @@ def launch(mode='existing-session'):
              'driver': {'pid': 20, 'startTime': '1234'}, 'guiHome': '/tmp/qa/home',
              'helperScriptDir': '/tmp/qa/home/config/polaris', 'runtimePath': '/tmp/qa/home/config/polaris/singbox-runtime.json',
              'appSha256': H, 'helperSha256': H, 'coreSha256': H, 'carrierSha256': H,
-             'kernelCommit': '0cfa24573ff34c26608151068334329268cfdf14', 'originalAdmission': 'verified',
+             'kernelCommit': 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e', 'originalAdmission': 'verified',
              'vmContext': {'githubHosted': True, 'dedicatedVM': True}, 'materialsDownloaded': True,
              'codeHashes': dict.fromkeys(m.FILES, H), 'authenticationMode': mode, 'execution': execution,
              'authorization': None, 'rpcProbePath': '/tmp/admitted-test-probe', 'rpcProbeSha256': H}
@@ -150,11 +150,12 @@ class LaunchTests(unittest.TestCase):
             with self.assertRaises(ValueError): m.validate_launch(v)
     def test_wrong_kernel_denied(self):
         self.assertEqual(launch()['kernelCommit'], vm_tun.KERNEL_COMMIT)
-        for commit in ('c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
+        for commit in ('0cfa24573ff34c26608151068334329268cfdf14',
+                       'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
                        '814da362838e96e54f904836a92c2b0d8c3ae29b'):
             with self.subTest(commit=commit):
                 v = launch(); v['kernelCommit'] = commit; before = copy.deepcopy(v)
-                with self.assertRaisesRegex(ValueError, 'complete reviewed alpha.12.4 carrier admission required'):
+                with self.assertRaisesRegex(ValueError, 'complete reviewed alpha.12.6 carrier admission required'):
                     m.validate_launch(v)
                 self.assertEqual(v, before)
     def test_boolean_authority_denied(self):

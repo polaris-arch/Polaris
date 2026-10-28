@@ -1691,7 +1691,7 @@ jobs:
           const statusPath = `${directory}/runtime-status.txt`;
           const statuses = existsSync(statusPath) ? readFileSync(statusPath, 'utf8').split('\n') : [];
           const tests = proxyTests.map((name) => {
-            const log = `${directory}/${name.split('::').at(-1)}.log`;
+            const log = `${directory}/${name.split('::').at(-1)}.stdout.log`;
             const exactPass = existsSync(log) && readFileSync(log, 'utf8').includes('test result: ok. 1 passed; 0 failed; 0 ignored;');
             const passed = statuses.includes(`${name}: passed`) && exactPass;
             return { name, state: passed ? 'passed' : statuses.includes(`${name}: started`) ? 'failed-or-incomplete' : 'unexecuted', log };

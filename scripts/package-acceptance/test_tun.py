@@ -164,7 +164,7 @@ class AllTableObservationTests(unittest.TestCase):
 
 class PreflightTests(unittest.TestCase):
     def test_complete_is_preparation_not_pass(self):
-        self.assertEqual(tun.KERNEL_COMMIT, '0cfa24573ff34c26608151068334329268cfdf14')
+        self.assertEqual(tun.KERNEL_COMMIT, 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e')
         result = tun.preflight(good_facts(), carrier(), True)
         self.assertEqual(result['status'], 'READY_FOR_LOCAL_PREPARATION')
         self.assertFalse(result['publicationEligible'])
@@ -174,7 +174,8 @@ class PreflightTests(unittest.TestCase):
         self.assertIn('reviewedFormalCarrierAdmission', result['blocked'])
         self.assertIn('realPkexecAuthenticationPendingConfirmation', result['blocked'])
     def test_historical_kernel_cannot_admit_current_carrier(self):
-        for commit in ('c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
+        for commit in ('0cfa24573ff34c26608151068334329268cfdf14',
+                       'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
                        '814da362838e96e54f904836a92c2b0d8c3ae29b', '8' * 40):
             with self.subTest(commit=commit):
                 c = carrier(); c['kernelCommit'] = commit; before = copy.deepcopy(c)
@@ -452,10 +453,11 @@ class FixtureAndCaptureTests(unittest.TestCase):
 class ReportTests(unittest.TestCase):
     def test_default_graph_requires_current_kernel_without_relabelling_history(self):
         evidence = {'dashboardEnabled': True, 'defaultSandbox': True, 'guiUid': 1001,
-                    'startedViaHelper': True, 'kernelCommit': '0cfa24573ff34c26608151068334329268cfdf14',
+                    'startedViaHelper': True, 'kernelCommit': 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e',
                     'originalEntry': True, 'stableDoubleRead': True, 'actualGraphSha256': H}
         tun.validate_case('default_graph', evidence)
-        for commit in ('c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
+        for commit in ('0cfa24573ff34c26608151068334329268cfdf14',
+                       'c6c0d8b3b83ab4d6e7b953dd2dbdb7efe6f8021a',
                        '814da362838e96e54f904836a92c2b0d8c3ae29b'):
             with self.subTest(commit=commit):
                 historical = dict(evidence, kernelCommit=commit); before = copy.deepcopy(historical)

@@ -1,12 +1,14 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { clearHelperInstallFeedback } from './helper-install-session';
 import { isValidElement, type ReactElement } from 'react';
 
-// Exercise real JSX event handlers and IPC envelopes with controlled hooks.
+// Exercise JSX handlers with controlled hooks and already-unwrapped API payloads.
+// Real SettingsPage + raw transport envelopes are covered by the browser fixture.
 // This is the existing node harness pattern; it does not emulate a real UAC window.
 const h = vi.hoisted(() => ({
   state: [] as unknown[], refs: [] as Array<{ current: unknown }>,
-  stateIndex: 0, refIndex: 0, effect: null as null | (() => void),
-  refresh: null as null | (() => void),
+  stateIndex: 0, refIndex: 0, effect: null as null | (() => (() => void)),
+  refresh: null as null | (() => void), cleanup: null as null | (() => void),
 }));
 vi.mock('react', async (original) => ({
   ...await original<typeof import('react')>(),
@@ -19,7 +21,7 @@ vi.mock('react', async (original) => ({
     const i = h.refIndex++;
     return h.refs[i] ?? (h.refs[i] = { current: initial });
   },
-  useEffect: (effect: () => void) => { h.effect ??= effect; },
+  useEffect: (effect: () => (() => void)) => { h.effect ??= effect; },
 }));
 vi.mock('react-i18next', async (importOriginal) => ({
   ...await importOriginal<typeof import('react-i18next')>(), useTranslation: () => ({ t: (key: string) => key }) }));
@@ -58,10 +60,10 @@ function click(label: string) {
 }
 async function mounted(status = installed) {
   vi.mocked(helperApi.getStatus).mockResolvedValue(status as never);
-  render(); h.effect!();
+  render(); h.cleanup = h.effect!();
   await vi.waitFor(() => expect(h.state[1]).toBe(status.installed ? 'installed' : 'none'));
 }
-beforeEach(() => { h.state = []; h.refs = []; h.effect = h.refresh = null; vi.clearAllMocks(); });
+beforeEach(() => { h.state = []; h.refs = []; h.effect = h.refresh = null; clearHelperInstallFeedback(); vi.clearAllMocks(); });
 it('partial plus installed:false preserves helper-only cleanup retry through status refresh and success', async () => {
   await mounted();
   vi.mocked(helperApi.uninstall).mockResolvedValueOnce({ success: false, errorCode: 'partialCleanup', status: absent } as never);
@@ -103,6 +105,8 @@ it.each([
   ['needs-btm', { ...installed, backgroundDisabled: true }],
 ] as const)('failed install in %s exposes exactly one status-only recovery action', async (expectedState, resultStatus) => {
   await mounted(absent);
+  // The terminal subscriber now performs an authoritative, read-only refresh.
+  vi.mocked(helperApi.getStatus).mockResolvedValue(resultStatus as never);
   vi.mocked(helperApi.install).mockResolvedValueOnce({ success: false, errorCode: 'installerFailed', status: resultStatus } as never);
   click('helper.installAction');
   await vi.waitFor(() => expect(h.state[3]).toBe('installerFailed'));
@@ -131,3 +135,5 @@ it('failed status recovery retains the install cause and never retries installat
   expect(helperApi.install).toHaveBeenCalledTimes(1);
   expect(helperApi.uninstall).not.toHaveBeenCalled();
 });
+
+afterEach(() => { h.cleanup?.(); h.cleanup = null; clearHelperInstallFeedback(); });

@@ -185,10 +185,11 @@ test('raw BuildInfo survives admission or parse failure with exact bytes, hash a
 });
 test('exact four real tests require one executed pass, no skip or uncertain cleanup', () => {
   assert.equal(TESTS.length, 4); assert.equal(new Set(TESTS).size, 4);
-  const value = { status: 0, output: 'test result: ok. 1 passed; 0 failed; 0 ignored; 10 filtered out;' };
+  const value = { status: 0, stdout: 'test result: ok. 1 passed; 0 failed; 0 ignored; 10 filtered out;', stderr: '', output: 'diagnostic-only' };
   assert.equal(exactPass(value), true);
   for (const changed of [{ ...value, cleanupUncertain: true }, { ...value, status: 1 },
-    { ...value, output: 'test result: ok. 0 passed; 0 failed; 1 ignored;' }, { ...value, output: value.output + '\n' + value.output }])
+    { ...value, stdout: 'test result: ok. 0 passed; 0 failed; 1 ignored;' }, { ...value, stdout: value.stdout + '\n' + value.stdout },
+    { ...value, stdout: undefined, output: value.stdout }, { ...value, stdout: '', stderr: value.stdout }])
     assert.equal(exactPass(changed), false);
 });
 test('test evidence must prove attributed start, actual manifest and owned cleanup', () => {

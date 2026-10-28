@@ -12,16 +12,16 @@ next to this file as LICENSE.
    **the Android artifact is distributed as a whole under GPLv3**.
 
 以子进程 / 二进制资源形式集成的第三方组件（非源码链接）：
-  - 桌面 sing-box v1.15.0-polaris-alpha.12.4 (GPLv3) — https://github.com/polaris-arch/sing-box-polaris
+  - 桌面 sing-box v1.15.0-polaris-alpha.12.6 (GPLv3) — https://github.com/polaris-arch/sing-box-polaris
         上游基线源码：https://github.com/SagerNet/sing-box/tree/v1.15.0-alpha.12
-        桌面发布构建：1.15.0-polaris-alpha.12.4
-        固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/0cfa24573ff34c26608151068334329268cfdf14
-        源码 tree：412b1640c777831b1e8811b4c596cfb6df27fdb0
-        固定消费标签：https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.4
-        消费标签对象：9a309913a06c91263a344c12f8c39a8fc3fb2210
-        消费合同 SHA-256：96e8cc61d7abf345145b2af230724708f9a1baea77715467e38e96277ae0ffdf
-        受审原始 index SHA-256：10629e4d325de33124b496e1021f9d097710a497e632071c16f006c324f7afc4
-        桌面发布：https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12.4
+        桌面发布构建：1.15.0-polaris-alpha.12.6
+        固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/bfcdf96b244f63e0fe84736ee4a4edd58f6b209e
+        源码 tree：4c0fdb31d59967f41c808ea6b63f87ca9661c2cf
+        固定消费标签：https://github.com/polaris-arch/sing-box-polaris/tree/v1.15.0-polaris-alpha.12.6
+        消费标签对象：8a230c1d34cb4855b261944e2935ce36f9cd14de
+        消费合同 SHA-256：66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f
+        受审原始 index SHA-256：5ddcb1b623492bc555d7fcc0bc17798ea16200df21d2207cfd9a228ffc340caa
+        桌面发布：https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12.6
         Linux SO / Windows DLL 随核同包；macOS 静态链接，无独立 sidecar。
         原 producer/native smoke 证据不代表 App 运行、最终载体或签名信任验收。
   - Android libbox 基线 v1.15.0-alpha.8 (GPLv3) — https://github.com/SagerNet/sing-box
@@ -43,8 +43,8 @@ next to this file as LICENSE.
 原始同批 index 保存在 `scripts/desktop-core/release-asset-index.json`，内容与原 producer 原件 hash 一致。
 `sourceArchive` 指向固定 commit 的 GitHub 自动源码归档，按实际传输 hash 与完整 Git tree 核验。
 原 producer 自定义 source tar 的身份单独保留，不把两种 gzip 字节当作相同文件。
-Android/iOS 源码输入固定 0cfa24573ff34c26608151068334329268cfdf14，
-正式 annotated tag object 为 9a309913a06c91263a344c12f8c39a8fc3fb2210；
+Android/iOS 源码输入固定 bfcdf96b244f63e0fe84736ee4a4edd58f6b209e，
+正式 annotated tag object 为 8a230c1d34cb4855b261944e2935ce36f9cd14de；
 新 AAR/XCFramework 的 App producer/ABI/SDK 收据仍待独立生成与核验。
 上述移动旧基线仅为历史对应源码记录，不证明新移动产物或设备验收。
 版本、来源及摘要由 `scripts/verify-packaging.mjs confs` 按各组件独立核验。
@@ -110,11 +110,11 @@ you MIT; taking the Android artifact gives you GPLv3.
 
 ════ 对应源码 / Corresponding Source ════
 
-桌面固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/0cfa24573ff34c26608151068334329268cfdf14
-桌面固定发布：https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12.4
-完整对应源码：https://github.com/polaris-arch/sing-box-polaris/archive/0cfa24573ff34c26608151068334329268cfdf14.tar.gz
-实际传输 SHA-256：47447ab8665433752d1144a7ee23ae07f81cbb885191378173c26100263c2683
-源码 Git tree：412b1640c777831b1e8811b4c596cfb6df27fdb0
+桌面固定源码：https://github.com/polaris-arch/sing-box-polaris/tree/bfcdf96b244f63e0fe84736ee4a4edd58f6b209e
+桌面固定发布：https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12.6
+完整对应源码：https://github.com/polaris-arch/sing-box-polaris/archive/bfcdf96b244f63e0fe84736ee4a4edd58f6b209e.tar.gz
+实际传输 SHA-256：70d0bed894f62b557a37c5f3a9211ced21807e135f144138189663ff2fc73566
+源码 Git tree：4c0fdb31d59967f41c808ea6b63f87ca9661c2cf
 原始 index、Go 模块与替换目录、Cronet 来源和逐文件 legal 内容随受审合同固定。
 安装载体保留这些原始说明和固定源码原包；源码、逐叶和 legal 检查不依赖额外公开 index/source 资产。
 
@@ -128,10 +128,10 @@ Android/Apple 旧基线、补丁及构建说明分别保留在 scripts/libbox-pa
 当前移动输入、工具与 ABI 规则见 scripts/mobile-core/source-contract.json；桌面包不能代替移动收据。
 对 Android 产物，完整对应源码还包括 Polaris 自身：https://github.com/polaris-arch/Polaris
 
-Desktop release: 1.15.0-polaris-alpha.12.4 — https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12.4
-Desktop source: https://github.com/polaris-arch/sing-box-polaris/tree/0cfa24573ff34c26608151068334329268cfdf14
-Desktop release contract: scripts/desktop-core/release-contract.json (SHA-256 96e8cc61d7abf345145b2af230724708f9a1baea77715467e38e96277ae0ffdf)
-Committed original index SHA-256: 10629e4d325de33124b496e1021f9d097710a497e632071c16f006c324f7afc4
+Desktop release: 1.15.0-polaris-alpha.12.6 — https://github.com/polaris-arch/sing-box-polaris/releases/tag/v1.15.0-polaris-alpha.12.6
+Desktop source: https://github.com/polaris-arch/sing-box-polaris/tree/bfcdf96b244f63e0fe84736ee4a4edd58f6b209e
+Desktop release contract: scripts/desktop-core/release-contract.json (SHA-256 66894ed01e8fb8f40b90e11427c0041fec3dc1e69be4439cd9ac0dbc8c849e5f)
+Committed original index SHA-256: 5ddcb1b623492bc555d7fcc0bc17798ea16200df21d2207cfd9a228ffc340caa
 Desktop selection uses src-tauri/core-manifest.json desktopRelease.
 The committed original index retains the producer archive identity; sourceArchive pins the independently verified fixed-commit GitHub source archive,
 including its actual transport SHA-256 and complete Git tree. Original legal files,

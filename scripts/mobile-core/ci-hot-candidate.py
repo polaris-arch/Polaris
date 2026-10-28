@@ -30,8 +30,8 @@ REF = 'refs/heads/hot/app-runtime-consumer-20261020'
 WORKFLOW_REF = APP_REPOSITORY + '/.github/workflows/android.yml@' + REF
 KERNEL_REPOSITORY = 'polaris-arch/sing-box-polaris'
 KERNEL_REPOSITORY_ID = 1421657509
-KERNEL_COMMIT = '0cfa24573ff34c26608151068334329268cfdf14'
-KERNEL_TREE = '412b1640c777831b1e8811b4c596cfb6df27fdb0'
+KERNEL_COMMIT = 'bfcdf96b244f63e0fe84736ee4a4edd58f6b209e'
+KERNEL_TREE = '4c0fdb31d59967f41c808ea6b63f87ca9661c2cf'
 PROTO = 'b6bb4642d1081f238e5b4f3563b7ddab8e5a1d66b65a306fbd215153164fac5f'
 SOURCE_HASHES = {
     'go.mod': 'd16c533c97de535cf38985a62a78993c1b755a8f723a78ea8a0d75d585d7201d',
@@ -69,7 +69,7 @@ UNIT_TEST_BUILD = ['bash', 'src-tauri/gen/android/gradlew', '--project-dir', 'sr
                    *[arg for name in UNIT_TEST_CLASSES for arg in ('--tests', 'com.polaris2.app.vpn.' + name)],
                    '-x', ':app:rustBuildArm64Debug', '--rerun-tasks', '--max-workers=2', '--no-daemon']
 
-FORMAL_HASH = '3740b0fe0739ae8f811b2a2a3665cfb0d0dc0d7882ffaec796956fed7714e5b6'
+FORMAL_HASH = '8acececd46ddbe2f12056a15b6009400044508f2c162781f86ef2b63fee01104'
 OVERRIDES = set(('GOFLAGS GOENV GOWORK GOTOOLCHAIN GOOS GOARCH GOARM GOARM64 GOEXPERIMENT '
                  'GOBIN GOMODCACHE GOCACHE GONOSUMDB GOPRIVATE GONOPROXY GOPROXY GOSUMDB GOINSECURE CC CXX CPP AR LD CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH '
                  'LIBRARY_PATH COMPILER_PATH GCC_EXEC_PREFIX JAVA_TOOL_OPTIONS _JAVA_OPTIONS '

@@ -658,7 +658,9 @@ async function run() {
       const observed = await executeCommand({ id: name.split('::').at(-1), program: selected.executable,
         args: [name, '--exact', '--nocapture', '--test-threads=1'] },
       { root: dirname(selected.manifest), env: testEnv, directory: evidence, timeout: 5 * 60_000 });
-      result.admissionTests.push({ name, passed: exactPass(observed), logSha256: observed.logSha256, logBytes: observed.logBytes });
+      result.admissionTests.push({ name, passed: exactPass(observed), logSha256: observed.logSha256, logBytes: observed.logBytes,
+        stdoutSha256: observed.stdoutSha256, stdoutBytes: observed.stdoutBytes,
+        stderrSha256: observed.stderrSha256, stderrBytes: observed.stderrBytes });
       verifyInput();
       demand(pinCore(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
         'Admitted executable changed during admission test');
@@ -672,7 +674,9 @@ async function run() {
       const observed = await executeCommand({ id: name.split('::').at(-1), program: selected.executable,
         args: [name, '--exact', '--ignored', '--nocapture', '--test-threads=1'] },
       { root: dirname(selected.manifest), env: testEnv, directory: evidence, timeout: 5 * 60_000 });
-      result.tests.push({ name, passed: exactPass(observed), logSha256: observed.logSha256, logBytes: observed.logBytes });
+      result.tests.push({ name, passed: exactPass(observed), logSha256: observed.logSha256, logBytes: observed.logBytes,
+        stdoutSha256: observed.stdoutSha256, stdoutBytes: observed.stdoutBytes,
+        stderrSha256: observed.stderrSha256, stderrBytes: observed.stderrBytes });
       verifyInput();
       demand(pinCore(binary).sha256 === receipt.binary.sha256 && filePin(selected.executable).sha256 === selected.sha256,
         'Admitted executable changed during test');

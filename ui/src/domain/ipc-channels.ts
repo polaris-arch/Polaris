@@ -107,6 +107,7 @@ export const IPC_CHANNELS = {
   TAILDROP_SAVE: 'taildrop_save', // 取件：开原生保存框 + 写盘
 
   // 订阅管理
+  SUBSCRIPTION_USER_AGENT_INFO: 'subscription_user_agent_info', // read-only backend UA identity + current precedence
   SUBSCRIPTION_UPDATE: 'subscription_update',
   SUBSCRIPTION_DELETE: 'subscription_delete',
   SUBSCRIPTION_UPDATE_SERVERS: 'subscription_update_servers',

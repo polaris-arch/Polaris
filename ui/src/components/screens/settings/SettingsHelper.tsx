@@ -23,6 +23,7 @@ import { useConfirmTwice } from '@/lib/confirm-twice';
 import { helperActionErrorText } from '@/domain/action-error-text';
 import { useDialogStore } from '@/components/dialogs/dialog-store';
 import { shellPlatformFromDataOs } from './settings-logic';
+import { beginHelperInstall, clearHelperInstallFeedback, completeHelperInstall, helperInstallSnapshot, subscribeHelperInstall } from './helper-install-session';
 
 /** 本页唯一的原地二次确认项（原型 :4234 `helper-uninstall`）。 */
 const UNINSTALL_KEY = 'helper-uninstall';
@@ -63,8 +64,8 @@ export default function SettingsHelper() {
   const { t } = useTranslation();
   const [status, setStatus] = useState<HelperStatus | null>(null);
   const [state, setState] = useState<HelperState>('checking');
-  const [busy, setBusy] = useState(false);
-  const [installFailure, setInstallFailure] = useState<HelperActionErrorCode | null>(null);
+  const [busy, setBusy] = useState(helperInstallSnapshot().busy);
+  const [installFailure, setInstallFailure] = useState<HelperActionErrorCode | null>(helperInstallSnapshot().failure);
   const cleanupPending = useRef(false);
   const installInFlight = useRef(false);
   const migrationConfirmation = useRef<string | null>(null);
@@ -72,28 +73,35 @@ export default function SettingsHelper() {
   const confirmingUninstall = armed === UNINSTALL_KEY;
 
   useEffect(() => {
-    void helperApi
-      .getStatus()
-      .then((s) => {
+    let alive = true;
+    let readGeneration = 0;
+    let wasInstalling = false;
+    const readStatus = (force = false) => {
+      const generation = ++readGeneration;
+      void helperApi.getStatus(force).then((s) => {
+        if (!alive || generation !== readGeneration) return;
         setStatus(s);
         setState(deriveState(s, cleanupPending.current));
-      })
-      // 失败时停在 'checking'（不谎报成 unsupported/none）——该态自带「重新检测」按钮，是可恢复的
-      // 死角而非死路。挂载即弹 toast 会在后端未就绪的正常启动窗口里制造噪音，故只记 console。
-      .catch((err) => console.error('[SettingsHelper] getStatus failed:', err));
-
-    const off = helperApi.onUpgradeable(() => {
-      // .catch 不可省：事件回调里的 promise 无人接管，抛出即未捕获 rejection。刷新失败只意味着
-      // 卡片停在旧状态（用户可点「重新检测」），不值得打断，故静默。
-      void helperApi
-        .getStatus()
-        .then((s) => {
-          setStatus(s);
-          setState(deriveState(s, cleanupPending.current));
-        })
-        .catch(() => undefined);
+      }).catch((err) => {
+        if (alive && generation === readGeneration) console.error('[SettingsHelper] getStatus failed:', err);
+      });
+    };
+    const offInstall = subscribeHelperInstall(({ busy: installing, failure }) => {
+      const settled = wasInstalling && !installing;
+      wasInstalling = installing;
+      setBusy(installing);
+      setInstallFailure(failure);
+      // The request may have started in a now-unmounted page. Read current status
+      // for this surviving page; never infer ready from success or retain diagnostics.
+      if (settled) readStatus(true);
     });
+    // Failure stays checking, not a fabricated unsupported/absent status.
+    readStatus();
+    const off = helperApi.onUpgradeable(() => readStatus());
     return () => {
+      alive = false;
+      readGeneration++;
+      offInstall();
       off();
       if (migrationConfirmation.current) {
         useDialogStore.getState().closeInstance(migrationConfirmation.current);
@@ -118,37 +126,37 @@ export default function SettingsHelper() {
 
   async function runInstall(mode?: HelperInstallMode) {
     if (installInFlight.current) return;
+    const request = beginHelperInstall();
+    if (request === null) return;
     installInFlight.current = true;
     if (migrationConfirmation.current) {
       useDialogStore.getState().closeInstance(migrationConfirmation.current);
       migrationConfirmation.current = null;
     }
-    setBusy(true);
-    setInstallFailure(null);
+    let failure: HelperActionErrorCode | null = 'failed';
     try {
       const r = mode === undefined ? await helperApi.install() : await helperApi.install(mode);
+      failure = r.success ? null : r.errorCode ?? 'failed';
       if (r.success) cleanupPending.current = false;
       setStatus(r.status);
       setState(deriveState(r.status, cleanupPending.current));
       // W10：Rust 侧把所有失败（用户取消/脚本失败/二进制缺失）都装进 success:false 的 ok 应答——
       // 不在这里读出来，任何失败都是零反馈的「点击安装无反应」。信封不 reject，catch 永远等不到它。
       if (!r.success) {
-        setInstallFailure(r.errorCode ?? 'failed');
         toast.error(t('helper.installFail'), helperActionErrorText(r.errorCode, t));
       }
     } catch (err) {
       console.error('[SettingsHelper] install failed:', err);
-      setInstallFailure('failed');
       reportFailure(t('helper.installFail'));
     } finally {
       installInFlight.current = false;
-      setBusy(false);
+      completeHelperInstall(request, failure);
     }
   }
 
   // This is a separate explicit action. An ordinary install failure never selects it.
   function stopAndUpgrade() {
-    if (busy || installInFlight.current || shellPlatformFromDataOs() !== 'mac' || installFailure !== 'upgradeDeferred') return;
+    if (busy || installInFlight.current || helperInstallSnapshot().busy || shellPlatformFromDataOs() !== 'mac' || installFailure !== 'upgradeDeferred' || helperInstallSnapshot().failure !== 'upgradeDeferred') return;
     const dialogs = useDialogStore.getState();
     if (migrationConfirmation.current && dialogs.hasInstance(migrationConfirmation.current)) return;
     const instanceId = dialogs.open({
@@ -165,7 +173,7 @@ export default function SettingsHelper() {
           if (migrationConfirmation.current !== instanceId || !useDialogStore.getState().hasInstance(instanceId)) return;
           useDialogStore.getState().closeInstance(instanceId);
           migrationConfirmation.current = null;
-          if (shellPlatformFromDataOs() !== 'mac' || installInFlight.current) return;
+          if (shellPlatformFromDataOs() !== 'mac' || installInFlight.current || helperInstallSnapshot().busy || helperInstallSnapshot().failure !== 'upgradeDeferred') return;
           void runInstall('stopAndUpgrade');
         },
       },
@@ -186,7 +194,7 @@ export default function SettingsHelper() {
         setBusy(true);
         try {
           const r = await helperApi.uninstall();
-          if (r.success) cleanupPending.current = false;
+          if (r.success) { cleanupPending.current = false; clearHelperInstallFeedback(); }
           else if (r.errorCode === 'partialCleanup') cleanupPending.current = true;
           setStatus(r.status);
           setState(deriveState(r.status, cleanupPending.current));
@@ -199,7 +207,7 @@ export default function SettingsHelper() {
           console.error('[SettingsHelper] uninstall failed:', err);
           reportFailure(t('helper.uninstallFail'));
         } finally {
-          setBusy(false);
+          setBusy(helperInstallSnapshot().busy);
         }
       })();
     });
@@ -215,7 +223,7 @@ export default function SettingsHelper() {
       console.error('[SettingsHelper] recheck failed:', err);
       reportFailure(t('helper.statusCheckFail'));
     } finally {
-      setBusy(false);
+      setBusy(helperInstallSnapshot().busy);
     }
   }
 
@@ -233,6 +241,10 @@ export default function SettingsHelper() {
       // 剪贴板 API 不可用（非安全上下文）：静默兜底
     }
   }
+
+  // A typed deferral changes the existing primary action in place. It never
+  // retries ordinary install or selects migration without the explicit confirmation.
+  const migrationAvailable = shellPlatformFromDataOs() === 'mac' && installFailure === 'upgradeDeferred';
 
   // A disappeared SCM service does not prove the protected support tree is clean.
   // Keep the same explicit-confirmation cleanup action in both recovery and none
@@ -370,11 +382,11 @@ export default function SettingsHelper() {
                   <span>{t('helper.stepRegisterDaemon')}</span>
                 </div>
               </div>
-              <Button variant="flow" onClick={install} disabled={busy}>
+              <Button variant="flow" onClick={migrationAvailable ? stopAndUpgrade : install} disabled={busy}>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
                   <path d="M12 3v11M8 10l4 4 4-4" />
                 </svg>
-                <span>{t('helper.installAction')}</span>
+                <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : t('helper.installAction')}</span>
               </Button>
               {uninstallButton}
             </div>
@@ -408,11 +420,11 @@ export default function SettingsHelper() {
               </div>
               <div className="card-sub">{t('helper.upgradeDescCard')}</div>
               <div style={{ display: 'flex', gap: 9, marginTop: 14 }}>
-                <Button variant="flow" size="sm" onClick={install} disabled={busy}>
+                <Button variant="flow" size="sm" onClick={migrationAvailable ? stopAndUpgrade : install} disabled={busy}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
                     <path d="M12 3v11M8 10l4 4 4-4" />
                   </svg>
-                  <span>{t(status?.selectedCore?.state === 'absent' ? 'helper.installSelectedCoreAction' : 'helper.upgradeHelperAction')}</span>
+                  <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : status?.selectedCore?.state === 'absent' ? t('helper.installSelectedCoreAction') : t('helper.upgradeHelperAction')}</span>
                 </Button>
               </div>
             </div>
@@ -452,8 +464,8 @@ export default function SettingsHelper() {
               </div>
               <div className="card-sub">{t('helper.repairDesc')}</div>
               <div style={{ display: 'flex', gap: 9, marginTop: 14 }}>
-                <Button variant="flow" size="sm" onClick={install} disabled={busy}>
-                  <span>{t('helper.repairAction')}</span>
+                <Button variant="flow" size="sm" onClick={migrationAvailable ? stopAndUpgrade : install} disabled={busy}>
+                  <span>{migrationAvailable ? t('helper.stopAndUpgradeAction') : t('helper.repairAction')}</span>
                 </Button>
               </div>
             </div>

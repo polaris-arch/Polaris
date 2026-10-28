@@ -64,6 +64,7 @@ import {
   armFontsReadyRemeasure,
   armScreenChangeRemeasure,
   resetTrayHeightLock,
+  trayNaturalWindowHeight,
   trayReportedHeight,
 } from './tray-menu-height';
 import { flagCodeForName } from '@/components/screens/nodes/NdFlag';
@@ -212,6 +213,7 @@ export default function TrayMenu() {
   // 托盘直接读本 store —— 无需后端排序 command（纯渲染端视图偏好，同源 webview 天然共享）。
   const sortByLatency = useNodeSortStore((s) => s.sortByLatency);
   const menuRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   // 高度锁：**主视图最近一次量到的值胜**，节点视图的测量不进锁，因此折叠/展开只改变卡片内部滚动
   // 内容，不让外层菜单忽高忽低。判据与清锁时机在 `tray-menu-height.ts`。
   // 挡住「忽高忽低」的是下面那个 `view === 'main'` 条件，不是「只认第一次」—— 后者已去掉：它给锁
@@ -454,22 +456,21 @@ export default function TrayMenu() {
   // 锁的清空由上面三条腿负责（展开 / 屏幕换代 / 字体落定），`remeasureNonce` 是它们逼这里重跑的那条依赖。
   useLayoutEffect(() => {
     const report = () => {
-      // 不能只报 `rect.bottom`：初始宿主只有 420px，`.tray-menu` 又以 `100vh` 为 max-height，rect 已被
-      // viewport 截短；拿它回报会把窗锁死在 420px。自然高必须取 scrollHeight + 两条 border，再与实际
-      // rect 高取大；rect.top/底 margin 继续承接四个 tray edge 的外边距。这样长内容先把宿主拉到平台上限，
-      // 随后才在卡片内滚；短内容仍按自身高度收缩。
+      // 外卡片必须铺满宿主以保持节点视图高度，但它的 rect/scrollHeight 因此不能用作自然高：
+      // 内容缩短后两者仍至少是旧窗高。独立内层不受 viewport 夹限，初始 420px 能长、长→短也能缩；
+      // 外层继续承担滚动、边框、padding 与四边 margin，宿主平台夹限和非 main 高度锁均不变。
       const menu = menuRef.current;
-      let h = document.body.scrollHeight;
-      if (menu) {
-        const style = getComputedStyle(menu);
-        const rect = menu.getBoundingClientRect();
-        const borderHeight =
-          parseFloat(style.borderTopWidth || '0') + parseFloat(style.borderBottomWidth || '0');
-        const naturalMenuHeight = menu.scrollHeight + borderHeight;
-        const mb = parseFloat(style.marginBottom || '0');
-        h = rect.top + Math.max(rect.height, naturalMenuHeight) + mb;
-      }
-      const measuredHeight = Math.ceil(h);
+      const content = contentRef.current;
+      if (!menu || !content) return;
+      const style = getComputedStyle(menu);
+      const measuredHeight = trayNaturalWindowHeight(content.getBoundingClientRect().height, {
+        top: menu.getBoundingClientRect().top,
+        paddingTop: parseFloat(style.paddingTop || '0'),
+        paddingBottom: parseFloat(style.paddingBottom || '0'),
+        borderTop: parseFloat(style.borderTopWidth || '0'),
+        borderBottom: parseFloat(style.borderBottomWidth || '0'),
+        marginBottom: parseFloat(style.marginBottom || '0'),
+      });
       const fixedHeight = trayReportedHeight(
         fixedMenuHeightRef,
         measuredHeight,
@@ -480,6 +481,7 @@ export default function TrayMenu() {
     report();
     const ro = new ResizeObserver(report);
     if (menuRef.current) ro.observe(menuRef.current);
+    if (contentRef.current) ro.observe(contentRef.current);
     ro.observe(document.body);
     return () => ro.disconnect();
   }, [config, view, remeasureNonce]);
@@ -856,6 +858,7 @@ export default function TrayMenu() {
     <>
       <PolarisStarSprite />
       <div className="tray-menu" ref={menuRef} role="menu" tabIndex={-1}>
+        <div className="tray-menu-content" ref={contentRef}>
         {/* 状态卡：连接态 + 当前节点 + 出口 IP。
             A2：四态（连接 / 连接中 / 异常 / 未连接）与**原生托盘图标同一条优先级**折算
             （`trayStatusTone` ↔ Rust `resolve_tray_state`）。此前只有 ok/idle 二态，起核中与崩溃
@@ -1255,6 +1258,7 @@ export default function TrayMenu() {
             </button>
           </div>
         )}
+        </div>
       </div>
     </>
   );

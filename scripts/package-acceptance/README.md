@@ -149,7 +149,7 @@ JSON, HOME, random API secret and raw App stdout are **never uploaded**. Private
 originals disappear with the ephemeral workspace; this is not cross-VM original
 JSON archival. Screenshots show the native App, not a browser mock.
 
-The genuine alpha.12.4 formal contract is now bound. Fresh same-package App
+The genuine alpha.12.6 formal contract is now bound. Fresh same-package App
 1.0.0 carrier and packaged GUI/TUN acceptance remain pending. The gate follows the
 committed formal pin; historical source checks or successful carrier builds do
 not constitute runtime acceptance of those packages.
