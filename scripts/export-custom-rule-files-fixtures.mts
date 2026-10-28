@@ -8,7 +8,7 @@
  *       condMatcherFields（各 EXT type + 端口解析 + 域名剥通配符）。
  *
  * 用法：REF_REPO=<上游仓根> npx tsx <本仓>/scripts/export-custom-rule-files-fixtures.mts
- *       > /home/sway/Code/polaris/crates/config-engine/fixtures/custom-rule-files.json
+ *       > <本仓>/crates/config-engine/fixtures/custom-rule-files.json
  */
 // 上游仓路径由环境变量 `REF_REPO` 注入：静态 import 的路径必须是字面量，写死等于把某台机器的
 // 绝对路径钉进仓库。

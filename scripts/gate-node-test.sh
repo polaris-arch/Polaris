@@ -35,7 +35,9 @@ required_tests=(
   # 「移动端全部接线了没」这句话的退出码逻辑（scripts/wiring-verdict.mjs）的变异测试：
   # 它守的是「销账被报成门坏了」与「清零那天的提示是死循环、rc=0 到不了」这两条真缺陷。
   scripts/wiring-verdict.test.mjs
-  # PC 发布冻门的策略测试不能被删/改名后静默少跑。
+  # PC policy uses inert retired-name fixtures after the unsupported R producer lane
+  # was archived. Its current-graph and pre-artifact rejection tests stay mandatory;
+  # retiring the two old Python wrappers does not lower the 501-pass minimum.
   scripts/assert-pc-runtime-release.test.mjs
   # Desktop source graph predicates may not disappear from the host fixture gate.
   scripts/build-desktop-core.test.mjs

@@ -112,8 +112,13 @@ API gates consume exact selected resources and fail on missing binaries.
 Existing lifecycle/stats fixtures use the compiled default resolver without a
 kernel-path override, then the existing per-instance test spawn opt-in. The
 normal full test matrix is Linux amd64, Windows amd64 and macOS arm64; Intel
-macOS retains its native/package routes. See `native-dns-runtime-gaps.md` for
-platform-specific lifecycle coverage, including Windows boundaries.
+macOS retains its native/package routes. An ordinary test pass does not establish
+that ignored native lifecycle or recovery gates ran. Bind each selected native
+gate to the exact App candidate and compiled carrier, retain its individual log,
+and require its expected nonzero test count and passed result. Missing, skipped,
+interrupted or failed gates remain unverified. User-token, SYSTEM, service and
+managed-launch acceptance are separate scopes; direct lifecycle tests cannot
+establish them. Historical candidate observations do not certify later builds.
 
 Windows directory tests use the selected clean source's `release/LDFLAGS`,
 selected production tags/version and actual SourceRevision. This is explicitly

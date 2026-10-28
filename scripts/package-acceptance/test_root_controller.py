@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import tempfile
@@ -3163,17 +3164,31 @@ class AuthBoundedResampleTests(unittest.TestCase):
     def test_real_ordinary_exit_after_initial_stat_uses_strict_same_birth_evidence(self):
         with AuthLifecycleRealFamily() as f:
             f.o.scan();held=copy.deepcopy(f.o.durable_rows[m.birth(f.child_identity)])
-            real_read=Path.read_text;triggered=[]
-            def read_barrier(path,*args,**kwargs):
-                value=real_read(path,*args,**kwargs)
-                if path==Path('/proc',str(f.child),'stat') and not triggered:
-                    triggered.append(True);os.kill(f.child,signal.SIGTERM)
-                return value
-            f.o.stage='periodic'
-            with patch.object(Path,'read_text',read_barrier):value=f.o.capture_child(f.child_identity)
-            self.assertTrue(triggered);self.assertLessEqual(f.o.capture_attempts,3)
-            if value is None:self.assertIn(f.o.terminals[m.birth(held)]['state'],('zombie','absent'))
-            else:self.assertTrue(vm_tun.same_process(held,value))
+            fd=os.pidfd_open(f.child,0)
+            try:
+                self.assertTrue(vm_tun.same_process(held,vm_tun.process_identity(f.child)))
+                with self.assertRaises(vm_tun.TerminalIdentityError) as live:
+                    vm_tun.terminal_identity(held)
+                self.assertEqual(live.exception.probe,'terminal-live')
+                exited=select.poll();exited.register(fd,select.POLLIN)
+                real_read=Path.read_text;triggered=[]
+                def read_barrier(path,*args,**kwargs):
+                    value=real_read(path,*args,**kwargs)
+                    if path==Path('/proc',str(f.child),'stat') and not triggered:
+                        triggered.append(True);signal.pidfd_send_signal(fd,signal.SIGTERM)
+                        # Signal delivery is not exit. Pin this process until the
+                        # kernel reports exit; its parent deliberately has not reaped.
+                        self.assertEqual(exited.poll(2000),[(fd,select.POLLIN)])
+                        self.assertEqual(vm_tun.terminal_identity(held)['state'],'zombie')
+                    return value
+                f.o.stage='periodic'
+                with patch.object(Path,'read_text',read_barrier):value=f.o.capture_child(f.child_identity)
+                self.assertTrue(triggered);self.assertIsNone(value)
+                self.assertEqual(f.o.capture_attempts,1);self.assertEqual(f.o.capture_probe,'exe-stat')
+                self.assertEqual(f.o.terminals[m.birth(held)],{
+                    'pid':held['pid'],'startTime':held['startTime'],'state':'zombie',
+                    'scope':'sampled-terminal-not-execution-identity'})
+            finally:os.close(fd)
             f.reap();self.assertEqual(vm_tun.terminal_identity(held)['state'],'absent')
 
 class LedgerBoundarySeparationTests(unittest.TestCase):

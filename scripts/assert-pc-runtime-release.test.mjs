@@ -97,6 +97,11 @@ function runPolicy(args = [], env = {}, policyScript = script) {
 const sourcePath = 'scripts/libbox-patches/source-manifest.json';
 const manifestPath = 'src-tauri/core-manifest.json';
 const source = JSON.parse(readFileSync(join(root, sourcePath)));
+// Deliberately inert bytes: policy depends on the retired names, not old implementation
+// or review transcripts. Matching hashes must not make these inputs admissible.
+const retiredOwnershipFixtures = new Map(OWNERSHIP_CHAIN_PATCHES.map((file) => [
+  `scripts/libbox-patches/${file}`, Buffer.from(`inert retired ownership input: ${file}\n`),
+]));
 const inputPaths = [manifestPath, sourcePath, 'scripts/core-source-provision.py',
   ...source.patches.map((patch) => `scripts/libbox-patches/${patch.file}`),
   ...source.dependencyPatches.map((dep) => `scripts/libbox-patches/${dep.patchFile}`),
@@ -175,9 +180,10 @@ test('ownership chain inputs are rejected by name, not as a digest drift', () =>
     const manifest = JSON.parse(inputs.get(manifestPath));
     manifest.sourceBuild.sourceManifestSha256 = sha(bytes);
     mutateManifest(manifest);
-    return fixtureRead(new Map([[sourcePath, bytes], [manifestPath, Buffer.from(JSON.stringify(manifest))]]));
+    return fixtureRead(new Map([...retiredOwnershipFixtures,
+      [sourcePath, bytes], [manifestPath, Buffer.from(JSON.stringify(manifest))]]));
   };
-  const patchBytes = (file) => readFileSync(join(root, 'scripts/libbox-patches', file));
+  const patchBytes = (file) => retiredOwnershipFixtures.get(`scripts/libbox-patches/${file}`);
   // Unchanged rebinding reaches the reviewed-input digest, so the helper is live.
   assert.throws(() => assertSourceFirstRelease(withSource((changed) => { changed.goVersion = '1.25.6'; })),
     /Source inputs differ from the reviewed release policy/);
@@ -186,7 +192,7 @@ test('ownership chain inputs are rejected by name, not as a digest drift', () =>
   assert.throws(() => assertSourceFirstRelease(withSource((changed) => {
     changed.patches.push({ file: 'tun-owner-consumer.patch', sha256: sha(patchBytes('tun-owner-consumer.patch')) });
   })), /Ownership chain policy: retired patch listed/);
-  // The retained files stay on disk; each name is refused in the ordered list.
+  // Every name is refused even when the synthetic bytes and listed digest agree.
   for (const file of OWNERSHIP_CHAIN_PATCHES) {
     assert.throws(() => assertSourceFirstRelease(withSource((changed) => {
       changed.patches.push({ file, sha256: sha(patchBytes(file)) });
@@ -226,6 +232,46 @@ test('ownership chain inputs are rejected by name, not as a digest drift', () =>
     const changed = accepted();
     mutate(changed);
     assert.throws(() => assertOwnershipChainAbsent(spec(), changed), /dependency patches must be empty/);
+  }
+});
+
+test('current committed mobile source graph retains the empty ownership policy', () => {
+  const manifest = JSON.parse(readFileSync(join(root, manifestPath)));
+  const currentSource = JSON.parse(readFileSync(join(root, sourcePath)));
+  assertOwnershipChainAbsent(manifest.sourceBuild, currentSource);
+  assert.deepEqual(currentSource.dependencyPatches, []);
+  assert.deepEqual(manifest.sourceBuild.dependencyModules, []);
+  assert.equal(manifest.sourceBuild.graphScope, 'core-source-only');
+  for (const platform of Object.values(manifest.sourceBuild.platforms)) {
+    assert.deepEqual(platform.patchedModules, { requiredLinked: [], allowedAbsent: [] });
+  }
+  for (const file of OWNERSHIP_CHAIN_PATCHES) {
+    const changed = structuredClone(currentSource);
+    changed.patches.push({ file, sha256: createHash('sha256')
+      .update(retiredOwnershipFixtures.get(`scripts/libbox-patches/${file}`)).digest('hex') });
+    assert.throws(() => assertOwnershipChainAbsent(manifest.sourceBuild, changed),
+      /Ownership chain policy: retired patch listed/, file);
+  }
+});
+
+test('retired ownership inputs reject before artifact reads with self-consistent synthetic hashes', () => {
+  const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
+  for (const file of OWNERSHIP_CHAIN_PATCHES) {
+    const artifactPath = `scripts/libbox-patches/${file}`;
+    const changed = JSON.parse(inputs.get(sourcePath));
+    changed.patches.push({ file, sha256: sha(retiredOwnershipFixtures.get(artifactPath)) });
+    const bytes = Buffer.from(JSON.stringify(changed));
+    const manifest = JSON.parse(inputs.get(manifestPath));
+    manifest.sourceBuild.sourceManifestSha256 = sha(bytes);
+    const read = fixtureRead(new Map([...retiredOwnershipFixtures,
+      [sourcePath, bytes], [manifestPath, Buffer.from(JSON.stringify(manifest))]]));
+    const observedReads = [];
+    assert.throws(() => assertSourceFirstRelease((path) => {
+      observedReads.push(path);
+      return read(path);
+    }), /Ownership chain policy: retired patch listed/, file);
+    assert.deepEqual(observedReads, [manifestPath, sourcePath],
+      'a forbidden name must be rejected before loading any artifact or reporting digest drift');
   }
 });
 
