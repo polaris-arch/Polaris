@@ -13,7 +13,7 @@ import { revealOnToggle } from '@/components/reveal';
 import { coreAdmissionIsDamage, coreAdmissionMessageKey } from '@/domain/core-admission';
 import type { HelperStatus } from '@/contracts/types/runtime';
 import type { CoreVersionInfo } from '@/contracts/types/update';
-import { Button, SetBlock, SetRow } from './Primitives';
+import { Button, SetBlock, SetRow, FeedbackNotice, Pill } from './Primitives';
 import CoreRecoveryActions from './CoreRecoveryActions';
 
 export interface CoreInfoCardProps {
@@ -50,16 +50,16 @@ export default function CoreInfoCard({ info, selectedCore, onRecovered, recovery
   }
   return (
     <SetBlock id="core-info-card" header={t('settings.update.coreCard')}>
-      {recoveryComplete && <p role="status" style={{ padding: '0 18px 16px' }}>{t('coreRecovery.restored')}</p>}
+      {recoveryComplete && <p role="status" className="core-card-note">{t('coreRecovery.restored')}</p>}
       {info?.admission?.state === 'rejected' && (
-        <div className="card-sub" role="status" data-core-admission={info.admission.kind} style={{ padding: '0 18px 16px' }}>
-          <p>{t(coreAdmissionMessageKey(info.admission.kind))}</p>
+        <div className="core-admission" data-core-admission={info.admission.kind}>
+          <FeedbackNotice tone={coreAdmissionIsDamage(info.admission.kind) ? 'error' : 'warning'} title={t(coreAdmissionMessageKey(info.admission.kind))} />
           {((coreAdmissionIsDamage(info.admission.kind) && info.admission.recovery === 'reinstallCurrentApp')
             || ['UnsupportedExactObject', 'UnsupportedCapability', 'LoaderPolicy'].includes(info.admission.kind ?? '')) && (
             <CoreRecoveryActions onRecovered={onRecovered} />
           )}
           {info.admission.kind === 'UnsupportedCapability' && (
-            <a href="#app-update-card">{t('settings.about.checkUpdate')}</a>
+            <a className="btn ghost sm" href="#app-update-card">{t('settings.about.checkUpdate')}</a>
           )}
         </div>
       )}
@@ -76,14 +76,15 @@ export default function CoreInfoCard({ info, selectedCore, onRecovered, recovery
       <SetRow label={t('helper.selectedCoreVersion')}>
         <span className="mono" data-core-info="selected-version">{selectedCore?.version || '—'}</span>
       </SetRow>
-      <SetRow label={t('helper.selectedCoreState')}>
-        <span data-core-info="installed-state">{observedState ? t(`helper.coreState.${observedState}`) : t('helper.checkUnknown')}</span>
+      <SetRow label={t('helper.selectedCoreState')} tip={t('helper.checkScope')}>
+        <Pill variant={observedState === 'present' ? 'ok' : observedState === 'invalid' ? 'err' : observedState ? 'warn' : 'default'}><span data-core-info="installed-state">
+          {observedState ? t(`helper.coreState.${observedState}`) : t('helper.checkUnknown')}
+        </span></Pill>
       </SetRow>
-      <div className="card-sub" style={{ padding: '0 18px 16px' }}>
-        <p>{t('helper.checkScope')}</p>
+      <div className="card-sub core-card-note">
         <details data-testid="core-diagnostics" onToggle={revealOnToggle}>
           <summary>{t('helper.coreDiagnosticsTitle')}</summary>
-          <dl style={{ overflowWrap: 'anywhere' }}>
+          <dl className="core-diagnostic-fields">
             <dt>{t('helper.selectedCoreId')}</dt>
             <dd className="mono" data-core-info="selected-id">{diagnostics?.selectedCore.id ?? t('helper.checkUnknown')}</dd>
             <dt>{t('helper.selectedCoreProvider')}</dt>

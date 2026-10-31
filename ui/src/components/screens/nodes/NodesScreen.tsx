@@ -272,7 +272,7 @@ export function NodesScreen() {
   const sortByLatency = useNodeSortStore((s) => s.sortByLatency);
   const setSortByLatency = useNodeSortStore((s) => s.setSortByLatency);
   // 其余档（默认/名称/协议）无跨端语义（托盘只认「按延迟」与否），留局部态——原型 st.nodeSort 亦不持久化。
-  const [nonLatencySortKey, setNonLatencySortKey] = useState<SortKey>('default');
+  const [nonLatencySortKey, setNonLatencySortKey] = useState<SortKey>('name');
   const sortKey: SortKey = sortByLatency ? 'lat' : nonLatencySortKey;
   const setSortKey = useCallback(
     (key: SortKey) => {
@@ -402,13 +402,52 @@ export function NodesScreen() {
   // 测速态。结果读**全局 store**、进度走**全局 toast**（两者订阅都在 App.tsx 顶层，切屏不丢）。
   // 本屏只留 `testing` 这一位灰态（按钮禁用），它是本屏控件的属性、天然是组件私有。
   // 勿把延迟改回 useState，也勿把进度订阅搬回来——那正是「切屏即丢」的来源。
-  const { visibleServers, renderedServers, gridRef } = useNodesRenderWindow({
+  const { visibleServers, renderedServers, gridRef, revealThrough } = useNodesRenderWindow({
     activeGroup,
     search,
     protoFilter,
     sortKey,
     activeTab,
   });
+
+  const [locateId, setLocateId] = useState<string | null>(null);
+  const highlighted = useRef<HTMLElement | null>(null);
+  const locateTarget = actualId;
+  const canLocateCurrent = !!locateTarget && servers.some(server => server.id === locateTarget);
+  function locateCurrent() {
+    if (!canLocateCurrent || !locateTarget) return;
+    if (highlighted.current) {
+      highlighted.current.classList.remove('node-located');
+      highlighted.current = null;
+    }
+    setSearch('');
+    setProtoFilter('');
+    setActiveTab(initialNodesTab(groups, locateTarget) ?? activeTab);
+    setLocateId(locateTarget);
+  }
+  useEffect(() => {
+    if (!locateId) return;
+    if (locateId !== locateTarget || search || protoFilter || !activeGroup?.servers.some(server => server.id === locateId)) {
+      setLocateId(null);
+      return;
+    }
+    const index = visibleServers.findIndex(server => server.id === locateId);
+    if (index < 0) return;
+    revealThrough(index);
+    const element = Array.from(gridRef.current?.querySelectorAll<HTMLElement>('[data-node-id]') ?? [])
+      .find(candidate => candidate.dataset.nodeId === locateId);
+    if (!element) return; // Commit after the existing batch exposes the target.
+    element.scrollIntoView({ block: 'center', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+    element.focus({ preventScroll: true });
+    element.classList.add('node-located');
+    highlighted.current = element;
+    setLocateId(null);
+  }, [locateId, locateTarget, search, protoFilter, activeGroup, visibleServers, renderedServers, revealThrough, gridRef]);
+  useEffect(() => () => {
+    if (highlighted.current) {
+      highlighted.current.classList.remove('node-located');
+    }
+  }, []);
 
   const protoOptions = useMemo(() => {
     if (!activeGroup) return [];
@@ -577,6 +616,8 @@ export function NodesScreen() {
         protoOptions={protoOptions}
         sortKey={sortKey}
         setSortKey={setSortKey}
+        locateCurrent={locateCurrent}
+        canLocateCurrent={canLocateCurrent}
         testVisible={testVisible}
         testing={testing}
         batchMode={batchMode}

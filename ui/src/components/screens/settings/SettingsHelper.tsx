@@ -67,6 +67,7 @@ export default function SettingsHelper() {
   // 步骤/说明/按钮等本页独有的句子本批新立键，五语种齐备。
   const { t } = useTranslation();
   const [status, setStatus] = useState<HelperStatus | null>(null);
+  const needsApplicationSupport = ['UnsupportedExactObject', 'UnsupportedCapability', 'LoaderPolicy'].includes(status?.selectedCore?.admission ?? '');
   const [state, setState] = useState<HelperState>('checking');
   const [busy, setBusy] = useState(helperInstallSnapshot().busy);
   const [installFailure, setInstallFailure] = useState<HelperActionErrorCode | null>(helperInstallSnapshot().failure);
@@ -368,14 +369,14 @@ export default function SettingsHelper() {
             </div>
           )}
           {state === 'admission-unavailable' && (
-            <div className="helper-state" data-s="admission-unavailable" role="status">
-              <p>{t(coreAdmissionMessageKey(status?.selectedCore?.admission))}</p>
-              {status?.selectedCore?.admission === 'UnsupportedCapability' && (
-                <Button variant="ghost" size="sm" onClick={() => useNavStore.getState().setSettingsScreen('update')}>
-                  <span>{t('settings.about.checkUpdate')}</span>
-                </Button>
-              )}
-              <Button variant="ghost" size="sm" onClick={recheck} disabled={busy}><span>{t('helper.recheck')}</span></Button>
+            <div className="helper-state" data-s="admission-unavailable">
+              <FeedbackNotice tone="warning" title={t(coreAdmissionMessageKey(status?.selectedCore?.admission))}
+                detail={needsApplicationSupport ? t('helper.coreAdmissionSupportHint') : undefined} actions={<>
+                  {needsApplicationSupport && <Button variant="ghost" size="sm" onClick={() => useNavStore.getState().setSettingsScreen('update')}>
+                    <span>{t('settings.about.checkUpdate')}</span>
+                  </Button>}
+                  <Button variant="ghost" size="sm" onClick={recheck} disabled={busy}><span>{t('helper.recheck')}</span></Button>
+                </>} />
             </div>
           )}
           {state === 'checking' && (

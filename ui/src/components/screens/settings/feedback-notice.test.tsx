@@ -42,6 +42,13 @@ describe('persistent feedback uses real settings primitives', () => {
     expect(html).not.toContain('data-tip');
     expect(html).toContain('长原因'.repeat(80));
   });
+  it('shares the notice and action layout while distinguishing a warning from an error', () => {
+    const html = renderToStaticMarkup(<FeedbackNotice tone="warning" title="Unsupported" actions={<Button>Update</Button>} />);
+    expect(html).toContain('feedback-notice warning');
+    expect(html).toContain('feedback-notice-actions');
+    expect(html).toContain('role="status"');
+    expect(renderToStaticMarkup(<FeedbackNotice title="Error" />)).not.toContain('feedback-notice warning');
+  });
   it('a busy original action stays disabled on the actual button', () => {
     const html = renderToStaticMarkup(<FeedbackNotice title="Failed" actions={<Button disabled onClick={() => {}}>Retry</Button>} />);
     expect(html).toMatch(/<button[^>]*disabled/);

@@ -143,7 +143,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { dirname, join, relative, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { afterAll } from 'vitest';
+import { afterAll, onTestFinished, TestRunner } from 'vitest';
 import postcss, { type AcceptedPlugin } from 'postcss';
 import tailwindcss from '@tailwindcss/postcss';
 import autoprefixer from 'autoprefixer';
@@ -506,11 +506,100 @@ interface Conn {
   child: ChildProcess;
   ws: WebSocket;
   dir: string;
+  cancelPending: (reason: Error) => void;
   send: (method: string, params?: Record<string, unknown>, sessionId?: string) => Promise<Record<string, unknown>>;
 }
 
 let CONN: Conn | null = null;
 let OPENING: Promise<Conn> | null = null;
+let OPENING_ABORT: AbortController | null = null;
+const ACTIVE_MEASURES = new Set<AbortController>();
+let CLOSING: Promise<void> | null = null;
+let FINALIZED = false;
+
+// Endpoint and reconnect limits already existed. Bound the missing handshake,
+// requests and whole measurement too; teardown has its own single total budget.
+export const ORACLE_TIMING = {
+  endpointMs: 30_000, handshakeMs: 10_000, requestMs: 10_000,
+  measureMs: 60_000, cleanupMs: 15_000,
+} as const;
+export const ORACLE_READY_TIMEOUT_MS =
+  ORACLE_TIMING.measureMs + ORACLE_TIMING.requestMs + ORACLE_TIMING.cleanupMs + 1_000;
+
+function withOracleAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    void work.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+export function openOracleSocket(ws: WebSocket, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      ws.onopen = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      if (error) {
+        try { ws.close(); } catch { /* already closed */ }
+        reject(error);
+      } else resolve();
+    };
+    const abort = () => finish(signal.reason as Error);
+    const timer = setTimeout(() => finish(new Error('CDP 握手超时')), ORACLE_TIMING.handshakeMs);
+    ws.onopen = () => finish();
+    ws.onerror = () => finish(new Error('CDP 握手失败'));
+    ws.onclose = () => finish(new Error('CDP 握手期间已断开'));
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
+export function oracleTransport(ws: WebSocket, onTimeout?: (error: Error) => void): Pick<Conn, 'send' | 'cancelPending'> {
+  let nextId = 0;
+  const pending = new Map<number, {
+    resolve: (value: Record<string, unknown>) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+  const cancelPending = (reason: Error) => {
+    for (const slot of pending.values()) { clearTimeout(slot.timer); slot.reject(reason); }
+    pending.clear();
+  };
+  ws.onmessage = (event: MessageEvent) => {
+    let message: { id?: number; error?: unknown; result?: Record<string, unknown> };
+    try { message = JSON.parse(String(event.data)); }
+    catch { cancelPending(new Error('CDP 响应无效')); return; }
+    if (message.id === undefined) return;
+    const slot = pending.get(message.id);
+    if (!slot) return;
+    pending.delete(message.id);
+    clearTimeout(slot.timer);
+    if (message.error !== undefined) slot.reject(new Error(`CDP error: ${JSON.stringify(message.error)}`));
+    else slot.resolve(message.result ?? {});
+  };
+  ws.onclose = () => cancelPending(new Error('CDP 连接已断开'));
+  ws.onerror = () => cancelPending(new Error('CDP 连接失败'));
+  const send: Conn['send'] = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+    const id = ++nextId;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      const error = new Error(`CDP 请求超时： ${method}`);
+      reject(error);
+      onTimeout?.(error);
+    }, ORACLE_TIMING.requestMs);
+    pending.set(id, { resolve, reject, timer });
+    try { ws.send(JSON.stringify({ id, method, params, ...(sessionId === undefined ? {} : { sessionId }) })); }
+    catch (error) { clearTimeout(timer); pending.delete(id); reject(error); }
+  });
+  return { send, cancelPending };
+}
 
 /**
  * **在途的 `measure`**。收尾必须把它们等回来，否则「浏览器在收尾之后才起来」这一档没人管。
@@ -743,7 +832,9 @@ export async function waitGone(
  * 就抛了」这一档（端口文件半截、握手失败、`Target.createTarget` 报错…）留下的浏览器，模块自己
  * 永远回收不了。请退成功返回 `true`。全程不发信号。
  */
-async function requestExitViaProfile(owned: Owned): Promise<boolean> {
+async function requestExitViaProfile(owned: Owned, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  if (timeoutMs <= 0) return false;
   const url = browserWsUrl(owned.dir);
   if (url === null) return false;
   let ws: WebSocket;
@@ -757,10 +848,10 @@ async function requestExitViaProfile(owned: Owned): Promise<boolean> {
     await new Promise<void>((res, rej) => {
       ws.onopen = () => res();
       ws.onerror = () => rej(new Error('重连 CDP 失败'));
-      timer = setTimeout(() => rej(new Error('重连 CDP 超时')), 10_000);
+      timer = setTimeout(() => rej(new Error('CDP 重连超时')), Math.min(ORACLE_TIMING.handshakeMs, timeoutMs));
     });
     ws.send(CLOSE_FRAME);
-    return await waitGone(owned, 10_000);
+    return await waitGone(owned, Math.max(0, deadline - Date.now()));
   } catch {
     return false;
   } finally {
@@ -790,8 +881,10 @@ export async function abandon(
 ): Promise<void> {
   o.child ??= child;
   const probe = options.probe ?? PROCESS_PROBE;
-  const requestExit = options.requestExit ?? requestExitViaProfile;
-  const timeoutMs = options.timeoutMs ?? 15_000;
+  const timeoutMs = options.timeoutMs ?? ORACLE_TIMING.cleanupMs;
+  const deadline = Date.now() + timeoutMs;
+  const remaining = () => Math.max(0, deadline - Date.now());
+  const requestExit = options.requestExit ?? ((owned: Owned) => requestExitViaProfile(owned, remaining()));
   try {
     if (ownedProcessState(o, probe) !== 'gone') {
       let sent = false;
@@ -803,7 +896,7 @@ export async function abandon(
           /* disconnected: retry using this owned profile's CDP endpoint */
         }
       }
-      if (sent) await waitGone(o, Math.min(timeoutMs, 10_000), probe);
+      if (sent) await waitGone(o, Math.min(remaining(), 10_000), probe);
       if (ownedProcessState(o, probe) !== 'gone') await requestExit(o);
     }
   } finally {
@@ -815,7 +908,7 @@ export async function abandon(
   }
   // Both normal shutdown and failed startup use this same exit gate. An absent
   // /proc, disconnected CDP, rejected close, or permission error is not an exit.
-  if (await waitGone(o, timeoutMs, probe)) {
+  if (await waitGone(o, remaining(), probe)) {
     rmSync(o.dir, { recursive: true, force: true });
     o.closed = true;
   }
@@ -889,11 +982,13 @@ export function spawnOwnedBrowser(): SpawnedBrowser {
  */
 export async function waitForDevToolsEndpoint(
   b: SpawnedBrowser,
-  timeoutMs = 30_000,
+  timeoutMs: number = ORACLE_TIMING.endpointMs,
+  signal?: AbortSignal,
 ): Promise<{ port: string; path: string }> {
   const portFile = join(b.owned.dir, 'DevToolsActivePort');
   const deadline = Date.now() + timeoutMs;
   for (;;) {
+    signal?.throwIfAborted();
     if (existsSync(portFile)) {
       const ep = parseDevToolsEndpoint(readFileSync(portFile, 'utf8'));
       if (ep !== null) return ep;
@@ -906,63 +1001,40 @@ export async function waitForDevToolsEndpoint(
   }
 }
 
-async function launch(): Promise<Conn> {
+async function launch(signal: AbortSignal): Promise<Conn> {
   const began = performance.now();
   const spawned = spawnOwnedBrowser();
   const spawnMs = performance.now() - began;
   let ws: WebSocket | undefined;
   try {
-    return await launchInto(spawned, (w) => (ws = w), spawnMs);
+    return await launchInto(spawned, (w) => (ws = w), spawnMs, signal);
   } catch (err) {
     await abandon(spawned.owned, spawned.child, ws);
     throw err;
   }
 }
 
-async function launchInto(spawned: SpawnedBrowser, keepWs: (w: WebSocket) => void, spawnMs: number): Promise<Conn> {
+async function launchInto(spawned: SpawnedBrowser, keepWs: (w: WebSocket) => void, spawnMs: number, signal: AbortSignal): Promise<Conn> {
   const { owned, child } = spawned;
   const dir = owned.dir;
   const endpointBegan = performance.now();
-  const { port, path } = await waitForDevToolsEndpoint(spawned);
+  const { port, path } = await waitForDevToolsEndpoint(spawned, ORACLE_TIMING.endpointMs, signal);
   const endpointReady = performance.now();
 
   const ws = new WebSocket(`ws://127.0.0.1:${port}${path}`);
   keepWs(ws);
-  await new Promise<void>((res, rej) => {
-    ws.onopen = () => res();
-    ws.onerror = () => rej(new Error('CDP 的 WebSocket 握手失败'));
-  });
+  await openOracleSocket(ws, signal);
   const websocketReady = performance.now();
 
-  let nextId = 0;
-  const pending = new Map<number, { res: (v: Record<string, unknown>) => void; rej: (e: Error) => void }>();
-  ws.onmessage = (ev: MessageEvent) => {
-    const msg = JSON.parse(String(ev.data)) as { id?: number; error?: unknown; result?: Record<string, unknown> };
-    if (msg.id === undefined) return;
-    const slot = pending.get(msg.id);
-    if (slot === undefined) return;
-    pending.delete(msg.id);
-    if (msg.error !== undefined) slot.rej(new Error(`CDP 报错：${JSON.stringify(msg.error)}`));
-    else slot.res(msg.result ?? {});
-  };
-  // 连接断掉时把在途请求**结清**。不写这一段，`Browser.close` 那条请求会永远吊着 ——
-  // 它的应答常常随连接一起消失（浏览器先关连接再退），于是收尾 hook 卡到超时（实测：
-  // 全量并行跑时四个文件的 afterAll 一起 Hook timed out，而 3957 条断言全绿）。
-  ws.onclose = () => {
-    for (const [, slot] of pending) slot.rej(new Error('CDP 连接已断开'));
-    pending.clear();
-  };
-  const send: Conn['send'] = (method, params = {}, sessionId) =>
-    new Promise((res, rej) => {
-      const id = ++nextId;
-      pending.set(id, { res, rej });
-      ws.send(JSON.stringify({ id, method, params, ...(sessionId === undefined ? {} : { sessionId }) }));
-    });
+  signal.throwIfAborted();
+  const { send, cancelPending } = oracleTransport(ws, (reason) => {
+    for (const controller of ACTIVE_MEASURES) controller.abort(reason);
+  });
 
   // 子进程句柄不再钉住事件循环：收尾仍然只走 `Browser.close`（本模块任何路径都不 kill），
   // 但万一它退得慢，测试进程不必陪着它一起吊死。
   child.unref();
-  return { owned, child, ws, dir, send, startup: {
+  return { owned, child, ws, dir, send, cancelPending, startup: {
     spawn: Math.round(spawnMs),
     endpoint: Math.round(endpointReady - endpointBegan),
     websocket: Math.round(websocketReady - endpointReady),
@@ -971,16 +1043,18 @@ async function launchInto(spawned: SpawnedBrowser, keepWs: (w: WebSocket) => voi
 
 async function conn(): Promise<Conn> {
   if (CONN !== null) return CONN;
-  OPENING ??= launch().then((c) => {
-    CONN = c;
-    OPENING = null;
-    return c;
-  });
+  if (OPENING === null) {
+    OPENING_ABORT = new AbortController();
+    OPENING = launch(OPENING_ABORT.signal).then((c) => {
+      CONN = c;
+      return c;
+    }).finally(() => { OPENING = null; OPENING_ABORT = null; });
+  }
   return OPENING;
 }
 
 /**
- * 收尾时**排空在途度量**的等待上限（毫秒）。
+ * 收尾时等待在途度量的宽限（毫秒）；到期后取消并等待有界收尾，仍返回超时错误。
  *
  * 做成可写的一格，只为给 [`closeOracle`] 那条超时分支一条判据（第七轮 T7：A6 自己立的规矩
  * 「每条 `throw` 都要有判据」在这一条上此前不成立）。为什么不做成 `closeOracle` 的形参 ——
@@ -988,6 +1062,8 @@ async function conn(): Promise<Conn> {
  * 加参数会让全部消费文件 `FixtureParseError`（本轮实测）。判据用完必须写回 60_000。
  */
 export const DRAIN = { timeoutMs: 60_000 };
+// Drain + an interrupted target/measurement teardown + one shared owner cleanup.
+export const ORACLE_CLOSE_TIMEOUT_MS = DRAIN.timeoutMs + ORACLE_TIMING.requestMs + 2 * ORACLE_TIMING.cleanupMs + 1_000;
 
 /**
  * 收尾。**走 CDP 的 `Browser.close` 让 Chrome 自己退** —— 本模块任何路径上都不 kill 进程。
@@ -1002,17 +1078,26 @@ export const DRAIN = { timeoutMs: 60_000 };
  * 当成 fixture 解析 —— 加一个 `opts` 参数，全部消费文件当场 `FixtureParseError`（本轮实测）。
  * 所以第 0 步那条超时上限放在 [`DRAIN`] 这一格里（见那里的理由）。
  */
-export async function closeOracle(): Promise<void> {
+export function closeOracle(): Promise<void> {
+  CLOSING ??= drainOracle().finally(() => { CLOSING = null; });
+  return CLOSING;
+}
+
+async function drainOracle(): Promise<void> {
   // 0. **在途的度量**先等回来（第六轮 A1）。不等它 ⇒ 浏览器在收尾之后才起来，
   //    而那时 `OWNED` 还是空的，自查器对着空表说「干净」。
+  let drainError: Error | undefined;
   const drainDeadline = Date.now() + DRAIN.timeoutMs;
   while (INFLIGHT.size > 0) {
     // `>=`（不是 `>`）：让 `DRAIN.timeoutMs = 0` 有确定含义 —— 一次都不等，当场报在途几个。
-    if (Date.now() >= drainDeadline)
-      throw new Error(
-        `CSS 裁判收尾时还有 ${INFLIGHT.size} 次度量在途，等了 ${DRAIN.timeoutMs}ms 没落地 —— ` +
-          '继续收尾就等于把它们启动的浏览器丢在宿主上（第六轮 A1）。',
-      );
+    if (Date.now() >= drainDeadline) {
+      drainError = new Error(`CSS oracle: ${INFLIGHT.size} 次度量在途; drain deadline exceeded`);
+      for (const controller of ACTIVE_MEASURES) controller.abort(drainError);
+      OPENING_ABORT?.abort(drainError);
+      CONN?.cancelPending(drainError);
+      await Promise.all([...INFLIGHT]);
+      break;
+    }
     await Promise.race([Promise.all([...INFLIGHT]), sleep(200)]);
   }
   // 1. 启动在途 ⇒ 等它落地。失败路径 `launch` 自己清过 profile，这里只吞异常。
@@ -1026,6 +1111,7 @@ export async function closeOracle(): Promise<void> {
   const c = CONN;
   CONN = null;
   OPENING = null;
+  const cleanupDeadline = Date.now() + ORACLE_TIMING.cleanupMs;
   if (c !== null) {
     // Share failure-path cleanup, including non-/proc child ownership and CDP retry.
     await abandon(c.owned, c.child, c.ws);
@@ -1034,7 +1120,13 @@ export async function closeOracle(): Promise<void> {
     if (h.liveBrowsers.length === 0 && h.leftProfiles.length === 0 && !h.unconfirmedBrowsers?.length)
       console.log(`[css-oracle] 收尾自查：本次启动 ${h.started} 个浏览器，已全部退出、profile 已删。`);
   }
+  // Also retry failed startup owners, not only the published connection.
+  for (const owned of OWNED) {
+    if (!owned.closed && owned !== c?.owned)
+      await abandon(owned, owned.child, undefined, { timeoutMs: Math.max(0, cleanupDeadline - Date.now()) });
+  }
   assertNoOracleLeak();
+  if (drainError) throw drainError;
 }
 
 /**
@@ -1045,7 +1137,14 @@ export async function closeOracle(): Promise<void> {
  * 谁 import 它，谁的那个文件就一定有收尾 —— 「哪条路径都不漏」的前提是这道 hook 不能靠人记得写。
  * `closeOracle` 幂等，消费文件里已有的 `afterAll(closeOracle, 30_000)` 保留着也不会重复请退。
  */
-afterAll(closeOracle, 60_000);
+async function finishOracle(): Promise<void> {
+  FINALIZED = true;
+  await closeOracle();
+}
+// An import inside an executing test is too late for a collection-time suite hook.
+// Bind that browser to the actual test's lifetime; normal imports retain file scope.
+if (TestRunner.getCurrentTest() !== undefined) onTestFinished(finishOracle, ORACLE_CLOSE_TIMEOUT_MS);
+else afterAll(finishOracle, ORACLE_CLOSE_TIMEOUT_MS);
 
 // 兜底：进程正常退出前再关一次（`beforeExit` 允许再排异步活）。
 // 兜底路径不能靠抛异常自曝（没人接），故把残留打到 stderr 并把退出码染红。
@@ -1361,8 +1460,30 @@ interface RawResult {
  * Vitest 的 timeout 不取消 callback，因此旧度量仍在途时也不能覆盖下一份 DOM 或媒体档。
  */
 export function measure(input: OracleInput, asks: readonly Ask[]): Promise<Measured> {
+  if (FINALIZED || CLOSING !== null)
+    return Promise.reject(new Error('CSS 裁判收尾期间不再接受新度量。'));
   // 🔴 第六轮 A1：**登记在途**。收尾要靠这张簿子把「还没走到 `conn()` 的那次度量」等回来。
-  return track(measureOnce(input, asks));
+  const controller = new AbortController();
+  ACTIVE_MEASURES.add(controller);
+  const timer = setTimeout(() => controller.abort(new Error('CSS 裁判度量超时')), ORACLE_TIMING.measureMs);
+  const cancel = () => {
+    OPENING_ABORT?.abort(controller.signal.reason);
+    CONN?.cancelPending(controller.signal.reason as Error);
+  };
+  controller.signal.addEventListener('abort', cancel, { once: true });
+  return track(measureOnce(input, asks, controller.signal).finally(async () => {
+    clearTimeout(timer);
+    controller.signal.removeEventListener('abort', cancel);
+    try {
+      if (controller.signal.aborted) {
+        // Startup cannot publish after cancellation. Wait its bounded teardown too.
+        if (OPENING !== null) await OPENING.catch(() => undefined);
+        const c = CONN;
+        CONN = null;
+        if (c !== null) await abandon(c.owned, c.child, c.ws);
+      }
+    } finally { ACTIVE_MEASURES.delete(controller); }
+  }));
 }
 
 /**
@@ -1382,7 +1503,7 @@ export interface SampledPoint {
 
 let coldMeasureReported = false;
 
-async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Measured> {
+async function measureOnce(input: OracleInput, asks: readonly Ask[], signal: AbortSignal): Promise<Measured> {
   const reportCold = !coldMeasureReported;
   coldMeasureReported = true;
   const began = performance.now();
@@ -1395,9 +1516,14 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
   const chain =
     input.css !== undefined
       ? input.css.map((css, i) => ({ file: `<memory>#${i}`, css }))
-      : await cssChain(input.ctx);
+      : await withOracleAbort(cssChain(input.ctx), signal);
   const cssReady = performance.now();
-  const c = await conn();
+  signal.throwIfAborted();
+  const c = await withOracleAbort(conn(), signal);
+  const send: Conn['send'] = (...args) => {
+    signal.throwIfAborted();
+    return withOracleAbort(c.send(...args), signal);
+  };
   const connected = performance.now();
   const vp = {
     width: input.viewport?.width ?? DEFAULT_VIEWPORT.width,
@@ -1459,26 +1585,26 @@ async function measureOnce(input: OracleInput, asks: readonly Ask[]): Promise<Me
     return JSON.stringify(out);
   })()`;
   const html = buildDocument(input, chain);
-  const { targetId } = (await c.send('Target.createTarget', { url: 'about:blank' })) as { targetId: string };
+  const { targetId } = (await send('Target.createTarget', { url: 'about:blank' })) as { targetId: string };
   const targetReady = performance.now();
   let raw: RawResult;
   let browserUserAgent: string | undefined;
   try {
-    const { sessionId } = (await c.send('Target.attachToTarget', { targetId, flatten: true })) as { sessionId: string };
-    await c.send('Page.enable', {}, sessionId);
-    const tree = (await c.send('Page.getFrameTree', {}, sessionId)) as { frameTree: { frame: { id: string } } };
-    await c.send(
+    const { sessionId } = (await send('Target.attachToTarget', { targetId, flatten: true })) as { sessionId: string };
+    await send('Page.enable', {}, sessionId);
+    const tree = (await send('Page.getFrameTree', {}, sessionId)) as { frameTree: { frame: { id: string } } };
+    await send(
       'Emulation.setDeviceMetricsOverride',
       { width: vp.width, height: vp.height, deviceScaleFactor: vp.dpr, mobile: false },
       sessionId,
     );
-    await c.send(
+    await send(
       'Emulation.setEmulatedMedia',
       { features: Object.entries(media).map(([name, value]) => ({ name, value })) },
       sessionId,
     );
-    await c.send('Page.setDocumentContent', { frameId: tree.frameTree.frame.id, html }, sessionId);
-    const evaluated = (await c.send('Runtime.evaluate', { expression, returnByValue: true }, sessionId)) as {
+    await send('Page.setDocumentContent', { frameId: tree.frameTree.frame.id, html }, sessionId);
+    const evaluated = (await send('Runtime.evaluate', { expression, returnByValue: true }, sessionId)) as {
       result?: { value?: string };
       exceptionDetails?: unknown;
     };

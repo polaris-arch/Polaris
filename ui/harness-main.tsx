@@ -74,6 +74,57 @@ declare global { interface Window { __coexHarness?: typeof coexControl } }
 if (coexFixtureEnabled) window.__coexHarness = coexControl;
 
 let demoConfig = structuredClone(DEMO_CONFIG);
+// Opt-in display/interaction fixture only; excluded from production build inputs.
+// All IPC is the existing mock transport; no installed Helper or user configuration is used.
+const uiLayoutFixture = new URLSearchParams(location.search).has('ui-layout-fixture');
+const uiLayoutAdmission = new URLSearchParams(location.search).get('admission') === 'unsupported';
+const uiLayoutVersion = '1.15.0-polaris-alpha.12.7';
+const uiLayoutHelper = {
+  supported: true, installed: true, ready: false, upgradeable: true, version: 2,
+  expectedProtocolVersion: 2, expectedBuildId: 'fixture-app', helperBuildId: 'fixture-old-helper',
+  loaded: null, needsRepair: false, backgroundDisabled: false, pathMismatch: false, installedSingboxPath: null,
+  selectedCore: { id: 'fixture-core', version: uiLayoutVersion, providerFingerprint: 'fixture-provider',
+    state: 'unavailable' as const, ...(uiLayoutAdmission ? { admission: 'UnsupportedExactObject' as const } : {}) },
+} satisfies import('./src/contracts/types/runtime').HelperStatus;
+if (uiLayoutFixture) {
+  demoConfig.language = 'zh-CN';
+  demoConfig.uiTheme = 'dark';
+  const names = ['JP10', 'Jp01-MASQUE', 'JP02', 'JP01-H3', 'JP01',
+    ...Array.from({ length: 315 }, (_, i) => `ZZ${i + 1}`)];
+  demoConfig.servers = names.map((name, index) => ({
+    ...DEMO_SERVERS[0], id: `layout-${index}`, name,
+    address: 'fixture.invalid', subscriptionId: index === 190 ? undefined : 'sub1',
+  }));
+  demoConfig.selectedServerId = 'layout-180';
+  const controls = {
+    async settings(screen: import('./src/store/nav-store').SettingsScreen) {
+      const { useNavStore } = await import('./src/store/nav-store'); useNavStore.getState().enterSettings(screen);
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    },
+    async main(screen: import('./src/store/nav-store').MainScreen) {
+      const { useNavStore } = await import('./src/store/nav-store'); useNavStore.getState().navigate(screen);
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    },
+    async language(language: string) { await syncLanguageChoice(language); },
+    async connection(running: boolean) {
+      const { useAppStore } = await import('./src/store/app-store'); useAppStore.setState({ proxyStatus: { running } });
+    },
+    async exitIdentity(running: boolean, actualServerId: string | null, savedServerId: string, auto = false) {
+      const { useAppStore } = await import('./src/store/app-store');
+      demoConfig = { ...demoConfig, selectedServerId: savedServerId,
+        selectionIntent: auto ? { mode: 'auto', scope: 'global' } : undefined,
+        autoSelectEnabled: auto };
+      useAppStore.setState({ config: structuredClone(demoConfig), proxyStatus: { running, actualServerId } });
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    },
+    selection() { return demoConfig.selectedServerId; },
+    async stats() {
+      await emit('event:statsUpdated', { uploadSpeed: 512, downloadSpeed: 1024, totalUpload: 0, totalDownload: 0, activeConnections: 3, timestamp: Date.now() });
+    },
+  };
+  (window as unknown as { __uiLayoutHarness: typeof controls }).__uiLayoutHarness = controls;
+}
+
 const meshIngressFixture = new URLSearchParams(window.location.search).has('mesh-inbound-fixture');
 const meshIngressStorageKey = 'polaris-harness-mesh-inbound';
 if (meshIngressFixture) {
@@ -178,8 +229,15 @@ mockIPC((cmd, payload) => {
     // 契约是 RuleResourceCatalogResult（{items, fetchedAt, source}），不是裸数组——回 [] 会让
     // 资源库/添加应用两个弹窗读 `catalog.items.filter` 时炸在 undefined 上。
     case 'rule_resources_get_catalog': return Promise.resolve({ items: [], fetchedAt: null, source: 'builtin' });
+    case 'server_identity_conflicts': return Promise.resolve({ groups: [] });
+    case 'helper_get_status': return Promise.resolve(uiLayoutFixture ? uiLayoutHelper : null);
+    case 'core_get_version_info': return Promise.resolve(uiLayoutFixture ? {
+      packagedVersion: '', bundledVersion: uiLayoutVersion, patchSet: 'fixture-patch-set',
+      admission: { state: 'rejected', kind: 'UnsupportedExactObject', recovery: 'unavailable' },
+    } : null);
     case 'proxy_get_status': return Promise.resolve(
-      meshIngressFixture || coexFixtureEnabled ? { running: false } : { running: true, startTime: Date.now() - 300_000 },
+
+      meshIngressFixture || coexFixtureEnabled || uiLayoutFixture ? { running: false } : { running: true, startTime: Date.now() - 300_000 },
     );
     case 'stats_subscribe': return Promise.resolve(null);
     case 'stats_unsubscribe': return Promise.resolve(null);
@@ -207,6 +265,7 @@ if (coexFixtureEnabled) {
 }
 
 void i18nReady.then(async () => {
+  if (uiLayoutFixture) await syncLanguageChoice('zh-CN');
   if (new URLSearchParams(window.location.search).has('mesh-choice-fixture')) {
     const { MeshJoinDialogView } = await import('./src/components/dialogs/MeshJoinDialog');
     const mode = new URLSearchParams(window.location.search).get('mesh-choice-fixture');

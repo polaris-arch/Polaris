@@ -1373,6 +1373,7 @@ describe('⑫ 桌面那批 app 级订阅：要么移植了，要么在表里登�
    * 不许写「本批不做」——那是排期，不是判定。
    */
   const NOT_PORTED: ReadonlyArray<readonly [string, string]> = [
+    ['coreAdmissionIsDamage', '桌面 Helper 升级通知区分数据损坏与不可修复的运行拒绝；移动入口没有提权 Helper 或 Helper 升级通知对象。这是桌面通知的判定依赖，不是缺失的移动端订阅。'],
     ['onSystemProxyResidual', '移动端接管方式恒为 TUN，系统代理这个对象在 Android 上不存在'],
     ['subscribeSpeedTestProgressToast', '移动端通过runId会话store与行内进度消费同样事件；不重复显示桌面的sticky toast'],
     // ── 2026-09-06 第二次扩面抓出来的七条：它们不长成订阅的样子，此前整条掉在取材面外 ──

@@ -1,6 +1,6 @@
 {
   "coreRecovery": {
-    "intro": "仅恢复当前应用的可信随包数据，不会补足当前环境缺少的运行支持。请先断开连接；不会自动安装助手或重新连接。",
+    "intro": "断开连接后恢复随包数据；不补足运行支持，不安装助手或自动重连。",
     "check": "检查离线恢复",
     "working": "正在核验或恢复，请稍候…",
     "ready": "随包恢复数据已核验。重置时会再次检查；运行支持仍单独核验，不会自动连接。",
@@ -112,7 +112,7 @@
     "checkYes": "是",
     "checkNo": "否",
     "checkUnknown": "未知／未观测",
-    "checkScope": "选定内核核验针对本应用所需的已安装内容，不代表当前正在运行的内核身份，也不证明连接已建立。",
+    "checkScope": "仅核验已安装内容，不代表当前正在运行的内核身份，也不证明连接已建立。",
     "diagnosticsTitle": "助手与内核诊断",
     "coreDiagnosticsTitle": "选定内核身份诊断",
     "diagnosticsScope": "复制内容仅含服务状态、协议数字及内容／构建身份，不含订阅、凭据、用户路径或原始日志。",
@@ -128,7 +128,8 @@
     "restoreOfflineAction": "离线恢复配套内核",
     "recoveryPartial": "应用内核已恢复，提权助手修复尚未完成。请重试修复；代理未自动重连。",
     "recoveryUserUnsupported": "此平台的提权助手修复无法恢复应用私有内核。如有需要，请重新安装可信的同版应用。",
-    "recoveryPending": "内核恢复尚未完成或收尾未确认。请重试修复；原件与恢复记录已保留。"
+    "recoveryPending": "内核恢复尚未完成或收尾未确认。请重试修复；原件与恢复记录已保留。",
+    "coreAdmissionSupportHint": "需要支持此环境的应用版本，修复助手无法解决。"
   },
   "proxy": {
     "systemProxyResidualDesc": "TUN 模式下检测到系统代理仍开启（{{proxy}}），它不是 Polaris 设置的，可能导致连接异常。如非必要建议关闭。",
@@ -2358,7 +2359,7 @@
     "selectedPrefix": "已选 ",
     "selectedSuffix": " 个",
     "sort": {
-      "default": "默认顺序",
+      "default": "导入顺序",
       "latency": "延迟",
       "name": "名称",
       "protocol": "协议"
@@ -2492,7 +2493,9 @@
     "mobileSortName": "名称",
     "mobileSortProtocol": "协议",
     "deleteConfirmMobile": "确定删除节点 \"{{name}}\" 吗？此操作无法撤销。",
-    "batchDeleteConfirmMobile": "确定删除选中的 {{count}} 个节点吗？此操作无法撤销。"
+    "batchDeleteConfirmMobile": "确定删除选中的 {{count}} 个节点吗？此操作无法撤销。",
+    "locateCurrent": "定位当前",
+    "locateCurrentHint": "清除筛选并定位当前节点"
   },
   "procPick": {
     "empty": "暂无进程数据，请刷新重试",

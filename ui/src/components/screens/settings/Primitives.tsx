@@ -463,15 +463,16 @@ export function Spinner({ className }: { className?: string }) {
 }
 
 /** Persistent feedback; callers retain every action and decide whether a toast already announced it. */
-export function FeedbackNotice({ title, detail, hint, actions, announce = true }: {
+export function FeedbackNotice({ title, detail, hint, actions, announce = true, tone = 'error' }: {
   title: string;
   detail?: string;
   hint?: string;
   actions?: ReactNode;
   announce?: boolean;
+  tone?: 'error' | 'warning';
 }) {
   const titleId = useId();
-  return <section className="feedback-notice" data-feedback-notice="" role={announce ? 'status' : 'region'}
+  return <section className={`feedback-notice${tone === 'warning' ? ' warning' : ''}`} data-feedback-notice="" role={announce ? 'status' : 'region'}
     aria-live={announce ? 'polite' : undefined} aria-labelledby={titleId}>
     <strong className="feedback-notice-title" id={titleId}>{title}</strong>
     {detail && detail !== title && <p className="feedback-notice-detail">{detail}</p>}

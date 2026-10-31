@@ -37,7 +37,7 @@
  */
 
 /** 原型三档配色：ok/err 有专属样式，`''` 走基础样式（不自造第四档）。 */
-export type ToastKind = 'ok' | 'err' | '';
+export type ToastKind = 'ok' | 'err' | 'warn' | '';
 
 export interface ToastEntry {
   /** 单调自增流水号。**每次 upsert 都换新**（见 `upsertToast`）——旧号即失效，在飞定时器随之变空转。 */

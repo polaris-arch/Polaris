@@ -105,7 +105,9 @@ class Integrity(unittest.TestCase):
             'memberBytes': {name: len(body) for name, body in members.items()},
         }))
         resources, sources = w.source_inventory(root)
-        return {'resources': resources, 'sources': sources}, b'MZ inert App ' + w.final.BUNDLE_UNK + b' ' + (root / 'resources/win/core-manifest.json').read_bytes()
+        return {'resources': resources, 'sources': sources,
+                'cargo': {'targetDirectory': str(root / 'target'), 'releaseDirectory': str(root / 'target/release'),
+                          'target': None, 'profile': 'release'}}, b'MZ inert App ' + w.final.BUNDLE_UNK + b' ' + (root / 'resources/win/core-manifest.json').read_bytes()
 
     def zip(self, root, expected, state, app, fault=None):
         archive = root / 'carrier.zip'
@@ -203,6 +205,7 @@ class Integrity(unittest.TestCase):
             sentinel = root / 'target/release/keep-me'; sentinel.write_bytes(b'untouched')
             env = root / 'env'
             with patch.dict(os.environ, {'GITHUB_ENV': str(env)}), patch.object(w, 'find_sevenzip', return_value=('7z', '25.01')), \
+                 patch.object(w, 'cargo_context', return_value=state['cargo']), \
                  patch.object(w, 'verified_sources', return_value=(state['resources'], state['sources'])), \
                  patch.object(w.subprocess, 'check_output', return_value='a' * 40 + '\n'):
                 w.prepare(root)
@@ -283,11 +286,11 @@ class Integrity(unittest.TestCase):
             root = Path(tmp); _, app = self.fixture(root)
             binary = root / 'target/release/polaris.exe'; binary.parent.mkdir(parents=True); binary.write_bytes(app)
             original = w.cargo_app_identity; calls = 0
-            def changed(value):
+            def changed(value, state=None):
                 nonlocal calls
                 calls += 1
                 if calls == 2: binary.write_bytes(app + b'changed')
-                return original(value)
+                return original(value, state)
             with patch.object(w, 'cargo_app_identity', side_effect=changed), \
                  self.assertRaisesRegex(ValueError, 'Cargo App path changed while reading'):
                 w.compiled_app(root)
@@ -477,7 +480,7 @@ class Integrity(unittest.TestCase):
             mutations = [
                 source.replace('        assemble_carriers(root, state, app_path, app, source_path, source_identity)',
                                '        pass  # producer checks detached'),
-                source.replace('        app_path, app = compiled_app(root, staging=Path(stage))',
+                source.replace('        app_path, app = compiled_app(root, staging=Path(stage), state=state)',
                                "        app_path, app = None, b'unchecked'"),
                 source.replace('    cli = tauri_identity(root)', "    cli = {'entry': 'fake', 'version': 'unchecked'}"),
                 source.replace('    zip_inventory(destination, expected)\n', '    # actual final ZIP check removed\n'),
@@ -670,6 +673,8 @@ class WindowsLongPaths(unittest.TestCase):
                 path = native / name; path.mkdir(parents=True); (path / 'old.exe').write_bytes(b'old')
             with patch.dict(os.environ, {'GITHUB_ENV': str(root / 'env')}), \
                  patch.object(w, 'find_sevenzip', return_value=('7z', '25.01')), \
+                 patch.object(w, 'cargo_context', return_value={'targetDirectory': str(root / 'target'),
+                              'releaseDirectory': str(root / 'target/release'), 'target': None, 'profile': 'release'}), \
                  patch.object(w, 'verified_sources', return_value=(expected, sources)), \
                  patch.object(w.subprocess, 'check_output', return_value='a' * 40 + '\n'):
                 w.prepare(root)
@@ -741,6 +746,210 @@ class WindowsLongPaths(unittest.TestCase):
         for name in [r'\\.\NUL', r'\\?\GLOBALROOT\Device\HarddiskVolume1\file', r'\\?\Volume{00000000-0000-0000-0000-000000000000}\file']:
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'unsupported Windows filesystem namespace'):
                 w.io_path(name)
+
+
+class CargoContexts(unittest.TestCase):
+    fixture = Integrity.fixture
+
+    @contextmanager
+    def cargo(self, root, directory, target=None):
+        # Only the Cargo metadata/artifact transport is controlled. All file
+        # IDs, hardlinks, state, inventories and ZIP reads use the real FS.
+        # These events do not claim that an App or installer has been built.
+        (root / 'Cargo.toml').write_text('[workspace]\nmembers=["src-tauri"]\n')
+        (root / 'Cargo.lock').write_text('version = 4\n')
+        (root / 'src-tauri/Cargo.toml').write_text('[package]\nname="polaris"\nversion="1.0.0"\n')
+        (root / 'src-tauri/tauri.conf.json').write_text('{"version":"1.0.0"}')
+        (root / 'src-tauri/src').mkdir()
+        (root / 'src-tauri/src/main.rs').write_text('fn main() {}\n')
+        tool = root / 'inert-cargo.exe'; tool.write_bytes(b'inert tool identity; never executed')
+        package = {'id': 'path+file:///fixture#polaris@1.0.0', 'name': 'polaris', 'version': '1.0.0',
+                   'manifest_path': str(root / 'src-tauri/Cargo.toml'),
+                   'targets': [{'name': 'polaris', 'kind': ['bin'], 'src_path': str(root / 'src-tauri/src/main.rs')}]}
+        metadata = {'workspace_root': str(root), 'target_directory': str(directory),
+                    'workspace_members': [package['id']], 'packages': [package]}
+        release = directory / target / 'release' if target else directory / 'release'
+        row = {'reason': 'compiler-artifact', 'package_id': package['id'], 'manifest_path': package['manifest_path'],
+               'target': copy.deepcopy(package['targets'][0]), 'executable': str(release / 'polaris.exe'),
+               'filenames': [str(release / 'polaris.exe')], 'fresh': True,
+               'profile': {'test': False, 'debug_assertions': False, 'opt_level': '3'}}
+        fixture = SimpleNamespace(metadata=metadata, artifact=row, calls=[], head='a' * 40, diff='', after_build=None)
+        def output(argv, cwd, **kwargs):
+            fixture.calls.append((argv, cwd, kwargs))
+            self.assertEqual(Path(argv[0]), Path(os.environ['CARGO']))
+            if argv[1] == '-vV': return 'cargo 1.99.1 (controlled fixture)\nhost: x86_64-pc-windows-msvc\n'
+            self.assertEqual(cwd, root / 'src-tauri')
+            if argv[1] == 'metadata': return json.dumps(metadata)
+            self.assertEqual(argv[1], 'build')
+            if fixture.after_build: fixture.after_build()
+            return '\n'.join(json.dumps(x) for x in [row, {'reason': 'build-finished', 'success': True}])
+        with patch.dict(os.environ), patch.object(w, 'cargo_output', side_effect=output), \
+             patch.object(w, 'find_sevenzip', return_value=('7z', '26.05')), \
+             patch.object(w, 'verified_sources', side_effect=w.source_inventory), \
+             patch.object(w.subprocess, 'check_output', side_effect=lambda argv, **k: fixture.diff if 'diff' in argv else fixture.head + '\n'):
+            for key in ['GITHUB_ENV', 'CARGO_BUILD_TARGET', 'POLARIS_WINDOWS_PACKAGE_TARGET', 'POLARIS_BUILD_ID']:
+                os.environ.pop(key, None)
+            os.environ.update(CARGO=str(tool), CARGO_TARGET_DIR=str(directory))
+            if target: os.environ['POLARIS_WINDOWS_PACKAGE_TARGET'] = target
+            yield fixture
+
+    def test_default_and_external_native_release_whole_chain(self):
+        for layout in ['default', 'external', 'native triple']:
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp); root = base / 'source'; root.mkdir(); _, app = self.fixture(root)
+                directory = root / 'target' if layout == 'default' else base / 'external-target'
+                target = 'x86_64-pc-windows-msvc' if layout == 'native triple' else None
+                with self.cargo(root, directory, target) as fixture:
+                    with patch.object(w, 'ROOT', root), patch.object(sys, 'argv', ['windows-package-integrity.py', 'prepare']
+                                               + (['--target', target] if target else [])):
+                        w.main()  # no GITHUB_ENV/CI impersonation
+                    release = directory / target / 'release' if target else directory / 'release'
+                    path = next(release.glob('.polaris-package-*')) / 'state.json'
+                    os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(path); state = w.load_state(root)
+                    self.assertEqual(state['cargo']['targetDirectory'], str(directory))
+                    self.assertEqual(state['cargo']['releaseDirectory'], str(release))
+                    binary = release / 'polaris.exe'; binary.write_bytes(app)
+                    (release / 'deps').mkdir(); os.link(binary, release / 'deps/polaris.exe')
+                    self.assertEqual(w.cargo_app_identity(root, state)[0], binary)
+                    self.assertEqual(w.compiled_app(root, state=state)[1], app)
+                    installer = release / 'bundle/nsis/Polaris_1.0.0_x64-setup.exe'
+                    installer.write_bytes(b'inert container, not a native NSIS positive')
+                    script = release / 'nsis/x64/installer.nsi'; script.parent.mkdir(parents=True)
+                    script.write_text('!define VERSION "1.0.0"\n!define MAINBINARYNAME "polaris"\n'
+                                      + '!define MAINBINARYSRCPATH "' + str(binary) + '"\nSection Install\n'
+                                      + 'File "${MAINBINARYSRCPATH}"\n'
+                                      + ''.join('File /a "/oname=' + name + '" "' + source + '"\n'
+                                                for name, source in state['sources'].items()) + 'SectionEnd\n')
+                    self.assertEqual(w.verify_generated_script(root, state), w.facts(script))
+                    with patch.object(w, 'tauri_identity', return_value={'version': 'tauri-cli 2.12.1'}), \
+                         patch.object(w, 'nsis_inventory', side_effect=lambda r, t, a, expected, temp: expected):
+                        os.environ.pop('POLARIS_WINDOWS_PACKAGE_STATE')
+                        with patch.object(w, 'ROOT', root), patch.object(sys, 'argv',
+                             ['windows-package-integrity.py', 'assemble', '--state', str(path)]): w.main()
+                    receipt = json.loads((root / 'windows-package-evidence/static-carriers.json').read_bytes())
+                    self.assertEqual(receipt['compiledAppInput']['sourcePath'], str(binary))
+                    self.assertEqual(receipt['cargoContext'], state['cargo'])
+                    builds = [argv for argv, _, _ in fixture.calls if argv[1] == 'build']
+                    self.assertEqual(len(builds), 1); self.assertIn('--release', builds[0])
+                    self.assertEqual('--target' in builds[0], target is not None)
+                    self.assertEqual(len(list((root / 'dist-win').glob('*'))), 2)
+                    self.assertEqual(w.verify_existing_zip(root, root / 'dist-win/Polaris_1.0.0_x64-win-Portable.zip'),
+                                     receipt['portableObserved'])
+                    # A retained old root/release App is never a fallback.
+                    os.link(binary, release / 'third.exe')
+                    with self.assertRaises(ValueError): w.cargo_app_identity(root, state)
+
+    def test_foreign_context_profile_state_and_source_changes(self):
+        for fault in ['manifest', 'package', 'workspace', 'tool', 'profile', 'owner', 'target', 'head', 'resources', 'sources', 'lock', 'tracked source']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); self.fixture(root)
+                with self.cargo(root, root / 'target') as fixture:
+                    w.prepare(root); path = next((root / 'target/release').glob('.polaris-package-*')) / 'state.json'
+                    os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(path); state = w.load_state(root)
+                    if fault == 'manifest': fixture.metadata['packages'][0]['manifest_path'] = str(root / 'foreign.toml')
+                    elif fault == 'package': fixture.metadata['packages'][0]['name'] = 'foreign'
+                    elif fault == 'workspace': fixture.metadata['workspace_root'] = str(root.parent)
+                    elif fault == 'tool':
+                        other = root / 'other-cargo.exe'; other.write_bytes(b'other tool'); os.environ['CARGO'] = str(other)
+                    elif fault == 'profile': state['cargo']['profile'] = 'debug'
+                    elif fault == 'owner': state['ownerIdentity'][1] += 1
+                    elif fault == 'target': fixture.metadata['target_directory'] = str(root / 'other-target')
+                    elif fault == 'head': fixture.head = 'b' * 40
+                    elif fault == 'resources': (root / 'resources/win/polaris-helper.exe').write_bytes(b'changed')
+                    elif fault == 'sources': state['sources']['_up_/LICENSE'] = str(root / 'NOTICE')
+                    elif fault == 'lock': (root / 'Cargo.lock').write_bytes(b'changed locked graph')
+                    elif fault == 'tracked source': fixture.diff = 'tracked source changed during the build'
+                    path.write_text(json.dumps(state))
+                    with self.assertRaises(ValueError): w.load_state(root)
+
+        # Isolate environment drift: no broken tool, metadata, namespace,
+        # source or resource can be responsible for these rejections.
+        inputs = {'TAURI_CONFIG': '{"bundle":{"active":true}}',
+                  'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS': '--cfg=package_freeze_fixture',
+                  'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER': 'fixture-linker'}
+        for target in [None, 'x86_64-pc-windows-msvc']:
+            for name, value in inputs.items():
+                for change in ['stable', 'stable-empty', 'add', 'change', 'remove',
+                               'add-empty', 'change-empty', 'remove-empty']:
+                    with self.subTest(target=target, name=name, change=change), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp); _, app = self.fixture(root)
+                        with self.cargo(root, root / 'target', target) as fixture:
+                            if change.startswith('add'): os.environ.pop(name, None)
+                            else: os.environ[name] = '' if change in ('stable-empty', 'remove-empty') else value
+                            w.prepare(root)
+                            release = root / 'target' / target / 'release' if target else root / 'target/release'
+                            path = next(release.glob('.polaris-package-*')) / 'state.json'
+                            os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(path)
+                            state = w.load_state(root)
+                            (release / 'polaris.exe').write_bytes(app)
+                            metadata = copy.deepcopy(fixture.metadata)
+                            if change in ('stable', 'stable-empty'):
+                                self.assertEqual(state['cargo']['environment'][name], os.environ[name])
+                                w.cargo_release_artifact(root, state)
+                                self.assertEqual(sum(argv[1] == 'build' for argv, _, _ in fixture.calls), 1)
+                                continue
+                            if change.startswith('remove'): os.environ.pop(name)
+                            elif change.endswith('empty'): os.environ[name] = ''
+                            else: os.environ[name] = value if change == 'add' else value + ' '
+                            current = w.cargo_context(root, target)
+                            self.assertNotEqual(current['environment'], state['cargo']['environment'])
+                            self.assertEqual({k: v for k, v in current.items() if k != 'environment'},
+                                             {k: v for k, v in state['cargo'].items() if k != 'environment'})
+                            self.assertEqual(fixture.metadata, metadata)
+                            self.assertEqual(fixture.head, state['candidate'])
+                            self.assertEqual(w.source_inventory(root), (state['resources'], state['sources']))
+                            self.assertEqual(w.directory_id(root / 'target'), state['targetIdentity'])
+                            self.assertEqual(w.directory_id(release), state['releaseIdentity'])
+                            self.assertEqual(w.directory_id(path.parent), state['ownerIdentity'])
+                            with self.assertRaisesRegex(ValueError, 'Cargo context changed'): w.load_state(root)
+                            with self.assertRaisesRegex(ValueError, 'Cargo context changed'): w.assemble(root)
+                            with self.assertRaisesRegex(ValueError, 'Cargo context changed before release proof'):
+                                w.cargo_release_artifact(root, state)
+                            self.assertFalse(any(argv[1] == 'build' for argv, _, _ in fixture.calls))
+
+    def test_debug_foreign_or_changed_release_artifacts_rejected(self):
+        for fault in ['debug flags', 'debug output', 'manifest', 'package', 'source', 'late resource', 'late head']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); _, app = self.fixture(root)
+                with self.cargo(root, root / 'target') as fixture:
+                    w.prepare(root); path = next((root / 'target/release').glob('.polaris-package-*')) / 'state.json'
+                    os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(path); state = w.load_state(root)
+                    (root / 'target/release/polaris.exe').write_bytes(app)
+                    if fault == 'debug flags': fixture.artifact['profile'].update(debug_assertions=True, opt_level='0')
+                    elif fault == 'debug output': fixture.artifact['executable'] = str(root / 'target/debug/polaris.exe')
+                    elif fault == 'manifest': fixture.artifact['manifest_path'] = str(root / 'foreign.toml')
+                    elif fault == 'package': fixture.artifact['package_id'] = 'foreign'
+                    elif fault == 'source': fixture.artifact['target']['src_path'] = str(root / 'other.rs')
+                    elif fault == 'late resource': fixture.after_build = lambda: (root / 'resources/win/polaris-helper.exe').write_bytes(b'changed')
+                    elif fault == 'late head': fixture.after_build = lambda: setattr(fixture, 'head', 'b' * 40)
+                    with self.assertRaises(ValueError): w.cargo_release_artifact(root, state)
+
+    def test_cargo_query_real_bounded_child_explicit_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(w.cargo_output([sys.executable, '-c', 'import os;print(os.getcwd(),end="")'], root), str(root))
+
+    def test_reparse_target_alias_foreign_state_and_debug_fallback_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); _, app = self.fixture(root)
+            with self.cargo(root, root / 'target') as fixture:
+                actual = root / 'real-target'; actual.mkdir(); alias = root / 'linked-target'
+                if os.name == 'nt':
+                    import _winapi
+                    _winapi.CreateJunction(str(actual), str(alias))
+                else: alias.symlink_to(actual, target_is_directory=True)
+                fixture.metadata['target_directory'] = str(alias)
+                with self.assertRaises(ValueError): w.cargo_context(root)
+                fixture.metadata['target_directory'] = str(root / 'target.')
+                with self.assertRaises(ValueError): w.cargo_context(root)
+                fixture.metadata['target_directory'] = str(root / 'target')
+                w.prepare(root); path = next((root / 'target/release').glob('.polaris-package-*')) / 'state.json'
+                os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(path); state = w.load_state(root)
+                debug = root / 'target/debug/polaris.exe'; debug.parent.mkdir(); debug.write_bytes(app)
+                with self.assertRaises(FileNotFoundError): w.cargo_app_identity(root, state)
+                foreign = root / 'foreign-state.json'; foreign.write_bytes(path.read_bytes())
+                os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = str(foreign)
+                with self.assertRaises(ValueError): w.load_state(root)
 
 
 if __name__ == '__main__': unittest.main()

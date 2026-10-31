@@ -23,7 +23,7 @@
  * - **栈上限 2**：原型 `while(c.children.length>=2) c.firstChild.remove()` —— 超出即挤掉最旧的，
  *   不是无限堆叠（连续失败时屏幕不会被糊满）；
  * - 2200ms 后淡出、200ms 后卸载；`.show` 类驱动进场（CSS 已在 prototype.css:578-587，含 dark 收敛）；
- * - kind → class：ok/err 有专属配色，info/warning 走基础样式（原型只有三档，不自造第四档）。
+ * - kind → class：ok/err 有专属配色，info 走基础样式，warning 复用应用的 --warn 风险色。
  *
  * # 原型之外的两样能力（`key` / `sticky`）
  *
@@ -132,7 +132,7 @@ export function Toaster() {
       // 第二参 description（错误原因）此前被丢；接上出口，两段展示（见 ToastEntry.desc / 渲染 .toast-desc）。
       error: (m, d, o) => push(m, 'err', d, o),
       info: (m, o) => push(m, '', undefined, o),
-      warning: (m, o) => push(m, '', undefined, o),
+      warning: (m, o) => push(m, 'warn', undefined, o),
     });
 
     const pending = timers.current;

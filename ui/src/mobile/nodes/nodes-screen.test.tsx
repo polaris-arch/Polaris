@@ -61,7 +61,7 @@ import {
 } from './view-model';
 import type { NodeRowVM, NodesScreenViewProps, SheetItem } from './view-model';
 import { winners, winnersText } from '@/styles/css-cascade.test-support';
-import { measure } from '@/styles/css-oracle.test-support';
+import { measure, ORACLE_READY_TIMEOUT_MS } from '@/styles/css-oracle.test-support';
 import { inMobileShell } from '@/styles/mount.test-support';
 import { mobileEditFormFor } from '../forms/form-store';
 
@@ -278,7 +278,7 @@ beforeAll(async () => {
     { select: '.mn', props: ['display'] },
   ]);
   expect(ready.get('.mn', 'display')).toBe('flex');
-}, 30_000);
+}, ORACLE_READY_TIMEOUT_MS);
 
 it('Tailscale 行保留协议与状态，空传输摘要不留下占位 span', () => {
   const ts = server('ts-summary', { protocol: 'tailscale' });
@@ -1526,6 +1526,9 @@ describe('⑥-d 十五条 handler 逐键：接线层交给构造器的就是那�
  * 不在此表且不在移动端源码里出现 ⇒ 红。
  */
 const TIP_DISPOSITION: Record<string, string> = {
+  'nodes.locateCurrentHint':
+    '桌面固定工具栏新增清筛选并定位卡片的按钮。移动端不渲染该工具栏或按钮，只保留现有当前出口标记；' +
+    '定位操作尚无移动端落点，不把本提示误挂到会切换出口的行点击上。此项是明确的界面差异，不声称已移植。',
   'home.stagedOnlyHint':
     '节点卡的待保存 badge 保留，i 明细使用 mobileHelp.stagedNodeDetails，明确底部保存与运行时应用的区别。',
   /* 2026-09-06（批 2）：这两条的处置理由**换了**，因为它们原来的理由已经不成立 ——

@@ -187,14 +187,115 @@ def unique_installer(directory, version, product='Polaris'):
     regular(candidates[0]); return candidates[0]
 
 
+def cargo_directory(path):
+    path = Path(path)
+    require(path.is_absolute() and '..' not in path.parts, 'absolute canonical Cargo directory required')
+    for part in path.parts[1:]: validate_names([(part, False)])
+    for parent in [path, *path.parents]:
+        try: value = io_path(parent).lstat()
+        except FileNotFoundError: continue
+        require(stat.S_ISDIR(value.st_mode) and not (getattr(value, 'st_file_attributes', 0) & 0x400),
+                'link/reparse Cargo directory: ' + str(parent))
+    return path
+
+
+def directory_id(path):
+    value = io_path(cargo_directory(path)).stat()
+    return [value.st_dev, value.st_ino]
+
+
+def cargo_output(argv, root, *, timeout=30):
+    output = bytearray()
+    stream_child(argv, output.extend, MAX_LISTING, timeout=timeout, cwd=root)
+    return output.decode('utf-8', errors='strict')
+
+
+def cargo_tool(path):
+    # Rustup's normal Cargo proxy may have several links. This build-tool
+    # identity does not relax the produced App's sole-known-alias rule.
+    path = Path(path).absolute()
+    before = app_identity(io_path(path).stat())
+    require(stat.S_ISREG(before[2]) and 0 < before[4] <= MAX_FILE, 'regular bounded Cargo executable required')
+    with io_path(path).open('rb') as stream:
+        held = app_identity(os.fstat(stream.fileno()))
+        require(app_object_identity(held) == app_object_identity(before), 'Cargo executable replaced before open')
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        require(app_identity(os.fstat(stream.fileno())) == held, 'Cargo executable changed while reading')
+    require(app_identity(io_path(path).stat()) == before, 'Cargo executable changed')
+    return {'path': str(path), 'identity': list(before), 'sha256': digest}
+
+
+def cargo_context(root, target=None):
+    """Resolve Cargo's actual workspace/package/output, never guess an App path."""
+    executable = os.environ.get('CARGO') or shutil.which('cargo')
+    require(executable, 'normal Cargo executable missing')
+    tool = cargo_tool(executable)
+    version = cargo_output([tool['path'], '-vV'], root)
+    require(version.startswith('cargo ') and '\nhost: x86_64-pc-windows-msvc\n' in version,
+            'native x64 Windows Cargo required')
+    target = target or os.environ.get('CARGO_BUILD_TARGET')
+    require(target in (None, 'x86_64-pc-windows-msvc'), 'only the actual native Windows target is supported')
+    manifest = regular(root / 'src-tauri/Cargo.toml')
+    metadata = json.loads(cargo_output([tool['path'], 'metadata', '--no-deps', '--format-version=1',
+                                      '--locked', '--offline', '--manifest-path', str(manifest)], root / 'src-tauri'))
+    packages = [p for p in metadata['packages'] if Path(p['manifest_path']) == manifest]
+    require(Path(metadata['workspace_root']) == root and len(packages) == 1, 'foreign Cargo workspace/manifest')
+    package = packages[0]
+    require(package['id'] in metadata['workspace_members'] and package['name'] == 'polaris', 'foreign Cargo package')
+    require(package['version'] == json.loads(io_path(regular(root / 'src-tauri/tauri.conf.json')).read_bytes())['version'],
+            'Cargo/App version differs')
+    binaries = [t for t in package['targets'] if t['name'] == 'polaris' and t['kind'] == ['bin']]
+    require(len(binaries) == 1 and Path(binaries[0]['src_path']) == regular(root / 'src-tauri/src/main.rs'),
+            'foreign Cargo binary target')
+    directory = cargo_directory(metadata['target_directory'])
+    require(directory != root and not root.is_relative_to(directory), 'Cargo target overlaps source root')
+    # Check the configured spelling before a normalized metadata path could
+    # conceal a junction. Ordinary relative CARGO_TARGET_DIR remains supported.
+    configured = os.environ.get('CARGO_TARGET_DIR')
+    if configured:
+        raw = Path(configured)
+        raw = raw if raw.is_absolute() else root / 'src-tauri' / raw
+        for parent in [raw, *raw.parents]:
+            try: value = io_path(parent).lstat()
+            except FileNotFoundError: continue
+            require(not stat.S_ISLNK(value.st_mode) and not (getattr(value, 'st_file_attributes', 0) & 0x400),
+                    'link/reparse configured Cargo target')
+    release = directory / target / 'release' if target else directory / 'release'
+    inputs = {str(p): facts(p) for p in [root / 'Cargo.toml', root / 'Cargo.lock', manifest]}
+    diff = subprocess.check_output(['git', '-C', str(root), 'diff', '--binary', 'HEAD', '--'], timeout=30)
+    source_diff = hashlib.sha256(diff.encode() if isinstance(diff, str) else diff).hexdigest()
+    for config_parent in [root / 'src-tauri', root, *root.parents]:
+        for name in ('config', 'config.toml'):
+            config = config_parent / '.cargo' / name
+            if io_path(config).exists() or io_path(config).is_symlink(): inputs[str(config)] = facts(config)
+    cargo_home = os.environ.get('CARGO_HOME') or str(Path.home() / '.cargo')
+    for name in ('config', 'config.toml'):
+        config = Path(cargo_home) / name
+        if io_path(config).exists() or io_path(config).is_symlink(): inputs[str(config)] = facts(config)
+    # Freeze the only supported native target's inputs too. Iterating existing
+    # keys preserves absent versus present-empty, including TAURI_CONFIG.
+    environment = {k: v for k, v in os.environ.items() if k.startswith(
+                   ('CARGO_PROFILE_', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_')) or k in
+                   ('CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET', 'RUSTC', 'RUSTC_WRAPPER',
+                    'RUSTC_WORKSPACE_WRAPPER', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'TAURI_CONFIG')}
+    require(cargo_tool(tool['path']) == tool, 'Cargo tool changed during metadata')
+    return {'tool': tool, 'version': version, 'packageId': package['id'], 'manifest': str(manifest),
+            'binarySource': binaries[0]['src_path'], 'inputs': inputs, 'sourceDiffSha256': source_diff, 'environment': environment,
+            'targetDirectory': str(directory), 'target': target, 'releaseDirectory': str(release), 'profile': 'release'}
+
+
 def prepare(root):
     tool, version = find_sevenzip()
     inventory, sources = verified_sources(root)
-    release = root / 'target/release'; io_path(release).mkdir(parents=True, exist_ok=True)
+    context = cargo_context(root, os.environ.get('POLARIS_WINDOWS_PACKAGE_TARGET'))
+    release = cargo_directory(context['releaseDirectory']); io_path(release).mkdir(parents=True, exist_ok=True)
+    require(directory_id(release)[0] == directory_id(root)[0], 'Cargo release/publication must share a filesystem for atomic retention')
     # Never delete somebody else's output. Quarantine only these two fixed owned
     # workflow output namespaces, under a fresh same-filesystem temporary owner.
     owner = release / Path(tempfile.mkdtemp(prefix='.polaris-package-', dir=io_path(release))).name
-    state = {'schema': 'polaris-windows-package-input-v1', 'owner': str(owner), 'root': str(root),
+    state = {'schema': 'polaris-windows-package-input-v2', 'owner': str(owner), 'root': str(root), 'cargo': context,
+             'targetIdentity': directory_id(context['targetDirectory']), 'releaseIdentity': directory_id(release),
+             'ownerIdentity': directory_id(owner),
              'sevenzip': tool, 'sevenzipVersion': version, 'resources': inventory, 'sources': sources,
              'version': json.loads(io_path(root / 'src-tauri/tauri.conf.json').read_bytes())['version'],
              'candidate': subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()}
@@ -209,20 +310,31 @@ def prepare(root):
     state['retainedPreviousOutputBytes'] = retained_bytes
     state_path = owner / 'state.json'
     io_path(state_path).write_text(json.dumps(state, indent=2) + '\n', encoding='utf-8')
-    require(os.environ.get('GITHUB_ENV'), 'workflow environment output required')
-    with open(io_path(os.environ['GITHUB_ENV']), 'a', encoding='utf-8') as env:
-        env.write('POLARIS_WINDOWS_PACKAGE_STATE=' + str(state_path) + '\n')
+    if os.environ.get('GITHUB_ENV'):
+        with open(io_path(os.environ['GITHUB_ENV']), 'a', encoding='utf-8') as env:
+            env.write('POLARIS_WINDOWS_PACKAGE_STATE=' + str(state_path) + '\n')
+    print('POLARIS_WINDOWS_PACKAGE_STATE=' + str(state_path))
     print('static NSIS reader:', tool, version, '; fresh output namespaces; frozen resources:', len(inventory))
 
 
 def load_state(root):
     path = regular(os.environ['POLARIS_WINDOWS_PACKAGE_STATE'])
     state = json.loads(io_path(path).read_bytes())
-    require(state['schema'] == 'polaris-windows-package-input-v1' and state['root'] == str(root)
-            and path.parent == Path(state['owner']) and path.parent.parent == root / 'target/release'
+    require(isinstance(state, dict) and state.get('schema') == 'polaris-windows-package-input-v2'
+            and isinstance(state.get('cargo'), dict), 'foreign package state')
+    context = cargo_context(root, state['cargo']['target'])
+    release = cargo_directory(context['releaseDirectory'])
+    require(state['schema'] == 'polaris-windows-package-input-v2' and state['root'] == str(root)
+            and path.parent == Path(state['owner']) and path.parent.parent == release
             and path.parent.name.startswith('.polaris-package-'), 'foreign package state')
-    current, _ = verified_sources(root)
-    require(current == state['resources'], 'source resources changed after pre-build freeze')
+    require(state['cargo'] == context, 'Cargo context changed')
+    target_id = directory_id(context['targetDirectory'])
+    release_id = directory_id(release)
+    owner_id = directory_id(path.parent)
+    require(target_id == state['targetIdentity'] and release_id == state['releaseIdentity'] and owner_id == state['ownerIdentity'],
+            'Cargo context or owned namespace changed')
+    current, sources = verified_sources(root)
+    require(current == state['resources'] and sources == state['sources'], 'source resources changed after pre-build freeze')
     head = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
     require(head == state['candidate'], 'candidate changed during bundling')
     require(json.loads(io_path(root / 'src-tauri/tauri.conf.json').read_bytes())['version'] == state['version'], 'App version changed')
@@ -296,7 +408,7 @@ def nsis_listing(text):
     return records
 
 
-def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MAX_STDERR):
+def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MAX_STDERR, cwd=None):
     """Drain both pipes with bounded queues; the caller sees only quota-safe blocks.
 
     Threads only read pipes. The parent alone checks budgets/writes files. All
@@ -307,7 +419,7 @@ def stream_child(argv, consume_stdout, stdout_limit, *, timeout, stderr_limit=MA
             'invalid child output/deadline budget')
     deadline = time.monotonic() + timeout
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, bufsize=0)
+                               stderr=subprocess.PIPE, bufsize=0, cwd=cwd)
     messages = queue.Queue(maxsize=4); stop = threading.Event()
     stderr = bytearray(); stdout_bytes = 0; ended = set()
     def publish(message):
@@ -490,14 +602,14 @@ def build_portable(root, state, app, destination):
 
 
 def verify_generated_script(root, state):
-    script = regular(root / 'target/release/nsis/x64/installer.nsi')
+    script = regular(Path(state['cargo']['releaseDirectory']) / 'nsis/x64/installer.nsi')
     text = io_path(script).read_text(encoding='utf-8-sig')
     def define(name):
         values = re.findall(r'^!define ' + name + r' "([^"\r\n]+)"\s*$', text, re.MULTILINE)
         require(len(values) == 1, 'generated NSIS define must be unique: ' + name)
         return values[0]
     require(define('VERSION') == state['version'] and define('MAINBINARYNAME') == 'polaris', 'NSIS source/version differs')
-    app_source, _ = cargo_app_identity(root)
+    app_source, _ = cargo_app_identity(root, state)
     require(Path(define('MAINBINARYSRCPATH')).absolute() == app_source.absolute(), 'NSIS main input differs')
     sections = re.findall(r'^Section Install\s*$(.*?)^SectionEnd\s*$', text, re.MULTILINE | re.DOTALL)
     require(len(sections) == 1, 'unique normal NSIS install section required')
@@ -516,9 +628,9 @@ def verify_generated_script(root, state):
     return facts(script)
 
 
-def cargo_app_identity(root):
+def cargo_app_identity(root, state=None):
     """Admit only the fixed Cargo output and its sole known deps hardlink."""
-    app_path = root / 'target/release/polaris.exe'
+    app_path = (Path(state['cargo']['releaseDirectory']) if state is not None else root / 'target/release') / 'polaris.exe'
     for path in [app_path, *app_path.parents]:
         value = io_path(path).lstat()
         require(not stat.S_ISLNK(value.st_mode) and not (getattr(value, 'st_file_attributes', 0) & 0x400),
@@ -548,14 +660,14 @@ def app_object_identity(identity):
     return (*identity[:2], stat.S_IFMT(identity[2]), *identity[3:6])
 
 
-def compiled_app(root, *, staging=None):
-    app_path, identity = cargo_app_identity(root)
+def compiled_app(root, *, staging=None, state=None):
+    app_path, identity = cargo_app_identity(root, state)
     with io_path(app_path).open('rb') as stream:
         fd_identity = app_identity(os.fstat(stream.fileno()))
         require(app_object_identity(fd_identity) == app_object_identity(identity), 'Cargo App replaced before read')
         app = stream.read(MAX_FILE + 1)
         require(app_identity(os.fstat(stream.fileno())) == fd_identity, 'Cargo App changed while reading')
-    require(cargo_app_identity(root)[1] == identity and len(app) == identity[4], 'Cargo App path changed while reading')
+    require(cargo_app_identity(root, state)[1] == identity and len(app) == identity[4], 'Cargo App path changed while reading')
     pin = io_path(regular(root / 'resources/win/core-manifest.json')).read_bytes()
     require(app.count(pin) == 1, 'App must embed the exact frozen selected manifest once')
     if staging is not None:
@@ -565,7 +677,7 @@ def compiled_app(root, *, staging=None):
         with io_path(app_path).open('xb') as stream:
             stream.write(app); stream.flush(); os.fsync(stream.fileno())
         require(facts(app_path) == byte_facts(app), 'private compiled App snapshot differs')
-        require(cargo_app_identity(root)[1] == identity, 'Cargo App changed during private staging')
+        require(cargo_app_identity(root, state)[1] == identity, 'Cargo App changed during private staging')
     return app_path, app
 
 
@@ -587,19 +699,54 @@ def tauri_identity(root):
     return {'entry': executable, 'version': actual}
 
 
+def cargo_release_artifact(root, state):
+    """Obtain an actual Cargo artifact event, not a caller-supplied transcript.
+
+    The standard release build normally reuses Tauri's completed build. A cache
+    miss is a real release build, never permission to relabel a debug binary.
+    Bundled bytes must still equal this exact result, or assembly fails closed.
+    """
+    context = state['cargo']
+    require(cargo_context(root, context['target']) == context, 'Cargo context changed before release proof')
+    require(os.environ.get('POLARIS_BUILD_ID', state['candidate']) == state['candidate'], 'foreign App BUILD_ID')
+    argv = [context['tool']['path'], 'build', '--release', '--locked', '--offline',
+            '--manifest-path', context['manifest'], '--package', context['packageId'], '--bin', 'polaris',
+            '--features', 'tauri/custom-protocol', '--message-format=json']
+    if context['target']: argv.extend(['--target', context['target']])
+    output = cargo_output(argv, root / 'src-tauri', timeout=180)
+    events = [json.loads(line) for line in output.splitlines() if line.strip()]
+    artifacts = [row for row in events if row.get('reason') == 'compiler-artifact'
+                 and row.get('target', {}).get('name') == 'polaris' and row['target'].get('kind') == ['bin']]
+    require(len(artifacts) == 1 and events[-1] == {'reason': 'build-finished', 'success': True},
+            'unique successful Cargo App artifact required')
+    row = artifacts[0]; profile = row['profile']
+    expected, identity = cargo_app_identity(root, state)
+    require(row['package_id'] == context['packageId'] and Path(row['manifest_path']) == Path(context['manifest'])
+            and Path(row['target']['src_path']) == Path(context['binarySource'])
+            and Path(row['executable']) == expected and str(expected) in row['filenames']
+            and profile['test'] is False and profile['debug_assertions'] is False
+            and profile['opt_level'] in ('1', '2', '3', 's', 'z'), 'foreign/debug Cargo App artifact')
+    require(cargo_context(root, context['target']) == context, 'Cargo context changed during release proof')
+    load_state(root)
+    return {'argv': argv, 'artifact': row, 'identity': list(identity)}
+
+
 def assemble(root):
     state = load_state(root)
-    source_path, source_identity = cargo_app_identity(root)
+    release = cargo_release_artifact(root, state)
+    state['cargoArtifact'] = release
+    source_path, source_identity = cargo_app_identity(root, state)
+    require(list(source_identity) == release['identity'], 'Cargo release artifact replaced')
     with tempfile.TemporaryDirectory(prefix='compiled-app-', dir=io_path(state['owner'])) as stage:
-        app_path, app = compiled_app(root, staging=Path(stage))
-        require(cargo_app_identity(root)[1] == source_identity, 'Cargo input changed before inspection')
+        app_path, app = compiled_app(root, staging=Path(stage), state=state)
+        require(cargo_app_identity(root, state)[1] == source_identity, 'Cargo input changed before inspection')
         assemble_carriers(root, state, app_path, app, source_path, source_identity)
 
 
 def assemble_carriers(root, state, app_path, app, source_path, source_identity):
     cli = tauri_identity(root)
     generated_script = verify_generated_script(root, state)
-    raw = unique_installer(root / 'target/release/bundle/nsis', state['version'])
+    raw = unique_installer(Path(state['cargo']['releaseDirectory']) / 'bundle/nsis', state['version'])
     artifact_before = facts(raw)
     with tempfile.TemporaryDirectory(prefix='nsis-', dir=io_path(state['owner'])) as tmp:
         observed = nsis_inventory(root, state['sevenzip'], raw, carrier_inventory(state, app, 'nsis'), Path(tmp))
@@ -612,7 +759,7 @@ def assemble_carriers(root, state, app_path, app, source_path, source_identity):
     build_portable(root, state, app, portable)
     load_state(root)
     require(facts(app_path) == byte_facts(app), 'App changed during carrier inspection')
-    require(cargo_app_identity(root)[1] == source_identity, 'Cargo App changed during carrier inspection')
+    require(cargo_app_identity(root, state)[1] == source_identity, 'Cargo App changed during carrier inspection')
     evidence = root / 'windows-package-evidence'; io_path(evidence).mkdir(exist_ok=True)
     receipt = {'schema': 'polaris-windows-static-carriers-v1', 'candidate': state['candidate'],
                'ownedStage': {'path': state['owner'], 'retainedPreviousOutputBytes': state['retainedPreviousOutputBytes'],
@@ -621,7 +768,7 @@ def assemble_carriers(root, state, app_path, app, source_path, source_identity):
                'sourceResources': state['resources'], 'sourceApp': byte_facts(app), 'generatedNSISScript': generated_script,
                'compiledAppInput': {'sourcePath': str(source_path), 'sourceIdentity': list(source_identity),
                                     'privateSingleLinkSnapshot': byte_facts(app)},
-               'tauriCLI': cli,
+               'tauriCLI': cli, 'cargoContext': state['cargo'], 'cargoArtifact': state['cargoArtifact'],
                'nsisExpected': carrier_inventory(state, app, 'nsis'), 'nsisObserved': observed,
                'portableExpected': carrier_inventory(state, app, 'zip'),
                'portableObserved': zip_inventory(portable, carrier_inventory(state, app, 'zip')),
@@ -632,9 +779,15 @@ def assemble_carriers(root, state, app_path, app, source_path, source_identity):
 
 
 def verify_existing_zip(root, archive):
-    resources, _ = verified_sources(root)
-    _, app = compiled_app(root)
-    return zip_inventory(archive, carrier_inventory({'resources': resources}, app, 'zip'))
+    state = load_state(root)
+    _, app = compiled_app(root, state=state)
+    _, identity = cargo_app_identity(root, state)
+    receipt = json.loads(io_path(regular(root / 'windows-package-evidence/static-carriers.json')).read_bytes())
+    require(receipt['candidate'] == state['candidate'] and receipt['cargoContext'] == state['cargo']
+            and receipt['sourceApp'] == byte_facts(app)
+            and receipt['cargoArtifact']['identity'] == list(identity),
+            'Cargo release input changed after carrier assembly')
+    return zip_inventory(archive, carrier_inventory(state, app, 'zip'))
 
 
 def contract(root, *, source_text=None, workflow_text=None):
@@ -699,10 +852,13 @@ def contract(root, *, source_text=None, workflow_text=None):
     required_edges = {
         'source_inventory': {'require_legal_resources'},
         'verified_sources': {'source_inventory'},
-        'prepare': {'verified_sources', 'find_sevenzip'},
-        'load_state': {'verified_sources'},
-        'assemble': {'load_state', 'cargo_app_identity', 'compiled_app', 'assemble_carriers'},
-        'assemble_carriers': {'tauri_identity', 'nsis_inventory', 'carrier_inventory', 'build_portable', 'zip_inventory', 'cargo_app_identity'},
+        'prepare': {'verified_sources', 'find_sevenzip', 'cargo_context', 'directory_id'},
+        'load_state': {'verified_sources', 'cargo_context', 'directory_id'},
+        'assemble': {'load_state', 'cargo_release_artifact', 'cargo_app_identity', 'compiled_app', 'assemble_carriers'},
+        'cargo_release_artifact': {'cargo_context', 'cargo_output', 'cargo_app_identity', 'load_state'},
+        'assemble_carriers': {'tauri_identity', 'verify_generated_script', 'nsis_inventory', 'carrier_inventory', 'build_portable', 'zip_inventory', 'cargo_app_identity'},
+        'verify_generated_script': {'cargo_app_identity'},
+        'verify_existing_zip': {'load_state', 'compiled_app', 'cargo_app_identity', 'zip_inventory'},
         'tauri_identity': {'tauri_command'},
         'build_portable': {'carrier_inventory', 'exact', 'zip_inventory'},
         'zip_inventory': {'exact'},
@@ -771,7 +927,15 @@ def contract(root, *, source_text=None, workflow_text=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['prepare', 'assemble', 'contract'])
+    parser.add_argument('--state', help='owned state printed by prepare; replaces the workflow environment lookup')
+    parser.add_argument('--target', choices=['x86_64-pc-windows-msvc'], help='actual native Cargo build target used by Tauri')
     args = parser.parse_args()
+    if args.state:
+        require(args.action == 'assemble', '--state is only valid for assemble')
+        os.environ['POLARIS_WINDOWS_PACKAGE_STATE'] = args.state
+    if args.target:
+        require(args.action == 'prepare', '--target is only valid for prepare')
+        os.environ['POLARIS_WINDOWS_PACKAGE_TARGET'] = args.target
     result = {'prepare': prepare, 'assemble': assemble, 'contract': contract}[args.action](ROOT)
     if args.action == 'contract': print(json.dumps(result, sort_keys=True))
 

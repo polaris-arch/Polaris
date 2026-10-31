@@ -1,6 +1,6 @@
 {
   "coreRecovery": {
-    "intro": "僅還原目前應用程式的可信隨附資料，不會補足目前環境缺少的執行支援。請先中斷連線；不會自動安裝助手或重新連線。",
+    "intro": "中斷連線後還原隨附資料；不會補足執行支援、安裝助手或自動重連。",
     "check": "檢查離線還原",
     "working": "正在驗證或還原，請稍候…",
     "ready": "隨附還原資料已通過驗證。重設時會再次檢查；執行支援仍單獨驗證，不會自動連線。",
@@ -112,7 +112,7 @@
     "checkYes": "是",
     "checkNo": "否",
     "checkUnknown": "未知／未觀測",
-    "checkScope": "選定核心驗證針對本應用程式所需的已安裝內容，不代表目前正在執行的核心身分，也不證明連線已建立。",
+    "checkScope": "僅核驗已安裝內容，不代表執行身分或連線狀態。",
     "diagnosticsTitle": "助手與核心診斷",
     "coreDiagnosticsTitle": "選定核心身分診斷",
     "diagnosticsScope": "複製內容僅含服務狀態、協定數字及內容／建置身分，不含訂閱、憑證、使用者路徑或原始日誌。",
@@ -128,7 +128,8 @@
     "restoreOfflineAction": "離線恢復配套核心",
     "recoveryPartial": "應用核心已恢復，提權助手修復尚未完成。請重試修復；代理未自動重連。",
     "recoveryUserUnsupported": "此平台的提權助手修復無法恢復應用私有核心。如有需要，請重新安裝可信的同版應用。",
-    "recoveryPending": "核心恢復尚未完成或收尾未確認。請重試修復；原件與恢復記錄已保留。"
+    "recoveryPending": "核心恢復尚未完成或收尾未確認。請重試修復；原件與恢復記錄已保留。",
+    "coreAdmissionSupportHint": "需要支援此環境的應用版本，修復助手無法解決。"
   },
   "proxy": {
     "systemProxyResidualDesc": "TUN 模式下偵測到系統代理仍開啟（{{proxy}}），它不是 Polaris 設定的，可能導致連線異常。如非必要建議關閉。",
@@ -2358,7 +2359,7 @@
     "selectedPrefix": "已選 ",
     "selectedSuffix": " 個",
     "sort": {
-      "default": "預設順序",
+      "default": "匯入順序",
       "latency": "延遲",
       "name": "名稱",
       "protocol": "協定"
@@ -2492,7 +2493,9 @@
     "mobileSortName": "名稱",
     "mobileSortProtocol": "協定",
     "deleteConfirmMobile": "確定刪除節點 \"{{name}}\" 嗎？此操作無法復原。",
-    "batchDeleteConfirmMobile": "確定刪除選取的 {{count}} 個節點嗎？此操作無法復原。"
+    "batchDeleteConfirmMobile": "確定刪除選取的 {{count}} 個節點嗎？此操作無法復原。",
+    "locateCurrent": "定位目前",
+    "locateCurrentHint": "清除篩選並定位目前節點"
   },
   "procPick": {
     "empty": "暫無程序資料，請重新整理再試",

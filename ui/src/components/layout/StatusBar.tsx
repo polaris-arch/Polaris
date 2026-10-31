@@ -18,7 +18,7 @@ import { MeasurementLabel } from '@/mobile/MeasurementLabel';
  *  - 上下行速率 + 连接数：statsApi 'stats' topic（EVENT_STATS_UPDATED → TrafficStats）。
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { createTopicSubscription } from '@/lib/topic-subscription';
@@ -106,6 +106,10 @@ export default function StatusBar() {
    *  向全部 webview 发同一帧保证（见 App.tsx 该订阅处注释），不靠本组件。 */
   const ipInfo = useAppStore((s) => s.ipInfo);
   const [stats, setStats] = useState<TrafficStats | null>(null);
+  const statsConnection = useRef(connected);
+  statsConnection.current = connected;
+  // A reconnect/new process must wait for a fresh observation, never revive the prior rates.
+  useEffect(() => { setStats(null); }, [connected, proxyStatus?.startTime]);
 
   /** 当前出口延迟：从**全局** latencyMap 按 selectedServerId 取（订阅挂 App.tsx 顶层）。
    *  切节点自然得到新 id 的值、未测过则 `undefined`（显「—」）——旧实现的「切节点手动清空」由
@@ -132,7 +136,7 @@ export default function StatusBar() {
         subscribe: () => api.stats.subscribe('stats'),
         unsubscribe: () => api.stats.unsubscribe('stats'),
       },
-      setStats
+      (frame) => { if (statsConnection.current) setStats(frame); }
     );
     sub.setWanted(true);
     return () => sub.dispose();
@@ -222,21 +226,18 @@ export default function StatusBar() {
         {showLatency && selectedServerId ? <MeasurementLabel serverId={selectedServerId} purpose="current" compact /> : latency}
       </span>
 
-      {/* 速率/连接数**仅连接态**显示（契约「状态栏」：`实时速率/连接数(仅连接态)`）。断开时这两个数
-          只会是上一帧的残留或恒 0——把「没有数据面」画成「0 B/s · 0 连接」，读起来像「代理在跑只是没流量」，
-          与「根本没在跑」是两回事。整块不渲染，右侧留白即诚实。 */}
-      {connected && (
-        <span className="sb-count sb-i">
-          <span className="rate-dn">↓ {rateDn}</span>
-          &nbsp;
-          <span className="rate-up">↑ {rateUp}</span>
-          <span className="sb-sep" style={{ margin: '0 4px' }} />
-          <span className="sb-conns">
-            <SbConnsIcon className="w-[13px] h-[13px]" />
-            <b>{conns}</b>
-          </span>
+      {/* Keep the stable rate slots. Disconnected/unknown observations are placeholders,
+          never stale rates or fabricated zero traffic. */}
+      <span className="sb-count sb-i" data-stats-available={connected && stats !== null}>
+        <span className="rate-dn">↓ {connected && stats ? rateDn : '—'}</span>
+        {' '}
+        <span className="rate-up">↑ {connected && stats ? rateUp : '—'}</span>
+        <span className="sb-sep" style={{ margin: '0 4px' }} />
+        <span className="sb-conns">
+          <SbConnsIcon className="w-[13px] h-[13px]" />
+          <b>{connected && stats ? conns : '—'}</b>
         </span>
-      )}
+      </span>
     </div>
   );
 }

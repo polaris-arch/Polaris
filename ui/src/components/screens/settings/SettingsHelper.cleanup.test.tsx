@@ -230,10 +230,11 @@ it.each(['UnsupportedExactObject','UnsupportedCapability','LoaderPolicy','Busy',
   expect(nodes(tree).some(n=>n.props['data-s']==='needs-repair')).toBe(false);
   expect(nodes(tree).filter(n=>typeof n.props.onClick==='function').map(n=>text(n.props.children))).not.toContain('helper.repairAction');
   expect(helperApi.install).not.toHaveBeenCalled();
-  if(admission==='UnsupportedCapability') {
+  if(['UnsupportedExactObject','UnsupportedCapability','LoaderPolicy'].includes(admission)) {
     click('settings.about.checkUpdate');
     const {useNavStore}=await import('@/store/nav-store');
     expect(useNavStore.getState().settingsScreen).toBe('update');
+    expect(helperApi.install).not.toHaveBeenCalled(); // Navigation never grants Helper repair or execution.
   } else {
     expect(nodes(tree).filter(n=>typeof n.props.onClick==='function').map(n=>text(n.props.children))).not.toContain('settings.about.checkUpdate');
   }

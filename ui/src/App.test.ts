@@ -531,6 +531,14 @@ describe('handleHelperUpgradeable（提权助手可升级 → 可操作 toast）
     expect(opts.actions[0].label).toBe('helper.upgradeToastAction');
   });
 
+  it.each(['UnsupportedExactObject', 'UnsupportedCapability', 'LoaderPolicy', 'Busy', 'Unknown'])('no upgrade-only toast for %s, without consuming the later actionable notice', (admission) => {
+    expect(handleHelperUpgradeable({ installed: true, upgradeable: true, selectedCore: { admission } }, t)).toBe(false);
+    expect(toastWarningMock).not.toHaveBeenCalled();
+    expect(handleHelperUpgradeable({ installed: true, upgradeable: true, selectedCore: { admission: 'Mismatch' } }, t)).toBe(true);
+    toastWarningMock.mock.calls[0][1].actions[0].onClick();
+    expect(useNavStore.getState().settingsScreen).toBe('helper');
+  });
+
   it('正面：点动作跳设置›助手页（与 HELPER_NOT_INSTALLED 的「去安装」同一个落点）', () => {
     expect(useNavStore.getState().scope).toBe('main');
     handleHelperUpgradeable({ installed: true, upgradeable: true }, t);
@@ -609,7 +617,7 @@ describe('接线门：可升级提示挂在全局事件订阅层（订阅 + 挂�
   it('两条腿都在同一个 effect 里：事件订阅 + 挂载即回读一次', () => {
     const body = sliceApp(
       '    const check = () =>',
-      '  }, [t]);',
+      '  }, [privacyMode, t]);',
     );
     // 用正则而不是 `toContain`：这条链被换行折成了多行，写死单行字面量的断言会在下一次
     // 换行位置变动时假红（判据是「调了谁」，不是「怎么排版」）。
@@ -624,7 +632,7 @@ describe('接线门：可升级提示挂在全局事件订阅层（订阅 + 挂�
     expect(body, '回读失败静默（后端未就绪的启动窗口里弹 toast 是噪音）').toContain(
       '.catch(() => undefined)'
     );
-    expect(body, 'effect 必须返回退订闭包，否则 App 重挂后订阅泄漏').toContain('return off;');
+    expect(body, 'effect 必须返回退订闭包，否则 App 重挂后订阅泄漏').toContain('active = false; off();');
   });
 
   it('不新增 IPC 命令：只用既有的 helper 通道（`helper_get_status` 早已返回 upgradeable）', () => {

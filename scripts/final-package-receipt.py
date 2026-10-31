@@ -327,7 +327,7 @@ def reject_local_selection(artifact):
     Reuse the Windows carrier reader's bounded child/namespace budgets. The
     native-proof mode below retains its original context and execution gates.
     """
-    import time, tarfile
+    import time, tarfile, posixpath
     spec = importlib.util.spec_from_file_location('selection_integrity', Path(__file__).with_name('windows-package-integrity.py'))
     integrity = importlib.util.module_from_spec(spec); spec.loader.exec_module(integrity)
     marker = b'POLARIS_SELECTION_LOCAL_DEVELOPMENT_V1'
@@ -352,8 +352,21 @@ def reject_local_selection(artifact):
         emit(consume)
         require(expected is None or state['bytes'] == expected, 'formal executable member size differs')
         checked.append({'member': name, 'role': role(name), 'bytes': state['bytes'], 'sha256': digest.hexdigest()})
-    def paths(records):
-        integrity.validate_names([(name+'/' if row['kind']=='dir' else name, row['kind'] == 'dir') for name,row in records.items()])
+    def paths(records, linux=False):
+        if linux:
+            # Linux containers retain case-distinct names, regardless of the
+            # reader's host OS. Keep every existing per-name safety check;
+            # only the namespace comparison must not use its Windows fold.
+            require(len(records) <= integrity.MAX_MEMBERS, 'member count budget exceeded')
+            seen = {}; ancestors = set()
+            for name, row in records.items():
+                directory = row['kind'] == 'dir'
+                windows_zip_key(name+'/' if directory else name, directory)
+                seen[name] = directory
+                ancestors.update('/'.join(name.split('/')[:i]) for i in range(1, len(name.split('/'))))
+            require(all(seen.get(parent, True) for parent in ancestors), 'formal archive file/directory alias collision')
+        else:
+            integrity.validate_names([(name+'/' if row['kind']=='dir' else name, row['kind'] == 'dir') for name,row in records.items()])
         require(sum(row.get('bytes', 0) for row in records.values()) <= integrity.MAX_TOTAL, 'formal archive expanded budget exceeded')
         result = []
         for name in records:
@@ -401,9 +414,11 @@ def reject_local_selection(artifact):
                 kind = 'dir' if member.isdir() else 'link' if member.issym() or member.islnk() else 'file' if member.isfile() else None
                 require(kind is not None, 'formal tar nonregular member')
                 target = member.linkname
-                if member.islnk(): target = os.path.relpath(target, str(PurePosixPath(name).parent)).replace('\\','/')
+                if member.islnk():
+                    require(not target.startswith('/') and '\\' not in target, 'formal executable link escapes archive')
+                    target = posixpath.relpath(target, str(PurePosixPath(name).parent))
                 record(records,name,{'kind':kind,'bytes':member.size,'target':target}); originals[name]=member
-            for name,target,size in paths(records):
+            for name,target,size in paths(records, linux=True):
                 def emit(consume,target=target):
                     with archive.extractfile(originals[target]) as stream: copy_stream(stream,consume)
                 observe(name,emit,size)
@@ -419,7 +434,7 @@ def reject_local_selection(artifact):
             name=name[len('squashfs-root/'):];target=''
             if line[0]=='l':name,target=name.split(' -> ',1)
             record(records,name,{'kind':{'d':'dir','l':'link','-':'file'}[line[0]],'bytes':int(fields[2]),'target':target})
-        for name,target,size in paths(records):
+        for name,target,size in paths(records, linux=True):
             observe(name,lambda consume,target=target:integrity.stream_child(['unsquashfs','-cat','-offset',offset,str(path),target],consume,integrity.MAX_FILE,timeout=remaining()),size)
     def scan_sevenzip(path, temporary, depth=0):
         tool,_version=integrity.find_sevenzip(timeout=min(30,remaining()))

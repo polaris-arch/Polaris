@@ -1,6 +1,6 @@
 {
   "coreRecovery": {
-    "intro": "Restore only trusted data bundled with this app. This cannot add missing execution support. Disconnect first; Helper will not be installed and the app will not reconnect.",
+    "intro": "Disconnect before restoring bundled data. This does not add runtime support, install the Helper or reconnect.",
     "check": "Check offline recovery",
     "working": "Checking or restoring. Please wait…",
     "ready": "Bundled recovery data was verified and will be checked again before reset. Execution support remains a separate check; the app will not reconnect.",
@@ -112,7 +112,7 @@
     "checkYes": "Yes",
     "checkNo": "No",
     "checkUnknown": "Unknown / not observed",
-    "checkScope": "The selected core check covers installed content for this app. It does not identify a currently running core or prove a connection is active.",
+    "checkScope": "Verifies installed content, not the running identity or connection.",
     "diagnosticsTitle": "Helper and core diagnostics",
     "coreDiagnosticsTitle": "Selected core identity diagnostics",
     "diagnosticsScope": "Copy includes only service status, protocol numbers and content/build identities. It excludes subscriptions, credentials, user paths and raw logs.",
@@ -128,7 +128,8 @@
     "restoreOfflineAction": "Restore bundled core offline",
     "recoveryPartial": "The app core was restored. Helper repair did not finish. Retry repair; no proxy was reconnected.",
     "recoveryUserUnsupported": "Helper repair does not restore the app’s private core on this platform. Reinstall this trusted app version if needed.",
-    "recoveryPending": "Core recovery is unfinished or its cleanup is unconfirmed. Retry repair; retained originals and recovery records have been preserved."
+    "recoveryPending": "Core recovery is unfinished or its cleanup is unconfirmed. Retry repair; retained originals and recovery records have been preserved.",
+    "coreAdmissionSupportHint": "An app version supporting this environment is required. Repairing the Helper will not resolve this."
   },
   "proxy": {
     "systemProxyResidualDesc": "A system proxy is still enabled ({{proxy}}) in TUN mode. It wasn't set by Polaris and may cause connection issues. Consider disabling it unless you need it.",
@@ -2358,7 +2359,7 @@
     "selectedPrefix": "",
     "selectedSuffix": " selected",
     "sort": {
-      "default": "Default order",
+      "default": "Import order",
       "latency": "Latency",
       "name": "Name",
       "protocol": "Protocol"
@@ -2492,7 +2493,9 @@
     "mobileSortName": "Name",
     "mobileSortProtocol": "Protocol",
     "deleteConfirmMobile": "Delete the node \"{{name}}\"? This cannot be undone.",
-    "batchDeleteConfirmMobile": "Delete the {{count}} selected nodes? This cannot be undone."
+    "batchDeleteConfirmMobile": "Delete the {{count}} selected nodes? This cannot be undone.",
+    "locateCurrent": "Locate current",
+    "locateCurrentHint": "Clear filters and locate the current node"
   },
   "procPick": {
     "empty": "No process data is available. Refresh to try again.",

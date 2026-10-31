@@ -24,6 +24,16 @@ describe('projectVisibleServers', () => {
     expect(projectVisibleServers(group(nodes), 'beta', 'vless', 'name', {})).toEqual([nodes[2]]);
   });
 
+  it('keeps node-number families together across case and numeric suffixes', () => {
+    const names = ['JP10', 'Jp01-MASQUE', 'JP02', 'JP01-H3', 'JP01'];
+    const nodes = names.map(name => server(name));
+    expect(projectVisibleServers(group(nodes), '', '', 'name', {}).map(node => node.name))
+      .toEqual(['JP01', 'JP01-H3', 'Jp01-MASQUE', 'JP02', 'JP10']);
+    // The explicit import-order option must still preserve the original persisted array.
+    expect(projectVisibleServers(group(nodes), '', '', 'default', {})).toEqual(nodes);
+    expect(nodes.map(node => node.name)).toEqual(names);
+  });
+
   it('sorts latency with missing measurements delegated to the domain comparator', () => {
     const nodes = [server('slow'), server('missing'), server('fast')];
 

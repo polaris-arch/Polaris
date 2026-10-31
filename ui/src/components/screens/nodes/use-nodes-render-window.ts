@@ -198,6 +198,7 @@ export function useNodesRenderWindow(params: {
     count: renderCount,
     onScroll: onGridScroll,
     renderAll: renderAllServers,
+    revealThrough,
   } = useScrollBatch(
     visibleServers.length,
     `${activeTab}\u0000${search}\u0000${protoFilter}\u0000${sortKey}`
@@ -323,5 +324,5 @@ export function useNodesRenderWindow(params: {
    */
   useIsomorphicLayoutEffect(topUpBatch);
 
-  return { visibleServers, renderedServers, gridRef };
+  return { visibleServers, renderedServers, gridRef, revealThrough };
 }

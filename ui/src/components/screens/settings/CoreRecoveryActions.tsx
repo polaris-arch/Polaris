@@ -42,8 +42,9 @@ export default function CoreRecoveryActions({ onRecovered }: { onRecovered?: (re
     }
   }
 
-  return <div data-core-recovery="current-app">
+  return <div className="core-recovery card-sub" data-core-recovery="current-app">
     <p role="status" aria-live="polite">{busy ? t('coreRecovery.working') : result ? resultLabels[result] : t('coreRecovery.intro')}</p>
+    <div className="feedback-notice-actions">
     {!busy && result === 'ready' && <Button
       variant="ghost" size="sm" className={armed === 'restore-core-data' ? 'confirming' : undefined}
       onClick={() => confirmTwice('restore-core-data', () => { void perform(true); })}
@@ -53,6 +54,7 @@ export default function CoreRecoveryActions({ onRecovered }: { onRecovered?: (re
     {!busy && result === 'helperRequired' &&
       <Button variant="ghost" size="sm" onClick={() => useNavStore.getState().enterSettings('helper')}>{t('coreRecovery.helper')}</Button>}
     {result !== 'restored' && result !== 'notNeeded' &&
-      <a href="#app-update-card">{t('coreRecovery.reinstall')}</a>}
+      <a className="btn ghost sm" href="#app-update-card">{t('coreRecovery.reinstall')}</a>}
+    </div>
   </div>;
 }

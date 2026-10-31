@@ -38,6 +38,7 @@ import { subscribeSpeedTestProgressToast } from './lib/speedtest-progress-toast'
 import { useSystemProxyLivePolling } from './store/use-system-proxy-live';
 import { api } from './ipc';
 import { helperApi, unlockApi } from './ipc/api-client';
+import { coreAdmissionIsDamage } from './domain/core-admission';
 import { toast } from './lib/error-handler';
 import { useIdlePrivacyLock } from './lib/use-idle-privacy-lock';
 import { initTooltips } from './lib/tooltip-engine';
@@ -123,12 +124,14 @@ function pullPendingChanges(): void {
  * 返回值 = **这次真的弹了吗**（供单测把「判定为假」与「被去重挡下」区分开；生产侧不消费）。
  */
 export function handleHelperUpgradeable(
-  status: { installed?: boolean; upgradeable?: boolean } | null | undefined,
+  status: { installed?: boolean; upgradeable?: boolean; selectedCore?: { admission?: string } } | null | undefined,
   t: (key: string) => string
 ): boolean {
   // 判据与后端 `startup_tasks::should_notify_helper_upgradeable` 同口径（`installed && upgradeable`）：
   // 未装是「去安装」轴（归起核门与 HomeScreen 的 HELPER_NOT_INSTALLED 分支），不是本腿的事。
   if (!status?.installed || !status.upgradeable) return false;
+  // A non-repairable execution refusal is not fixed by installing the Helper.
+  if (status.selectedCore?.admission && !coreAdmissionIsDamage(status.selectedCore.admission)) return false;
   if (!helperUpgradeToastGate()) return false;
   toast.warning(t('helper.statusUpgradeable'), {
     description: t('helper.upgradeDescCard'),
@@ -148,6 +151,7 @@ export default function App() {
   const refreshProxyStatus = useAppStore((s) => s.refreshProxyStatus);
   const servers = useAppStore((s) => s.servers);
   const config = useAppStore((s) => s.config);
+  const privacyMode = useAppStore((s) => s.privacyMode);
   /** 每个节点只记最后一个登录 URL，配置对账时同步驱逐，避免长会话按 URL 永久增长。 */
   const tsAuthSeen = useRef<Map<string, string>>(new Map());
 
@@ -610,15 +614,19 @@ export default function App() {
   // 回读失败 `.catch(() => undefined)` 静默：理由同 `SettingsHelper.tsx` —— 后端未就绪的正常启动
   // 窗口里弹 toast 是噪音，而这条提示本就不紧急（下次启动还会再判一次）。
   useEffect(() => {
+    // The shell deliberately unmounts Toaster while privacy is locked/hydrating.
+    // Wait for its real mount instead of consuming the once gate in console fallback.
+    if (privacyMode) return;
+    let active = true;
     const check = () =>
       void helperApi
         .getStatus()
-        .then((s) => handleHelperUpgradeable(s, t))
+        .then((s) => { if (active) handleHelperUpgradeable(s, t); })
         .catch(() => undefined);
     check();
     const off = helperApi.onUpgradeable(() => check());
-    return off;
-  }, [t]);
+    return () => { active = false; off(); };
+  }, [privacyMode, t]);
 
   // 订阅后台自动更新失败：scheduler 拉取失败此前**完全静默**（无日志/无事件/无 toast），用户不知订阅已
   // 停更。补一条**仅失败态** toast——对齐 上游 后台更新的静默度（上游 后台失败只入日志、不弹成功、不发系统

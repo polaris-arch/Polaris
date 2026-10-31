@@ -18,6 +18,8 @@ interface Props {
   sortKey: SortKey;
   setSortKey: (key: SortKey) => void;
   testVisible: () => void;
+  locateCurrent?: () => void;
+  canLocateCurrent?: boolean;
   testing: boolean;
   batchMode: boolean;
   setBatchMode: (v: boolean) => void;
@@ -37,6 +39,8 @@ export function NodesToolbar({
   sortKey,
   setSortKey,
   testVisible,
+  locateCurrent,
+  canLocateCurrent = false,
   testing,
   batchMode,
   setBatchMode,
@@ -109,6 +113,15 @@ export function NodesToolbar({
           { value: 'proto', label: t('nodes.sort.protocol') },
         ]}
       />
+
+      <button type="button" className="btn ghost sm" onClick={locateCurrent}
+        disabled={!canLocateCurrent} data-tip={t('nodes.locateCurrentHint')}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+          <circle cx="12" cy="12" r="6" /><circle cx="12" cy="12" r="2" />
+          <path d="M12 2v4m0 12v4M2 12h4m12 0h4" />
+        </svg>
+        <span>{t('nodes.locateCurrent')}</span>
+      </button>
 
       {/* 测的是搜索/协议筛选之后**你眼前这些**（∩ 可测集），不是整组。
           射程由 `data-tip` 说明承载，不写进按钮字面（陈先生 2026-07-29 裁定）。 */}

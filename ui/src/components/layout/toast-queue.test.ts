@@ -213,7 +213,7 @@ describe('接线还在：Toaster 用的是本模块的判定，没有就地复�
       /success: \(m, o\) => push\(m, 'ok', undefined, o\)/,
       /error: \(m, d, o\) => push\(m, 'err', d, o\)/,
       /info: \(m, o\) => push\(m, '', undefined, o\)/,
-      /warning: \(m, o\) => push\(m, '', undefined, o\)/,
+      /warning: \(m, o\) => push\(m, 'warn', undefined, o\)/,
     ]) {
       expect(toaster).toMatch(re);
     }

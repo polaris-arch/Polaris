@@ -1852,3 +1852,29 @@ body:has(.pending-bar.show) #toast-stack{
 .toast.dismissible .toast-desc{ max-height:35vh; overflow-y:auto; overflow-wrap:anywhere; }
 .toast.dismissible .toast-desc:focus-visible{ outline:2px solid currentColor; outline-offset:1px; }
 .toast.dismissible .toast-action{ max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+
+/* Shared warning language and compact read-only settings values. */
+.toast.warn{ background:hsl(var(--warn-weak)); color:hsl(var(--warn)); border-color:hsl(var(--warn)/.35); }
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]) .toast.warn{ background:hsl(var(--warn-weak)); color:hsl(var(--warn)); border-color:hsl(var(--warn)/.35); }
+}
+:root[data-theme="dark"] .toast.warn{ background:hsl(var(--warn-weak)); color:hsl(var(--warn)); border-color:hsl(var(--warn)/.35); }
+.feedback-notice.warning{ background:hsl(var(--warn-weak)); border-color:hsl(var(--warn)/.3); }
+.feedback-notice.warning .feedback-notice-title{ color:hsl(var(--warn)); }
+#core-info-card .sr-ctl{ min-width:0; max-width:62%; font-size:13px; line-height:1.5; text-align:end; overflow-wrap:anywhere; }
+.core-admission{ display:grid; gap:12px; margin-bottom:14px; }
+.core-card-note{ margin:12px 0 0; line-height:1.55; }
+.core-recovery{ line-height:1.55; }
+.core-recovery > p{ margin:0; }
+.core-recovery a{ font-size:12px; }
+.core-diagnostic-fields{ margin:12px 0; overflow-wrap:anywhere; }
+.core-diagnostic-fields dd{ margin:4px 0 12px; }
+#core-info-card details .btn{ margin-top:10px; }
+
+.node-toolbar{ position:sticky; top:0; z-index:12; background:hsl(var(--bg)); padding-block:8px; }
+.nd-card.node-located{ outline:2px solid hsl(var(--flow)); outline-offset:3px; animation:node-located-pulse 1.6s ease-out; }
+@keyframes node-located-pulse{ 0%,75%{ outline-color:hsl(var(--flow)); } 100%{ outline-color:transparent; } }
+@media (prefers-reduced-motion:reduce){ .nd-card.node-located{ animation-duration:.01ms; } }
+
+.sb-count[data-stats-available="false"] .rate-dn,
+.sb-count[data-stats-available="false"] .rate-up{ color:hsl(var(--fg-dim)); }

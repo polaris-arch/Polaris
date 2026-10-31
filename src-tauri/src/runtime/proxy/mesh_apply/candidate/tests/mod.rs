@@ -551,60 +551,137 @@ fn unsupported_resource_inputs_fail_closed_without_publishing_or_touching_cache(
     }
 }
 
+// Reviewed check identities do not grant execution. Only this exact compiled
+// Formal absence is an expected denial; every other admission error still fails.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn selected_check_has_known_denial(
+    binary: &std::path::Path,
+    profile: check::LinuxCheckProfile,
+) -> bool {
+    use polaris_core_supervisor::admitted_payload::{
+        check_selected_capability, AdmissionError, AdmissionErrorKind, ExecPurpose, RecoveryAction,
+    };
+    use polaris_core_supervisor::selected_core::{
+        selection_lane, SelectionLane, COMPILED_VALIDATION_SOURCE, RELEASE_CONTRACT,
+    };
+    let manifest = crate::runtime::core_identity::selected_manifest("linux").unwrap();
+    let selected_binary = manifest
+        .files
+        .iter()
+        .find(|file| file.name == "sing-box")
+        .unwrap();
+    assert_eq!(profile.binary_sha256(), selected_binary.sha256);
+    match check_selected_capability(ExecPurpose::CheckConfig) {
+        Ok(()) => false,
+        Err(error) => {
+            assert_eq!(selection_lane(), SelectionLane::Formal);
+            assert_eq!(COMPILED_VALIDATION_SOURCE, b"null");
+            assert_eq!(profile, check::LinuxCheckProfile::E3155C9);
+            assert_eq!(
+                crate::runtime::core_identity::selected_check_source("linux").unwrap(),
+                (
+                    "3155c9151f553967aabcee93f09e51084fc89899".into(),
+                    "9537af1d9de8d16885022f21e70647b8c5bec920179b8c1e2727a1e8ea420fdf".into(),
+                )
+            );
+            let contract: Value = serde_json::from_str(RELEASE_CONTRACT).unwrap();
+            assert!(contract["platforms"]["linux"]
+                .get("trustedExecution")
+                .is_none());
+            let expected = AdmissionError {
+                kind: AdmissionErrorKind::UnsupportedCapability,
+                purpose: Some(ExecPurpose::CheckConfig),
+                member: None,
+                recovery: RecoveryAction::None,
+                detail: "trusted-execution v1 fields differ".into(),
+            };
+            assert_eq!(error, expected);
+            assert_eq!(
+                crate::runtime::core_identity::acquire_at(binary, ExecPurpose::CheckConfig)
+                    .unwrap_err(),
+                expected
+            );
+            true
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[tokio::test]
 async fn checked_candidate_prepares_same_protected_images_without_managed_permit() {
     let Some((binary, profile)) = selected_core_for_test() else {
         return;
     };
-    let (_dir, runtime, snapshot, input, plan) = fixture();
+    let denied = selected_check_has_known_denial(&binary, profile);
+    let (dir, runtime, snapshot, input, plan) = fixture();
+    let source_before = fs::read(dir.join("config.json")).unwrap();
+    let gate_before = runtime.gate.generation();
+    let decoy_before = runtime.node_dns_decoy_override();
     let candidate = generate_direct_vless_candidate(&runtime, &snapshot, &input, &plan).unwrap();
     let expected_config = candidate.facts.final_config_sha256.clone();
-    let checked =
-        strict_check_pinned_linux_candidate(&runtime, &snapshot, candidate, &binary, profile)
-            .await
-            .unwrap();
-    let protected =
-        protected_inputs::prepare_checked_linux_inputs(checked, &snapshot, &plan, &binary).unwrap();
-    assert_eq!(protected.checked().config_sha256(), expected_config);
+    assert!(candidate.metadata().managed_launch_unsupported);
     assert_eq!(
-        protected.checked().execution_profile(),
-        profile.execution_profile()
-    );
-    assert_eq!(protected.checked().profile(), profile);
-    assert_eq!(protected.checked().binary_sha256(), profile.binary_sha256());
-    assert!(
-        protected
-            .checked()
-            .candidate()
-            .metadata()
-            .managed_launch_unsupported
-    );
-    assert_eq!(
-        protected.checked().candidate().metadata().manifest,
+        candidate.metadata().manifest,
         ManifestPublication::Unpublished
     );
-    use polaris_core_supervisor::exact_spawn::MutableObligation;
-    assert_eq!(
-        protected
-            .inputs()
-            .validate_protection(profile.input_profile()),
-        Ok(())
-    );
-    assert_eq!(protected.inputs().profile(), profile.input_profile());
-    let other = if profile == check::LinuxCheckProfile::B609 {
-        check::LinuxCheckProfile::FE182
+    let result =
+        strict_check_pinned_linux_candidate(&runtime, &snapshot, candidate, &binary, profile).await;
+    if denied {
+        assert!(matches!(
+            result,
+            Err(check::CandidateCheckError::Unsupported)
+        ));
     } else {
-        check::LinuxCheckProfile::B609
-    };
-    assert!(protected
-        .inputs()
-        .validate_protection(other.input_profile())
-        .is_err());
-    assert_eq!(
-        protected.inputs().mutable_obligations(),
-        &[MutableObligation::CacheWriterLeaseAndSelectorReadback]
-    );
+        let checked = result.unwrap();
+        let protected =
+            protected_inputs::prepare_checked_linux_inputs(checked, &snapshot, &plan, &binary)
+                .unwrap();
+        assert_eq!(protected.checked().config_sha256(), expected_config);
+        assert_eq!(
+            protected.checked().execution_profile(),
+            profile.execution_profile()
+        );
+        assert_eq!(protected.checked().profile(), profile);
+        assert_eq!(protected.checked().binary_sha256(), profile.binary_sha256());
+        assert!(
+            protected
+                .checked()
+                .candidate()
+                .metadata()
+                .managed_launch_unsupported
+        );
+        assert_eq!(
+            protected.checked().candidate().metadata().manifest,
+            ManifestPublication::Unpublished
+        );
+        use polaris_core_supervisor::exact_spawn::MutableObligation;
+        assert_eq!(
+            protected
+                .inputs()
+                .validate_protection(profile.input_profile()),
+            Ok(())
+        );
+        assert_eq!(protected.inputs().profile(), profile.input_profile());
+        let other = if profile == check::LinuxCheckProfile::B609 {
+            check::LinuxCheckProfile::FE182
+        } else {
+            check::LinuxCheckProfile::B609
+        };
+        assert!(protected
+            .inputs()
+            .validate_protection(other.input_profile())
+            .is_err());
+        assert_eq!(
+            protected.inputs().mutable_obligations(),
+            &[MutableObligation::CacheWriterLeaseAndSelectorReadback]
+        );
+    }
+    assert_eq!(fs::read(dir.join("config.json")).unwrap(), source_before);
+    assert!(!dir.join("cache.db").exists());
+    assert!(!dir.join("mesh-routes").exists());
+    assert!(!dir.join("singbox-runtime.json").exists());
+    assert_eq!(runtime.gate.generation(), gate_before);
+    assert_eq!(runtime.node_dns_decoy_override(), decoy_before);
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -613,6 +690,7 @@ async fn pinned_strict_check_uses_full_builder_bytes_without_cache_or_listener_s
     let Some((binary, profile)) = selected_core_for_test() else {
         return;
     };
+    let denied = selected_check_has_known_denial(&binary, profile);
     for state in ["absent", "existing", "corrupt", "locked"] {
         let (dir, runtime, snapshot, input, plan) = fixture();
         let cache_path = dir.join("cache.db");
@@ -622,6 +700,7 @@ async fn pinned_strict_check_uses_full_builder_bytes_without_cache_or_listener_s
             _ => {}
         }
         let cache_before = fs::read(&cache_path).ok();
+        let source_before = fs::read(dir.join("config.json")).unwrap();
         let cache_lock = if state == "locked" {
             Some(
                 nix::fcntl::Flock::lock(
@@ -671,35 +750,56 @@ async fn pinned_strict_check_uses_full_builder_bytes_without_cache_or_listener_s
         for port in ports {
             listeners.push(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap());
         }
-        let checked =
-            strict_check_pinned_linux_candidate(&runtime, &snapshot, candidate, &binary, profile)
-                .await
-                .unwrap_or_else(|error| panic!("{state}: {error:?}"));
-        assert_eq!(checked.config_sha256(), exact_hash, "{state}");
-        assert_eq!(checked.binary_sha256(), profile.binary_sha256());
-        assert_eq!(checked.execution_profile(), profile.execution_profile());
-        assert_eq!(checked.profile(), profile);
         assert_eq!(
-            checked.candidate().materialized.closure.config_bytes,
-            exact_bytes
+            polaris_updater::verify::sha256_hex(&exact_bytes),
+            exact_hash
         );
-        assert_eq!(checked.candidate().facts.cache.path, config_cache_path);
-        assert_eq!(fs::read(&cache_path).ok(), cache_before, "{state}");
-        assert!(!dir.join("mesh-routes").exists(), "{state}");
-        assert!(!dir.join("singbox-runtime.json").exists(), "{state}");
-        assert_eq!(runtime.gate.generation(), gate_before, "{state}");
-        assert_eq!(runtime.node_dns_decoy_override(), decoy_before, "{state}");
+        assert!(candidate.metadata().managed_launch_unsupported);
+        assert_eq!(
+            candidate.metadata().manifest,
+            ManifestPublication::Unpublished
+        );
+        let result =
+            strict_check_pinned_linux_candidate(&runtime, &snapshot, candidate, &binary, profile)
+                .await;
+        // Reap this fixture's original child before reporting an unexpected check
+        // result; a failing assertion must not leave its sleep process behind.
         let mut old = runtime
             .child
             .lock()
             .unwrap()
             .take_running_for_test()
             .unwrap();
-        assert!(
-            old.child_for_test().try_wait().unwrap().is_none(),
+        let old_still_running = old.child_for_test().try_wait().unwrap().is_none();
+        old.child_for_test().kill().await.unwrap();
+        if denied {
+            assert!(
+                matches!(result, Err(check::CandidateCheckError::Unsupported)),
+                "{state}"
+            );
+        } else {
+            let checked = result.unwrap_or_else(|error| panic!("{state}: {error:?}"));
+            assert_eq!(checked.config_sha256(), exact_hash, "{state}");
+            assert_eq!(checked.binary_sha256(), profile.binary_sha256());
+            assert_eq!(checked.execution_profile(), profile.execution_profile());
+            assert_eq!(checked.profile(), profile);
+            assert_eq!(
+                checked.candidate().materialized.closure.config_bytes,
+                exact_bytes
+            );
+            assert_eq!(checked.candidate().facts.cache.path, config_cache_path);
+        }
+        assert!(old_still_running, "{state}");
+        assert_eq!(
+            fs::read(dir.join("config.json")).unwrap(),
+            source_before,
             "{state}"
         );
-        old.child_for_test().kill().await.unwrap();
+        assert_eq!(fs::read(&cache_path).ok(), cache_before, "{state}");
+        assert!(!dir.join("mesh-routes").exists(), "{state}");
+        assert!(!dir.join("singbox-runtime.json").exists(), "{state}");
+        assert_eq!(runtime.gate.generation(), gate_before, "{state}");
+        assert_eq!(runtime.node_dns_decoy_override(), decoy_before, "{state}");
         drop(cache_lock);
         drop(listeners);
     }

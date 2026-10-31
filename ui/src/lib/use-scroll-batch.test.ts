@@ -170,6 +170,19 @@ describe('`useScrollBatch` 计数推进', () => {
     expect(total).toBeGreaterThan(SCROLL_BATCH_PAGE);
   });
 
+  it('an explicit target exposes only the required prefix and the next filter resets the batch', () => {
+    mount();
+    let batch = commit(() => useScrollBatch(1000, 'all'));
+    batch.revealThrough(180);
+    batch = commit(() => useScrollBatch(1000, 'all'));
+    expect(batch.count).toBe(181);
+    for (const invalid of [-1, 1000, Infinity, 1.5]) batch.revealThrough(invalid);
+    batch = commit(() => useScrollBatch(1000, 'all'));
+    expect(batch.count).toBe(181);
+    batch = commit(() => useScrollBatch(1000, 'filtered'));
+    expect(batch.count).toBe(SCROLL_BATCH_PAGE);
+  });
+
   it('没滚到底就不推进（少了这一向，「每次渲染都追加」照样能过上一条）', () => {
     mount();
     let batch = commit(() => useScrollBatch(1000, 'k'));

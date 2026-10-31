@@ -215,6 +215,11 @@ function NodeCardView({
   return (
     <div
       className={cn('nd-card', isCurrent && 'cur', useConfirming && 'confirming')}
+      data-node-id={server.id}
+      tabIndex={-1}
+      onAnimationEnd={(event) => {
+        if (event.animationName === 'node-located-pulse') event.currentTarget.classList.remove('node-located');
+      }}
       /* 多选态整卡 = 勾选（原有语义，优先）；否则整卡 = 设为出口。
          已是当前出口就什么都不做 —— 重选同一个节点在后端是空操作，弹一条「已切换」是噪声。 */
       onClick={() => {

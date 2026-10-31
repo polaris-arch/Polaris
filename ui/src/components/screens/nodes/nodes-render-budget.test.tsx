@@ -505,12 +505,13 @@ describe('不变量② · 分批只切渲染尾，检索/全选/测速仍对全�
    * 出现这个标识符，本条转红。（反面教训：日志页「500 行以外搜不到」正是把渲染切片当成了数据全集。）
    */
   it('切片变量只出现在受控几处，不泄漏进全选/测可见/批选的动作腿', () => {
-    // NodesScreen：destructure（1）+ `renderedServers={renderedServers}` 透传给 NodesGrid（属性名+值，2）= 3。
-    expect(occurrences(NODES, 'renderedServers')).toBe(3);
+    // NodesScreen：destructure（1）+ Grid 透传（2）+ 定位等待真实 DOM commit 的 effect 依赖（1）；
+    // 定位只推进渲染尾，不把切片用于全选或测速。
+    expect(occurrences(NODES, 'renderedServers')).toBe(4);
     expect(NODES).toContain('renderedServers={renderedServers}');
     expect(occurrences(WINDOW, 'renderedServers')).toBe(2);
     expect(WINDOW).toContain('const renderedServers = useMemo(');
-    expect(WINDOW).toContain('return { visibleServers, renderedServers, gridRef };');
+    expect(WINDOW).toContain('return { visibleServers, renderedServers, gridRef, revealThrough };');
     expect(GRID).toContain('renderedServers.map((server) => {');
     // 真正会重现「切片当全集」缺陷的三个消费者：全选/测可见按钮/批选条，一律不得含这个标识符。
     expect(ACTIONS, '批选/全选动作腿混进了渲染切片').not.toContain('renderedServers');

@@ -130,6 +130,64 @@ function loadStripped() {
   return { ci: stripComments(ciRaw), sh: stripComments(shRaw), controlled: controlledRaw };
 }
 
+// Execute the actual two inline projections with in-memory job output. A source
+// substring is insufficient: inherited overrides and projection leakage must fail.
+const RESOURCE_PROJECTION_STEP = 'Select resources for non-runtime compilation';
+function compileResourceProjection(ci, job, config, extraEnv = {}) {
+  const block = extractCiStepBlock(extractCiJobBlock(ci, job), RESOURCE_PROJECTION_STEP);
+  const match = /node --input-type=module - <<'NODE'\n([\s\S]*?)\n          NODE/.exec(block);
+  assert.ok(match, `${job}: missing inline resource projection`);
+  const script = match[1].replace(/^          /gm, '').replace(/^import .*;\n/gm, '');
+  const writes = [];
+  new Function('process', 'readFileSync', 'appendFileSync', script)(
+    { env: { GITHUB_ENV: 'fixture-job-env', ...extraEnv } },
+    (path, encoding) => {
+      assert.equal(path, 'src-tauri/tauri.conf.json');
+      assert.equal(encoding, 'utf8');
+      return JSON.stringify(config);
+    },
+    (path, content) => { assert.equal(path, 'fixture-job-env'); writes.push(content); },
+  );
+  assert.equal(writes.length, 1);
+  assert.match(writes[0], /^TAURI_CONFIG=[^\n]+\n$/);
+  return JSON.parse(writes[0].slice('TAURI_CONFIG='.length));
+}
+function assertCompileResourceBoundary(ci) {
+  assert.equal(ci.split(`- name: ${RESOURCE_PROJECTION_STEP}\n`).length - 1, 2);
+  const common = JSON.parse(readFileSync(join(ROOT, 'src-tauri/tauri.conf.json'), 'utf8'));
+  for (const job of ['lint', 'cross']) {
+    const jobBlock = extractCiJobBlock(ci, job);
+    const projection = extractCiStepBlock(jobBlock, RESOURCE_PROJECTION_STEP);
+    const consumer = jobBlock.indexOf(job === 'lint' ? 'cargo clippy --workspace' : 'cargo clippy --target');
+    assert.ok(consumer > jobBlock.indexOf(projection));
+    assert.deepEqual(compileResourceProjection(ci, job, common), { bundle: { resources: common.bundle.resources } });
+    for (const value of ['', '{}']) {
+      assert.throws(() => compileResourceProjection(ci, job, common, { TAURI_CONFIG: value }), /requires an unset TAURI_CONFIG/);
+    }
+    assert.throws(() => compileResourceProjection(ci, job, { bundle: { resources: [] } }), /expected common compile-only/);
+    assert.throws(() => compileResourceProjection(ci, job, { bundle: { resources: ['../resources/core-recovery/linux/'] } }), /expected common compile-only/);
+  }
+  const native = extractCiJobBlock(ci, 'test');
+  assert.doesNotMatch(native, /TAURI_CONFIG|Select resources for non-runtime compilation/);
+  for (const platform of ['linux', 'windows', 'macos-arm64', 'macos-x64']) {
+    const config = readFileSync(join(ROOT, `src-tauri/tauri.${platform}.conf.json`), 'utf8');
+    assert.match(config, /core-recovery/);
+  }
+}
+test('ordinary compile-only resources use the common projection without weakening native Recovery preparation', () => {
+  const { ci } = loadStripped();
+  assertCompileResourceBoundary(ci);
+  for (const [before, after] of [
+    ["Object.hasOwn(process.env, 'TAURI_CONFIG')", 'false'],
+    ['src-tauri/tauri.conf.json', 'src-tauri/tauri.linux.conf.json'],
+    ['`TAURI_CONFIG=${JSON.stringify({ bundle: { resources } })}\\n`', '`TAURI_CONFIG={}\\n`'],
+  ]) {
+    assert.ok(ci.includes(before));
+    assert.throws(() => assertCompileResourceBoundary(ci.replaceAll(before, after)));
+  }
+  assert.throws(() => assertCompileResourceBoundary(ci + '\n  fixture_native:\n    steps:\n      - name: Select resources for non-runtime compilation\n        run: true\n'));
+});
+
 /** ci.yml 里那条 Android 影响面完备性步骤的名字（本文件多处引用，抠成常量免得写歪一处不自知）。 */
 const ANDROID_FACE_STEP = 'Android impact face must be registered (dep-info 对差)';
 

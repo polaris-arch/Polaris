@@ -2,6 +2,8 @@ import type { ServerConfig } from '@/contracts/types';
 import { sortServersByLatency } from '@/domain/server-latency-sort';
 import type { ServerGroup } from '@/domain/server-grouping';
 
+const nodeNameOrder = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
 /** The list sort choices owned by the nodes toolbar. */
 export type NodesListSortKey = 'default' | 'name' | 'lat' | 'proto';
 
@@ -38,7 +40,7 @@ export function projectVisibleServers(
 
   // Direction is intentionally fixed: name/protocol A→Z and latency low→high.
   if (sortKey === 'name') {
-    list.sort((a, b) => a.name.localeCompare(b.name));
+    list.sort((a, b) => nodeNameOrder.compare(a.name, b.name));
   } else if (sortKey === 'lat') {
     // The domain comparator keeps missing measurements at the end.
     list = sortServersByLatency(list, (id) => latencies[id], 'asc');

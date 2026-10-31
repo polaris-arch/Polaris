@@ -16,9 +16,14 @@ import { tmpdir } from 'node:os';
 import { ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { contextOf, memoryFs, stripComments, winnerValue } from './css-cascade.test-support';
+import * as ts from '@/test/ts-compiler';
+import { contextOf, memoryFs, winnerValue } from './css-cascade.test-support';
 import {
   DRAIN,
+  ORACLE_TIMING,
+  ORACLE_CLOSE_TIMEOUT_MS,
+  openOracleSocket,
+  oracleTransport,
   MEDIA_DEFAULTS,
   PLUGIN_LOADERS,
   abandon,
@@ -50,7 +55,7 @@ import { inMobileShell } from './mount.test-support';
 
 // 收尾走 CDP 的 `Browser.close`，让 Chrome 自己退（全程不 kill 进程）。
 // 超时给到 30s：全量并行跑时机器争用，默认的 10s hookTimeout 会在收尾这一步假红。
-afterAll(closeOracle, 30_000);
+afterAll(closeOracle, ORACLE_CLOSE_TIMEOUT_MS);
 
 /** 一次问一个属性的糖 —— 本文件的断言都是单点的。 */
 const one = async (css: string[], html: string, select: string, prop: string): Promise<string> =>
@@ -696,14 +701,29 @@ describe('⑨ 第六轮：故障关闭分支逐条有门', () => {
 
     it('收尾 hook 由本模块自己注册 —— 消费方忘了写 `afterAll` 也覆盖得到', () => {
       // 「忘了写」上一版只剩 `beforeExit` 一条兜底：它晚于 vitest 报 rc，且只能打 stderr。
-      const src = stripComments(MODULE_SRC);
-      expect(src, '本模块不再自己挂收尾 hook —— 「谁 import 它谁就有收尾」这句话失效了').toMatch(
-        /^afterAll\(closeOracle,/m,
-      );
-      // 正向对照：同一条扫描对着一份没挂 hook 的源码不报（上一条不是恒真）。
-      expect(stripComments('const x = 1;\nexport function closeOracle() {}\n')).not.toMatch(
-        /^afterAll\(closeOracle,/m,
-      );
+      const bindings = (source: string) => {
+        const parsed = ts.parseSourceFile('oracle-owner-hook-fixture.ts', source);
+        const branch = parsed.statements.find((statement) => ts.isIfStatement(statement)
+          && statement.expression.getText(parsed) === 'TestRunner.getCurrentTest() !== undefined');
+        if (!branch || !ts.isIfStatement(branch)) return [];
+        return [branch.thenStatement, branch.elseStatement].map(statement => {
+          if (!statement || !ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return null;
+          const call = statement.expression;
+          return { hook: call.expression.getText(parsed), handler: call.arguments[0]?.getText(parsed),
+            budget: call.arguments[1]?.getText(parsed) };
+        });
+      };
+      expect(bindings(MODULE_SRC)).toEqual([
+        { hook: 'onTestFinished', handler: 'finishOracle', budget: 'ORACLE_CLOSE_TIMEOUT_MS' },
+        { hook: 'afterAll', handler: 'finishOracle', budget: 'ORACLE_CLOSE_TIMEOUT_MS' },
+      ]);
+      const parsed = ts.parseSourceFile('oracle-owner-finalize-fixture.ts', MODULE_SRC);
+      const finish = parsed.statements.find(statement => ts.isFunctionDeclaration(statement) && statement.name?.text === 'finishOracle');
+      expect(finish && ts.isFunctionDeclaration(finish) ? finish.body?.statements.map(statement => statement.getText(parsed)) : [])
+        .toEqual(['FINALIZED = true;', 'await closeOracle();']);
+      expect(bindings('const x = 1; export function closeOracle() {}')).toEqual([]);
+      expect(bindings('// if (TestRunner.getCurrentTest() !== undefined) onTestFinished(finishOracle, ORACLE_CLOSE_TIMEOUT_MS);\n'
+        + 'const fake = "else afterAll(finishOracle, ORACLE_CLOSE_TIMEOUT_MS);";')).toEqual([]);
     });
   });
 
@@ -1062,9 +1082,13 @@ describe('⑩ 第七轮：段序 + A6 规矩上欠着的那几条', () => {
           { ctx: 'mobile', html: inMobileShell('<span class="t7-leaf"></span>', 'home') },
           [{ select: '.t7-leaf', props: ['display'] }],
         );
+        const rejected = expect(inFlight).rejects.toThrow(/次度量在途/);
         await expect(closeOracle()).rejects.toThrow(/次度量在途/);
         // 把它等回来 —— 判据自己不许把浏览器丢在宿主上。
-        await inFlight;
+        await rejected;
+        expect(inflightMeasures()).toBe(0);
+        await new Promise(resolve => setTimeout(resolve, 50));
+        assertNoOracleLeak();
       } finally {
         DRAIN.timeoutMs = 60_000;
       }
@@ -1130,5 +1154,97 @@ describe('⑩ 第七轮：段序 + A6 规矩上欠着的那几条', () => {
       ).toEqual([]);
       expect(calls.length, '正向对照：那一处存在性探针还在（它没了说明本判据在空跑）').toBe(1);
     });
+  });
+});
+
+
+describe('CDP phase deadlines and cancellation', () => {
+  const socket = () => ({
+    onopen: null, onerror: null, onclose: null, onmessage: null,
+    send: vi.fn(), close: vi.fn(), readyState: 1, OPEN: 1,
+  }) as unknown as WebSocket;
+
+  it('bounds a silent handshake, detaches callbacks and closes its own socket', async () => {
+    vi.useFakeTimers();
+    try {
+      const ws = socket();
+      const controller = new AbortController();
+      const result = expect(openOracleSocket(ws, controller.signal)).rejects.toThrow(/CDP 握手超时/);
+      await vi.advanceTimersByTimeAsync(ORACLE_TIMING.handshakeMs);
+      await result;
+      expect(ws.close).toHaveBeenCalledOnce();
+      expect(ws.onopen).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('abort during handshake cannot publish a late open; successful open clears its deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController(), ws = socket();
+      const pending = openOracleSocket(ws, controller.signal);
+      const lateOpen = ws.onopen;
+      const rejected = expect(pending).rejects.toThrow('cancel startup');
+      controller.abort(new Error('cancel startup'));
+      lateOpen?.call(ws, new Event('open'));
+      await rejected;
+      expect(ws.close).toHaveBeenCalledOnce();
+      const good = socket();
+      const opened = openOracleSocket(good, new AbortController().signal);
+      good.onopen?.call(good, new Event('open'));
+      await expect(opened).resolves.toBeUndefined();
+      expect(good.close).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('admits existing work but rejects a new measurement during draining', async () => {
+    await closeOracle();
+    const accepted = measure({ css: ['.owned{display:block}'], html: '<i class="owned"></i>' },
+      [{ select: '.owned', props: ['display'] }]);
+    const closing = closeOracle();
+    const late = expect(measure({ css: ['.late{display:block}'], html: '<i class="late"></i>' },
+      [{ select: '.late', props: ['display'] }])).rejects.toThrow(/收尾期间/);
+    expect((await accepted).get('.owned', 'display')).toBe('block');
+    await closing;
+    await late;
+    expect(inflightMeasures()).toBe(0);
+    assertNoOracleLeak();
+  }, 60_000);
+
+  it('cancels endpoint polling without a late launch or deleting an unconfirmed profile', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oracle-endpoint-abort-'));
+    const child = new ChildProcess();
+    const owned: Owned = { dir, pid: undefined, closed: false, state: 'starting', child };
+    const controller = new AbortController();
+    try {
+      const stopped = expect(waitForDevToolsEndpoint({ owned, child, stderr: [] }, ORACLE_TIMING.endpointMs, controller.signal))
+        .rejects.toThrow('cancel endpoint');
+      controller.abort(new Error('cancel endpoint'));
+      await stopped;
+      expect(owned.closed).toBe(false);
+      expect(existsSync(dir)).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('request timeout rejects its owner, ignores late replies and drains the pending request timers', async () => {
+    vi.useFakeTimers();
+    try {
+      const ws = socket(), expired = vi.fn();
+      const transport = oracleTransport(ws, expired);
+      const timed = expect(transport.send('Target.createTarget')).rejects.toThrow(/CDP 请求超时.*Target.createTarget/);
+      await vi.advanceTimersByTimeAsync(ORACLE_TIMING.requestMs);
+      await timed;
+      expect(expired).toHaveBeenCalledOnce();
+      ws.onmessage?.call(ws, new MessageEvent('message', { data: JSON.stringify({ id: 1, result: { targetId: 'late' } }) }));
+      const pending = expect(transport.send('Page.enable')).rejects.toThrow('cancel owner');
+      transport.cancelPending(new Error('cancel owner'));
+      await pending;
+      expect(vi.getTimerCount()).toBe(0);
+      const good = transport.send('Page.getFrameTree');
+      ws.onmessage?.call(ws, new MessageEvent('message', { data: JSON.stringify({ id: 3, result: { frameTree: 'owned' } }) }));
+      await expect(good).resolves.toEqual({ frameTree: 'owned' });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
   });
 });

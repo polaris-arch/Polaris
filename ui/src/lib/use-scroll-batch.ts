@@ -112,6 +112,8 @@ export interface ScrollBatch {
    * 代价是用户永远点不到剩下的节点，且**没有滚动条就没有「还有更多」的暗示**，他不会知道少了。
    */
   renderAll: () => void;
+  /** Reveal one explicit target without disabling batching for the remaining tail. */
+  revealThrough: (index: number) => void;
 }
 
 /**
@@ -142,5 +144,9 @@ export function useScrollBatch(total: number, resetKey: ScrollBatchResetKey): Sc
     count,
     onScroll: (e) => setCount((c) => advanceBatch(c, total, e.currentTarget)),
     renderAll: () => setCount((c) => (c >= total ? c : total)),
+    revealThrough: (index) => {
+      if (!Number.isSafeInteger(index) || index < 0 || index >= total) return;
+      setCount((c) => Math.max(c, Math.min(total, index + 1)));
+    },
   };
 }

@@ -183,6 +183,7 @@ struct SelectedPolicy {
     tree: String,
     digest: String,
     purposes: Vec<ExecPurpose>,
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     loader: String,
 }
 impl SelectedPolicy {
@@ -230,15 +231,16 @@ impl SelectedPolicy {
             .ok_or_else(|| {
                 AdmissionError::new(AdmissionErrorKind::Mismatch, "missing selected tree")
             })?;
-        let (purposes, loader) = Self::declaration(policy, source, tree, platform)?;
+        let declaration = Self::declaration(policy, source, tree, platform)?;
         Ok(Self {
             manifest,
             id,
             source: source.into(),
             tree: tree.into(),
             digest: sha256_hex(&serde_json::to_vec(policy).expect("policy JSON")),
-            purposes,
-            loader,
+            purposes: declaration.0,
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+            loader: declaration.1,
         })
     }
     fn declaration(
